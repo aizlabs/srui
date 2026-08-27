@@ -6,7 +6,7 @@ This specification defines the canonical, language-agnostic registry for **Names
 
 ## 1. Overview and Purpose
 
-The protocol registry ([`protocol/registry.yaml`](file:///Users/zozulya/github/srui/protocol/registry.yaml)) serves as the single source of truth for standard semantic primitives in SRUI:
+The protocol registry ([`protocol/registry.yaml`](../protocol/registry.yaml)) serves as the single source of truth for standard semantic primitives in SRUI:
 - **Node Types**: Standard layout containers, content controls, and collection views.
 - **Common Properties**: Typed semantic properties covering identity, accessibility, common state, content, layout intent, and control-specific descriptors.
 - **Standard Enums**: Type-safe enumerations communicating presentation intent, roles, alignment, and sizing without specifying raw pixel rendering.
@@ -113,7 +113,7 @@ When adding a new primitive to Namespace 0:
    - If the primitive is specific to a single domain or experimental workflow, define it within an **Extension Profile** rather than Namespace 0.
 
 2. **Assign Next Monotonic ID**:
-   - Locate the target category in [`protocol/registry.yaml`](file:///Users/zozulya/github/srui/protocol/registry.yaml).
+   - Locate the target category in [`protocol/registry.yaml`](../protocol/registry.yaml).
    - Find the current maximum ID ($ID_{\max}$) in that category.
    - Assign $ID_{\text{new}} = ID_{\max} + 1$. Do NOT insert between existing IDs.
 

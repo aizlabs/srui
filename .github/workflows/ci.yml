@@ -7,6 +7,14 @@ on:
     branches: [ main, master ]
 
 jobs:
+  registry:
+    name: Registry Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate protocol/registry.yaml
+        run: python3 protocol/validate_registry.py
+
   rust:
     name: Rust Build
     runs-on: macos-15

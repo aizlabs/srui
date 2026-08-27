@@ -1,1 +1,685 @@
-# SRUI Type and Property Registries — placeholder; schema to be implemented in a later task.
+# ==============================================================================
+# SRUI Canonical Standard Registry (Namespace 0)
+# Reference: SRUI Design Document v0.4 (§6.4, §7.2–7.6, §13)
+# ==============================================================================
+# Invariants:
+# 1. Namespace 0 is permanently reserved for the SRUI standard registry.
+# 2. IDs are assigned monotonically starting at 1 within each category.
+# 3. Once assigned, IDs must NEVER be reused, reordered, or renumbered.
+# ==============================================================================
+
+namespace: 0
+namespace_name: "org.srui.standard"
+version: "0.4.0"
+description: "Canonical standard registry for SRUI namespace 0 (standard widgets, properties, enums, events, operations)"
+
+node_types:
+  # Containers & Layout (§7.2)
+  - id: 1
+    name: Surface
+    tier: required
+    category: container
+    description: "Top-level content/window surface"
+
+  - id: 2
+    name: Dialog
+    tier: standard
+    category: container
+    description: "Transient modal or modeless surface"
+
+  - id: 3
+    name: Row
+    tier: required
+    category: layout
+    description: "Ordered horizontal layout container"
+
+  - id: 4
+    name: Column
+    tier: required
+    category: layout
+    description: "Ordered vertical layout container"
+
+  - id: 5
+    name: Grid
+    tier: required
+    category: layout
+    description: "Two-dimensional row/column layout container"
+
+  - id: 6
+    name: Spacer
+    tier: required
+    category: layout
+    description: "Flexible empty layout item for adjusting spacing and alignment"
+
+  - id: 7
+    name: Separator
+    tier: required
+    category: layout
+    description: "Semantic visual grouping line or divider"
+
+  - id: 8
+    name: Scroll
+    tier: required
+    category: container
+    description: "Scrollable viewport container"
+
+  # Content & Basic Controls (§7.2, §7.3 Required Tier)
+  - id: 9
+    name: Text
+    tier: required
+    category: text
+    description: "Non-editable static or dynamic text label"
+
+  - id: 10
+    name: RichText
+    tier: required
+    category: text
+    description: "Selectable structured text with semantic annotations"
+
+  - id: 11
+    name: Button
+    tier: required
+    category: control
+    description: "Momentary action trigger"
+
+  - id: 12
+    name: Toggle
+    tier: required
+    category: control
+    description: "User-editable boolean state control (rendered as checkbox, switch, or platform default)"
+
+  - id: 13
+    name: TextInput
+    tier: required
+    category: control
+    description: "Single-line text editing field"
+
+  - id: 14
+    name: TextArea
+    tier: required
+    category: control
+    description: "Multi-line text editing view"
+
+  - id: 15
+    name: Progress
+    tier: required
+    category: control
+    description: "Determinate or indeterminate progress indicator"
+
+  - id: 16
+    name: Image
+    tier: required
+    category: content
+    description: "Raster or vector image resource display"
+
+  # Collections (§7.2, §7.3 Required Tier)
+  - id: 17
+    name: List
+    tier: required
+    category: collection
+    description: "Virtualized one-dimensional collection of items"
+
+  - id: 18
+    name: Table
+    tier: required
+    category: collection
+    description: "Multi-column row-based collection view"
+
+  - id: 19
+    name: Tree
+    tier: required
+    category: collection
+    description: "Hierarchical outline collection view with expandable nodes"
+
+  # Advanced Controls (§7.2, §7.3 SHOULD Tier)
+  - id: 20
+    name: Select
+    tier: should
+    category: control
+    description: "Choose a single option from a compact dropdown/popup set"
+
+  - id: 21
+    name: ChoiceGroup
+    tier: should
+    category: control
+    description: "Mutually exclusive visible choices (e.g. radio button group, segmented control)"
+
+  - id: 22
+    name: Slider
+    tier: should
+    category: control
+    description: "Continuous or stepped numeric value selection from a range"
+
+  - id: 23
+    name: NumberInput
+    tier: should
+    category: control
+    description: "Editable numeric value with constraints, step increments, and optional stepper"
+
+  - id: 24
+    name: Tabs
+    tier: should
+    category: container
+    description: "Mutually exclusive page container with tab strip"
+
+  - id: 25
+    name: Split
+    tier: should
+    category: container
+    description: "User-resizable pane division container"
+
+  # Shell / Command Strips (§7.2, §7.3 Deferred Tier)
+  - id: 26
+    name: Menu
+    tier: deferred
+    category: shell
+    description: "Command and action menu hierarchy"
+
+  - id: 27
+    name: Toolbar
+    tier: deferred
+    category: shell
+    description: "Primary window or application command strip"
+
+properties:
+  # Identity / Accessibility (§7.4)
+  - id: 1
+    name: label
+    category: identity_accessibility
+    value_type: string
+    description: "Primary user-visible label or accessibility name"
+
+  - id: 2
+    name: accessible_description
+    category: identity_accessibility
+    value_type: string
+    description: "Secondary accessibility description or tooltip text"
+
+  - id: 3
+    name: role
+    category: identity_accessibility
+    value_type: enum
+    description: "Semantic appearance or behavioral role (e.g. TextRole, ActionRole, InputRole)"
+
+  - id: 4
+    name: value_description
+    category: identity_accessibility
+    value_type: string
+    description: "Human-readable accessibility description of current value"
+
+  - id: 5
+    name: actions
+    category: identity_accessibility
+    value_type: list
+    description: "List of semantic actions supported by this node"
+
+  # Common State (§7.4)
+  - id: 6
+    name: visibility
+    category: common_state
+    value_type: enum
+    description: "Node visibility state (visible, hidden, collapsed)"
+
+  - id: 7
+    name: enabled
+    category: common_state
+    value_type: bool
+    description: "Whether the node is interactive and accepts user input"
+
+  - id: 8
+    name: read_only
+    category: common_state
+    value_type: bool
+    description: "Whether the node value is displayable but not directly editable"
+
+  - id: 9
+    name: busy
+    category: common_state
+    value_type: bool
+    description: "Whether the node is performing an asynchronous operation"
+
+  - id: 10
+    name: selected
+    category: common_state
+    value_type: bool
+    description: "Whether the node or item is in a selected state"
+
+  - id: 11
+    name: validation_state
+    category: common_state
+    value_type: enum
+    description: "Validation status (valid, warning, error) with optional message"
+
+  # Content (§7.4)
+  - id: 12
+    name: text
+    category: content
+    value_type: string
+    description: "Primary text content of a label, button, or static text node"
+
+  - id: 13
+    name: value
+    category: content
+    value_type: value
+    description: "Current value of an input or control (boolean, number, string, etc.)"
+
+  - id: 14
+    name: placeholder
+    category: content
+    value_type: string
+    description: "Placeholder text displayed when an input field is empty"
+
+  - id: 15
+    name: resource
+    category: content
+    value_type: resource_hash
+    description: "Content-addressed SHA-256 binary resource identifier"
+
+  - id: 16
+    name: items
+    category: content
+    value_type: list
+    description: "Inline list of items or choices for small collections"
+
+  - id: 17
+    name: model_ref
+    category: content
+    value_type: uint64
+    description: "Identifier of an external collection data model"
+
+  # Layout Intent (§7.4)
+  - id: 18
+    name: horizontal_alignment
+    category: layout_intent
+    value_type: enum
+    description: "Horizontal alignment within parent layout (leading, center, trailing, fill)"
+
+  - id: 19
+    name: vertical_alignment
+    category: layout_intent
+    value_type: enum
+    description: "Vertical alignment within parent layout (top, center, bottom, fill)"
+
+  - id: 20
+    name: grow
+    category: layout_intent
+    value_type: float64
+    description: "Relative flex grow weight along the layout axis"
+
+  - id: 21
+    name: shrink
+    category: layout_intent
+    value_type: float64
+    description: "Relative flex shrink weight along the layout axis"
+
+  - id: 22
+    name: minimum_size
+    category: layout_intent
+    value_type: size
+    description: "Minimum logical dimensions (width, height) hint"
+
+  - id: 23
+    name: maximum_size
+    category: layout_intent
+    value_type: size
+    description: "Maximum logical dimensions (width, height) hint"
+
+  - id: 24
+    name: preferred_size
+    category: layout_intent
+    value_type: size
+    description: "Preferred logical dimensions (width, height) hint"
+
+  - id: 25
+    name: spacing_role
+    category: layout_intent
+    value_type: enum
+    description: "Semantic inter-item spacing (none, tight, normal, relaxed)"
+
+  - id: 26
+    name: padding_role
+    category: layout_intent
+    value_type: enum
+    description: "Semantic container padding (none, tight, normal, relaxed)"
+
+  # Standard Control-Specific & Semantic Properties (§7.2, §7.7, §8)
+  - id: 27
+    name: presentation_hint
+    category: control_specific
+    value_type: enum
+    description: "Advisory presentation hint (e.g. checkbox, switch, automatic for Toggle)"
+
+  - id: 28
+    name: action_key
+    category: control_specific
+    value_type: string
+    description: "Opaque semantic action key bound to server-side action handler"
+
+  - id: 29
+    name: columns
+    category: control_specific
+    value_type: list
+    description: "Column definitions for tabular collections"
+
+  - id: 30
+    name: selection_mode
+    category: control_specific
+    value_type: enum
+    description: "Selection mode for collections (none, single, multiple)"
+
+enums:
+  - name: TextRole
+    description: "Semantic intent and hierarchy for text display (§7.5)"
+    values:
+      - id: 1
+        name: title
+        description: "Primary top-level title"
+      - id: 2
+        name: heading
+        description: "Section or group heading"
+      - id: 3
+        name: body
+        description: "Standard body text"
+      - id: 4
+        name: caption
+        description: "Secondary caption or footnote text"
+      - id: 5
+        name: code
+        description: "Monospaced code or technical token text"
+      - id: 6
+        name: status
+        description: "Informative status indicator text"
+      - id: 7
+        name: warning
+        description: "Warning message text"
+      - id: 8
+        name: error
+        description: "Error message text"
+
+  - name: ActionRole
+    description: "Semantic intent and prominence for interactive actions (§7.5)"
+    values:
+      - id: 1
+        name: normal
+        description: "Standard action button"
+      - id: 2
+        name: primary
+        description: "Default or primary action in the current context"
+      - id: 3
+        name: destructive
+        description: "Action that deletes, removes, or irrevocably modifies state"
+      - id: 4
+        name: quiet
+        description: "Subtle or borderless action"
+
+  - name: InputRole
+    description: "Semantic behavior and security intent for text input fields (§7.5)"
+    values:
+      - id: 1
+        name: plain
+        description: "Standard single-line text input"
+      - id: 2
+        name: search
+        description: "Search input field with search semantics and clearing button"
+      - id: 3
+        name: secure
+        description: "Sensitive or password input field with masked character display"
+      - id: 4
+        name: command
+        description: "Command or shell prompt input field"
+
+  - name: Importance
+    description: "Semantic emphasis level for widgets (§7.5)"
+    values:
+      - id: 1
+        name: normal
+        description: "Standard visual importance"
+      - id: 2
+        name: emphasized
+        description: "Elevated visual importance or accent"
+      - id: 3
+        name: de_emphasized
+        description: "Diminished or muted visual prominence"
+
+  - name: TogglePresentationHint
+    description: "Advisory presentation style for Toggle controls (§7.2)"
+    values:
+      - id: 1
+        name: automatic
+        description: "Renderer chooses the locally idiomatic control style"
+      - id: 2
+        name: checkbox
+        description: "Prefer a checkbox appearance"
+      - id: 3
+        name: switch
+        description: "Prefer a toggle switch appearance"
+
+  - name: Visibility
+    description: "Visibility and layout participation state (§7.4)"
+    values:
+      - id: 1
+        name: visible
+        description: "Rendered and occupies layout space"
+      - id: 2
+        name: hidden
+        description: "Invisible but retains layout space"
+      - id: 3
+        name: collapsed
+        description: "Invisible and removed from layout calculation"
+
+  - name: SpacingRole
+    description: "Semantic inter-item layout spacing (§7.4)"
+    values:
+      - id: 1
+        name: none
+        description: "No spacing between items"
+      - id: 2
+        name: tight
+        description: "Compact inter-item spacing"
+      - id: 3
+        name: normal
+        description: "Standard platform inter-item spacing"
+      - id: 4
+        name: relaxed
+        description: "Generous or spacious inter-item spacing"
+
+  - name: PaddingRole
+    description: "Semantic container padding (§7.4)"
+    values:
+      - id: 1
+        name: none
+        description: "No container padding"
+      - id: 2
+        name: tight
+        description: "Compact container padding"
+      - id: 3
+        name: normal
+        description: "Standard platform container padding"
+      - id: 4
+        name: relaxed
+        description: "Generous container padding"
+
+  - name: HorizontalAlignment
+    description: "Horizontal alignment options within layout containers (§7.4)"
+    values:
+      - id: 1
+        name: leading
+        description: "Aligned to the leading edge (left in LTR, right in RTL)"
+      - id: 2
+        name: center
+        description: "Centered horizontally"
+      - id: 3
+        name: trailing
+        description: "Aligned to the trailing edge (right in LTR, left in RTL)"
+      - id: 4
+        name: fill
+        description: "Stretches to fill available horizontal space"
+
+  - name: VerticalAlignment
+    description: "Vertical alignment options within layout containers (§7.4)"
+    values:
+      - id: 1
+        name: top
+        description: "Aligned to the top edge"
+      - id: 2
+        name: center
+        description: "Centered vertically"
+      - id: 3
+        name: bottom
+        description: "Aligned to the bottom edge"
+      - id: 4
+        name: fill
+        description: "Stretches to fill available vertical space"
+
+  - name: SelectionMode
+    description: "Item selection mode for collection views (§8)"
+    values:
+      - id: 1
+        name: none
+        description: "Selection is disabled"
+      - id: 2
+        name: single
+        description: "At most one item may be selected"
+      - id: 3
+        name: multiple
+        description: "Multiple items may be selected concurrently"
+
+  - name: ValidationState
+    description: "Form and control validation state (§7.4)"
+    values:
+      - id: 1
+        name: valid
+        description: "Value passed validation checks"
+      - id: 2
+        name: warning
+        description: "Value is acceptable but triggered an advisory warning"
+      - id: 3
+        name: error
+        description: "Value failed validation checks"
+
+events:
+  # Semantic Events (§7.6)
+  - id: 1
+    name: ACTIVATE
+    kind: semantic
+    description: "Momentary control activation (e.g. Button click/press)"
+
+  - id: 2
+    name: VALUE_CHANGED
+    kind: semantic
+    description: "Scalar or boolean value change (e.g. Toggle, Slider, NumberInput, Split position)"
+
+  - id: 3
+    name: SELECTION_CHANGED
+    kind: semantic
+    description: "Selection change within a collection or choice control (e.g. List, Table, Tree, Tabs, ChoiceGroup, Select)"
+
+  - id: 4
+    name: EXPANSION_CHANGED
+    kind: semantic
+    description: "Disclosure or node expansion state change in hierarchical views (e.g. Tree node expanded/collapsed)"
+
+  - id: 5
+    name: TEXT_EDIT
+    kind: semantic
+    description: "Committed or staged text edit synchronization from TextInput or TextArea"
+
+  - id: 6
+    name: VIEWPORT_CHANGED
+    kind: semantic
+    description: "Asynchronous viewport or window geometry change (e.g. Surface resized, Scroll region shifted)"
+
+  # Coordinate / Pointer Events (§7.7, reserved for subscribed custom scenes)
+  - id: 7
+    name: POINTER_DOWN
+    kind: coordinate
+    description: "Pointer button pressed at logical scene coordinates"
+
+  - id: 8
+    name: POINTER_UP
+    kind: coordinate
+    description: "Pointer button released at logical scene coordinates"
+
+  - id: 9
+    name: POINTER_MOVE
+    kind: coordinate
+    description: "Pointer moved within scene at logical coordinates"
+
+  - id: 10
+    name: POINTER_CANCEL
+    kind: coordinate
+    description: "Pointer tracking cancelled or interrupted"
+
+  - id: 11
+    name: POINTER_SCROLL
+    kind: coordinate
+    description: "Pointer scroll/wheel gesture at logical scene coordinates"
+
+operations:
+  # Required Core Operations (§13)
+  - id: 1
+    name: CREATE_NODE
+    category: required
+    description: "Instantiate a new semantic node with type, parent, child index, and initial properties"
+
+  - id: 2
+    name: DELETE_NODE
+    category: required
+    description: "Remove an existing semantic node and its entire subtree"
+
+  - id: 3
+    name: SET_PROPERTY
+    category: required
+    description: "Set or update a typed property value on an existing node"
+
+  - id: 4
+    name: CLEAR_PROPERTY
+    category: required
+    description: "Clear or reset a property to its default unset state"
+
+  - id: 5
+    name: COMMIT
+    category: required
+    description: "Atomically commit all preceding operations to advance to a new semantic revision"
+
+  # Standard Model Operations (§13)
+  - id: 6
+    name: CREATE_MODEL
+    category: model
+    description: "Create a new non-tree data collection model"
+
+  - id: 7
+    name: MODEL_INSERT
+    category: model
+    description: "Insert items into a collection model at a specified index"
+
+  - id: 8
+    name: MODEL_DELETE
+    category: model
+    description: "Delete items from a collection model by item identity or range"
+
+  - id: 9
+    name: MODEL_UPDATE
+    category: model
+    description: "Update existing item data in a collection model"
+
+  - id: 10
+    name: MODEL_RESET_RANGE
+    category: model
+    description: "Replace a range of items or reset virtualized model state"
+
+  # Optional Optimization Operations (§13)
+  - id: 11
+    name: MOVE_NODE
+    category: optimization
+    description: "Move an existing node to a new parent or child index without recreation"
+
+  - id: 12
+    name: REORDER_CHILDREN
+    category: optimization
+    description: "Reorder child node IDs within a parent container"
+
+  - id: 13
+    name: BATCH_PROPERTY_SET
+    category: optimization
+    description: "Set multiple properties on a single node in a single compact operation"

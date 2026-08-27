@@ -26,5 +26,9 @@ DerivedData/
 *.swp
 *~
 
+# Python
+__pycache__/
+*.pyc
+
 # Tooling
 .lemoncrow/

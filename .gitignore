@@ -29,6 +29,7 @@ DerivedData/
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Tooling
 .lemoncrow/

@@ -12,8 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Python tooling
+        run: uv sync --extra dev
       - name: Validate protocol/registry.yaml
-        run: python3 protocol/validate_registry.py
+        run: uv run python protocol/validate_registry.py
+      - name: Run registry validator tests
+        run: uv run pytest protocol/tests
 
   rust:
     name: Rust Build

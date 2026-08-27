@@ -69,38 +69,36 @@ To guarantee long-term protocol stability and backwards compatibility, the follo
 
 ## 4. Registry Categories
 
+The authoritative symbol tables live in [`protocol/registry.yaml`](../protocol/registry.yaml). The summaries below are descriptive; when they differ from the registry file, the registry file wins. Automated validation is enforced by `protocol/validate_registry.py`.
+
 ### 4.1 Node Types (§7.2, §7.3)
-Enumerates standard semantic nodes across tiers:
-- **Required Tier (§7.3)**: `Surface`, `Row`, `Column`, `Grid`, `Spacer`, `Separator`, `Scroll`, `Text`, `RichText`, `Button`, `Toggle`, `TextInput`, `TextArea`, `Progress`, `Image`, `List`, `Table`, `Tree`.
-- **SHOULD Tier (§7.3)**: `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`, `Split`.
-- **Standard Containers & Deferred (§7.2, §7.3)**: `Dialog`, `Menu`, `Toolbar`.
+The canonical registry defines 27 node types with `tier` metadata (`required`, `should`, `standard`, `deferred`) and `category` metadata (`container`, `layout`, `text`, `control`, `content`, `collection`, `shell`).
+
+Design-doc tier groupings for reference:
+- **Required Tier (§7.3)**: 18 node types including `Surface`, `Row`, `Column`, `Grid`, `Text`, `Button`, `List`, `Table`, and `Tree`.
+- **SHOULD Tier (§7.3)**: 6 node types including `Select`, `ChoiceGroup`, `Slider`, `Tabs`, and `Split`.
+- **Standard Containers & Deferred (§7.2, §7.3)**: `Dialog`, `Menu`, and `Toolbar`.
 
 > **Admission Rule for Standard Widgets (§7.2)**: A widget belongs in the Standard Profile only if its meaning and state machine are stable across multiple major desktop toolkit families (AppKit, WinUI, GTK, SWT), its behavior is specified without reference to a particular drawing API, and it supports accessibility mapping.
 
-### 4.2 Common Properties (§7.4)
-Divided into five structural categories:
-1. **Identity & Accessibility**: `label`, `accessible_description`, `role`, `value_description`, `actions`.
-2. **Common State**: `visibility`, `enabled`, `read_only`, `busy`, `selected`, `validation_state`.
-3. **Content**: `text`, `value`, `placeholder`, `resource`, `items`, `model_ref`.
-4. **Layout Intent**: `horizontal_alignment`, `vertical_alignment`, `grow`, `shrink`, `minimum_size`, `maximum_size`, `preferred_size`, `spacing_role`, `padding_role`.
-5. **Control-Specific & Semantic Metadata**: `presentation_hint`, `action_key`, `columns`, `selection_mode`.
+### 4.2 Common Properties (§7.4, §8)
+The canonical registry defines 30 standard properties in five categories:
+1. **Identity & Accessibility** (§7.4)
+2. **Common State** (§7.4)
+3. **Content** (§7.4)
+4. **Layout Intent** (§7.4)
+5. **Control-Specific & Semantic Metadata** (§8): `presentation_hint`, `action_key`, `columns`, `selection_mode`
 
-### 4.3 Standard Enums (§7.5, §7.2, §7.4)
-- `TextRole`: `title`, `heading`, `body`, `caption`, `code`, `status`, `warning`, `error`.
-- `ActionRole`: `normal`, `primary`, `destructive`, `quiet`.
-- `InputRole`: `plain`, `search`, `secure`, `command`.
-- `Importance`: `normal`, `emphasized`, `de_emphasized`.
-- `TogglePresentationHint`: `automatic`, `checkbox`, `switch`.
-- Supporting layout & state enums: `Visibility`, `SpacingRole`, `PaddingRole`, `HorizontalAlignment`, `VerticalAlignment`, `SelectionMode`, `ValidationState`.
+Each property entry includes `value_type` metadata validated by the registry tool.
+
+### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)
+The canonical registry defines 12 standard enums with contiguous value IDs. These include appearance roles (`TextRole`, `ActionRole`, `InputRole`, `Importance`), toggle presentation hints, and supporting layout/state enums (`Visibility`, `SpacingRole`, `PaddingRole`, `HorizontalAlignment`, `VerticalAlignment`, `SelectionMode`, `ValidationState`).
 
 ### 4.4 Standard Events (§7.6, §7.7)
-- **Semantic Events**: `ACTIVATE`, `VALUE_CHANGED`, `SELECTION_CHANGED`, `EXPANSION_CHANGED`, `TEXT_EDIT`, `VIEWPORT_CHANGED`.
-- **Coordinate Pointer Events**: `POINTER_DOWN`, `POINTER_UP`, `POINTER_MOVE`, `POINTER_CANCEL`, `POINTER_SCROLL` (applicable only to custom scene nodes that explicitly subscribe to coordinate streams).
+Semantic and coordinate pointer events are defined with `kind` metadata (`semantic` or `coordinate`).
 
 ### 4.5 Core Mutation Operations (§13)
-- **Required Core Operations**: `CREATE_NODE`, `DELETE_NODE`, `SET_PROPERTY`, `CLEAR_PROPERTY`, `COMMIT`.
-- **Standard Model Operations**: `CREATE_MODEL`, `MODEL_INSERT`, `MODEL_DELETE`, `MODEL_UPDATE`, `MODEL_RESET_RANGE`.
-- **Optional Optimization Operations**: `MOVE_NODE`, `REORDER_CHILDREN`, `BATCH_PROPERTY_SET`.
+Required core, model, and optimization operations are defined with `category` metadata (`required`, `model`, `optimization`).
 
 ---
 
@@ -121,14 +119,27 @@ When adding a new primitive to Namespace 0:
    - Add a descriptive `name`, appropriate `tier` or `category`, `value_type` (for properties), and human-readable `description`.
 
 4. **Validate**:
+   - Install Python tooling once with `uv sync --extra dev`.
    - Run the automated registry validation script:
      ```bash
-     python3 protocol/validate_registry.py
+     uv run python protocol/validate_registry.py
+     ```
+   - For CI/automation, use machine-readable output:
+     ```bash
+     uv run python protocol/validate_registry.py --json
+     ```
+   - Run the validator test suite:
+     ```bash
+     uv run pytest protocol/tests
      ```
    - Verify that:
      - No duplicate IDs exist.
      - No sequential gaps exist.
      - All required-tier primitives remain present.
+     - Metadata fields (`tier`, `category`, `value_type`, `kind`) are valid.
+     - `protocol/validate/conformance.py` remains in sync with `protocol/registry.yaml` (enforced by tests).
 
 5. **Update Code Generation & Specs**:
-   - Update protocol documentation in `spec/` and downstream code generators in subsequent development tasks.
+   - Update normative prose in `spec/` when behavior changes.
+   - Do not duplicate symbol tables into `spec/registries.md`; link to `protocol/registry.yaml` instead.
+   - Update downstream code generators in subsequent development tasks.

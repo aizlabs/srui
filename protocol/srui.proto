@@ -2,4 +2,515 @@ syntax = "proto3";
 
 package srui.protocol;
 
-// Stub protocol definition. Detailed schema will be implemented in subsequent tasks.
+// =============================================================================
+// SRUI Protocol Buffers Wire Schema
+// Reference: SRUI Design Document v0.4 (§6.4, §6.5, §7.2–7.7, §8, §13, §15, §16, §18)
+// Registry: protocol/registry.yaml (Namespace 0)
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Standard Registry Identifiers (Namespace 0)
+// Numeric IDs match protocol/registry.yaml exactly.
+// -----------------------------------------------------------------------------
+
+enum StandardNodeType {
+  NODE_TYPE_UNSPECIFIED = 0;
+  // Containers & Layout (§7.2)
+  NODE_TYPE_SURFACE = 1;
+  NODE_TYPE_DIALOG = 2;
+  NODE_TYPE_ROW = 3;
+  NODE_TYPE_COLUMN = 4;
+  NODE_TYPE_GRID = 5;
+  NODE_TYPE_SPACER = 6;
+  NODE_TYPE_SEPARATOR = 7;
+  NODE_TYPE_SCROLL = 8;
+  // Content & Basic Controls (§7.2, §7.3)
+  NODE_TYPE_TEXT = 9;
+  NODE_TYPE_RICHTEXT = 10;
+  NODE_TYPE_BUTTON = 11;
+  NODE_TYPE_TOGGLE = 12;
+  NODE_TYPE_TEXT_INPUT = 13;
+  NODE_TYPE_TEXT_AREA = 14;
+  NODE_TYPE_PROGRESS = 15;
+  NODE_TYPE_IMAGE = 16;
+  // Collections (§7.2, §7.3)
+  NODE_TYPE_LIST = 17;
+  NODE_TYPE_TABLE = 18;
+  NODE_TYPE_TREE = 19;
+  // Advanced Controls (§7.2, §7.3)
+  NODE_TYPE_SELECT = 20;
+  NODE_TYPE_CHOICE_GROUP = 21;
+  NODE_TYPE_SLIDER = 22;
+  NODE_TYPE_NUMBER_INPUT = 23;
+  NODE_TYPE_TABS = 24;
+  NODE_TYPE_SPLIT = 25;
+  // Shell / Command Strips (§7.2, §7.3)
+  NODE_TYPE_MENU = 26;
+  NODE_TYPE_TOOLBAR = 27;
+}
+
+enum StandardProperty {
+  PROPERTY_UNSPECIFIED = 0;
+  // Identity / Accessibility (§7.4)
+  PROPERTY_LABEL = 1;
+  PROPERTY_ACCESSIBLE_DESCRIPTION = 2;
+  PROPERTY_ROLE = 3;
+  PROPERTY_VALUE_DESCRIPTION = 4;
+  PROPERTY_ACTIONS = 5;
+  // Common State (§7.4)
+  PROPERTY_VISIBILITY = 6;
+  PROPERTY_ENABLED = 7;
+  PROPERTY_READ_ONLY = 8;
+  PROPERTY_BUSY = 9;
+  PROPERTY_SELECTED = 10;
+  PROPERTY_VALIDATION_STATE = 11;
+  // Content (§7.4)
+  PROPERTY_TEXT = 12;
+  PROPERTY_VALUE = 13;
+  PROPERTY_PLACEHOLDER = 14;
+  PROPERTY_RESOURCE = 15;
+  PROPERTY_ITEMS = 16;
+  PROPERTY_MODEL_REF = 17;
+  // Layout Intent (§7.4)
+  PROPERTY_HORIZONTAL_ALIGNMENT = 18;
+  PROPERTY_VERTICAL_ALIGNMENT = 19;
+  PROPERTY_GROW = 20;
+  PROPERTY_SHRINK = 21;
+  PROPERTY_MINIMUM_SIZE = 22;
+  PROPERTY_MAXIMUM_SIZE = 23;
+  PROPERTY_PREFERRED_SIZE = 24;
+  PROPERTY_SPACING_ROLE = 25;
+  PROPERTY_PADDING_ROLE = 26;
+  // Standard Control-Specific & Semantic Metadata (§7.2, §7.7, §8)
+  PROPERTY_PRESENTATION_HINT = 27;
+  PROPERTY_ACTION_KEY = 28;
+  PROPERTY_COLUMNS = 29;
+  PROPERTY_SELECTION_MODE = 30;
+}
+
+enum TextRole {
+  TEXT_ROLE_UNSPECIFIED = 0;
+  TEXT_ROLE_TITLE = 1;
+  TEXT_ROLE_HEADING = 2;
+  TEXT_ROLE_BODY = 3;
+  TEXT_ROLE_CAPTION = 4;
+  TEXT_ROLE_CODE = 5;
+  TEXT_ROLE_STATUS = 6;
+  TEXT_ROLE_WARNING = 7;
+  TEXT_ROLE_ERROR = 8;
+}
+
+enum ActionRole {
+  ACTION_ROLE_UNSPECIFIED = 0;
+  ACTION_ROLE_NORMAL = 1;
+  ACTION_ROLE_PRIMARY = 2;
+  ACTION_ROLE_DESTRUCTIVE = 3;
+  ACTION_ROLE_QUIET = 4;
+}
+
+enum InputRole {
+  INPUT_ROLE_UNSPECIFIED = 0;
+  INPUT_ROLE_PLAIN = 1;
+  INPUT_ROLE_SEARCH = 2;
+  INPUT_ROLE_SECURE = 3;
+  INPUT_ROLE_COMMAND = 4;
+}
+
+enum Importance {
+  IMPORTANCE_UNSPECIFIED = 0;
+  IMPORTANCE_NORMAL = 1;
+  IMPORTANCE_EMPHASIZED = 2;
+  IMPORTANCE_DE_EMPHASIZED = 3;
+}
+
+enum TogglePresentationHint {
+  TOGGLE_HINT_UNSPECIFIED = 0;
+  TOGGLE_HINT_AUTOMATIC = 1;
+  TOGGLE_HINT_CHECKBOX = 2;
+  TOGGLE_HINT_SWITCH = 3;
+}
+
+enum Visibility {
+  VISIBILITY_UNSPECIFIED = 0;
+  VISIBILITY_VISIBLE = 1;
+  VISIBILITY_HIDDEN = 2;
+  VISIBILITY_COLLAPSED = 3;
+}
+
+enum SpacingRole {
+  SPACING_UNSPECIFIED = 0;
+  SPACING_NONE = 1;
+  SPACING_TIGHT = 2;
+  SPACING_NORMAL = 3;
+  SPACING_RELAXED = 4;
+}
+
+enum PaddingRole {
+  PADDING_UNSPECIFIED = 0;
+  PADDING_NONE = 1;
+  PADDING_TIGHT = 2;
+  PADDING_NORMAL = 3;
+  PADDING_RELAXED = 4;
+}
+
+enum HorizontalAlignment {
+  HALIGN_UNSPECIFIED = 0;
+  HALIGN_LEADING = 1;
+  HALIGN_CENTER = 2;
+  HALIGN_TRAILING = 3;
+  HALIGN_FILL = 4;
+}
+
+enum VerticalAlignment {
+  VALIGN_UNSPECIFIED = 0;
+  VALIGN_TOP = 1;
+  VALIGN_CENTER = 2;
+  VALIGN_BOTTOM = 3;
+  VALIGN_FILL = 4;
+}
+
+enum SelectionMode {
+  SELECTION_MODE_UNSPECIFIED = 0;
+  SELECTION_MODE_NONE = 1;
+  SELECTION_MODE_SINGLE = 2;
+  SELECTION_MODE_MULTIPLE = 3;
+}
+
+enum ValidationState {
+  VALIDATION_UNSPECIFIED = 0;
+  VALIDATION_VALID = 1;
+  VALIDATION_WARNING = 2;
+  VALIDATION_ERROR = 3;
+}
+
+enum StandardEvent {
+  EVENT_UNSPECIFIED = 0;
+  // Semantic Events (§7.6)
+  EVENT_ACTIVATE = 1;
+  EVENT_VALUE_CHANGED = 2;
+  EVENT_SELECTION_CHANGED = 3;
+  EVENT_EXPANSION_CHANGED = 4;
+  EVENT_TEXT_EDIT = 5;
+  EVENT_VIEWPORT_CHANGED = 6;
+  // Coordinate / Pointer Events (§7.7)
+  EVENT_POINTER_DOWN = 7;
+  EVENT_POINTER_UP = 8;
+  EVENT_POINTER_MOVE = 9;
+  EVENT_POINTER_CANCEL = 10;
+  EVENT_POINTER_SCROLL = 11;
+}
+
+enum StandardOperation {
+  OPERATION_UNSPECIFIED = 0;
+  // Required Core Operations (§13)
+  OPERATION_CREATE_NODE = 1;
+  OPERATION_DELETE_NODE = 2;
+  OPERATION_SET_PROPERTY = 3;
+  OPERATION_CLEAR_PROPERTY = 4;
+  OPERATION_COMMIT = 5;
+  // Standard Model Operations (§13)
+  OPERATION_CREATE_MODEL = 6;
+  OPERATION_MODEL_INSERT = 7;
+  OPERATION_MODEL_DELETE = 8;
+  OPERATION_MODEL_UPDATE = 9;
+  OPERATION_MODEL_RESET_RANGE = 10;
+  // Optional Optimization Operations (§13)
+  OPERATION_MOVE_NODE = 11;
+  OPERATION_REORDER_CHILDREN = 12;
+  OPERATION_BATCH_PROPERTY_SET = 13;
+}
+
+// -----------------------------------------------------------------------------
+// Core Protocol References and Value System (§6.4, §6.5)
+// -----------------------------------------------------------------------------
+
+message TypeRef {
+  uint32 namespace_id = 1; // 0 = standard registry
+  uint32 local_id = 2;
+}
+
+message PropertyRef {
+  uint32 namespace_id = 1; // 0 = standard registry
+  uint32 local_id = 2;
+}
+
+enum NullValue {
+  NULL_VALUE = 0;
+}
+
+message EnumValue {
+  uint32 enum_id = 1;
+  uint32 value_id = 2;
+}
+
+message SizeVal {
+  double width = 1;
+  double height = 2;
+}
+
+message PointVal {
+  double x = 1;
+  double y = 2;
+}
+
+message RangeVal {
+  uint64 location = 1;
+  uint64 length = 2;
+}
+
+message RectVal {
+  double x = 1;
+  double y = 2;
+  double width = 3;
+  double height = 4;
+}
+
+message EdgeInsetsVal {
+  double top = 1;
+  double leading = 2;
+  double bottom = 3;
+  double trailing = 4;
+}
+
+message ValueList {
+  repeated Value values = 1;
+}
+
+message SmallRecord {
+  TypeRef type = 1;
+  repeated Property properties = 2;
+}
+
+message Value {
+  oneof value {
+    NullValue null_value = 1;
+    bool bool_value = 2;
+    sint64 int_value = 3;
+    uint64 uint_value = 4;
+    double float_value = 5;
+    string string_value = 6;
+    uint64 node_id_value = 7;
+    uint64 item_id_value = 8;
+    bytes resource_hash = 9; // 32-byte SHA-256 hash
+    EnumValue enum_value = 10;
+    SizeVal size_value = 11;
+    PointVal point_value = 12;
+    RangeVal range_value = 13;
+    RectVal rect_value = 14;
+    EdgeInsetsVal insets_value = 15;
+    ValueList list_value = 16;
+    SmallRecord record_value = 17;
+  }
+}
+
+message Property {
+  PropertyRef property = 1;
+  Value value = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Node and Tree Representation (§6.2, §16)
+// -----------------------------------------------------------------------------
+
+message NodeRecord {
+  uint64 node_id = 1;
+  TypeRef type = 2;
+  uint64 parent_id = 3;
+  uint32 child_index = 4;
+  repeated Property properties = 5;
+}
+
+// -----------------------------------------------------------------------------
+// Core Mutation Operations (§13)
+// -----------------------------------------------------------------------------
+
+message CreateNodeOp {
+  NodeRecord node = 1;
+}
+
+message DeleteNodeOp {
+  uint64 node_id = 1;
+}
+
+message SetPropertyOp {
+  uint64 node_id = 1;
+  PropertyRef property = 2;
+  Value value = 3;
+}
+
+message ClearPropertyOp {
+  uint64 node_id = 1;
+  PropertyRef property = 2;
+}
+
+message MoveNodeOp {
+  uint64 node_id = 1;
+  uint64 new_parent_id = 2;
+  uint32 new_child_index = 3;
+}
+
+message ReorderChildrenOp {
+  uint64 parent_id = 1;
+  repeated uint64 child_node_ids = 2;
+}
+
+message BatchPropertySetOp {
+  uint64 node_id = 1;
+  repeated Property properties = 2;
+}
+
+message ModelItem {
+  uint64 item_id = 1;
+  Value value = 2;
+  repeated Property properties = 3;
+}
+
+message CreateModelOp {
+  uint64 model_id = 1;
+  TypeRef model_type = 2;
+  uint64 item_count = 3;
+}
+
+message ModelInsertOp {
+  uint64 model_id = 1;
+  uint64 index = 2;
+  repeated ModelItem items = 3;
+}
+
+message ModelDeleteOp {
+  uint64 model_id = 1;
+  uint64 index = 2;
+  uint64 count = 3;
+  repeated uint64 item_ids = 4;
+}
+
+message ModelUpdateOp {
+  uint64 model_id = 1;
+  uint64 index = 2;
+  repeated ModelItem items = 3;
+}
+
+message ModelResetRangeOp {
+  uint64 model_id = 1;
+  uint64 start_index = 2;
+  repeated ModelItem items = 3;
+  uint64 total_count = 4;
+}
+
+message Operation {
+  oneof op {
+    CreateNodeOp create_node = 1;
+    DeleteNodeOp delete_node = 2;
+    SetPropertyOp set_property = 3;
+    ClearPropertyOp clear_property = 4;
+    MoveNodeOp move_node = 5;
+    ReorderChildrenOp reorder_children = 6;
+    BatchPropertySetOp batch_property_set = 7;
+    CreateModelOp create_model = 8;
+    ModelInsertOp model_insert = 9;
+    ModelDeleteOp model_delete = 10;
+    ModelUpdateOp model_update = 11;
+    ModelResetRangeOp model_reset_range = 12;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Transactions and Events (§12, §16, §18)
+// -----------------------------------------------------------------------------
+
+message Transaction {
+  uint64 base_revision = 1;
+  uint64 new_revision = 2;
+  repeated Operation operations = 3;
+  uint32 priority = 4;
+}
+
+message Event {
+  bytes client_instance_id = 1;
+  uint64 event_seq = 2;
+  bytes event_id = 3; // Globally unique within session lifetime (§18.2)
+  uint64 observed_revision = 4;
+  uint64 node_id = 5;
+  TypeRef event_type = 6;
+  repeated Property arguments = 7;
+}
+
+// -----------------------------------------------------------------------------
+// Handshake and Session Negotiation Messages (§15, §18)
+// -----------------------------------------------------------------------------
+
+message ClientLimits {
+  uint32 max_frame_size = 1;
+  uint32 max_transaction_operations = 2;
+  uint32 max_tree_depth = 3;
+  uint32 max_node_count = 4;
+  uint32 max_string_length = 5;
+  uint32 max_resource_size = 6;
+}
+
+message ServerLimits {
+  uint32 max_frame_size = 1;
+  uint32 max_transaction_operations = 2;
+  uint32 max_tree_depth = 3;
+  uint32 max_node_count = 4;
+  uint32 max_string_length = 5;
+  uint32 max_resource_size = 6;
+}
+
+message ExtensionNamespaceMapping {
+  string extension_uri = 1;
+  uint32 namespace_id = 2;
+}
+
+message ClientHello {
+  string core_version = 1;
+  repeated string profiles = 2;
+  ClientLimits limits = 3;
+  bytes client_instance_id = 4;
+  map<string, string> client_metadata = 5;
+}
+
+message ServerWelcome {
+  string core_version = 1;
+  repeated string required_profiles = 2;
+  repeated string optional_profiles = 3;
+  string session_id = 4;
+  uint64 initial_revision = 5;
+  repeated ExtensionNamespaceMapping extension_namespaces = 6;
+  ServerLimits limits = 7;
+}
+
+message ClientResume {
+  string session_id = 1;
+  bytes client_instance_id = 2;
+  uint64 last_applied_revision = 3;
+  uint64 last_acked_event_seq = 4;
+  map<uint64, uint64> terminal_stream_offsets = 5;
+}
+
+message ServerResumeOk {
+  string session_id = 1;
+  uint64 replay_from_revision = 2;
+}
+
+message ServerResyncRequired {
+  string session_id = 1;
+  uint64 snapshot_revision = 2;
+  string reason = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Top-Level Message Envelope
+// -----------------------------------------------------------------------------
+
+message SruiMessage {
+  oneof msg {
+    ClientHello client_hello = 1;
+    ServerWelcome server_welcome = 2;
+    ClientResume client_resume = 3;
+    ServerResumeOk server_resume_ok = 4;
+    ServerResyncRequired server_resync_required = 5;
+    Transaction transaction = 6;
+    Event event = 7;
+  }
+}

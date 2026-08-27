@@ -18,6 +18,9 @@ let package = Package(
         .library(name: "Resources", targets: ["Resources"]),
         .library(name: "Accessibility", targets: ["Accessibility"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.2"),
+    ],
     targets: [
         .target(
             name: "TransportSSH",
@@ -25,6 +28,9 @@ let package = Package(
         ),
         .target(
             name: "Protocol",
+            dependencies: [
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
             path: "Protocol"
         ),
         .target(

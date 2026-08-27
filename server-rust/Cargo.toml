@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "protocol",
     "ssh-bridge",
     "sessiond",
     "semantic-tree",

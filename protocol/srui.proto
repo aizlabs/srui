@@ -1,0 +1,5 @@
+syntax = "proto3";
+
+package srui.protocol;
+
+// Stub protocol definition. Detailed schema will be implemented in subsequent tasks.

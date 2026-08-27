@@ -1,0 +1,8 @@
+# SRUI Type and Property Registries
+# Standard namespace: 0
+# Extended namespaces: dynamically negotiated or registered
+version: "0.1.0"
+namespaces:
+  standard:
+    id: 0
+    name: "org.srui.standard"

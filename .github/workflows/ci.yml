@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  rust:
+    name: Rust Build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build server-rust
+        run: cargo build
+        working-directory: server-rust
+
+  swift:
+    name: Swift Build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build client-macos
+        run: swift build
+        working-directory: client-macos

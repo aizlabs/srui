@@ -1,0 +1,27 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Swift / SwiftPM / Xcode
+.build/
+.swiftpm/
+Packages/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# macOS / OS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*~

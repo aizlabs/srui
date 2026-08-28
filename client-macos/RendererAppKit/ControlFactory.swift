@@ -40,9 +40,14 @@ public final class ControlFactory {
 
         switch node.nodeType {
         case .surface:
-            let contentView = NSView(frame: .zero)
+            let contentView = NSStackView(frame: NSRect(x: 0, y: 0, width: 440, height: 320))
+            contentView.orientation = .vertical
+            contentView.alignment = .leading
+            contentView.distribution = .fill
+            contentView.spacing = 14
+            contentView.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 820, height: 720),
+                contentRect: NSRect(x: 0, y: 0, width: 440, height: 320),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false

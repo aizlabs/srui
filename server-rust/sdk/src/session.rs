@@ -344,11 +344,44 @@ impl Session {
     ///
     /// assert_eq!(session.current_revision().get(), 1);
     /// ```
+    /// # Deadlock / Reentrancy Notice
+    ///
+    /// The session lock is held for the duration of the transaction closure to guarantee atomic staging.
+    /// Transactions are therefore non-reentrant: calling `session.transaction` from within another
+    /// `session.transaction` closure on the same session will result in a deadlock.
+    /// Handlers registered via [`Session::on`] are executed outside the lock and can safely call `session.transaction`.
     pub fn transaction<T, F>(&self, f: F) -> Result<T, SdkError>
     where
         F: FnOnce(&mut UiTransaction) -> Result<T, StoreError>,
     {
-        self.transaction_custom(f)
+        let mut guard = self.inner.lock().map_err(|_| SdkError::LockPoisoned)?;
+        let base_revision = guard.store.revision();
+        let max_ops = guard.store.limits().max_transaction_operations;
+        let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut ui)));
+
+        match result {
+            Ok(Ok(val)) => {
+                let new_rev = base_revision.next();
+                guard.store.commit_staging(ui.into_staged(), new_rev);
+                Ok(val)
+            }
+            Ok(Err(store_err)) => {
+                // Staged mutations dropped; store remains untouched at base_revision
+                Err(SdkError::Store(store_err))
+            }
+            Err(panic_payload) => {
+                let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                Err(SdkError::Panicked(panic_msg))
+            }
+        }
     }
 
     /// Opens an atomic semantic transaction with a custom error type (§12.1, §29).

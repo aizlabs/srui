@@ -124,13 +124,26 @@ fn test_transaction_atomicity_and_rollback_on_err() {
         Button::builder(new_node).parent(root).label("Temp").create(ui)?;
         assert_eq!(ui.node_count(), 3); // visible in staging
 
-        // Deliberate error return
-        Err(StoreError::OperationError("simulated business rule rejection".into()))
+        // Deliberate StoreError return
+        Err(StoreError::OperationError("simulated store rejection".into()))
     });
 
     assert!(result.is_err());
     match result {
-        Err(SdkError::User(msg)) => assert!(msg.contains("simulated business rule rejection")),
+        Err(SdkError::Store(StoreError::OperationError(msg))) => {
+            assert!(msg.contains("simulated store rejection"))
+        }
+        other => panic!("expected SdkError::Store, got {:?}", other),
+    }
+
+    // Also test transaction_custom with custom error type
+    let custom_res: Result<(), SdkError> = session.transaction_custom(|ui| {
+        ui.set(text, TEXT, "Custom Fail").unwrap();
+        Err("custom user error string")
+    });
+    assert!(custom_res.is_err());
+    match custom_res {
+        Err(SdkError::User(msg)) => assert_eq!(msg, "custom user error string"),
         other => panic!("expected SdkError::User, got {:?}", other),
     }
 

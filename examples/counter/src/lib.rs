@@ -5,9 +5,6 @@
 //! - In-process event handling: clicking the button (via `ACTIVATE` event) triggers `session.transaction`,
 //!   updating the counter text and progress indicator atomically.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
 use srui_sdk::*;
 
 /// Minimal counter application built with the SRUI Server SDK (§29).
@@ -18,7 +15,6 @@ pub struct CounterApp {
     text_id: NodeId,
     progress_id: NodeId,
     button_id: NodeId,
-    counter: Arc<AtomicU64>,
 }
 
 impl CounterApp {
@@ -29,7 +25,6 @@ impl CounterApp {
         let text_id = NodeId::new(2);
         let progress_id = NodeId::new(3);
         let button_id = NodeId::new(4);
-        let counter = Arc::new(AtomicU64::new(0));
 
         // Initial UI construction within a single atomic transaction (§12.1, §29)
         session.transaction(|ui| {
@@ -59,13 +54,19 @@ impl CounterApp {
         })?;
 
         // Register ACTIVATE event handler on the button (§7.6, §29)
-        let counter_clone = Arc::clone(&counter);
         let text = text_id;
         let prog = progress_id;
 
         session.on(button_id, ACTIVATE, move |ctx, _event| {
-            let next_val = counter_clone.fetch_add(1, Ordering::SeqCst) + 1;
             ctx.transaction(|ui| {
+                let current: u64 = ui
+                    .get_node(text)
+                    .and_then(|n| n.get_property(TEXT))
+                    .and_then(|v| v.as_string())
+                    .and_then(|s| s.strip_prefix("Count: "))
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let next_val = current + 1;
                 ui.set(text, TEXT, format!("Count: {}", next_val))?;
                 ui.set(prog, VALUE, (next_val as f64) / 100.0)?;
                 ui.set(prog, VALUE_DESCRIPTION, format!("{} / 100", next_val))?;
@@ -80,7 +81,6 @@ impl CounterApp {
             text_id,
             progress_id,
             button_id,
-            counter,
         })
     }
 
@@ -109,9 +109,15 @@ impl CounterApp {
         self.button_id
     }
 
-    /// Returns the current numeric count value.
+    /// Returns the current numeric count value derived directly from authoritative store state (§6.3).
     pub fn get_count(&self) -> u64 {
-        self.counter.load(Ordering::SeqCst)
+        self.session.with_store(|store| {
+            Text::from_store(store, self.text_id)
+                .and_then(|t| t.text(store))
+                .and_then(|s| s.strip_prefix("Count: "))
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
     }
 
     /// Returns the current committed text string from the store.

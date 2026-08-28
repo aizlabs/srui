@@ -31,6 +31,7 @@ struct SessionControllerThreadingTests {
             outbox: outbox,
             renderer: renderer
         )
+        controller.attachRenderer(renderer)
 
         try await controller.start()
 
@@ -159,6 +160,7 @@ struct SessionControllerThreadingTests {
             outbox: outbox,
             renderer: renderer
         )
+        controller.attachRenderer(renderer)
 
         try await controller.start()
 

@@ -45,6 +45,7 @@ struct RendererDemoApp {
             outbox: outbox,
             renderer: renderer
         )
+        controller.attachRenderer(renderer)
 
         let delegate = LiveApplicationDelegate(controller: controller, renderer: renderer)
         application.delegate = delegate
@@ -81,8 +82,11 @@ private final class LiveApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        let semaphore = DispatchSemaphore(value: 0)
         Task {
             await controller.stop()
+            semaphore.signal()
         }
+        semaphore.wait()
     }
 }

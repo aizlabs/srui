@@ -285,4 +285,43 @@ public final class TransactionApplier: @unchecked Sendable {
             newRevision: record.newRevision
         )
     }
+
+    /// Replaces the entire local replica from a resync snapshot transaction (§20.2).
+    ///
+    /// Snapshot transactions carry `base_revision == 0` and reconstruct the full tree at
+    /// `new_revision`, regardless of the client's current revision.
+    public func applySnapshot(record: Transaction) -> Result<Revision, TxnError> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard record.baseRevision == .initial else {
+            return .failure(
+                .staleBaseRevision(expected: .initial, actual: record.baseRevision)
+            )
+        }
+
+        let maxOps = _store.limits.maxTransactionOperations
+        if record.operations.count > maxOps {
+            return .failure(.maxOperationsExceeded(limit: maxOps, actual: record.operations.count))
+        }
+
+        var staged = SemanticStore(limits: _store.limits, revision: .initial)
+        for (idx, op) in record.operations.enumerated() {
+            do {
+                try op.apply(to: &staged)
+            } catch let error as StoreError {
+                return .failure(.opFailed(opIndex: idx, source: error))
+            } catch {
+                return .failure(
+                    .opFailed(opIndex: idx, source: .operationError(error.localizedDescription))
+                )
+            }
+        }
+
+        var committed = SemanticStore(limits: _store.limits, revision: .initial)
+        committed.commitStaging(staged, newRevision: record.newRevision)
+        _store = committed
+        _lastAppliedRevision = record.newRevision
+        return .success(record.newRevision)
+    }
 }

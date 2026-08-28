@@ -26,7 +26,9 @@ public final class SessionController: @unchecked Sendable {
     private var receiveTask: Task<Void, Never>?
     private var isRunning = false
     private var hasMountedInitialTree = false
+    private var pendingResync = false
     private var currentSessionId: String?
+    private var actionHandlerWired = false
 
     public init(
         transport: any Transport,
@@ -42,12 +44,6 @@ public final class SessionController: @unchecked Sendable {
         self.decoder = decoder
         self.renderer = renderer
         self.currentSessionId = sessionId
-
-        if let renderer {
-            MainActor.assumeIsolated {
-                self.wireActionHandler(for: renderer)
-            }
-        }
     }
 
     private func withStateLock<T>(_ body: () -> T) -> T {
@@ -64,23 +60,32 @@ public final class SessionController: @unchecked Sendable {
 
     @MainActor
     private func wireActionHandler(for renderer: AppKitRenderer) {
+        guard !actionHandlerWired else { return }
+        actionHandlerWired = true
+
         renderer.onAction = { [weak self] nodeID, typeRef in
             guard let self else { return }
             if typeRef == .EVENT_ACTIVATE || typeRef == TypeRef.standard(1) {
-                let observedRev = self.applier.currentSnapshot.revision
                 Task {
                     do {
+                        let observedRev = self.applier.currentSnapshot.revision
                         try await self.outbox.sendActivate(
                             nodeId: nodeID,
                             observedRevision: observedRev,
                             via: self.transport
                         )
                     } catch {
-                        // Log or handle dispatch failure
+                        SessionDiagnostics.error("ACTIVATE dispatch failed: \(error)")
                     }
                 }
             }
         }
+    }
+
+    @MainActor
+    private func ensureActionHandlerWired() {
+        guard let renderer else { return }
+        wireActionHandler(for: renderer)
     }
 
     /// Starts the session by sending initial handshake and launching the background receive loop (§18, §22.2).
@@ -91,6 +96,10 @@ public final class SessionController: @unchecked Sendable {
             return true
         }
         guard shouldStart else { return }
+
+        await MainActor.run {
+            ensureActionHandlerWired()
+        }
 
         // 1. Send Handshake (§15, §18)
         let clientInstanceId = outbox.clientInstanceId
@@ -136,20 +145,21 @@ public final class SessionController: @unchecked Sendable {
                 do {
                     messages = try streamDecoder.appendAndExtract(incoming: chunk)
                 } catch {
+                    SessionDiagnostics.error("Frame decode failed: \(error)")
                     break
                 }
 
                 for msg in messages {
-                    try await handleIncomingMessage(msg)
+                    await handleIncomingMessage(msg)
                 }
             }
         } catch {
-            // Stream terminated
+            SessionDiagnostics.error("Transport receive stream ended: \(error)")
         }
     }
 
     /// Processes a single wire envelope, deserializing and applying transactions serially (§12.1, §22.2).
-    public func handleIncomingMessage(_ message: SRUIMessage) async throws {
+    public func handleIncomingMessage(_ message: SRUIMessage) async {
         guard let payload = message.msg else { return }
 
         switch payload {
@@ -163,39 +173,76 @@ public final class SessionController: @unchecked Sendable {
                 self.currentSessionId = welcome.sessionID
             }
 
-        case .transaction(let wireTx):
-            // 1. Off-main Protobuf validation and conversion (§16, §22.2)
-            let domainTx = try decoder.validateAndConvertTransaction(wire: wireTx)
+        case .serverResyncRequired(let resync):
+            withStateLock {
+                self.pendingResync = true
+            }
+            SessionDiagnostics.log("Server resync required at revision \(resync.snapshotRevision): \(resync.reason)")
 
-            // 2. Serialized store application and revision advancement (§12.1, §14)
-            let applyResult = applier.apply(record: domainTx)
+        case .transaction(let wireTx):
+            let domainTx: Transaction
+            do {
+                domainTx = try decoder.validateAndConvertTransaction(wire: wireTx)
+            } catch {
+                SessionDiagnostics.error("Transaction decode failed: \(error)")
+                return
+            }
+
+            let shouldApplySnapshot = withStateLock {
+                pendingResync
+                    || (domainTx.baseRevision == .initial && applier.lastAppliedRevision > .initial)
+            }
+
+            let applyResult: Result<Revision, TxnError>
+            if shouldApplySnapshot {
+                applyResult = applier.applySnapshot(record: domainTx)
+                withStateLock {
+                    self.pendingResync = false
+                }
+            } else {
+                applyResult = applier.apply(record: domainTx)
+            }
+
             switch applyResult {
             case .success:
                 let snapshot = applier.currentSnapshot
-
-                // 3. Dispatch to MainActor for AppKit view mutation (§22.2)
-                await MainActor.run {
-                    guard let renderer = self.renderer else { return }
-                    do {
-                        if !self.hasMountedInitialTree {
-                            self.hasMountedInitialTree = true
-                            try renderer.attach(store: snapshot.store)
-                            renderer.showWindows()
-                        } else {
-                            try renderer.apply(transaction: domainTx, newStore: snapshot.store)
-                        }
-                    } catch {
-                        // View apply error
-                    }
-                }
+                await updateRenderer(
+                    transaction: shouldApplySnapshot ? nil : domainTx,
+                    snapshot: snapshot,
+                    forceRemount: shouldApplySnapshot
+                )
 
             case .failure(let err):
-                // Transaction rejected without side-effects (§12.1)
-                throw err
+                SessionDiagnostics.error("Transaction rejected (no side effects): \(err)")
             }
 
         default:
             break
+        }
+    }
+
+    /// Dispatches committed store state to AppKit on the main actor (§22.2).
+    private func updateRenderer(
+        transaction: Transaction?,
+        snapshot: TransactionSnapshot,
+        forceRemount: Bool
+    ) async {
+        await MainActor.run {
+            guard let renderer = self.renderer else { return }
+            do {
+                if forceRemount || !self.hasMountedInitialTree {
+                    try renderer.attach(store: snapshot.store)
+                    renderer.showWindows()
+                    self.hasMountedInitialTree = true
+                } else if let transaction {
+                    try renderer.apply(transaction: transaction, newStore: snapshot.store)
+                }
+            } catch {
+                SessionDiagnostics.error("Renderer update failed: \(error)")
+                if forceRemount || !self.hasMountedInitialTree {
+                    self.hasMountedInitialTree = false
+                }
+            }
         }
     }
 

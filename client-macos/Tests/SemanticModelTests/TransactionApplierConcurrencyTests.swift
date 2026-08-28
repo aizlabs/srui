@@ -21,6 +21,43 @@ struct TransactionApplierConcurrencyTests {
     }
 
     @Test
+    func applySnapshotReplacesStateRegardlessOfCurrentRevision() {
+        let applier = TransactionApplier()
+        _ = applier.apply(
+            baseRevision: .initial,
+            operations: [
+                .createNode(id: 1, nodeType: .surface),
+                .createNode(
+                    id: 2,
+                    nodeType: .text,
+                    parentID: 1,
+                    properties: [Property(property: .text, value: .string("Before"))]
+                ),
+            ]
+        )
+        #expect(applier.lastAppliedRevision == Revision(1))
+
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(5),
+            operations: [
+                .createNode(id: 1, nodeType: .surface),
+                .createNode(
+                    id: 2,
+                    nodeType: .text,
+                    parentID: 1,
+                    properties: [Property(property: .text, value: .string("After"))]
+                ),
+            ]
+        )
+
+        let result = applier.applySnapshot(record: snapshot)
+        #expect(result == .success(Revision(5)))
+        #expect(applier.lastAppliedRevision == Revision(5))
+        #expect(applier.store.node(for: 2)?.getProperty(.text) == .string("After"))
+    }
+
+    @Test
     func snapshotsStayConsistentDuringConcurrentReadsAndWrites() async throws {
         let applier = TransactionApplier()
         let initialResult = applier.apply(

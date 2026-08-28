@@ -31,6 +31,7 @@ struct CounterLiveIntegrationTests {
             outbox: outbox,
             renderer: renderer
         )
+        controller.attachRenderer(renderer)
 
         try await controller.start()
 

@@ -24,6 +24,7 @@ pub mod model;
 pub mod store;
 pub mod transaction;
 pub mod value;
+pub mod wire;
 
 pub use capability::{
     CapabilitySet, NegotiationError, ParseProfileError, Profile, ServerCapabilities,
@@ -60,5 +61,11 @@ pub use transaction::{Operation, Revision, Transaction, TxnError};
 pub use value::{
     EdgeInsets, EnumToken, Point, Property, Range, Rect, Size, SmallRecord, Value,
     ValueConversionError,
+};
+
+pub use wire::{
+    decode_event, decode_message, decode_node_record, decode_operation, decode_transaction,
+    decode_value, encode_event, encode_message, encode_node_record, encode_operation,
+    encode_transaction, encode_value, NodeRecord, WireError,
 };
 

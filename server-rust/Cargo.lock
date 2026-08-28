@@ -685,6 +685,7 @@ dependencies = [
 name = "srui-semantic-tree"
 version = "0.1.0"
 dependencies = [
+ "prost",
  "serde",
  "serde_json",
  "serde_yaml",

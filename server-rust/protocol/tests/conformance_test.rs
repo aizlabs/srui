@@ -17,6 +17,111 @@ fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+fn create_authored_node_record() -> NodeRecord {
+    NodeRecord {
+        node_id: 42,
+        r#type: Some(TypeRef {
+            namespace_id: STANDARD_NAMESPACE_ID,
+            local_id: StandardNodeType::NodeTypeButton as u32,
+        }),
+        parent_id: 1,
+        child_index: 0,
+        properties: vec![
+            Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyLabel as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::StringValue("Delete".to_string())),
+                }),
+            },
+            Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyRole as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::EnumValue(EnumValue {
+                        enum_id: StandardEnum::EnumActionRole as u32,
+                        value_id: ActionRole::Destructive as u32,
+                    })),
+                }),
+            },
+            Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyEnabled as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::BoolValue(true)),
+                }),
+            },
+        ],
+    }
+}
+
+fn create_authored_transaction() -> Transaction {
+    Transaction {
+        base_revision: 104,
+        new_revision: 105,
+        priority: 1,
+        operations: vec![
+            Operation {
+                op: Some(operation::Op::CreateNode(CreateNodeOp {
+                    node: Some(NodeRecord {
+                        node_id: 19,
+                        r#type: Some(TypeRef {
+                            namespace_id: STANDARD_NAMESPACE_ID,
+                            local_id: StandardNodeType::NodeTypeText as u32,
+                        }),
+                        parent_id: 2,
+                        child_index: 3,
+                        properties: vec![Property {
+                            property: Some(PropertyRef {
+                                namespace_id: STANDARD_NAMESPACE_ID,
+                                local_id: StandardProperty::PropertyText as u32,
+                            }),
+                            value: Some(Value {
+                                value: Some(value::Value::StringValue("27 tests passed".to_string())),
+                            }),
+                        }],
+                    }),
+                })),
+            },
+            Operation {
+                op: Some(operation::Op::SetProperty(SetPropertyOp {
+                    node_id: 4,
+                    property: Some(PropertyRef {
+                        namespace_id: STANDARD_NAMESPACE_ID,
+                        local_id: StandardProperty::PropertyValue as u32,
+                    }),
+                    value: Some(Value {
+                        value: Some(value::Value::FloatValue(0.71)),
+                    }),
+                })),
+            },
+            Operation {
+                op: Some(operation::Op::BatchPropertySet(BatchPropertySetOp {
+                    node_id: 19,
+                    properties: vec![Property {
+                        property: Some(PropertyRef {
+                            namespace_id: STANDARD_NAMESPACE_ID,
+                            local_id: StandardProperty::PropertyMinimumSize as u32,
+                        }),
+                        value: Some(Value {
+                            value: Some(value::Value::SizeValue(SizeVal {
+                                width: 120.0,
+                                height: 24.0,
+                            })),
+                        }),
+                    }],
+                })),
+            },
+        ],
+    }
+}
+
 #[test]
 fn test_decode_golden_node_record_against_expected_json() {
     let (vectors_dir, spec) = load_expected_spec();
@@ -192,49 +297,7 @@ fn test_direct_encode_golden_node_record_matches_wire_bytes() {
     let expected_hex = node_spec["hex"].as_str().unwrap();
     let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
 
-    // Construct NodeRecord directly from scratch in Rust
-    let authored_node = NodeRecord {
-        node_id: 42,
-        r#type: Some(TypeRef {
-            namespace_id: STANDARD_NAMESPACE_ID,
-            local_id: StandardNodeType::NodeTypeButton as u32,
-        }),
-        parent_id: 1,
-        child_index: 0,
-        properties: vec![
-            Property {
-                property: Some(PropertyRef {
-                    namespace_id: STANDARD_NAMESPACE_ID,
-                    local_id: StandardProperty::PropertyLabel as u32,
-                }),
-                value: Some(Value {
-                    value: Some(value::Value::StringValue("Delete".to_string())),
-                }),
-            },
-            Property {
-                property: Some(PropertyRef {
-                    namespace_id: STANDARD_NAMESPACE_ID,
-                    local_id: StandardProperty::PropertyRole as u32,
-                }),
-                value: Some(Value {
-                    value: Some(value::Value::EnumValue(EnumValue {
-                        enum_id: StandardEnum::EnumActionRole as u32,
-                        value_id: ActionRole::Destructive as u32,
-                    })),
-                }),
-            },
-            Property {
-                property: Some(PropertyRef {
-                    namespace_id: STANDARD_NAMESPACE_ID,
-                    local_id: StandardProperty::PropertyEnabled as u32,
-                }),
-                value: Some(Value {
-                    value: Some(value::Value::BoolValue(true)),
-                }),
-            },
-        ],
-    };
-
+    let authored_node = create_authored_node_record();
     let mut encoded = Vec::new();
     authored_node.encode(&mut encoded).unwrap();
 
@@ -250,69 +313,35 @@ fn test_direct_encode_golden_transaction_matches_wire_bytes() {
     let expected_hex = tx_spec["hex"].as_str().unwrap();
     let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
 
-    // Construct Transaction directly from scratch in Rust
-    let authored_tx = Transaction {
-        base_revision: 104,
-        new_revision: 105,
-        priority: 1,
-        operations: vec![
-            Operation {
-                op: Some(operation::Op::CreateNode(CreateNodeOp {
-                    node: Some(NodeRecord {
-                        node_id: 19,
-                        r#type: Some(TypeRef {
-                            namespace_id: STANDARD_NAMESPACE_ID,
-                            local_id: StandardNodeType::NodeTypeText as u32,
-                        }),
-                        parent_id: 2,
-                        child_index: 3,
-                        properties: vec![Property {
-                            property: Some(PropertyRef {
-                                namespace_id: STANDARD_NAMESPACE_ID,
-                                local_id: StandardProperty::PropertyText as u32,
-                            }),
-                            value: Some(Value {
-                                value: Some(value::Value::StringValue("27 tests passed".to_string())),
-                            }),
-                        }],
-                    }),
-                })),
-            },
-            Operation {
-                op: Some(operation::Op::SetProperty(SetPropertyOp {
-                    node_id: 4,
-                    property: Some(PropertyRef {
-                        namespace_id: STANDARD_NAMESPACE_ID,
-                        local_id: StandardProperty::PropertyValue as u32,
-                    }),
-                    value: Some(Value {
-                        value: Some(value::Value::FloatValue(0.71)),
-                    }),
-                })),
-            },
-            Operation {
-                op: Some(operation::Op::BatchPropertySet(BatchPropertySetOp {
-                    node_id: 19,
-                    properties: vec![Property {
-                        property: Some(PropertyRef {
-                            namespace_id: STANDARD_NAMESPACE_ID,
-                            local_id: StandardProperty::PropertyMinimumSize as u32,
-                        }),
-                        value: Some(Value {
-                            value: Some(value::Value::SizeValue(SizeVal {
-                                width: 120.0,
-                                height: 24.0,
-                            })),
-                        }),
-                    }],
-                })),
-            },
-        ],
-    };
-
+    let authored_tx = create_authored_transaction();
     let mut encoded = Vec::new();
     authored_tx.encode(&mut encoded).unwrap();
 
     assert_eq!(to_hex(&encoded), expected_hex);
     assert_eq!(encoded, fixture_bytes);
+}
+
+#[test]
+fn test_cross_language_rust_vs_swift_byte_equality() {
+    let (vectors_dir, _) = load_expected_spec();
+
+    // 1. Rust-encoded NodeRecord must match golden fixture bit-for-bit
+    let rust_node = create_authored_node_record();
+    let mut rust_node_bytes = Vec::new();
+    rust_node.encode(&mut rust_node_bytes).unwrap();
+    let golden_node_bytes = fs::read(vectors_dir.join("golden_node_record.bin")).unwrap();
+    assert_eq!(
+        rust_node_bytes, golden_node_bytes,
+        "Rust-encoded NodeRecord does not match golden bytes"
+    );
+
+    // 2. Rust-encoded Transaction must match golden fixture bit-for-bit
+    let rust_tx = create_authored_transaction();
+    let mut rust_tx_bytes = Vec::new();
+    rust_tx.encode(&mut rust_tx_bytes).unwrap();
+    let golden_tx_bytes = fs::read(vectors_dir.join("golden_transaction.bin")).unwrap();
+    assert_eq!(
+        rust_tx_bytes, golden_tx_bytes,
+        "Rust-encoded Transaction does not match golden bytes"
+    );
 }

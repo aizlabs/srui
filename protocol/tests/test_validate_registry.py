@@ -80,6 +80,12 @@ def test_proto_registry_ids_match() -> None:
     assert result.ok, result.errors
 
 
+def test_proto_matches_conformance_python_constants() -> None:
+    from validate.proto_registry import validate_proto_conformance_py_sync
+    result = validate_proto_conformance_py_sync()
+    assert result.ok, result.errors
+
+
 def test_missing_control_specific_property_fails() -> None:
     registry = load_registry(REGISTRY_PATH)
     registry["properties"] = [

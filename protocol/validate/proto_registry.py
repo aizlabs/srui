@@ -1,10 +1,18 @@
-"""Cross-check protocol/srui.proto enum numeric IDs against protocol/registry.yaml."""
+"""Cross-check protocol/srui.proto enum numeric IDs against protocol/registry.yaml and Python conformance oracle."""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from validate.conformance import (
+    ALL_SECTION_7_2_NODE_TYPES,
+    REQUIRED_ENUM_VALUES,
+    REQUIRED_EVENTS,
+    REQUIRED_OPERATIONS,
+    REQUIRED_STANDARD_PROPERTIES,
+)
 
 PROTO_PATH = Path(__file__).resolve().parent.parent / "srui.proto"
 SWIFT_PB_PATH = Path(__file__).resolve().parent.parent.parent / "client-macos" / "Protocol" / "srui.pb.swift"
@@ -142,6 +150,9 @@ def _enum_specific_prefix(enum_type_name: str) -> str:
         "TogglePresentationHint": "TOGGLE_HINT_",
         "HorizontalAlignment": "HALIGN_",
         "VerticalAlignment": "VALIGN_",
+        "SpacingRole": "SPACING_",
+        "PaddingRole": "PADDING_",
+        "ValidationState": "VALIDATION_",
     }
     return mapping.get(enum_type_name, _camel_to_snake_upper(enum_type_name) + "_")
 
@@ -161,6 +172,78 @@ def _parse_operation_oneof_fields(proto_text: str) -> dict[str, int]:
     return fields
 
 
+def validate_proto_conformance_py_sync(proto_path: Path = PROTO_PATH) -> ProtoRegistrySyncResult:
+    """Assert direct parity between protocol/srui.proto and validate/conformance.py oracle sets."""
+    errors: list[str] = []
+
+    if not proto_path.exists():
+        return ProtoRegistrySyncResult(errors=[f"Proto file not found: {proto_path}"])
+
+    proto_text = proto_path.read_text(encoding="utf-8")
+    proto_enums = _parse_proto_enums(proto_text)
+
+    # 1. Node types
+    node_proto = proto_enums.get("StandardNodeType", {})
+    proto_node_names = {
+        _proto_node_type_suffix(k) for k in node_proto if _proto_node_type_suffix(k) is not None
+    }
+    # Match case-insensitively
+    proto_norm = {_normalize_symbol(n or "") for n in proto_node_names}
+    conformance_norm = {_normalize_symbol(n) for n in ALL_SECTION_7_2_NODE_TYPES}
+    missing_nodes = conformance_norm - proto_norm
+    if missing_nodes:
+        errors.append(f"[proto↔conformance.py] StandardNodeType missing nodes: {sorted(missing_nodes)}")
+
+    # 2. Properties
+    prop_proto = proto_enums.get("StandardProperty", {})
+    proto_props = {_proto_property_to_registry(k) for k in prop_proto if _proto_property_to_registry(k) is not None}
+    missing_props = REQUIRED_STANDARD_PROPERTIES - proto_props
+    if missing_props:
+        errors.append(f"[proto↔conformance.py] StandardProperty missing properties: {sorted(missing_props)}")
+
+    # 3. Events
+    event_proto = proto_enums.get("StandardEvent", {})
+    proto_events = {_proto_event_to_registry(k) for k in event_proto if _proto_event_to_registry(k) is not None}
+    missing_events = REQUIRED_EVENTS - proto_events
+    if missing_events:
+        errors.append(f"[proto↔conformance.py] StandardEvent missing events: {sorted(missing_events)}")
+
+    # 4. Operations
+    op_proto = proto_enums.get("StandardOperation", {})
+    proto_ops = {_proto_operation_to_registry(k) for k in op_proto if _proto_operation_to_registry(k) is not None}
+    missing_ops = REQUIRED_OPERATIONS - proto_ops
+    if missing_ops:
+        errors.append(f"[proto↔conformance.py] StandardOperation missing operations: {sorted(missing_ops)}")
+
+    # 5. Enums & Enum Values
+    std_enum_proto = proto_enums.get("StandardEnum", {})
+    proto_std_enums = {
+        _proto_standard_enum_to_registry(k) for k in std_enum_proto if _proto_standard_enum_to_registry(k) is not None
+    }
+    expected_enum_names = {_normalize_symbol(k) for k in REQUIRED_ENUM_VALUES.keys()}
+    missing_enums = expected_enum_names - proto_std_enums
+    if missing_enums:
+        errors.append(f"[proto↔conformance.py] StandardEnum missing enum types: {sorted(missing_enums)}")
+
+    for enum_name, expected_values in REQUIRED_ENUM_VALUES.items():
+        proto_enum = proto_enums.get(enum_name)
+        if proto_enum is None:
+            errors.append(f"[proto↔conformance.py] Missing enum {enum_name} in proto")
+            continue
+        proto_val_names = {
+            _proto_enum_value_to_registry(enum_name, k)
+            for k in proto_enum
+            if _proto_enum_value_to_registry(enum_name, k) is not None
+        }
+        missing_vals = expected_values - proto_val_names
+        if missing_vals:
+            errors.append(
+                f"[proto↔conformance.py] Enum {enum_name} missing values: {sorted(missing_vals)}"
+            )
+
+    return ProtoRegistrySyncResult(errors=errors)
+
+
 def validate_proto_registry_sync(
     registry: dict,
     proto_path: Path = PROTO_PATH,
@@ -170,6 +253,10 @@ def validate_proto_registry_sync(
 
     if not proto_path.exists():
         return ProtoRegistrySyncResult(errors=[f"Proto file not found: {proto_path}"])
+
+    # First verify proto against Python conformance oracle sets
+    py_sync = validate_proto_conformance_py_sync(proto_path)
+    errors.extend(py_sync.errors)
 
     proto_text = proto_path.read_text(encoding="utf-8")
     proto_enums = _parse_proto_enums(proto_text)
@@ -283,7 +370,6 @@ def validate_proto_registry_sync(
         if enum_id is None:
             errors.append(f"[proto↔registry] enums.{enum_name} missing 'id' in registry.yaml")
             continue
-        # Check in StandardEnum
         norm_name = _normalize_symbol(enum_name)
         proto_enum_key = next(
             (k for k in standard_enum_proto if _proto_standard_enum_to_registry(k) == norm_name),

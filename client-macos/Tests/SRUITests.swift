@@ -470,4 +470,29 @@ final class SRUITests: XCTestCase {
         XCTAssertEqual(decoded.transaction.newRevision, 105)
         XCTAssertEqual(decoded.transaction.operations.count, 3)
     }
+
+    func testMaxFrameSizeLimitEnforced() throws {
+        var msg = Srui_Protocol_SruiMessage()
+        msg.transaction = createAuthoredTransaction()
+
+        // Encoding exceeding frame size should throw
+        XCTAssertThrowsError(try SRUIFraming.encodeFramed(msg, maxFrameSize: 2)) { error in
+            guard case SRUIFramingError.frameSizeLimitExceeded(let limit, let actual) = error else {
+                XCTFail("Expected frameSizeLimitExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 2)
+            XCTAssertGreaterThan(actual, 2)
+        }
+
+        // Decoding exceeding frame size should throw
+        let validFramed = try SRUIFraming.encodeFramed(msg)
+        XCTAssertThrowsError(try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: validFramed, maxFrameSize: 2)) { error in
+            guard case SRUIFramingError.frameSizeLimitExceeded(let limit, _) = error else {
+                XCTFail("Expected frameSizeLimitExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 2)
+        }
+    }
 }

@@ -43,7 +43,9 @@ PROPERTY_ENUM_REFERENCES = {
 
 def _derive_oracle_from_registry(registry_path: Path = REGISTRY_PATH) -> dict[str, Any]:
     if not registry_path.exists():
-        return {}
+        raise FileNotFoundError(
+            f"Canonical SRUI registry.yaml not found at expected path: {registry_path}"
+        )
     reg = load_registry(registry_path)
 
     node_types = reg.get("node_types", [])

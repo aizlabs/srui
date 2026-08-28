@@ -200,3 +200,115 @@ fn test_disabled_button_dispatch_is_rejected_without_executing_handlers() {
     assert_eq!(app.get_count(), 0);
     assert_eq!(app.get_text(), Some("Count: 0".to_string()));
 }
+
+#[test]
+fn test_live_counter_app_dispatch_with_wire_encoding_and_store_replay() {
+    // 1. Initialize live CounterApp (produces Revision 1 initial UI)
+    let app = CounterApp::new().expect("failed to initialize CounterApp");
+    assert_eq!(app.current_revision(), 1);
+
+    let mut fresh_store = SemanticStore::new();
+
+    // Replay initial state from live CounterApp session store via wire serialization
+    let initial_txn = Transaction::new(
+        Revision::INITIAL,
+        vec![
+            Operation::create_node(
+                app.surface_id(),
+                TypeRef::SURFACE,
+                None,
+                None,
+                [(LABEL, Value::from("Counter Application"))],
+            ),
+            Operation::create_node(
+                app.text_id(),
+                TypeRef::TEXT,
+                Some(app.surface_id()),
+                None,
+                [
+                    (TEXT, Value::from("Count: 0")),
+                    (ROLE, Value::from(EnumToken::from(TextRole::Heading))),
+                ],
+            ),
+            Operation::create_node(
+                app.progress_id(),
+                TypeRef::PROGRESS,
+                Some(app.surface_id()),
+                None,
+                [
+                    (VALUE, Value::from(0.0f64)),
+                    (VALUE_DESCRIPTION, Value::from("0 / 100")),
+                ],
+            ),
+            Operation::create_node(
+                app.button_id(),
+                TypeRef::BUTTON,
+                Some(app.surface_id()),
+                None,
+                [
+                    (LABEL, Value::from("Increment")),
+                    (ROLE, Value::from(EnumToken::from(ActionRole::Primary))),
+                ],
+            ),
+        ],
+    );
+
+    // Wire encode & decode initial transaction
+    let initial_wire_bytes = encode_transaction(&initial_txn);
+    let decoded_initial_txn = decode_transaction(&initial_wire_bytes).expect("decode initial txn");
+    fresh_store
+        .apply_transaction_record(&decoded_initial_txn)
+        .expect("replay initial txn to fresh store");
+
+    // Verify initial fresh store matches live CounterApp session store
+    assert_eq!(fresh_store.revision(), app.session().current_revision());
+    assert_eq!(fresh_store.node_count(), app.session().node_count());
+
+    // 2. Dispatch 5 clicks through the live CounterApp session
+    // For each click, serialize the Event over wire bytes before dispatching to CounterApp!
+    for seq in 1..=5 {
+        let rev = app.session().current_revision();
+        let original_event = Event::activate(seq, format!("click-{}", seq), rev, app.button_id());
+
+        // Event wire encode & decode roundtrip
+        let event_wire_bytes = encode_event(&original_event);
+        let decoded_event = decode_event(&event_wire_bytes).expect("decode event bytes");
+        assert_eq!(decoded_event, original_event);
+
+        // Dispatch decoded event to the live CounterApp session
+        let handled = app.session().dispatch(decoded_event).expect("dispatch decoded event");
+        assert_eq!(handled, 1);
+
+        // Live CounterApp updated its store atomically (§12.1)
+        assert_eq!(app.current_revision(), seq + 1);
+        assert_eq!(app.get_count(), seq);
+
+        // Capture the matching transaction, serialize to wire bytes, and replay against fresh store
+        let click_txn = Transaction::new(
+            Revision::new(seq),
+            vec![
+                Operation::set_property(app.text_id(), TEXT, format!("Count: {}", seq)),
+                Operation::set_property(app.progress_id(), VALUE, (seq as f64) / 100.0),
+                Operation::set_property(app.progress_id(), VALUE_DESCRIPTION, format!("{} / 100", seq)),
+            ],
+        );
+
+        let txn_wire_bytes = encode_transaction(&click_txn);
+        let decoded_txn = decode_transaction(&txn_wire_bytes).expect("decode click txn");
+        fresh_store
+            .apply_transaction_record(&decoded_txn)
+            .expect("replay click txn to fresh store");
+
+        // Verify fresh store exactly matches live CounterApp session store at this revision
+        assert_eq!(fresh_store.revision(), app.session().current_revision());
+        assert_eq!(fresh_store.node_count(), app.session().node_count());
+        assert_eq!(
+            fresh_store.get_node(app.text_id()).unwrap().get_property(TEXT),
+            app.session().get_node(app.text_id()).unwrap().get_property(TEXT)
+        );
+        assert_eq!(
+            fresh_store.get_node(app.progress_id()).unwrap().get_property(VALUE),
+            app.session().get_node(app.progress_id()).unwrap().get_property(VALUE)
+        );
+    }
+}

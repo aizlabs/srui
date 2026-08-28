@@ -54,9 +54,11 @@ public final class RenderRegistry {
         guard handles[rootID] != nil else { return [] }
 
         var pending = [rootID]
+        var visited: Set<NodeId> = []
         var orderedIDs: [NodeId] = []
         while let nodeID = pending.popLast() {
-            guard let handle = handles[nodeID] else { continue }
+            // Child metadata is not guaranteed acyclic, so visited tracking bounds the walk.
+            guard let handle = handles[nodeID], visited.insert(nodeID).inserted else { continue }
             orderedIDs.append(nodeID)
             pending.append(contentsOf: handle.childIDs)
         }

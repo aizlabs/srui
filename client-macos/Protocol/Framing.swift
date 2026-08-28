@@ -9,6 +9,8 @@ public enum SRUIFramingError: Error, Equatable, Sendable, CustomStringConvertibl
     case frameSizeLimitExceeded(limit: Int, actual: Int)
     case malformedVarint
     case truncatedPayload(expected: Int, actual: Int)
+    /// The varint length prefix itself is incomplete, so the frame length is not yet known.
+    case incompleteLengthPrefix(buffered: Int)
 
     public var description: String {
         switch self {
@@ -18,7 +20,34 @@ public enum SRUIFramingError: Error, Equatable, Sendable, CustomStringConvertibl
             return "Malformed varint length prefix in wire frame"
         case .truncatedPayload(let expected, let actual):
             return "Truncated frame payload: expected \(expected) bytes, got \(actual) bytes"
+        case .incompleteLengthPrefix(let buffered):
+            return "Incomplete varint length prefix in wire frame: only \(buffered) bytes available"
         }
+    }
+}
+
+/// Failure raised by `SRUIMessageStreamDecoder`, carrying every frame decoded before the failure.
+///
+/// Frames that decoded successfully earlier in the same transport chunk are reported here rather
+/// than discarded, so a caller that keeps the connection alive never loses well-formed messages.
+public struct SRUIStreamDecodeError: Error, CustomStringConvertible {
+    /// Messages fully decoded before the failing frame, in wire order.
+    public let decodedMessages: [SRUIMessage]
+    /// The framing or protobuf error that stopped decoding.
+    public let underlying: any Error
+
+    public init(decodedMessages: [SRUIMessage], underlying: any Error) {
+        self.decodedMessages = decodedMessages
+        self.underlying = underlying
+    }
+
+    /// The underlying failure when it is a framing error (§16, §26).
+    public var framingError: SRUIFramingError? {
+        underlying as? SRUIFramingError
+    }
+
+    public var description: String {
+        "Stream decode failed after \(decodedMessages.count) complete frame(s): \(underlying)"
     }
 }
 
@@ -132,11 +161,8 @@ public enum SRUIFraming {
         )
 
         guard case .complete(let length, let payloadStart) = prefix else {
-            let expected = data.count == Int.max ? Int.max : data.count + 1
-            throw SRUIFramingError.truncatedPayload(
-                expected: expected,
-                actual: data.count
-            )
+            // The declared frame length is still unknown, so no `expected` size can be reported.
+            throw SRUIFramingError.incompleteLengthPrefix(buffered: data.count)
         }
 
         let payloadLength = try checkedFrameLength(
@@ -184,8 +210,8 @@ public struct SRUIMessageStreamDecoder: Sendable {
     public mutating func appendAndExtract(incoming: Data) throws -> [SRUIMessage] {
         buffer.append(incoming)
 
+        var messages: [SRUIMessage] = []
         do {
-            var messages: [SRUIMessage] = []
             var frameStart = buffer.startIndex
 
             while frameStart < buffer.endIndex {
@@ -228,7 +254,9 @@ public struct SRUIMessageStreamDecoder: Sendable {
             return messages
         } catch {
             buffer.removeAll(keepingCapacity: false)
-            throw error
+            // Frames decoded earlier in this chunk are well-formed; report them with the failure
+            // instead of dropping them.
+            throw SRUIStreamDecodeError(decodedMessages: messages, underlying: error)
         }
     }
 

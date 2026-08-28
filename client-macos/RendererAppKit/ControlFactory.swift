@@ -22,6 +22,9 @@ public final class ControlFactory {
                 backing: .buffered,
                 defer: false
             )
+            // RenderHandle keeps a strong reference and LayoutRenderer.tearDown() closes the
+            // window on remount; AppKit's default would then release it a second time.
+            window.isReleasedWhenClosed = false
             window.contentView = contentView
             window.center()
             result = (contentView, window, nil)
@@ -124,6 +127,21 @@ public final class ControlFactory {
             scrollView.hasVerticalScroller = true
             scrollView.hasHorizontalScroller = false
             scrollView.drawsBackground = false
+            // An NSScrollView holds exactly one documentView, so children are attached to an
+            // implicit stack; otherwise every child but the last would be evicted silently.
+            let documentStack = NSStackView()
+            documentStack.orientation = .vertical
+            documentStack.alignment = .leading
+            documentStack.distribution = .fill
+            documentStack.spacing = 8
+            documentStack.translatesAutoresizingMaskIntoConstraints = false
+            scrollView.documentView = documentStack
+            NSLayoutConstraint.activate([
+                documentStack.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+                documentStack.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+                documentStack.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+                documentStack.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            ])
             result = (scrollView, nil, nil)
 
         case .list, .table:
@@ -152,8 +170,17 @@ public final class ControlFactory {
         return handle
     }
 
+    /// Property entries of `node` in the order they are applied to a handle.
+    ///
+    /// `Node.properties` is a dictionary, so its iteration order varies between processes.
+    /// Properties that write the same AppKit state (`text`/`value`, `selected`/`value`) would
+    /// otherwise resolve nondeterministically; ascending `PropertyRef` order fixes the outcome.
+    public static func orderedPropertyEntries(of node: Node) -> [(PropertyRef, Value)] {
+        node.propertyEntries.sorted { $0.0 < $1.0 }
+    }
+
     public func apply(node: Node, to handle: RenderHandle) {
-        for (property, value) in node.propertyEntries {
+        for (property, value) in Self.orderedPropertyEntries(of: node) {
             apply(property: property, value: value, to: handle)
         }
     }
@@ -186,8 +213,11 @@ public final class ControlFactory {
             handle.accessibilityMetadata.actions = value?.asList?.compactMap { $0.asString } ?? []
 
         case .visibility:
+            // §7.4: `hidden` is invisible but retains layout space; only `collapsed` is
+            // removed from layout calculation.
             let token = value?.asEnumToken
-            handle.view.isHidden = token == .visibilityHidden || token == .visibilityCollapsed
+            handle.view.isHidden = token == .visibilityCollapsed
+            handle.view.alphaValue = token == .visibilityHidden ? 0 : 1
 
         case .enabled:
             (handle.view as? NSControl)?.isEnabled = value?.asBool ?? true
@@ -225,9 +255,16 @@ public final class ControlFactory {
             (handle.view as? NSTextField)?.placeholderString = value?.asString
 
         case .resource:
-            if let imageView = handle.view as? NSImageView, value == nil {
+            // lc-debt: no client resource cache exists yet (§14; the Resources target is a stub),
+            // so an arriving hash is recorded and the placeholder retained rather than resolved;
+            // resolve `pendingResourceHash` through the cache once it lands.
+            handle.pendingResourceHash = value?.asResourceHash
+            if let imageView = handle.view as? NSImageView {
                 imageView.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "Image")
             }
+            RendererDiagnostics.log(
+                "resource node=\(handle.nodeID) hash=\(handle.pendingResourceHash?.description ?? "none") unresolved (§14)"
+            )
 
         case .items:
             updateCollection(value, in: handle)
@@ -400,8 +437,12 @@ public final class ControlFactory {
     }
 
     private func applyRole(_ token: EnumToken?, to handle: RenderHandle) {
-        if let textRole = token.flatMap(StandardTextRole.init(enumToken:)) {
-            let style: (font: NSFont, color: NSColor) = switch textRole {
+        let textRole = token.flatMap(StandardTextRole.init(enumToken:))
+        let actionRole = token.flatMap(StandardActionRole.init(enumToken:))
+
+        // A cleared role must restore defaults, otherwise the previous role's styling sticks.
+        if textRole != nil || token == nil {
+            let style: (font: NSFont, color: NSColor) = switch textRole ?? .body {
             case .title:
                 (NSFont.systemFont(ofSize: 24, weight: .bold), .labelColor)
             case .heading:
@@ -425,11 +466,11 @@ public final class ControlFactory {
             textView(in: handle)?.textColor = style.color
         }
 
-        guard let actionRole = token.flatMap(StandardActionRole.init(enumToken:)),
+        guard actionRole != nil || token == nil,
               let button = handle.view as? NSButton else {
             return
         }
-        switch actionRole {
+        switch actionRole ?? .normal {
         case .normal:
             button.bezelStyle = .rounded
             button.contentTintColor = nil

@@ -35,6 +35,25 @@ struct RenderRegistryTests {
     }
 
     @Test
+    func removeSubtreeTerminatesOnCyclicChildMetadata() throws {
+        let registry = RenderRegistry()
+        let factory = ControlFactory()
+        let first = try factory.makeHandle(
+            for: Node(id: 1, nodeType: .column, orderedChildren: [2])
+        )
+        let second = try factory.makeHandle(
+            for: Node(id: 2, nodeType: .column, parentID: 1, orderedChildren: [1])
+        )
+        try registry.register(first)
+        try registry.register(second)
+
+        let removed = registry.removeSubtree(rootID: 1)
+
+        #expect(removed.count == 2)
+        #expect(registry.isEmpty)
+    }
+
+    @Test
     func removesRegisteredSubtree() throws {
         let registry = RenderRegistry()
         let factory = ControlFactory()

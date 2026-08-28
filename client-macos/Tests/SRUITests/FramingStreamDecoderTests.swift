@@ -66,8 +66,10 @@ final class FramingStreamDecoderTests: XCTestCase {
         XCTAssertThrowsError(
             try decoder.appendAndExtract(incoming: Data([0x80, 0x01]))
         ) { error in
+            let streamError = error as? SRUIStreamDecodeError
+            XCTAssertEqual(streamError?.decodedMessages, [])
             XCTAssertEqual(
-                error as? SRUIFramingError,
+                streamError?.framingError,
                 .frameSizeLimitExceeded(limit: 127, actual: 128)
             )
         }
@@ -82,10 +84,9 @@ final class FramingStreamDecoderTests: XCTestCase {
                 incoming: Data(repeating: 0x80, count: 10)
             )
         ) { error in
-            XCTAssertEqual(
-                error as? SRUIFramingError,
-                .malformedVarint
-            )
+            let streamError = error as? SRUIStreamDecodeError
+            XCTAssertEqual(streamError?.decodedMessages, [])
+            XCTAssertEqual(streamError?.framingError, .malformedVarint)
         }
         XCTAssertEqual(decoder.bufferedByteCount, 0)
 
@@ -123,6 +124,36 @@ final class FramingStreamDecoderTests: XCTestCase {
             }
             XCTAssertGreaterThan(expected, actual)
         }
+    }
+
+    func testIncompleteLengthPrefixIsDistinguishedFromTruncatedPayload() {
+        XCTAssertThrowsError(
+            try SRUIFraming.decodeFramed(SRUIMessage.self, from: Data([0x80]))
+        ) { error in
+            XCTAssertEqual(
+                error as? SRUIFramingError,
+                .incompleteLengthPrefix(buffered: 1)
+            )
+        }
+    }
+
+    func testDecodedPrefixIsReportedWhenALaterFrameFails() throws {
+        let first = makeClientHello(version: "0.4-first", instanceByte: 1)
+
+        var incoming = try SRUIFraming.encodeFramed(first)
+        // Frame two declares one payload byte that is not valid protobuf.
+        incoming.append(Data([0x01, 0x08]))
+
+        var decoder = SRUIMessageStreamDecoder()
+        XCTAssertThrowsError(
+            try decoder.appendAndExtract(incoming: incoming)
+        ) { error in
+            guard let streamError = error as? SRUIStreamDecodeError else {
+                return XCTFail("Expected SRUIStreamDecodeError, got \(error)")
+            }
+            XCTAssertEqual(streamError.decodedMessages, [first])
+        }
+        XCTAssertEqual(decoder.bufferedByteCount, 0)
     }
 
     private func makeClientHello(

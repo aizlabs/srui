@@ -14,6 +14,9 @@ public final class LayoutRenderer {
     public let registry: RenderRegistry
     public let controlFactory: ControlFactory
 
+    /// Whether surfaces have been ordered on screen, so a remount can restore visibility.
+    private var surfacesShown = false
+
     public init(
         registry: RenderRegistry = RenderRegistry(),
         controlFactory: ControlFactory = ControlFactory()
@@ -29,6 +32,10 @@ public final class LayoutRenderer {
         tearDown()
         for rootID in store.rootIDs {
             try mount(nodeID: rootID, from: store)
+        }
+        // tearDown() closed the previous surfaces; a remount must not leave the UI invisible.
+        if surfacesShown {
+            showWindows()
         }
         RendererDiagnostics.log("mount complete handles=\(registry.count)")
     }
@@ -69,6 +76,7 @@ public final class LayoutRenderer {
     }
 
     public func showWindows() {
+        surfacesShown = true
         for handle in registry.surfaceHandles {
             handle.window?.makeKeyAndOrderFront(nil)
         }
@@ -108,15 +116,9 @@ public final class LayoutRenderer {
             return
         }
 
-        if parent.nodeType == .scroll, let scrollView = parent.view as? NSScrollView {
-            scrollView.documentView = child
-            child.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([
-                child.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-                child.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-                child.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-                child.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            ])
+        if parent.nodeType == .scroll,
+           let documentStack = (parent.view as? NSScrollView)?.documentView as? NSStackView {
+            documentStack.addArrangedSubview(child)
             return
         }
 

@@ -54,6 +54,8 @@ public final class RenderHandle {
     public internal(set) var layoutMetadata: RenderLayoutMetadata
     public internal(set) var accessibilityMetadata: RenderAccessibilityMetadata
     public internal(set) var modelAdapter: AnyObject?
+    /// Content hash of the resource most recently referenced by this node (§14).
+    public internal(set) var pendingResourceHash: ResourceHash?
 
     internal var propertyConstraints: [PropertyRef: [NSLayoutConstraint]] = [:]
 

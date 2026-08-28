@@ -221,4 +221,157 @@ final class SRUITests: XCTestCase {
         let roundtripData = try tx.serializedData()
         XCTAssertEqual(roundtripData, data, "Roundtrip re-encode mismatch")
     }
+
+    func testDirectEncodeGoldenNodeRecordMatchesWireBytes() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let nodeSpec = vectors["golden_node_record"] as? [String: Any],
+              let filename = nodeSpec["file"] as? String,
+              let expectedHex = nodeSpec["hex"] as? String else {
+            XCTFail("Malformed expected.json structure for golden_node_record")
+            return
+        }
+
+        let fixtureData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+
+        // Author NodeRecord directly from scratch in Swift
+        var authoredNode = SRUINodeRecord()
+        authoredNode.nodeID = 42
+        authoredNode.type = SRUITypeRef.with {
+            $0.namespaceID = standardNamespaceID
+            $0.localID = UInt32(Srui_Protocol_StandardNodeType.nodeTypeButton.rawValue)
+        }
+        authoredNode.parentID = 1
+        authoredNode.childIndex = 0
+
+        // Property 0: label = "Delete"
+        let p0 = SRUIProperty.with {
+            $0.property = SRUIPropertyRef.with {
+                $0.namespaceID = standardNamespaceID
+                $0.localID = UInt32(Srui_Protocol_StandardProperty.propertyLabel.rawValue)
+            }
+            $0.value = SRUIValue.with {
+                $0.stringValue = "Delete"
+            }
+        }
+
+        // Property 1: role = ActionRole.destructive
+        let p1 = SRUIProperty.with {
+            $0.property = SRUIPropertyRef.with {
+                $0.namespaceID = standardNamespaceID
+                $0.localID = UInt32(Srui_Protocol_StandardProperty.propertyRole.rawValue)
+            }
+            $0.value = SRUIValue.with {
+                $0.enumValue = Srui_Protocol_EnumValue.with {
+                    $0.enumID = UInt32(Srui_Protocol_StandardEnum.enumActionRole.rawValue)
+                    $0.valueID = UInt32(Srui_Protocol_ActionRole.destructive.rawValue)
+                }
+            }
+        }
+
+        // Property 2: enabled = true
+        let p2 = SRUIProperty.with {
+            $0.property = SRUIPropertyRef.with {
+                $0.namespaceID = standardNamespaceID
+                $0.localID = UInt32(Srui_Protocol_StandardProperty.propertyEnabled.rawValue)
+            }
+            $0.value = SRUIValue.with {
+                $0.boolValue = true
+            }
+        }
+
+        authoredNode.properties = [p0, p1, p2]
+
+        let encodedData = try authoredNode.serializedData()
+
+        XCTAssertEqual(hexString(from: encodedData), expectedHex, "Authored Swift NodeRecord hex mismatch")
+        XCTAssertEqual(encodedData, fixtureData, "Authored Swift NodeRecord byte mismatch against golden fixture")
+    }
+
+    func testDirectEncodeGoldenTransactionMatchesWireBytes() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let txSpec = vectors["golden_transaction"] as? [String: Any],
+              let filename = txSpec["file"] as? String,
+              let expectedHex = txSpec["hex"] as? String else {
+            XCTFail("Malformed expected.json structure for golden_transaction")
+            return
+        }
+
+        let fixtureData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+
+        // Author Transaction directly from scratch in Swift
+        var authoredTx = SRUITransaction()
+        authoredTx.baseRevision = 104
+        authoredTx.newRevision = 105
+        authoredTx.priority = 1
+
+        // Op 0: CREATE_NODE
+        let createOp = SRUIOperation.with {
+            $0.createNode = Srui_Protocol_CreateNodeOp.with {
+                $0.node = SRUINodeRecord.with {
+                    $0.nodeID = 19
+                    $0.type = SRUITypeRef.with {
+                        $0.namespaceID = standardNamespaceID
+                        $0.localID = UInt32(Srui_Protocol_StandardNodeType.nodeTypeText.rawValue)
+                    }
+                    $0.parentID = 2
+                    $0.childIndex = 3
+                    $0.properties = [
+                        SRUIProperty.with {
+                            $0.property = SRUIPropertyRef.with {
+                                $0.namespaceID = standardNamespaceID
+                                $0.localID = UInt32(Srui_Protocol_StandardProperty.propertyText.rawValue)
+                            }
+                            $0.value = SRUIValue.with {
+                                $0.stringValue = "27 tests passed"
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+
+        // Op 1: SET_PROPERTY
+        let setOp = SRUIOperation.with {
+            $0.setProperty = Srui_Protocol_SetPropertyOp.with {
+                $0.nodeID = 4
+                $0.property = SRUIPropertyRef.with {
+                    $0.namespaceID = standardNamespaceID
+                    $0.localID = UInt32(Srui_Protocol_StandardProperty.propertyValue.rawValue)
+                }
+                $0.value = SRUIValue.with {
+                    $0.floatValue = 0.71
+                }
+            }
+        }
+
+        // Op 2: BATCH_PROPERTY_SET
+        let batchOp = SRUIOperation.with {
+            $0.batchPropertySet = Srui_Protocol_BatchPropertySetOp.with {
+                $0.nodeID = 19
+                $0.properties = [
+                    SRUIProperty.with {
+                        $0.property = SRUIPropertyRef.with {
+                            $0.namespaceID = standardNamespaceID
+                            $0.localID = UInt32(Srui_Protocol_StandardProperty.propertyMinimumSize.rawValue)
+                        }
+                        $0.value = SRUIValue.with {
+                            $0.sizeValue = Srui_Protocol_SizeVal.with {
+                                $0.width = 120.0
+                                $0.height = 24.0
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+
+        authoredTx.operations = [createOp, setOp, batchOp]
+
+        let encodedData = try authoredTx.serializedData()
+
+        XCTAssertEqual(hexString(from: encodedData), expectedHex, "Authored Swift Transaction hex mismatch")
+        XCTAssertEqual(encodedData, fixtureData, "Authored Swift Transaction byte mismatch against golden fixture")
+    }
 }

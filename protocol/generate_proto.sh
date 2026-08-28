@@ -13,16 +13,22 @@ SWIFT_OUT="${REPO_ROOT}/client-macos/Protocol"
 echo "=== Generating SRUI Protocol Buffers ==="
 
 # 1. Locate protoc
+PROTOC_BIN=""
 if [[ -n "${PROTOC:-}" && -x "${PROTOC}" ]]; then
     PROTOC_BIN="${PROTOC}"
-elif command -v protoc >/dev/null 2>&1; then
+elif command -v protoc >/dev/null 2>&1 && protoc --version >/dev/null 2>&1; then
     PROTOC_BIN="$(command -v protoc)"
 else
-    # Find cargo-vendored protoc
-    CARGO_PROTOC=$(find "${HOME}/.cargo" -name "protoc" -perm +111 2>/dev/null | grep -E "macos.*protoc$" | head -n 1 || true)
-    if [[ -n "${CARGO_PROTOC}" && -x "${CARGO_PROTOC}" ]]; then
-        PROTOC_BIN="${CARGO_PROTOC}"
-    else
+    # Search cargo cache for a working protoc binary compatible with this host
+    CARGO_DIR="${CARGO_HOME:-${HOME}/.cargo}"
+    while IFS= read -r candidate; do
+        if [[ -x "${candidate}" ]] && "${candidate}" --version >/dev/null 2>&1; then
+            PROTOC_BIN="${candidate}"
+            break
+        fi
+    done < <(find "${CARGO_DIR}" "${REPO_ROOT}/server-rust/target" -name "protoc" -type f -perm +111 2>/dev/null || true)
+
+    if [[ -z "${PROTOC_BIN}" ]]; then
         echo "Error: protoc binary not found. Please install protobuf or build server-rust." >&2
         exit 1
     fi
@@ -30,20 +36,35 @@ fi
 echo "Using protoc: ${PROTOC_BIN} ($("${PROTOC_BIN}" --version))"
 
 # 2. Locate protoc-gen-swift
+PLUGIN_BIN=""
 if [[ -n "${PROTOC_GEN_SWIFT:-}" && -x "${PROTOC_GEN_SWIFT}" ]]; then
     PLUGIN_BIN="${PROTOC_GEN_SWIFT}"
 elif command -v protoc-gen-swift >/dev/null 2>&1; then
     PLUGIN_BIN="$(command -v protoc-gen-swift)"
 else
-    # Look in SwiftPM build checkouts
-    SWIFT_PLUGIN=$(find "${REPO_ROOT}/client-macos/.build" -name "protoc-gen-swift" -perm +111 -type f 2>/dev/null | grep -v "\.dSYM" | head -n 1 || true)
-    if [[ -n "${SWIFT_PLUGIN}" && -x "${SWIFT_PLUGIN}" ]]; then
-        PLUGIN_BIN="${SWIFT_PLUGIN}"
-    else
-        echo "Building protoc-gen-swift from client-macos dependencies..."
-        swift build --package-path "${REPO_ROOT}/client-macos/.build/checkouts/swift-protobuf" --product protoc-gen-swift -c release
-        ARCH="$(uname -m)"
-        PLUGIN_BIN="${REPO_ROOT}/client-macos/.build/checkouts/swift-protobuf/.build/${ARCH}-apple-macosx/release/protoc-gen-swift"
+    # Look for existing build of protoc-gen-swift in client-macos/.build
+    while IFS= read -r candidate; do
+        if [[ -x "${candidate}" && "${candidate}" != *".dSYM"* ]]; then
+            PLUGIN_BIN="${candidate}"
+            break
+        fi
+    done < <(find "${REPO_ROOT}/client-macos/.build" -name "protoc-gen-swift" -type f -perm +111 2>/dev/null || true)
+
+    if [[ -z "${PLUGIN_BIN}" ]]; then
+        CHECKOUT_DIR="${REPO_ROOT}/client-macos/.build/checkouts/swift-protobuf"
+        if [[ -d "${CHECKOUT_DIR}" ]]; then
+            echo "Building protoc-gen-swift from client-macos dependencies..."
+            swift build --package-path "${CHECKOUT_DIR}" --product protoc-gen-swift -c release
+            SWIFT_BIN_DIR="$(swift build --package-path "${CHECKOUT_DIR}" --product protoc-gen-swift -c release --show-bin-path 2>/dev/null || true)"
+            if [[ -n "${SWIFT_BIN_DIR}" && -x "${SWIFT_BIN_DIR}/protoc-gen-swift" ]]; then
+                PLUGIN_BIN="${SWIFT_BIN_DIR}/protoc-gen-swift"
+            fi
+        fi
+    fi
+
+    if [[ -z "${PLUGIN_BIN}" ]]; then
+        echo "Error: protoc-gen-swift plugin not found. Please run 'swift build' in client-macos first." >&2
+        exit 1
     fi
 fi
 echo "Using protoc-gen-swift: ${PLUGIN_BIN}"

@@ -1,75 +1,67 @@
 # SRUI Protocol Wire Schema
 
-Protobuf wire encoding for the SRUI semantic protocol (Design v0.4 §6.5, §13, §15, §16, §18).
+Protobuf wire encoding and code generation for the SRUI semantic protocol (Design Doc v0.4 §6.5, §13, §15, §16, §18).
 
-## Files
+---
 
-| File | Purpose |
+## Files & Layout
+
+| File / Directory | Purpose |
 |---|---|
-| `srui.proto` | Authoritative Protobuf schema |
-| `registry.yaml` | Canonical namespace-0 ID registry (Tasks 0–1) |
-| `generate_proto.sh` | Swift code generation script |
-| `conformance-vectors/` | Fixed binary golden fixtures for cross-language wire checks |
+| [`srui.proto`](srui.proto) | Authoritative Protobuf wire schema |
+| [`registry.yaml`](registry.yaml) | Canonical namespace-0 ID registry (monotonically assigned IDs) |
+| [`generate_proto.sh`](generate_proto.sh) | Portable cross-platform code generation script |
+| [`conformance-vectors/expected.json`](conformance-vectors/expected.json) | Canonical JSON specification for golden binary fixtures and expected field values |
+| [`conformance-vectors/*.bin`](conformance-vectors/) | Fixed binary golden fixtures for cross-language wire checks |
 
-## Code generation
+---
 
-### Rust (`prost` + `build.rs`)
+## Dual Codegen Architecture & Unified Developer Workflow
 
-Rust types are generated at compile time by `server-rust/protocol/build.rs` using
-[prost-build](https://github.com/tokio-rs/prost) with a vendored `protoc` binary
-(`protoc-bin-vendored`). Generated code lands in `target/` and is **not** committed.
+### What to run when `srui.proto` or `registry.yaml` changes:
 
-**Why prost + build.rs:** prost is the de-facto Protobuf crate in the Rust ecosystem,
-integrates cleanly with Cargo rebuild tracking (`rerun-if-changed`), and keeps generated
-code out of version control while guaranteeing every `cargo build` compiles against the
-current `srui.proto`.
+Run the single top-level generation and validation script:
 
 ```bash
-cd server-rust
-cargo build -p srui-protocol   # triggers codegen
-cargo test -p srui-protocol    # runs conformance tests
+# 1. Regenerate Swift code
+./protocol/generate_proto.sh
+
+# 2. Run full triple-oracle validation and test suite
+uv run python protocol/validate_registry.py
+cargo test --manifest-path server-rust/Cargo.toml
+swift test --package-path client-macos
 ```
 
-### Swift (committed script + checked-in output)
+### Why this dual strategy was chosen:
 
-Swift types live in `client-macos/Protocol/srui.pb.swift`, produced by
-`protocol/generate_proto.sh` with `protoc` and `protoc-gen-swift` (SwiftProtobuf).
+- **Rust (`prost` + `build.rs`)**:
+  Rust types are generated automatically at build time in `server-rust/protocol/build.rs` using `prost-build` with `protoc-bin-vendored`.
+  *Rationale*: Self-contained, zero external build dependencies, integrated with `cargo:rerun-if-changed`, keeps generated code out of git.
 
-**Why a script instead of a SwiftPM build plugin:** SwiftPM protobuf plugins add
-checkout/build complexity and require every developer CI machine to resolve
-`protoc-gen-swift` before `swift build` succeeds. Checking in the generated Swift
-file plus a small regen script keeps `swift build` self-contained (only the
-SwiftProtobuf runtime dependency) while still making regeneration explicit and
-reviewable when `srui.proto` changes.
+- **Swift (`SwiftProtobuf` + committed `srui.pb.swift`)**:
+  Swift types live in `client-macos/Protocol/srui.pb.swift` and are compiled via `SwiftProtobuf`.
+  *Rationale*: Keeps `swift build` and `swift test` self-contained without requiring host-level `protoc` or SwiftPM plugin sandboxing issues in diverse IDE and CI environments.
 
-```bash
-./protocol/generate_proto.sh          # regenerate srui.pb.swift
-cd client-macos && swift test        # runs conformance tests
-```
+- **CI Freshness Guard**:
+  CI automatically verifies that committed `srui.pb.swift` is fresh and in sync with `srui.proto` via `./protocol/generate_proto.sh && git diff --exit-code client-macos/Protocol/srui.pb.swift`.
 
-Regenerate Swift output whenever `srui.proto` changes and commit the diff alongside
-the proto edit.
+---
 
-## Golden conformance fixtures
+## Canonical Conformance Vectors (`expected.json`)
 
-`conformance-vectors/golden_node_record.bin` and `golden_transaction.bin` are
-**fixed, committed bytes** — tests decode them but never rewrite them.
+To prevent assertion drift across languages, [`protocol/conformance-vectors/expected.json`](conformance-vectors/expected.json) is the single source of truth for:
+- Binary file names, SHA-256 hashes, exact hex bytes, and byte lengths.
+- Expected decoded structure and field values.
 
-Fixtures encode:
+Tests in **Rust** (`server-rust/protocol/tests/conformance_test.rs`), **Swift** (`client-macos/Tests/SRUITests.swift`), and **Python** (`protocol/tests/test_validate_registry.py`) all read `expected.json` and assert:
+1. **Decode Conformance**: Decoded messages match `expected.json` field-for-field.
+2. **Encode Conformance**: Messages constructed from scratch in Rust and Swift serialize to bit-for-bit identical binary bytes matching `expected.json["hex"]`.
+3. **Roundtrip Re-encode**: Decoded messages re-encode to the exact golden fixture bytes.
 
-- **NodeRecord:** Button #42 (`label="Delete"`, `role=destructive`, `enabled=true`) — §7.1 example
-- **Transaction:** revision 104→105 with CREATE_NODE, SET_PROPERTY, and BATCH_PROPERTY_SET ops — §12.1 example
+---
 
-The one-shot authoring utility `server-rust/protocol/src/bin/generate_fixtures.rs`
-can reproduce these bytes for review when `SRUI_WRITE_FIXTURES=1` is set; CI and tests
-always read the committed files.
+## Standard Registry & Operation Wire Tags
 
-## COMMIT semantics
-
-Registry operation `COMMIT` (id 5) is a **logical** §13 operation for validation and
-future journal typing. On the wire, atomic commit is expressed by the `Transaction`
-envelope (`base_revision` → `new_revision`), not as an `Operation` oneof variant.
-
-Both Rust (`server-rust/protocol/tests/conformance_test.rs`) and Swift
-(`client-macos/Tests/SRUITests.swift`) decode the same bytes and assert identical
-field values — the first cross-language wire-format conformance check.
+- **Standard Enums**: `StandardEnum` type IDs $1 \ldots 12$ match `registry.yaml` enums $1 \ldots 12$. On the wire, `EnumValue` carries `(enum_id, value_id)`.
+- **Operations & Commit**: `Operation` oneof field tags $1 \ldots 13$ map 1:1 with numeric operation IDs in `StandardOperation` and `registry.yaml`, including `CommitOp commit = 5`.
+- **Transactions**: The `Transaction` envelope (`base_revision` → `new_revision`) defines atomic commit boundaries.

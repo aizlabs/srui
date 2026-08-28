@@ -183,3 +183,136 @@ fn test_decode_golden_transaction_against_expected_json() {
     tx.encode(&mut roundtrip).unwrap();
     assert_eq!(roundtrip, bytes, "Roundtrip re-encode mismatch");
 }
+
+#[test]
+fn test_direct_encode_golden_node_record_matches_wire_bytes() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let node_spec = &spec["vectors"]["golden_node_record"];
+    let filename = node_spec["file"].as_str().unwrap();
+    let expected_hex = node_spec["hex"].as_str().unwrap();
+    let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
+
+    // Construct NodeRecord directly from scratch in Rust
+    let authored_node = NodeRecord {
+        node_id: 42,
+        r#type: Some(TypeRef {
+            namespace_id: STANDARD_NAMESPACE_ID,
+            local_id: StandardNodeType::NodeTypeButton as u32,
+        }),
+        parent_id: 1,
+        child_index: 0,
+        properties: vec![
+            Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyLabel as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::StringValue("Delete".to_string())),
+                }),
+            },
+            Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyRole as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::EnumValue(EnumValue {
+                        enum_id: StandardEnum::EnumActionRole as u32,
+                        value_id: ActionRole::Destructive as u32,
+                    })),
+                }),
+            },
+            Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyEnabled as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::BoolValue(true)),
+                }),
+            },
+        ],
+    };
+
+    let mut encoded = Vec::new();
+    authored_node.encode(&mut encoded).unwrap();
+
+    assert_eq!(to_hex(&encoded), expected_hex);
+    assert_eq!(encoded, fixture_bytes);
+}
+
+#[test]
+fn test_direct_encode_golden_transaction_matches_wire_bytes() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let tx_spec = &spec["vectors"]["golden_transaction"];
+    let filename = tx_spec["file"].as_str().unwrap();
+    let expected_hex = tx_spec["hex"].as_str().unwrap();
+    let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
+
+    // Construct Transaction directly from scratch in Rust
+    let authored_tx = Transaction {
+        base_revision: 104,
+        new_revision: 105,
+        priority: 1,
+        operations: vec![
+            Operation {
+                op: Some(operation::Op::CreateNode(CreateNodeOp {
+                    node: Some(NodeRecord {
+                        node_id: 19,
+                        r#type: Some(TypeRef {
+                            namespace_id: STANDARD_NAMESPACE_ID,
+                            local_id: StandardNodeType::NodeTypeText as u32,
+                        }),
+                        parent_id: 2,
+                        child_index: 3,
+                        properties: vec![Property {
+                            property: Some(PropertyRef {
+                                namespace_id: STANDARD_NAMESPACE_ID,
+                                local_id: StandardProperty::PropertyText as u32,
+                            }),
+                            value: Some(Value {
+                                value: Some(value::Value::StringValue("27 tests passed".to_string())),
+                            }),
+                        }],
+                    }),
+                })),
+            },
+            Operation {
+                op: Some(operation::Op::SetProperty(SetPropertyOp {
+                    node_id: 4,
+                    property: Some(PropertyRef {
+                        namespace_id: STANDARD_NAMESPACE_ID,
+                        local_id: StandardProperty::PropertyValue as u32,
+                    }),
+                    value: Some(Value {
+                        value: Some(value::Value::FloatValue(0.71)),
+                    }),
+                })),
+            },
+            Operation {
+                op: Some(operation::Op::BatchPropertySet(BatchPropertySetOp {
+                    node_id: 19,
+                    properties: vec![Property {
+                        property: Some(PropertyRef {
+                            namespace_id: STANDARD_NAMESPACE_ID,
+                            local_id: StandardProperty::PropertyMinimumSize as u32,
+                        }),
+                        value: Some(Value {
+                            value: Some(value::Value::SizeValue(SizeVal {
+                                width: 120.0,
+                                height: 24.0,
+                            })),
+                        }),
+                    }],
+                })),
+            },
+        ],
+    };
+
+    let mut encoded = Vec::new();
+    authored_tx.encode(&mut encoded).unwrap();
+
+    assert_eq!(to_hex(&encoded), expected_hex);
+    assert_eq!(encoded, fixture_bytes);
+}

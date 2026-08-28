@@ -221,19 +221,20 @@ macro_rules! impl_string_prop {
         impl $widget {
             #[doc = concat!("Returns the `", stringify!($getter), "` property if set.")]
             #[inline]
+            #[allow(clippy::needless_lifetimes)]
             pub fn $getter<'a>(&self, store: &'a SemanticStore) -> Option<&'a str> {
                 store.get_node(self.id).and_then(|n| Self::$getter_of(n))
             }
 
             #[doc = concat!("Returns the `", stringify!($getter), "` property from a [`Node`].")]
             #[inline]
-            pub fn $getter_of<'a>(node: &'a Node) -> Option<&'a str> {
+            pub fn $getter_of(node: &Node) -> Option<&str> {
                 node.get_property($prop_ref).and_then(Value::as_string)
             }
 
             #[doc = concat!("Returns the `", stringify!($getter), "` property for node `id` from `store`.")]
             #[inline]
-            pub fn $get_getter<'a>(store: &'a SemanticStore, id: NodeId) -> Option<&'a str> {
+            pub fn $get_getter(store: &SemanticStore, id: NodeId) -> Option<&str> {
                 store.get_node(id).and_then(Self::$getter_of)
             }
 
@@ -651,19 +652,20 @@ macro_rules! impl_list_prop {
         impl $widget {
             #[doc = concat!("Returns the `", stringify!($getter), "` list property if set.")]
             #[inline]
+            #[allow(clippy::needless_lifetimes)]
             pub fn $getter<'a>(&self, store: &'a SemanticStore) -> Option<&'a [Value]> {
                 store.get_node(self.id).and_then(|n| Self::$getter_of(n))
             }
 
             #[doc = concat!("Returns the `", stringify!($getter), "` list property from a [`Node`].")]
             #[inline]
-            pub fn $getter_of<'a>(node: &'a Node) -> Option<&'a [Value]> {
+            pub fn $getter_of(node: &Node) -> Option<&[Value]> {
                 node.get_property($prop_ref).and_then(Value::as_list)
             }
 
             #[doc = concat!("Returns the `", stringify!($getter), "` list property for node `id` from `store`.")]
             #[inline]
-            pub fn $get_getter<'a>(store: &'a SemanticStore, id: NodeId) -> Option<&'a [Value]> {
+            pub fn $get_getter(store: &SemanticStore, id: NodeId) -> Option<&[Value]> {
                 store.get_node(id).and_then(Self::$getter_of)
             }
 
@@ -1112,7 +1114,7 @@ impl Image {
     #[doc = "Returns the content-addressed [`ResourceHash`] if set (§14)."]
     #[inline]
     pub fn resource(&self, store: &SemanticStore) -> Option<ResourceHash> {
-        store.get_node(self.id).and_then(|n| Self::resource_of(n))
+        store.get_node(self.id).and_then(Self::resource_of)
     }
 
     #[doc = "Returns the content-addressed [`ResourceHash`] from a [`Node`] (§14)."]

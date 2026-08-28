@@ -329,7 +329,7 @@ fn test_all_17_value_variants_wire_byte_roundtrip() {
         Value::Bool(true),
         Value::SignedInt(-9223372036854775807),
         Value::UnsignedInt(18446744073709551615),
-        Value::Float64(2.718281828459045),
+        Value::Float64(std::f64::consts::E),
         Value::String("SRUI Semantic UI Protocol v0.4".to_string()),
         Value::NodeId(NodeId::new(42)),
         Value::ItemId(ItemId::new(999)),

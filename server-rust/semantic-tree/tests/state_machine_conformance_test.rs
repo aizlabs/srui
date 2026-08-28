@@ -534,12 +534,14 @@ fn get_fixture_files() -> Vec<PathBuf> {
 // State Snapshot for Rollback Verification
 // ==============================================================================
 
+type NodeSnapshot = (TypeRef, Option<NodeId>, Vec<NodeId>, HashMap<PropertyRef, Value>);
+
 #[derive(Clone, Debug, PartialEq)]
 struct StoreSnapshot {
     revision: Revision,
     node_count: usize,
     roots: Vec<NodeId>,
-    nodes: BTreeMap<NodeId, (TypeRef, Option<NodeId>, Vec<NodeId>, HashMap<PropertyRef, Value>)>,
+    nodes: BTreeMap<NodeId, NodeSnapshot>,
     model_count: usize,
     models: BTreeMap<ModelId, (TypeRef, u64, usize)>,
 }
@@ -573,7 +575,7 @@ fn take_snapshot(store: &SemanticStore) -> StoreSnapshot {
 fn collect_nodes_snapshot(
     store: &SemanticStore,
     id: NodeId,
-    nodes: &mut BTreeMap<NodeId, (TypeRef, Option<NodeId>, Vec<NodeId>, HashMap<PropertyRef, Value>)>,
+    nodes: &mut BTreeMap<NodeId, NodeSnapshot>,
 ) {
     if let Some(n) = store.get_node(id) {
         nodes.insert(

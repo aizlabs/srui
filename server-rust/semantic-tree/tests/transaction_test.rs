@@ -140,8 +140,8 @@ fn test_transaction_with_invalid_last_op_aborts_with_zero_side_effects() {
     // Verify ZERO visible side effects and unadvanced revision (§12.1)
     assert_eq!(store.revision(), Revision::new(1));
     assert_eq!(store.node_count(), 1);
-    assert_eq!(store.contains_node(col_id), false);
-    assert_eq!(store.is_id_used(col_id), false); // NodeId(2) must not be consumed by aborted txn
+    assert!(!store.contains_node(col_id));
+    assert!(!store.is_id_used(col_id)); // NodeId(2) must not be consumed by aborted txn
     assert_eq!(store.children_of(root_id), Some(&[][..]));
 
     let root_node = store.get_node(root_id).unwrap();
@@ -165,7 +165,7 @@ fn test_transaction_with_invalid_last_op_aborts_with_zero_side_effects() {
     assert_eq!(new_rev, Revision::new(2));
     assert_eq!(store.revision(), Revision::new(2));
     assert_eq!(store.node_count(), 2);
-    assert_eq!(store.contains_node(col_id), true);
+    assert!(store.contains_node(col_id));
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn test_transaction_with_stale_or_wrong_base_revision_rejected() {
     // Store state and revision remain unchanged
     assert_eq!(store.revision(), Revision::new(1));
     assert_eq!(store.node_count(), 1);
-    assert_eq!(store.contains_node(NodeId::new(2)), false);
+    assert!(!store.contains_node(NodeId::new(2)));
 }
 
 #[test]
@@ -266,9 +266,9 @@ fn test_max_operations_limit_enforced_as_precheck() {
 
     // Pre-check prevents any execution: store is completely untouched
     assert_eq!(store.revision(), Revision::INITIAL);
-    assert_eq!(store.is_empty(), true);
-    assert_eq!(store.is_id_used(NodeId::new(1)), false);
-    assert_eq!(store.is_id_used(NodeId::new(2)), false);
+    assert!(store.is_empty());
+    assert!(!store.is_id_used(NodeId::new(1)));
+    assert!(!store.is_id_used(NodeId::new(2)));
 }
 
 #[test]
@@ -294,7 +294,7 @@ fn test_transaction_record_with_invalid_new_revision_rejected() {
     );
 
     assert_eq!(store.revision(), Revision::INITIAL);
-    assert_eq!(store.is_empty(), true);
+    assert!(store.is_empty());
 }
 
 #[test]
@@ -403,10 +403,10 @@ fn test_intermediate_failure_rolls_back_entire_transaction() {
     // Assert complete rollback
     assert_eq!(store.revision(), Revision::new(1));
     assert_eq!(store.node_count(), 3);
-    assert_eq!(store.contains_node(NodeId::new(4)), false);
-    assert_eq!(store.contains_node(NodeId::new(5)), false);
-    assert_eq!(store.is_id_used(NodeId::new(4)), false);
-    assert_eq!(store.is_id_used(NodeId::new(5)), false);
+    assert!(!store.contains_node(NodeId::new(4)));
+    assert!(!store.contains_node(NodeId::new(5)));
+    assert!(!store.is_id_used(NodeId::new(4)));
+    assert!(!store.is_id_used(NodeId::new(5)));
     assert_eq!(store.parent_of(NodeId::new(2)), Some(Some(NodeId::new(1))));
     assert_eq!(store.get_node(NodeId::new(1)).unwrap().get_property(PropertyRef::LABEL), None);
 }

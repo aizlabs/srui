@@ -318,9 +318,9 @@ fn test_delete_node_recursive_subtree_cleanup() {
 
     // Active nodes count is reduced
     assert_eq!(store.node_count(), 3);
-    assert_eq!(store.contains_node(c1), false);
-    assert_eq!(store.contains_node(gc1), false);
-    assert_eq!(store.contains_node(c2), true);
+    assert!(!store.contains_node(c1));
+    assert!(!store.contains_node(gc1));
+    assert!(store.contains_node(c2));
     assert_eq!(store.children_of(col_id), Some(&[c2][..]));
 }
 
@@ -343,8 +343,8 @@ fn test_node_id_cannot_be_reused_even_after_deletion() {
 
     // 2. Delete the node
     store.delete_node(item_id).expect("delete item");
-    assert_eq!(store.contains_node(item_id), false);
-    assert_eq!(store.is_id_used(item_id), true);
+    assert!(!store.contains_node(item_id));
+    assert!(store.is_id_used(item_id));
 
     // 3. Attempting to create a node with the deleted ID is STILL rejected (§6.2)
     let err = store
@@ -366,7 +366,7 @@ fn test_create_under_nonexistent_parent_rejected() {
     assert_eq!(err, StoreError::ParentNotFound(fake_parent));
     assert!(store.is_empty());
     // Since creation failed during validation, the id is not marked used
-    assert_eq!(store.is_id_used(child_id), false);
+    assert!(!store.is_id_used(child_id));
 }
 
 #[test]
@@ -402,8 +402,8 @@ fn test_max_tree_depth_enforced_and_store_unchanged() {
 
     // Store is left completely unchanged
     assert_eq!(store.node_count(), 3);
-    assert_eq!(store.contains_node(n4), false);
-    assert_eq!(store.is_id_used(n4), false);
+    assert!(!store.contains_node(n4));
+    assert!(!store.is_id_used(n4));
     assert_eq!(store.children_of(n3), Some(&[][..]));
 
     // Moving a subtree that would exceed max depth is also rejected
@@ -454,8 +454,8 @@ fn test_max_node_count_enforced_and_store_unchanged() {
 
     // Store is left completely unchanged
     assert_eq!(store.node_count(), 2);
-    assert_eq!(store.contains_node(n3), false);
-    assert_eq!(store.is_id_used(n3), false);
+    assert!(!store.contains_node(n3));
+    assert!(!store.is_id_used(n3));
     assert_eq!(store.children_of(n1), Some(&[n2][..]));
 }
 
@@ -514,8 +514,8 @@ fn test_max_string_length_enforced_and_store_unchanged() {
         .expect_err("oversized create string");
 
     assert!(matches!(err, StoreError::MaxStringLengthExceeded { .. }));
-    assert_eq!(store.contains_node(n2), false);
-    assert_eq!(store.is_id_used(n2), false);
+    assert!(!store.contains_node(n2));
+    assert!(!store.is_id_used(n2));
 }
 
 #[test]
@@ -580,8 +580,8 @@ fn test_apply_protobuf_wire_operations() {
         )),
     };
     store.apply_operation(&del_op).expect("apply del_op");
-    assert_eq!(store.is_empty(), true);
-    assert_eq!(store.is_id_used(NodeId::new(100)), true);
+    assert!(store.is_empty());
+    assert!(store.is_id_used(NodeId::new(100)));
 
     // 5. Create children with exact index vs append sentinel (u32::MAX)
     let root_op = srui_protocol::Operation {

@@ -11,18 +11,39 @@ import Protocol
 import TransportSSH
 
 /// Actor managing outbound semantic event generation, monotonic sequencing, and wire transmission (§7.7, §16, §18.2, §22).
+///
+/// Retry safety (§18.2): every application-side-effect event carries a stable `event_id`. When a
+/// connection dies before the acknowledgement arrives, the event is replayed **with its original
+/// `event_id`** so the server's dedupe cache recognizes it as a retry and returns the prior result
+/// instead of re-running the action. Minting a fresh id on retry would turn one "Delete" into two.
 public actor EventOutbox {
+    /// Upper bound on unacknowledged events retained for replay (§18.2 "bounded" cache, §26).
+    public static let defaultMaxPendingEvents = 256
+
     public nonisolated let clientInstanceId: ClientInstanceId
+    private let maxPendingEvents: Int
     private var currentEventSeq: UInt64 = 0
     private var pendingEvents: [EventId: Event] = [:]
+    /// Send order of `pendingEvents`, so replay preserves ordering and eviction drops the oldest.
+    private var pendingOrder: [EventId] = []
+    private var _lastAckedEventSeq: UInt64 = 0
 
-    public init(clientInstanceId: ClientInstanceId = ClientInstanceId(string: UUID().uuidString)) {
+    public init(
+        clientInstanceId: ClientInstanceId = ClientInstanceId(string: UUID().uuidString),
+        maxPendingEvents: Int = EventOutbox.defaultMaxPendingEvents
+    ) {
         self.clientInstanceId = clientInstanceId
+        self.maxPendingEvents = max(1, maxPendingEvents)
     }
 
     /// Returns the current monotonic event sequence number.
     public var eventSeq: UInt64 {
         currentEventSeq
+    }
+
+    /// Highest event sequence acknowledged by the server, reported in `CLIENT RESUME` (§18).
+    public var lastAckedEventSeq: UInt64 {
+        _lastAckedEventSeq
     }
 
     /// Allocates the next monotonic event sequence number (§7.7, §16).
@@ -67,7 +88,7 @@ public actor EventOutbox {
         msg.event = event.toWire()
         let framedBytes = try SRUIFraming.encodeFramed(msg)
         try await transport.send(data: framedBytes)
-        pendingEvents[event.eventId] = event
+        retainPending(event)
     }
 
     /// Constructs and sends an `ACTIVATE` event in one atomic operation.
@@ -78,13 +99,55 @@ public actor EventOutbox {
         return event
     }
 
-    /// Acknowledges event delivery by sequence number or event ID.
+    /// Replays every unacknowledged event, in original send order and with its original `event_id`,
+    /// after a transport was re-established (§18, §18.2).
+    ///
+    /// Re-delivery of the same `event_id` returns the prior acknowledgement/result on the server and
+    /// does not re-run the action, which is what makes an ambiguous disconnect retry-safe.
+    public func resendPendingEvents(via transport: any Transport) async {
+        let replay = pendingOrder.compactMap { pendingEvents[$0] }
+        for event in replay {
+            do {
+                var msg = SRUIMessage()
+                msg.event = event.toWire()
+                try await transport.send(data: try SRUIFraming.encodeFramed(msg))
+            } catch {
+                // Still unacknowledged: it stays pending for the next resume.
+                return
+            }
+        }
+    }
+
+    /// Acknowledges event delivery by event ID.
     public func acknowledgeEvent(id: EventId) {
-        pendingEvents.removeValue(forKey: id)
+        guard let event = pendingEvents.removeValue(forKey: id) else { return }
+        pendingOrder.removeAll { $0 == id }
+        _lastAckedEventSeq = max(_lastAckedEventSeq, event.eventSeq)
+    }
+
+    /// Acknowledges every event up to and including `seq` (§18: `last_acked_event_seq`).
+    public func acknowledgeEvents(throughSeq seq: UInt64) {
+        guard seq > _lastAckedEventSeq else { return }
+        _lastAckedEventSeq = seq
+        for (id, event) in pendingEvents where event.eventSeq <= seq {
+            pendingEvents.removeValue(forKey: id)
+        }
+        pendingOrder.removeAll { pendingEvents[$0] == nil }
     }
 
     /// Returns the count of pending unacknowledged events.
     public var pendingCount: Int {
         pendingEvents.count
+    }
+
+    /// Records a sent event for retry, evicting the oldest entries beyond the configured bound.
+    private func retainPending(_ event: Event) {
+        if pendingEvents.updateValue(event, forKey: event.eventId) == nil {
+            pendingOrder.append(event.eventId)
+        }
+        while pendingOrder.count > maxPendingEvents {
+            let evicted = pendingOrder.removeFirst()
+            pendingEvents.removeValue(forKey: evicted)
+        }
     }
 }

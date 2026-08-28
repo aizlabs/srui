@@ -10,7 +10,9 @@ import Foundation
 /// In-memory bidirectional stream transport actor for tests and local simulation.
 public actor PipeTransport: Transport {
     private var isClosed = false
-    private var peer: PipeTransport?
+    /// Weak so that `createPair` does not build a retain cycle between the two ends. The caller of
+    /// `createPair` holds both, which is what keeps them alive.
+    private weak var peer: PipeTransport?
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 

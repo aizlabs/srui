@@ -257,6 +257,16 @@ public final class TransactionApplier: @unchecked Sendable {
 
     /// Applies a structured `Transaction` record, validating its base and target revisions.
     public func apply(record: Transaction) -> Result<Revision, TxnError> {
+        applyCommitted(record: record).map(\.revision)
+    }
+
+    /// Applies a structured `Transaction` record and atomically returns the committed snapshot.
+    ///
+    /// Callers that must hand the renderer a store matching exactly the transaction they just
+    /// applied MUST use this instead of `apply(record:)` followed by a separate `currentSnapshot`
+    /// read: those are two distinct critical sections, and an interleaved commit between them
+    /// would pair a transaction with a store from a later revision (§22.2).
+    public func applyCommitted(record: Transaction) -> Result<TransactionSnapshot, TxnError> {
         lock.lock()
         defer { lock.unlock() }
 
@@ -283,20 +293,43 @@ public final class TransactionApplier: @unchecked Sendable {
         return applyStaged(
             operations: record.operations,
             newRevision: record.newRevision
-        )
+        ).map { _ in
+            TransactionSnapshot(store: _store, revision: _lastAppliedRevision)
+        }
     }
 
     /// Replaces the entire local replica from a resync snapshot transaction (§20.2).
     ///
     /// Snapshot transactions carry `base_revision == 0` and reconstruct the full tree at
     /// `new_revision`, regardless of the client's current revision.
+    ///
+    /// This bypasses the normal `base_revision` continuity check, so it MUST only be driven by an
+    /// explicit `SERVER RESYNC_REQUIRED` (§18). Inferring "this is a snapshot" from
+    /// `base_revision == 0` alone would let a stale or duplicated copy of the initial transaction
+    /// wipe a live replica.
     public func applySnapshot(record: Transaction) -> Result<Revision, TxnError> {
+        applyResyncSnapshot(record: record).map(\.revision)
+    }
+
+    /// Applies a resync snapshot and atomically returns the committed snapshot (§18, §20.2, §22.2).
+    public func applyResyncSnapshot(record: Transaction) -> Result<TransactionSnapshot, TxnError> {
         lock.lock()
         defer { lock.unlock() }
 
         guard record.baseRevision == .initial else {
             return .failure(
                 .staleBaseRevision(expected: .initial, actual: record.baseRevision)
+            )
+        }
+
+        // §12.1: committed revisions are monotonically increasing and never repeat downwards.
+        // A snapshot may re-state the revision we already hold, but must never regress it.
+        guard record.newRevision >= _lastAppliedRevision else {
+            return .failure(
+                .invalidNewRevision(
+                    expected: _lastAppliedRevision,
+                    actual: record.newRevision
+                )
             )
         }
 
@@ -322,6 +355,6 @@ public final class TransactionApplier: @unchecked Sendable {
         committed.commitStaging(staged, newRevision: record.newRevision)
         _store = committed
         _lastAppliedRevision = record.newRevision
-        return .success(record.newRevision)
+        return .success(TransactionSnapshot(store: _store, revision: _lastAppliedRevision))
     }
 }

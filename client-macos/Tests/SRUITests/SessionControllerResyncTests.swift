@@ -166,9 +166,15 @@ struct SessionControllerResyncTests {
         await serverTransport.close()
     }
 
-    @Test("Failed initial mount leaves hasMountedInitialTree false for retry")
+    // NOTE: this scenario never reaches the renderer at all — the store rejects `badTx` because of
+    // its dangling parent, so no mount is ever attempted. What it actually pins down is that a
+    // rejected transaction leaves no side effects and that a store-level rejection is treated as
+    // replica divergence rather than being silently skipped (§12.1, §4 inv. 13). Recovery of the
+    // mount flag after a genuine *renderer* failure is covered by
+    // `SessionRobustnessTests.rendererFailureForcesFullReattach`.
+    @Test("A rejected transaction leaves no side effects and ends the session")
     @MainActor
-    func failedMountAllowsRetryOnNextTransaction() async throws {
+    func rejectedTransactionLeavesNoSideEffects() async throws {
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
         let controller = SessionController(
@@ -197,6 +203,10 @@ struct SessionControllerResyncTests {
         #expect(applier.lastAppliedRevision == .initial)
         #expect(renderer.registry.count == 0)
 
+        // The server committed this revision even though we could not, so the replica is now behind
+        // and can only recover by resuming on a fresh transport (§18).
+        #expect(controller.isDiverged)
+
         let goodTx = Transaction(
             baseRevision: .initial,
             newRevision: Revision(1),
@@ -217,7 +227,8 @@ struct SessionControllerResyncTests {
             return msg
         }())
 
-        #expect(applier.lastAppliedRevision == Revision(1))
-        #expect(renderer.registry.count == 2)
+        // A diverged session must not keep applying the stream as though nothing happened.
+        #expect(applier.lastAppliedRevision == .initial)
+        #expect(renderer.registry.count == 0)
     }
 }

@@ -19,7 +19,8 @@ public actor TCPSocketTransport: Transport {
 
     private var socketFD: Int32 = -1
     private var isClosed = false
-    private var readTask: Task<Void, Never>?
+    private var readThread: Thread?
+    private var readLatch = SocketReadLatch()
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 
@@ -38,15 +39,26 @@ public actor TCPSocketTransport: Transport {
     }
 
     deinit {
+        readLatch.stop()
         let fd = socketFD
         if fd >= 0 {
             Darwin.shutdown(fd, SHUT_RDWR)
             Darwin.close(fd)
         }
+        // Otherwise a consumer still iterating `receiveStream()` would hang forever. Drop the
+        // termination handler first: it captures `self` weakly, and forming that reference while
+        // the actor is mid-deallocation traps.
+        continuation.onTermination = nil
+        continuation.finish()
     }
 
     /// Establishes the TCP socket connection to the server.
     public func connect() throws {
+        // A closed transport stays closed: its stream continuation is already finished, so silently
+        // reconnecting here would open a socket whose every inbound byte is discarded.
+        guard !isClosed else {
+            throw TransportError.closed
+        }
         guard socketFD == -1 else {
             return
         }
@@ -80,15 +92,17 @@ public actor TCPSocketTransport: Transport {
         }
 
         self.socketFD = fd
-        self.isClosed = false
         startReadingLoop()
     }
 
     public func send(data: Data) async throws {
+        guard !isClosed else {
+            throw TransportError.closed
+        }
         if socketFD == -1 {
             try connect()
         }
-        guard !isClosed, socketFD >= 0 else {
+        guard socketFD >= 0 else {
             throw TransportError.closed
         }
         let fd = socketFD
@@ -126,29 +140,34 @@ public actor TCPSocketTransport: Transport {
     }
 
     private func ensureConnected() throws {
+        guard !isClosed else {
+            throw TransportError.closed
+        }
         if socketFD == -1 {
             try connect()
         }
     }
 
+    /// Runs the blocking `read(2)` loop on a dedicated thread rather than a `Task.detached`, which
+    /// would park one of the cooperative pool's threads for the lifetime of the connection (§22.2).
     private func startReadingLoop() {
-        guard readTask == nil else { return }
+        guard readThread == nil else { return }
         let fd = self.socketFD
         let cont = self.continuation
+        let latch = self.readLatch
 
-        let task = Task.detached {
+        let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
 
-            while !Task.isCancelled {
+            while !latch.isStopped {
                 let bytesRead = Darwin.read(fd, &buffer, buffer.count)
 
                 if bytesRead > 0 {
-                    let chunk = Data(buffer[0..<bytesRead])
-                    cont.yield(chunk)
+                    cont.yield(Data(buffer[0..<bytesRead]))
                 } else if bytesRead == 0 {
                     // EOF
                     cont.finish()
-                    break
+                    return
                 } else {
                     let err = errno
                     if err == EINTR {
@@ -159,20 +178,25 @@ public actor TCPSocketTransport: Transport {
                     } else {
                         cont.finish(throwing: TransportError.ioError("TCP read failed: \(String(cString: strerror(err)))"))
                     }
-                    break
+                    return
                 }
             }
+            cont.finish()
         }
-
-        self.readTask = task
+        thread.name = "org.srui.TCPSocketTransport.read"
+        thread.stackSize = 512 * 1024
+        self.readThread = thread
+        thread.start()
     }
 
     public func close() async {
         guard !isClosed else { return }
         isClosed = true
 
-        readTask?.cancel()
-        readTask = nil
+        // Latch first, then shutdown to wake a blocked `read`, then release the descriptor. `send`
+        // and `close` are both actor-isolated, so no write can be in flight against this fd here.
+        readLatch.stop()
+        readThread = nil
         continuation.finish()
 
         if socketFD >= 0 {

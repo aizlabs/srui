@@ -1,12 +1,16 @@
-//! SRUI Semantic Tree: in-memory core types, identifiers, and value representations.
+//! SRUI Semantic Tree: in-memory core types, identifiers, value representations, and node store.
 //!
 //! Conforms to SRUI Specification v0.4:
 //! - §6.2: Node identity ([`NodeId`])
+//! - §6.3: State ownership ([`SemanticStore`])
 //! - §6.4: Type and property references, namespaces ([`TypeRef`], [`PropertyRef`], [`STANDARD_NAMESPACE_ID`])
 //! - §6.5: Typed value representation ([`Value`], semantic tuples, lists, small records)
+//! - §13: Core mutation operations ([`SemanticStore`])
 //! - §14: Resource model (large blobs are resources, not properties)
+//! - §26: Mandatory limits ([`StoreLimits`])
 
 pub mod ids;
+pub mod store;
 pub mod value;
 
 pub use ids::{
@@ -18,7 +22,13 @@ pub use ids::{
     STANDARD_NAMESPACE_ID, STANDARD_NODE_TYPES, STANDARD_OPERATIONS, STANDARD_PROPERTIES,
 };
 
+pub use store::{
+    Node, SemanticStore, StoreError, StoreLimits, DEFAULT_MAX_NODE_COUNT,
+    DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TREE_DEPTH,
+};
+
 pub use value::{
     EdgeInsets, EdgeInsetsVal, EnumToken, EnumValue, Point, PointVal, Property, Range, RangeVal,
     Rect, RectVal, Size, SizeVal, SmallRecord, Value, ValueConversionError,
 };
+

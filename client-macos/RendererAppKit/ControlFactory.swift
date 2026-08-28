@@ -5,13 +5,38 @@ public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
 }
 
+/// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
+@MainActor
+public final class ActionTrampoline: NSObject {
+    public let nodeID: NodeId
+    public let eventType: TypeRef
+    public let handler: @MainActor (NodeId, TypeRef) -> Void
+
+    public init(
+        nodeID: NodeId,
+        eventType: TypeRef = .EVENT_ACTIVATE,
+        handler: @escaping @MainActor (NodeId, TypeRef) -> Void
+    ) {
+        self.nodeID = nodeID
+        self.eventType = eventType
+        self.handler = handler
+    }
+
+    @objc public func performAction(_ sender: Any?) {
+        handler(nodeID, eventType)
+    }
+}
+
 /// Creates native controls for the required §7.3 tier and applies scalar properties in place.
 @MainActor
 public final class ControlFactory {
+    /// Semantic action callback invoked when a native interactive control is activated (§7.6, §7.7).
+    public var onAction: (@MainActor (NodeId, TypeRef) -> Void)?
+
     public init() {}
 
     public func makeHandle(for node: Node) throws -> RenderHandle {
-        let result: (view: NSView, window: NSWindow?, adapter: AnyObject?)
+        let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
 
         switch node.nodeType {
         case .surface:
@@ -27,7 +52,7 @@ public final class ControlFactory {
             window.isReleasedWhenClosed = false
             window.contentView = contentView
             window.center()
-            result = (contentView, window, nil)
+            result = (contentView, window, nil, nil)
 
         case .row:
             let stack = NSStackView()
@@ -35,7 +60,7 @@ public final class ControlFactory {
             stack.alignment = .centerY
             stack.distribution = .fill
             stack.spacing = 8
-            result = (stack, nil, nil)
+            result = (stack, nil, nil, nil)
 
         case .column:
             let stack = NSStackView()
@@ -43,30 +68,30 @@ public final class ControlFactory {
             stack.alignment = .leading
             stack.distribution = .fill
             stack.spacing = 8
-            result = (stack, nil, nil)
+            result = (stack, nil, nil, nil)
 
         case .grid:
             let grid = NSGridView(views: [[NSView]]())
             grid.rowSpacing = 8
             grid.columnSpacing = 8
-            result = (grid, nil, nil)
+            result = (grid, nil, nil, nil)
 
         case .spacer:
             let spacer = NSView(frame: .zero)
             spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
             spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
-            result = (spacer, nil, nil)
+            result = (spacer, nil, nil, nil)
 
         case .separator:
             let separator = NSBox(frame: .zero)
             separator.boxType = .separator
-            result = (separator, nil, nil)
+            result = (separator, nil, nil, nil)
 
         case .text:
             let label = NSTextField(labelWithString: "")
             label.maximumNumberOfLines = 0
             label.lineBreakMode = .byWordWrapping
-            result = (label, nil, nil)
+            result = (label, nil, nil, nil)
 
         case .richText:
             let textView = NSTextView(frame: .zero)
@@ -75,21 +100,26 @@ public final class ControlFactory {
             textView.drawsBackground = false
             textView.textContainerInset = NSSize(width: 0, height: 4)
             textView.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
-            result = (textView, nil, nil)
+            result = (textView, nil, nil, nil)
 
         case .button:
             let button = NSButton(title: "Button", target: nil, action: nil)
             button.bezelStyle = .rounded
-            result = (button, nil, nil)
+            let trampoline = ActionTrampoline(nodeID: node.id, eventType: .EVENT_ACTIVATE) { [weak self] nodeID, type in
+                self?.onAction?(nodeID, type)
+            }
+            button.target = trampoline
+            button.action = #selector(ActionTrampoline.performAction(_:))
+            result = (button, nil, nil, trampoline)
 
         case .toggle:
             let toggle = NSButton(checkboxWithTitle: "Toggle", target: nil, action: nil)
-            result = (toggle, nil, nil)
+            result = (toggle, nil, nil, nil)
 
         case .textInput:
             let field = NSTextField(frame: .zero)
             field.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
-            result = (field, nil, nil)
+            result = (field, nil, nil, nil)
 
         case .textArea:
             let scrollView = NSScrollView(frame: .zero)
@@ -103,7 +133,7 @@ public final class ControlFactory {
             scrollView.documentView = textView
             scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 88).isActive = true
-            result = (scrollView, nil, nil)
+            result = (scrollView, nil, nil, nil)
 
         case .progress:
             let progress = NSProgressIndicator(frame: .zero)
@@ -112,7 +142,7 @@ public final class ControlFactory {
             progress.maxValue = 1
             progress.isIndeterminate = false
             progress.widthAnchor.constraint(greaterThanOrEqualToConstant: 150).isActive = true
-            result = (progress, nil, nil)
+            result = (progress, nil, nil, nil)
 
         case .image:
             let imageView = NSImageView(frame: .zero)
@@ -120,7 +150,7 @@ public final class ControlFactory {
             imageView.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "Image")
             imageView.widthAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
             imageView.heightAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
-            result = (imageView, nil, nil)
+            result = (imageView, nil, nil, nil)
 
         case .scroll:
             let scrollView = NSScrollView(frame: .zero)
@@ -142,13 +172,15 @@ public final class ControlFactory {
                 documentStack.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
                 documentStack.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             ])
-            result = (scrollView, nil, nil)
+            result = (scrollView, nil, nil, nil)
 
         case .list, .table:
-            result = makeTable(for: node)
+            let table = makeTable(for: node)
+            result = (table.0, table.1, table.2, nil)
 
         case .tree:
-            result = makeOutline(for: node)
+            let outline = makeOutline(for: node)
+            result = (outline.0, outline.1, outline.2, nil)
 
         default:
             throw ControlFactoryError.unsupportedNodeType(node.nodeType)
@@ -164,7 +196,8 @@ public final class ControlFactory {
             window: result.window,
             parentID: node.parentID,
             childIDs: node.orderedChildren,
-            modelAdapter: result.adapter
+            modelAdapter: result.adapter,
+            actionTrampoline: result.trampoline
         )
         apply(node: node, to: handle)
         return handle

@@ -41,6 +41,12 @@ let package = Package(
         ),
         .target(
             name: "Session",
+            dependencies: [
+                "TransportSSH",
+                "Protocol",
+                "SemanticModel",
+                "RendererAppKit",
+            ],
             path: "Session"
         ),
         .target(
@@ -53,7 +59,11 @@ let package = Package(
         .executableTarget(
             name: "RendererDemoApp",
             dependencies: [
+                "Session",
                 "RendererAppKit",
+                "TransportSSH",
+                "Protocol",
+                "SemanticModel",
             ],
             path: "RendererDemoApp"
         ),

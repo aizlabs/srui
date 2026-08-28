@@ -7,6 +7,11 @@ public final class AppKitRenderer {
     public let controlFactory: ControlFactory
     public let layoutRenderer: LayoutRenderer
 
+    public var onAction: (@MainActor (NodeId, TypeRef) -> Void)? {
+        get { controlFactory.onAction }
+        set { controlFactory.onAction = newValue }
+    }
+
     public init() {
         let registry = RenderRegistry()
         let controlFactory = ControlFactory()

@@ -54,6 +54,7 @@ public final class RenderHandle {
     public internal(set) var layoutMetadata: RenderLayoutMetadata
     public internal(set) var accessibilityMetadata: RenderAccessibilityMetadata
     public internal(set) var modelAdapter: AnyObject?
+    public internal(set) var actionTrampoline: AnyObject?
     /// Content hash of the resource most recently referenced by this node (§14).
     public internal(set) var pendingResourceHash: ResourceHash?
 
@@ -68,7 +69,8 @@ public final class RenderHandle {
         childIDs: [NodeId] = [],
         layoutMetadata: RenderLayoutMetadata = RenderLayoutMetadata(),
         accessibilityMetadata: RenderAccessibilityMetadata = RenderAccessibilityMetadata(),
-        modelAdapter: AnyObject? = nil
+        modelAdapter: AnyObject? = nil,
+        actionTrampoline: AnyObject? = nil
     ) {
         self.nodeID = nodeID
         self.nodeType = nodeType
@@ -79,5 +81,6 @@ public final class RenderHandle {
         self.layoutMetadata = layoutMetadata
         self.accessibilityMetadata = accessibilityMetadata
         self.modelAdapter = modelAdapter
+        self.actionTrampoline = actionTrampoline
     }
 }

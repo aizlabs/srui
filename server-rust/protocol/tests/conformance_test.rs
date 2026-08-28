@@ -345,3 +345,23 @@ fn test_cross_language_rust_vs_swift_byte_equality() {
         "Rust-encoded Transaction does not match golden bytes"
     );
 }
+
+#[test]
+fn test_length_delimited_framing_conformance() {
+    let msg = SruiMessage {
+        msg: Some(srui_message::Msg::Transaction(create_authored_transaction())),
+    };
+
+    let framed_bytes = encode_framed(&msg).expect("encode framed");
+    assert!(!framed_bytes.is_empty());
+
+    let decoded: SruiMessage = decode_framed(&framed_bytes).expect("decode framed");
+    match decoded.msg {
+        Some(srui_message::Msg::Transaction(tx)) => {
+            assert_eq!(tx.base_revision, 104);
+            assert_eq!(tx.new_revision, 105);
+            assert_eq!(tx.operations.len(), 3);
+        }
+        other => panic!("Expected Transaction payload, got {:?}", other),
+    }
+}

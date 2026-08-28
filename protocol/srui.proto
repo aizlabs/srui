@@ -464,6 +464,8 @@ message Event {
 // Handshake and Session Negotiation Messages (§15, §18)
 // -----------------------------------------------------------------------------
 
+// Negotiated operational boundaries (§15) to prevent unbounded memory allocation
+// on variable-length wire fields (strings, byte arrays, collections, transactions).
 message ClientLimits {
   uint32 max_frame_size = 1;
   uint32 max_transaction_operations = 2;

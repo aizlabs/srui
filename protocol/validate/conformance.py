@@ -1,4 +1,13 @@
+"""Conformance oracle for namespace 0 v0.4.0 derived directly from protocol/registry.yaml."""
+
 from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from validate.loader import load_registry
+
+REGISTRY_PATH = Path(__file__).resolve().parent.parent / "registry.yaml"
 
 NODE_TIERS = frozenset({"required", "should", "standard", "deferred"})
 NODE_CATEGORIES = frozenset(
@@ -31,87 +40,70 @@ PROPERTY_ENUM_REFERENCES = {
     "selection_mode": {"SelectionMode"},
 }
 
-# Conformance oracle for namespace 0 v0.4.0. Keep in sync with protocol/registry.yaml.
-# tests/test_validate_registry.py verifies these sets match the canonical registry file.
-REQUIRED_NODE_TYPES = {
-    "Surface", "Row", "Column", "Grid", "Spacer", "Separator",
-    "Text", "RichText", "Button", "Toggle", "TextInput", "TextArea",
-    "Progress", "Image", "Scroll", "List", "Table", "Tree",
-}
-SHOULD_NODE_TYPES = {
-    "Select", "ChoiceGroup", "Slider", "NumberInput", "Tabs", "Split",
-}
-OTHER_STANDARD_NODE_TYPES = {"Dialog", "Menu", "Toolbar"}
-ALL_SECTION_7_2_NODE_TYPES = REQUIRED_NODE_TYPES | SHOULD_NODE_TYPES | OTHER_STANDARD_NODE_TYPES
 
-EXPECTED_NODE_TIERS = {
-    "Surface": "required",
-    "Dialog": "standard",
-    "Row": "required",
-    "Column": "required",
-    "Grid": "required",
-    "Spacer": "required",
-    "Separator": "required",
-    "Scroll": "required",
-    "Text": "required",
-    "RichText": "required",
-    "Button": "required",
-    "Toggle": "required",
-    "TextInput": "required",
-    "TextArea": "required",
-    "Progress": "required",
-    "Image": "required",
-    "List": "required",
-    "Table": "required",
-    "Tree": "required",
-    "Select": "should",
-    "ChoiceGroup": "should",
-    "Slider": "should",
-    "NumberInput": "should",
-    "Tabs": "should",
-    "Split": "should",
-    "Menu": "deferred",
-    "Toolbar": "deferred",
-}
+def _derive_oracle_from_registry(registry_path: Path = REGISTRY_PATH) -> dict[str, Any]:
+    if not registry_path.exists():
+        return {}
+    reg = load_registry(registry_path)
 
-REQUIRED_PROPERTIES_SECTION_7_4 = {
-    "label", "accessible_description", "role", "value_description", "actions",
-    "visibility", "enabled", "read_only", "busy", "selected", "validation_state",
-    "text", "value", "placeholder", "resource", "items", "model_ref",
-    "horizontal_alignment", "vertical_alignment", "grow", "shrink",
-    "minimum_size", "maximum_size", "preferred_size", "spacing_role", "padding_role",
-}
-REQUIRED_CONTROL_SPECIFIC_PROPERTIES = {
-    "presentation_hint", "action_key", "columns", "selection_mode",
-}
-REQUIRED_STANDARD_PROPERTIES = REQUIRED_PROPERTIES_SECTION_7_4 | REQUIRED_CONTROL_SPECIFIC_PROPERTIES
+    node_types = reg.get("node_types", [])
+    required_nodes = {n["name"] for n in node_types if n.get("tier") == "required"}
+    should_nodes = {n["name"] for n in node_types if n.get("tier") == "should"}
+    other_nodes = {n["name"] for n in node_types if n.get("tier") in ("standard", "deferred")}
+    all_nodes = {n["name"] for n in node_types}
+    node_tiers = {n["name"]: n.get("tier") for n in node_types}
 
-REQUIRED_ENUM_VALUES = {
-    "TextRole": {"title", "heading", "body", "caption", "code", "status", "warning", "error"},
-    "ActionRole": {"normal", "primary", "destructive", "quiet"},
-    "InputRole": {"plain", "search", "secure", "command"},
-    "Importance": {"normal", "emphasized", "de_emphasized"},
-    "TogglePresentationHint": {"automatic", "checkbox", "switch"},
-    "Visibility": {"visible", "hidden", "collapsed"},
-    "SpacingRole": {"none", "tight", "normal", "relaxed"},
-    "PaddingRole": {"none", "tight", "normal", "relaxed"},
-    "HorizontalAlignment": {"leading", "center", "trailing", "fill"},
-    "VerticalAlignment": {"top", "center", "bottom", "fill"},
-    "SelectionMode": {"none", "single", "multiple"},
-    "ValidationState": {"valid", "warning", "error"},
-}
+    properties = reg.get("properties", [])
+    standard_props = {p["name"] for p in properties}
+    sec_7_4_props = {
+        p["name"] for p in properties if p.get("category") != "control_specific"
+    }
+    control_props = {
+        p["name"] for p in properties if p.get("category") == "control_specific"
+    }
 
-REQUIRED_EVENTS = {
-    "ACTIVATE", "VALUE_CHANGED", "SELECTION_CHANGED", "EXPANSION_CHANGED",
-    "TEXT_EDIT", "VIEWPORT_CHANGED",
-    "POINTER_DOWN", "POINTER_UP", "POINTER_MOVE", "POINTER_CANCEL", "POINTER_SCROLL",
-}
+    enums = reg.get("enums", [])
+    enum_values = {
+        e["name"]: {v["name"] for v in e.get("values", [])} for e in enums
+    }
 
-REQUIRED_OPERATIONS = {
-    "CREATE_NODE", "DELETE_NODE", "SET_PROPERTY", "CLEAR_PROPERTY", "COMMIT",
-    "CREATE_MODEL", "MODEL_INSERT", "MODEL_DELETE", "MODEL_UPDATE", "MODEL_RESET_RANGE",
-    "MOVE_NODE", "REORDER_CHILDREN", "BATCH_PROPERTY_SET",
-}
+    events = reg.get("events", [])
+    event_names = {ev["name"] for ev in events}
+
+    operations = reg.get("operations", [])
+    op_names = {op["name"] for op in operations}
+
+    return {
+        "REQUIRED_NODE_TYPES": required_nodes,
+        "SHOULD_NODE_TYPES": should_nodes,
+        "OTHER_STANDARD_NODE_TYPES": other_nodes,
+        "ALL_SECTION_7_2_NODE_TYPES": all_nodes,
+        "EXPECTED_NODE_TIERS": node_tiers,
+        "REQUIRED_PROPERTIES_SECTION_7_4": sec_7_4_props,
+        "REQUIRED_CONTROL_SPECIFIC_PROPERTIES": control_props,
+        "REQUIRED_STANDARD_PROPERTIES": standard_props,
+        "REQUIRED_ENUM_VALUES": enum_values,
+        "REQUIRED_EVENTS": event_names,
+        "REQUIRED_OPERATIONS": op_names,
+    }
+
+
+_DERIVED = _derive_oracle_from_registry()
+
+# Conformance oracle sets derived from registry.yaml
+REQUIRED_NODE_TYPES: set[str] = _DERIVED.get("REQUIRED_NODE_TYPES", set())
+SHOULD_NODE_TYPES: set[str] = _DERIVED.get("SHOULD_NODE_TYPES", set())
+OTHER_STANDARD_NODE_TYPES: set[str] = _DERIVED.get("OTHER_STANDARD_NODE_TYPES", set())
+ALL_SECTION_7_2_NODE_TYPES: set[str] = _DERIVED.get("ALL_SECTION_7_2_NODE_TYPES", set())
+EXPECTED_NODE_TIERS: dict[str, str] = _DERIVED.get("EXPECTED_NODE_TIERS", {})
+
+REQUIRED_PROPERTIES_SECTION_7_4: set[str] = _DERIVED.get("REQUIRED_PROPERTIES_SECTION_7_4", set())
+REQUIRED_CONTROL_SPECIFIC_PROPERTIES: set[str] = _DERIVED.get("REQUIRED_CONTROL_SPECIFIC_PROPERTIES", set())
+REQUIRED_STANDARD_PROPERTIES: set[str] = _DERIVED.get("REQUIRED_STANDARD_PROPERTIES", set())
+
+REQUIRED_ENUM_VALUES: dict[str, set[str]] = _DERIVED.get("REQUIRED_ENUM_VALUES", {})
+REQUIRED_EVENTS: set[str] = _DERIVED.get("REQUIRED_EVENTS", set())
+REQUIRED_OPERATIONS: set[str] = _DERIVED.get("REQUIRED_OPERATIONS", set())
 
 REQUIRED_TIER_NODE_COUNT = len(REQUIRED_NODE_TYPES)
 SHOULD_TIER_NODE_COUNT = len(SHOULD_NODE_TYPES)

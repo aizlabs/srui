@@ -1996,6 +1996,8 @@ public nonisolated struct Srui_Protocol_Event: Sendable {
   fileprivate var _eventType: Srui_Protocol_TypeRef? = nil
 }
 
+/// Negotiated operational boundaries (§15) to prevent unbounded memory allocation
+/// on variable-length wire fields (strings, byte arrays, collections, transactions).
 public nonisolated struct Srui_Protocol_ClientLimits: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for

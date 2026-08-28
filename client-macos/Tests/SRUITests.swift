@@ -394,4 +394,17 @@ final class SRUITests: XCTestCase {
             "Cross-language mismatch: Swift-encoded Transaction does not match Rust-authored bytes"
         )
     }
+
+    func testLengthDelimitedFraming() throws {
+        var msg = Srui_Protocol_SruiMessage()
+        msg.transaction = createAuthoredTransaction()
+
+        let framed = try SRUIFraming.encodeFramed(msg)
+        XCTAssertFalse(framed.isEmpty)
+
+        let decoded = try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: framed)
+        XCTAssertEqual(decoded.transaction.baseRevision, 104)
+        XCTAssertEqual(decoded.transaction.newRevision, 105)
+        XCTAssertEqual(decoded.transaction.operations.count, 3)
+    }
 }

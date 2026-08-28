@@ -822,7 +822,7 @@ public struct SemanticStore: Equatable, Sendable {
         let applier = TransactionApplier(store: self)
         let res = applier.apply(baseRevision: baseRevision, operations: operations)
         if case .success = res {
-            self = applier.store
+            self = applier.currentSnapshot.store
         }
         return res
     }
@@ -832,7 +832,7 @@ public struct SemanticStore: Equatable, Sendable {
         let applier = TransactionApplier(store: self)
         let res = applier.apply(record: record)
         if case .success = res {
-            self = applier.store
+            self = applier.currentSnapshot.store
         }
         return res
     }

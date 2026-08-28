@@ -655,7 +655,7 @@ extension SemanticStore {
         let applier = TransactionApplier(store: self)
         let res = applier.apply(wire: wire)
         if case .success = res {
-            self = applier.store
+            self = applier.currentSnapshot.store
         }
         return res
     }

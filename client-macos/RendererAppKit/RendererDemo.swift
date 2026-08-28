@@ -29,13 +29,16 @@ private final class DemoApplicationDelegate: NSObject, NSApplicationDelegate {
     private let applier = TransactionApplier()
 
     func start() {
-        let transaction = DemoFixtures.initial(baseRevision: applier.store.revision)
+        let transaction = DemoFixtures.initial(
+            baseRevision: applier.currentSnapshot.revision
+        )
         guard case .success = applier.apply(record: transaction) else {
             fatalError("Initial renderer demo transaction failed")
         }
+        let committedSnapshot = applier.currentSnapshot
 
         do {
-            try renderer.attach(store: applier.store)
+            try renderer.attach(store: committedSnapshot.store)
             renderer.showWindows()
             logFrames(phase: "initial")
         } catch {
@@ -68,13 +71,19 @@ private final class DemoApplicationDelegate: NSObject, NSApplicationDelegate {
             renderer.registry.view(for: nodeID).map { (nodeID, ObjectIdentifier($0)) }
         })
 
-        let transaction = DemoFixtures.scalarUpdate(baseRevision: applier.store.revision)
+        let transaction = DemoFixtures.scalarUpdate(
+            baseRevision: applier.currentSnapshot.revision
+        )
         guard case .success = applier.apply(record: transaction) else {
             fatalError("Scalar renderer demo transaction failed")
         }
+        let committedSnapshot = applier.currentSnapshot
 
         do {
-            try renderer.apply(transaction: transaction, newStore: applier.store)
+            try renderer.apply(
+                transaction: transaction,
+                newStore: committedSnapshot.store
+            )
         } catch {
             fatalError("Scalar renderer demo update failed: \(error)")
         }

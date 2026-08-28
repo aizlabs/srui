@@ -142,38 +142,76 @@ public struct Transaction: Equatable, Sendable {
 ///
 /// `TransactionApplier` enforces all-or-nothing atomic execution, revision advancement,
 /// and tracks `lastAppliedRevision` (§18).
+/// Atomically captured semantic state and its corresponding applied revision.
+public struct TransactionSnapshot: Equatable, Sendable {
+    public let store: SemanticStore
+    public let revision: Revision
+
+    public init(store: SemanticStore, revision: Revision) {
+        self.store = store
+        self.revision = revision
+    }
+}
+
+/// Synchronous transaction gateway whose mutable state is protected by `lock`.
+///
+/// The `@unchecked Sendable` conformance is justified by locking every read and write of
+/// `_store` and `_lastAppliedRevision`. New mutable state must use the same lock.
 public final class TransactionApplier: @unchecked Sendable {
     private let lock = NSLock()
+    private var _store: SemanticStore
+    private var _lastAppliedRevision: Revision
 
-    /// The underlying semantic store replica.
-    public private(set) var store: SemanticStore
+    /// A thread-safe copy of the underlying semantic store replica.
+    public var store: SemanticStore {
+        lock.lock()
+        defer { lock.unlock() }
+        return _store
+    }
 
-    /// The latest committed revision applied to the replica (§18).
-    public private(set) var lastAppliedRevision: Revision
+    /// A thread-safe copy of the latest committed revision.
+    public var lastAppliedRevision: Revision {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lastAppliedRevision
+    }
+
+    /// Atomically returns the store and revision from the same committed state.
+    public var currentSnapshot: TransactionSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return TransactionSnapshot(
+            store: _store,
+            revision: _lastAppliedRevision
+        )
+    }
 
     /// Constructs a `TransactionApplier` wrapping an existing `SemanticStore`.
     public init(store: SemanticStore = SemanticStore()) {
-        self.store = store
-        self.lastAppliedRevision = store.revision
+        self._store = store
+        self._lastAppliedRevision = store.revision
     }
 
     /// Constructs a `TransactionApplier` with specified limits and initial revision.
     public init(limits: StoreLimits, initialRevision: Revision = .initial) {
-        self.store = SemanticStore(limits: limits, revision: initialRevision)
-        self.lastAppliedRevision = initialRevision
+        self._store = SemanticStore(limits: limits, revision: initialRevision)
+        self._lastAppliedRevision = initialRevision
     }
 
     /// Executes operations speculatively against a staged clone of the store.
+    ///
+    /// The caller must hold `lock`; this method accesses backing storage directly to avoid
+    /// recursively acquiring the non-recursive `NSLock`.
     private func applyStaged(
         operations: [Operation],
         newRevision: Revision
     ) -> Result<Revision, TxnError> {
-        let maxOps = store.limits.maxTransactionOperations
+        let maxOps = _store.limits.maxTransactionOperations
         if operations.count > maxOps {
             return .failure(.maxOperationsExceeded(limit: maxOps, actual: operations.count))
         }
 
-        var staged = store.cloneStaging()
+        var staged = _store.cloneStaging()
         for (idx, op) in operations.enumerated() {
             do {
                 try op.apply(to: &staged)
@@ -184,8 +222,8 @@ public final class TransactionApplier: @unchecked Sendable {
             }
         }
 
-        store.commitStaging(staged, newRevision: newRevision)
-        self.lastAppliedRevision = newRevision
+        _store.commitStaging(staged, newRevision: newRevision)
+        _lastAppliedRevision = newRevision
         return .success(newRevision)
     }
 
@@ -195,8 +233,8 @@ public final class TransactionApplier: @unchecked Sendable {
     /// 1. Rejects if `baseRevision` does not match the store's current committed revision (`TxnError.staleBaseRevision`).
     /// 2. Enforces `maxTransactionOperations` limit as a pre-check (`TxnError.maxOperationsExceeded`).
     /// 3. Applies all operations speculatively to a private staging copy of the store.
-    /// 4. If any operation fails, the entire transaction is discarded with zero visible side-effects or partial changes on the store (`TxnError.opFailed`).
-    /// 5. On full success, atomically commits staged mutations and advances the store's revision to `newRevision = baseRevision + 1`.
+    /// 4. If any operation fails, the entire transaction is discarded with zero visible side-effects or partial changes on the store.
+    /// 5. On full success, atomically commits staged mutations and advances the revision.
     public func apply(
         baseRevision: Revision,
         operations: [Operation]
@@ -204,30 +242,47 @@ public final class TransactionApplier: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        let currentRev = store.revision
-        if baseRevision != currentRev {
-            return .failure(.staleBaseRevision(expected: currentRev, actual: baseRevision))
+        let currentRevision = _store.revision
+        if baseRevision != currentRevision {
+            return .failure(
+                .staleBaseRevision(expected: currentRevision, actual: baseRevision)
+            )
         }
 
-        return applyStaged(operations: operations, newRevision: baseRevision.next)
+        return applyStaged(
+            operations: operations,
+            newRevision: baseRevision.next
+        )
     }
 
-    /// Applies a structured `Transaction` record, validating base revision, new revision (`baseRevision + 1`), and operational limits (§12.1).
+    /// Applies a structured `Transaction` record, validating its base and target revisions.
     public func apply(record: Transaction) -> Result<Revision, TxnError> {
         lock.lock()
         defer { lock.unlock() }
 
-        let currentRev = store.revision
-        if record.baseRevision != currentRev {
-            return .failure(.staleBaseRevision(expected: currentRev, actual: record.baseRevision))
+        let currentRevision = _store.revision
+        if record.baseRevision != currentRevision {
+            return .failure(
+                .staleBaseRevision(
+                    expected: currentRevision,
+                    actual: record.baseRevision
+                )
+            )
         }
 
-        let expectedNewRev = record.baseRevision.next
-        if record.newRevision != expectedNewRev {
-            return .failure(.invalidNewRevision(expected: expectedNewRev, actual: record.newRevision))
+        let expectedNewRevision = record.baseRevision.next
+        if record.newRevision != expectedNewRevision {
+            return .failure(
+                .invalidNewRevision(
+                    expected: expectedNewRevision,
+                    actual: record.newRevision
+                )
+            )
         }
 
-        return applyStaged(operations: record.operations, newRevision: record.newRevision)
+        return applyStaged(
+            operations: record.operations,
+            newRevision: record.newRevision
+        )
     }
 }
-

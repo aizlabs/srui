@@ -26,6 +26,13 @@ public typealias SRUIServerResumeOk = Srui_Protocol_ServerResumeOk
 public typealias SRUIServerResyncRequired = Srui_Protocol_ServerResyncRequired
 public typealias SRUIMessage = Srui_Protocol_SruiMessage
 
+public typealias SRUIModelItem = Srui_Protocol_ModelItem
+public typealias SRUICreateModelOp = Srui_Protocol_CreateModelOp
+public typealias SRUIModelInsertOp = Srui_Protocol_ModelInsertOp
+public typealias SRUIModelDeleteOp = Srui_Protocol_ModelDeleteOp
+public typealias SRUIModelUpdateOp = Srui_Protocol_ModelUpdateOp
+public typealias SRUIModelResetRangeOp = Srui_Protocol_ModelResetRangeOp
+
 public struct ProtocolPlaceholder {
     public init() {}
 }

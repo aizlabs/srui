@@ -225,6 +225,68 @@ public struct StoreLimits: Equatable, Sendable {
         )
     }
 
+    // MARK: - Fluent Limit Builders
+
+    public func withMaxTreeDepth(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxTreeDepth = max
+        return copy
+    }
+
+    public func withMaxNodeCount(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxNodeCount = max
+        return copy
+    }
+
+    public func withMaxStringLength(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxStringLength = max
+        return copy
+    }
+
+    public func withMaxValueDepth(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxValueDepth = max
+        return copy
+    }
+
+    public func withMaxListElements(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxListElements = max
+        return copy
+    }
+
+    public func withMaxRecordProperties(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxRecordProperties = max
+        return copy
+    }
+
+    public func withMaxTransactionOperations(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxTransactionOperations = max
+        return copy
+    }
+
+    public func withMaxModelCount(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxModelCount = max
+        return copy
+    }
+
+    public func withMaxCachedItemsPerModel(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxCachedItemsPerModel = max
+        return copy
+    }
+
+    public func withMaxItemsPerModelOperation(_ max: Int) -> StoreLimits {
+        var copy = self
+        copy.maxItemsPerModelOperation = max
+        return copy
+    }
+
     /// Validates a `Value` against string length, nesting depth, and collection size limits.
     public func validate(value: Value) throws {
         try validateInner(value: value, depth: 1)
@@ -379,7 +441,7 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .maxModelCountExceeded: return "max_model_count_exceeded"
         case .maxCachedItemsPerModelExceeded: return "max_cached_items_per_model_exceeded"
         case .maxItemsPerModelOperationExceeded: return "max_items_per_model_operation_exceeded"
-        case .maxTransactionOperationsExceeded: return "max_transaction_operations_exceeded"
+        case .maxTransactionOperationsExceeded: return "max_operations_exceeded"
         case .invalidModelDelete: return "invalid_model_delete"
         case .childIndexOutOfBounds: return "child_index_out_of_bounds"
         case .modelIdAlreadyUsed: return "model_id_already_used"
@@ -423,6 +485,21 @@ public enum StoreOperation: Equatable, Sendable {
     /// Sets multiple properties on a node atomically (§13 BATCH_PROPERTY_SET, §26).
     case batchPropertySet(id: NodeId, properties: [Property])
 
+    /// Creates a new collection model (§13 CREATE_MODEL, §8).
+    case createModel(id: ModelId, modelType: TypeRef, itemCount: UInt64)
+
+    /// Inserts items into a collection model at a specified index (§13 MODEL_INSERT, §8).
+    case modelInsert(id: ModelId, index: UInt64, items: [ModelItem])
+
+    /// Deletes items from a collection model by item identity or index range (§13 MODEL_DELETE, §8).
+    case modelDelete(id: ModelId, index: UInt64?, count: UInt64?, itemIds: [ItemId])
+
+    /// Updates existing items in a collection model (§13 MODEL_UPDATE, §8).
+    case modelUpdate(id: ModelId, index: UInt64?, items: [ModelItem])
+
+    /// Resets/replaces a range of cached items in a collection model (§13 MODEL_RESET_RANGE, §8).
+    case modelResetRange(id: ModelId, startIndex: UInt64, items: [ModelItem], totalCount: UInt64?)
+
     /// Convenience factory for creating a `createNode` operation with property pairs.
     public static func create(
         id: NodeId,
@@ -430,6 +507,23 @@ public enum StoreOperation: Equatable, Sendable {
         parentID: NodeId? = nil,
         childIndex: Int? = nil,
         properties: [(PropertyRef, Value)] = []
+    ) -> StoreOperation {
+        .createNode(
+            id: id,
+            nodeType: nodeType,
+            parentID: parentID,
+            childIndex: childIndex,
+            properties: properties.map { Property(property: $0.0, value: $0.1) }
+        )
+    }
+
+    /// Convenience factory for creating a `createNode` operation with property pairs.
+    public static func createNode(
+        id: NodeId,
+        nodeType: TypeRef,
+        parentID: NodeId? = nil,
+        childIndex: Int? = nil,
+        properties: [(PropertyRef, Value)]
     ) -> StoreOperation {
         .createNode(
             id: id,
@@ -449,6 +543,27 @@ public enum StoreOperation: Equatable, Sendable {
             id: id,
             properties: properties.map { Property(property: $0.0, value: $0.1) }
         )
+    }
+
+    /// Convenience factory for creating a `batchPropertySet` operation with property pairs.
+    public static func batchPropertySet(
+        id: NodeId,
+        properties: [(PropertyRef, Value)]
+    ) -> StoreOperation {
+        .batchPropertySet(
+            id: id,
+            properties: properties.map { Property(property: $0.0, value: $0.1) }
+        )
+    }
+
+    /// Convenience factory for creating a `modelDelete` operation by item IDs.
+    public static func modelDeleteItems(id: ModelId, itemIds: [ItemId]) -> StoreOperation {
+        .modelDelete(id: id, index: nil, count: nil, itemIds: itemIds)
+    }
+
+    /// Convenience factory for creating a `modelDelete` operation by index range.
+    public static func modelDeleteRange(id: ModelId, index: UInt64, count: UInt64) -> StoreOperation {
+        .modelDelete(id: id, index: index, count: count, itemIds: [])
     }
 
     /// Decodes a `StoreOperation` from a protobuf wire operation message (§16).
@@ -525,6 +640,50 @@ public enum StoreOperation: Equatable, Sendable {
             }
             self = .batchPropertySet(id: id, properties: props)
 
+        case .createModel(let create):
+            let id = ModelId(create.modelID)
+            guard create.hasModelType else {
+                throw StoreError.operationError("CreateModelOp missing model_type")
+            }
+            let modelType = TypeRef(wire: create.modelType)
+            self = .createModel(id: id, modelType: modelType, itemCount: create.itemCount)
+
+        case .modelInsert(let insert):
+            let id = ModelId(insert.modelID)
+            var items: [ModelItem] = []
+            items.reserveCapacity(insert.items.count)
+            for item in insert.items {
+                items.append(try ModelItem(wire: item))
+            }
+            self = .modelInsert(id: id, index: insert.index, items: items)
+
+        case .modelDelete(let del):
+            let id = ModelId(del.modelID)
+            let index = del.count > 0 ? del.index : nil
+            let count = del.count > 0 ? del.count : nil
+            let itemIds = del.itemIds.map { ItemId($0) }
+            self = .modelDelete(id: id, index: index, count: count, itemIds: itemIds)
+
+        case .modelUpdate(let update):
+            let id = ModelId(update.modelID)
+            let index = update.index == UInt64.max ? nil : update.index
+            var items: [ModelItem] = []
+            items.reserveCapacity(update.items.count)
+            for item in update.items {
+                items.append(try ModelItem(wire: item))
+            }
+            self = .modelUpdate(id: id, index: index, items: items)
+
+        case .modelResetRange(let reset):
+            let id = ModelId(reset.modelID)
+            let totalCount = reset.totalCount > 0 ? reset.totalCount : nil
+            var items: [ModelItem] = []
+            items.reserveCapacity(reset.items.count)
+            for item in reset.items {
+                items.append(try ModelItem(wire: item))
+            }
+            self = .modelResetRange(id: id, startIndex: reset.startIndex, items: items, totalCount: totalCount)
+
         default:
             throw StoreError.operationError("Unsupported operation variant on SemanticStore")
         }
@@ -591,6 +750,43 @@ public enum StoreOperation: Equatable, Sendable {
                 return wireProp
             }
             op.batchPropertySet = batch
+
+        case .createModel(let id, let modelType, let itemCount):
+            var create = Srui_Protocol_CreateModelOp()
+            create.modelID = id.value
+            create.modelType = modelType.toWire()
+            create.itemCount = itemCount
+            op.createModel = create
+
+        case .modelInsert(let id, let index, let items):
+            var insert = Srui_Protocol_ModelInsertOp()
+            insert.modelID = id.value
+            insert.index = index
+            insert.items = items.map { $0.toWire() }
+            op.modelInsert = insert
+
+        case .modelDelete(let id, let index, let count, let itemIds):
+            var del = Srui_Protocol_ModelDeleteOp()
+            del.modelID = id.value
+            del.index = index ?? 0
+            del.count = count ?? 0
+            del.itemIds = itemIds.map { $0.value }
+            op.modelDelete = del
+
+        case .modelUpdate(let id, let index, let items):
+            var update = Srui_Protocol_ModelUpdateOp()
+            update.modelID = id.value
+            update.index = index ?? UInt64.max
+            update.items = items.map { $0.toWire() }
+            op.modelUpdate = update
+
+        case .modelResetRange(let id, let startIndex, let items, let totalCount):
+            var reset = Srui_Protocol_ModelResetRangeOp()
+            reset.modelID = id.value
+            reset.startIndex = startIndex
+            reset.totalCount = totalCount ?? 0
+            reset.items = items.map { $0.toWire() }
+            op.modelResetRange = reset
         }
         return op
     }
@@ -612,6 +808,16 @@ public enum StoreOperation: Equatable, Sendable {
             try store.reorderChildren(parentID: parentID, newOrder: newOrder)
         case .batchPropertySet(let id, let properties):
             try store.batchPropertySet(nodeID: id, properties: properties)
+        case .createModel(let id, let modelType, let itemCount):
+            try store.createModel(id: id, modelType: modelType, itemCount: itemCount)
+        case .modelInsert(let id, let index, let items):
+            try store.modelInsert(id: id, index: index, items: items)
+        case .modelDelete(let id, let index, let count, let itemIds):
+            try store.modelDelete(id: id, index: index, count: count, itemIds: itemIds)
+        case .modelUpdate(let id, let index, let items):
+            try store.modelUpdate(id: id, index: index, items: items)
+        case .modelResetRange(let id, let startIndex, let items, let totalCount):
+            try store.modelResetRange(id: id, startIndex: startIndex, items: items, totalCount: totalCount)
         }
     }
 }
@@ -645,22 +851,39 @@ public struct SemanticStore: Equatable, Sendable {
     /// Set of all `NodeId`s that have ever been created in this session (§6.2 invariant).
     private var usedIDs: Set<NodeId>
 
+    /// Active collection models mapped by `ModelId` (§8, §13).
+    private var models: [ModelId: Model]
+
+    /// Set of all `ModelId`s that have ever been created in this session (§6.2, §8 invariant).
+    private var usedModelIDs: Set<ModelId>
+
     /// Mandatory runtime limits enforced by the store (§26).
     private let limitsValue: StoreLimits
 
+    /// Authoritative committed revision counter (§12.1).
+    private var revisionValue: Revision
+
     // MARK: - Initializers
 
-    /// Constructs a new empty `SemanticStore` with default limits (§26).
+    /// Constructs a new empty `SemanticStore` with default limits and baseline revision 0 (§12.1, §26).
     public init() {
-        self.init(limits: StoreLimits())
+        self.init(limits: StoreLimits(), revision: .initial)
     }
 
-    /// Constructs a new empty `SemanticStore` with custom configured limits (§26).
+    /// Constructs a new empty `SemanticStore` with custom configured limits and baseline revision 0 (§12.1, §26).
     public init(limits: StoreLimits) {
+        self.init(limits: limits, revision: .initial)
+    }
+
+    /// Constructs a new `SemanticStore` with configured limits and initial committed revision (§12.1, §18).
+    public init(limits: StoreLimits, revision: Revision) {
         self.nodes = [:]
         self.roots = []
         self.usedIDs = []
+        self.models = [:]
+        self.usedModelIDs = []
         self.limitsValue = limits
+        self.revisionValue = revision
     }
 
     /// Internal constructor for cloning/staging.
@@ -668,12 +891,18 @@ public struct SemanticStore: Equatable, Sendable {
         nodes: [NodeId: Node],
         roots: [NodeId],
         usedIDs: Set<NodeId>,
-        limits: StoreLimits
+        models: [ModelId: Model],
+        usedModelIDs: Set<ModelId>,
+        limits: StoreLimits,
+        revision: Revision
     ) {
         self.nodes = nodes
         self.roots = roots
         self.usedIDs = usedIDs
+        self.models = models
+        self.usedModelIDs = usedModelIDs
         self.limitsValue = limits
+        self.revisionValue = revision
     }
 
     // MARK: - Read-only Graph Inspection (§6.2, §6.3, §22.9)
@@ -681,6 +910,11 @@ public struct SemanticStore: Equatable, Sendable {
     /// Returns the store's configured runtime safety limits (§26).
     public var limits: StoreLimits {
         limitsValue
+    }
+
+    /// Returns the store's current committed revision (§12.1).
+    public var revision: Revision {
+        revisionValue
     }
 
     /// Returns the number of active nodes currently in the store.
@@ -766,15 +1000,23 @@ public struct SemanticStore: Equatable, Sendable {
             nodes: self.nodes,
             roots: self.roots,
             usedIDs: self.usedIDs,
-            limits: self.limitsValue
+            models: self.models,
+            usedModelIDs: self.usedModelIDs,
+            limits: self.limitsValue,
+            revision: self.revisionValue
         )
     }
 
     /// Commits the contents of a successful staging store into this store (§12.1).
-    public mutating func commitStaging(_ staged: SemanticStore) {
+    public mutating func commitStaging(_ staged: SemanticStore, newRevision: Revision? = nil) {
         self.nodes = staged.nodes
         self.roots = staged.roots
         self.usedIDs = staged.usedIDs
+        self.models = staged.models
+        self.usedModelIDs = staged.usedModelIDs
+        if let rev = newRevision {
+            self.revisionValue = rev
+        }
     }
 
     /// Applies a single mutation operation directly to this store (§13).
@@ -810,7 +1052,58 @@ public struct SemanticStore: Equatable, Sendable {
         try apply(ops)
     }
 
+    /// Applies a sequence of mutation operations as an atomic transaction advancing from `baseRevision` to `baseRevision + 1` (§12.1).
+    public mutating func applyTransaction(
+        baseRevision: Revision,
+        operations: [Operation]
+    ) -> Result<Revision, TxnError> {
+        let applier = TransactionApplier(store: self)
+        let res = applier.apply(baseRevision: baseRevision, operations: operations)
+        if case .success = res {
+            self = applier.store
+        }
+        return res
+    }
+
+    /// Applies a structured `Transaction` record, validating base revision, target revision, and operational limits (§12.1).
+    public mutating func applyTransactionRecord(_ record: Transaction) -> Result<Revision, TxnError> {
+        let applier = TransactionApplier(store: self)
+        let res = applier.apply(record: record)
+        if case .success = res {
+            self = applier.store
+        }
+        return res
+    }
+
+    /// Decodes and applies a protobuf wire `SRUITransaction` atomically (§12.1, §16).
+    public mutating func applyWireTransaction(_ wire: SRUITransaction) -> Result<Revision, TxnError> {
+        let applier = TransactionApplier(store: self)
+        let res = applier.apply(wire: wire)
+        if case .success = res {
+            self = applier.store
+        }
+        return res
+    }
+
     // MARK: - Low-Level Mutation Primitives (§13, §26)
+
+    /// Validates referential integrity for semantic properties (e.g. ensuring `PropertyRef.modelRef` references an existing model).
+    private func validatePropertyReferences(property: PropertyRef, value: Value) throws {
+        if property == .modelRef || property == .MODEL_REF {
+            let modelID: ModelId
+            switch value {
+            case .unsignedInt(let u):
+                modelID = ModelId(u)
+            case .signedInt(let i) where i >= 0:
+                modelID = ModelId(UInt64(i))
+            default:
+                throw StoreError.operationError("model_ref property must be a non-negative integer")
+            }
+            guard models[modelID] != nil else {
+                throw StoreError.modelNotFound(modelID)
+            }
+        }
+    }
 
     /// Creates a new node in the graph (§13 CREATE_NODE, §6.2, §26).
     public mutating func createNode(
@@ -858,9 +1151,10 @@ public struct SemanticStore: Equatable, Sendable {
             )
         }
 
-        // 4. Validate all properties and limits (§26)
-        for (_, val) in properties {
+        // 4. Validate all properties, limits, and referential integrity (§26)
+        for (prop, val) in properties {
             try limitsValue.validate(value: val)
+            try validatePropertyReferences(property: prop, value: val)
         }
 
         // 5. Validate insertion index bounds
@@ -976,6 +1270,7 @@ public struct SemanticStore: Equatable, Sendable {
         value: Value
     ) throws -> Value? {
         try limitsValue.validate(value: value)
+        try validatePropertyReferences(property: property, value: value)
         guard nodes[nodeID] != nil else {
             throw StoreError.nodeNotFound(nodeID)
         }
@@ -1001,8 +1296,9 @@ public struct SemanticStore: Equatable, Sendable {
         nodeID: NodeId,
         properties: [(PropertyRef, Value)]
     ) throws {
-        for (_, val) in properties {
+        for (prop, val) in properties {
             try limitsValue.validate(value: val)
+            try validatePropertyReferences(property: prop, value: val)
         }
         guard nodes[nodeID] != nil else {
             throw StoreError.nodeNotFound(nodeID)
@@ -1158,5 +1454,197 @@ public struct SemanticStore: Equatable, Sendable {
         }
 
         nodes[parentID]?.orderedChildren = newOrder
+    }
+
+    // MARK: - Collection Models (§8, §13)
+
+    /// Returns the number of active models currently in the store (§8).
+    public var modelCount: Int {
+        models.count
+    }
+
+    /// Returns the IDs of all active models in the store (§8).
+    public var modelIDs: [ModelId] {
+        Array(models.keys)
+    }
+
+    /// Returns `true` if an active model exists with the given ID (§8).
+    public func containsModel(_ id: ModelId) -> Bool {
+        models[id] != nil
+    }
+
+    /// Returns `true` if the given `ModelId` was ever used in this session (even if deleted, §6.2, §8).
+    public func isModelIDUsed(_ id: ModelId) -> Bool {
+        usedModelIDs.contains(id)
+    }
+
+    /// Returns the model with the given ID, if active in the store.
+    public func getModel(_ id: ModelId) -> Model? {
+        models[id]
+    }
+
+    /// Returns the model referenced by the given node, if any (§8).
+    public func getModelForNode(_ nodeID: NodeId) -> Model? {
+        guard let node = nodes[nodeID], let mId = node.modelRef else {
+            return nil
+        }
+        return models[mId]
+    }
+
+    /// Creates a new collection model in the store (§13 CREATE_MODEL, §8).
+    public mutating func createModel(
+        id: ModelId,
+        modelType: TypeRef,
+        itemCount: UInt64
+    ) throws {
+        if usedModelIDs.contains(id) {
+            throw StoreError.modelIdAlreadyUsed(id)
+        }
+        if models.count >= limitsValue.maxModelCount {
+            throw StoreError.maxModelCountExceeded(
+                limit: limitsValue.maxModelCount,
+                current: models.count
+            )
+        }
+
+        let model = Model(id: id, modelType: modelType, itemCount: itemCount)
+        models[id] = model
+        usedModelIDs.insert(id)
+    }
+
+    /// Deletes a model from the store, returning the deleted model if it existed.
+    @discardableResult
+    public mutating func deleteModel(_ id: ModelId) throws -> Model? {
+        guard models[id] != nil else {
+            throw StoreError.modelNotFound(id)
+        }
+        return models.removeValue(forKey: id)
+    }
+
+    /// Inserts items into a collection model at a specified index (§13 MODEL_INSERT).
+    public mutating func modelInsert(
+        id: ModelId,
+        index: UInt64,
+        items: [ModelItem]
+    ) throws {
+        if items.count > limitsValue.maxItemsPerModelOperation {
+            throw StoreError.maxItemsPerModelOperationExceeded(
+                limit: limitsValue.maxItemsPerModelOperation,
+                actual: items.count
+            )
+        }
+
+        for item in items {
+            try limitsValue.validate(value: item.value)
+            for (_, val) in item.properties {
+                try limitsValue.validate(value: val)
+            }
+        }
+
+        guard var model = models[id] else {
+            throw StoreError.modelNotFound(id)
+        }
+
+        let projectedCached = model.cachedItemCount + items.count
+        if projectedCached > limitsValue.maxCachedItemsPerModel {
+            throw StoreError.maxCachedItemsPerModelExceeded(
+                limit: limitsValue.maxCachedItemsPerModel,
+                current: model.cachedItemCount,
+                attempted: projectedCached
+            )
+        }
+
+        try model.insertItems(index: index, items: items)
+        models[id] = model
+    }
+
+    /// Deletes items from a collection model by item identity or index range (§13 MODEL_DELETE).
+    public mutating func modelDelete(
+        id: ModelId,
+        index: UInt64?,
+        count: UInt64?,
+        itemIds: [ItemId]
+    ) throws {
+        if itemIds.count > limitsValue.maxItemsPerModelOperation {
+            throw StoreError.maxItemsPerModelOperationExceeded(
+                limit: limitsValue.maxItemsPerModelOperation,
+                actual: itemIds.count
+            )
+        }
+
+        guard var model = models[id] else {
+            throw StoreError.modelNotFound(id)
+        }
+
+        try model.deleteItems(index: index, count: count, itemIds: itemIds)
+        models[id] = model
+    }
+
+    /// Updates existing items in a collection model (§13 MODEL_UPDATE).
+    public mutating func modelUpdate(
+        id: ModelId,
+        index: UInt64?,
+        items: [ModelItem]
+    ) throws {
+        if items.count > limitsValue.maxItemsPerModelOperation {
+            throw StoreError.maxItemsPerModelOperationExceeded(
+                limit: limitsValue.maxItemsPerModelOperation,
+                actual: items.count
+            )
+        }
+
+        for item in items {
+            try limitsValue.validate(value: item.value)
+            for (_, val) in item.properties {
+                try limitsValue.validate(value: val)
+            }
+        }
+
+        guard var model = models[id] else {
+            throw StoreError.modelNotFound(id)
+        }
+
+        try model.updateItems(index: index, items: items)
+        models[id] = model
+    }
+
+    /// Resets/replaces a range of cached items in a collection model (§13 MODEL_RESET_RANGE).
+    public mutating func modelResetRange(
+        id: ModelId,
+        startIndex: UInt64,
+        items: [ModelItem],
+        totalCount: UInt64?
+    ) throws {
+        if items.count > limitsValue.maxItemsPerModelOperation {
+            throw StoreError.maxItemsPerModelOperationExceeded(
+                limit: limitsValue.maxItemsPerModelOperation,
+                actual: items.count
+            )
+        }
+
+        for item in items {
+            try limitsValue.validate(value: item.value)
+            for (_, val) in item.properties {
+                try limitsValue.validate(value: val)
+            }
+        }
+
+        guard var model = models[id] else {
+            throw StoreError.modelNotFound(id)
+        }
+
+        let endIndex = startIndex.addingReportingOverflow(UInt64(items.count)).partialValue
+        let removedInRange = model.iterCachedItems().filter { $0.0 >= startIndex && $0.0 < endIndex }.count
+        let projectedCached = model.cachedItemCount - removedInRange + items.count
+        if projectedCached > limitsValue.maxCachedItemsPerModel {
+            throw StoreError.maxCachedItemsPerModelExceeded(
+                limit: limitsValue.maxCachedItemsPerModel,
+                current: model.cachedItemCount,
+                attempted: projectedCached
+            )
+        }
+
+        try model.resetRange(startIndex: startIndex, items: items, totalCount: totalCount)
+        models[id] = model
     }
 }

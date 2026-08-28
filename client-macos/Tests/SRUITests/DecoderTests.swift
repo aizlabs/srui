@@ -250,6 +250,129 @@ final class DecoderTests: XCTestCase {
         XCTAssertEqual(event, framedDecoded)
     }
 
+    // MARK: - All 17 Value Variants Decoding Roundtrip
+
+    func testAll17ValueVariantsRoundtrip() throws {
+        let sampleHash = try ResourceHash(hex: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        let values: [Value] = [
+            .null,
+            .bool(true),
+            .signedInt(-123456789),
+            .unsignedInt(987654321),
+            .float64(3.1415926535),
+            .string("Swift & Rust Wire Parity"),
+            .nodeID(NodeId(101)),
+            .itemID(ItemId(202)),
+            .resourceHash(sampleHash),
+            .enumToken(EnumToken(enumID: 2, valueID: 3)),
+            .size(Size(width: 800.0, height: 600.0)),
+            .point(Point(x: 10.0, y: 20.0)),
+            .range(SemanticRange(start: 5, length: 15)),
+            .rect(Rect(x: 0, y: 0, width: 1920, height: 1080)),
+            .edgeInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)),
+            .list([.signedInt(1), .string("two"), .bool(true)]),
+            .record(SmallRecord(typeRef: TypeRef.standard(1), properties: [
+                Property(property: PropertyRef.standard(1), value: .string("nested")),
+                Property(property: PropertyRef.standard(2), value: .float64(42.0))
+            ]))
+        ]
+
+        for val in values {
+            let data = try encodeValue(val)
+            let decoded = try decodeValue(from: data)
+            XCTAssertEqual(val, decoded, "Failed roundtrip for value variant: \(val)")
+        }
+    }
+
+    // MARK: - All 12 Operation Variants Decoding Roundtrip
+
+    func testAll12OperationVariantsRoundtrip() throws {
+        let sampleProps = [Property(property: PropertyRef.standard(1), value: .string("val"))]
+        let sampleItems = [ModelItem(itemID: ItemId(1), value: .string("item1"), properties: [PropertyRef.standard(1): .signedInt(10)])]
+
+        let ops: [StoreOperation] = [
+            .createNode(id: NodeId(1), nodeType: .surface, parentID: nil, childIndex: 0, properties: sampleProps),
+            .deleteNode(id: NodeId(1)),
+            .setProperty(id: NodeId(1), property: PropertyRef.standard(1), value: .string("newVal")),
+            .clearProperty(id: NodeId(1), property: PropertyRef.standard(1)),
+            .moveNode(id: NodeId(1), newParentID: NodeId(2), newChildIndex: 0),
+            .reorderChildren(parentID: NodeId(2), newOrder: [NodeId(3), NodeId(1)]),
+            .batchPropertySet(id: NodeId(1), properties: sampleProps),
+            .createModel(id: ModelId(10), modelType: TypeRef.standard(5), itemCount: 100),
+            .modelInsert(id: ModelId(10), index: 0, items: sampleItems),
+            .modelDelete(id: ModelId(10), index: 0, count: 1, itemIds: [ItemId(1)]),
+            .modelUpdate(id: ModelId(10), index: 0, items: sampleItems),
+            .modelResetRange(id: ModelId(10), startIndex: 0, items: sampleItems, totalCount: 100)
+        ]
+
+        for op in ops {
+            let data = try encodeOperation(op)
+            let decoded = try decodeOperation(from: data)
+            XCTAssertEqual(op, decoded, "Failed roundtrip for op variant: \(op)")
+        }
+    }
+
+    // MARK: - Top-Level SruiMessage Wire Variants Roundtrip
+
+    func testTopLevelSruiMessageVariantsRoundtrip() throws {
+        // 1. ClientHello
+        var helloMsg = SRUIMessage()
+        var hello = SRUIClientHello()
+        hello.coreVersion = "0.4.0"
+        hello.profiles = ["core", "widgets.standard"]
+        helloMsg.clientHello = hello
+
+        let helloData = try encodeFramedMessage(helloMsg)
+        let helloDecoded = try decodeFramedMessage(from: helloData)
+        XCTAssertEqual(helloDecoded.clientHello.coreVersion, "0.4.0")
+
+        // 2. ServerWelcome
+        var welcomeMsg = SRUIMessage()
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = "0.4.0"
+        welcome.sessionID = "session-12345"
+        welcome.initialRevision = 100
+        welcomeMsg.serverWelcome = welcome
+
+        let welcomeData = try encodeFramedMessage(welcomeMsg)
+        let welcomeDecoded = try decodeFramedMessage(from: welcomeData)
+        XCTAssertEqual(welcomeDecoded.serverWelcome.sessionID, "session-12345")
+        XCTAssertEqual(welcomeDecoded.serverWelcome.initialRevision, 100)
+
+        // 3. ClientResume
+        var resumeMsg = SRUIMessage()
+        var resume = SRUIClientResume()
+        resume.sessionID = "session-12345"
+        resume.lastAppliedRevision = 42
+        resumeMsg.clientResume = resume
+
+        let resumeData = try encodeFramedMessage(resumeMsg)
+        let resumeDecoded = try decodeFramedMessage(from: resumeData)
+        XCTAssertEqual(resumeDecoded.clientResume.lastAppliedRevision, 42)
+
+        // 4. ServerResumeOk
+        var resumeOkMsg = SRUIMessage()
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "session-12345"
+        resumeOk.replayFromRevision = 50
+        resumeOkMsg.serverResumeOk = resumeOk
+
+        let resumeOkData = try encodeFramedMessage(resumeOkMsg)
+        let resumeOkDecoded = try decodeFramedMessage(from: resumeOkData)
+        XCTAssertEqual(resumeOkDecoded.serverResumeOk.replayFromRevision, 50)
+
+
+        // 5. ServerResyncRequired
+        var resyncMsg = SRUIMessage()
+        var resync = SRUIServerResyncRequired()
+        resync.reason = "Journal evicted"
+        resyncMsg.serverResyncRequired = resync
+
+        let resyncData = try encodeFramedMessage(resyncMsg)
+        let resyncDecoded = try decodeFramedMessage(from: resyncData)
+        XCTAssertEqual(resyncDecoded.serverResyncRequired.reason, "Journal evicted")
+    }
+
     // MARK: - §26 Mandatory Limits Rejection Tests
 
     func testOversizedFrameRejectedCleanly() throws {
@@ -336,6 +459,72 @@ final class DecoderTests: XCTestCase {
         }
     }
 
+    func testMaxListElementsLimitRejectedCleanly() throws {
+        var customLimits = StoreLimits()
+        customLimits.maxListElements = 5
+
+        var wireList = Srui_Protocol_ValueList()
+        for i in 1...10 {
+            var item = SRUIValue()
+            item.intValue = Int64(i)
+            wireList.values.append(item)
+        }
+        var wireVal = SRUIValue()
+        wireVal.listValue = wireList
+
+        let data = try wireVal.serializedData()
+        XCTAssertThrowsError(try decodeValue(from: data, limits: customLimits)) { error in
+            guard case ProtocolDecodeError.maxListElementsExceeded(let limit, let actual) = error else {
+                XCTFail("Expected maxListElementsExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 5)
+            XCTAssertEqual(actual, 10)
+        }
+    }
+
+    func testMaxRecordPropertiesLimitRejectedCleanly() throws {
+        var customLimits = StoreLimits()
+        customLimits.maxRecordProperties = 3
+
+        var rec = Srui_Protocol_SmallRecord()
+        rec.type = TypeRef.standard(1).toWire()
+        for i in 1...5 {
+            var prop = SRUIProperty()
+            prop.property = PropertyRef.standard(UInt32(i)).toWire()
+            var val = SRUIValue()
+            val.intValue = Int64(i)
+            prop.value = val
+            rec.properties.append(prop)
+        }
+        var wireVal = SRUIValue()
+        wireVal.recordValue = rec
+
+        let data = try wireVal.serializedData()
+        XCTAssertThrowsError(try decodeValue(from: data, limits: customLimits)) { error in
+            guard case ProtocolDecodeError.maxRecordPropertiesExceeded(let limit, let actual) = error else {
+                XCTFail("Expected maxRecordPropertiesExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 3)
+            XCTAssertEqual(actual, 5)
+        }
+    }
+
+    func testInvalidResourceHashLengthRejectedCleanly() throws {
+        var wireVal = SRUIValue()
+        wireVal.resourceHash = Data([0x01, 0x02, 0x03]) // Only 3 bytes instead of 32
+
+        let data = try wireVal.serializedData()
+        XCTAssertThrowsError(try decodeValue(from: data)) { error in
+            guard case ProtocolDecodeError.invalidResourceHashLength(let len) = error else {
+                XCTFail("Expected invalidResourceHashLength, got \(error)")
+                return
+            }
+            XCTAssertEqual(len, 3)
+        }
+    }
+
     func testOversizedModelItemsRejectedCleanly() throws {
         let fileURL = malformedVectorsDir.appendingPathComponent("oversized_model_items.bin")
         let data = try Data(contentsOf: fileURL)
@@ -347,6 +536,51 @@ final class DecoderTests: XCTestCase {
             }
             XCTAssertEqual(limit, 10_000)
             XCTAssertEqual(actual, 10_005)
+        }
+    }
+
+    func testModelUpdateAndResetRangeItemsLimitRejectedCleanly() throws {
+        var customLimits = StoreLimits()
+        customLimits.maxItemsPerModelOperation = 2
+
+        var item = SRUIModelItem()
+        item.itemID = 1
+        var val = SRUIValue()
+        val.intValue = 1
+        item.value = val
+
+        // 1. ModelUpdate with 3 items
+        var updateOp = SRUIOperation()
+        var update = Srui_Protocol_ModelUpdateOp()
+        update.modelID = 10
+        update.items = [item, item, item]
+        updateOp.modelUpdate = update
+
+        let updateData = try updateOp.serializedData()
+        XCTAssertThrowsError(try decodeOperation(from: updateData, limits: customLimits)) { error in
+            guard case ProtocolDecodeError.maxItemsPerModelOperationExceeded(let limit, let actual) = error else {
+                XCTFail("Expected maxItemsPerModelOperationExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 2)
+            XCTAssertEqual(actual, 3)
+        }
+
+        // 2. ModelResetRange with 3 items
+        var resetOp = SRUIOperation()
+        var reset = Srui_Protocol_ModelResetRangeOp()
+        reset.modelID = 10
+        reset.items = [item, item, item]
+        resetOp.modelResetRange = reset
+
+        let resetData = try resetOp.serializedData()
+        XCTAssertThrowsError(try decodeOperation(from: resetData, limits: customLimits)) { error in
+            guard case ProtocolDecodeError.maxItemsPerModelOperationExceeded(let limit, let actual) = error else {
+                XCTFail("Expected maxItemsPerModelOperationExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 2)
+            XCTAssertEqual(actual, 3)
         }
     }
 
@@ -394,6 +628,56 @@ final class DecoderTests: XCTestCase {
             }
             XCTAssertEqual(field, "Event.eventType")
         }
+    }
+
+    func testTransactionFailClosedWhenSingleOpViolatesLimit() throws {
+        var customLimits = StoreLimits()
+        customLimits.maxStringLength = 10
+
+        // Transaction with 3 valid ops and 1 op with an oversized string
+        var wireTxn = SRUITransaction()
+        wireTxn.baseRevision = 1
+        wireTxn.newRevision = 2
+
+        var validOp1 = SRUIOperation()
+        var del1 = Srui_Protocol_DeleteNodeOp()
+        del1.nodeID = 10
+        validOp1.deleteNode = del1
+
+        var invalidOp = SRUIOperation()
+        var set = Srui_Protocol_SetPropertyOp()
+        set.nodeID = 20
+        set.property = PropertyRef.standard(1).toWire()
+        var strVal = SRUIValue()
+        strVal.stringValue = "This string is way too long for 10 bytes limit"
+        set.value = strVal
+        invalidOp.setProperty = set
+
+        var validOp2 = SRUIOperation()
+        var del2 = Srui_Protocol_DeleteNodeOp()
+        del2.nodeID = 30
+        validOp2.deleteNode = del2
+
+        wireTxn.operations = [validOp1, invalidOp, validOp2]
+
+        let txnData = try wireTxn.serializedData()
+
+        let store = SemanticStore(limits: customLimits, revision: Revision(1))
+        let originalSnapshot = store
+
+        // Decoding MUST fail closed without returning a partial transaction
+        XCTAssertThrowsError(try decodeTransaction(from: txnData, limits: customLimits)) { error in
+            guard case ProtocolDecodeError.maxStringLengthExceeded(let limit, let actual) = error else {
+                XCTFail("Expected maxStringLengthExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 10)
+            XCTAssertEqual(actual, "This string is way too long for 10 bytes limit".utf8.count)
+        }
+
+        // Store state untouched
+        XCTAssertEqual(store.revision, originalSnapshot.revision)
+        XCTAssertEqual(store.nodeCount, originalSnapshot.nodeCount)
     }
 
     // MARK: - §22.2 Thread Safety / Off-Main Execution Test

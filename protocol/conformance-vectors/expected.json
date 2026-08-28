@@ -1,0 +1,137 @@
+{
+  "version": "0.4.0",
+  "namespace": 0,
+  "vectors": {
+    "golden_node_record": {
+      "file": "golden_node_record.bin",
+      "sha256": "3a5b06a9ac9fed0b462dfc9c75c32c38ab52872a782df5370f6dd5679161a506",
+      "hex": "082a1202100b18012a0e0a0210011208320644656c6574652a0c0a02100312065204080210032a080a02100712021001",
+      "byte_length": 48,
+      "expected": {
+        "node_id": 42,
+        "type": {
+          "namespace_id": 0,
+          "local_id": 11,
+          "name": "Button"
+        },
+        "parent_id": 1,
+        "child_index": 0,
+        "properties": [
+          {
+            "property": {
+              "namespace_id": 0,
+              "local_id": 1,
+              "name": "label"
+            },
+            "value": {
+              "string_value": "Delete"
+            }
+          },
+          {
+            "property": {
+              "namespace_id": 0,
+              "local_id": 3,
+              "name": "role"
+            },
+            "value": {
+              "enum_value": {
+                "enum_id": 2,
+                "enum_name": "ActionRole",
+                "value_id": 3,
+                "value_name": "destructive"
+              }
+            }
+          },
+          {
+            "property": {
+              "namespace_id": 0,
+              "local_id": 7,
+              "name": "enabled"
+            },
+            "value": {
+              "bool_value": true
+            }
+          }
+        ]
+      }
+    },
+    "golden_transaction": {
+      "file": "golden_transaction.bin",
+      "sha256": "25c564b5ab57e9d22be057b2edb12feb013e0a5a8d0b95209dbeb6400f3f343b",
+      "hex": "086810691a270a250a23081312021009180220032a170a02100c1211320f3237207465737473207061737365641a131a1108041202100d1a0929b81e85eb51b8e63f1a206a1e0813121a0a02101612145a12090000000000005e401100000000000038402001",
+      "byte_length": 102,
+      "expected": {
+        "base_revision": 104,
+        "new_revision": 105,
+        "priority": 1,
+        "operations": [
+          {
+            "op_type": "CREATE_NODE",
+            "op_id": 1,
+            "create_node": {
+              "node": {
+                "node_id": 19,
+                "type": {
+                  "namespace_id": 0,
+                  "local_id": 9,
+                  "name": "Text"
+                },
+                "parent_id": 2,
+                "child_index": 3,
+                "properties": [
+                  {
+                    "property": {
+                      "namespace_id": 0,
+                      "local_id": 12,
+                      "name": "text"
+                    },
+                    "value": {
+                      "string_value": "27 tests passed"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "op_type": "SET_PROPERTY",
+            "op_id": 3,
+            "set_property": {
+              "node_id": 4,
+              "property": {
+                "namespace_id": 0,
+                "local_id": 13,
+                "name": "value"
+              },
+              "value": {
+                "float_value": 0.71
+              }
+            }
+          },
+          {
+            "op_type": "BATCH_PROPERTY_SET",
+            "op_id": 13,
+            "batch_property_set": {
+              "node_id": 19,
+              "properties": [
+                {
+                  "property": {
+                    "namespace_id": 0,
+                    "local_id": 22,
+                    "name": "minimum_size"
+                  },
+                  "value": {
+                    "size_value": {
+                      "width": 120.0,
+                      "height": 24.0
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -194,3 +194,42 @@ def test_round_trip_yaml_matches_canonical_registry() -> None:
     round_tripped = yaml.safe_load(yaml.safe_dump(registry, sort_keys=False))
     result = validate_registry_data(round_tripped)
     assert result.ok
+
+
+def test_expected_json_matches_fixtures_and_registry() -> None:
+    import hashlib
+
+    spec_path = REGISTRY_PATH.parent / "conformance-vectors" / "expected.json"
+    assert spec_path.exists(), f"Missing {spec_path}"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+
+    registry = load_registry(REGISTRY_PATH)
+    node_types_by_id = {entry["id"]: entry["name"] for entry in registry["node_types"]}
+    properties_by_id = {entry["id"]: entry["name"] for entry in registry["properties"]}
+    enums_by_id = {entry["id"]: entry["name"] for entry in registry["enums"]}
+
+    vectors = spec["vectors"]
+    assert "golden_node_record" in vectors
+    assert "golden_transaction" in vectors
+
+    for key, vector in vectors.items():
+        filename = vector["file"]
+        fixture_path = REGISTRY_PATH.parent / "conformance-vectors" / filename
+        assert fixture_path.exists(), f"Fixture file missing: {fixture_path}"
+        data = fixture_path.read_bytes()
+
+        assert len(data) == vector["byte_length"]
+        assert hashlib.sha256(data).hexdigest() == vector["sha256"]
+        assert data.hex() == vector["hex"]
+
+    # Validate node record IDs in expected.json against registry
+    node_exp = vectors["golden_node_record"]["expected"]
+    type_id = node_exp["type"]["local_id"]
+    assert node_types_by_id[type_id] == node_exp["type"]["name"]
+
+    for prop in node_exp["properties"]:
+        prop_id = prop["property"]["local_id"]
+        assert properties_by_id[prop_id] == prop["property"]["name"]
+        if "enum_value" in prop["value"]:
+            ev = prop["value"]["enum_value"]
+            assert enums_by_id[ev["enum_id"]] == ev["enum_name"]

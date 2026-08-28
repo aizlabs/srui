@@ -715,7 +715,14 @@ impl SemanticStore {
                 } else {
                     Some(NodeId::new(rec.parent_id))
                 };
-                let child_index = Some(rec.child_index as usize);
+                // In wire protocol (§16), child_index is uint32. If parent_id is None (root),
+                // child_index is None. If child_index == u32::MAX (0xFFFFFFFF), it signals
+                // append-at-end (None). Otherwise, Some(child_index as usize) specifies exact insertion index.
+                let child_index = if parent_id.is_none() || rec.child_index == u32::MAX {
+                    None
+                } else {
+                    Some(rec.child_index as usize)
+                };
 
                 let mut properties = Vec::with_capacity(rec.properties.len());
                 for wire_prop in &rec.properties {
@@ -764,7 +771,12 @@ impl SemanticStore {
                 } else {
                     Some(NodeId::new(op.new_parent_id))
                 };
-                let new_child_index = Some(op.new_child_index as usize);
+                // If new_parent_id is None or new_child_index == u32::MAX, treat as None (append-at-end).
+                let new_child_index = if new_parent_id.is_none() || op.new_child_index == u32::MAX {
+                    None
+                } else {
+                    Some(op.new_child_index as usize)
+                };
                 self.move_node(id, new_parent_id, new_child_index)?;
                 Ok(())
             }

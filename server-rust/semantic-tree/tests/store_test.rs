@@ -581,4 +581,92 @@ fn test_apply_protobuf_wire_operations() {
     store.apply_operation(&del_op).expect("apply del_op");
     assert_eq!(store.is_empty(), true);
     assert_eq!(store.is_id_used(NodeId::new(100)), true);
+
+    // 5. Create children with exact index vs append sentinel (u32::MAX)
+    let root_op = srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::CreateNode(
+            srui_protocol::CreateNodeOp {
+                node: Some(srui_protocol::NodeRecord {
+                    node_id: 1,
+                    r#type: Some(TypeRef::SURFACE.into()),
+                    parent_id: 0,
+                    child_index: 0,
+                    properties: vec![],
+                }),
+            },
+        )),
+    };
+    store.apply_operation(&root_op).expect("create root");
+
+    // First child at index 0
+    let child1 = srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::CreateNode(
+            srui_protocol::CreateNodeOp {
+                node: Some(srui_protocol::NodeRecord {
+                    node_id: 2,
+                    r#type: Some(TypeRef::BUTTON.into()),
+                    parent_id: 1,
+                    child_index: 0,
+                    properties: vec![],
+                }),
+            },
+        )),
+    };
+    store.apply_operation(&child1).expect("create child1 at 0");
+
+    // Second child appended using u32::MAX sentinel
+    let child2 = srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::CreateNode(
+            srui_protocol::CreateNodeOp {
+                node: Some(srui_protocol::NodeRecord {
+                    node_id: 3,
+                    r#type: Some(TypeRef::TEXT.into()),
+                    parent_id: 1,
+                    child_index: u32::MAX,
+                    properties: vec![],
+                }),
+            },
+        )),
+    };
+    store.apply_operation(&child2).expect("create child2 with append sentinel");
+    assert_eq!(
+        store.children_of(NodeId::new(1)),
+        Some(&[NodeId::new(2), NodeId::new(3)][..])
+    );
+
+    // Third child inserted at index 1 (between 2 and 3)
+    let child3 = srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::CreateNode(
+            srui_protocol::CreateNodeOp {
+                node: Some(srui_protocol::NodeRecord {
+                    node_id: 4,
+                    r#type: Some(TypeRef::TOGGLE.into()),
+                    parent_id: 1,
+                    child_index: 1,
+                    properties: vec![],
+                }),
+            },
+        )),
+    };
+    store.apply_operation(&child3).expect("create child3 at 1");
+    assert_eq!(
+        store.children_of(NodeId::new(1)),
+        Some(&[NodeId::new(2), NodeId::new(4), NodeId::new(3)][..])
+    );
+
+    // Move child 2 to end using append sentinel
+    let move_op = srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::MoveNode(
+            srui_protocol::MoveNodeOp {
+                node_id: 2,
+                new_parent_id: 1,
+                new_child_index: u32::MAX,
+            },
+        )),
+    };
+    store.apply_operation(&move_op).expect("move child 2 to end");
+    assert_eq!(
+        store.children_of(NodeId::new(1)),
+        Some(&[NodeId::new(4), NodeId::new(3), NodeId::new(2)][..])
+    );
 }

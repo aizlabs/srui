@@ -3,7 +3,19 @@ use srui_protocol::{
     srui_message, ClientHello, ClientLimits, FramingError, SruiCodec, SruiMessage, Transaction,
 };
 use tokio::io::{duplex, AsyncWriteExt};
-use tokio_util::codec::{FramedRead, FramedWrite};
+use tokio_util::codec::{Decoder, FramedRead, FramedWrite};
+
+#[test]
+fn test_malformed_overlong_varint_returns_decode_error() {
+    let mut codec = SruiCodec::new();
+    let mut buf = bytes::BytesMut::from(&[0x80u8; 11][..]);
+
+    let err = codec
+        .decode(&mut buf)
+        .expect_err("11 bytes of continuation varint should not return Ok(None)");
+
+    assert!(matches!(err, FramingError::DecodeError(_)));
+}
 
 #[tokio::test]
 async fn test_async_codec_roundtrip() {

@@ -81,12 +81,6 @@ pub fn decode_framed_with_limit<M: Message + Default>(
     mut buf: &[u8],
     max_frame_size: usize,
 ) -> Result<M, FramingError> {
-    if buf.len() > max_frame_size.saturating_add(10) {
-        return Err(FramingError::FrameSizeLimitExceeded {
-            limit: max_frame_size,
-            actual: buf.len(),
-        });
-    }
     let mut peek_buf = buf;
     if let Ok(varint_len) = prost::decode_length_delimiter(&mut peek_buf) {
         if varint_len > max_frame_size {
@@ -142,5 +136,27 @@ mod tests {
         let decode_err = decode_framed_with_limit::<SruiMessage>(&valid_bytes, 2)
             .expect_err("decode exceeding frame size");
         assert!(matches!(decode_err, FramingError::FrameSizeLimitExceeded { limit: 2, .. }));
+    }
+
+    #[test]
+    fn test_decode_framed_with_limit_ignores_buffer_padding() {
+        let msg = SruiMessage {
+            msg: Some(srui_message::Msg::Transaction(Transaction {
+                base_revision: 10,
+                new_revision: 11,
+                priority: 1,
+                operations: vec![],
+            })),
+        };
+
+        let framed = encode_framed(&msg).expect("encode framed");
+        assert!(framed.len() <= 100);
+
+        let mut large_buf = vec![0u8; 1024 * 1024];
+        large_buf[..framed.len()].copy_from_slice(&framed);
+
+        let decoded: SruiMessage =
+            decode_framed_with_limit(&large_buf, DEFAULT_MAX_FRAME_SIZE).expect("decode framed");
+        assert_eq!(msg, decoded);
     }
 }

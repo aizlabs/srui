@@ -123,8 +123,15 @@ public struct Property: Hashable, Equatable, Sendable, CustomStringConvertible {
     }
 
     public init(wire: SRUIProperty) throws {
+        guard wire.hasProperty else {
+            throw ValueConversionError.missingField("property")
+        }
         self.property = PropertyRef(wire: wire.property)
-        self.value = try Value(wire: wire.value)
+        if wire.hasValue {
+            self.value = try Value(wire: wire.value)
+        } else {
+            self.value = .null
+        }
     }
 
     public func toWire() -> SRUIProperty {

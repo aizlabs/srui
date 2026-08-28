@@ -64,6 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         tokio::select! {
+            Some(res) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(e) = res {
+                    error!("Connection task panicked: {}", e);
+                }
+            }
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _peer_addr)) => {

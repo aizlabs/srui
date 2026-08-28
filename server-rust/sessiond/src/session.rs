@@ -44,6 +44,9 @@ pub enum SessionError {
 
     #[error("lock poisoned")]
     LockPoisoned,
+
+    #[error("client lagged behind transaction broadcast; resync required")]
+    LaggedResyncRequired,
 }
 
 /// Outcome of a [`ClientResume`] handshake request.

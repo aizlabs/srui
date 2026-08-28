@@ -157,7 +157,8 @@ where
                         framed_write.send(envelope).await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("Client lagged behind by {} transaction revisions", skipped);
+                        warn!("Client lagged behind by {} transaction revisions; closing connection to force resync", skipped);
+                        return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         break;

@@ -176,7 +176,7 @@ final class SemanticModelTests: XCTestCase {
         XCTAssertNil(p3.standardName)
     }
 
-    func testWireProtoConversion() {
+    func testWireProtoConversion() throws {
         let typeRef = TypeRef(namespaceID: 0, localID: 11)
         let wireType = typeRef.toWire()
         XCTAssertEqual(wireType.namespaceID, 0)
@@ -190,6 +190,28 @@ final class SemanticModelTests: XCTestCase {
         XCTAssertEqual(wireProp.localID, 1)
         let backProp = PropertyRef(wire: wireProp)
         XCTAssertEqual(propRef, backProp)
+
+        // Valid Property roundtrip
+        let property = Property(property: PropertyRef.standard(1), value: .string("Hello"))
+        let wireProperty = property.toWire()
+        let backProperty = try Property(wire: wireProperty)
+        XCTAssertEqual(property, backProperty)
+
+        // Missing property field must throw ValueConversionError.missingField("property")
+        var emptyWireProperty = SRUIProperty()
+        XCTAssertThrowsError(try Property(wire: emptyWireProperty)) { error in
+            guard case ValueConversionError.missingField(let field) = error else {
+                XCTFail("Expected missingField error, got \(error)")
+                return
+            }
+            XCTAssertEqual(field, "property")
+        }
+
+        // Missing value field defaults to Value.null
+        emptyWireProperty.property = PropertyRef.standard(1).toWire()
+        let defaultedProperty = try Property(wire: emptyWireProperty)
+        XCTAssertEqual(defaultedProperty.property, PropertyRef.standard(1))
+        XCTAssertEqual(defaultedProperty.value, .null)
     }
 
     func testResolveKnownRegistryNodeTypes() {

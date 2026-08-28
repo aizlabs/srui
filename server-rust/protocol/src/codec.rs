@@ -55,7 +55,11 @@ impl Decoder for SruiCodec {
         let varint_len = match prost::decode_length_delimiter(&mut peek_buf) {
             Ok(len) => len,
             Err(_) => {
-                // Not enough bytes to decode the varint length prefix yet; wait for more data
+                if src.len() >= 10 {
+                    return Err(FramingError::DecodeError(
+                        "malformed or overlong varint length prefix (exceeds 10 bytes)".to_string(),
+                    ));
+                }
                 return Ok(None);
             }
         };

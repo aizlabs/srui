@@ -622,10 +622,13 @@ extension TransactionApplier {
     /// Decodes and applies a protobuf wire `SRUITransaction` atomically (§12.1, §16).
     public func apply(wire: SRUITransaction) -> Result<Revision, TxnError> {
         do {
-            let record = try Transaction(wire: wire)
+            let data = try wire.serializedData()
+            let record = try decodeTransaction(from: data, limits: store.limits)
             return apply(record: record)
+        } catch let error as ProtocolDecodeError {
+            return .failure(.wireError(error.description))
         } catch {
-            return .failure(.wireError(error.localizedDescription))
+            return .failure(.wireError(String(describing: error)))
         }
     }
 }
@@ -633,13 +636,17 @@ extension TransactionApplier {
 extension SemanticStore {
     /// Applies a protobuf wire operation directly to this store (§13, §16).
     public mutating func apply(wire: SRUIOperation) throws {
-        let op = try StoreOperation(wire: wire)
+        let data = try wire.serializedData()
+        let op = try decodeOperation(from: data, limits: limits)
         try apply(op)
     }
 
     /// Applies a list of protobuf wire operations atomically (§12.1, §16).
     public mutating func apply(wireOperations: [SRUIOperation]) throws {
-        let ops = try wireOperations.map { try StoreOperation(wire: $0) }
+        let ops = try wireOperations.map { wireOp in
+            let data = try wireOp.serializedData()
+            return try decodeOperation(from: data, limits: limits)
+        }
         try apply(ops)
     }
 

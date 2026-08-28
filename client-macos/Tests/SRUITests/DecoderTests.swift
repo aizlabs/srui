@@ -584,6 +584,27 @@ final class DecoderTests: XCTestCase {
         }
     }
 
+    func testModelDeleteItemsLimitRejectedCleanly() throws {
+        var customLimits = StoreLimits()
+        customLimits.maxItemsPerModelOperation = 2
+
+        var deleteOp = SRUIOperation()
+        var delete = Srui_Protocol_ModelDeleteOp()
+        delete.modelID = 10
+        delete.itemIds = [1, 2, 3]
+        deleteOp.modelDelete = delete
+
+        let deleteData = try deleteOp.serializedData()
+        XCTAssertThrowsError(try decodeOperation(from: deleteData, limits: customLimits)) { error in
+            guard case ProtocolDecodeError.maxItemsPerModelOperationExceeded(let limit, let actual) = error else {
+                XCTFail("Expected maxItemsPerModelOperationExceeded, got \(error)")
+                return
+            }
+            XCTAssertEqual(limit, 2)
+            XCTAssertEqual(actual, 3)
+        }
+    }
+
     func testMalformedProtobufRejectedCleanly() throws {
         let fileURL = malformedVectorsDir.appendingPathComponent("malformed_protobuf.bin")
         let data = try Data(contentsOf: fileURL)

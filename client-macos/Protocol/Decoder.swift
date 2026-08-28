@@ -352,6 +352,12 @@ public struct ProtocolDecoder: Sendable {
             return .modelInsert(id: id, index: insert.index, items: items)
 
         case .modelDelete(let del):
+            if del.itemIds.count > limits.maxItemsPerModelOperation {
+                throw ProtocolDecodeError.maxItemsPerModelOperationExceeded(
+                    limit: limits.maxItemsPerModelOperation,
+                    actual: del.itemIds.count
+                )
+            }
             let id = ModelId(del.modelID)
             let index = del.count > 0 ? del.index : nil
             let count = del.count > 0 ? del.count : nil

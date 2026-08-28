@@ -291,6 +291,38 @@ final class TransactionTests: XCTestCase {
         XCTAssertEqual(applier.store.children(of: rootID), [childID])
     }
 
+    func testApplyWireTransactionRejectsOversizedOperationsWithoutStoreMutation() throws {
+        var customLimits = StoreLimits()
+        customLimits.maxTransactionOperations = 2
+
+        var wireTxn = SRUITransaction()
+        wireTxn.baseRevision = Revision.initial.value
+        wireTxn.newRevision = Revision(1).value
+        var ops: [SRUIOperation] = []
+        for i in 1...3 {
+            var op = SRUIOperation()
+            var del = Srui_Protocol_DeleteNodeOp()
+            del.nodeID = UInt64(i)
+            op.deleteNode = del
+            ops.append(op)
+        }
+        wireTxn.operations = ops
+
+        let applier = TransactionApplier(limits: customLimits)
+        let originalRevision = applier.store.revision
+        let originalNodeCount = applier.store.nodeCount
+
+        let res = applier.apply(wire: wireTxn)
+        guard case .failure(.wireError(let message)) = res else {
+            XCTFail("Expected wireError failure, got \(res)")
+            return
+        }
+        XCTAssertTrue(message.contains("max limit of 2"))
+
+        XCTAssertEqual(applier.store.revision, originalRevision)
+        XCTAssertEqual(applier.store.nodeCount, originalNodeCount)
+    }
+
     func testIntermediateFailureRollsBackEntireTransaction() {
         let applier = TransactionApplier()
 

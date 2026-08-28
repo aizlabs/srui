@@ -1,0 +1,104 @@
+{
+  "name": "valid_multi_op_transaction",
+  "description": "Atomic multi-operation transaction creating a root Surface, child Column, Button, and Text, advancing revision from 0 to 1 (§4.5, §6.2, §12.1, §13).",
+  "spec_sections": ["§4.5", "§6.2", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 1,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "label": "Main Window",
+          "visibility": { "enum": "Visibility", "value": "visible" }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Column",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "spacing_role": { "enum": "SpacingRole", "value": "normal" }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Button",
+        "parent_id": 2,
+        "child_index": 0,
+        "properties": {
+          "label": "Save Changes",
+          "role": { "enum": "ActionRole", "value": "primary" },
+          "enabled": true
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 4,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": 1,
+        "properties": {
+          "text": "Status: Ready",
+          "role": { "enum": "TextRole", "value": "status" }
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 1,
+    "store_state": {
+      "node_count": 4,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [2],
+          "properties": {
+            "label": "Main Window"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Column",
+          "parent_id": 1,
+          "ordered_children": [3, 4],
+          "properties": {}
+        },
+        "3": {
+          "node_id": 3,
+          "node_type": "Button",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "label": "Save Changes",
+            "enabled": true
+          }
+        },
+        "4": {
+          "node_id": 4,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "Status: Ready"
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

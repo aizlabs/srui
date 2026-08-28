@@ -1,0 +1,116 @@
+{
+  "name": "valid_model_operations",
+  "description": "Atomic transaction performing full collection model lifecycle operations: CREATE_MODEL, MODEL_INSERT, MODEL_UPDATE, MODEL_RESET_RANGE, and MODEL_DELETE (§8, §13).",
+  "spec_sections": ["§8", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_MODEL",
+        "model_id": 10,
+        "model_type": "Table",
+        "item_count": 100
+      },
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 0,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "Initial Row A",
+            "properties": {
+              "text": "Row A"
+            }
+          },
+          {
+            "item_id": 102,
+            "value": "Initial Row B",
+            "properties": {
+              "text": "Row B"
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_UPDATE",
+        "model_id": 10,
+        "index": null,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "Updated Row A",
+            "properties": {
+              "text": "Row A Modified"
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_RESET_RANGE",
+        "model_id": 10,
+        "start_index": 0,
+        "total_count": null,
+        "items": [
+          {
+            "item_id": 201,
+            "value": "Replaced Row 1",
+            "properties": {
+              "text": "R1"
+            }
+          },
+          {
+            "item_id": 202,
+            "value": "Replaced Row 2",
+            "properties": {
+              "text": "R2"
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_DELETE",
+        "model_id": 10,
+        "index": null,
+        "count": null,
+        "item_ids": [201]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 1,
+    "store_state": {
+      "node_count": 0,
+      "roots": [],
+      "nodes": {},
+      "model_count": 1,
+      "models": {
+        "10": {
+          "model_id": 10,
+          "model_type": "Table",
+          "item_count": 101,
+          "cached_item_count": 1,
+          "cached_ranges": [
+            {
+              "start": 0,
+              "length": 1
+            }
+          ],
+          "items": {
+            "0": {
+              "item_id": 202,
+              "value": "Replaced Row 2",
+              "properties": {
+                "text": "R2"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

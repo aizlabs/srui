@@ -1,0 +1,64 @@
+{
+  "name": "exceed_max_tree_depth_rejected",
+  "description": "Attempting to create a node exceeding the configured max_tree_depth limit is rejected with max_tree_depth_exceeded (§26).",
+  "spec_sections": ["§26"],
+  "initial_limits": {
+    "max_tree_depth": 3
+  },
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Column",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Row",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {}
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 4,
+        "node_type": "Button",
+        "parent_id": 3,
+        "child_index": null,
+        "properties": {
+          "label": "Deep Button"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "max_tree_depth_exceeded",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

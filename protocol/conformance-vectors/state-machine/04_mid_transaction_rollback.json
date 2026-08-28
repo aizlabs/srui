@@ -1,0 +1,50 @@
+{
+  "name": "mid_transaction_rollback",
+  "description": "When an operation in a multi-operation transaction fails midway, the entire transaction is rolled back with zero side effects (§4.5, §12.1).",
+  "spec_sections": ["§4.5", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 1,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "label": "Staged Surface"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Button",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "label": "Staged Button"
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Text",
+        "parent_id": 999,
+        "child_index": null,
+        "properties": {
+          "text": "Invalid Orphan Child"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "parent_not_found",
+    "failed_op_index": 2,
+    "expected_store_revision": 0,
+    "rollback_verified": true
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "name": "exceed_max_operations_rejected",
+  "description": "A transaction containing more operations than permitted by max_transaction_operations is rejected during pre-check with max_operations_exceeded (§26).",
+  "spec_sections": ["§26"],
+  "initial_limits": {
+    "max_transaction_operations": 2
+  },
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 1,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {}
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Column",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {}
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Button",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {}
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "max_operations_exceeded",
+    "expected_store_revision": 0,
+    "rollback_verified": true
+  }
+}

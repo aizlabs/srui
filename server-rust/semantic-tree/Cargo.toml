@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 srui-protocol = { path = "../protocol" }
 
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"

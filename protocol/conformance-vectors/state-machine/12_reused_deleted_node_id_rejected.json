@@ -1,0 +1,57 @@
+{
+  "name": "reused_deleted_node_id_rejected",
+  "description": "Per §6.2 invariant, a NodeId is session-scoped and must never be reused in the same session even after the original node has been deleted.",
+  "spec_sections": ["§4.6", "§6.2", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 50,
+          "node_type": "Button",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Ephemeral Button"
+          }
+        }
+      ]
+    },
+    {
+      "base_revision": 1,
+      "new_revision": 2,
+      "operations": [
+        {
+          "type": "DELETE_NODE",
+          "node_id": 50
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 2,
+    "new_revision": 3,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 50,
+        "node_type": "Text",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "text": "Reused ID After Deletion"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "node_id_already_used",
+    "failed_op_index": 0,
+    "expected_store_revision": 2,
+    "rollback_verified": true
+  }
+}

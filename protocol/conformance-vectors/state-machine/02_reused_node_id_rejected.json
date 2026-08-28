@@ -1,0 +1,47 @@
+{
+  "name": "reused_node_id_rejected",
+  "description": "Attempting to create a node with an ID already used in this session is rejected with node_id_already_used (§4.6, §6.2, §13).",
+  "spec_sections": ["§4.6", "§6.2", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 42,
+          "node_type": "Button",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Original Button"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 42,
+        "node_type": "Text",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "text": "Conflicting Node"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "node_id_already_used",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

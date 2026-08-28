@@ -1,0 +1,30 @@
+{
+  "name": "orphan_parent_rejected",
+  "description": "Attempting to create a node referencing a non-existent parent node ID is rejected with parent_not_found (§13).",
+  "spec_sections": ["§6.2", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 10,
+        "node_type": "Button",
+        "parent_id": 999,
+        "child_index": null,
+        "properties": {
+          "label": "Orphan Button"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "parent_not_found",
+    "failed_op_index": 0,
+    "expected_store_revision": 0,
+    "rollback_verified": true
+  }
+}

@@ -1,0 +1,166 @@
+{
+  "name": "semantic_not_paint_widget_properties",
+  "description": "Demonstrates the semantic-not-paint invariant: standard widget profile trees define portable meaning, roles, and layout intent without display frames, paint instructions, or mandatory absolute pixel geometry (§4.7, §4.16, §4.17, §7.1, §10, §32.3).",
+  "spec_sections": ["§4.7", "§4.16", "§4.17", "§7.1", "§10", "§12.2", "§32.3"],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_NODE",
+        "node_id": 1,
+        "node_type": "Surface",
+        "parent_id": null,
+        "child_index": null,
+        "properties": {
+          "label": "Deploy Service",
+          "visibility": { "enum": "Visibility", "value": "visible" }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Column",
+        "parent_id": 1,
+        "child_index": null,
+        "properties": {
+          "spacing_role": { "enum": "SpacingRole", "value": "normal" },
+          "padding_role": { "enum": "PaddingRole", "value": "normal" }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "Production Deployment",
+          "role": { "enum": "TextRole", "value": "heading" }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 4,
+        "node_type": "Progress",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "value": 0.72,
+          "enabled": true
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 5,
+        "node_type": "Row",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "horizontal_alignment": { "enum": "HorizontalAlignment", "value": "trailing" },
+          "spacing_role": { "enum": "SpacingRole", "value": "tight" }
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 6,
+        "node_type": "Button",
+        "parent_id": 5,
+        "child_index": null,
+        "properties": {
+          "label": "Cancel",
+          "role": { "enum": "ActionRole", "value": "quiet" },
+          "enabled": true
+        }
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 7,
+        "node_type": "Button",
+        "parent_id": 5,
+        "child_index": null,
+        "properties": {
+          "label": "Deploy Now",
+          "role": { "enum": "ActionRole", "value": "primary" },
+          "enabled": true
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 1,
+    "store_state": {
+      "node_count": 7,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [2],
+          "properties": {
+            "label": "Deploy Service"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Column",
+          "parent_id": 1,
+          "ordered_children": [3, 4, 5],
+          "properties": {}
+        },
+        "3": {
+          "node_id": 3,
+          "node_type": "Text",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "text": "Production Deployment"
+          }
+        },
+        "4": {
+          "node_id": 4,
+          "node_type": "Progress",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "value": 0.72,
+            "enabled": true
+          }
+        },
+        "5": {
+          "node_id": 5,
+          "node_type": "Row",
+          "parent_id": 2,
+          "ordered_children": [6, 7],
+          "properties": {}
+        },
+        "6": {
+          "node_id": 6,
+          "node_type": "Button",
+          "parent_id": 5,
+          "ordered_children": [],
+          "properties": {
+            "label": "Cancel",
+            "enabled": true
+          }
+        },
+        "7": {
+          "node_id": 7,
+          "node_type": "Button",
+          "parent_id": 5,
+          "ordered_children": [],
+          "properties": {
+            "label": "Deploy Now",
+            "enabled": true
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

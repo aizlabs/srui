@@ -5,12 +5,16 @@
 //! - §6.3: State ownership ([`SemanticStore`])
 //! - §6.4: Type and property references, namespaces ([`TypeRef`], [`PropertyRef`], [`STANDARD_NAMESPACE_ID`])
 //! - §6.5: Typed value representation ([`Value`], semantic tuples, lists, small records)
+//! - §12: Persistent object graph and mutation stream
+//! - §12.1: Revisions and transactions ([`Revision`], [`Transaction`], [`Operation`])
+//! - §12.2: Commits are state-consistency boundaries, not render frames
 //! - §13: Core mutation operations ([`SemanticStore`])
 //! - §14: Resource model (large blobs are resources, not properties)
 //! - §26: Mandatory limits ([`StoreLimits`])
 
 pub mod ids;
 pub mod store;
+pub mod transaction;
 pub mod value;
 
 pub use ids::{
@@ -27,8 +31,10 @@ pub use ids::{
 
 pub use store::{
     Node, SemanticStore, StoreError, StoreLimits, DEFAULT_MAX_NODE_COUNT,
-    DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TREE_DEPTH,
+    DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
+
+pub use transaction::{Operation, Revision, Transaction, TxnError};
 
 pub use value::{
     EdgeInsets, EnumToken, Point, Property, Range, Rect, Size, SmallRecord, Value,

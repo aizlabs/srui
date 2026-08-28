@@ -5,10 +5,11 @@ pub mod limits;
 pub mod node;
 
 pub use error::StoreError;
-pub use limits::StoreLimits;
+pub use limits::{StoreLimits, DEFAULT_MAX_TRANSACTION_OPERATIONS};
 pub use node::Node;
 
 use crate::ids::{NodeId, PropertyRef, TypeRef};
+use crate::transaction::Revision;
 use crate::value::{Property, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +20,7 @@ pub const DEFAULT_MAX_NODE_COUNT: usize = 100_000;
 /// Default maximum allowed property string length in bytes (§26).
 pub const DEFAULT_MAX_STRING_LENGTH: usize = 1024 * 1024; // 1 MiB
 
-/// Authoritative in-memory semantic node graph holding the session's active UI tree (§6.2, §6.3).
+/// Authoritative in-memory semantic node graph holding the session's active UI tree (§6.2, §6.3, §12).
 ///
 /// Note: per §6.3, the server `SemanticStore` is the single authoritative source of truth for the
 /// session graph and intentionally does not implement `Clone` to prevent accidental divergent tree copies.
@@ -33,6 +34,8 @@ pub struct SemanticStore {
     used_ids: HashSet<NodeId>,
     /// Mandatory runtime limits enforced by the store (§26).
     limits: StoreLimits,
+    /// Authoritative committed revision counter (§12.1).
+    revision: Revision,
 }
 
 impl Default for SemanticStore {
@@ -42,19 +45,60 @@ impl Default for SemanticStore {
 }
 
 impl SemanticStore {
-    /// Constructs a new `SemanticStore` with default limits (§26).
+    /// Constructs a new `SemanticStore` with default limits and baseline revision 0 (§12.1, §26).
     pub fn new() -> Self {
         Self::with_limits(StoreLimits::default())
     }
 
-    /// Constructs a new `SemanticStore` with configured limits (§26).
+    /// Constructs a new `SemanticStore` with configured limits and baseline revision 0 (§12.1, §26).
     pub fn with_limits(limits: StoreLimits) -> Self {
         Self {
             nodes: HashMap::new(),
             roots: Vec::new(),
             used_ids: HashSet::new(),
             limits,
+            revision: Revision::INITIAL,
         }
+    }
+
+    /// Constructs a new `SemanticStore` with configured limits and initial committed revision (§12.1, §18).
+    pub fn with_limits_and_revision(limits: StoreLimits, revision: Revision) -> Self {
+        Self {
+            nodes: HashMap::new(),
+            roots: Vec::new(),
+            used_ids: HashSet::new(),
+            limits,
+            revision,
+        }
+    }
+
+    /// Returns the store's current committed revision (§12.1).
+    pub fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    /// Returns the store's current committed revision (§12.1).
+    pub fn committed_revision(&self) -> Revision {
+        self.revision
+    }
+
+    /// Creates a private staging clone of the store's node graph for atomic transaction application (§12.1).
+    pub(crate) fn clone_staging(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            roots: self.roots.clone(),
+            used_ids: self.used_ids.clone(),
+            limits: self.limits.clone(),
+            revision: self.revision,
+        }
+    }
+
+    /// Atomically commits a successful staging store and advances the committed revision (§12.1).
+    pub(crate) fn commit_staging(&mut self, staged: Self, new_revision: Revision) {
+        self.nodes = staged.nodes;
+        self.roots = staged.roots;
+        self.used_ids = staged.used_ids;
+        self.revision = new_revision;
     }
 
     /// Returns a reference to the store's configured limits.

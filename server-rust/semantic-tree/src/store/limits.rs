@@ -1,6 +1,9 @@
 use super::error::StoreError;
 use crate::value::Value;
 
+/// Default maximum allowed operations in a single transaction (§26).
+pub const DEFAULT_MAX_TRANSACTION_OPERATIONS: usize = 10_000;
+
 /// Configurable mandatory runtime safety limits for `SemanticStore` (§26).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreLimits {
@@ -16,6 +19,8 @@ pub struct StoreLimits {
     pub max_list_elements: usize,
     /// Maximum allowed property count in a single `SmallRecord`. Default: 1,000.
     pub max_record_properties: usize,
+    /// Maximum allowed mutation operations in a single transaction. Default: 10,000.
+    pub max_transaction_operations: usize,
 }
 
 impl Default for StoreLimits {
@@ -27,6 +32,7 @@ impl Default for StoreLimits {
             max_value_depth: 16,
             max_list_elements: 10_000,
             max_record_properties: 1_000,
+            max_transaction_operations: DEFAULT_MAX_TRANSACTION_OPERATIONS,
         }
     }
 }
@@ -41,6 +47,7 @@ impl StoreLimits {
             max_value_depth: 16,
             max_list_elements: 10_000,
             max_record_properties: 1_000,
+            max_transaction_operations: DEFAULT_MAX_TRANSACTION_OPERATIONS,
         }
     }
 
@@ -60,7 +67,14 @@ impl StoreLimits {
             max_value_depth,
             max_list_elements,
             max_record_properties,
+            max_transaction_operations: DEFAULT_MAX_TRANSACTION_OPERATIONS,
         }
+    }
+
+    /// Returns a copy of `self` with a customized maximum transaction operations limit (§26).
+    pub const fn with_max_transaction_operations(mut self, max: usize) -> Self {
+        self.max_transaction_operations = max;
+        self
     }
 
     /// Validates a `Value` against string length, nesting depth, and collection size limits.

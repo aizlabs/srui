@@ -38,10 +38,17 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Verify SemanticModel does not import AppKit or Cocoa (§1)
+        run: |
+          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then
+            echo "Error: SemanticModel must never import AppKit or Cocoa"
+            exit 1
+          fi
       - name: Build and test client-macos
         run: swift test
         working-directory: client-macos
-      - name: Verify committed Swift protobuf output is fresh
+      - name: Verify committed Swift protobuf and registry output is fresh
         run: |
           ./protocol/generate_proto.sh
-          git diff --exit-code client-macos/Protocol/srui.pb.swift
+          git diff --exit-code client-macos/Protocol/srui.pb.swift client-macos/SemanticModel/RegistryTables.swift

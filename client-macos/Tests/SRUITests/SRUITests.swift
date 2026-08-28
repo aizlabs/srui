@@ -14,12 +14,15 @@ import CryptoKit
 
 final class SRUITests: XCTestCase {
     private var conformanceVectorsDir: URL {
-        let testFileURL = URL(fileURLWithPath: #filePath)
-        let repoRoot = testFileURL
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // client-macos
-            .deletingLastPathComponent() // repo root
-        return repoRoot.appendingPathComponent("protocol/conformance-vectors")
+        var current = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        while current.path != "/" {
+            let candidate = current.appendingPathComponent("protocol/conformance-vectors")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+            current = current.deletingLastPathComponent()
+        }
+        fatalError("Could not locate protocol/conformance-vectors from \(#filePath)")
     }
 
     private func loadExpectedSpec() throws -> [String: Any] {

@@ -35,6 +35,9 @@ let package = Package(
         ),
         .target(
             name: "SemanticModel",
+            dependencies: [
+                "Protocol",
+            ],
             path: "SemanticModel"
         ),
         .target(
@@ -66,7 +69,15 @@ let package = Package(
             path: "Accessibility"
         ),
         .testTarget(
-            name: "Tests",
+            name: "SemanticModelTests",
+            dependencies: [
+                "SemanticModel",
+                "Protocol",
+            ],
+            path: "Tests/SemanticModelTests"
+        ),
+        .testTarget(
+            name: "SRUITests",
             dependencies: [
                 "TransportSSH",
                 "Protocol",
@@ -79,7 +90,7 @@ let package = Package(
                 "Resources",
                 "Accessibility",
             ],
-            path: "Tests"
+            path: "Tests/SRUITests"
         ),
     ]
 )

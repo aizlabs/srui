@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SRUI Protocol Buffers Code Generation Script
+# SRUI Protocol Buffers & Registry Code Generation Script
 # Compiles protocol/srui.proto for Swift (client-macos/Protocol/srui.pb.swift)
-# and validates Rust prost compilation.
+# and generates standard registry tables (client-macos/SemanticModel/RegistryTables.swift).
 # ==============================================================================
 set -euo pipefail
 
@@ -69,7 +69,7 @@ else
 fi
 echo "Using protoc-gen-swift: ${PLUGIN_BIN}"
 
-# 3. Generate Swift Code
+# 3. Generate Swift Protobuf Code
 mkdir -p "${SWIFT_OUT}"
 "${PROTOC_BIN}" \
     --plugin="protoc-gen-swift=${PLUGIN_BIN}" \
@@ -80,4 +80,15 @@ mkdir -p "${SWIFT_OUT}"
 
 echo "Generated Swift protobuf code -> ${SWIFT_OUT}/srui.pb.swift"
 echo "Rust code generation is handled automatically at build time via server-rust/protocol/build.rs (prost-build)."
+
+# 4. Generate Swift Registry Tables
+echo "=== Generating SRUI Registry Tables ==="
+if command -v uv >/dev/null 2>&1; then
+    uv run python "${REPO_ROOT}/protocol/generate_swift_registry.py"
+elif command -v python3 >/dev/null 2>&1; then
+    python3 "${REPO_ROOT}/protocol/generate_swift_registry.py"
+else
+    echo "Warning: Python 3 not found to regenerate Swift registry tables."
+fi
+
 echo "=== SRUI Codegen Complete ==="

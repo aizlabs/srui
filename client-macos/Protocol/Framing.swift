@@ -29,28 +29,28 @@ public enum SRUIFraming {
         try encodeFramed(message, maxFrameSize: defaultMaxFrameSize)
     }
 
-    /// Serializes a message with a varint length prefix, enforcing a custom `maxFrameSize` (§16, §26).
+    /// Serializes a message with a varint length prefix via `BinaryDelimited`, enforcing a custom `maxFrameSize` (§16, §26).
     public static func encodeFramed<M: SwiftProtobuf.Message>(_ message: M, maxFrameSize: Int) throws -> Data {
-        let serialized = try message.serializedData()
-        if serialized.count > maxFrameSize {
-            throw SRUIFramingError.frameSizeLimitExceeded(limit: maxFrameSize, actual: serialized.count)
+        let serializedSize = try message.serializedData().count
+        if serializedSize > maxFrameSize {
+            throw SRUIFramingError.frameSizeLimitExceeded(limit: maxFrameSize, actual: serializedSize)
         }
-        var varintData = Data()
-        var value = UInt64(serialized.count)
-        while value >= 0x80 {
-            varintData.append(UInt8((value & 0x7F) | 0x80))
-            value >>= 7
+        let stream = OutputStream.toMemory()
+        stream.open()
+        defer { stream.close() }
+        try BinaryDelimited.serialize(message: message, to: stream)
+        guard let data = stream.property(forKey: .dataWrittenToMemoryStreamKey) as? Data else {
+            throw SRUIFramingError.truncatedPayload(expected: serializedSize, actual: 0)
         }
-        varintData.append(UInt8(value & 0x7F))
-        return varintData + serialized
+        return data
     }
 
-    /// Decodes a length-delimited message (§16) from Data, enforcing `defaultMaxFrameSize` (§26).
+    /// Decodes a length-delimited message (§16) from Data via `BinaryDelimited`, enforcing `defaultMaxFrameSize` (§26).
     public static func decodeFramed<M: SwiftProtobuf.Message>(_ type: M.Type, from data: Data) throws -> M {
         try decodeFramed(type, from: data, maxFrameSize: defaultMaxFrameSize)
     }
 
-    /// Decodes a length-delimited message (§16) from Data, enforcing a custom `maxFrameSize` (§26).
+    /// Decodes a length-delimited message (§16) from Data via `BinaryDelimited`, enforcing a custom `maxFrameSize` (§26).
     public static func decodeFramed<M: SwiftProtobuf.Message>(_ type: M.Type, from data: Data, maxFrameSize: Int) throws -> M {
         // Read varint length prefix
         var offset = 0

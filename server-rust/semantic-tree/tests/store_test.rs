@@ -226,6 +226,31 @@ fn test_move_node() {
 }
 
 #[test]
+fn test_move_node_same_parent_append_index() {
+    let mut store = SemanticStore::new();
+    let root_id = NodeId::new(1);
+    let col_id = NodeId::new(2);
+    let c1 = NodeId::new(3);
+    let c2 = NodeId::new(4);
+    let c3 = NodeId::new(5);
+
+    store.create_node(root_id, TypeRef::SURFACE, None, None, []).unwrap();
+    store.create_node(col_id, TypeRef::COLUMN, Some(root_id), None, []).unwrap();
+    store.create_node(c1, TypeRef::TEXT, Some(col_id), Some(0), []).unwrap();
+    store.create_node(c2, TypeRef::TEXT, Some(col_id), Some(1), []).unwrap();
+    store.create_node(c3, TypeRef::TEXT, Some(col_id), Some(2), []).unwrap();
+
+    assert_eq!(store.children_of(col_id), Some(&[c1, c2, c3][..]));
+
+    let append_index = store.children_of(col_id).unwrap().len();
+    store
+        .move_node(c2, Some(col_id), Some(append_index))
+        .expect("same-parent append index should be valid");
+
+    assert_eq!(store.children_of(col_id), Some(&[c1, c3, c2][..]));
+}
+
+#[test]
 fn test_move_node_cycle_prevention() {
     let mut store = SemanticStore::new();
     let root_id = NodeId::new(1);

@@ -165,6 +165,7 @@ fn test_standard_registry_lookups() {
     assert_eq!(resolve_standard_node_type("Scroll").unwrap(), TypeRef::SCROLL);
     assert_eq!(resolve_standard_node_type("Text").unwrap(), TypeRef::TEXT);
     assert_eq!(resolve_standard_node_type("RichText").unwrap(), TypeRef::RICHTEXT);
+    assert_eq!(resolve_standard_node_type("RichText").unwrap(), TypeRef::RICH_TEXT);
     assert_eq!(resolve_standard_node_type("Button").unwrap(), TypeRef::BUTTON);
     assert_eq!(resolve_standard_node_type("Toggle").unwrap(), TypeRef::TOGGLE);
     assert_eq!(resolve_standard_node_type("TextInput").unwrap(), TypeRef::TEXT_INPUT);
@@ -182,6 +183,38 @@ fn test_standard_registry_lookups() {
     assert_eq!(resolve_standard_node_type("Split").unwrap(), TypeRef::SPLIT);
     assert_eq!(resolve_standard_node_type("Menu").unwrap(), TypeRef::MENU);
     assert_eq!(resolve_standard_node_type("Toolbar").unwrap(), TypeRef::TOOLBAR);
+
+    // Check all 30 standard property constants match registry.yaml
+    assert_eq!(resolve_standard_property("label").unwrap(), PropertyRef::LABEL);
+    assert_eq!(resolve_standard_property("accessible_description").unwrap(), PropertyRef::ACCESSIBLE_DESCRIPTION);
+    assert_eq!(resolve_standard_property("role").unwrap(), PropertyRef::ROLE);
+    assert_eq!(resolve_standard_property("value_description").unwrap(), PropertyRef::VALUE_DESCRIPTION);
+    assert_eq!(resolve_standard_property("actions").unwrap(), PropertyRef::ACTIONS);
+    assert_eq!(resolve_standard_property("visibility").unwrap(), PropertyRef::VISIBILITY);
+    assert_eq!(resolve_standard_property("enabled").unwrap(), PropertyRef::ENABLED);
+    assert_eq!(resolve_standard_property("read_only").unwrap(), PropertyRef::READ_ONLY);
+    assert_eq!(resolve_standard_property("busy").unwrap(), PropertyRef::BUSY);
+    assert_eq!(resolve_standard_property("selected").unwrap(), PropertyRef::SELECTED);
+    assert_eq!(resolve_standard_property("validation_state").unwrap(), PropertyRef::VALIDATION_STATE);
+    assert_eq!(resolve_standard_property("text").unwrap(), PropertyRef::TEXT);
+    assert_eq!(resolve_standard_property("value").unwrap(), PropertyRef::VALUE);
+    assert_eq!(resolve_standard_property("placeholder").unwrap(), PropertyRef::PLACEHOLDER);
+    assert_eq!(resolve_standard_property("resource").unwrap(), PropertyRef::RESOURCE);
+    assert_eq!(resolve_standard_property("items").unwrap(), PropertyRef::ITEMS);
+    assert_eq!(resolve_standard_property("model_ref").unwrap(), PropertyRef::MODEL_REF);
+    assert_eq!(resolve_standard_property("horizontal_alignment").unwrap(), PropertyRef::HORIZONTAL_ALIGNMENT);
+    assert_eq!(resolve_standard_property("vertical_alignment").unwrap(), PropertyRef::VERTICAL_ALIGNMENT);
+    assert_eq!(resolve_standard_property("grow").unwrap(), PropertyRef::GROW);
+    assert_eq!(resolve_standard_property("shrink").unwrap(), PropertyRef::SHRINK);
+    assert_eq!(resolve_standard_property("minimum_size").unwrap(), PropertyRef::MINIMUM_SIZE);
+    assert_eq!(resolve_standard_property("maximum_size").unwrap(), PropertyRef::MAXIMUM_SIZE);
+    assert_eq!(resolve_standard_property("preferred_size").unwrap(), PropertyRef::PREFERRED_SIZE);
+    assert_eq!(resolve_standard_property("spacing_role").unwrap(), PropertyRef::SPACING_ROLE);
+    assert_eq!(resolve_standard_property("padding_role").unwrap(), PropertyRef::PADDING_ROLE);
+    assert_eq!(resolve_standard_property("presentation_hint").unwrap(), PropertyRef::PRESENTATION_HINT);
+    assert_eq!(resolve_standard_property("action_key").unwrap(), PropertyRef::ACTION_KEY);
+    assert_eq!(resolve_standard_property("columns").unwrap(), PropertyRef::COLUMNS);
+    assert_eq!(resolve_standard_property("selection_mode").unwrap(), PropertyRef::SELECTION_MODE);
 
     // Check all 27 standard node types round-trip with their names
     for (id, name) in STANDARD_NODE_TYPES {

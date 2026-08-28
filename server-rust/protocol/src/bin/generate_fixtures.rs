@@ -127,4 +127,12 @@ fn main() {
     transaction.encode(&mut tx_bytes).expect("encode Transaction");
     fs::write(out_dir.join("golden_transaction.bin"), &tx_bytes).expect("write golden_transaction.bin");
     println!("Wrote golden_transaction.bin ({} bytes)", tx_bytes.len());
+
+    // 3. Construct golden Framed SruiMessage
+    let framed_message = SruiMessage {
+        msg: Some(srui_message::Msg::Transaction(transaction)),
+    };
+    let framed_bytes = encode_framed(&framed_message).expect("encode framed SruiMessage");
+    fs::write(out_dir.join("golden_framed_message.bin"), &framed_bytes).expect("write golden_framed_message.bin");
+    println!("Wrote golden_framed_message.bin ({} bytes)", framed_bytes.len());
 }

@@ -132,6 +132,19 @@
           }
         ]
       }
+    },
+    "golden_framed_message": {
+      "file": "golden_framed_message.bin",
+      "sha256": "33b401728a3e2dcd275b085f73b72a417ca89839d2985e1470406dee4866677e",
+      "hex": "683266086810691a270a250a23081312021009180220032a170a02100c1211320f3237207465737473207061737365641a131a1108041202100d1a0929b81e85eb51b8e63f1a206a1e0813121a0a02101612145a12090000000000005e401100000000000038402001",
+      "byte_length": 105,
+      "expected": {
+        "msg_type": "transaction",
+        "base_revision": 104,
+        "new_revision": 105,
+        "priority": 1,
+        "operation_count": 3
+      }
     }
   }
 }

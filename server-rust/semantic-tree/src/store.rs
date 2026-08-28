@@ -558,13 +558,11 @@ impl SemanticStore {
                 });
             }
 
-            // Child index validation.
+            // Child index validation. Allow `idx == len` for append-at-end, matching
+            // `create_node` (`idx <= parent.ordered_children.len()`). Same-parent moves
+            // include the node in `len`, so the upper bound is always `len + 1`.
             if let Some(idx) = new_child_index {
-                let effective_len = if old_parent_id == Some(new_pid) {
-                    new_parent.ordered_children.len()
-                } else {
-                    new_parent.ordered_children.len() + 1
-                };
+                let effective_len = new_parent.ordered_children.len() + 1;
                 if idx >= effective_len {
                     return Err(StoreError::InvalidChildIndex {
                         index: idx,

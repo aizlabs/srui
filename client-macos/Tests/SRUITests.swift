@@ -393,6 +393,69 @@ final class SRUITests: XCTestCase {
             rustTxBytes,
             "Cross-language mismatch: Swift-encoded Transaction does not match Rust-authored bytes"
         )
+
+        // 3. Cross-language Framed SruiMessage check: Swift framing must be bit-for-bit identical to Rust-authored fixture
+        var msg = Srui_Protocol_SruiMessage()
+        msg.transaction = authoredTx
+        let swiftFramedBytes = try SRUIFraming.encodeFramed(msg)
+        let rustFramedBytes = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent("golden_framed_message.bin"))
+        XCTAssertEqual(
+            swiftFramedBytes,
+            rustFramedBytes,
+            "Cross-language mismatch: Swift-encoded Framed SruiMessage does not match Rust-authored bytes"
+        )
+    }
+
+    func testDecodeGoldenFramedMessageAgainstExpectedJSON() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let framedSpec = vectors["golden_framed_message"] as? [String: Any],
+              let filename = framedSpec["file"] as? String,
+              let expectedHex = framedSpec["hex"] as? String,
+              let expectedSHA256 = framedSpec["sha256"] as? String,
+              let expectedByteLen = framedSpec["byte_length"] as? Int,
+              let expected = framedSpec["expected"] as? [String: Any] else {
+            XCTFail("Malformed expected.json structure for golden_framed_message")
+            return
+        }
+
+        let fileURL = conformanceVectorsDir.appendingPathComponent(filename)
+        let data = try Data(contentsOf: fileURL)
+
+        // 1. Assert raw bytes match canonical specification
+        XCTAssertEqual(data.count, expectedByteLen, "Fixture byte length mismatch")
+        XCTAssertEqual(hexString(from: data), expectedHex, "Fixture hex mismatch")
+        XCTAssertEqual(sha256String(from: data), expectedSHA256, "Fixture SHA256 mismatch")
+
+        // 2. Decode framed message and assert against JSON oracle
+        let decoded = try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: data)
+        XCTAssertEqual(decoded.transaction.baseRevision, UInt64(expected["base_revision"] as? Int ?? -1))
+        XCTAssertEqual(decoded.transaction.newRevision, UInt64(expected["new_revision"] as? Int ?? -1))
+        XCTAssertEqual(decoded.transaction.priority, UInt32(expected["priority"] as? Int ?? -1))
+        XCTAssertEqual(decoded.transaction.operations.count, expected["operation_count"] as? Int ?? -1)
+
+        // 3. Re-encode and verify identical wire bytes
+        let roundtripData = try SRUIFraming.encodeFramed(decoded)
+        XCTAssertEqual(roundtripData, data, "Roundtrip re-encode framed mismatch")
+    }
+
+    func testDirectEncodeGoldenFramedMessageMatchesWireBytes() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let framedSpec = vectors["golden_framed_message"] as? [String: Any],
+              let filename = framedSpec["file"] as? String,
+              let expectedHex = framedSpec["hex"] as? String else {
+            XCTFail("Malformed expected.json structure for golden_framed_message")
+            return
+        }
+
+        let fixtureData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+        var msg = Srui_Protocol_SruiMessage()
+        msg.transaction = createAuthoredTransaction()
+        let encodedData = try SRUIFraming.encodeFramed(msg)
+
+        XCTAssertEqual(hexString(from: encodedData), expectedHex, "Authored Swift Framed SruiMessage hex mismatch")
+        XCTAssertEqual(encodedData, fixtureData, "Authored Swift Framed SruiMessage byte mismatch against golden fixture")
     }
 
     func testLengthDelimitedFraming() throws {

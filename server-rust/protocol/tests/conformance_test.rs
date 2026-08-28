@@ -344,6 +344,69 @@ fn test_cross_language_rust_vs_swift_byte_equality() {
         rust_tx_bytes, golden_tx_bytes,
         "Rust-encoded Transaction does not match golden bytes"
     );
+
+    // 3. Rust-encoded Framed SruiMessage must match golden fixture bit-for-bit
+    let rust_framed_msg = SruiMessage {
+        msg: Some(srui_message::Msg::Transaction(create_authored_transaction())),
+    };
+    let rust_framed_bytes = encode_framed(&rust_framed_msg).unwrap();
+    let golden_framed_bytes = fs::read(vectors_dir.join("golden_framed_message.bin")).unwrap();
+    assert_eq!(
+        rust_framed_bytes, golden_framed_bytes,
+        "Rust-encoded Framed SruiMessage does not match golden bytes"
+    );
+}
+
+#[test]
+fn test_decode_golden_framed_message_against_expected_json() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let framed_spec = &spec["vectors"]["golden_framed_message"];
+
+    let filename = framed_spec["file"].as_str().expect("file name");
+    let expected_hex = framed_spec["hex"].as_str().expect("hex");
+    let expected_byte_len = framed_spec["byte_length"].as_u64().expect("byte_length") as usize;
+    let expected = &framed_spec["expected"];
+
+    let fixture_path = vectors_dir.join(filename);
+    let bytes = fs::read(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to read fixture from {:?}: {}", fixture_path, e));
+
+    // 1. Assert raw bytes match canonical specification
+    assert_eq!(bytes.len(), expected_byte_len, "Fixture byte length mismatch");
+    assert_eq!(to_hex(&bytes), expected_hex, "Fixture hex mismatch");
+
+    // 2. Decode framed message and assert against expected JSON spec
+    let decoded: SruiMessage = decode_framed(&bytes[..]).expect("Decode framed SruiMessage");
+    match decoded.msg {
+        Some(srui_message::Msg::Transaction(ref tx)) => {
+            assert_eq!(tx.base_revision, expected["base_revision"].as_u64().unwrap());
+            assert_eq!(tx.new_revision, expected["new_revision"].as_u64().unwrap());
+            assert_eq!(tx.priority, expected["priority"].as_u64().unwrap() as u32);
+            assert_eq!(tx.operations.len(), expected["operation_count"].as_u64().unwrap() as usize);
+        }
+        other => panic!("Expected Transaction in framed message, got {:?}", other),
+    }
+
+    // 3. Re-encode framed and verify identical wire bytes
+    let roundtrip = encode_framed(&decoded).expect("re-encode framed");
+    assert_eq!(roundtrip, bytes, "Roundtrip re-encode framed mismatch");
+}
+
+#[test]
+fn test_direct_encode_golden_framed_message_matches_wire_bytes() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let framed_spec = &spec["vectors"]["golden_framed_message"];
+    let filename = framed_spec["file"].as_str().unwrap();
+    let expected_hex = framed_spec["hex"].as_str().unwrap();
+    let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
+
+    let msg = SruiMessage {
+        msg: Some(srui_message::Msg::Transaction(create_authored_transaction())),
+    };
+    let encoded = encode_framed(&msg).expect("encode framed");
+
+    assert_eq!(to_hex(&encoded), expected_hex);
+    assert_eq!(encoded, fixture_bytes);
 }
 
 #[test]

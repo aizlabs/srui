@@ -212,6 +212,27 @@ fn main() {
     }
     code.push_str("];\n\n");
 
+    // Generated Constants for TypeRef
+    code.push_str("impl TypeRef {\n");
+    code.push_str("    // Generated Standard Node Type constants from protocol/registry.yaml (§7.2)\n");
+    for item in &node_types {
+        let const_name = to_upper_snake_case(&item.name);
+        code.push_str(&format!("    pub const {}: Self = Self::standard({});\n", const_name, item.id));
+        if item.name == "RichText" {
+            code.push_str(&format!("    pub const RICHTEXT: Self = Self::standard({});\n", item.id));
+        }
+    }
+    code.push_str("}\n\n");
+
+    // Generated Constants for PropertyRef
+    code.push_str("impl PropertyRef {\n");
+    code.push_str("    // Generated Standard Property constants from protocol/registry.yaml (§7.4)\n");
+    for item in &properties {
+        let const_name = to_upper_snake_case(&item.name);
+        code.push_str(&format!("    pub const {}: Self = Self::standard({});\n", const_name, item.id));
+    }
+    code.push_str("}\n\n");
+
     // Lookup functions for Node Types
     code.push_str("pub fn lookup_standard_node_type(name: &str) -> Option<u32> {\n");
     code.push_str("    match name {\n");
@@ -310,4 +331,19 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("registry_tables.rs");
     fs::write(&dest_path, code).unwrap_or_else(|e| panic!("Failed to write registry_tables.rs: {}", e));
+}
+
+fn to_upper_snake_case(name: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = name.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            if !prev.is_uppercase() && prev != '_' {
+                result.push('_');
+            }
+        }
+        result.push(c.to_ascii_uppercase());
+    }
+    result
 }

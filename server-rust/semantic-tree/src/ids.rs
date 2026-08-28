@@ -13,9 +13,6 @@ use std::ops::Deref;
 /// Namespace 0 is permanently reserved for the SRUI standard registry (§6.4).
 pub const STANDARD_NAMESPACE_ID: u32 = 0;
 
-// Include build-time generated lookup tables from protocol/registry.yaml.
-include!(concat!(env!("OUT_DIR"), "/registry_tables.rs"));
-
 /// Session-scoped unique identifier for a semantic node (§6.2).
 ///
 /// Rules per §6.2:
@@ -240,37 +237,6 @@ pub struct TypeRef {
 }
 
 impl TypeRef {
-    // -------------------------------------------------------------------------
-    // Standard Node Types (§7.2, Namespace 0)
-    // -------------------------------------------------------------------------
-    pub const SURFACE: Self = Self::standard(1);
-    pub const DIALOG: Self = Self::standard(2);
-    pub const ROW: Self = Self::standard(3);
-    pub const COLUMN: Self = Self::standard(4);
-    pub const GRID: Self = Self::standard(5);
-    pub const SPACER: Self = Self::standard(6);
-    pub const SEPARATOR: Self = Self::standard(7);
-    pub const SCROLL: Self = Self::standard(8);
-    pub const TEXT: Self = Self::standard(9);
-    pub const RICHTEXT: Self = Self::standard(10);
-    pub const BUTTON: Self = Self::standard(11);
-    pub const TOGGLE: Self = Self::standard(12);
-    pub const TEXT_INPUT: Self = Self::standard(13);
-    pub const TEXT_AREA: Self = Self::standard(14);
-    pub const PROGRESS: Self = Self::standard(15);
-    pub const IMAGE: Self = Self::standard(16);
-    pub const LIST: Self = Self::standard(17);
-    pub const TABLE: Self = Self::standard(18);
-    pub const TREE: Self = Self::standard(19);
-    pub const SELECT: Self = Self::standard(20);
-    pub const CHOICE_GROUP: Self = Self::standard(21);
-    pub const SLIDER: Self = Self::standard(22);
-    pub const NUMBER_INPUT: Self = Self::standard(23);
-    pub const TABS: Self = Self::standard(24);
-    pub const SPLIT: Self = Self::standard(25);
-    pub const MENU: Self = Self::standard(26);
-    pub const TOOLBAR: Self = Self::standard(27);
-
     /// Constructs a `TypeRef` with given namespace and local IDs.
     pub const fn new(namespace_id: u32, local_id: u32) -> Self {
         Self {
@@ -357,40 +323,6 @@ pub struct PropertyRef {
 }
 
 impl PropertyRef {
-    // -------------------------------------------------------------------------
-    // Standard Properties (§7.4, Namespace 0)
-    // -------------------------------------------------------------------------
-    pub const LABEL: Self = Self::standard(1);
-    pub const ACCESSIBLE_DESCRIPTION: Self = Self::standard(2);
-    pub const ROLE: Self = Self::standard(3);
-    pub const VALUE_DESCRIPTION: Self = Self::standard(4);
-    pub const ACTIONS: Self = Self::standard(5);
-    pub const VISIBILITY: Self = Self::standard(6);
-    pub const ENABLED: Self = Self::standard(7);
-    pub const READ_ONLY: Self = Self::standard(8);
-    pub const BUSY: Self = Self::standard(9);
-    pub const SELECTED: Self = Self::standard(10);
-    pub const VALIDATION_STATE: Self = Self::standard(11);
-    pub const TEXT: Self = Self::standard(12);
-    pub const VALUE: Self = Self::standard(13);
-    pub const PLACEHOLDER: Self = Self::standard(14);
-    pub const RESOURCE: Self = Self::standard(15);
-    pub const ITEMS: Self = Self::standard(16);
-    pub const MODEL_REF: Self = Self::standard(17);
-    pub const HORIZONTAL_ALIGNMENT: Self = Self::standard(18);
-    pub const VERTICAL_ALIGNMENT: Self = Self::standard(19);
-    pub const GROW: Self = Self::standard(20);
-    pub const SHRINK: Self = Self::standard(21);
-    pub const MINIMUM_SIZE: Self = Self::standard(22);
-    pub const MAXIMUM_SIZE: Self = Self::standard(23);
-    pub const PREFERRED_SIZE: Self = Self::standard(24);
-    pub const SPACING_ROLE: Self = Self::standard(25);
-    pub const PADDING_ROLE: Self = Self::standard(26);
-    pub const PRESENTATION_HINT: Self = Self::standard(27);
-    pub const ACTION_KEY: Self = Self::standard(28);
-    pub const COLUMNS: Self = Self::standard(29);
-    pub const SELECTION_MODE: Self = Self::standard(30);
-
     /// Constructs a `PropertyRef` with given namespace and local IDs.
     pub const fn new(namespace_id: u32, local_id: u32) -> Self {
         Self {
@@ -435,6 +367,9 @@ impl PropertyRef {
         }
     }
 }
+
+// Include build-time generated lookup tables and constants from protocol/registry.yaml.
+include!(concat!(env!("OUT_DIR"), "/registry_tables.rs"));
 
 impl fmt::Display for PropertyRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

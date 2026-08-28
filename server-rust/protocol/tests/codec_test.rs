@@ -1,9 +1,74 @@
 use futures::{SinkExt, StreamExt};
+use bytes::BytesMut;
+use prost::Message;
 use srui_protocol::{
     srui_message, ClientHello, ClientLimits, FramingError, SruiCodec, SruiMessage, Transaction,
 };
 use tokio::io::{duplex, AsyncWriteExt};
 use tokio_util::codec::{Decoder, FramedRead, FramedWrite};
+
+#[test]
+fn test_decode_does_not_eagerly_reserve_full_frame() {
+    let mut codec = SruiCodec::new();
+    let mut buf = BytesMut::new();
+
+    // Header claims 1 MiB payload but only a few payload bytes are present.
+    let claimed_payload = 1024 * 1024;
+    prost::encode_length_delimiter(claimed_payload, &mut buf).expect("encode length delimiter");
+    buf.extend_from_slice(&[0u8; 10]);
+
+    let capacity_before = buf.capacity();
+    let result = codec.decode(&mut buf).expect("decode should not error");
+    assert!(result.is_none(), "incomplete frame should return Ok(None)");
+
+    let growth = buf.capacity().saturating_sub(capacity_before);
+    assert!(
+        buf.capacity() < 128 * 1024,
+        "capacity {} should stay well below claimed frame size {}",
+        buf.capacity(),
+        claimed_payload
+    );
+    assert!(
+        growth <= 64 * 1024 + 1024,
+        "reserve growth {} should be capped near 64 KiB",
+        growth
+    );
+}
+
+#[test]
+fn test_decode_chunked_large_frame_without_upfront_allocation() {
+    let msg = SruiMessage {
+        msg: Some(srui_message::Msg::Transaction(Transaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 1,
+            operations: vec![],
+        })),
+    };
+
+    let mut full_frame = BytesMut::new();
+    msg.encode_length_delimited(&mut full_frame).expect("encode frame");
+
+    let mut codec = SruiCodec::new();
+    let mut buf = BytesMut::new();
+    let chunk_size = 64;
+
+    for chunk in full_frame.chunks(chunk_size) {
+        buf.extend_from_slice(chunk);
+        let max_capacity_during_decode = buf.capacity();
+        assert!(
+            max_capacity_during_decode < full_frame.len() + 128 * 1024,
+            "buffer should grow incrementally, not reserve full frame upfront"
+        );
+
+        if let Some(decoded) = codec.decode(&mut buf).expect("decode should not error") {
+            assert_eq!(decoded, msg);
+            return;
+        }
+    }
+
+    panic!("frame should have decoded after all chunks were fed");
+}
 
 #[test]
 fn test_malformed_overlong_varint_returns_decode_error() {
@@ -47,9 +112,8 @@ async fn test_async_codec_roundtrip() {
 
 #[tokio::test]
 async fn test_async_codec_max_frame_size_enforced() {
-    let (client_io, server_io) = duplex(1024);
+    let (client_io, _server_io) = duplex(1024);
     let mut writer = FramedWrite::new(client_io, SruiCodec::with_max_frame_size(5));
-    let mut reader = FramedRead::new(server_io, SruiCodec::with_max_frame_size(5));
 
     let msg = SruiMessage {
         msg: Some(srui_message::Msg::Transaction(Transaction {

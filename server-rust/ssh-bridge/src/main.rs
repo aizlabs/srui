@@ -42,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_shutdown_signal().await;
         shutdown_signal.cancel();
     });
 
@@ -51,4 +51,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("srui-ssh-bridge exited cleanly.");
     Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    use tracing::info;
+
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+
+    tokio::select! {
+        _ = sigint.recv() => { info!("Received SIGINT (Ctrl+C)"); }
+        _ = sigterm.recv() => { info!("Received SIGTERM"); }
+        _ = sighup.recv() => { info!("Received SIGHUP (SSH session detach)"); }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }

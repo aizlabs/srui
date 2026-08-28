@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use srui_semantic_tree::{
     Event, EventValidationError, Node, NodeId, Operation, PropertyRef, Revision,
@@ -53,6 +53,10 @@ pub enum SdkError {
     /// Transaction closure panicked during execution.
     #[error("transaction panicked: {0}")]
     Panicked(String),
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Transactional UI context passed into [`Session::transaction`] closures (§12.1, §29).
@@ -261,37 +265,37 @@ impl Session {
 
     /// Returns the session ID string (§6.1).
     pub fn session_id(&self) -> String {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.session_id.clone()
     }
 
     /// Returns the current committed revision of the session graph (§12.1).
     pub fn current_revision(&self) -> Revision {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.store.revision()
     }
 
     /// Returns the total number of active nodes currently in the store (§6.2).
     pub fn node_count(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.store.node_count()
     }
 
     /// Returns `true` if an active node exists with the given ID.
     pub fn contains_node(&self, node: impl Into<NodeId>) -> bool {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.store.contains_node(node.into())
     }
 
     /// Returns a clone of the node with the given ID, if it exists in the store.
     pub fn get_node(&self, node: impl Into<NodeId>) -> Option<Node> {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.store.get_node(node.into()).cloned()
     }
 
     /// Returns a list of top-level root node IDs.
     pub fn root_ids(&self) -> Vec<NodeId> {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.store.root_ids().to_vec()
     }
 
@@ -300,7 +304,7 @@ impl Session {
     where
         F: FnOnce(&SemanticStore) -> T,
     {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         f(&guard.store)
     }
 
@@ -459,7 +463,7 @@ impl Session {
     where
         F: Fn(&Session, &Event) + Send + Sync + 'static,
     {
-        let mut guard = self.inner.lock().expect("lock not poisoned");
+        let mut guard = lock_or_recover(&self.inner);
         guard
             .handlers
             .entry((node.into(), event_type))
@@ -469,7 +473,7 @@ impl Session {
 
     /// Returns the number of registered handlers for a specific node and event type.
     pub fn handler_count(&self, node: impl Into<NodeId>, event_type: TypeRef) -> usize {
-        let guard = self.inner.lock().expect("lock not poisoned");
+        let guard = lock_or_recover(&self.inner);
         guard
             .handlers
             .get(&(node.into(), event_type))
@@ -479,7 +483,7 @@ impl Session {
 
     /// Clears all registered event handlers from this session.
     pub fn clear_handlers(&self) {
-        let mut guard = self.inner.lock().expect("lock not poisoned");
+        let mut guard = lock_or_recover(&self.inner);
         guard.handlers.clear();
     }
 
@@ -519,5 +523,30 @@ impl Session {
         }
 
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+impl Session {
+    fn poison_lock_for_test(&self) {
+        let inner = Arc::clone(&self.inner);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = inner.lock().unwrap();
+            panic!("test lock poison");
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_getters_survive_poisoned_lock() {
+        let session = Session::new("poison-test");
+        session.poison_lock_for_test();
+        assert_eq!(session.session_id(), "poison-test");
+        assert_eq!(session.current_revision().get(), 0);
+        assert_eq!(session.node_count(), 0);
     }
 }

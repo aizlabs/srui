@@ -84,8 +84,9 @@ impl Decoder for SruiCodec {
         };
 
         if src.len() < total_frame_len {
-            // Reserve remaining required capacity to avoid incremental allocations
-            src.reserve(total_frame_len - src.len());
+            // Reserve incrementally up to 64 KiB to avoid unbounded eager allocation on untrusted headers
+            let remaining = total_frame_len - src.len();
+            src.reserve(remaining.min(64 * 1024));
             return Ok(None);
         }
 

@@ -8,7 +8,7 @@
 //! Conforms to [`async-bounded-channel`](rules/async-bounded-channel.md):
 //! transaction broadcast channels are strictly bounded.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
 use srui_event_dedupe::EventDeduplicator;
@@ -47,6 +47,10 @@ pub enum SessionError {
 
     #[error("client lagged behind transaction broadcast; resync required")]
     LaggedResyncRequired,
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Outcome of a [`ClientResume`] handshake request.
@@ -111,7 +115,7 @@ impl Session {
 
     /// Returns the session ID.
     pub fn session_id(&self) -> String {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.session_id.clone()
     }
 
@@ -152,29 +156,65 @@ impl Session {
 
     /// Evaluates a `ClientResume` reconnection request (§20.2, §21, §32.5).
     pub fn handle_resume(&self, resume: &ClientResume) -> Result<ResumeOutcome, SessionError> {
-        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        enum ResumePlan {
+            Replay {
+                session_id: String,
+                replayed_transactions: Vec<Transaction>,
+            },
+            Resync {
+                session_id: String,
+                snapshot_revision: u64,
+                store_snapshot: SemanticStore,
+            },
+        }
 
-        if let Some(replayed) = guard.journal.replay_from(resume.last_applied_revision) {
-            let welcome_msg = ServerResumeOk {
-                session_id: guard.session_id.clone(),
-                replay_from_revision: resume.last_applied_revision,
-            };
-            Ok(ResumeOutcome::Replay {
-                welcome_msg,
-                replayed_transactions: replayed,
-            })
-        } else {
-            // Replay window expired -> full state snapshot required (§20.2)
-            let snapshot_tx = export_snapshot_transaction(&guard.store);
-            let resync_msg = ServerResyncRequired {
-                session_id: guard.session_id.clone(),
-                snapshot_revision: guard.store.revision().get(),
-                reason: "client revision outside retained journal window".to_string(),
-            };
-            Ok(ResumeOutcome::Resync {
-                resync_msg,
-                snapshot_transaction: snapshot_tx,
-            })
+        let plan = {
+            let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+
+            if let Some(replayed) = guard.journal.replay_from(resume.last_applied_revision) {
+                ResumePlan::Replay {
+                    session_id: guard.session_id.clone(),
+                    replayed_transactions: replayed,
+                }
+            } else {
+                ResumePlan::Resync {
+                    session_id: guard.session_id.clone(),
+                    snapshot_revision: guard.store.revision().get(),
+                    store_snapshot: guard.store.clone_staging(),
+                }
+            }
+        };
+
+        match plan {
+            ResumePlan::Replay {
+                session_id,
+                replayed_transactions,
+            } => {
+                let welcome_msg = ServerResumeOk {
+                    session_id,
+                    replay_from_revision: resume.last_applied_revision,
+                };
+                Ok(ResumeOutcome::Replay {
+                    welcome_msg,
+                    replayed_transactions,
+                })
+            }
+            ResumePlan::Resync {
+                session_id,
+                snapshot_revision,
+                store_snapshot,
+            } => {
+                let snapshot_tx = export_snapshot_transaction(&store_snapshot);
+                let resync_msg = ServerResyncRequired {
+                    session_id,
+                    snapshot_revision,
+                    reason: "client revision outside retained journal window".to_string(),
+                };
+                Ok(ResumeOutcome::Resync {
+                    resync_msg,
+                    snapshot_transaction: snapshot_tx,
+                })
+            }
         }
     }
 
@@ -233,7 +273,7 @@ impl Session {
 
     /// Returns the current revision of the store.
     pub fn current_revision(&self) -> u64 {
-        let guard = self.inner.lock().unwrap();
+        let guard = lock_or_recover(&self.inner);
         guard.store.revision().get()
     }
 }
@@ -290,6 +330,24 @@ fn export_snapshot_transaction(store: &SemanticStore) -> Transaction {
 mod tests {
     use super::*;
 
+    impl Session {
+        fn poison_lock_for_test(&self) {
+            let inner = Arc::clone(&self.inner);
+            let _ = std::panic::catch_unwind(|| {
+                let _guard = inner.lock().unwrap();
+                panic!("test lock poison");
+            });
+        }
+    }
+
+    #[test]
+    fn test_getters_survive_poisoned_lock() {
+        let session = Session::new("poison-test");
+        session.poison_lock_for_test();
+        assert_eq!(session.session_id(), "poison-test");
+        assert_eq!(session.current_revision(), 0);
+    }
+
     #[test]
     fn test_session_lifecycle() {
         let session = Session::new("test-session");
@@ -337,6 +395,43 @@ mod tests {
                 assert_eq!(replayed_transactions[0].new_revision, 1);
             }
             ResumeOutcome::Resync { .. } => panic!("expected replay, got resync"),
+        }
+    }
+
+    #[test]
+    fn test_handle_resume_resync_after_journal_eviction() {
+        let session = Session::new("resync-test");
+
+        // Journal capacity is 1024; commit 1025 txs to evict revision 0 from replay window.
+        for rev in 0..1025 {
+            let tx = Transaction {
+                base_revision: rev,
+                new_revision: rev + 1,
+                priority: 1,
+                operations: vec![],
+            };
+            session.commit_transaction(tx).expect("commit tx");
+        }
+        assert_eq!(session.current_revision(), 1025);
+
+        let resume = ClientResume {
+            session_id: "resync-test".to_string(),
+            client_instance_id: vec![1],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+        };
+
+        match session.handle_resume(&resume).expect("resume handled") {
+            ResumeOutcome::Resync {
+                resync_msg,
+                snapshot_transaction,
+            } => {
+                assert_eq!(resync_msg.session_id, "resync-test");
+                assert_eq!(resync_msg.snapshot_revision, 1025);
+                assert_eq!(snapshot_transaction.new_revision, 1025);
+            }
+            ResumeOutcome::Replay { .. } => panic!("expected resync, got replay"),
         }
     }
 }

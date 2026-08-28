@@ -5,7 +5,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientHello, ClientResume, Event, SruiCodec, SruiMessage, Transaction,
+    srui_message, ClientHello, ClientResume, SruiCodec, SruiMessage, Transaction,
 };
 use srui_sessiond::{handle_connection, Session};
 

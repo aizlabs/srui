@@ -229,6 +229,28 @@ fn test_standard_registry_lookups() {
         assert_eq!(prop_ref.standard_name(), Some(*name));
         assert_eq!(PropertyRef::resolve_standard(name).unwrap(), prop_ref);
     }
+
+    // Check typed EnumToken constants
+    assert_eq!(EnumToken::TEXT_ROLE_TITLE, EnumToken::new(1, 1));
+    assert_eq!(EnumToken::ACTION_ROLE_NORMAL, EnumToken::new(2, 1));
+    assert_eq!(EnumToken::ACTION_ROLE_PRIMARY, EnumToken::new(2, 2));
+    assert_eq!(EnumToken::ACTION_ROLE_DESTRUCTIVE, EnumToken::new(2, 3));
+    assert_eq!(EnumToken::INPUT_ROLE_SEARCH, EnumToken::new(3, 2));
+    assert_eq!(EnumToken::IMPORTANCE_EMPHASIZED, EnumToken::new(4, 2));
+    assert_eq!(EnumToken::TOGGLE_PRESENTATION_HINT_CHECKBOX, EnumToken::new(5, 2));
+    assert_eq!(EnumToken::VISIBILITY_VISIBLE, EnumToken::new(6, 1));
+    assert_eq!(EnumToken::SPACING_ROLE_TIGHT, EnumToken::new(7, 2));
+    assert_eq!(EnumToken::PADDING_ROLE_RELAXED, EnumToken::new(8, 4));
+    assert_eq!(EnumToken::HORIZONTAL_ALIGNMENT_CENTER, EnumToken::new(9, 2));
+    assert_eq!(EnumToken::VERTICAL_ALIGNMENT_TOP, EnumToken::new(10, 1));
+    assert_eq!(EnumToken::SELECTION_MODE_MULTIPLE, EnumToken::new(11, 3));
+    assert_eq!(EnumToken::VALIDATION_STATE_ERROR, EnumToken::new(12, 3));
+
+    // Check typed standard enum conversions
+    let action_role = StandardActionRole::Destructive;
+    let token: EnumToken = action_role.into();
+    assert_eq!(token, EnumToken::ACTION_ROLE_DESTRUCTIVE);
+    assert_eq!(StandardActionRole::try_from(token).unwrap(), StandardActionRole::Destructive);
 }
 
 #[test]

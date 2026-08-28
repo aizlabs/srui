@@ -28,18 +28,6 @@ PROPERTY_VALUE_TYPES = frozenset(
 EVENT_KINDS = frozenset({"semantic", "coordinate"})
 OPERATION_CATEGORIES = frozenset({"required", "model", "optimization"})
 
-PROPERTY_ENUM_REFERENCES = {
-    "role": {"TextRole", "ActionRole", "InputRole", "Importance"},
-    "visibility": {"Visibility"},
-    "validation_state": {"ValidationState"},
-    "horizontal_alignment": {"HorizontalAlignment"},
-    "vertical_alignment": {"VerticalAlignment"},
-    "spacing_role": {"SpacingRole"},
-    "padding_role": {"PaddingRole"},
-    "presentation_hint": {"TogglePresentationHint"},
-    "selection_mode": {"SelectionMode"},
-}
-
 
 def _derive_oracle_from_registry(registry_path: Path = REGISTRY_PATH) -> dict[str, Any]:
     if not registry_path.exists():
@@ -62,6 +50,11 @@ def _derive_oracle_from_registry(registry_path: Path = REGISTRY_PATH) -> dict[st
     }
     control_props = {
         p["name"] for p in properties if p.get("category") == "control_specific"
+    }
+    property_enum_refs = {
+        p["name"]: set(p.get("enum_types", []))
+        for p in properties
+        if p.get("value_type") == "enum"
     }
 
     enums = reg.get("enums", [])
@@ -87,6 +80,7 @@ def _derive_oracle_from_registry(registry_path: Path = REGISTRY_PATH) -> dict[st
         "REQUIRED_ENUM_VALUES": enum_values,
         "REQUIRED_EVENTS": event_names,
         "REQUIRED_OPERATIONS": op_names,
+        "PROPERTY_ENUM_REFERENCES": property_enum_refs,
     }
 
 
@@ -102,10 +96,10 @@ EXPECTED_NODE_TIERS: dict[str, str] = _DERIVED.get("EXPECTED_NODE_TIERS", {})
 REQUIRED_PROPERTIES_SECTION_7_4: set[str] = _DERIVED.get("REQUIRED_PROPERTIES_SECTION_7_4", set())
 REQUIRED_CONTROL_SPECIFIC_PROPERTIES: set[str] = _DERIVED.get("REQUIRED_CONTROL_SPECIFIC_PROPERTIES", set())
 REQUIRED_STANDARD_PROPERTIES: set[str] = _DERIVED.get("REQUIRED_STANDARD_PROPERTIES", set())
-
 REQUIRED_ENUM_VALUES: dict[str, set[str]] = _DERIVED.get("REQUIRED_ENUM_VALUES", {})
 REQUIRED_EVENTS: set[str] = _DERIVED.get("REQUIRED_EVENTS", set())
 REQUIRED_OPERATIONS: set[str] = _DERIVED.get("REQUIRED_OPERATIONS", set())
+PROPERTY_ENUM_REFERENCES: dict[str, set[str]] = _DERIVED.get("PROPERTY_ENUM_REFERENCES", {})
 
 REQUIRED_TIER_NODE_COUNT = len(REQUIRED_NODE_TYPES)
 SHOULD_TIER_NODE_COUNT = len(SHOULD_NODE_TYPES)

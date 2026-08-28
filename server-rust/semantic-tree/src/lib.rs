@@ -18,7 +18,10 @@ pub use ids::{
     lookup_standard_property, resolve_standard_node_type, resolve_standard_property,
     standard_enum_name, standard_event_name, standard_node_type_name, standard_operation_name,
     standard_property_name, ItemId, NodeId, ParseResourceHashError, PropertyRef,
-    RegistryLookupError, ResourceHash, TypeRef, STANDARD_ENUMS, STANDARD_EVENTS,
+    RegistryLookupError, ResourceHash, TypeRef, StandardActionRole, StandardHorizontalAlignment,
+    StandardImportance, StandardInputRole, StandardPaddingRole, StandardSelectionMode,
+    StandardSpacingRole, StandardTextRole, StandardTogglePresentationHint, StandardValidationState,
+    StandardVerticalAlignment, StandardVisibility, STANDARD_ENUMS, STANDARD_EVENTS,
     STANDARD_NAMESPACE_ID, STANDARD_NODE_TYPES, STANDARD_OPERATIONS, STANDARD_PROPERTIES,
 };
 
@@ -28,7 +31,6 @@ pub use store::{
 };
 
 pub use value::{
-    EdgeInsets, EdgeInsetsVal, EnumToken, EnumValue, Point, PointVal, Property, Range, RangeVal,
-    Rect, RectVal, Size, SizeVal, SmallRecord, Value, ValueConversionError,
+    EdgeInsets, EnumToken, Point, Property, Range, Rect, Size, SmallRecord, Value,
+    ValueConversionError,
 };
-

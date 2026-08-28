@@ -146,5 +146,21 @@
         "operation_count": 3
       }
     }
+  },
+  "malformed_vectors": {
+    "malformed_overlong_varint": {
+      "file": "malformed_overlong_varint.bin",
+      "sha256": "15ae0ffce4697a1b4a359ec70d4b24ccfe04c05992e500ec6812cc9e9fc6e0cd",
+      "hex": "8080808080808080808001",
+      "byte_length": 11,
+      "expected_error": "overlong_varint"
+    },
+    "malformed_truncated_frame": {
+      "file": "malformed_truncated_frame.bin",
+      "sha256": "94a528e3a198c8e95c5d5ff8837b3cc742ce436c86c1fce007cdbb9281f08f63",
+      "hex": "6401020304",
+      "byte_length": 5,
+      "expected_error": "truncated_frame"
+    }
   }
 }

@@ -43,15 +43,12 @@ struct RegistryEnum {
     tier: Option<String>,
     #[allow(dead_code)]
     description: Option<String>,
-    #[allow(dead_code)]
     values: Vec<RegistryEnumValue>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RegistryEnumValue {
-    #[allow(dead_code)]
     id: u32,
-    #[allow(dead_code)]
     name: String,
     #[allow(dead_code)]
     description: Option<String>,
@@ -68,6 +65,22 @@ fn to_upper_snake_case(name: &str) -> String {
             }
         }
         result.push(c.to_ascii_uppercase());
+    }
+    result
+}
+
+fn to_pascal_case(name: &str) -> String {
+    let mut result = String::new();
+    let mut capitalize_next = true;
+    for c in name.chars() {
+        if c == '_' || c == '-' || c == ' ' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            result.push(c.to_ascii_uppercase());
+            capitalize_next = false;
+        } else {
+            result.push(c);
+        }
     }
     result
 }
@@ -150,6 +163,56 @@ fn main() {
         code.push_str(&format!("    pub const {}: Self = Self::standard({});\n", const_name, item.id));
     }
     code.push_str("}\n\n");
+
+    // Generated Constants for EnumToken
+    code.push_str("impl EnumToken {\n");
+    code.push_str("    // Generated Standard Enum value constants from protocol/registry.yaml (§7.5)\n");
+    for enum_def in &registry.enums {
+        let enum_prefix = to_upper_snake_case(&enum_def.name);
+        for val in &enum_def.values {
+            let val_suffix = to_upper_snake_case(&val.name);
+            code.push_str(&format!(
+                "    pub const {}_{}: Self = Self::new({}, {});\n",
+                enum_prefix, val_suffix, enum_def.id, val.id
+            ));
+        }
+    }
+    code.push_str("}\n\n");
+
+    // Generated Typed Standard Enums
+    for enum_def in &registry.enums {
+        let enum_type_name = format!("Standard{}", enum_def.name);
+        code.push_str(&format!("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n"));
+        code.push_str(&format!("#[repr(u32)]\n"));
+        code.push_str(&format!("pub enum {} {{\n", enum_type_name));
+        for val in &enum_def.values {
+            let variant_name = to_pascal_case(&val.name);
+            code.push_str(&format!("    {} = {},\n", variant_name, val.id));
+        }
+        code.push_str("}\n\n");
+
+        code.push_str(&format!("impl From<{}> for EnumToken {{\n", enum_type_name));
+        code.push_str(&format!("    fn from(val: {}) -> Self {{\n", enum_type_name));
+        code.push_str(&format!("        Self::new({}, val as u32)\n", enum_def.id));
+        code.push_str("    }\n");
+        code.push_str("}\n\n");
+
+        code.push_str(&format!("impl TryFrom<EnumToken> for {} {{\n", enum_type_name));
+        code.push_str("    type Error = ();\n");
+        code.push_str("    fn try_from(token: EnumToken) -> Result<Self, ()> {\n");
+        code.push_str(&format!("        if token.enum_id != {} {{\n", enum_def.id));
+        code.push_str("            return Err(());\n");
+        code.push_str("        }\n");
+        code.push_str("        match token.value_id {\n");
+        for val in &enum_def.values {
+            let variant_name = to_pascal_case(&val.name);
+            code.push_str(&format!("            {} => Ok(Self::{}),\n", val.id, variant_name));
+        }
+        code.push_str("            _ => Err(()),\n");
+        code.push_str("        }\n");
+        code.push_str("    }\n");
+        code.push_str("}\n\n");
+    }
 
     // Lookup functions for Node Types
     code.push_str("pub fn lookup_standard_node_type(name: &str) -> Option<u32> {\n");

@@ -199,6 +199,7 @@ properties:
     name: role
     category: identity_accessibility
     value_type: enum
+    enum_types: [TextRole, ActionRole, InputRole, Importance]
     description: "Semantic appearance or behavioral role (e.g. TextRole, ActionRole, InputRole)"
 
   - id: 4
@@ -218,6 +219,7 @@ properties:
     name: visibility
     category: common_state
     value_type: enum
+    enum_types: [Visibility]
     description: "Node visibility state (visible, hidden, collapsed)"
 
   - id: 7
@@ -248,6 +250,7 @@ properties:
     name: validation_state
     category: common_state
     value_type: enum
+    enum_types: [ValidationState]
     description: "Validation status (valid, warning, error) with optional message"
 
   # Content (§7.4)
@@ -292,12 +295,14 @@ properties:
     name: horizontal_alignment
     category: layout_intent
     value_type: enum
+    enum_types: [HorizontalAlignment]
     description: "Horizontal alignment within parent layout (leading, center, trailing, fill)"
 
   - id: 19
     name: vertical_alignment
     category: layout_intent
     value_type: enum
+    enum_types: [VerticalAlignment]
     description: "Vertical alignment within parent layout (top, center, bottom, fill)"
 
   - id: 20
@@ -334,12 +339,14 @@ properties:
     name: spacing_role
     category: layout_intent
     value_type: enum
+    enum_types: [SpacingRole]
     description: "Semantic inter-item spacing (none, tight, normal, relaxed)"
 
   - id: 26
     name: padding_role
     category: layout_intent
     value_type: enum
+    enum_types: [PaddingRole]
     description: "Semantic container padding (none, tight, normal, relaxed)"
 
   # Standard Control-Specific & Semantic Properties (§7.2, §7.7, §8)
@@ -347,6 +354,7 @@ properties:
     name: presentation_hint
     category: control_specific
     value_type: enum
+    enum_types: [TogglePresentationHint]
     description: "Advisory presentation hint (e.g. checkbox, switch, automatic for Toggle)"
 
   - id: 28
@@ -365,6 +373,7 @@ properties:
     name: selection_mode
     category: control_specific
     value_type: enum
+    enum_types: [SelectionMode]
     description: "Selection mode for collections (none, single, multiple)"
 
 enums:

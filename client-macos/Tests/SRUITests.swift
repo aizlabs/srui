@@ -495,4 +495,26 @@ final class SRUITests: XCTestCase {
             XCTAssertEqual(limit, 2)
         }
     }
+
+    func testMalformedFramingVectorsRejectedCleanly() throws {
+        let spec = try loadExpectedSpec()
+        guard let malformed = spec["malformed_vectors"] as? [String: Any],
+              let overlongSpec = malformed["malformed_overlong_varint"] as? [String: Any],
+              let truncatedSpec = malformed["malformed_truncated_frame"] as? [String: Any] else {
+            XCTFail("Missing malformed_vectors in expected.json")
+            return
+        }
+
+        // 1. Overlong varint
+        let overlongFile = overlongSpec["file"] as! String
+        let overlongData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(overlongFile))
+        XCTAssertEqual(hexString(from: overlongData), overlongSpec["hex"] as! String)
+        XCTAssertThrowsError(try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: overlongData))
+
+        // 2. Truncated frame
+        let truncatedFile = truncatedSpec["file"] as! String
+        let truncatedData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(truncatedFile))
+        XCTAssertEqual(hexString(from: truncatedData), truncatedSpec["hex"] as! String)
+        XCTAssertThrowsError(try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: truncatedData))
+    }
 }

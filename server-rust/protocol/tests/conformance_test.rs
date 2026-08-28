@@ -428,3 +428,25 @@ fn test_length_delimited_framing_conformance() {
         other => panic!("Expected Transaction payload, got {:?}", other),
     }
 }
+
+#[test]
+fn test_malformed_framing_fixtures_rejected_cleanly() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let malformed = &spec["malformed_vectors"];
+
+    // 1. Overlong varint
+    let overlong_spec = &malformed["malformed_overlong_varint"];
+    let overlong_file = overlong_spec["file"].as_str().unwrap();
+    let overlong_bytes = fs::read(vectors_dir.join(overlong_file)).unwrap();
+    assert_eq!(to_hex(&overlong_bytes), overlong_spec["hex"].as_str().unwrap());
+    let overlong_err = decode_framed::<SruiMessage>(&overlong_bytes).expect_err("overlong varint must fail");
+    assert!(matches!(overlong_err, FramingError::DecodeError(_) | FramingError::FrameSizeLimitExceeded { .. }));
+
+    // 2. Truncated frame
+    let truncated_spec = &malformed["malformed_truncated_frame"];
+    let truncated_file = truncated_spec["file"].as_str().unwrap();
+    let truncated_bytes = fs::read(vectors_dir.join(truncated_file)).unwrap();
+    assert_eq!(to_hex(&truncated_bytes), truncated_spec["hex"].as_str().unwrap());
+    let truncated_err = decode_framed::<SruiMessage>(&truncated_bytes).expect_err("truncated frame must fail");
+    assert!(matches!(truncated_err, FramingError::DecodeError(_)));
+}

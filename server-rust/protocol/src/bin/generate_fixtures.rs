@@ -135,4 +135,16 @@ fn main() {
     let framed_bytes = encode_framed(&framed_message).expect("encode framed SruiMessage");
     fs::write(out_dir.join("golden_framed_message.bin"), &framed_bytes).expect("write golden_framed_message.bin");
     println!("Wrote golden_framed_message.bin ({} bytes)", framed_bytes.len());
+
+    // 4. Construct Malformed Fixture: Overlong Varint (11 bytes, exceeds 64-bit 10-byte limit)
+    let overlong_varint_bytes = vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
+    fs::write(out_dir.join("malformed_overlong_varint.bin"), &overlong_varint_bytes)
+        .expect("write malformed_overlong_varint.bin");
+    println!("Wrote malformed_overlong_varint.bin ({} bytes)", overlong_varint_bytes.len());
+
+    // 5. Construct Malformed Fixture: Truncated Frame (declares 100 bytes length, has only 4)
+    let truncated_frame_bytes = vec![0x64, 0x01, 0x02, 0x03, 0x04];
+    fs::write(out_dir.join("malformed_truncated_frame.bin"), &truncated_frame_bytes)
+        .expect("write malformed_truncated_frame.bin");
+    println!("Wrote malformed_truncated_frame.bin ({} bytes)", truncated_frame_bytes.len());
 }

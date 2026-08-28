@@ -1,7 +1,8 @@
 //! Integration tests for SemanticStore and mutation operations (§6.2, §6.3, §13, §26).
 
 use srui_semantic_tree::{
-    NodeId, PropertyRef, SemanticStore, StoreError, StoreLimits, TypeRef, Value,
+    NodeId, Property, PropertyRef, SemanticStore, SmallRecord, StoreError, StoreLimits, TypeRef,
+    Value,
 };
 
 #[test]
@@ -668,5 +669,99 @@ fn test_apply_protobuf_wire_operations() {
     assert_eq!(
         store.children_of(NodeId::new(1)),
         Some(&[NodeId::new(4), NodeId::new(3), NodeId::new(2)][..])
+    );
+}
+
+#[test]
+fn test_nested_value_depth_limit_enforced() {
+    let limits = StoreLimits::with_all_limits(64, 1000, 1024, 3, 100, 100);
+    let mut store = SemanticStore::with_limits(limits);
+
+    // Depth 1: List containing scalar
+    let val_depth_1 = Value::List(vec![Value::from(42i64)]);
+    store
+        .create_node(
+            NodeId::new(1),
+            TypeRef::SURFACE,
+            None,
+            None,
+            [(PropertyRef::VALUE, val_depth_1)],
+        )
+        .expect("depth 1 list ok");
+
+    // Depth 3: List -> List -> List -> scalar (depth 4 when inspecting inner)
+    let nested_val = Value::List(vec![Value::List(vec![Value::List(vec![Value::List(vec![
+        Value::from(1i64),
+    ])])])]);
+
+    let err = store
+        .set_property(NodeId::new(1), PropertyRef::VALUE, nested_val)
+        .expect_err("nested value depth limit must fail");
+
+    assert!(matches!(
+        err,
+        StoreError::MaxValueDepthExceeded { limit: 3, actual: 4 }
+    ));
+}
+
+#[test]
+fn test_max_list_elements_limit_enforced() {
+    let limits = StoreLimits::with_all_limits(64, 1000, 1024, 10, 3, 100);
+    let mut store = SemanticStore::with_limits(limits);
+
+    let list_ok = Value::List(vec![Value::from(1i64), Value::from(2i64), Value::from(3i64)]);
+    store
+        .create_node(
+            NodeId::new(1),
+            TypeRef::SURFACE,
+            None,
+            None,
+            [(PropertyRef::ITEMS, list_ok)],
+        )
+        .expect("3 items list ok");
+
+    let list_too_long = Value::List(vec![
+        Value::from(1i64),
+        Value::from(2i64),
+        Value::from(3i64),
+        Value::from(4i64),
+    ]);
+    let err = store
+        .set_property(NodeId::new(1), PropertyRef::ITEMS, list_too_long)
+        .expect_err("exceeding max list elements must fail");
+
+    assert_eq!(
+        err,
+        StoreError::MaxListLengthExceeded { limit: 3, actual: 4 }
+    );
+}
+
+#[test]
+fn test_max_record_properties_limit_enforced() {
+    let limits = StoreLimits::with_all_limits(64, 1000, 1024, 10, 100, 2);
+    let mut store = SemanticStore::with_limits(limits);
+
+    let record_too_many_props = Value::Record(SmallRecord::new(
+        TypeRef::standard(1),
+        vec![
+            Property::new(PropertyRef::standard(1), Value::from("A")),
+            Property::new(PropertyRef::standard(2), Value::from("B")),
+            Property::new(PropertyRef::standard(3), Value::from("C")),
+        ],
+    ));
+
+    let err = store
+        .create_node(
+            NodeId::new(1),
+            TypeRef::SURFACE,
+            None,
+            None,
+            [(PropertyRef::VALUE, record_too_many_props)],
+        )
+        .expect_err("exceeding record properties limit must fail");
+
+    assert_eq!(
+        err,
+        StoreError::MaxRecordPropertiesExceeded { limit: 2, actual: 3 }
     );
 }

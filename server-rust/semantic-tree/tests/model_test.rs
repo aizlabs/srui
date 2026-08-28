@@ -61,7 +61,26 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
     assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().value, Value::from("postgres"));
     assert_eq!(model.get_item_by_id(ItemId::new(303)).unwrap().value, Value::from("redis"));
 
-    // 3. Update an addressed item by item_id (update postgres -> postgres-master)
+    // 3. Insert a new item into the sparse collection using MODEL_INSERT (§13)
+    let item_inserted = ModelItem::new(
+        ItemId::new(150),
+        "memcached",
+        vec![(col_name, Value::from("memcached")), (col_cpu, Value::from(0.01))],
+    );
+    store
+        .model_insert(model_id, 11, vec![item_inserted])
+        .expect("insert memcached at index 11");
+
+    // Verify insertion: item count incremented, item1 at index 10 untouched, item2 shifted to 12, item3 shifted to 1001
+    let model = store.get_model(model_id).unwrap();
+    assert_eq!(model.item_count(), large_count + 1);
+    assert_eq!(model.cached_item_count(), 4);
+    assert_eq!(model.index_of(ItemId::new(101)), Some(10));
+    assert_eq!(model.index_of(ItemId::new(150)), Some(11));
+    assert_eq!(model.index_of(ItemId::new(202)), Some(12));
+    assert_eq!(model.index_of(ItemId::new(303)), Some(1001));
+
+    // 4. Update an addressed item by item_id (update postgres -> postgres-master)
     let updated_postgres = ModelItem::new(
         ItemId::new(202),
         "postgres-master",
@@ -76,18 +95,20 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
     assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().value, Value::from("postgres-master"));
     assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().get_property(col_cpu), Some(&Value::from(0.50)));
     assert_eq!(model.get_item_by_id(ItemId::new(101)).unwrap().value, Value::from("nginx"));
+    assert_eq!(model.get_item_by_id(ItemId::new(150)).unwrap().value, Value::from("memcached"));
     assert_eq!(model.get_item_by_id(ItemId::new(303)).unwrap().value, Value::from("redis"));
-    assert_eq!(model.cached_item_count(), 3);
+    assert_eq!(model.cached_item_count(), 4);
 
-    // 4. Delete an item by item_id (delete nginx ItemId(101))
+    // 5. Delete an item by item_id (delete nginx ItemId(101))
     store
         .model_delete(model_id, None, None, vec![ItemId::new(101)])
         .expect("delete nginx");
 
     // Confirm only the addressed item was removed; others remain intact
     let model = store.get_model(model_id).unwrap();
-    assert_eq!(model.cached_item_count(), 2);
+    assert_eq!(model.cached_item_count(), 3);
     assert!(!model.contains_item(ItemId::new(101)));
+    assert_eq!(model.get_item_by_id(ItemId::new(150)).unwrap().value, Value::from("memcached"));
     assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().value, Value::from("postgres-master"));
     assert_eq!(model.get_item_by_id(ItemId::new(303)).unwrap().value, Value::from("redis"));
 }

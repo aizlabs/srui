@@ -12,6 +12,12 @@ pub use framing::{
     DEFAULT_MAX_FRAME_SIZE,
 };
 
+#[cfg(feature = "async-codec")]
+pub mod codec;
+#[cfg(feature = "async-codec")]
+pub use codec::SruiCodec;
+
 /// Namespace 0 is the permanently reserved SRUI standard registry namespace.
 pub const STANDARD_NAMESPACE_ID: u32 = 0;
+
 

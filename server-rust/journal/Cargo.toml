@@ -5,3 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+srui-protocol = { path = "../protocol" }
+srui-semantic-tree = { path = "../semantic-tree" }
+thiserror.workspace = true
+

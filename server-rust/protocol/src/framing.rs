@@ -5,7 +5,7 @@ use std::fmt;
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Errors returned by length-delimited wire framing operations (§16, §26).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum FramingError {
     /// The frame payload or decoded length prefix exceeds the configured maximum frame size limit (§26).
     FrameSizeLimitExceeded { limit: usize, actual: usize },
@@ -13,6 +13,8 @@ pub enum FramingError {
     EncodeError(String),
     /// Protobuf decoding failed.
     DecodeError(String),
+    /// Underlying I/O error.
+    Io(std::io::Error),
 }
 
 impl fmt::Display for FramingError {
@@ -25,11 +27,26 @@ impl fmt::Display for FramingError {
             ),
             Self::EncodeError(msg) => write!(f, "framing encode error: {}", msg),
             Self::DecodeError(msg) => write!(f, "framing decode error: {}", msg),
+            Self::Io(e) => write!(f, "framing I/O error: {}", e),
         }
     }
 }
 
-impl std::error::Error for FramingError {}
+impl From<std::io::Error> for FramingError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl std::error::Error for FramingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 
 /// Encodes a message with a varint length prefix, enforcing `DEFAULT_MAX_FRAME_SIZE` (§16, §26).
 pub fn encode_framed<M: Message>(msg: &M) -> Result<Vec<u8>, FramingError> {

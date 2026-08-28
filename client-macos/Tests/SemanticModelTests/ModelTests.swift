@@ -412,6 +412,23 @@ final class ModelTests: XCTestCase {
         }
     }
 
+    func testModelDeleteRangeRejectsOverflowingCount() throws {
+        var store = SemanticStore()
+        let listType = try XCTUnwrap(resolveStandardNodeType("List").get())
+        let modelID = ModelId(1)
+
+        try store.createModel(id: modelID, modelType: listType, itemCount: 10)
+
+        XCTAssertThrowsError(
+            try store.modelDelete(id: modelID, index: 5, count: UInt64.max, itemIds: [])
+        ) { error in
+            XCTAssertEqual(error as? StoreError, StoreError.modelIndexOutOfBounds(index: UInt64.max, count: 10))
+        }
+
+        let model = try XCTUnwrap(store.getModel(modelID))
+        XCTAssertEqual(model.itemCount, 10)
+    }
+
     func testModelDeleteRejectsCombinedIdentityAndRange() throws {
         var store = SemanticStore()
         let listType = try XCTUnwrap(resolveStandardNodeType("List").get())

@@ -343,14 +343,13 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
             let idx = index ?? 0
             let cnt = count!
 
-            if idx > itemCount || idx.addingReportingOverflow(cnt).partialValue > itemCount || (idx + cnt) > itemCount {
+            let (rangeEnd, overflowed) = idx.addingReportingOverflow(cnt)
+            if idx > itemCount || overflowed || rangeEnd > itemCount {
                 throw StoreError.modelIndexOutOfBounds(
-                    index: idx + cnt,
+                    index: overflowed ? UInt64.max : rangeEnd,
                     count: itemCount
                 )
             }
-
-            let rangeEnd = idx + cnt
             var keysToRemove: [UInt64] = []
             for k in items.keys where k >= idx && k < rangeEnd {
                 keysToRemove.append(k)
@@ -362,7 +361,7 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
                 }
             }
 
-            shiftCachedIndices(fromIndex: idx + cnt, delta: -Int64(cnt))
+            shiftCachedIndices(fromIndex: rangeEnd, delta: -Int64(cnt))
             itemCount = itemCount >= cnt ? itemCount - cnt : 0
             return
         }

@@ -68,6 +68,41 @@ impl From<ItemId> for u64 {
     }
 }
 
+/// Strongly-typed identifier for a collection model in the semantic graph (§6.2, §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModelId(pub u64);
+
+impl ModelId {
+    /// Creates a new `ModelId`.
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Returns the underlying `u64` identifier.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ModelId({})", self.0)
+    }
+}
+
+impl From<u64> for ModelId {
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+impl From<ModelId> for u64 {
+    fn from(id: ModelId) -> Self {
+        id.0
+    }
+}
+
+
 /// 256-bit SHA-256 binary digest identifying content-addressed resources (§7.4, §8, §18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResourceHash(pub [u8; 32]);

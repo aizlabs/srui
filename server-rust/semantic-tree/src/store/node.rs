@@ -1,4 +1,4 @@
-use crate::ids::{NodeId, PropertyRef, TypeRef};
+use crate::ids::{ModelId, NodeId, PropertyRef, TypeRef};
 use crate::value::Value;
 use std::collections::HashMap;
 
@@ -47,5 +47,15 @@ impl Node {
     /// Returns an iterator over all defined properties on this node.
     pub fn iter_properties(&self) -> impl Iterator<Item = (&PropertyRef, &Value)> {
         self.properties.iter()
+    }
+
+    /// Returns the referenced `ModelId` if this node has a `model_ref` property defined (§8).
+    pub fn model_ref(&self) -> Option<ModelId> {
+        self.get_property(PropertyRef::standard(17))
+            .and_then(|v| match v {
+                Value::UnsignedInt(u) => Some(ModelId::new(*u)),
+                Value::SignedInt(i) if *i >= 0 => Some(ModelId::new(*i as u64)),
+                _ => None,
+            })
     }
 }

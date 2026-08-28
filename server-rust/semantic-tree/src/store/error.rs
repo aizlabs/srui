@@ -1,4 +1,4 @@
-use crate::ids::NodeId;
+use crate::ids::{ItemId, ModelId, NodeId};
 use std::fmt;
 
 /// Errors returned by `SemanticStore` mutation operations.
@@ -28,6 +28,16 @@ pub enum StoreError {
     MaxRecordPropertiesExceeded { limit: usize, actual: usize },
     /// The specified child insertion index is out of bounds for the parent's current children list.
     ChildIndexOutOfBounds { index: usize, count: usize },
+    /// Attempted to create a model using a `ModelId` that was already used in this session (§6.2, §8).
+    ModelIdAlreadyUsed(ModelId),
+    /// The specified model was not found in the store.
+    ModelNotFound(ModelId),
+    /// The specified item was not found in the collection model cache.
+    ItemNotFound(ItemId),
+    /// Operation index is out of bounds for the collection model.
+    ModelIndexOutOfBounds { index: u64, count: u64 },
+    /// Attempted to insert a duplicate ItemId into the collection model.
+    DuplicateItemId { model_id: ModelId, item_id: ItemId },
     /// Generic operation error when applying a wire operation.
     OperationError(String),
 }
@@ -89,6 +99,23 @@ impl fmt::Display for StoreError {
                 f,
                 "child index {} out of bounds (current child count: {})",
                 index, count
+            ),
+            Self::ModelIdAlreadyUsed(id) => write!(
+                f,
+                "ModelId {} has already been used in this session and cannot be reused (§6.2)",
+                id
+            ),
+            Self::ModelNotFound(id) => write!(f, "model {} not found in store", id),
+            Self::ItemNotFound(id) => write!(f, "item {} not found in model", id),
+            Self::ModelIndexOutOfBounds { index, count } => write!(
+                f,
+                "model index {} out of bounds (item count: {})",
+                index, count
+            ),
+            Self::DuplicateItemId { model_id, item_id } => write!(
+                f,
+                "duplicate item ID {} in model {}",
+                item_id, model_id
             ),
             Self::OperationError(msg) => write!(f, "operation application error: {}", msg),
         }

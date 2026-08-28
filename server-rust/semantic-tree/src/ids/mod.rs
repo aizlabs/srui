@@ -4,7 +4,7 @@ pub mod node_id;
 pub mod property_ref;
 pub mod type_ref;
 
-pub use node_id::{ItemId, NodeId, ParseResourceHashError, ResourceHash};
+pub use node_id::{ItemId, ModelId, NodeId, ParseResourceHashError, ResourceHash};
 pub use property_ref::PropertyRef;
 pub use srui_protocol::STANDARD_NAMESPACE_ID;
 pub use type_ref::TypeRef;

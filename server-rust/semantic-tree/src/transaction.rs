@@ -21,7 +21,8 @@
 //! `new_revision == base_revision + 1` (rejecting with [`TxnError::InvalidNewRevision`] if mismatched),
 //! ensuring strict monotonic increment semantics across all interfaces.
 
-use crate::ids::{NodeId, PropertyRef, TypeRef};
+use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, TypeRef};
+use crate::model::ModelItem;
 use crate::store::error::StoreError;
 use crate::store::SemanticStore;
 use crate::value::{Property, Value};
@@ -113,6 +114,38 @@ pub enum Operation {
         id: NodeId,
         properties: Vec<(PropertyRef, Value)>,
     },
+    /// Creates a new collection model (§13 CREATE_MODEL, §8).
+    CreateModel {
+        id: ModelId,
+        model_type: TypeRef,
+        item_count: u64,
+    },
+    /// Inserts items into a collection model at a specified index (§13 MODEL_INSERT, §8).
+    ModelInsert {
+        id: ModelId,
+        index: u64,
+        items: Vec<ModelItem>,
+    },
+    /// Deletes items from a collection model by item identity and/or index range (§13 MODEL_DELETE, §8).
+    ModelDelete {
+        id: ModelId,
+        index: Option<u64>,
+        count: Option<u64>,
+        item_ids: Vec<ItemId>,
+    },
+    /// Updates existing items in a collection model (§13 MODEL_UPDATE, §8).
+    ModelUpdate {
+        id: ModelId,
+        index: Option<u64>,
+        items: Vec<ModelItem>,
+    },
+    /// Resets/replaces a range of cached items in a collection model (§13 MODEL_RESET_RANGE, §8).
+    ModelResetRange {
+        id: ModelId,
+        start_index: u64,
+        items: Vec<ModelItem>,
+        total_count: Option<u64>,
+    },
 }
 
 impl Operation {
@@ -184,6 +217,91 @@ impl Operation {
         }
     }
 
+    /// Convenience constructor for [`Operation::CreateModel`].
+    pub fn create_model(id: ModelId, model_type: TypeRef, item_count: u64) -> Self {
+        Self::CreateModel {
+            id,
+            model_type,
+            item_count,
+        }
+    }
+
+    /// Convenience constructor for [`Operation::ModelInsert`].
+    pub fn model_insert(
+        id: ModelId,
+        index: u64,
+        items: impl IntoIterator<Item = ModelItem>,
+    ) -> Self {
+        Self::ModelInsert {
+            id,
+            index,
+            items: items.into_iter().collect(),
+        }
+    }
+
+    /// Convenience constructor for [`Operation::ModelDelete`] by item IDs.
+    pub fn model_delete_items(id: ModelId, item_ids: impl IntoIterator<Item = ItemId>) -> Self {
+        Self::ModelDelete {
+            id,
+            index: None,
+            count: None,
+            item_ids: item_ids.into_iter().collect(),
+        }
+    }
+
+    /// Convenience constructor for [`Operation::ModelDelete`] by index range.
+    pub fn model_delete_range(id: ModelId, index: u64, count: u64) -> Self {
+        Self::ModelDelete {
+            id,
+            index: Some(index),
+            count: Some(count),
+            item_ids: Vec::new(),
+        }
+    }
+
+    /// Convenience constructor for [`Operation::ModelDelete`].
+    pub fn model_delete(
+        id: ModelId,
+        index: Option<u64>,
+        count: Option<u64>,
+        item_ids: impl IntoIterator<Item = ItemId>,
+    ) -> Self {
+        Self::ModelDelete {
+            id,
+            index,
+            count,
+            item_ids: item_ids.into_iter().collect(),
+        }
+    }
+
+    /// Convenience constructor for [`Operation::ModelUpdate`].
+    pub fn model_update(
+        id: ModelId,
+        index: Option<u64>,
+        items: impl IntoIterator<Item = ModelItem>,
+    ) -> Self {
+        Self::ModelUpdate {
+            id,
+            index,
+            items: items.into_iter().collect(),
+        }
+    }
+
+    /// Convenience constructor for [`Operation::ModelResetRange`].
+    pub fn model_reset_range(
+        id: ModelId,
+        start_index: u64,
+        items: impl IntoIterator<Item = ModelItem>,
+        total_count: Option<u64>,
+    ) -> Self {
+        Self::ModelResetRange {
+            id,
+            start_index,
+            items: items.into_iter().collect(),
+            total_count,
+        }
+    }
+
     /// Applies this operation directly to the given `SemanticStore` (§13).
     pub fn apply(&self, store: &mut SemanticStore) -> Result<(), StoreError> {
         match self {
@@ -221,6 +339,29 @@ impl Operation {
             Self::BatchPropertySet { id, properties } => {
                 store.batch_property_set(*id, properties.clone())
             }
+            Self::CreateModel {
+                id,
+                model_type,
+                item_count,
+            } => store.create_model(*id, *model_type, *item_count),
+            Self::ModelInsert { id, index, items } => {
+                store.model_insert(*id, *index, items.clone())
+            }
+            Self::ModelDelete {
+                id,
+                index,
+                count,
+                item_ids,
+            } => store.model_delete(*id, *index, *count, item_ids.clone()),
+            Self::ModelUpdate { id, index, items } => {
+                store.model_update(*id, *index, items.clone())
+            }
+            Self::ModelResetRange {
+                id,
+                start_index,
+                items,
+                total_count,
+            } => store.model_reset_range(*id, *start_index, items.clone(), *total_count),
         }
     }
 }
@@ -338,6 +479,71 @@ impl TryFrom<srui_protocol::Operation> for Operation {
                 }
                 Ok(Self::BatchPropertySet { id, properties })
             }
+            Op::CreateModel(create_op) => {
+                let id = ModelId::new(create_op.model_id);
+                let model_type = create_op
+                    .model_type
+                    .map(TypeRef::from)
+                    .ok_or_else(|| TxnError::WireError("missing TypeRef in CreateModelOp".to_string()))?;
+                Ok(Self::CreateModel {
+                    id,
+                    model_type,
+                    item_count: create_op.item_count,
+                })
+            }
+            Op::ModelInsert(insert_op) => {
+                let id = ModelId::new(insert_op.model_id);
+                let mut items = Vec::with_capacity(insert_op.items.len());
+                for wire_item in insert_op.items {
+                    let item = ModelItem::try_from(wire_item)
+                        .map_err(|e| TxnError::WireError(e.to_string()))?;
+                    items.push(item);
+                }
+                Ok(Self::ModelInsert {
+                    id,
+                    index: insert_op.index,
+                    items,
+                })
+            }
+            Op::ModelDelete(del_op) => {
+                let id = ModelId::new(del_op.model_id);
+                let index = if del_op.count > 0 { Some(del_op.index) } else { None };
+                let count = if del_op.count > 0 { Some(del_op.count) } else { None };
+                let item_ids = del_op.item_ids.into_iter().map(ItemId::new).collect();
+                Ok(Self::ModelDelete {
+                    id,
+                    index,
+                    count,
+                    item_ids,
+                })
+            }
+            Op::ModelUpdate(update_op) => {
+                let id = ModelId::new(update_op.model_id);
+                let index = if update_op.index == u64::MAX { None } else { Some(update_op.index) };
+                let mut items = Vec::with_capacity(update_op.items.len());
+                for wire_item in update_op.items {
+                    let item = ModelItem::try_from(wire_item)
+                        .map_err(|e| TxnError::WireError(e.to_string()))?;
+                    items.push(item);
+                }
+                Ok(Self::ModelUpdate { id, index, items })
+            }
+            Op::ModelResetRange(reset_op) => {
+                let id = ModelId::new(reset_op.model_id);
+                let total_count = if reset_op.total_count > 0 { Some(reset_op.total_count) } else { None };
+                let mut items = Vec::with_capacity(reset_op.items.len());
+                for wire_item in reset_op.items {
+                    let item = ModelItem::try_from(wire_item)
+                        .map_err(|e| TxnError::WireError(e.to_string()))?;
+                    items.push(item);
+                }
+                Ok(Self::ModelResetRange {
+                    id,
+                    start_index: reset_op.start_index,
+                    items,
+                    total_count,
+                })
+            }
             _ => Err(TxnError::WireError(
                 "unsupported operation variant for tree mutation".to_string(),
             )),
@@ -432,6 +638,66 @@ impl From<Operation> for srui_protocol::Operation {
                     op: Some(Op::BatchPropertySet(srui_protocol::BatchPropertySetOp {
                         node_id: id.get(),
                         properties: wire_properties,
+                    })),
+                }
+            }
+            Operation::CreateModel {
+                id,
+                model_type,
+                item_count,
+            } => srui_protocol::Operation {
+                op: Some(Op::CreateModel(srui_protocol::CreateModelOp {
+                    model_id: id.get(),
+                    model_type: Some(model_type.into()),
+                    item_count,
+                })),
+            },
+            Operation::ModelInsert { id, index, items } => {
+                let wire_items = items.into_iter().map(srui_protocol::ModelItem::from).collect();
+                srui_protocol::Operation {
+                    op: Some(Op::ModelInsert(srui_protocol::ModelInsertOp {
+                        model_id: id.get(),
+                        index,
+                        items: wire_items,
+                    })),
+                }
+            }
+            Operation::ModelDelete {
+                id,
+                index,
+                count,
+                item_ids,
+            } => srui_protocol::Operation {
+                op: Some(Op::ModelDelete(srui_protocol::ModelDeleteOp {
+                    model_id: id.get(),
+                    index: index.unwrap_or(0),
+                    count: count.unwrap_or(0),
+                    item_ids: item_ids.into_iter().map(|i| i.get()).collect(),
+                })),
+            },
+            Operation::ModelUpdate { id, index, items } => {
+                let wire_items = items.into_iter().map(srui_protocol::ModelItem::from).collect();
+                srui_protocol::Operation {
+                    op: Some(Op::ModelUpdate(srui_protocol::ModelUpdateOp {
+                        model_id: id.get(),
+                        index: index.unwrap_or(u64::MAX),
+                        items: wire_items,
+                    })),
+                }
+            }
+            Operation::ModelResetRange {
+                id,
+                start_index,
+                items,
+                total_count,
+            } => {
+                let wire_items = items.into_iter().map(srui_protocol::ModelItem::from).collect();
+                srui_protocol::Operation {
+                    op: Some(Op::ModelResetRange(srui_protocol::ModelResetRangeOp {
+                        model_id: id.get(),
+                        start_index,
+                        items: wire_items,
+                        total_count: total_count.unwrap_or(0),
                     })),
                 }
             }

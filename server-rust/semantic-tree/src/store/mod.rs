@@ -8,7 +8,8 @@ pub use error::StoreError;
 pub use limits::{StoreLimits, DEFAULT_MAX_TRANSACTION_OPERATIONS};
 pub use node::Node;
 
-use crate::ids::{NodeId, PropertyRef, TypeRef};
+use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, TypeRef};
+use crate::model::{Model, ModelItem};
 use crate::transaction::Revision;
 use crate::value::{Property, Value};
 use std::collections::{HashMap, HashSet};
@@ -32,6 +33,10 @@ pub struct SemanticStore {
     roots: Vec<NodeId>,
     /// Set of all `NodeId`s that have ever been created in this session (§6.2 invariant).
     used_ids: HashSet<NodeId>,
+    /// Active collection models mapped by `ModelId` (§8, §13).
+    models: HashMap<ModelId, Model>,
+    /// Set of all `ModelId`s that have ever been created in this session (§6.2, §8 invariant).
+    used_model_ids: HashSet<ModelId>,
     /// Mandatory runtime limits enforced by the store (§26).
     limits: StoreLimits,
     /// Authoritative committed revision counter (§12.1).
@@ -56,6 +61,8 @@ impl SemanticStore {
             nodes: HashMap::new(),
             roots: Vec::new(),
             used_ids: HashSet::new(),
+            models: HashMap::new(),
+            used_model_ids: HashSet::new(),
             limits,
             revision: Revision::INITIAL,
         }
@@ -67,6 +74,8 @@ impl SemanticStore {
             nodes: HashMap::new(),
             roots: Vec::new(),
             used_ids: HashSet::new(),
+            models: HashMap::new(),
+            used_model_ids: HashSet::new(),
             limits,
             revision,
         }
@@ -88,6 +97,8 @@ impl SemanticStore {
             nodes: self.nodes.clone(),
             roots: self.roots.clone(),
             used_ids: self.used_ids.clone(),
+            models: self.models.clone(),
+            used_model_ids: self.used_model_ids.clone(),
             limits: self.limits.clone(),
             revision: self.revision,
         }
@@ -98,6 +109,8 @@ impl SemanticStore {
         self.nodes = staged.nodes;
         self.roots = staged.roots;
         self.used_ids = staged.used_ids;
+        self.models = staged.models;
+        self.used_model_ids = staged.used_model_ids;
         self.revision = new_revision;
     }
 
@@ -504,6 +517,130 @@ impl SemanticStore {
         Ok(())
     }
 
+    /// Returns the number of active models currently in the store (§8).
+    pub fn model_count(&self) -> usize {
+        self.models.len()
+    }
+
+    /// Returns `true` if an active model exists with the given ID (§8).
+    pub fn contains_model(&self, id: ModelId) -> bool {
+        self.models.contains_key(&id)
+    }
+
+    /// Returns `true` if the given `ModelId` was ever used in this session (even if deleted, §6.2, §8).
+    pub fn is_model_id_used(&self, id: ModelId) -> bool {
+        self.used_model_ids.contains(&id)
+    }
+
+    /// Returns an immutable reference to the model with the given ID.
+    pub fn get_model(&self, id: ModelId) -> Option<&Model> {
+        self.models.get(&id)
+    }
+
+    /// Returns a mutable reference to the model with the given ID.
+    pub fn get_model_mut(&mut self, id: ModelId) -> Option<&mut Model> {
+        self.models.get_mut(&id)
+    }
+
+    /// Returns the model referenced by the given node, if any (§8).
+    pub fn get_model_for_node(&self, node_id: NodeId) -> Option<&Model> {
+        let node = self.nodes.get(&node_id)?;
+        let model_id = node.model_ref()?;
+        self.models.get(&model_id)
+    }
+
+    /// Creates a new collection model in the store (§13 CREATE_MODEL, §8).
+    pub fn create_model(
+        &mut self,
+        id: ModelId,
+        model_type: TypeRef,
+        item_count: u64,
+    ) -> Result<(), StoreError> {
+        if self.used_model_ids.contains(&id) {
+            return Err(StoreError::ModelIdAlreadyUsed(id));
+        }
+
+        let model = Model::new(id, model_type, item_count);
+        self.models.insert(id, model);
+        self.used_model_ids.insert(id);
+        Ok(())
+    }
+
+    /// Deletes a model from the store, returning the deleted model if it existed.
+    pub fn delete_model(&mut self, id: ModelId) -> Result<Option<Model>, StoreError> {
+        if !self.models.contains_key(&id) {
+            return Err(StoreError::ModelNotFound(id));
+        }
+        Ok(self.models.remove(&id))
+    }
+
+    /// Inserts items into a collection model at a specified index (§13 MODEL_INSERT).
+    pub fn model_insert(
+        &mut self,
+        id: ModelId,
+        index: u64,
+        items: Vec<ModelItem>,
+    ) -> Result<(), StoreError> {
+        for item in &items {
+            self.limits.validate_value(&item.value)?;
+            for (_, val) in &item.properties {
+                self.limits.validate_value(val)?;
+            }
+        }
+
+        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        model.insert_items(index, items)
+    }
+
+    /// Deletes items from a collection model by item identity and/or index range (§13 MODEL_DELETE).
+    pub fn model_delete(
+        &mut self,
+        id: ModelId,
+        index: Option<u64>,
+        count: Option<u64>,
+        item_ids: Vec<ItemId>,
+    ) -> Result<(), StoreError> {
+        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        model.delete_items(index, count, &item_ids)
+    }
+
+    /// Updates existing items in a collection model (§13 MODEL_UPDATE).
+    pub fn model_update(
+        &mut self,
+        id: ModelId,
+        index: Option<u64>,
+        items: Vec<ModelItem>,
+    ) -> Result<(), StoreError> {
+        for item in &items {
+            self.limits.validate_value(&item.value)?;
+            for (_, val) in &item.properties {
+                self.limits.validate_value(val)?;
+            }
+        }
+
+        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        model.update_items(index, items)
+    }
+
+    /// Resets/replaces a range of cached items in a collection model (§13 MODEL_RESET_RANGE).
+    pub fn model_reset_range(
+        &mut self,
+        id: ModelId,
+        start_index: u64,
+        items: Vec<ModelItem>,
+        total_count: Option<u64>,
+    ) -> Result<(), StoreError> {
+        for item in &items {
+            self.limits.validate_value(&item.value)?;
+            for (_, val) in &item.properties {
+                self.limits.validate_value(val)?;
+            }
+        }
+
+        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        model.reset_range(start_index, items, total_count)
+    }
+
     /// Applies a protobuf wire `Operation` directly to the store (§13, §16).
     pub fn apply_operation(&mut self, op: &srui_protocol::Operation) -> Result<(), StoreError> {
         use srui_protocol::operation::Op;
@@ -609,6 +746,58 @@ impl SemanticStore {
                     properties.push((prop.property, prop.value));
                 }
                 self.batch_property_set(id, properties)?;
+                Ok(())
+            }
+            Op::CreateModel(op) => {
+                let id = ModelId::new(op.model_id);
+                let model_type = op
+                    .model_type
+                    .map(TypeRef::from)
+                    .ok_or_else(|| StoreError::OperationError("missing TypeRef in CreateModelOp".to_string()))?;
+                self.create_model(id, model_type, op.item_count)?;
+                Ok(())
+            }
+            Op::ModelInsert(op) => {
+                let id = ModelId::new(op.model_id);
+                let mut items = Vec::with_capacity(op.items.len());
+                for wire_item in &op.items {
+                    let item = ModelItem::try_from(wire_item.clone())
+                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
+                    items.push(item);
+                }
+                self.model_insert(id, op.index, items)?;
+                Ok(())
+            }
+            Op::ModelDelete(op) => {
+                let id = ModelId::new(op.model_id);
+                let index = if op.count > 0 { Some(op.index) } else { None };
+                let count = if op.count > 0 { Some(op.count) } else { None };
+                let item_ids = op.item_ids.iter().copied().map(ItemId::new).collect();
+                self.model_delete(id, index, count, item_ids)?;
+                Ok(())
+            }
+            Op::ModelUpdate(op) => {
+                let id = ModelId::new(op.model_id);
+                let index = if op.index == u64::MAX { None } else { Some(op.index) };
+                let mut items = Vec::with_capacity(op.items.len());
+                for wire_item in &op.items {
+                    let item = ModelItem::try_from(wire_item.clone())
+                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
+                    items.push(item);
+                }
+                self.model_update(id, index, items)?;
+                Ok(())
+            }
+            Op::ModelResetRange(op) => {
+                let id = ModelId::new(op.model_id);
+                let total_count = if op.total_count > 0 { Some(op.total_count) } else { None };
+                let mut items = Vec::with_capacity(op.items.len());
+                for wire_item in &op.items {
+                    let item = ModelItem::try_from(wire_item.clone())
+                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
+                    items.push(item);
+                }
+                self.model_reset_range(id, op.start_index, items, total_count)?;
                 Ok(())
             }
             _ => Err(StoreError::OperationError(

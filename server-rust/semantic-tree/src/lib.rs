@@ -13,6 +13,7 @@
 //! - §26: Mandatory limits ([`StoreLimits`])
 
 pub mod ids;
+pub mod model;
 pub mod store;
 pub mod transaction;
 pub mod value;
@@ -21,13 +22,15 @@ pub use ids::{
     lookup_standard_enum, lookup_standard_event, lookup_standard_node_type, lookup_standard_operation,
     lookup_standard_property, resolve_standard_node_type, resolve_standard_property,
     standard_enum_name, standard_event_name, standard_node_type_name, standard_operation_name,
-    standard_property_name, ItemId, NodeId, ParseResourceHashError, PropertyRef,
+    standard_property_name, ItemId, ModelId, NodeId, ParseResourceHashError, PropertyRef,
     RegistryLookupError, ResourceHash, TypeRef, StandardActionRole, StandardHorizontalAlignment,
     StandardImportance, StandardInputRole, StandardPaddingRole, StandardSelectionMode,
     StandardSpacingRole, StandardTextRole, StandardTogglePresentationHint, StandardValidationState,
     StandardVerticalAlignment, StandardVisibility, STANDARD_ENUMS, STANDARD_EVENTS,
     STANDARD_NAMESPACE_ID, STANDARD_NODE_TYPES, STANDARD_OPERATIONS, STANDARD_PROPERTIES,
 };
+
+pub use model::{Model, ModelItem};
 
 pub use store::{
     Node, SemanticStore, StoreError, StoreLimits, DEFAULT_MAX_NODE_COUNT,
@@ -40,3 +43,4 @@ pub use value::{
     EdgeInsets, EnumToken, Point, Property, Range, Rect, Size, SmallRecord, Value,
     ValueConversionError,
 };
+

@@ -33,6 +33,33 @@ impl SemanticStore {
         Ok(new_revision)
     }
 
+    fn apply_staged_owned(
+        &mut self,
+        ops: Vec<Operation>,
+        new_revision: Revision,
+    ) -> Result<Revision, TxnError> {
+        let max_ops = self.limits().max_transaction_operations;
+        if ops.len() > max_ops {
+            return Err(TxnError::MaxOperationsExceeded {
+                limit: max_ops,
+                actual: ops.len(),
+            });
+        }
+
+        let mut staged = self.clone_staging();
+        for (idx, op) in ops.into_iter().enumerate() {
+            if let Err(source) = op.apply_owned(&mut staged) {
+                return Err(TxnError::OpFailed {
+                    op_index: idx,
+                    source,
+                });
+            }
+        }
+
+        self.commit_staging(staged, new_revision);
+        Ok(new_revision)
+    }
+
     /// Applies a sequence of mutation operations as an atomic transaction advancing from `base_revision` to `base_revision + 1` (§12.1).
     ///
     /// Semantics required by §12.1 and §26:
@@ -65,7 +92,7 @@ impl SemanticStore {
             });
         }
 
-        self.apply_staged(&ops, base_rev.next())
+        self.apply_staged_owned(ops, base_rev.next())
     }
 
     /// Applies a structured [`Transaction`] record, validating base revision, new revision (`base_revision + 1`), and operational limits (§12.1).
@@ -95,6 +122,22 @@ impl SemanticStore {
         wire_txn: srui_protocol::Transaction,
     ) -> Result<Revision, TxnError> {
         let txn = Transaction::try_from(wire_txn)?;
-        self.apply_transaction_record(&txn)
+        let base_rev = self.revision();
+        if txn.base_revision != base_rev {
+            return Err(TxnError::StaleBaseRevision {
+                expected: base_rev,
+                actual: txn.base_revision,
+            });
+        }
+
+        let expected_new_rev = txn.base_revision.next();
+        if txn.new_revision != expected_new_rev {
+            return Err(TxnError::InvalidNewRevision {
+                expected: expected_new_rev,
+                actual: txn.new_revision,
+            });
+        }
+
+        self.apply_staged_owned(txn.operations, txn.new_revision)
     }
 }

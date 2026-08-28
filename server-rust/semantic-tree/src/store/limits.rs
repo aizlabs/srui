@@ -94,6 +94,7 @@ impl StoreLimits {
     }
 
     /// Creates a new `StoreLimits` with full explicit customization of all 10 store, value, transaction, and model limits (§26).
+    #[allow(clippy::too_many_arguments)]
     pub const fn with_all_limits(
         max_tree_depth: usize,
         max_node_count: usize,

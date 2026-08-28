@@ -14,6 +14,7 @@
 use crate::ids::{ItemId, ModelId, PropertyRef, TypeRef};
 use crate::store::error::StoreError;
 use crate::value::{Property, Range, Value, ValueConversionError};
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// An item within a collection data model (§8, §13).
@@ -71,12 +72,12 @@ impl ModelItem {
     }
 }
 
-impl From<ModelItem> for srui_protocol::ModelItem {
-    fn from(item: ModelItem) -> Self {
+impl From<&ModelItem> for srui_protocol::ModelItem {
+    fn from(item: &ModelItem) -> Self {
         let properties = item
             .properties
-            .into_iter()
-            .map(|(p, v)| srui_protocol::Property {
+            .iter()
+            .map(|(&p, v)| srui_protocol::Property {
                 property: Some(p.into()),
                 value: Some(v.into()),
             })
@@ -84,9 +85,15 @@ impl From<ModelItem> for srui_protocol::ModelItem {
 
         srui_protocol::ModelItem {
             item_id: item.item_id.get(),
-            value: Some(item.value.into()),
+            value: Some((&item.value).into()),
             properties,
         }
+    }
+}
+
+impl From<ModelItem> for srui_protocol::ModelItem {
+    fn from(item: ModelItem) -> Self {
+        (&item).into()
     }
 }
 
@@ -353,11 +360,16 @@ impl Model {
             }
 
             // Remove only cached items within the deleted range in O(k log N)
-            let cached_keys_in_range: Vec<u64> =
-                self.items.range(idx..idx + cnt).map(|(&k, _)| k).collect();
-            for k in cached_keys_in_range {
-                if let Some(removed) = self.items.remove(&k) {
-                    self.id_to_index.remove(&removed.item_id);
+            if self.items.range(idx..idx + cnt).next().is_some() {
+                let cached_keys_in_range: SmallVec<[u64; 16]> = self
+                    .items
+                    .range(idx..idx + cnt)
+                    .map(|(&k, _)| k)
+                    .collect();
+                for k in cached_keys_in_range {
+                    if let Some(removed) = self.items.remove(&k) {
+                        self.id_to_index.remove(&removed.item_id);
+                    }
                 }
             }
 

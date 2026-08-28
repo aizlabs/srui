@@ -187,8 +187,8 @@ fn main() {
     // Generated Typed Standard Enums
     for enum_def in &registry.enums {
         let enum_type_name = format!("Standard{}", enum_def.name);
-        code.push_str(&format!("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n"));
-        code.push_str(&format!("#[repr(u32)]\n"));
+        code.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n");
+        code.push_str("#[repr(u32)]\n");
         code.push_str(&format!("pub enum {} {{\n", enum_type_name));
         for val in &enum_def.values {
             let variant_name = to_pascal_case(&val.name);

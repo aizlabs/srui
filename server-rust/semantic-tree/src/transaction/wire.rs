@@ -192,8 +192,8 @@ impl TryFrom<srui_protocol::Operation> for Operation {
     }
 }
 
-impl From<Operation> for srui_protocol::Operation {
-    fn from(op: Operation) -> Self {
+impl From<&Operation> for srui_protocol::Operation {
+    fn from(op: &Operation) -> Self {
         use srui_protocol::operation::Op;
 
         match op {
@@ -205,9 +205,9 @@ impl From<Operation> for srui_protocol::Operation {
                 properties,
             } => {
                 let wire_properties = properties
-                    .into_iter()
+                    .iter()
                     .map(|(p, v)| srui_protocol::Property {
-                        property: Some(p.into()),
+                        property: Some((*p).into()),
                         value: Some(v.into()),
                     })
                     .collect();
@@ -216,7 +216,7 @@ impl From<Operation> for srui_protocol::Operation {
                     op: Some(Op::CreateNode(srui_protocol::CreateNodeOp {
                         node: Some(srui_protocol::NodeRecord {
                             node_id: id.get(),
-                            r#type: Some(node_type.into()),
+                            r#type: Some((*node_type).into()),
                             parent_id: parent_id.map(|p| p.get()).unwrap_or(0),
                             child_index: child_index.map(|idx| idx as u32).unwrap_or(u32::MAX),
                             properties: wire_properties,
@@ -236,14 +236,14 @@ impl From<Operation> for srui_protocol::Operation {
             } => srui_protocol::Operation {
                 op: Some(Op::SetProperty(srui_protocol::SetPropertyOp {
                     node_id: id.get(),
-                    property: Some(property.into()),
+                    property: Some((*property).into()),
                     value: Some(value.into()),
                 })),
             },
             Operation::ClearProperty { id, property } => srui_protocol::Operation {
                 op: Some(Op::ClearProperty(srui_protocol::ClearPropertyOp {
                     node_id: id.get(),
-                    property: Some(property.into()),
+                    property: Some((*property).into()),
                 })),
             },
             Operation::MoveNode {
@@ -263,14 +263,14 @@ impl From<Operation> for srui_protocol::Operation {
             } => srui_protocol::Operation {
                 op: Some(Op::ReorderChildren(srui_protocol::ReorderChildrenOp {
                     parent_id: parent_id.get(),
-                    child_node_ids: new_order.into_iter().map(|id| id.get()).collect(),
+                    child_node_ids: new_order.iter().map(|id| id.get()).collect(),
                 })),
             },
             Operation::BatchPropertySet { id, properties } => {
                 let wire_properties = properties
-                    .into_iter()
+                    .iter()
                     .map(|(p, v)| srui_protocol::Property {
-                        property: Some(p.into()),
+                        property: Some((*p).into()),
                         value: Some(v.into()),
                     })
                     .collect();
@@ -289,16 +289,16 @@ impl From<Operation> for srui_protocol::Operation {
             } => srui_protocol::Operation {
                 op: Some(Op::CreateModel(srui_protocol::CreateModelOp {
                     model_id: id.get(),
-                    model_type: Some(model_type.into()),
-                    item_count,
+                    model_type: Some((*model_type).into()),
+                    item_count: *item_count,
                 })),
             },
             Operation::ModelInsert { id, index, items } => {
-                let wire_items = items.into_iter().map(srui_protocol::ModelItem::from).collect();
+                let wire_items = items.iter().map(srui_protocol::ModelItem::from).collect();
                 srui_protocol::Operation {
                     op: Some(Op::ModelInsert(srui_protocol::ModelInsertOp {
                         model_id: id.get(),
-                        index,
+                        index: *index,
                         items: wire_items,
                     })),
                 }
@@ -313,11 +313,11 @@ impl From<Operation> for srui_protocol::Operation {
                     model_id: id.get(),
                     index: index.unwrap_or(0),
                     count: count.unwrap_or(0),
-                    item_ids: item_ids.into_iter().map(|i| i.get()).collect(),
+                    item_ids: item_ids.iter().map(|i| i.get()).collect(),
                 })),
             },
             Operation::ModelUpdate { id, index, items } => {
-                let wire_items = items.into_iter().map(srui_protocol::ModelItem::from).collect();
+                let wire_items = items.iter().map(srui_protocol::ModelItem::from).collect();
                 srui_protocol::Operation {
                     op: Some(Op::ModelUpdate(srui_protocol::ModelUpdateOp {
                         model_id: id.get(),
@@ -332,17 +332,23 @@ impl From<Operation> for srui_protocol::Operation {
                 items,
                 total_count,
             } => {
-                let wire_items = items.into_iter().map(srui_protocol::ModelItem::from).collect();
+                let wire_items = items.iter().map(srui_protocol::ModelItem::from).collect();
                 srui_protocol::Operation {
                     op: Some(Op::ModelResetRange(srui_protocol::ModelResetRangeOp {
                         model_id: id.get(),
-                        start_index,
+                        start_index: *start_index,
                         items: wire_items,
                         total_count: total_count.unwrap_or(0),
                     })),
                 }
             }
         }
+    }
+}
+
+impl From<Operation> for srui_protocol::Operation {
+    fn from(op: Operation) -> Self {
+        (&op).into()
     }
 }
 
@@ -364,14 +370,24 @@ impl TryFrom<srui_protocol::Transaction> for Transaction {
     }
 }
 
-impl From<Transaction> for srui_protocol::Transaction {
-    fn from(txn: Transaction) -> Self {
-        let operations = txn.operations.into_iter().map(srui_protocol::Operation::from).collect();
+impl From<&Transaction> for srui_protocol::Transaction {
+    fn from(txn: &Transaction) -> Self {
+        let operations = txn
+            .operations
+            .iter()
+            .map(srui_protocol::Operation::from)
+            .collect();
         srui_protocol::Transaction {
             base_revision: txn.base_revision.get(),
             new_revision: txn.new_revision.get(),
             operations,
             priority: txn.priority,
         }
+    }
+}
+
+impl From<Transaction> for srui_protocol::Transaction {
+    fn from(txn: Transaction) -> Self {
+        (&txn).into()
     }
 }

@@ -11,6 +11,7 @@
 //!   and `Vec<u8>` buffers without socket I/O dependencies.
 
 use prost::Message;
+use bytes::BufMut;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -149,7 +150,7 @@ impl NodeRecord {
 
     /// Converts this record to a protobuf wire [`srui_protocol::NodeRecord`].
     pub fn to_wire(&self) -> srui_protocol::NodeRecord {
-        self.clone().into()
+        self.into()
     }
 
     /// Encodes this record directly to protobuf wire bytes.
@@ -172,11 +173,11 @@ impl NodeRecord {
 // NodeRecord <-> srui_protocol::NodeRecord
 // -----------------------------------------------------------------------------
 
-impl From<NodeRecord> for srui_protocol::NodeRecord {
-    fn from(rec: NodeRecord) -> Self {
+impl From<&NodeRecord> for srui_protocol::NodeRecord {
+    fn from(rec: &NodeRecord) -> Self {
         let properties = rec
             .properties
-            .into_iter()
+            .iter()
             .map(srui_protocol::Property::from)
             .collect();
 
@@ -187,6 +188,12 @@ impl From<NodeRecord> for srui_protocol::NodeRecord {
             child_index: rec.child_index.map(|idx| idx as u32).unwrap_or(u32::MAX),
             properties,
         }
+    }
+}
+
+impl From<NodeRecord> for srui_protocol::NodeRecord {
+    fn from(rec: NodeRecord) -> Self {
+        (&rec).into()
     }
 }
 
@@ -281,18 +288,19 @@ impl TryFrom<Operation> for NodeRecord {
 // Event <-> srui_protocol::Event
 // -----------------------------------------------------------------------------
 
-impl From<Event> for srui_protocol::Event {
-    fn from(event: Event) -> Self {
+impl From<&Event> for srui_protocol::Event {
+    fn from(event: &Event) -> Self {
         let client_instance_id = event
             .client_instance_id
-            .map(|id| id.0)
+            .as_ref()
+            .map(|id| id.0.clone())
             .unwrap_or_default();
 
         let arguments = event
             .arguments
-            .into_iter()
+            .iter()
             .map(|(p, v)| srui_protocol::Property {
-                property: Some(p.into()),
+                property: Some((*p).into()),
                 value: Some(v.into()),
             })
             .collect();
@@ -300,12 +308,18 @@ impl From<Event> for srui_protocol::Event {
         Self {
             client_instance_id,
             event_seq: event.event_seq,
-            event_id: event.event_id.0,
+            event_id: event.event_id.0.clone(),
             observed_revision: event.observed_revision.get(),
             node_id: event.node_id.get(),
             event_type: Some(event.event_type.into()),
             arguments,
         }
+    }
+}
+
+impl From<Event> for srui_protocol::Event {
+    fn from(event: Event) -> Self {
+        (&event).into()
     }
 }
 
@@ -349,7 +363,7 @@ impl TryFrom<srui_protocol::Event> for Event {
 impl Transaction {
     /// Converts this transaction envelope to a protobuf wire [`srui_protocol::Transaction`].
     pub fn to_wire(&self) -> srui_protocol::Transaction {
-        self.clone().into()
+        self.into()
     }
 
     /// Encodes this transaction directly to protobuf wire bytes.
@@ -371,7 +385,7 @@ impl Transaction {
 impl Operation {
     /// Converts this mutation operation to a protobuf wire [`srui_protocol::Operation`].
     pub fn to_wire(&self) -> srui_protocol::Operation {
-        self.clone().into()
+        self.into()
     }
 
     /// Encodes this operation directly to protobuf wire bytes.
@@ -393,7 +407,7 @@ impl Operation {
 impl Event {
     /// Converts this semantic event to a protobuf wire [`srui_protocol::Event`].
     pub fn to_wire(&self) -> srui_protocol::Event {
-        self.clone().into()
+        self.into()
     }
 
     /// Encodes this event directly to protobuf wire bytes.
@@ -415,7 +429,7 @@ impl Event {
 impl Value {
     /// Converts this dynamic value to a protobuf wire [`srui_protocol::Value`].
     pub fn to_wire(&self) -> srui_protocol::Value {
-        self.clone().into()
+        self.into()
     }
 
     /// Encodes this value directly to protobuf wire bytes.
@@ -440,12 +454,21 @@ impl Value {
 
 /// Serializes a [`Transaction`] to Protocol Buffers wire bytes.
 pub fn encode_transaction(txn: &Transaction) -> Vec<u8> {
-    let wire_txn: srui_protocol::Transaction = txn.clone().into();
+    let wire_txn: srui_protocol::Transaction = txn.into();
     let mut buf = Vec::with_capacity(wire_txn.encoded_len());
     wire_txn
         .encode(&mut buf)
         .expect("Transaction protobuf encoding should never fail in-memory");
     buf
+}
+
+/// Encodes a [`Transaction`] into an existing buffer without cloning the domain transaction.
+pub fn encode_transaction_ref(
+    txn: &Transaction,
+    buf: &mut impl BufMut,
+) -> Result<(), prost::EncodeError> {
+    let wire_txn: srui_protocol::Transaction = txn.into();
+    wire_txn.encode(buf)
 }
 
 /// Deserializes a [`Transaction`] from Protocol Buffers wire bytes.
@@ -456,12 +479,21 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<Transaction, WireError> {
 
 /// Serializes an [`Operation`] to Protocol Buffers wire bytes.
 pub fn encode_operation(op: &Operation) -> Vec<u8> {
-    let wire_op: srui_protocol::Operation = op.clone().into();
+    let wire_op: srui_protocol::Operation = op.into();
     let mut buf = Vec::with_capacity(wire_op.encoded_len());
     wire_op
         .encode(&mut buf)
         .expect("Operation protobuf encoding should never fail in-memory");
     buf
+}
+
+/// Encodes an [`Operation`] into an existing buffer without cloning the domain operation.
+pub fn encode_operation_ref(
+    op: &Operation,
+    buf: &mut impl BufMut,
+) -> Result<(), prost::EncodeError> {
+    let wire_op: srui_protocol::Operation = op.into();
+    wire_op.encode(buf)
 }
 
 /// Deserializes an [`Operation`] from Protocol Buffers wire bytes.
@@ -472,12 +504,21 @@ pub fn decode_operation(bytes: &[u8]) -> Result<Operation, WireError> {
 
 /// Serializes an [`Event`] to Protocol Buffers wire bytes.
 pub fn encode_event(event: &Event) -> Vec<u8> {
-    let wire_event: srui_protocol::Event = event.clone().into();
+    let wire_event: srui_protocol::Event = event.into();
     let mut buf = Vec::with_capacity(wire_event.encoded_len());
     wire_event
         .encode(&mut buf)
         .expect("Event protobuf encoding should never fail in-memory");
     buf
+}
+
+/// Encodes an [`Event`] into an existing buffer without cloning the domain event.
+pub fn encode_event_ref(
+    event: &Event,
+    buf: &mut impl BufMut,
+) -> Result<(), prost::EncodeError> {
+    let wire_event: srui_protocol::Event = event.into();
+    wire_event.encode(buf)
 }
 
 /// Deserializes an [`Event`] from Protocol Buffers wire bytes.
@@ -488,12 +529,21 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event, WireError> {
 
 /// Serializes a [`Value`] to Protocol Buffers wire bytes.
 pub fn encode_value(value: &Value) -> Vec<u8> {
-    let wire_value: srui_protocol::Value = value.clone().into();
+    let wire_value: srui_protocol::Value = value.into();
     let mut buf = Vec::with_capacity(wire_value.encoded_len());
     wire_value
         .encode(&mut buf)
         .expect("Value protobuf encoding should never fail in-memory");
     buf
+}
+
+/// Encodes a [`Value`] into an existing buffer without cloning the domain value.
+pub fn encode_value_ref(
+    value: &Value,
+    buf: &mut impl BufMut,
+) -> Result<(), prost::EncodeError> {
+    let wire_value: srui_protocol::Value = value.into();
+    wire_value.encode(buf)
 }
 
 /// Deserializes a [`Value`] from Protocol Buffers wire bytes.
@@ -504,12 +554,21 @@ pub fn decode_value(bytes: &[u8]) -> Result<Value, WireError> {
 
 /// Serializes a [`NodeRecord`] to Protocol Buffers wire bytes.
 pub fn encode_node_record(node: &NodeRecord) -> Vec<u8> {
-    let wire_node: srui_protocol::NodeRecord = node.clone().into();
+    let wire_node: srui_protocol::NodeRecord = node.into();
     let mut buf = Vec::with_capacity(wire_node.encoded_len());
     wire_node
         .encode(&mut buf)
         .expect("NodeRecord protobuf encoding should never fail in-memory");
     buf
+}
+
+/// Encodes a [`NodeRecord`] into an existing buffer without cloning the domain record.
+pub fn encode_node_record_ref(
+    node: &NodeRecord,
+    buf: &mut impl BufMut,
+) -> Result<(), prost::EncodeError> {
+    let wire_node: srui_protocol::NodeRecord = node.into();
+    wire_node.encode(buf)
 }
 
 /// Deserializes a [`NodeRecord`] from Protocol Buffers wire bytes.

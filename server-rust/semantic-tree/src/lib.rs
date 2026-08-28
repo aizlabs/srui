@@ -65,7 +65,8 @@ pub use value::{
 
 pub use wire::{
     decode_event, decode_message, decode_node_record, decode_operation, decode_transaction,
-    decode_value, encode_event, encode_message, encode_node_record, encode_operation,
-    encode_transaction, encode_value, NodeRecord, WireError,
+    decode_value, encode_event, encode_event_ref, encode_message, encode_node_record,
+    encode_node_record_ref, encode_operation, encode_operation_ref, encode_transaction,
+    encode_transaction_ref, encode_value, encode_value_ref, NodeRecord, WireError,
 };
 

@@ -97,27 +97,36 @@ impl TransactionJournal {
         from_revision >= self.earliest_revision && from_revision <= self.latest_revision
     }
 
+    /// Returns an iterator over transactions starting from `from_revision` up to `latest_revision`.
+    ///
+    /// Returns `None` if `from_revision` falls outside the retained journal window.
+    #[must_use]
+    pub fn iter_from(&self, from_revision: u64) -> Option<impl Iterator<Item = &Transaction>> {
+        if from_revision > self.latest_revision || from_revision < self.earliest_revision {
+            return None;
+        }
+
+        let skip_count = if from_revision == self.latest_revision {
+            self.entries.len()
+        } else {
+            let count = (from_revision - self.earliest_revision) as usize;
+            if count > self.entries.len() {
+                return None;
+            }
+            count
+        };
+
+        Some(self.entries.iter().skip(skip_count))
+    }
+
     /// Returns a list of sequential transactions starting from `from_revision` up to `latest_revision`.
     ///
     /// Returns `None` if `from_revision` falls outside the retained journal window (indicating that
     /// the client has fallen too far behind and must receive a full state snapshot resync, §20.2).
     #[must_use]
     pub fn replay_from(&self, from_revision: u64) -> Option<Vec<Transaction>> {
-        if from_revision > self.latest_revision || from_revision < self.earliest_revision {
-            return None;
-        }
-
-        if from_revision == self.latest_revision {
-            return Some(Vec::new());
-        }
-
-        let skip_count = (from_revision - self.earliest_revision) as usize;
-        if skip_count > self.entries.len() {
-            return None;
-        }
-
-        let replayed: Vec<Transaction> = self.entries.iter().skip(skip_count).cloned().collect();
-        Some(replayed)
+        self.iter_from(from_revision)
+            .map(|iter| iter.cloned().collect())
     }
 
     /// Returns the earliest revision currently retained in the journal.

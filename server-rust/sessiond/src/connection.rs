@@ -92,13 +92,14 @@ where
             match session.handle_resume(&resume)? {
                 ResumeOutcome::Replay {
                     welcome_msg,
-                    replayed_transactions,
+                    from_revision,
                 } => {
                     let envelope = SruiMessage {
                         msg: Some(srui_message::Msg::ServerResumeOk(welcome_msg)),
                     };
                     framed_write.send(envelope).await?;
-                    for tx in replayed_transactions {
+                    let replayed = session.collect_replayed_transactions(from_revision)?;
+                    for tx in replayed {
                         let tx_env = SruiMessage {
                             msg: Some(srui_message::Msg::Transaction(tx)),
                         };

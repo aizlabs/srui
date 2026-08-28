@@ -4,6 +4,8 @@
 //! Enforces bounded memory limits per client to prevent memory exhaustion.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+
+use bytes::Bytes;
 use srui_protocol::Event;
 
 /// Default maximum number of recent event IDs retained per client instance (4096 events).
@@ -13,13 +15,13 @@ pub const DEFAULT_MAX_DEDUPE_ENTRIES: usize = 4096;
 #[derive(Debug, Clone)]
 pub struct EventDeduplicator {
     max_entries_per_client: usize,
-    clients: HashMap<Vec<u8>, ClientDedupeWindow>,
+    clients: HashMap<Bytes, ClientDedupeWindow>,
 }
 
 #[derive(Debug, Clone)]
 struct ClientDedupeWindow {
-    seen_ids: HashSet<Vec<u8>>,
-    order: VecDeque<Vec<u8>>,
+    seen_ids: HashSet<Bytes>,
+    order: VecDeque<Bytes>,
 }
 
 impl ClientDedupeWindow {
@@ -41,9 +43,9 @@ impl ClientDedupeWindow {
             }
         }
 
-        let id_vec = event_id.to_vec();
-        self.seen_ids.insert(id_vec.clone());
-        self.order.push_back(id_vec);
+        let id = Bytes::copy_from_slice(event_id);
+        self.order.push_back(id.clone());
+        self.seen_ids.insert(id);
         true
     }
 
@@ -87,12 +89,15 @@ impl EventDeduplicator {
         }
 
         let max_entries = self.max_entries_per_client;
-        let window = self
-            .clients
-            .entry(client_instance_id.to_vec())
-            .or_insert_with(ClientDedupeWindow::new);
+        if let Some(window) = self.clients.get_mut(client_instance_id) {
+            return window.record(event_id, max_entries);
+        }
 
-        window.record(event_id, max_entries)
+        let mut window = ClientDedupeWindow::new();
+        let is_new = window.record(event_id, max_entries);
+        self.clients
+            .insert(Bytes::copy_from_slice(client_instance_id), window);
+        is_new
     }
 
     /// Convenience helper to record a protobuf [`Event`].

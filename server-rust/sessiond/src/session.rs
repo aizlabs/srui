@@ -47,6 +47,9 @@ pub enum SessionError {
 
     #[error("client lagged behind transaction broadcast; resync required")]
     LaggedResyncRequired,
+
+    #[error("replay unavailable for requested revision")]
+    ReplayUnavailable,
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -59,7 +62,7 @@ pub enum ResumeOutcome {
     /// Replay available: sends `ServerResumeOk` followed by the missing transaction sequence.
     Replay {
         welcome_msg: ServerResumeOk,
-        replayed_transactions: Vec<Transaction>,
+        from_revision: u64,
     },
     /// Replay window expired: client must receive full snapshot resync (§20.2).
     Resync {
@@ -124,6 +127,19 @@ impl Session {
         self.tx_broadcast.subscribe()
     }
 
+    /// Collects transactions to replay starting at `from_revision` using a borrowed journal iterator.
+    pub fn collect_replayed_transactions(
+        &self,
+        from_revision: u64,
+    ) -> Result<Vec<Transaction>, SessionError> {
+        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        guard
+            .journal
+            .iter_from(from_revision)
+            .map(|iter| iter.cloned().collect())
+            .ok_or(SessionError::ReplayUnavailable)
+    }
+
     /// Evaluates a `ClientHello` handshake message, negotiates capabilities,
     /// and returns the `ServerWelcome` envelope (§15, §18).
     pub fn handle_hello(&self, hello: &ClientHello) -> Result<ServerWelcome, SessionError> {
@@ -148,7 +164,7 @@ impl Session {
                 extension_uri: "org.srui.standard-widgets".to_string(),
                 namespace_id: 0,
             }],
-            limits: Some(guard.limits.clone()),
+            limits: Some(guard.limits),
         };
 
         Ok(welcome)
@@ -156,10 +172,11 @@ impl Session {
 
     /// Evaluates a `ClientResume` reconnection request (§20.2, §21, §32.5).
     pub fn handle_resume(&self, resume: &ClientResume) -> Result<ResumeOutcome, SessionError> {
+        #[allow(clippy::large_enum_variant)]
         enum ResumePlan {
             Replay {
                 session_id: String,
-                replayed_transactions: Vec<Transaction>,
+                from_revision: u64,
             },
             Resync {
                 session_id: String,
@@ -171,10 +188,10 @@ impl Session {
         let plan = {
             let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
-            if let Some(replayed) = guard.journal.replay_from(resume.last_applied_revision) {
+            if guard.journal.iter_from(resume.last_applied_revision).is_some() {
                 ResumePlan::Replay {
                     session_id: guard.session_id.clone(),
-                    replayed_transactions: replayed,
+                    from_revision: resume.last_applied_revision,
                 }
             } else {
                 ResumePlan::Resync {
@@ -188,15 +205,15 @@ impl Session {
         match plan {
             ResumePlan::Replay {
                 session_id,
-                replayed_transactions,
+                from_revision,
             } => {
                 let welcome_msg = ServerResumeOk {
                     session_id,
-                    replay_from_revision: resume.last_applied_revision,
+                    replay_from_revision: from_revision,
                 };
                 Ok(ResumeOutcome::Replay {
                     welcome_msg,
-                    replayed_transactions,
+                    from_revision,
                 })
             }
             ResumePlan::Resync {
@@ -389,10 +406,13 @@ mod tests {
         };
 
         match session.handle_resume(&resume).expect("resume handled") {
-            ResumeOutcome::Replay { welcome_msg, replayed_transactions } => {
+            ResumeOutcome::Replay { welcome_msg, from_revision } => {
                 assert_eq!(welcome_msg.replay_from_revision, 0);
-                assert_eq!(replayed_transactions.len(), 1);
-                assert_eq!(replayed_transactions[0].new_revision, 1);
+                let replayed = session
+                    .collect_replayed_transactions(from_revision)
+                    .expect("replay available");
+                assert_eq!(replayed.len(), 1);
+                assert_eq!(replayed[0].new_revision, 1);
             }
             ResumeOutcome::Resync { .. } => panic!("expected replay, got resync"),
         }

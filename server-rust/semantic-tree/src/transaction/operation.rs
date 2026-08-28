@@ -302,7 +302,7 @@ impl Operation {
                 id,
                 property,
                 value,
-                } => store.set_property(*id, *property, value.clone()).map(|_| ()),
+            } => store.set_property(*id, *property, value.clone()).map(|_| ()),
             Self::ClearProperty { id, property } => {
                 store.clear_property(*id, *property).map(|_| ())
             }
@@ -341,6 +341,55 @@ impl Operation {
                 items,
                 total_count,
             } => store.model_reset_range(*id, *start_index, items.clone(), *total_count),
+        }
+    }
+
+    /// Applies this operation to the store by moving heap-allocated fields (no defensive clones).
+    pub fn apply_owned(self, store: &mut SemanticStore) -> Result<(), StoreError> {
+        match self {
+            Self::CreateNode {
+                id,
+                node_type,
+                parent_id,
+                child_index,
+                properties,
+            } => store.create_node(id, node_type, parent_id, child_index, properties),
+            Self::DeleteNode { id } => store.delete_node(id).map(|_| ()),
+            Self::SetProperty {
+                id,
+                property,
+                value,
+            } => store.set_property(id, property, value).map(|_| ()),
+            Self::ClearProperty { id, property } => store.clear_property(id, property).map(|_| ()),
+            Self::MoveNode {
+                id,
+                new_parent_id,
+                new_child_index,
+            } => store.move_node(id, new_parent_id, new_child_index),
+            Self::ReorderChildren {
+                parent_id,
+                new_order,
+            } => store.reorder_children(parent_id, &new_order),
+            Self::BatchPropertySet { id, properties } => store.batch_property_set(id, properties),
+            Self::CreateModel {
+                id,
+                model_type,
+                item_count,
+            } => store.create_model(id, model_type, item_count),
+            Self::ModelInsert { id, index, items } => store.model_insert(id, index, items),
+            Self::ModelDelete {
+                id,
+                index,
+                count,
+                item_ids,
+            } => store.model_delete(id, index, count, &item_ids),
+            Self::ModelUpdate { id, index, items } => store.model_update(id, index, items),
+            Self::ModelResetRange {
+                id,
+                start_index,
+                items,
+                total_count,
+            } => store.model_reset_range(id, start_index, items, total_count),
         }
     }
 }

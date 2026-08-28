@@ -25,17 +25,17 @@ impl fmt::Display for ValueConversionError {
 
 impl std::error::Error for ValueConversionError {}
 
-// In-Memory -> Wire Proto
-impl From<Value> for srui_protocol::Value {
-    fn from(val: Value) -> Self {
+// In-Memory -> Wire Proto (borrowed: avoids cloning the full domain Value tree)
+impl From<&Value> for srui_protocol::Value {
+    fn from(val: &Value) -> Self {
         use srui_protocol::value::Value as WireVal;
         let inner = match val {
             Value::Null => WireVal::NullValue(srui_protocol::NullValue::NullValue as i32),
-            Value::Bool(b) => WireVal::BoolValue(b),
-            Value::SignedInt(i) => WireVal::IntValue(i),
-            Value::UnsignedInt(u) => WireVal::UintValue(u),
-            Value::Float64(f) => WireVal::FloatValue(f),
-            Value::String(s) => WireVal::StringValue(s),
+            Value::Bool(b) => WireVal::BoolValue(*b),
+            Value::SignedInt(i) => WireVal::IntValue(*i),
+            Value::UnsignedInt(u) => WireVal::UintValue(*u),
+            Value::Float64(f) => WireVal::FloatValue(*f),
+            Value::String(s) => WireVal::StringValue(s.clone()),
             Value::NodeId(id) => WireVal::NodeIdValue(id.0),
             Value::ItemId(id) => WireVal::ItemIdValue(id.0),
             Value::ResourceHash(h) => WireVal::ResourceHash(h.0.to_vec()),
@@ -69,19 +69,29 @@ impl From<Value> for srui_protocol::Value {
             }),
             Value::List(list) => {
                 let wire_list: Vec<srui_protocol::Value> =
-                    list.into_iter().map(srui_protocol::Value::from).collect();
+                    list.iter().map(srui_protocol::Value::from).collect();
                 WireVal::ListValue(srui_protocol::ValueList { values: wire_list })
             }
             Value::Record(rec) => {
                 let wire_rec = srui_protocol::SmallRecord {
                     r#type: Some(rec.type_ref.into()),
-                    properties: rec.properties.into_iter().map(srui_protocol::Property::from).collect(),
+                    properties: rec
+                        .properties
+                        .iter()
+                        .map(srui_protocol::Property::from)
+                        .collect(),
                 };
                 WireVal::RecordValue(wire_rec)
             }
         };
 
         Self { value: Some(inner) }
+    }
+}
+
+impl From<Value> for srui_protocol::Value {
+    fn from(val: Value) -> Self {
+        (&val).into()
     }
 }
 
@@ -146,12 +156,18 @@ impl TryFrom<srui_protocol::Value> for Value {
     }
 }
 
-impl From<Property> for srui_protocol::Property {
-    fn from(prop: Property) -> Self {
+impl From<&Property> for srui_protocol::Property {
+    fn from(prop: &Property) -> Self {
         Self {
             property: Some(prop.property.into()),
-            value: Some(prop.value.into()),
+            value: Some((&prop.value).into()),
         }
+    }
+}
+
+impl From<Property> for srui_protocol::Property {
+    fn from(prop: Property) -> Self {
+        (&prop).into()
     }
 }
 

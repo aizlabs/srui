@@ -103,6 +103,7 @@ impl SemanticStore {
     ///   migrated to structural Copy-on-Write (e.g. `im::HashMap` persistent trees offering
     ///   $O(\text{ops} \cdot \log N)$ commit cost) or in-place mutation with an undo-journal rollback
     ///   log to avoid full graph allocations per transaction.
+    ///
     /// Creates a private staging clone of the store's node graph for atomic transaction application (§12.1).
     pub fn clone_staging(&self) -> Self {
         Self {
@@ -634,7 +635,7 @@ impl SemanticStore {
 
         for item in &items {
             self.limits.validate_value(&item.value)?;
-            for (_, val) in &item.properties {
+            for val in item.properties.values() {
                 self.limits.validate_value(val)?;
             }
         }
@@ -682,7 +683,7 @@ impl SemanticStore {
 
         for item in &items {
             self.limits.validate_value(&item.value)?;
-            for (_, val) in &item.properties {
+            for val in item.properties.values() {
                 self.limits.validate_value(val)?;
             }
         }
@@ -703,7 +704,7 @@ impl SemanticStore {
 
         for item in &items {
             self.limits.validate_value(&item.value)?;
-            for (_, val) in &item.properties {
+            for val in item.properties.values() {
                 self.limits.validate_value(val)?;
             }
         }

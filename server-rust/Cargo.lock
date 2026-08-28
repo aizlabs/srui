@@ -638,6 +638,7 @@ dependencies = [
 name = "srui-event-dedupe"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "srui-protocol",
 ]
 
@@ -685,10 +686,12 @@ dependencies = [
 name = "srui-semantic-tree"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "prost",
  "serde",
  "serde_json",
  "serde_yaml",
+ "smallvec",
  "srui-protocol",
 ]
 

@@ -674,7 +674,7 @@ fn test_apply_protobuf_wire_operations() {
 
 #[test]
 fn test_nested_value_depth_limit_enforced() {
-    let limits = StoreLimits::with_all_limits(64, 1000, 1024, 3, 100, 100);
+    let limits = StoreLimits::with_tree_and_value_limits(64, 1000, 1024, 3, 100, 100);
     let mut store = SemanticStore::with_limits(limits);
 
     // Depth 1: List containing scalar
@@ -706,7 +706,7 @@ fn test_nested_value_depth_limit_enforced() {
 
 #[test]
 fn test_max_list_elements_limit_enforced() {
-    let limits = StoreLimits::with_all_limits(64, 1000, 1024, 10, 3, 100);
+    let limits = StoreLimits::with_tree_and_value_limits(64, 1000, 1024, 10, 3, 100);
     let mut store = SemanticStore::with_limits(limits);
 
     let list_ok = Value::List(vec![Value::from(1i64), Value::from(2i64), Value::from(3i64)]);
@@ -738,7 +738,7 @@ fn test_max_list_elements_limit_enforced() {
 
 #[test]
 fn test_max_record_properties_limit_enforced() {
-    let limits = StoreLimits::with_all_limits(64, 1000, 1024, 10, 100, 2);
+    let limits = StoreLimits::with_tree_and_value_limits(64, 1000, 1024, 10, 100, 2);
     let mut store = SemanticStore::with_limits(limits);
 
     let record_too_many_props = Value::Record(SmallRecord::new(

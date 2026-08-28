@@ -52,3 +52,10 @@ pub fn resolve_standard_property(name: &str) -> Result<PropertyRef, RegistryLook
         .map(PropertyRef::standard)
         .ok_or_else(|| RegistryLookupError::UnknownProperty(name.to_string()))
 }
+
+/// Resolves a standard event name to a standard namespace 0 `TypeRef`.
+pub fn resolve_standard_event(name: &str) -> Result<TypeRef, RegistryLookupError> {
+    lookup_standard_event(name)
+        .map(TypeRef::standard)
+        .ok_or_else(|| RegistryLookupError::UnknownEvent(name.to_string()))
+}

@@ -51,7 +51,7 @@ impl Node {
 
     /// Returns the referenced `ModelId` if this node has a `model_ref` property defined (§8).
     pub fn model_ref(&self) -> Option<ModelId> {
-        self.get_property(PropertyRef::standard(17))
+        self.get_property(PropertyRef::MODEL_REF)
             .and_then(|v| match v {
                 Value::UnsignedInt(u) => Some(ModelId::new(*u)),
                 Value::SignedInt(i) if *i >= 0 => Some(ModelId::new(*i as u64)),

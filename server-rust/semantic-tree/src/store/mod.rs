@@ -5,13 +5,16 @@ pub mod limits;
 pub mod node;
 
 pub use error::StoreError;
-pub use limits::{StoreLimits, DEFAULT_MAX_TRANSACTION_OPERATIONS};
+pub use limits::{
+    StoreLimits, DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+    DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_TRANSACTION_OPERATIONS,
+};
 pub use node::Node;
 
 use crate::ids::{ItemId, ModelId, NodeId, PropertyRef, TypeRef};
 use crate::model::{Model, ModelItem};
-use crate::transaction::Revision;
-use crate::value::{Property, Value};
+use crate::transaction::{Operation, Revision};
+use crate::value::Value;
 use std::collections::{HashMap, HashSet};
 
 /// Default maximum allowed tree depth (§26).
@@ -86,12 +89,20 @@ impl SemanticStore {
         self.revision
     }
 
-    /// Returns the store's current committed revision (§12.1).
-    pub fn committed_revision(&self) -> Revision {
-        self.revision
-    }
-
     /// Creates a private staging clone of the store's node graph for atomic transaction application (§12.1).
+    ///
+    /// # Performance & Scalability Considerations
+    ///
+    /// This deep clone clones all active `nodes`, `roots`, `used_ids`, `models`, and `used_model_ids`.
+    /// The computational and allocation cost is $O(\text{total store size})$ per transaction.
+    ///
+    /// - **v1 Implementation**: This full-store snapshot guarantees strict transaction isolation
+    ///   and zero-cost rollback on failure (the staging copy is simply dropped).
+    /// - **Production Scalability Roadmap**: Before deploying to production servers configured
+    ///   at large scale (`DEFAULT_MAX_NODE_COUNT = 100_000`), this cloning strategy should be
+    ///   migrated to structural Copy-on-Write (e.g. `im::HashMap` persistent trees offering
+    ///   $O(\text{ops} \cdot \log N)$ commit cost) or in-place mutation with an undo-journal rollback
+    ///   log to avoid full graph allocations per transaction.
     pub(crate) fn clone_staging(&self) -> Self {
         Self {
             nodes: self.nodes.clone(),
@@ -166,11 +177,6 @@ impl SemanticStore {
 
     /// Calculates the depth of a node in the hierarchy (root is depth 1).
     pub fn node_depth(&self, id: NodeId) -> Option<usize> {
-        self.calculate_node_depth(id)
-    }
-
-    /// Calculates the depth of a node in the hierarchy (root is depth 1).
-    pub fn calculate_node_depth(&self, id: NodeId) -> Option<usize> {
         let mut current_id = id;
         let mut depth = 0;
         loop {
@@ -186,15 +192,10 @@ impl SemanticStore {
 
     /// Calculates the maximum depth of any node within the subtree rooted at `id` (relative to `id`, root of subtree is 1).
     pub fn subtree_depth(&self, id: NodeId) -> usize {
-        self.calculate_subtree_max_depth(id)
-    }
-
-    /// Calculates the maximum depth of any node within the subtree rooted at `id` (relative to `id`, root of subtree is 1).
-    pub fn calculate_subtree_max_depth(&self, id: NodeId) -> usize {
         let mut max_child_depth = 0;
         if let Some(node) = self.nodes.get(&id) {
             for child_id in &node.ordered_children {
-                let child_depth = self.calculate_subtree_max_depth(*child_id);
+                let child_depth = self.subtree_depth(*child_id);
                 if child_depth > max_child_depth {
                     max_child_depth = child_depth;
                 }
@@ -229,7 +230,7 @@ impl SemanticStore {
         let depth = match parent_id {
             Some(pid) => {
                 let parent_depth = self
-                    .calculate_node_depth(pid)
+                    .node_depth(pid)
                     .ok_or(StoreError::ParentNotFound(pid))?;
                 let target_depth = parent_depth + 1;
                 if target_depth > self.limits.max_tree_depth {
@@ -250,10 +251,11 @@ impl SemanticStore {
             });
         }
 
-        // 4. Validate all properties and limits
+        // 4. Validate all properties, limits, and referential integrity
         let prop_list: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
-        for (_, val) in &prop_list {
+        for (prop, val) in &prop_list {
             self.limits.validate_value(val)?;
+            self.validate_property_references(*prop, val)?;
         }
 
         // 5. Validate insertion index if parent specified
@@ -301,6 +303,25 @@ impl SemanticStore {
         Ok(())
     }
 
+    /// Validates referential integrity for semantic properties (e.g. ensuring `PropertyRef::MODEL_REF` references an existing model).
+    fn validate_property_references(&self, prop: PropertyRef, val: &Value) -> Result<(), StoreError> {
+        if prop == PropertyRef::MODEL_REF {
+            let model_id = match val {
+                Value::UnsignedInt(u) => ModelId::new(*u),
+                Value::SignedInt(i) if *i >= 0 => ModelId::new(*i as u64),
+                _ => {
+                    return Err(StoreError::OperationError(
+                        "model_ref property must be a non-negative integer".to_string(),
+                    ))
+                }
+            };
+            if !self.models.contains_key(&model_id) {
+                return Err(StoreError::ModelNotFound(model_id));
+            }
+        }
+        Ok(())
+    }
+
     /// Deletes a node and all of its descendants recursively, returning all deleted node IDs (§13 DELETE_NODE, §6.2).
     pub fn delete_node(&mut self, id: NodeId) -> Result<Vec<NodeId>, StoreError> {
         let node = self.nodes.get(&id).ok_or(StoreError::NodeNotFound(id))?;
@@ -340,8 +361,12 @@ impl SemanticStore {
         prop: PropertyRef,
         val: Value,
     ) -> Result<Option<Value>, StoreError> {
+        if !self.nodes.contains_key(&id) {
+            return Err(StoreError::NodeNotFound(id));
+        }
         self.limits.validate_value(&val)?;
-        let node = self.nodes.get_mut(&id).ok_or(StoreError::NodeNotFound(id))?;
+        self.validate_property_references(prop, &val)?;
+        let node = self.nodes.get_mut(&id).unwrap();
         Ok(node.properties.insert(prop, val))
     }
 
@@ -357,12 +382,16 @@ impl SemanticStore {
         id: NodeId,
         properties: impl IntoIterator<Item = (PropertyRef, Value)>,
     ) -> Result<(), StoreError> {
+        if !self.nodes.contains_key(&id) {
+            return Err(StoreError::NodeNotFound(id));
+        }
         let prop_list: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
-        for (_, val) in &prop_list {
+        for (prop, val) in &prop_list {
             self.limits.validate_value(val)?;
+            self.validate_property_references(*prop, val)?;
         }
 
-        let node = self.nodes.get_mut(&id).ok_or(StoreError::NodeNotFound(id))?;
+        let node = self.nodes.get_mut(&id).unwrap();
         for (prop, val) in prop_list {
             node.properties.insert(prop, val);
         }
@@ -405,10 +434,10 @@ impl SemanticStore {
         }
 
         // 2. Tree depth limit validation (§26)
-        let subtree_depth = self.calculate_subtree_max_depth(id);
+        let subtree_depth = self.subtree_depth(id);
         let new_parent_depth = match new_parent_id {
             Some(pid) => {
-                self.calculate_node_depth(pid)
+                self.node_depth(pid)
                     .ok_or(StoreError::ParentNotFound(pid))?
             }
             None => 0,
@@ -543,6 +572,13 @@ impl SemanticStore {
     }
 
     /// Returns the model referenced by the given node, if any (§8).
+    ///
+    /// # Decoupled Late-Binding Design
+    ///
+    /// Semantic nodes reference models through their standard [`PropertyRef::MODEL_REF`](crate::ids::PropertyRef::MODEL_REF)
+    /// property. References are evaluated dynamically at access time rather than via write-time
+    /// foreign key constraints, permitting nodes to be created before, concurrently with, or after
+    /// their target collection models within or across transactions.
     pub fn get_model_for_node(&self, node_id: NodeId) -> Option<&Model> {
         let node = self.nodes.get(&node_id)?;
         let model_id = node.model_ref()?;
@@ -559,6 +595,12 @@ impl SemanticStore {
         if self.used_model_ids.contains(&id) {
             return Err(StoreError::ModelIdAlreadyUsed(id));
         }
+        if self.models.len() >= self.limits.max_model_count {
+            return Err(StoreError::MaxModelCountExceeded {
+                limit: self.limits.max_model_count,
+                current: self.models.len(),
+            });
+        }
 
         let model = Model::new(id, model_type, item_count);
         self.models.insert(id, model);
@@ -567,6 +609,13 @@ impl SemanticStore {
     }
 
     /// Deletes a model from the store, returning the deleted model if it existed.
+    ///
+    /// # Protocol & Lifecycle Note
+    ///
+    /// `delete_model` provides direct programmatic lifecycle management for collection models
+    /// in the in-memory authoritative store. Note that in SRUI Specification v0.4 (§13), the wire
+    /// mutation stream defines `CREATE_MODEL`, `MODEL_INSERT`, `MODEL_DELETE`, `MODEL_UPDATE`,
+    /// and `MODEL_RESET_RANGE`, without an explicit `OPERATION_DELETE_MODEL` wire opcode.
     pub fn delete_model(&mut self, id: ModelId) -> Result<Option<Model>, StoreError> {
         if !self.models.contains_key(&id) {
             return Err(StoreError::ModelNotFound(id));
@@ -581,6 +630,8 @@ impl SemanticStore {
         index: u64,
         items: Vec<ModelItem>,
     ) -> Result<(), StoreError> {
+        self.limits.validate_model_items_batch(items.len())?;
+
         for item in &items {
             self.limits.validate_value(&item.value)?;
             for (_, val) in &item.properties {
@@ -589,10 +640,25 @@ impl SemanticStore {
         }
 
         let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        let projected_cached = model.cached_item_count() + items.len();
+        if projected_cached > self.limits.max_cached_items_per_model {
+            return Err(StoreError::MaxCachedItemsPerModelExceeded {
+                limit: self.limits.max_cached_items_per_model,
+                current: model.cached_item_count(),
+                attempted: projected_cached,
+            });
+        }
+
         model.insert_items(index, items)
     }
 
-    /// Deletes items from a collection model by item identity and/or index range (§13 MODEL_DELETE).
+    /// Deletes items from a collection model by item identity or index range (§13 MODEL_DELETE).
+    ///
+    /// # Sparse Model Deletion Invariant (§8)
+    ///
+    /// Per §8, when deleting by `item_ids`, items not currently resident in the local sparse cache
+    /// are accepted and still decrement logical `item_count` to ensure synchrony with the remote
+    /// authoritative collection length without requiring full collection hydration.
     pub fn model_delete(
         &mut self,
         id: ModelId,
@@ -600,6 +666,7 @@ impl SemanticStore {
         count: Option<u64>,
         item_ids: Vec<ItemId>,
     ) -> Result<(), StoreError> {
+        self.limits.validate_model_items_batch(item_ids.len())?;
         let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
         model.delete_items(index, count, &item_ids)
     }
@@ -611,6 +678,8 @@ impl SemanticStore {
         index: Option<u64>,
         items: Vec<ModelItem>,
     ) -> Result<(), StoreError> {
+        self.limits.validate_model_items_batch(items.len())?;
+
         for item in &items {
             self.limits.validate_value(&item.value)?;
             for (_, val) in &item.properties {
@@ -630,6 +699,8 @@ impl SemanticStore {
         items: Vec<ModelItem>,
         total_count: Option<u64>,
     ) -> Result<(), StoreError> {
+        self.limits.validate_model_items_batch(items.len())?;
+
         for item in &items {
             self.limits.validate_value(&item.value)?;
             for (_, val) in &item.properties {
@@ -638,171 +709,35 @@ impl SemanticStore {
         }
 
         let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        let end_index = start_index.saturating_add(items.len() as u64);
+        let removed_in_range = model
+            .iter_cached_items()
+            .filter(|(idx, _)| **idx >= start_index && **idx < end_index)
+            .count();
+        let projected_cached = model.cached_item_count() - removed_in_range + items.len();
+        if projected_cached > self.limits.max_cached_items_per_model {
+            return Err(StoreError::MaxCachedItemsPerModelExceeded {
+                limit: self.limits.max_cached_items_per_model,
+                current: model.cached_item_count(),
+                attempted: projected_cached,
+            });
+        }
+
         model.reset_range(start_index, items, total_count)
     }
 
-    /// Applies a protobuf wire `Operation` directly to the store (§13, §16).
+    /// Applies a protobuf wire `Operation` directly to the live store graph (§13, §16).
+    ///
+    /// # Warning: Non-Transactional Mutation
+    ///
+    /// This method executes a single operation immediately against the live store graph without
+    /// base revision verification, speculative staging isolation, or rollback on failure.
+    /// For production wire handlers and compliant §12.1 atomic execution, always use
+    /// [`SemanticStore::apply_wire_transaction`](crate::transaction::apply).
+    /// This helper is intended primarily for low-level unit tests and bootstrap fixtures.
     pub fn apply_operation(&mut self, op: &srui_protocol::Operation) -> Result<(), StoreError> {
-        use srui_protocol::operation::Op;
-
-        let op_kind = match op.op.as_ref() {
-            Some(k) => k,
-            None => return Err(StoreError::OperationError("empty operation payload".to_string())),
-        };
-
-        match op_kind {
-            Op::CreateNode(op) => {
-                let rec = op.node.as_ref().ok_or_else(|| {
-                    StoreError::OperationError("missing NodeRecord in CreateNodeOp".to_string())
-                })?;
-                let id = NodeId::new(rec.node_id);
-                let node_type = rec
-                    .r#type
-                    .map(TypeRef::from)
-                    .ok_or_else(|| StoreError::OperationError("missing TypeRef".to_string()))?;
-                let parent_id = if rec.parent_id == 0 {
-                    None
-                } else {
-                    Some(NodeId::new(rec.parent_id))
-                };
-                let child_index = if parent_id.is_none() || rec.child_index == u32::MAX {
-                    None
-                } else {
-                    Some(rec.child_index as usize)
-                };
-
-                let mut properties = Vec::with_capacity(rec.properties.len());
-                for wire_prop in &rec.properties {
-                    let prop = Property::try_from(wire_prop.clone())
-                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
-                    properties.push((prop.property, prop.value));
-                }
-
-                self.create_node(id, node_type, parent_id, child_index, properties)?;
-                Ok(())
-            }
-            Op::DeleteNode(op) => {
-                self.delete_node(NodeId::new(op.node_id))?;
-                Ok(())
-            }
-            Op::SetProperty(op) => {
-                let id = NodeId::new(op.node_id);
-                let prop_ref = op
-                    .property
-                    .map(PropertyRef::from)
-                    .ok_or_else(|| StoreError::OperationError("missing PropertyRef".to_string()))?;
-                let val = op
-                    .value
-                    .as_ref()
-                    .map(|v| Value::try_from(v.clone()))
-                    .transpose()
-                    .map_err(|e| StoreError::OperationError(e.to_string()))?
-                    .unwrap_or(Value::Null);
-
-                self.set_property(id, prop_ref, val)?;
-                Ok(())
-            }
-            Op::ClearProperty(op) => {
-                let id = NodeId::new(op.node_id);
-                let prop_ref = op
-                    .property
-                    .map(PropertyRef::from)
-                    .ok_or_else(|| StoreError::OperationError("missing PropertyRef".to_string()))?;
-                self.clear_property(id, prop_ref)?;
-                Ok(())
-            }
-            Op::MoveNode(op) => {
-                let id = NodeId::new(op.node_id);
-                let new_parent_id = if op.new_parent_id == 0 {
-                    None
-                } else {
-                    Some(NodeId::new(op.new_parent_id))
-                };
-                let new_child_index = if new_parent_id.is_none() || op.new_child_index == u32::MAX {
-                    None
-                } else {
-                    Some(op.new_child_index as usize)
-                };
-                self.move_node(id, new_parent_id, new_child_index)?;
-                Ok(())
-            }
-            Op::ReorderChildren(op) => {
-                let parent_id = NodeId::new(op.parent_id);
-                let child_ids: Vec<NodeId> = op
-                    .child_node_ids
-                    .iter()
-                    .copied()
-                    .map(NodeId::new)
-                    .collect();
-                self.reorder_children(parent_id, &child_ids)?;
-                Ok(())
-            }
-            Op::BatchPropertySet(op) => {
-                let id = NodeId::new(op.node_id);
-                let mut properties = Vec::with_capacity(op.properties.len());
-                for wire_prop in &op.properties {
-                    let prop = Property::try_from(wire_prop.clone())
-                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
-                    properties.push((prop.property, prop.value));
-                }
-                self.batch_property_set(id, properties)?;
-                Ok(())
-            }
-            Op::CreateModel(op) => {
-                let id = ModelId::new(op.model_id);
-                let model_type = op
-                    .model_type
-                    .map(TypeRef::from)
-                    .ok_or_else(|| StoreError::OperationError("missing TypeRef in CreateModelOp".to_string()))?;
-                self.create_model(id, model_type, op.item_count)?;
-                Ok(())
-            }
-            Op::ModelInsert(op) => {
-                let id = ModelId::new(op.model_id);
-                let mut items = Vec::with_capacity(op.items.len());
-                for wire_item in &op.items {
-                    let item = ModelItem::try_from(wire_item.clone())
-                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
-                    items.push(item);
-                }
-                self.model_insert(id, op.index, items)?;
-                Ok(())
-            }
-            Op::ModelDelete(op) => {
-                let id = ModelId::new(op.model_id);
-                let index = if op.count > 0 { Some(op.index) } else { None };
-                let count = if op.count > 0 { Some(op.count) } else { None };
-                let item_ids = op.item_ids.iter().copied().map(ItemId::new).collect();
-                self.model_delete(id, index, count, item_ids)?;
-                Ok(())
-            }
-            Op::ModelUpdate(op) => {
-                let id = ModelId::new(op.model_id);
-                let index = if op.index == u64::MAX { None } else { Some(op.index) };
-                let mut items = Vec::with_capacity(op.items.len());
-                for wire_item in &op.items {
-                    let item = ModelItem::try_from(wire_item.clone())
-                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
-                    items.push(item);
-                }
-                self.model_update(id, index, items)?;
-                Ok(())
-            }
-            Op::ModelResetRange(op) => {
-                let id = ModelId::new(op.model_id);
-                let total_count = if op.total_count > 0 { Some(op.total_count) } else { None };
-                let mut items = Vec::with_capacity(op.items.len());
-                for wire_item in &op.items {
-                    let item = ModelItem::try_from(wire_item.clone())
-                        .map_err(|e| StoreError::OperationError(e.to_string()))?;
-                    items.push(item);
-                }
-                self.model_reset_range(id, op.start_index, items, total_count)?;
-                Ok(())
-            }
-            _ => Err(StoreError::OperationError(
-                "unsupported or unhandled operation type".to_string(),
-            )),
-        }
+        Operation::try_from(op.clone())
+            .map_err(|e| StoreError::OperationError(e.to_string()))?
+            .apply(self)
     }
 }

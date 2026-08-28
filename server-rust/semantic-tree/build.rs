@@ -153,6 +153,11 @@ fn main() {
             code.push_str(&format!("    pub const RICHTEXT: Self = Self::standard({});\n", item.id));
         }
     }
+    code.push_str("    // Generated Standard Event constants from protocol/registry.yaml (§7.6)\n");
+    for item in &registry.events {
+        let const_name = format!("EVENT_{}", to_upper_snake_case(&item.name));
+        code.push_str(&format!("    pub const {}: Self = Self::standard({});\n", const_name, item.id));
+    }
     code.push_str("}\n\n");
 
     // Generated Constants for PropertyRef

@@ -38,9 +38,23 @@ impl TypeRef {
         }
     }
 
-    /// Resolves a standard node type name to a standard `TypeRef`.
+    /// Looks up the standard string name of this event type if it belongs to namespace 0 (§7.6).
+    pub fn standard_event_name(&self) -> Option<&'static str> {
+        if self.is_standard() {
+            super::standard_event_name(self.local_id)
+        } else {
+            None
+        }
+    }
+
+    /// Resolves a standard node type name to a standard `TypeRef` (§7.2).
     pub fn resolve_standard(name: &str) -> Result<Self, super::RegistryLookupError> {
         super::resolve_standard_node_type(name)
+    }
+
+    /// Resolves a standard event name to a standard `TypeRef` (§7.6).
+    pub fn resolve_standard_event(name: &str) -> Result<Self, super::RegistryLookupError> {
+        super::resolve_standard_event(name)
     }
 }
 

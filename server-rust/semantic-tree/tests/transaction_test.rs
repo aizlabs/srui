@@ -345,7 +345,7 @@ fn test_wire_transaction_conversion_and_application() {
     };
 
     let committed_rev = store
-        .apply_wire_transaction(&wire_txn)
+        .apply_wire_transaction(wire_txn)
         .expect("apply wire transaction");
 
     assert_eq!(committed_rev, Revision::new(1));

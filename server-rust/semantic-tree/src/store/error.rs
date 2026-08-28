@@ -26,6 +26,14 @@ pub enum StoreError {
     MaxListLengthExceeded { limit: usize, actual: usize },
     /// Small record exceeds the configured maximum properties count (§26).
     MaxRecordPropertiesExceeded { limit: usize, actual: usize },
+    /// Operation exceeds the configured maximum model count limit (§26).
+    MaxModelCountExceeded { limit: usize, current: usize },
+    /// Collection model exceeds the configured maximum cached items limit (§26).
+    MaxCachedItemsPerModelExceeded { limit: usize, current: usize, attempted: usize },
+    /// Model mutation operation exceeds the configured maximum items limit (§26).
+    MaxItemsPerModelOperationExceeded { limit: usize, actual: usize },
+    /// Invalid model delete parameters (e.g. combined identity and range selectors, §8, §13).
+    InvalidModelDelete(String),
     /// The specified child insertion index is out of bounds for the parent's current children list.
     ChildIndexOutOfBounds { index: usize, count: usize },
     /// Attempted to create a model using a `ModelId` that was already used in this session (§6.2, §8).
@@ -95,6 +103,28 @@ impl fmt::Display for StoreError {
                 "record properties limit exceeded: max allowed is {}, actual count is {}",
                 limit, actual
             ),
+            Self::MaxModelCountExceeded { limit, current } => write!(
+                f,
+                "model count limit exceeded: max allowed is {}, current count is {}",
+                limit, current
+            ),
+            Self::MaxCachedItemsPerModelExceeded {
+                limit,
+                current,
+                attempted,
+            } => write!(
+                f,
+                "cached items per model limit exceeded: max allowed is {}, current cached is {}, attempted is {}",
+                limit, current, attempted
+            ),
+            Self::MaxItemsPerModelOperationExceeded { limit, actual } => write!(
+                f,
+                "items per model operation limit exceeded: max allowed is {}, actual count is {}",
+                limit, actual
+            ),
+            Self::InvalidModelDelete(reason) => {
+                write!(f, "invalid model delete: {}", reason)
+            }
             Self::ChildIndexOutOfBounds { index, count } => write!(
                 f,
                 "child index {} out of bounds (current child count: {})",

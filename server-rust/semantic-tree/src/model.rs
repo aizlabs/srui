@@ -249,6 +249,23 @@ impl Model {
         ranges
     }
 
+    /// Shifts all cached item indices starting at `>= from_index` by signed `delta`.
+    fn shift_cached_indices(&mut self, from_index: u64, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let to_shift: Vec<(u64, ModelItem)> = self.items.split_off(&from_index).into_iter().collect();
+        for (old_idx, item) in to_shift {
+            let new_idx = if delta > 0 {
+                old_idx + delta as u64
+            } else {
+                old_idx - (-delta) as u64
+            };
+            self.id_to_index.insert(item.item_id, new_idx);
+            self.items.insert(new_idx, item);
+        }
+    }
+
     /// Inserts items into the model at the specified index, shifting subsequent items (§13 MODEL_INSERT).
     pub fn insert_items(&mut self, index: u64, items: Vec<ModelItem>) -> Result<(), StoreError> {
         if index > self.item_count {
@@ -271,13 +288,7 @@ impl Model {
 
         let n = items.len() as u64;
         if n > 0 {
-            // Shift existing cached items at >= index
-            let to_shift: Vec<(u64, ModelItem)> = self.items.split_off(&index).into_iter().collect();
-            for (old_idx, item) in to_shift {
-                let new_idx = old_idx + n;
-                self.id_to_index.insert(item.item_id, new_idx);
-                self.items.insert(new_idx, item);
-            }
+            self.shift_cached_indices(index, n as i64);
 
             // Insert new items
             for (i, item) in items.into_iter().enumerate() {
@@ -292,78 +303,110 @@ impl Model {
         Ok(())
     }
 
-    /// Deletes items by `item_ids` and/or index range (§13 MODEL_DELETE).
+    /// Deletes items by `item_ids` or by index range (§13 MODEL_DELETE).
+    ///
+    /// Per §8 and §13, a `MODEL_DELETE` operation must specify either discrete item identities
+    /// (`item_ids`) or a contiguous index range (`index` + `count`), but not both.
+    /// Attempting to combine both selectors returns [`StoreError::InvalidModelDelete`] to prevent
+    /// double-decrement corruption of `item_count`.
+    ///
+    /// Note (§8 Sparse Collection Invariant): When deleting by `item_id`, if the item is not
+    /// currently held in the local sparse cache (uncached), `item_count` is still decremented
+    /// to maintain consistency with the authoritative collection length.
     pub fn delete_items(
         &mut self,
         index: Option<u64>,
         count: Option<u64>,
         item_ids: &[ItemId],
     ) -> Result<(), StoreError> {
-        // 1. Delete by item identity (§8, §13)
-        for &item_id in item_ids {
-            if let Some(&idx) = self.id_to_index.get(&item_id) {
-                self.items.remove(&idx);
-                self.id_to_index.remove(&item_id);
-                self.item_count = self.item_count.saturating_sub(1);
+        let has_range = count.is_some() && count.unwrap() > 0;
+        let has_ids = !item_ids.is_empty();
 
-                // Shift subsequent cached items down by 1
-                let to_shift: Vec<(u64, ModelItem)> =
-                    self.items.split_off(&(idx + 1)).into_iter().collect();
-                for (old_idx, item) in to_shift {
-                    let new_idx = old_idx - 1;
-                    self.id_to_index.insert(item.item_id, new_idx);
-                    self.items.insert(new_idx, item);
-                }
-            } else {
-                self.item_count = self.item_count.saturating_sub(1);
-            }
+        if has_range && has_ids {
+            return Err(StoreError::InvalidModelDelete(
+                "cannot combine item_ids and range deletion in ModelDelete (§8, §13)".to_string(),
+            ));
         }
 
-        // 2. Delete by index range if specified
-        if let (Some(idx), Some(cnt)) = (index, count) {
-            if cnt > 0 {
-                for i in idx..(idx + cnt) {
-                    if let Some(removed) = self.items.remove(&i) {
-                        self.id_to_index.remove(&removed.item_id);
-                    }
+        if has_ids {
+            for &item_id in item_ids {
+                if let Some(idx) = self.id_to_index.remove(&item_id) {
+                    self.items.remove(&idx);
+                    self.item_count = self.item_count.saturating_sub(1);
+                    self.shift_cached_indices(idx + 1, -1);
+                } else {
+                    self.item_count = self.item_count.saturating_sub(1);
                 }
-
-                let to_shift: Vec<(u64, ModelItem)> =
-                    self.items.split_off(&(idx + cnt)).into_iter().collect();
-                for (old_idx, item) in to_shift {
-                    let new_idx = old_idx - cnt;
-                    self.id_to_index.insert(item.item_id, new_idx);
-                    self.items.insert(new_idx, item);
-                }
-
-                self.item_count = self.item_count.saturating_sub(cnt);
             }
+            return Ok(());
+        }
+
+        if has_range {
+            let idx = index.unwrap_or(0);
+            let cnt = count.unwrap();
+
+            if idx > self.item_count || idx.saturating_add(cnt) > self.item_count {
+                return Err(StoreError::ModelIndexOutOfBounds {
+                    index: idx.saturating_add(cnt),
+                    count: self.item_count,
+                });
+            }
+
+            // Remove only cached items within the deleted range in O(k log N)
+            let cached_keys_in_range: Vec<u64> =
+                self.items.range(idx..idx + cnt).map(|(&k, _)| k).collect();
+            for k in cached_keys_in_range {
+                if let Some(removed) = self.items.remove(&k) {
+                    self.id_to_index.remove(&removed.item_id);
+                }
+            }
+
+            self.shift_cached_indices(idx + cnt, -(cnt as i64));
+            self.item_count = self.item_count.saturating_sub(cnt);
+            return Ok(());
         }
 
         Ok(())
     }
 
     /// Updates existing items by identity or index without shifting (§13 MODEL_UPDATE).
+    ///
+    /// # Conflict Resolution & Semantics
+    ///
+    /// - **Positional Update (`index: Some(base_idx)`)**: Items are written directly to indices
+    ///   `base_idx + i`. If an incoming `item_id` was previously cached at a different index position,
+    ///   its old index entry is removed and re-keyed to the new target index, ensuring bidirectional
+    ///   `id_to_index` and `items` consistency without duplicating items.
+    /// - **Identity Update (`index: None`)**: Items are matched by stable `item_id` in `id_to_index`.
+    ///   If an item is not found in the sparse cache, [`StoreError::ItemNotFound`] is returned.
     pub fn update_items(
         &mut self,
         index: Option<u64>,
         items: Vec<ModelItem>,
     ) -> Result<(), StoreError> {
         for (i, item) in items.into_iter().enumerate() {
-            if let Some(&idx) = self.id_to_index.get(&item.item_id) {
-                // Item found by stable ItemId in cache -> update directly
-                self.items.insert(idx, item);
-            } else if let Some(base_idx) = index {
+            if let Some(base_idx) = index {
                 let target_idx = base_idx + i as u64;
-                if target_idx < self.item_count {
-                    if let Some(old) = self.items.remove(&target_idx) {
-                        self.id_to_index.remove(&old.item_id);
-                    }
-                    self.id_to_index.insert(item.item_id, target_idx);
-                    self.items.insert(target_idx, item);
-                } else {
-                    return Err(StoreError::ItemNotFound(item.item_id));
+                if target_idx >= self.item_count {
+                    return Err(StoreError::ModelIndexOutOfBounds {
+                        index: target_idx,
+                        count: self.item_count,
+                    });
                 }
+                // If item_id was previously cached at another index, remove its old slot
+                if let Some(old_pos) = self.id_to_index.remove(&item.item_id) {
+                    if old_pos != target_idx {
+                        self.items.remove(&old_pos);
+                    }
+                }
+                // If target_idx currently holds a different item, remove its id_to_index entry
+                if let Some(displaced) = self.items.remove(&target_idx) {
+                    self.id_to_index.remove(&displaced.item_id);
+                }
+                self.id_to_index.insert(item.item_id, target_idx);
+                self.items.insert(target_idx, item);
+            } else if let Some(&idx) = self.id_to_index.get(&item.item_id) {
+                self.items.insert(idx, item);
             } else {
                 return Err(StoreError::ItemNotFound(item.item_id));
             }
@@ -400,7 +443,7 @@ impl Model {
             });
         }
 
-        // Validate incoming ItemIds for duplicates within items
+        // Validate incoming ItemIds for duplicates within items and collisions outside range
         let mut incoming_ids = HashSet::with_capacity(items.len());
         for item in &items {
             if !incoming_ids.insert(item.item_id) {
@@ -408,6 +451,14 @@ impl Model {
                     model_id: self.id,
                     item_id: item.item_id,
                 });
+            }
+            if let Some(&existing_idx) = self.id_to_index.get(&item.item_id) {
+                if existing_idx < start_index || existing_idx >= end_index {
+                    return Err(StoreError::DuplicateItemId {
+                        model_id: self.id,
+                        item_id: item.item_id,
+                    });
+                }
             }
         }
 

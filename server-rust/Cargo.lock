@@ -704,6 +704,7 @@ dependencies = [
  "srui-event-dedupe",
  "srui-journal",
  "srui-protocol",
+ "srui-sdk",
  "srui-semantic-tree",
  "thiserror",
  "tokio",

@@ -71,15 +71,17 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug)]
 pub struct UiTransaction {
     staged: SemanticStore,
+    operations: Vec<Operation>,
     op_count: usize,
     max_ops: usize,
 }
 
 impl UiTransaction {
     /// Constructs a new `UiTransaction` wrapping a staging store.
-    pub(crate) fn new(staged: SemanticStore, max_ops: usize) -> Self {
+    pub fn new(staged: SemanticStore, max_ops: usize) -> Self {
         Self {
             staged,
+            operations: Vec::new(),
             op_count: 0,
             max_ops,
         }
@@ -103,9 +105,20 @@ impl UiTransaction {
         self.op_count
     }
 
+    /// Returns the operations recorded during this transaction.
+    #[inline]
+    pub fn operations(&self) -> &[Operation] {
+        &self.operations
+    }
+
     /// Consumes this context and returns the staging store.
-    pub(crate) fn into_staged(self) -> SemanticStore {
+    pub fn into_staged(self) -> SemanticStore {
         self.staged
+    }
+
+    /// Consumes this context and returns the staging store alongside recorded operations.
+    pub fn into_staged_and_ops(self) -> (SemanticStore, Vec<Operation>) {
+        (self.staged, self.operations)
     }
 
     /// Sets a property on a node within the active transaction (§13 SET_PROPERTY, §29).
@@ -128,8 +141,11 @@ impl UiTransaction {
         prop: PropertyRef,
         val: impl Into<Value>,
     ) -> Result<Option<Value>, StoreError> {
+        let node_id = node.into();
+        let value = val.into();
         self.record_op()?;
-        self.staged.set_property(node.into(), prop, val.into())
+        self.operations.push(Operation::set_property(node_id, prop, value.clone()));
+        self.staged.set_property(node_id, prop, value)
     }
 
     /// Clears a property from a node within the active transaction (§13 CLEAR_PROPERTY, §29).
@@ -138,8 +154,10 @@ impl UiTransaction {
         node: impl Into<NodeId>,
         prop: PropertyRef,
     ) -> Result<Option<Value>, StoreError> {
+        let node_id = node.into();
         self.record_op()?;
-        self.staged.clear_property(node.into(), prop)
+        self.operations.push(Operation::clear_property(node_id, prop));
+        self.staged.clear_property(node_id, prop)
     }
 
     /// Creates a new node in the graph within the active transaction (§13 CREATE_NODE).
@@ -151,15 +169,26 @@ impl UiTransaction {
         child_index: Option<usize>,
         properties: impl IntoIterator<Item = (PropertyRef, Value)>,
     ) -> Result<(), StoreError> {
+        let id = id.into();
+        let props: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
         self.record_op()?;
+        self.operations.push(Operation::create_node(
+            id,
+            node_type,
+            parent_id,
+            child_index,
+            props.clone(),
+        ));
         self.staged
-            .create_node(id.into(), node_type, parent_id, child_index, properties)
+            .create_node(id, node_type, parent_id, child_index, props)
     }
 
     /// Deletes a node and all of its descendants within the active transaction (§13 DELETE_NODE).
     pub fn delete(&mut self, node: impl Into<NodeId>) -> Result<Vec<NodeId>, StoreError> {
+        let node_id = node.into();
         self.record_op()?;
-        self.staged.delete_node(node.into())
+        self.operations.push(Operation::delete_node(node_id));
+        self.staged.delete_node(node_id)
     }
 
     /// Moves a node to a new parent and/or child index within the active transaction (§13 MOVE_NODE).
@@ -169,9 +198,12 @@ impl UiTransaction {
         new_parent_id: Option<NodeId>,
         new_child_index: Option<usize>,
     ) -> Result<(), StoreError> {
+        let node_id = node.into();
         self.record_op()?;
+        self.operations
+            .push(Operation::move_node(node_id, new_parent_id, new_child_index));
         self.staged
-            .move_node(node.into(), new_parent_id, new_child_index)
+            .move_node(node_id, new_parent_id, new_child_index)
     }
 
     /// Reorders the children of a parent node within the active transaction (§13 REORDER_CHILDREN).
@@ -180,13 +212,17 @@ impl UiTransaction {
         parent: impl Into<NodeId>,
         new_order: &[NodeId],
     ) -> Result<(), StoreError> {
+        let parent_id = parent.into();
         self.record_op()?;
-        self.staged.reorder_children(parent.into(), new_order)
+        self.operations
+            .push(Operation::reorder_children(parent_id, new_order.iter().copied()));
+        self.staged.reorder_children(parent_id, new_order)
     }
 
     /// Applies a low-level mutation [`Operation`] to the staging store (§13).
     pub fn apply_op(&mut self, op: &Operation) -> Result<(), StoreError> {
         self.record_op()?;
+        self.operations.push(op.clone());
         op.apply(&mut self.staged)
     }
 }

@@ -20,7 +20,6 @@
 //
 
 import Foundation
-import Protocol
 
 // MARK: - Revision (§12.1)
 
@@ -135,29 +134,6 @@ public struct Transaction: Equatable, Sendable {
         self.operations = operations
         self.priority = priority
     }
-
-    // MARK: - Protobuf Wire Conversion (§16)
-
-    public init(wire: SRUITransaction) throws {
-        var ops: [Operation] = []
-        ops.reserveCapacity(wire.operations.count)
-        for op in wire.operations {
-            ops.append(try Operation(wire: op))
-        }
-        self.baseRevision = Revision(wire.baseRevision)
-        self.newRevision = Revision(wire.newRevision)
-        self.operations = ops
-        self.priority = wire.priority
-    }
-
-    public func toWire() -> SRUITransaction {
-        var wire = SRUITransaction()
-        wire.baseRevision = baseRevision.value
-        wire.newRevision = newRevision.value
-        wire.priority = priority
-        wire.operations = operations.map { $0.toWire() }
-        return wire
-    }
 }
 
 // MARK: - Transaction Applier (§12.1, §18, §22)
@@ -253,14 +229,5 @@ public final class TransactionApplier: @unchecked Sendable {
 
         return applyStaged(operations: record.operations, newRevision: record.newRevision)
     }
-
-    /// Decodes and applies a protobuf wire `SRUITransaction` atomically (§12.1, §16).
-    public func apply(wire: SRUITransaction) -> Result<Revision, TxnError> {
-        do {
-            let record = try Transaction(wire: wire)
-            return apply(record: record)
-        } catch {
-            return .failure(.wireError(error.localizedDescription))
-        }
-    }
 }
+

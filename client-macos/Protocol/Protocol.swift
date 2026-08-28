@@ -1,8 +1,7 @@
 import Foundation
 @_exported import SwiftProtobuf
+@_exported import SemanticModel
 
-/// Namespace 0 is permanently reserved for the canonical SRUI standard registry (§6.4).
-public let standardNamespaceID: UInt32 = 0
 
 // Convenient typealiases for SRUI wire types
 public typealias SRUINodeRecord = Srui_Protocol_NodeRecord

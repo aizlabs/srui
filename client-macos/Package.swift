@@ -27,18 +27,16 @@ let package = Package(
             path: "TransportSSH"
         ),
         .target(
+            name: "SemanticModel",
+            path: "SemanticModel"
+        ),
+        .target(
             name: "Protocol",
             dependencies: [
+                "SemanticModel",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
             path: "Protocol"
-        ),
-        .target(
-            name: "SemanticModel",
-            dependencies: [
-                "Protocol",
-            ],
-            path: "SemanticModel"
         ),
         .target(
             name: "Session",

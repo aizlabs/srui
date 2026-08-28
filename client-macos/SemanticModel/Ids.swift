@@ -7,7 +7,10 @@
 //
 
 import Foundation
-import Protocol
+
+/// Namespace 0 is permanently reserved for the canonical SRUI standard registry (§6.4).
+public let standardNamespaceID: UInt32 = 0
+
 
 // MARK: - Node Identifier (§6.2)
 
@@ -235,19 +238,6 @@ public struct TypeRef: Hashable, Equatable, Comparable, Sendable, CustomStringCo
         }
         return lhs.localID < rhs.localID
     }
-
-    // Wire Protobuf Conversion
-    public init(wire: SRUITypeRef) {
-        self.namespaceID = wire.namespaceID
-        self.localID = wire.localID
-    }
-
-    public func toWire() -> SRUITypeRef {
-        SRUITypeRef.with {
-            $0.namespaceID = self.namespaceID
-            $0.localID = self.localID
-        }
-    }
 }
 
 // MARK: - Property Reference (§6.4, §7.4)
@@ -295,19 +285,6 @@ public struct PropertyRef: Hashable, Equatable, Comparable, Sendable, CustomStri
             return lhs.namespaceID < rhs.namespaceID
         }
         return lhs.localID < rhs.localID
-    }
-
-    // Wire Protobuf Conversion
-    public init(wire: SRUIPropertyRef) {
-        self.namespaceID = wire.namespaceID
-        self.localID = wire.localID
-    }
-
-    public func toWire() -> SRUIPropertyRef {
-        SRUIPropertyRef.with {
-            $0.namespaceID = self.namespaceID
-            $0.localID = self.localID
-        }
     }
 }
 

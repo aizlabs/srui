@@ -17,7 +17,6 @@
 //
 
 import Foundation
-import Protocol
 
 // MARK: - Model Item (§8, §13)
 
@@ -98,33 +97,6 @@ public struct ModelItem: Equatable, Sendable, CustomStringConvertible {
 
     public var description: String {
         "ModelItem(id: \(itemID), value: \(value), properties: \(properties.count))"
-    }
-
-    // MARK: - Protobuf Wire Conversions (§16)
-
-    public init(wire: SRUIModelItem) throws {
-        self.itemID = ItemId(wire.itemID)
-        self.value = wire.hasValue ? try Value(wire: wire.value) : .null
-        var props: [PropertyRef: Value] = [:]
-        props.reserveCapacity(wire.properties.count)
-        for p in wire.properties {
-            let prop = try Property(wire: p)
-            props[prop.property] = prop.value
-        }
-        self.properties = props
-    }
-
-    public func toWire() -> SRUIModelItem {
-        var wire = SRUIModelItem()
-        wire.itemID = itemID.value
-        wire.value = value.toWire()
-        wire.properties = properties.map { (k, v) in
-            var wireProp = SRUIProperty()
-            wireProp.property = k.toWire()
-            wireProp.value = v.toWire()
-            return wireProp
-        }
-        return wire
     }
 }
 

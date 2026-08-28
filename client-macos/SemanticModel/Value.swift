@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import Protocol
+
 
 // MARK: - Geometric & Semantic Value Tuples
 
@@ -120,25 +120,6 @@ public struct Property: Hashable, Equatable, Sendable, CustomStringConvertible {
 
     public var description: String {
         "Property(\(property), \(value))"
-    }
-
-    public init(wire: SRUIProperty) throws {
-        guard wire.hasProperty else {
-            throw ValueConversionError.missingField("property")
-        }
-        self.property = PropertyRef(wire: wire.property)
-        if wire.hasValue {
-            self.value = try Value(wire: wire.value)
-        } else {
-            self.value = .null
-        }
-    }
-
-    public func toWire() -> SRUIProperty {
-        SRUIProperty.with {
-            $0.property = self.property.toWire()
-            $0.value = self.value.toWire()
-        }
     }
 }
 
@@ -390,134 +371,3 @@ extension Value: ExpressibleByArrayLiteral {
     }
 }
 
-// MARK: - Wire Protobuf Conversion
-
-extension Value {
-    public init(wire: SRUIValue) throws {
-        guard let wireVal = wire.value else {
-            throw ValueConversionError.missingField("value")
-        }
-
-        switch wireVal {
-        case .nullValue:
-            self = .null
-        case .boolValue(let b):
-            self = .bool(b)
-        case .intValue(let i):
-            self = .signedInt(i)
-        case .uintValue(let u):
-            self = .unsignedInt(u)
-        case .floatValue(let f):
-            self = .float64(f)
-        case .stringValue(let s):
-            self = .string(s)
-        case .nodeIDValue(let id):
-            self = .nodeID(NodeId(id))
-        case .itemIDValue(let id):
-            self = .itemID(ItemId(id))
-        case .resourceHash(let bytes):
-            guard bytes.count == 32 else {
-                throw ValueConversionError.invalidResourceHashLength(bytes.count)
-            }
-            self = .resourceHash(try ResourceHash(bytes: bytes))
-        case .enumValue(let e):
-            self = .enumToken(EnumToken(enumID: e.enumID, valueID: e.valueID))
-        case .sizeValue(let s):
-            self = .size(Size(width: s.width, height: s.height))
-        case .pointValue(let p):
-            self = .point(Point(x: p.x, y: p.y))
-        case .rangeValue(let r):
-            self = .range(SemanticRange(start: r.location, length: r.length))
-        case .rectValue(let r):
-            self = .rect(Rect(x: r.x, y: r.y, width: r.width, height: r.height))
-        case .insetsValue(let i):
-            self = .edgeInsets(EdgeInsets(top: i.top, leading: i.leading, bottom: i.bottom, trailing: i.trailing))
-        case .listValue(let l):
-            var items: [Value] = []
-            items.reserveCapacity(l.values.count)
-            for v in l.values {
-                items.append(try Value(wire: v))
-            }
-            self = .list(items)
-        case .recordValue(let r):
-            guard r.hasType else {
-                throw ValueConversionError.missingField("record.type")
-            }
-            let typeRef = TypeRef(wire: r.type)
-            var props: [Property] = []
-            props.reserveCapacity(r.properties.count)
-            for p in r.properties {
-                props.append(try Property(wire: p))
-            }
-            self = .record(SmallRecord(typeRef: typeRef, properties: props))
-        }
-    }
-
-    public func toWire() -> SRUIValue {
-        var wire = SRUIValue()
-        switch self {
-        case .null:
-            wire.nullValue = .nullValue
-        case .bool(let b):
-            wire.boolValue = b
-        case .signedInt(let i):
-            wire.intValue = i
-        case .unsignedInt(let u):
-            wire.uintValue = u
-        case .float64(let f):
-            wire.floatValue = f
-        case .string(let s):
-            wire.stringValue = s
-        case .nodeID(let id):
-            wire.nodeIDValue = id.value
-        case .itemID(let id):
-            wire.itemIDValue = id.value
-        case .resourceHash(let h):
-            wire.resourceHash = h.bytes
-        case .enumToken(let e):
-            wire.enumValue = Srui_Protocol_EnumValue.with {
-                $0.enumID = e.enumID
-                $0.valueID = e.valueID
-            }
-        case .size(let s):
-            wire.sizeValue = Srui_Protocol_SizeVal.with {
-                $0.width = s.width
-                $0.height = s.height
-            }
-        case .point(let p):
-            wire.pointValue = Srui_Protocol_PointVal.with {
-                $0.x = p.x
-                $0.y = p.y
-            }
-        case .range(let r):
-            wire.rangeValue = Srui_Protocol_RangeVal.with {
-                $0.location = r.start
-                $0.length = r.length
-            }
-        case .rect(let r):
-            wire.rectValue = Srui_Protocol_RectVal.with {
-                $0.x = r.x
-                $0.y = r.y
-                $0.width = r.width
-                $0.height = r.height
-            }
-        case .edgeInsets(let i):
-            wire.insetsValue = Srui_Protocol_EdgeInsetsVal.with {
-                $0.top = i.top
-                $0.leading = i.leading
-                $0.bottom = i.bottom
-                $0.trailing = i.trailing
-            }
-        case .list(let list):
-            wire.listValue = Srui_Protocol_ValueList.with {
-                $0.values = list.map { $0.toWire() }
-            }
-        case .record(let rec):
-            wire.recordValue = Srui_Protocol_SmallRecord.with {
-                $0.type = rec.typeRef.toWire()
-                $0.properties = rec.properties.map { $0.toWire() }
-            }
-        }
-        return wire
-    }
-}

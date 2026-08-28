@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import Protocol
 
 /// SemanticModel module version.
 public let semanticModelVersion = "0.4.0"
+

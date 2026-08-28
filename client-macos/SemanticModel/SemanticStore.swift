@@ -17,7 +17,6 @@
 //
 
 import Foundation
-import Protocol
 
 // MARK: - Semantic Node (§6.2)
 
@@ -566,231 +565,6 @@ public enum StoreOperation: Equatable, Sendable {
         .modelDelete(id: id, index: index, count: count, itemIds: [])
     }
 
-    /// Decodes a `StoreOperation` from a protobuf wire operation message (§16).
-    public init(wire: SRUIOperation) throws {
-        guard let op = wire.op else {
-            throw StoreError.operationError("Operation missing op payload")
-        }
-
-        switch op {
-        case .createNode(let create):
-            guard create.hasNode else {
-                throw StoreError.operationError("CreateNodeOp missing node record")
-            }
-            let record = create.node
-            guard record.hasType else {
-                throw StoreError.operationError("NodeRecord missing type")
-            }
-            let id = NodeId(record.nodeID)
-            let nodeType = TypeRef(wire: record.type)
-            let parentID = record.parentID == 0 ? nil : NodeId(record.parentID)
-            let childIndex = record.childIndex == UInt32.max ? nil : Int(record.childIndex)
-            var props: [Property] = []
-            props.reserveCapacity(record.properties.count)
-            for p in record.properties {
-                guard p.hasProperty else {
-                    throw StoreError.operationError("Property missing property ref")
-                }
-                let propRef = PropertyRef(wire: p.property)
-                let val = p.hasValue ? try Value(wire: p.value) : .null
-                props.append(Property(property: propRef, value: val))
-            }
-            self = .createNode(id: id, nodeType: nodeType, parentID: parentID, childIndex: childIndex, properties: props)
-
-        case .deleteNode(let del):
-            self = .deleteNode(id: NodeId(del.nodeID))
-
-        case .setProperty(let set):
-            guard set.hasProperty else {
-                throw StoreError.operationError("SetPropertyOp missing property ref")
-            }
-            let id = NodeId(set.nodeID)
-            let propRef = PropertyRef(wire: set.property)
-            let val = set.hasValue ? try Value(wire: set.value) : .null
-            self = .setProperty(id: id, property: propRef, value: val)
-
-        case .clearProperty_p(let clear):
-            guard clear.hasProperty else {
-                throw StoreError.operationError("ClearPropertyOp missing property ref")
-            }
-            self = .clearProperty(id: NodeId(clear.nodeID), property: PropertyRef(wire: clear.property))
-
-        case .moveNode(let move):
-            let id = NodeId(move.nodeID)
-            let newParentID = move.newParentID == 0 ? nil : NodeId(move.newParentID)
-            let newChildIndex = move.newChildIndex == UInt32.max ? nil : Int(move.newChildIndex)
-            self = .moveNode(id: id, newParentID: newParentID, newChildIndex: newChildIndex)
-
-        case .reorderChildren(let reorder):
-            let parentID = NodeId(reorder.parentID)
-            let newOrder = reorder.childNodeIds.map { NodeId($0) }
-            self = .reorderChildren(parentID: parentID, newOrder: newOrder)
-
-        case .batchPropertySet(let batch):
-            let id = NodeId(batch.nodeID)
-            var props: [Property] = []
-            props.reserveCapacity(batch.properties.count)
-            for p in batch.properties {
-                guard p.hasProperty else {
-                    throw StoreError.operationError("Property missing property ref")
-                }
-                let propRef = PropertyRef(wire: p.property)
-                let val = p.hasValue ? try Value(wire: p.value) : .null
-                props.append(Property(property: propRef, value: val))
-            }
-            self = .batchPropertySet(id: id, properties: props)
-
-        case .createModel(let create):
-            let id = ModelId(create.modelID)
-            guard create.hasModelType else {
-                throw StoreError.operationError("CreateModelOp missing model_type")
-            }
-            let modelType = TypeRef(wire: create.modelType)
-            self = .createModel(id: id, modelType: modelType, itemCount: create.itemCount)
-
-        case .modelInsert(let insert):
-            let id = ModelId(insert.modelID)
-            var items: [ModelItem] = []
-            items.reserveCapacity(insert.items.count)
-            for item in insert.items {
-                items.append(try ModelItem(wire: item))
-            }
-            self = .modelInsert(id: id, index: insert.index, items: items)
-
-        case .modelDelete(let del):
-            let id = ModelId(del.modelID)
-            let index = del.count > 0 ? del.index : nil
-            let count = del.count > 0 ? del.count : nil
-            let itemIds = del.itemIds.map { ItemId($0) }
-            self = .modelDelete(id: id, index: index, count: count, itemIds: itemIds)
-
-        case .modelUpdate(let update):
-            let id = ModelId(update.modelID)
-            let index = update.index == UInt64.max ? nil : update.index
-            var items: [ModelItem] = []
-            items.reserveCapacity(update.items.count)
-            for item in update.items {
-                items.append(try ModelItem(wire: item))
-            }
-            self = .modelUpdate(id: id, index: index, items: items)
-
-        case .modelResetRange(let reset):
-            let id = ModelId(reset.modelID)
-            let totalCount = reset.totalCount > 0 ? reset.totalCount : nil
-            var items: [ModelItem] = []
-            items.reserveCapacity(reset.items.count)
-            for item in reset.items {
-                items.append(try ModelItem(wire: item))
-            }
-            self = .modelResetRange(id: id, startIndex: reset.startIndex, items: items, totalCount: totalCount)
-
-        default:
-            throw StoreError.operationError("Unsupported operation variant on SemanticStore")
-        }
-    }
-
-    /// Encodes this `StoreOperation` into a protobuf wire operation message (§16).
-    public func toWire() -> SRUIOperation {
-        var op = SRUIOperation()
-        switch self {
-        case .createNode(let id, let nodeType, let parentID, let childIndex, let properties):
-            var create = Srui_Protocol_CreateNodeOp()
-            var record = Srui_Protocol_NodeRecord()
-            record.nodeID = id.value
-            record.type = nodeType.toWire()
-            record.parentID = parentID?.value ?? 0
-            record.childIndex = childIndex.map { UInt32($0) } ?? UInt32.max
-            record.properties = properties.map { p in
-                var wireProp = Srui_Protocol_Property()
-                wireProp.property = p.property.toWire()
-                wireProp.value = p.value.toWire()
-                return wireProp
-            }
-            create.node = record
-            op.createNode = create
-
-        case .deleteNode(let id):
-            var del = Srui_Protocol_DeleteNodeOp()
-            del.nodeID = id.value
-            op.deleteNode = del
-
-        case .setProperty(let id, let prop, let val):
-            var set = Srui_Protocol_SetPropertyOp()
-            set.nodeID = id.value
-            set.property = prop.toWire()
-            set.value = val.toWire()
-            op.setProperty = set
-
-        case .clearProperty(let id, let prop):
-            var clear = Srui_Protocol_ClearPropertyOp()
-            clear.nodeID = id.value
-            clear.property = prop.toWire()
-            op.clearProperty_p = clear
-
-        case .moveNode(let id, let newParentID, let newChildIndex):
-            var move = Srui_Protocol_MoveNodeOp()
-            move.nodeID = id.value
-            move.newParentID = newParentID?.value ?? 0
-            move.newChildIndex = newChildIndex.map { UInt32($0) } ?? UInt32.max
-            op.moveNode = move
-
-        case .reorderChildren(let parentID, let newOrder):
-            var reorder = Srui_Protocol_ReorderChildrenOp()
-            reorder.parentID = parentID.value
-            reorder.childNodeIds = newOrder.map { $0.value }
-            op.reorderChildren = reorder
-
-        case .batchPropertySet(let id, let properties):
-            var batch = Srui_Protocol_BatchPropertySetOp()
-            batch.nodeID = id.value
-            batch.properties = properties.map { p in
-                var wireProp = Srui_Protocol_Property()
-                wireProp.property = p.property.toWire()
-                wireProp.value = p.value.toWire()
-                return wireProp
-            }
-            op.batchPropertySet = batch
-
-        case .createModel(let id, let modelType, let itemCount):
-            var create = Srui_Protocol_CreateModelOp()
-            create.modelID = id.value
-            create.modelType = modelType.toWire()
-            create.itemCount = itemCount
-            op.createModel = create
-
-        case .modelInsert(let id, let index, let items):
-            var insert = Srui_Protocol_ModelInsertOp()
-            insert.modelID = id.value
-            insert.index = index
-            insert.items = items.map { $0.toWire() }
-            op.modelInsert = insert
-
-        case .modelDelete(let id, let index, let count, let itemIds):
-            var del = Srui_Protocol_ModelDeleteOp()
-            del.modelID = id.value
-            del.index = index ?? 0
-            del.count = count ?? 0
-            del.itemIds = itemIds.map { $0.value }
-            op.modelDelete = del
-
-        case .modelUpdate(let id, let index, let items):
-            var update = Srui_Protocol_ModelUpdateOp()
-            update.modelID = id.value
-            update.index = index ?? UInt64.max
-            update.items = items.map { $0.toWire() }
-            op.modelUpdate = update
-
-        case .modelResetRange(let id, let startIndex, let items, let totalCount):
-            var reset = Srui_Protocol_ModelResetRangeOp()
-            reset.modelID = id.value
-            reset.startIndex = startIndex
-            reset.totalCount = totalCount ?? 0
-            reset.items = items.map { $0.toWire() }
-            op.modelResetRange = reset
-        }
-        return op
-    }
-
     /// Applies this operation to a mutable `SemanticStore` instance (§13).
     public func apply(to store: inout SemanticStore) throws {
         switch self {
@@ -1040,18 +814,6 @@ public struct SemanticStore: Equatable, Sendable {
         self.commitStaging(staged)
     }
 
-    /// Applies a protobuf wire operation directly to this store (§13, §16).
-    public mutating func apply(wire: SRUIOperation) throws {
-        let op = try StoreOperation(wire: wire)
-        try apply(op)
-    }
-
-    /// Applies a list of protobuf wire operations atomically (§12.1, §16).
-    public mutating func apply(wireOperations: [SRUIOperation]) throws {
-        let ops = try wireOperations.map { try StoreOperation(wire: $0) }
-        try apply(ops)
-    }
-
     /// Applies a sequence of mutation operations as an atomic transaction advancing from `baseRevision` to `baseRevision + 1` (§12.1).
     public mutating func applyTransaction(
         baseRevision: Revision,
@@ -1069,16 +831,6 @@ public struct SemanticStore: Equatable, Sendable {
     public mutating func applyTransactionRecord(_ record: Transaction) -> Result<Revision, TxnError> {
         let applier = TransactionApplier(store: self)
         let res = applier.apply(record: record)
-        if case .success = res {
-            self = applier.store
-        }
-        return res
-    }
-
-    /// Decodes and applies a protobuf wire `SRUITransaction` atomically (§12.1, §16).
-    public mutating func applyWireTransaction(_ wire: SRUITransaction) -> Result<Revision, TxnError> {
-        let applier = TransactionApplier(store: self)
-        let res = applier.apply(wire: wire)
         if case .success = res {
             self = applier.store
         }

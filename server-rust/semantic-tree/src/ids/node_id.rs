@@ -120,10 +120,11 @@ impl ResourceHash {
 
     /// Returns lowercase hex string representation.
     pub fn to_hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
         let mut hex = String::with_capacity(64);
-        for byte in &self.0 {
-            use std::fmt::Write;
-            let _ = write!(hex, "{:02x}", byte);
+        for &byte in &self.0 {
+            hex.push(HEX[(byte >> 4) as usize] as char);
+            hex.push(HEX[(byte & 0x0f) as usize] as char);
         }
         hex
     }

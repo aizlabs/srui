@@ -372,7 +372,14 @@ impl FromIterator<Profile> for CapabilitySet {
 
 impl fmt::Display for CapabilitySet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CapabilitySet{:?}", self.to_string_vec())
+        write!(f, "CapabilitySet[")?;
+        for (i, p) in self.profiles.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "\"{}\"", p)?;
+        }
+        write!(f, "]")
     }
 }
 
@@ -412,9 +419,15 @@ impl fmt::Display for NegotiationError {
             Self::UnsatisfiedRequiredProfiles { missing } => {
                 write!(
                     f,
-                    "unsatisfied required capabilities: client did not offer required profile(s): {:?}",
-                    missing.iter().map(|p| p.to_string()).collect::<Vec<_>>()
-                )
+                    "unsatisfied required capabilities: client did not offer required profile(s): ["
+                )?;
+                for (i, p) in missing.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "\"{}\"", p)?;
+                }
+                write!(f, "]")
             }
         }
     }

@@ -254,7 +254,7 @@ impl Model {
         if delta == 0 {
             return;
         }
-        let to_shift: Vec<(u64, ModelItem)> = self.items.split_off(&from_index).into_iter().collect();
+        let to_shift = self.items.split_off(&from_index);
         for (old_idx, item) in to_shift {
             let new_idx = if delta > 0 {
                 old_idx + delta as u64

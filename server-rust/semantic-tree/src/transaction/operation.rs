@@ -331,7 +331,7 @@ impl Operation {
                 index,
                 count,
                 item_ids,
-            } => store.model_delete(*id, *index, *count, item_ids.clone()),
+            } => store.model_delete(*id, *index, *count, item_ids),
             Self::ModelUpdate { id, index, items } => {
                 store.model_update(*id, *index, items.clone())
             }

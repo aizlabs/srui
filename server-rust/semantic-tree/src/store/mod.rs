@@ -260,7 +260,7 @@ impl SemanticStore {
 
         // 5. Validate insertion index if parent specified
         if let Some(pid) = parent_id {
-            let parent_node = self.nodes.get(&pid).unwrap();
+            let parent_node = self.nodes.get(&pid).expect("parent existence verified above");
             let child_count = parent_node.ordered_children.len();
             if let Some(idx) = child_index {
                 if idx > child_count {
@@ -275,7 +275,7 @@ impl SemanticStore {
         // 6. Insert into parent's ordered_children or roots
         match parent_id {
             Some(pid) => {
-                let parent_node = self.nodes.get_mut(&pid).unwrap();
+                let parent_node = self.nodes.get_mut(&pid).expect("parent existence verified above");
                 match child_index {
                     Some(idx) => parent_node.ordered_children.insert(idx, id),
                     None => parent_node.ordered_children.push(id),
@@ -361,12 +361,9 @@ impl SemanticStore {
         prop: PropertyRef,
         val: Value,
     ) -> Result<Option<Value>, StoreError> {
-        if !self.nodes.contains_key(&id) {
-            return Err(StoreError::NodeNotFound(id));
-        }
         self.limits.validate_value(&val)?;
         self.validate_property_references(prop, &val)?;
-        let node = self.nodes.get_mut(&id).unwrap();
+        let node = self.nodes.get_mut(&id).ok_or(StoreError::NodeNotFound(id))?;
         Ok(node.properties.insert(prop, val))
     }
 
@@ -382,16 +379,13 @@ impl SemanticStore {
         id: NodeId,
         properties: impl IntoIterator<Item = (PropertyRef, Value)>,
     ) -> Result<(), StoreError> {
-        if !self.nodes.contains_key(&id) {
-            return Err(StoreError::NodeNotFound(id));
-        }
         let prop_list: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
         for (prop, val) in &prop_list {
             self.limits.validate_value(val)?;
             self.validate_property_references(*prop, val)?;
         }
 
-        let node = self.nodes.get_mut(&id).unwrap();
+        let node = self.nodes.get_mut(&id).ok_or(StoreError::NodeNotFound(id))?;
         for (prop, val) in prop_list {
             node.properties.insert(prop, val);
         }
@@ -450,11 +444,11 @@ impl SemanticStore {
             });
         }
 
-        let old_parent_id = self.nodes.get(&id).unwrap().parent_id;
+        let old_parent_id = self.nodes.get(&id).expect("node existence verified").parent_id;
 
         // 3. Validate new_child_index bounds against current destination container length
         let current_dest_len = match new_parent_id {
-            Some(pid) => self.nodes.get(&pid).unwrap().ordered_children.len(),
+            Some(pid) => self.nodes.get(&pid).expect("parent existence verified").ordered_children.len(),
             None => self.roots.len(),
         };
 
@@ -482,7 +476,7 @@ impl SemanticStore {
         // 5. Insert into new location
         match new_parent_id {
             Some(pid) => {
-                let parent_node = self.nodes.get_mut(&pid).unwrap();
+                let parent_node = self.nodes.get_mut(&pid).expect("parent existence verified");
                 match new_child_index {
                     Some(idx) => {
                         let target_idx = idx.min(parent_node.ordered_children.len());
@@ -501,7 +495,7 @@ impl SemanticStore {
         }
 
         // 6. Update node's parent_id
-        let node = self.nodes.get_mut(&id).unwrap();
+        let node = self.nodes.get_mut(&id).expect("node existence verified");
         node.parent_id = new_parent_id;
 
         Ok(())
@@ -541,7 +535,7 @@ impl SemanticStore {
             }
         }
 
-        let parent_node_mut = self.nodes.get_mut(&parent_id).unwrap();
+        let parent_node_mut = self.nodes.get_mut(&parent_id).expect("parent existence verified");
         parent_node_mut.ordered_children = new_order.to_vec();
         Ok(())
     }
@@ -669,11 +663,11 @@ impl SemanticStore {
         id: ModelId,
         index: Option<u64>,
         count: Option<u64>,
-        item_ids: Vec<ItemId>,
+        item_ids: &[ItemId],
     ) -> Result<(), StoreError> {
         self.limits.validate_model_items_batch(item_ids.len())?;
         let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
-        model.delete_items(index, count, &item_ids)
+        model.delete_items(index, count, item_ids)
     }
 
     /// Updates existing items in a collection model (§13 MODEL_UPDATE).

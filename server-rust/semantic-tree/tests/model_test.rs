@@ -101,7 +101,7 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
 
     // 5. Delete an item by item_id (delete nginx ItemId(101))
     store
-        .model_delete(model_id, None, None, vec![ItemId::new(101)])
+        .model_delete(model_id, None, None, &[ItemId::new(101)])
         .expect("delete nginx");
 
     // Confirm only the addressed item was removed; others remain intact
@@ -444,7 +444,7 @@ fn test_model_delete_range_rejects_out_of_bounds() {
     store.create_model(model_id, list_type, 10).unwrap();
 
     let err = store
-        .model_delete(model_id, Some(5), Some(100), vec![])
+        .model_delete(model_id, Some(5), Some(100), &[])
         .unwrap_err();
     assert_eq!(
         err,
@@ -479,7 +479,7 @@ fn test_model_delete_rejects_combined_identity_and_range() {
             model_id,
             Some(0),
             Some(2),
-            vec![ItemId::new(1), ItemId::new(2)],
+            &[ItemId::new(1), ItemId::new(2)],
         )
         .unwrap_err();
 
@@ -625,7 +625,7 @@ fn test_model_delete_combined_identity_and_range_preserves_item_count() {
             model_id,
             Some(5),
             Some(2),
-            vec![ItemId::new(50)],
+            &[ItemId::new(50)],
         )
         .unwrap_err();
 
@@ -684,7 +684,7 @@ fn test_model_delete_sparse_range_large_count() {
 
     // Delete range [40, 140) (count = 100). This covers items at 50 and 100.
     store
-        .model_delete(model_id, Some(40), Some(100), vec![])
+        .model_delete(model_id, Some(40), Some(100), &[])
         .unwrap();
 
     let model = store.get_model(model_id).unwrap();
@@ -750,7 +750,7 @@ fn test_model_batch_limits_enforced_across_all_ops() {
             model_id,
             None,
             None,
-            vec![ItemId::new(1), ItemId::new(2), ItemId::new(3)],
+            &[ItemId::new(1), ItemId::new(2), ItemId::new(3)],
         )
         .unwrap_err();
     assert_eq!(

@@ -292,6 +292,8 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case maxCachedItemsPerModelExceeded(limit: Int, current: Int, attempted: Int)
     /// Model mutation operation exceeds the configured maximum items limit (§26).
     case maxItemsPerModelOperationExceeded(limit: Int, actual: Int)
+    /// Batch exceeds the configured maximum mutation operations limit (§26).
+    case maxTransactionOperationsExceeded(limit: Int, actual: Int)
     /// Invalid model delete parameters (e.g. combined identity and range selectors, §8, §13).
     case invalidModelDelete(String)
     /// The specified child insertion index is out of bounds for the parent's current children list.
@@ -339,6 +341,8 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "cached items per model limit exceeded: max allowed is \(limit), current cached is \(current), attempted is \(attempted)"
         case .maxItemsPerModelOperationExceeded(let limit, let actual):
             return "items per model operation limit exceeded: max allowed is \(limit), actual count is \(actual)"
+        case .maxTransactionOperationsExceeded(let limit, let actual):
+            return "transaction operations limit exceeded: max allowed is \(limit), actual count is \(actual)"
         case .invalidModelDelete(let reason):
             return "invalid model delete: \(reason)"
         case .childIndexOutOfBounds(let index, let count):
@@ -375,6 +379,7 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .maxModelCountExceeded: return "max_model_count_exceeded"
         case .maxCachedItemsPerModelExceeded: return "max_cached_items_per_model_exceeded"
         case .maxItemsPerModelOperationExceeded: return "max_items_per_model_operation_exceeded"
+        case .maxTransactionOperationsExceeded: return "max_transaction_operations_exceeded"
         case .invalidModelDelete: return "invalid_model_delete"
         case .childIndexOutOfBounds: return "child_index_out_of_bounds"
         case .modelIdAlreadyUsed: return "model_id_already_used"
@@ -780,6 +785,12 @@ public struct SemanticStore: Equatable, Sendable {
     /// Applies a list of mutation operations atomically: if any operation fails,
     /// the store is guaranteed to remain completely unchanged in its pre-call state (§12.1).
     public mutating func apply(_ operations: [StoreOperation]) throws {
+        if operations.count > limitsValue.maxTransactionOperations {
+            throw StoreError.maxTransactionOperationsExceeded(
+                limit: limitsValue.maxTransactionOperations,
+                actual: operations.count
+            )
+        }
         var staged = self.cloneStaging()
         for op in operations {
             try op.apply(to: &staged)
@@ -858,11 +869,11 @@ public struct SemanticStore: Equatable, Sendable {
                 throw StoreError.parentNotFound(pid)
             }
             let childCount = parentNode.orderedChildren.count
-            if let idx = childIndex, idx > childCount {
+            if let idx = childIndex, idx < 0 || idx > childCount {
                 throw StoreError.childIndexOutOfBounds(index: idx, count: childCount)
             }
         } else {
-            if let idx = childIndex, idx > roots.count {
+            if let idx = childIndex, idx < 0 || idx > roots.count {
                 throw StoreError.childIndexOutOfBounds(index: idx, count: roots.count)
             }
         }
@@ -1078,7 +1089,7 @@ public struct SemanticStore: Equatable, Sendable {
             currentDestLen = roots.count
         }
 
-        if let idx = newChildIndex, idx > currentDestLen {
+        if let idx = newChildIndex, idx < 0 || idx > currentDestLen {
             throw StoreError.childIndexOutOfBounds(index: idx, count: currentDestLen)
         }
 

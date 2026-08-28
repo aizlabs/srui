@@ -711,6 +711,57 @@ final class SemanticStoreTests: XCTestCase {
         XCTAssertNil(store.getNode(colID)?.getProperty(.enabled), "Property set on colID must be rolled back")
     }
 
+    func testNegativeChildIndexRejected() throws {
+        var store = SemanticStore()
+        let rootID = NodeId(1)
+        try store.createNode(id: rootID, nodeType: .surface)
+
+        XCTAssertThrowsError(
+            try store.createNode(id: NodeId(2), nodeType: .button, parentID: rootID, childIndex: -1)
+        ) { error in
+            XCTAssertEqual(error as? StoreError, StoreError.childIndexOutOfBounds(index: -1, count: 0))
+        }
+
+        XCTAssertThrowsError(
+            try store.moveNode(nodeID: rootID, newParentID: nil, newChildIndex: -1)
+        ) { error in
+            XCTAssertEqual(error as? StoreError, StoreError.childIndexOutOfBounds(index: -1, count: 1))
+        }
+
+        XCTAssertEqual(store.nodeCount, 1)
+        XCTAssertEqual(store.rootIDs, [rootID])
+    }
+
+    func testMaxTransactionOperationsLimitEnforced() throws {
+        let limits = StoreLimits(
+            maxTreeDepth: 64,
+            maxNodeCount: 100,
+            maxStringLength: 1024,
+            maxValueDepth: 16,
+            maxListElements: 10_000,
+            maxRecordProperties: 1_000,
+            maxTransactionOperations: 2
+        )
+        var store = SemanticStore(limits: limits)
+        try store.createNode(id: NodeId(1), nodeType: .surface)
+
+        let operations: [StoreOperation] = [
+            .create(id: NodeId(2), nodeType: .text, parentID: NodeId(1)),
+            .create(id: NodeId(3), nodeType: .text, parentID: NodeId(1)),
+            .create(id: NodeId(4), nodeType: .text, parentID: NodeId(1))
+        ]
+
+        XCTAssertThrowsError(try store.apply(operations)) { error in
+            XCTAssertEqual(
+                error as? StoreError,
+                StoreError.maxTransactionOperationsExceeded(limit: 2, actual: 3)
+            )
+        }
+
+        XCTAssertEqual(store.nodeCount, 1)
+        XCTAssertFalse(store.isIDUsed(NodeId(2)))
+    }
+
     func testAtomicBatchApplicationSuccess() throws {
         var store = SemanticStore()
         let rootID = NodeId(1)

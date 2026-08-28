@@ -20,6 +20,7 @@ from validate.conformance import (
     SHOULD_NODE_TYPES,
 )
 from validate.loader import RegistryLoadError, load_registry
+from validate.proto_registry import validate_proto_registry_sync
 from validate.validate import validate_registry_data
 
 REGISTRY_PATH = Path(__file__).resolve().parent.parent / "registry.yaml"
@@ -71,6 +72,12 @@ def test_conformance_constants_match_registry() -> None:
 
     operation_names = {entry["name"] for entry in registry["operations"]}
     assert operation_names == REQUIRED_OPERATIONS
+
+
+def test_proto_registry_ids_match() -> None:
+    registry = load_registry(REGISTRY_PATH)
+    result = validate_proto_registry_sync(registry)
+    assert result.ok, result.errors
 
 
 def test_missing_control_specific_property_fails() -> None:

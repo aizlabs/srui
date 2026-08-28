@@ -959,6 +959,84 @@ public nonisolated enum Srui_Protocol_StandardEvent: SwiftProtobuf.Enum, Swift.C
 
 }
 
+public nonisolated enum Srui_Protocol_StandardEnum: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case enumUnspecified // = 0
+  case enumTextRole // = 1
+  case enumActionRole // = 2
+  case enumInputRole // = 3
+  case enumImportance // = 4
+  case enumTogglePresentationHint // = 5
+  case enumVisibility // = 6
+  case enumSpacingRole // = 7
+  case enumPaddingRole // = 8
+  case enumHorizontalAlignment // = 9
+  case enumVerticalAlignment // = 10
+  case enumSelectionMode // = 11
+  case enumValidationState // = 12
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .enumUnspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .enumUnspecified
+    case 1: self = .enumTextRole
+    case 2: self = .enumActionRole
+    case 3: self = .enumInputRole
+    case 4: self = .enumImportance
+    case 5: self = .enumTogglePresentationHint
+    case 6: self = .enumVisibility
+    case 7: self = .enumSpacingRole
+    case 8: self = .enumPaddingRole
+    case 9: self = .enumHorizontalAlignment
+    case 10: self = .enumVerticalAlignment
+    case 11: self = .enumSelectionMode
+    case 12: self = .enumValidationState
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .enumUnspecified: return 0
+    case .enumTextRole: return 1
+    case .enumActionRole: return 2
+    case .enumInputRole: return 3
+    case .enumImportance: return 4
+    case .enumTogglePresentationHint: return 5
+    case .enumVisibility: return 6
+    case .enumSpacingRole: return 7
+    case .enumPaddingRole: return 8
+    case .enumHorizontalAlignment: return 9
+    case .enumVerticalAlignment: return 10
+    case .enumSelectionMode: return 11
+    case .enumValidationState: return 12
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_StandardEnum] = [
+    .enumUnspecified,
+    .enumTextRole,
+    .enumActionRole,
+    .enumInputRole,
+    .enumImportance,
+    .enumTogglePresentationHint,
+    .enumVisibility,
+    .enumSpacingRole,
+    .enumPaddingRole,
+    .enumHorizontalAlignment,
+    .enumVerticalAlignment,
+    .enumSelectionMode,
+    .enumValidationState,
+  ]
+
+}
+
 public nonisolated enum Srui_Protocol_StandardOperation: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case operationUnspecified // = 0
@@ -1112,6 +1190,7 @@ public nonisolated struct Srui_Protocol_EnumValue: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
+  /// enum_id is the registry enum type id (protocol/registry.yaml enums[].id).
   public var enumID: UInt32 = 0
 
   public var valueID: UInt32 = 0
@@ -1554,73 +1633,16 @@ public nonisolated struct Srui_Protocol_ClearPropertyOp: Sendable {
   fileprivate var _property: Srui_Protocol_PropertyRef? = nil
 }
 
-public nonisolated struct Srui_Protocol_MoveNodeOp: Sendable {
+public nonisolated struct Srui_Protocol_CommitOp: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
-  public var nodeID: UInt64 = 0
-
-  public var newParentID: UInt64 = 0
-
-  public var newChildIndex: UInt32 = 0
+  public var revision: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
-}
-
-public nonisolated struct Srui_Protocol_ReorderChildrenOp: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  public var parentID: UInt64 = 0
-
-  public var childNodeIds: [UInt64] = []
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Srui_Protocol_BatchPropertySetOp: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  public var nodeID: UInt64 = 0
-
-  public var properties: [Srui_Protocol_Property] = []
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Srui_Protocol_ModelItem: Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  public var itemID: UInt64 = 0
-
-  public var value: Srui_Protocol_Value {
-    get {_value ?? Srui_Protocol_Value()}
-    set {_value = newValue}
-  }
-  /// Returns true if `value` has been explicitly set.
-  public var hasValue: Bool {self._value != nil}
-  /// Clears the value of `value`. Subsequent reads from it will return its default value.
-  public mutating func clearValue() {self._value = nil}
-
-  public var properties: [Srui_Protocol_Property] = []
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-
-  fileprivate var _value: Srui_Protocol_Value? = nil
 }
 
 public nonisolated struct Srui_Protocol_CreateModelOp: Sendable {
@@ -1716,11 +1738,81 @@ public nonisolated struct Srui_Protocol_ModelResetRangeOp: Sendable {
   public init() {}
 }
 
+public nonisolated struct Srui_Protocol_MoveNodeOp: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var nodeID: UInt64 = 0
+
+  public var newParentID: UInt64 = 0
+
+  public var newChildIndex: UInt32 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_ReorderChildrenOp: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var parentID: UInt64 = 0
+
+  public var childNodeIds: [UInt64] = []
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_BatchPropertySetOp: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var nodeID: UInt64 = 0
+
+  public var properties: [Srui_Protocol_Property] = []
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_ModelItem: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var itemID: UInt64 = 0
+
+  public var value: Srui_Protocol_Value {
+    get {_value ?? Srui_Protocol_Value()}
+    set {_value = newValue}
+  }
+  /// Returns true if `value` has been explicitly set.
+  public var hasValue: Bool {self._value != nil}
+  /// Clears the value of `value`. Subsequent reads from it will return its default value.
+  public mutating func clearValue() {self._value = nil}
+
+  public var properties: [Srui_Protocol_Property] = []
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+
+  fileprivate var _value: Srui_Protocol_Value? = nil
+}
+
 public nonisolated struct Srui_Protocol_Operation: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
+  /// Wire variants matching registry operation IDs 1..13 1:1.
   public var op: Srui_Protocol_Operation.OneOf_Op? = nil
 
   public var createNode: Srui_Protocol_CreateNodeOp {
@@ -1755,28 +1847,12 @@ public nonisolated struct Srui_Protocol_Operation: Sendable {
     set {op = .clearProperty_p(newValue)}
   }
 
-  public var moveNode: Srui_Protocol_MoveNodeOp {
+  public var commit: Srui_Protocol_CommitOp {
     get {
-      if case .moveNode(let v)? = op {return v}
-      return Srui_Protocol_MoveNodeOp()
+      if case .commit(let v)? = op {return v}
+      return Srui_Protocol_CommitOp()
     }
-    set {op = .moveNode(newValue)}
-  }
-
-  public var reorderChildren: Srui_Protocol_ReorderChildrenOp {
-    get {
-      if case .reorderChildren(let v)? = op {return v}
-      return Srui_Protocol_ReorderChildrenOp()
-    }
-    set {op = .reorderChildren(newValue)}
-  }
-
-  public var batchPropertySet: Srui_Protocol_BatchPropertySetOp {
-    get {
-      if case .batchPropertySet(let v)? = op {return v}
-      return Srui_Protocol_BatchPropertySetOp()
-    }
-    set {op = .batchPropertySet(newValue)}
+    set {op = .commit(newValue)}
   }
 
   public var createModel: Srui_Protocol_CreateModelOp {
@@ -1819,21 +1895,47 @@ public nonisolated struct Srui_Protocol_Operation: Sendable {
     set {op = .modelResetRange(newValue)}
   }
 
+  public var moveNode: Srui_Protocol_MoveNodeOp {
+    get {
+      if case .moveNode(let v)? = op {return v}
+      return Srui_Protocol_MoveNodeOp()
+    }
+    set {op = .moveNode(newValue)}
+  }
+
+  public var reorderChildren: Srui_Protocol_ReorderChildrenOp {
+    get {
+      if case .reorderChildren(let v)? = op {return v}
+      return Srui_Protocol_ReorderChildrenOp()
+    }
+    set {op = .reorderChildren(newValue)}
+  }
+
+  public var batchPropertySet: Srui_Protocol_BatchPropertySetOp {
+    get {
+      if case .batchPropertySet(let v)? = op {return v}
+      return Srui_Protocol_BatchPropertySetOp()
+    }
+    set {op = .batchPropertySet(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
+  /// Wire variants matching registry operation IDs 1..13 1:1.
   public nonisolated enum OneOf_Op: Equatable, Sendable {
     case createNode(Srui_Protocol_CreateNodeOp)
     case deleteNode(Srui_Protocol_DeleteNodeOp)
     case setProperty(Srui_Protocol_SetPropertyOp)
     case clearProperty_p(Srui_Protocol_ClearPropertyOp)
-    case moveNode(Srui_Protocol_MoveNodeOp)
-    case reorderChildren(Srui_Protocol_ReorderChildrenOp)
-    case batchPropertySet(Srui_Protocol_BatchPropertySetOp)
+    case commit(Srui_Protocol_CommitOp)
     case createModel(Srui_Protocol_CreateModelOp)
     case modelInsert(Srui_Protocol_ModelInsertOp)
     case modelDelete(Srui_Protocol_ModelDeleteOp)
     case modelUpdate(Srui_Protocol_ModelUpdateOp)
     case modelResetRange(Srui_Protocol_ModelResetRangeOp)
+    case moveNode(Srui_Protocol_MoveNodeOp)
+    case reorderChildren(Srui_Protocol_ReorderChildrenOp)
+    case batchPropertySet(Srui_Protocol_BatchPropertySetOp)
 
   }
 
@@ -1845,6 +1947,8 @@ public nonisolated struct Srui_Protocol_Transaction: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
+  /// Atomic commit boundary: operations apply atomically when advancing from
+  /// base_revision to new_revision. This envelope is the wire commit (§12, §13).
   public var baseRevision: UInt64 = 0
 
   public var newRevision: UInt64 = 0
@@ -2203,6 +2307,10 @@ nonisolated extension Srui_Protocol_ValidationState: SwiftProtobuf._ProtoNamePro
 
 nonisolated extension Srui_Protocol_StandardEvent: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0EVENT_UNSPECIFIED\0\u{1}EVENT_ACTIVATE\0\u{1}EVENT_VALUE_CHANGED\0\u{1}EVENT_SELECTION_CHANGED\0\u{1}EVENT_EXPANSION_CHANGED\0\u{1}EVENT_TEXT_EDIT\0\u{1}EVENT_VIEWPORT_CHANGED\0\u{1}EVENT_POINTER_DOWN\0\u{1}EVENT_POINTER_UP\0\u{1}EVENT_POINTER_MOVE\0\u{1}EVENT_POINTER_CANCEL\0\u{1}EVENT_POINTER_SCROLL\0")
+}
+
+nonisolated extension Srui_Protocol_StandardEnum: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ENUM_UNSPECIFIED\0\u{1}ENUM_TEXT_ROLE\0\u{1}ENUM_ACTION_ROLE\0\u{1}ENUM_INPUT_ROLE\0\u{1}ENUM_IMPORTANCE\0\u{1}ENUM_TOGGLE_PRESENTATION_HINT\0\u{1}ENUM_VISIBILITY\0\u{1}ENUM_SPACING_ROLE\0\u{1}ENUM_PADDING_ROLE\0\u{1}ENUM_HORIZONTAL_ALIGNMENT\0\u{1}ENUM_VERTICAL_ALIGNMENT\0\u{1}ENUM_SELECTION_MODE\0\u{1}ENUM_VALIDATION_STATE\0")
 }
 
 nonisolated extension Srui_Protocol_StandardOperation: SwiftProtobuf._ProtoNameProviding {
@@ -3099,9 +3207,9 @@ nonisolated extension Srui_Protocol_ClearPropertyOp: SwiftProtobuf.Message, Swif
   }
 }
 
-nonisolated extension Srui_Protocol_MoveNodeOp: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".MoveNodeOp"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{3}new_parent_id\0\u{3}new_child_index\0")
+nonisolated extension Srui_Protocol_CommitOp: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".CommitOp"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}revision\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3109,145 +3217,21 @@ nonisolated extension Srui_Protocol_MoveNodeOp: SwiftProtobuf.Message, SwiftProt
       // allocates stack space for every case branch when no optimizations are
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
-      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
-      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.newParentID) }()
-      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.newChildIndex) }()
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.revision) }()
       default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if self.nodeID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
-    }
-    if self.newParentID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.newParentID, fieldNumber: 2)
-    }
-    if self.newChildIndex != 0 {
-      try visitor.visitSingularUInt32Field(value: self.newChildIndex, fieldNumber: 3)
+    if self.revision != 0 {
+      try visitor.visitSingularUInt64Field(value: self.revision, fieldNumber: 1)
     }
     try unknownFields.traverse(visitor: &visitor)
   }
 
-  public static func ==(lhs: Srui_Protocol_MoveNodeOp, rhs: Srui_Protocol_MoveNodeOp) -> Bool {
-    if lhs.nodeID != rhs.nodeID {return false}
-    if lhs.newParentID != rhs.newParentID {return false}
-    if lhs.newChildIndex != rhs.newChildIndex {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension Srui_Protocol_ReorderChildrenOp: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".ReorderChildrenOp"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}parent_id\0\u{3}child_node_ids\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.parentID) }()
-      case 2: try { try decoder.decodeRepeatedUInt64Field(value: &self.childNodeIds) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if self.parentID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.parentID, fieldNumber: 1)
-    }
-    if !self.childNodeIds.isEmpty {
-      try visitor.visitPackedUInt64Field(value: self.childNodeIds, fieldNumber: 2)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Srui_Protocol_ReorderChildrenOp, rhs: Srui_Protocol_ReorderChildrenOp) -> Bool {
-    if lhs.parentID != rhs.parentID {return false}
-    if lhs.childNodeIds != rhs.childNodeIds {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension Srui_Protocol_BatchPropertySetOp: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".BatchPropertySetOp"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{1}properties\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
-      case 2: try { try decoder.decodeRepeatedMessageField(value: &self.properties) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if self.nodeID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
-    }
-    if !self.properties.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.properties, fieldNumber: 2)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Srui_Protocol_BatchPropertySetOp, rhs: Srui_Protocol_BatchPropertySetOp) -> Bool {
-    if lhs.nodeID != rhs.nodeID {return false}
-    if lhs.properties != rhs.properties {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
-nonisolated extension Srui_Protocol_ModelItem: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".ModelItem"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}item_id\0\u{1}value\0\u{1}properties\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.itemID) }()
-      case 2: try { try decoder.decodeSingularMessageField(value: &self._value) }()
-      case 3: try { try decoder.decodeRepeatedMessageField(value: &self.properties) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    // The use of inline closures is to circumvent an issue where the compiler
-    // allocates stack space for every if/case branch local when no optimizations
-    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
-    // https://github.com/apple/swift-protobuf/issues/1182
-    if self.itemID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.itemID, fieldNumber: 1)
-    }
-    try { if let v = self._value {
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
-    } }()
-    if !self.properties.isEmpty {
-      try visitor.visitRepeatedMessageField(value: self.properties, fieldNumber: 3)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Srui_Protocol_ModelItem, rhs: Srui_Protocol_ModelItem) -> Bool {
-    if lhs.itemID != rhs.itemID {return false}
-    if lhs._value != rhs._value {return false}
-    if lhs.properties != rhs.properties {return false}
+  public static func ==(lhs: Srui_Protocol_CommitOp, rhs: Srui_Protocol_CommitOp) -> Bool {
+    if lhs.revision != rhs.revision {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -3467,9 +3451,163 @@ nonisolated extension Srui_Protocol_ModelResetRangeOp: SwiftProtobuf.Message, Sw
   }
 }
 
+nonisolated extension Srui_Protocol_MoveNodeOp: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".MoveNodeOp"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{3}new_parent_id\0\u{3}new_child_index\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.newParentID) }()
+      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.newChildIndex) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.nodeID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
+    }
+    if self.newParentID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.newParentID, fieldNumber: 2)
+    }
+    if self.newChildIndex != 0 {
+      try visitor.visitSingularUInt32Field(value: self.newChildIndex, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_MoveNodeOp, rhs: Srui_Protocol_MoveNodeOp) -> Bool {
+    if lhs.nodeID != rhs.nodeID {return false}
+    if lhs.newParentID != rhs.newParentID {return false}
+    if lhs.newChildIndex != rhs.newChildIndex {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_ReorderChildrenOp: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ReorderChildrenOp"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}parent_id\0\u{3}child_node_ids\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.parentID) }()
+      case 2: try { try decoder.decodeRepeatedUInt64Field(value: &self.childNodeIds) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.parentID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.parentID, fieldNumber: 1)
+    }
+    if !self.childNodeIds.isEmpty {
+      try visitor.visitPackedUInt64Field(value: self.childNodeIds, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ReorderChildrenOp, rhs: Srui_Protocol_ReorderChildrenOp) -> Bool {
+    if lhs.parentID != rhs.parentID {return false}
+    if lhs.childNodeIds != rhs.childNodeIds {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_BatchPropertySetOp: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".BatchPropertySetOp"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{1}properties\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
+      case 2: try { try decoder.decodeRepeatedMessageField(value: &self.properties) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.nodeID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
+    }
+    if !self.properties.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.properties, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_BatchPropertySetOp, rhs: Srui_Protocol_BatchPropertySetOp) -> Bool {
+    if lhs.nodeID != rhs.nodeID {return false}
+    if lhs.properties != rhs.properties {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_ModelItem: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ModelItem"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}item_id\0\u{1}value\0\u{1}properties\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.itemID) }()
+      case 2: try { try decoder.decodeSingularMessageField(value: &self._value) }()
+      case 3: try { try decoder.decodeRepeatedMessageField(value: &self.properties) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
+    if self.itemID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.itemID, fieldNumber: 1)
+    }
+    try { if let v = self._value {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
+    } }()
+    if !self.properties.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.properties, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ModelItem, rhs: Srui_Protocol_ModelItem) -> Bool {
+    if lhs.itemID != rhs.itemID {return false}
+    if lhs._value != rhs._value {return false}
+    if lhs.properties != rhs.properties {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
 nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Operation"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}create_node\0\u{3}delete_node\0\u{3}set_property\0\u{3}clear_property\0\u{3}move_node\0\u{3}reorder_children\0\u{3}batch_property_set\0\u{3}create_model\0\u{3}model_insert\0\u{3}model_delete\0\u{3}model_update\0\u{3}model_reset_range\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}create_node\0\u{3}delete_node\0\u{3}set_property\0\u{3}clear_property\0\u{1}commit\0\u{3}create_model\0\u{3}model_insert\0\u{3}model_delete\0\u{3}model_update\0\u{3}model_reset_range\0\u{3}move_node\0\u{3}reorder_children\0\u{3}batch_property_set\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3530,45 +3668,19 @@ nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProto
         }
       }()
       case 5: try {
-        var v: Srui_Protocol_MoveNodeOp?
+        var v: Srui_Protocol_CommitOp?
         var hadOneofValue = false
         if let current = self.op {
           hadOneofValue = true
-          if case .moveNode(let m) = current {v = m}
+          if case .commit(let m) = current {v = m}
         }
         try decoder.decodeSingularMessageField(value: &v)
         if let v = v {
           if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.op = .moveNode(v)
+          self.op = .commit(v)
         }
       }()
       case 6: try {
-        var v: Srui_Protocol_ReorderChildrenOp?
-        var hadOneofValue = false
-        if let current = self.op {
-          hadOneofValue = true
-          if case .reorderChildren(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.op = .reorderChildren(v)
-        }
-      }()
-      case 7: try {
-        var v: Srui_Protocol_BatchPropertySetOp?
-        var hadOneofValue = false
-        if let current = self.op {
-          hadOneofValue = true
-          if case .batchPropertySet(let m) = current {v = m}
-        }
-        try decoder.decodeSingularMessageField(value: &v)
-        if let v = v {
-          if hadOneofValue {try decoder.handleConflictingOneOf()}
-          self.op = .batchPropertySet(v)
-        }
-      }()
-      case 8: try {
         var v: Srui_Protocol_CreateModelOp?
         var hadOneofValue = false
         if let current = self.op {
@@ -3581,7 +3693,7 @@ nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProto
           self.op = .createModel(v)
         }
       }()
-      case 9: try {
+      case 7: try {
         var v: Srui_Protocol_ModelInsertOp?
         var hadOneofValue = false
         if let current = self.op {
@@ -3594,7 +3706,7 @@ nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProto
           self.op = .modelInsert(v)
         }
       }()
-      case 10: try {
+      case 8: try {
         var v: Srui_Protocol_ModelDeleteOp?
         var hadOneofValue = false
         if let current = self.op {
@@ -3607,7 +3719,7 @@ nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProto
           self.op = .modelDelete(v)
         }
       }()
-      case 11: try {
+      case 9: try {
         var v: Srui_Protocol_ModelUpdateOp?
         var hadOneofValue = false
         if let current = self.op {
@@ -3620,7 +3732,7 @@ nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProto
           self.op = .modelUpdate(v)
         }
       }()
-      case 12: try {
+      case 10: try {
         var v: Srui_Protocol_ModelResetRangeOp?
         var hadOneofValue = false
         if let current = self.op {
@@ -3631,6 +3743,45 @@ nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProto
         if let v = v {
           if hadOneofValue {try decoder.handleConflictingOneOf()}
           self.op = .modelResetRange(v)
+        }
+      }()
+      case 11: try {
+        var v: Srui_Protocol_MoveNodeOp?
+        var hadOneofValue = false
+        if let current = self.op {
+          hadOneofValue = true
+          if case .moveNode(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.op = .moveNode(v)
+        }
+      }()
+      case 12: try {
+        var v: Srui_Protocol_ReorderChildrenOp?
+        var hadOneofValue = false
+        if let current = self.op {
+          hadOneofValue = true
+          if case .reorderChildren(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.op = .reorderChildren(v)
+        }
+      }()
+      case 13: try {
+        var v: Srui_Protocol_BatchPropertySetOp?
+        var hadOneofValue = false
+        if let current = self.op {
+          hadOneofValue = true
+          if case .batchPropertySet(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.op = .batchPropertySet(v)
         }
       }()
       default: break
@@ -3660,37 +3811,41 @@ nonisolated extension Srui_Protocol_Operation: SwiftProtobuf.Message, SwiftProto
       guard case .clearProperty_p(let v)? = self.op else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 4)
     }()
-    case .moveNode?: try {
-      guard case .moveNode(let v)? = self.op else { preconditionFailure() }
+    case .commit?: try {
+      guard case .commit(let v)? = self.op else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 5)
-    }()
-    case .reorderChildren?: try {
-      guard case .reorderChildren(let v)? = self.op else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
-    }()
-    case .batchPropertySet?: try {
-      guard case .batchPropertySet(let v)? = self.op else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
     }()
     case .createModel?: try {
       guard case .createModel(let v)? = self.op else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
     }()
     case .modelInsert?: try {
       guard case .modelInsert(let v)? = self.op else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 9)
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
     }()
     case .modelDelete?: try {
       guard case .modelDelete(let v)? = self.op else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
     }()
     case .modelUpdate?: try {
       guard case .modelUpdate(let v)? = self.op else { preconditionFailure() }
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 9)
     }()
     case .modelResetRange?: try {
       guard case .modelResetRange(let v)? = self.op else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
+    }()
+    case .moveNode?: try {
+      guard case .moveNode(let v)? = self.op else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
+    }()
+    case .reorderChildren?: try {
+      guard case .reorderChildren(let v)? = self.op else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 12)
+    }()
+    case .batchPropertySet?: try {
+      guard case .batchPropertySet(let v)? = self.op else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
     }()
     case nil: break
     }

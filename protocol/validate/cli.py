@@ -57,6 +57,7 @@ def _print_success(result: ValidationResult) -> None:
     )
     print("  • No duplicate IDs, no duplicate names, no accidental gaps in numbering.")
     print(f"  • Tier metadata verified for {len(EXPECTED_NODE_TIERS)} node types.")
+    print("  • Triple-oracle sync verified (registry.yaml ↔ srui.proto ↔ srui.pb.swift).")
 
 
 def validate_registry(registry_path: Path, *, json_output: bool = False) -> bool:

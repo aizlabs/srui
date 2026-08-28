@@ -61,9 +61,10 @@ To guarantee long-term protocol stability and backwards compatibility, the follo
    - Numeric IDs are scoped independently within each registry category:
      - `node_types`: IDs $1 \ldots N$
      - `properties`: IDs $1 \ldots M$
-     - `enums`: Each enum type scopes its own value IDs $1 \ldots K$
+     - `enums`: Each enum **type** has a monotonic type id (`enums[].id`); value IDs are scoped per type ($1 \ldots K$)
      - `events`: IDs $1 \ldots E$
      - `operations`: IDs $1 \ldots O$
+   - `EnumValue.enum_id` on the wire references `enums[].id`; `EnumValue.value_id` references `enums[].values[].id`.
 
 ---
 
@@ -92,13 +93,29 @@ The canonical registry defines 30 standard properties in five categories:
 Each property entry includes `value_type` metadata validated by the registry tool.
 
 ### 4.3 Standard Enums (§7.5, §7.2, §7.4, §8)
-The canonical registry defines 12 standard enums with contiguous value IDs. These include appearance roles (`TextRole`, `ActionRole`, `InputRole`, `Importance`), toggle presentation hints, and supporting layout/state enums (`Visibility`, `SpacingRole`, `PaddingRole`, `HorizontalAlignment`, `VerticalAlignment`, `SelectionMode`, `ValidationState`).
+The canonical registry defines 12 standard enum types with monotonic type IDs ($1 \ldots 12$) and contiguous value IDs within each enum.
+On the wire, enum values are represented by `EnumValue(enum_id, value_id)` where `enum_id` references the `StandardEnum` type ID (e.g. `ActionRole = 2`) and `value_id` references the value within that enum (e.g. `destructive = 3`).
+
+Standard enum types:
+1. `TextRole` (ID 1)
+2. `ActionRole` (ID 2)
+3. `InputRole` (ID 3)
+4. `Importance` (ID 4)
+5. `TogglePresentationHint` (ID 5)
+6. `Visibility` (ID 6)
+7. `SpacingRole` (ID 7)
+8. `PaddingRole` (ID 8)
+9. `HorizontalAlignment` (ID 9)
+10. `VerticalAlignment` (ID 10)
+11. `SelectionMode` (ID 11)
+12. `ValidationState` (ID 12)
 
 ### 4.4 Standard Events (§7.6, §7.7)
-Semantic and coordinate pointer events are defined with `kind` metadata (`semantic` or `coordinate`).
+Semantic and coordinate pointer events are defined with `kind` metadata (`semantic` or `coordinate`) with monotonic IDs ($1 \ldots 11$).
 
 ### 4.5 Core Mutation Operations (§13)
-Required core, model, and optimization operations are defined with `category` metadata (`required`, `model`, `optimization`).
+Required core, model, and optimization operations are defined with `category` metadata (`required`, `model`, `optimization`) with monotonic IDs ($1 \ldots 13$).
+On the wire, `Operation` oneof field tags match the operation registry IDs $1 \ldots 13$ 1:1, including `CommitOp` (tag 5).
 
 ---
 

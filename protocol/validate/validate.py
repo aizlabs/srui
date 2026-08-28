@@ -24,6 +24,7 @@ from validate.metadata import (
     validate_operation_entry,
     validate_property_entry,
 )
+from validate.proto_registry import validate_proto_registry_sync
 
 
 @dataclass
@@ -36,7 +37,7 @@ class ValidationResult:
         return not self.errors
 
 
-def validate_registry_data(registry: dict) -> ValidationResult:
+def validate_registry_data(registry: dict, *, check_proto: bool = True) -> ValidationResult:
     """Validate a loaded registry mapping."""
     errors: list[str] = []
 
@@ -120,6 +121,8 @@ def validate_registry_data(registry: dict) -> ValidationResult:
     if not enums:
         errors.append("Category 'enums' is missing or empty.")
 
+    enum_type_names, _, _ = validate_category_sequence(enums, "enums", errors)
+
     enums_seen: dict[str, dict] = {}
     for enum_entry in enums:
         if not isinstance(enum_entry, dict):
@@ -176,6 +179,10 @@ def validate_registry_data(registry: dict) -> ValidationResult:
     if missing_ops:
         errors.append(f"[operations] Missing core mutation operations (§13): {sorted(missing_ops)}")
 
+    if check_proto:
+        proto_sync = validate_proto_registry_sync(registry)
+        errors.extend(proto_sync.errors)
+
     summary = {
         "namespace": namespace,
         "namespace_name": namespace_name,
@@ -187,5 +194,6 @@ def validate_registry_data(registry: dict) -> ValidationResult:
         "operations": len(op_names),
         "required_properties": len(REQUIRED_STANDARD_PROPERTIES),
         "required_enums": len(REQUIRED_ENUM_VALUES),
+        "proto_sync": "verified" if check_proto and not errors else "skipped",
     }
     return ValidationResult(errors=errors, summary=summary)

@@ -4,6 +4,14 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
+    if std::env::var("SRUI_WRITE_FIXTURES").as_deref() != Ok("1") {
+        eprintln!(
+            "Refusing to overwrite conformance vectors.\n\
+             Set SRUI_WRITE_FIXTURES=1 if you intentionally need to regenerate golden bytes."
+        );
+        std::process::exit(1);
+    }
+
     let out_dir = Path::new("../../protocol/conformance-vectors");
     fs::create_dir_all(out_dir).expect("create conformance-vectors dir");
 

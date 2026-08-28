@@ -368,7 +368,8 @@ properties:
     description: "Selection mode for collections (none, single, multiple)"
 
 enums:
-  - name: TextRole
+  - id: 1
+    name: TextRole
     description: "Semantic intent and hierarchy for text display (§7.5)"
     values:
       - id: 1
@@ -396,7 +397,8 @@ enums:
         name: error
         description: "Error message text"
 
-  - name: ActionRole
+  - id: 2
+    name: ActionRole
     description: "Semantic intent and prominence for interactive actions (§7.5)"
     values:
       - id: 1
@@ -412,7 +414,8 @@ enums:
         name: quiet
         description: "Subtle or borderless action"
 
-  - name: InputRole
+  - id: 3
+    name: InputRole
     description: "Semantic behavior and security intent for text input fields (§7.5)"
     values:
       - id: 1
@@ -428,7 +431,8 @@ enums:
         name: command
         description: "Command or shell prompt input field"
 
-  - name: Importance
+  - id: 4
+    name: Importance
     description: "Semantic emphasis level for widgets (§7.5)"
     values:
       - id: 1
@@ -441,7 +445,8 @@ enums:
         name: de_emphasized
         description: "Diminished or muted visual prominence"
 
-  - name: TogglePresentationHint
+  - id: 5
+    name: TogglePresentationHint
     description: "Advisory presentation style for Toggle controls (§7.2)"
     values:
       - id: 1
@@ -454,7 +459,8 @@ enums:
         name: switch
         description: "Prefer a toggle switch appearance"
 
-  - name: Visibility
+  - id: 6
+    name: Visibility
     description: "Visibility and layout participation state (§7.4)"
     values:
       - id: 1
@@ -467,7 +473,8 @@ enums:
         name: collapsed
         description: "Invisible and removed from layout calculation"
 
-  - name: SpacingRole
+  - id: 7
+    name: SpacingRole
     description: "Semantic inter-item layout spacing (§7.4)"
     values:
       - id: 1
@@ -483,7 +490,8 @@ enums:
         name: relaxed
         description: "Generous or spacious inter-item spacing"
 
-  - name: PaddingRole
+  - id: 8
+    name: PaddingRole
     description: "Semantic container padding (§7.4)"
     values:
       - id: 1
@@ -499,7 +507,8 @@ enums:
         name: relaxed
         description: "Generous container padding"
 
-  - name: HorizontalAlignment
+  - id: 9
+    name: HorizontalAlignment
     description: "Horizontal alignment options within layout containers (§7.4)"
     values:
       - id: 1
@@ -515,7 +524,8 @@ enums:
         name: fill
         description: "Stretches to fill available horizontal space"
 
-  - name: VerticalAlignment
+  - id: 10
+    name: VerticalAlignment
     description: "Vertical alignment options within layout containers (§7.4)"
     values:
       - id: 1
@@ -531,7 +541,8 @@ enums:
         name: fill
         description: "Stretches to fill available vertical space"
 
-  - name: SelectionMode
+  - id: 11
+    name: SelectionMode
     description: "Item selection mode for collection views (§8)"
     values:
       - id: 1
@@ -544,7 +555,8 @@ enums:
         name: multiple
         description: "Multiple items may be selected concurrently"
 
-  - name: ValidationState
+  - id: 12
+    name: ValidationState
     description: "Form and control validation state (§7.4)"
     values:
       - id: 1
@@ -640,7 +652,7 @@ operations:
   - id: 5
     name: COMMIT
     category: required
-    description: "Atomically commit all preceding operations to advance to a new semantic revision"
+    description: "Atomically commit preceding operations to advance to a new semantic revision (expressed in Transaction envelope or as CommitOp wire variant tag 5)"
 
   # Standard Model Operations (§13)
   - id: 6

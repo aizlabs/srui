@@ -200,6 +200,22 @@ enum StandardEvent {
   EVENT_POINTER_SCROLL = 11;
 }
 
+enum StandardEnum {
+  ENUM_UNSPECIFIED = 0;
+  ENUM_TEXT_ROLE = 1;
+  ENUM_ACTION_ROLE = 2;
+  ENUM_INPUT_ROLE = 3;
+  ENUM_IMPORTANCE = 4;
+  ENUM_TOGGLE_PRESENTATION_HINT = 5;
+  ENUM_VISIBILITY = 6;
+  ENUM_SPACING_ROLE = 7;
+  ENUM_PADDING_ROLE = 8;
+  ENUM_HORIZONTAL_ALIGNMENT = 9;
+  ENUM_VERTICAL_ALIGNMENT = 10;
+  ENUM_SELECTION_MODE = 11;
+  ENUM_VALIDATION_STATE = 12;
+}
+
 enum StandardOperation {
   OPERATION_UNSPECIFIED = 0;
   // Required Core Operations (§13)
@@ -239,6 +255,7 @@ enum NullValue {
 }
 
 message EnumValue {
+  // enum_id is the registry enum type id (protocol/registry.yaml enums[].id).
   uint32 enum_id = 1;
   uint32 value_id = 2;
 }
@@ -343,26 +360,8 @@ message ClearPropertyOp {
   PropertyRef property = 2;
 }
 
-message MoveNodeOp {
-  uint64 node_id = 1;
-  uint64 new_parent_id = 2;
-  uint32 new_child_index = 3;
-}
-
-message ReorderChildrenOp {
-  uint64 parent_id = 1;
-  repeated uint64 child_node_ids = 2;
-}
-
-message BatchPropertySetOp {
-  uint64 node_id = 1;
-  repeated Property properties = 2;
-}
-
-message ModelItem {
-  uint64 item_id = 1;
-  Value value = 2;
-  repeated Property properties = 3;
+message CommitOp {
+  uint64 revision = 1;
 }
 
 message CreateModelOp {
@@ -397,20 +396,44 @@ message ModelResetRangeOp {
   uint64 total_count = 4;
 }
 
+message MoveNodeOp {
+  uint64 node_id = 1;
+  uint64 new_parent_id = 2;
+  uint32 new_child_index = 3;
+}
+
+message ReorderChildrenOp {
+  uint64 parent_id = 1;
+  repeated uint64 child_node_ids = 2;
+}
+
+message BatchPropertySetOp {
+  uint64 node_id = 1;
+  repeated Property properties = 2;
+}
+
+message ModelItem {
+  uint64 item_id = 1;
+  Value value = 2;
+  repeated Property properties = 3;
+}
+
 message Operation {
+  // Wire variants matching registry operation IDs 1..13 1:1.
   oneof op {
     CreateNodeOp create_node = 1;
     DeleteNodeOp delete_node = 2;
     SetPropertyOp set_property = 3;
     ClearPropertyOp clear_property = 4;
-    MoveNodeOp move_node = 5;
-    ReorderChildrenOp reorder_children = 6;
-    BatchPropertySetOp batch_property_set = 7;
-    CreateModelOp create_model = 8;
-    ModelInsertOp model_insert = 9;
-    ModelDeleteOp model_delete = 10;
-    ModelUpdateOp model_update = 11;
-    ModelResetRangeOp model_reset_range = 12;
+    CommitOp commit = 5;
+    CreateModelOp create_model = 6;
+    ModelInsertOp model_insert = 7;
+    ModelDeleteOp model_delete = 8;
+    ModelUpdateOp model_update = 9;
+    ModelResetRangeOp model_reset_range = 10;
+    MoveNodeOp move_node = 11;
+    ReorderChildrenOp reorder_children = 12;
+    BatchPropertySetOp batch_property_set = 13;
   }
 }
 
@@ -419,6 +442,8 @@ message Operation {
 // -----------------------------------------------------------------------------
 
 message Transaction {
+  // Atomic commit boundary: operations apply atomically when advancing from
+  // base_revision to new_revision. This envelope is the wire commit (§12, §13).
   uint64 base_revision = 1;
   uint64 new_revision = 2;
   repeated Operation operations = 3;

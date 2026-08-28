@@ -83,6 +83,10 @@ def validate_enum_entry(entry: dict, errors: list[str]) -> None:
     enum_name = entry.get("name", "<unknown>")
     _require_string_field(entry, "description", "enums", enum_name, errors)
 
+    enum_id = entry.get("id")
+    if enum_id is None:
+        errors.append(f"[enums] Enum '{enum_name}' is missing enum type 'id'.")
+
     values = entry.get("values", [])
     if not isinstance(values, list):
         errors.append(f"[enums] Enum '{enum_name}' values must be a list.")

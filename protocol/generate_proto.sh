@@ -42,7 +42,8 @@ else
     else
         echo "Building protoc-gen-swift from client-macos dependencies..."
         swift build --package-path "${REPO_ROOT}/client-macos/.build/checkouts/swift-protobuf" --product protoc-gen-swift -c release
-        PLUGIN_BIN="${REPO_ROOT}/client-macos/.build/checkouts/swift-protobuf/.build/arm64-apple-macosx/release/protoc-gen-swift"
+        ARCH="$(uname -m)"
+        PLUGIN_BIN="${REPO_ROOT}/client-macos/.build/checkouts/swift-protobuf/.build/${ARCH}-apple-macosx/release/protoc-gen-swift"
     fi
 fi
 echo "Using protoc-gen-swift: ${PLUGIN_BIN}"

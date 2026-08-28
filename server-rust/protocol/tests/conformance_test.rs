@@ -128,3 +128,31 @@ fn test_decode_golden_transaction() {
         other => panic!("Expected BatchPropertySet op, got {:?}", other),
     }
 }
+
+#[test]
+fn test_golden_node_record_encode_roundtrip() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = Path::new(manifest_dir)
+        .join("../../protocol/conformance-vectors/golden_node_record.bin");
+    let bytes = fs::read(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to read golden_node_record.bin from {:?}: {}", fixture_path, e));
+
+    let node = NodeRecord::decode(&bytes[..]).expect("decode golden NodeRecord");
+    let mut encoded = Vec::new();
+    node.encode(&mut encoded).expect("encode NodeRecord");
+    assert_eq!(encoded, bytes, "prost re-encode must match committed golden bytes");
+}
+
+#[test]
+fn test_golden_transaction_encode_roundtrip() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let fixture_path = Path::new(manifest_dir)
+        .join("../../protocol/conformance-vectors/golden_transaction.bin");
+    let bytes = fs::read(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to read golden_transaction.bin from {:?}: {}", fixture_path, e));
+
+    let tx = Transaction::decode(&bytes[..]).expect("decode golden Transaction");
+    let mut encoded = Vec::new();
+    tx.encode(&mut encoded).expect("encode Transaction");
+    assert_eq!(encoded, bytes, "prost re-encode must match committed golden bytes");
+}

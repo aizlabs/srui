@@ -446,6 +446,10 @@ version = "0.1.0"
 [[package]]
 name = "srui-sdk"
 version = "0.1.0"
+dependencies = [
+ "srui-protocol",
+ "srui-semantic-tree",
+]
 
 [[package]]
 name = "srui-semantic-tree"

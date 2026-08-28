@@ -6,11 +6,13 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["rt", "io-util", "sync", "macros", "net", "signal"] }
-tokio-util = { workspace = true, features = ["codec"] }
-bytes.workspace = true
-futures.workspace = true
+tokio-util = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-srui-protocol = { path = "../protocol", features = ["async-codec"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }
+tokio-util = { workspace = true, features = ["codec"] }
+futures.workspace = true
+srui-protocol = { path = "../protocol", features = ["async-codec"] }

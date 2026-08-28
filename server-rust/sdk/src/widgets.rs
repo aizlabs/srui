@@ -14,6 +14,8 @@
 
 use srui_semantic_tree::EnumToken;
 
+use crate::StoreMut;
+
 pub use srui_semantic_tree::{
     ItemId, ModelId, Node, NodeId, Operation, PropertyRef, ResourceHash,
     SemanticStore, Size, StoreError, TypeRef, Value,
@@ -62,7 +64,7 @@ pub trait Widget: Copy + Clone + PartialEq + Eq + std::hash::Hash + std::fmt::De
     }
 
     /// Deletes this widget and all its descendants from the store (§13 DELETE_NODE).
-    fn delete(&self, store: &mut SemanticStore) -> Result<Vec<NodeId>, StoreError> {
+    fn delete(&self, store: &mut impl StoreMut) -> Result<Vec<NodeId>, StoreError> {
         store.delete_node(self.id())
     }
 
@@ -198,7 +200,7 @@ macro_rules! impl_widget_boilerplate {
             }
 
             #[inline]
-            pub fn create(self, store: &mut SemanticStore) -> Result<$widget, StoreError> {
+            pub fn create(self, store: &mut impl StoreMut) -> Result<$widget, StoreError> {
                 store.create_node(
                     self.id,
                     $widget::NODE_TYPE,
@@ -240,13 +242,13 @@ macro_rules! impl_string_prop {
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on this widget in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter(&self, store: &mut SemanticStore, value: impl Into<String>) -> Result<Option<Value>, StoreError> {
+            pub fn $setter(&self, store: &mut impl StoreMut, value: impl Into<String>) -> Result<Option<Value>, StoreError> {
                 Self::$setter_for(store, self.id, value)
             }
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on the given node in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter_for(store: &mut SemanticStore, id: NodeId, value: impl Into<String>) -> Result<Option<Value>, StoreError> {
+            pub fn $setter_for(store: &mut impl StoreMut, id: NodeId, value: impl Into<String>) -> Result<Option<Value>, StoreError> {
                 store.set_property(id, $prop_ref, Value::String(value.into()))
             }
 
@@ -264,13 +266,13 @@ macro_rules! impl_string_prop {
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on this widget in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+            pub fn $clear(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
                 Self::$clear_for(store, self.id)
             }
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on the given node in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+            pub fn $clear_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
                 store.clear_property(id, $prop_ref)
             }
 
@@ -340,13 +342,13 @@ macro_rules! impl_bool_prop {
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on this widget in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter(&self, store: &mut SemanticStore, value: bool) -> Result<Option<Value>, StoreError> {
+            pub fn $setter(&self, store: &mut impl StoreMut, value: bool) -> Result<Option<Value>, StoreError> {
                 Self::$setter_for(store, self.id, value)
             }
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on the given node in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter_for(store: &mut SemanticStore, id: NodeId, value: bool) -> Result<Option<Value>, StoreError> {
+            pub fn $setter_for(store: &mut impl StoreMut, id: NodeId, value: bool) -> Result<Option<Value>, StoreError> {
                 store.set_property(id, $prop_ref, Value::Bool(value))
             }
 
@@ -364,13 +366,13 @@ macro_rules! impl_bool_prop {
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on this widget in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+            pub fn $clear(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
                 Self::$clear_for(store, self.id)
             }
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on the given node in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+            pub fn $clear_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
                 store.clear_property(id, $prop_ref)
             }
 
@@ -424,13 +426,13 @@ macro_rules! impl_enum_prop {
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on this widget in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter(&self, store: &mut SemanticStore, value: $enum_type) -> Result<Option<Value>, StoreError> {
+            pub fn $setter(&self, store: &mut impl StoreMut, value: $enum_type) -> Result<Option<Value>, StoreError> {
                 Self::$setter_for(store, self.id, value)
             }
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on the given node in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter_for(store: &mut SemanticStore, id: NodeId, value: $enum_type) -> Result<Option<Value>, StoreError> {
+            pub fn $setter_for(store: &mut impl StoreMut, id: NodeId, value: $enum_type) -> Result<Option<Value>, StoreError> {
                 store.set_property(id, $prop_ref, Value::EnumToken(EnumToken::from(value)))
             }
 
@@ -448,13 +450,13 @@ macro_rules! impl_enum_prop {
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on this widget in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+            pub fn $clear(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
                 Self::$clear_for(store, self.id)
             }
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on the given node in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+            pub fn $clear_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
                 store.clear_property(id, $prop_ref)
             }
 
@@ -506,13 +508,13 @@ macro_rules! impl_f64_prop {
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on this widget in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter(&self, store: &mut SemanticStore, value: f64) -> Result<Option<Value>, StoreError> {
+            pub fn $setter(&self, store: &mut impl StoreMut, value: f64) -> Result<Option<Value>, StoreError> {
                 Self::$setter_for(store, self.id, value)
             }
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on the given node in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter_for(store: &mut SemanticStore, id: NodeId, value: f64) -> Result<Option<Value>, StoreError> {
+            pub fn $setter_for(store: &mut impl StoreMut, id: NodeId, value: f64) -> Result<Option<Value>, StoreError> {
                 store.set_property(id, $prop_ref, Value::Float64(value))
             }
 
@@ -530,13 +532,13 @@ macro_rules! impl_f64_prop {
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on this widget in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+            pub fn $clear(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
                 Self::$clear_for(store, self.id)
             }
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on the given node in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+            pub fn $clear_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
                 store.clear_property(id, $prop_ref)
             }
 
@@ -588,13 +590,13 @@ macro_rules! impl_size_prop {
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on this widget in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter(&self, store: &mut SemanticStore, value: Size) -> Result<Option<Value>, StoreError> {
+            pub fn $setter(&self, store: &mut impl StoreMut, value: Size) -> Result<Option<Value>, StoreError> {
                 Self::$setter_for(store, self.id, value)
             }
 
             #[doc = concat!("Sets the `", stringify!($getter), "` property on the given node in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter_for(store: &mut SemanticStore, id: NodeId, value: Size) -> Result<Option<Value>, StoreError> {
+            pub fn $setter_for(store: &mut impl StoreMut, id: NodeId, value: Size) -> Result<Option<Value>, StoreError> {
                 store.set_property(id, $prop_ref, Value::Size(value))
             }
 
@@ -612,13 +614,13 @@ macro_rules! impl_size_prop {
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on this widget in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+            pub fn $clear(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
                 Self::$clear_for(store, self.id)
             }
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on the given node in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+            pub fn $clear_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
                 store.clear_property(id, $prop_ref)
             }
 
@@ -671,13 +673,13 @@ macro_rules! impl_list_prop {
 
             #[doc = concat!("Sets the `", stringify!($getter), "` list property on this widget in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter(&self, store: &mut SemanticStore, value: impl IntoIterator<Item = impl Into<Value>>) -> Result<Option<Value>, StoreError> {
+            pub fn $setter(&self, store: &mut impl StoreMut, value: impl IntoIterator<Item = impl Into<Value>>) -> Result<Option<Value>, StoreError> {
                 Self::$setter_for(store, self.id, value)
             }
 
             #[doc = concat!("Sets the `", stringify!($getter), "` list property on the given node in `store` (§13 SET_PROPERTY).")]
             #[inline]
-            pub fn $setter_for(store: &mut SemanticStore, id: NodeId, value: impl IntoIterator<Item = impl Into<Value>>) -> Result<Option<Value>, StoreError> {
+            pub fn $setter_for(store: &mut impl StoreMut, id: NodeId, value: impl IntoIterator<Item = impl Into<Value>>) -> Result<Option<Value>, StoreError> {
                 store.set_property(id, $prop_ref, Value::List(value.into_iter().map(Into::into).collect()))
             }
 
@@ -695,13 +697,13 @@ macro_rules! impl_list_prop {
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on this widget in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+            pub fn $clear(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
                 Self::$clear_for(store, self.id)
             }
 
             #[doc = concat!("Clears the `", stringify!($getter), "` property on the given node in `store` (§13 CLEAR_PROPERTY).")]
             #[inline]
-            pub fn $clear_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+            pub fn $clear_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
                 store.clear_property(id, $prop_ref)
             }
 
@@ -753,13 +755,13 @@ macro_rules! impl_model_ref_prop {
 
             #[doc = "Sets the `model_ref` property on this widget in `store` (§13 SET_PROPERTY, §8)."]
             #[inline]
-            pub fn set_model_ref(&self, store: &mut SemanticStore, model_id: impl Into<ModelId>) -> Result<Option<Value>, StoreError> {
+            pub fn set_model_ref(&self, store: &mut impl StoreMut, model_id: impl Into<ModelId>) -> Result<Option<Value>, StoreError> {
                 Self::set_model_ref_for(store, self.id, model_id)
             }
 
             #[doc = "Sets the `model_ref` property on the given node in `store` (§13 SET_PROPERTY, §8)."]
             #[inline]
-            pub fn set_model_ref_for(store: &mut SemanticStore, id: NodeId, model_id: impl Into<ModelId>) -> Result<Option<Value>, StoreError> {
+            pub fn set_model_ref_for(store: &mut impl StoreMut, id: NodeId, model_id: impl Into<ModelId>) -> Result<Option<Value>, StoreError> {
                 let mid = model_id.into();
                 store.set_property(id, PropertyRef::MODEL_REF, Value::UnsignedInt(mid.get()))
             }
@@ -779,13 +781,13 @@ macro_rules! impl_model_ref_prop {
 
             #[doc = "Clears the `model_ref` property on this widget in `store` (§13 CLEAR_PROPERTY)."]
             #[inline]
-            pub fn clear_model_ref(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+            pub fn clear_model_ref(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
                 Self::clear_model_ref_for(store, self.id)
             }
 
             #[doc = "Clears the `model_ref` property on the given node in `store` (§13 CLEAR_PROPERTY)."]
             #[inline]
-            pub fn clear_model_ref_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+            pub fn clear_model_ref_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
                 store.clear_property(id, PropertyRef::MODEL_REF)
             }
 
@@ -1131,13 +1133,13 @@ impl Image {
 
     #[doc = "Sets the `resource` property on this widget in `store` (§13 SET_PROPERTY, §14)."]
     #[inline]
-    pub fn set_resource(&self, store: &mut SemanticStore, hash: impl Into<ResourceHash>) -> Result<Option<Value>, StoreError> {
+    pub fn set_resource(&self, store: &mut impl StoreMut, hash: impl Into<ResourceHash>) -> Result<Option<Value>, StoreError> {
         Self::set_resource_for(store, self.id, hash)
     }
 
     #[doc = "Sets the `resource` property on the given node in `store` (§13 SET_PROPERTY, §14)."]
     #[inline]
-    pub fn set_resource_for(store: &mut SemanticStore, id: NodeId, hash: impl Into<ResourceHash>) -> Result<Option<Value>, StoreError> {
+    pub fn set_resource_for(store: &mut impl StoreMut, id: NodeId, hash: impl Into<ResourceHash>) -> Result<Option<Value>, StoreError> {
         store.set_property(id, PropertyRef::RESOURCE, Value::ResourceHash(hash.into()))
     }
 
@@ -1155,13 +1157,13 @@ impl Image {
 
     #[doc = "Clears the `resource` property on this widget in `store` (§13 CLEAR_PROPERTY)."]
     #[inline]
-    pub fn clear_resource(&self, store: &mut SemanticStore) -> Result<Option<Value>, StoreError> {
+    pub fn clear_resource(&self, store: &mut impl StoreMut) -> Result<Option<Value>, StoreError> {
         Self::clear_resource_for(store, self.id)
     }
 
     #[doc = "Clears the `resource` property on the given node in `store` (§13 CLEAR_PROPERTY)."]
     #[inline]
-    pub fn clear_resource_for(store: &mut SemanticStore, id: NodeId) -> Result<Option<Value>, StoreError> {
+    pub fn clear_resource_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
         store.clear_property(id, PropertyRef::RESOURCE)
     }
 

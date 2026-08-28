@@ -717,7 +717,6 @@ dependencies = [
 name = "srui-ssh-bridge"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "futures",
  "srui-protocol",
  "thiserror",

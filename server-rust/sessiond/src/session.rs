@@ -511,6 +511,36 @@ mod tests {
     }
 
     #[test]
+    fn test_session_transaction_records_widget_builder_operations() {
+        use srui_sdk::{NodeId, Surface};
+
+        let session = Session::new("widget-ops-test");
+        session
+            .transaction(|ui| {
+                Surface::builder(1).label("Counter Application").create(ui)?;
+                Ok(())
+            })
+            .expect("widget builder transaction");
+
+        let replayed = session
+            .collect_replayed_transactions(0)
+            .expect("journal replay available");
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].base_revision, 0);
+        assert_eq!(replayed[0].new_revision, 1);
+        assert_eq!(
+            replayed[0].operations.len(),
+            1,
+            "widget builder mutations must be recorded as wire operations"
+        );
+
+        session.with_store(|store| {
+            let surface = Surface::from_store(store, NodeId::new(1)).expect("surface exists");
+            assert_eq!(surface.label(store), Some("Counter Application"));
+        });
+    }
+
+    #[test]
     fn test_getters_survive_poisoned_lock() {
         let session = Session::new("poison-test");
         session.poison_lock_for_test();

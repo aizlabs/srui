@@ -18,7 +18,7 @@
 //!   execute nested transactions (`session.transaction(...)`) or dispatch further events without risk of deadlock.
 
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use srui_semantic_tree::{
@@ -59,12 +59,81 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Mutation surface shared by [`SemanticStore`] and transactional [`UiTransaction`] (§12.1, §13).
+///
+/// Typed widget builders and setters accept `&mut impl StoreMut` so mutations routed through
+/// [`UiTransaction`] record [`Operation`]s for wire encoding, while direct store access remains
+/// available for non-transactional tests and tooling.
+pub trait StoreMut {
+    /// Creates a node in the graph (§13 CREATE_NODE).
+    fn create_node(
+        &mut self,
+        id: NodeId,
+        node_type: TypeRef,
+        parent_id: Option<NodeId>,
+        child_index: Option<usize>,
+        properties: impl IntoIterator<Item = (PropertyRef, Value)>,
+    ) -> Result<(), StoreError>;
+
+    /// Sets a property on a node (§13 SET_PROPERTY).
+    fn set_property(
+        &mut self,
+        node: NodeId,
+        prop: PropertyRef,
+        val: Value,
+    ) -> Result<Option<Value>, StoreError>;
+
+    /// Clears a property from a node (§13 CLEAR_PROPERTY).
+    fn clear_property(
+        &mut self,
+        node: NodeId,
+        prop: PropertyRef,
+    ) -> Result<Option<Value>, StoreError>;
+
+    /// Deletes a node and its descendants (§13 DELETE_NODE).
+    fn delete_node(&mut self, node: NodeId) -> Result<Vec<NodeId>, StoreError>;
+}
+
+impl StoreMut for SemanticStore {
+    fn create_node(
+        &mut self,
+        id: NodeId,
+        node_type: TypeRef,
+        parent_id: Option<NodeId>,
+        child_index: Option<usize>,
+        properties: impl IntoIterator<Item = (PropertyRef, Value)>,
+    ) -> Result<(), StoreError> {
+        SemanticStore::create_node(self, id, node_type, parent_id, child_index, properties)
+    }
+
+    fn set_property(
+        &mut self,
+        node: NodeId,
+        prop: PropertyRef,
+        val: Value,
+    ) -> Result<Option<Value>, StoreError> {
+        SemanticStore::set_property(self, node, prop, val)
+    }
+
+    fn clear_property(
+        &mut self,
+        node: NodeId,
+        prop: PropertyRef,
+    ) -> Result<Option<Value>, StoreError> {
+        SemanticStore::clear_property(self, node, prop)
+    }
+
+    fn delete_node(&mut self, node: NodeId) -> Result<Vec<NodeId>, StoreError> {
+        SemanticStore::delete_node(self, node)
+    }
+}
+
 /// Transactional UI context passed into [`Session::transaction`] closures (§12.1, §29).
 ///
 /// `UiTransaction` wraps a speculative staging copy of the [`SemanticStore`].
-/// Because it implements [`Deref<Target = SemanticStore>`] and [`DerefMut<Target = SemanticStore>`],
-/// any typed widget builder or mutator (from Task 9's typed widget layer) can be called directly
-/// on `ui` (e.g. `Button::builder(id).create(ui)`, `btn.set_label(ui, "...")`).
+/// Because it implements [`Deref<Target = SemanticStore>`], read-only store queries
+/// (e.g. `ui.get_node(...)`) work directly. Mutations must go through [`StoreMut`] methods
+/// (including typed widget builders and setters) so operations are recorded for wire encoding.
 ///
 /// It also provides §29 convenience helpers such as [`UiTransaction::set`], [`UiTransaction::clear`],
 /// and [`UiTransaction::delete`].
@@ -141,11 +210,7 @@ impl UiTransaction {
         prop: PropertyRef,
         val: impl Into<Value>,
     ) -> Result<Option<Value>, StoreError> {
-        let node_id = node.into();
-        let value = val.into();
-        self.record_op()?;
-        self.operations.push(Operation::set_property(node_id, prop, value.clone()));
-        self.staged.set_property(node_id, prop, value)
+        StoreMut::set_property(self, node.into(), prop, val.into())
     }
 
     /// Clears a property from a node within the active transaction (§13 CLEAR_PROPERTY, §29).
@@ -154,10 +219,7 @@ impl UiTransaction {
         node: impl Into<NodeId>,
         prop: PropertyRef,
     ) -> Result<Option<Value>, StoreError> {
-        let node_id = node.into();
-        self.record_op()?;
-        self.operations.push(Operation::clear_property(node_id, prop));
-        self.staged.clear_property(node_id, prop)
+        StoreMut::clear_property(self, node.into(), prop)
     }
 
     /// Creates a new node in the graph within the active transaction (§13 CREATE_NODE).
@@ -169,26 +231,19 @@ impl UiTransaction {
         child_index: Option<usize>,
         properties: impl IntoIterator<Item = (PropertyRef, Value)>,
     ) -> Result<(), StoreError> {
-        let id = id.into();
-        let props: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
-        self.record_op()?;
-        self.operations.push(Operation::create_node(
-            id,
+        StoreMut::create_node(
+            self,
+            id.into(),
             node_type,
             parent_id,
             child_index,
-            props.clone(),
-        ));
-        self.staged
-            .create_node(id, node_type, parent_id, child_index, props)
+            properties,
+        )
     }
 
     /// Deletes a node and all of its descendants within the active transaction (§13 DELETE_NODE).
     pub fn delete(&mut self, node: impl Into<NodeId>) -> Result<Vec<NodeId>, StoreError> {
-        let node_id = node.into();
-        self.record_op()?;
-        self.operations.push(Operation::delete_node(node_id));
-        self.staged.delete_node(node_id)
+        StoreMut::delete_node(self, node.into())
     }
 
     /// Moves a node to a new parent and/or child index within the active transaction (§13 MOVE_NODE).
@@ -236,10 +291,54 @@ impl Deref for UiTransaction {
     }
 }
 
-impl DerefMut for UiTransaction {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.staged
+impl StoreMut for UiTransaction {
+    fn create_node(
+        &mut self,
+        id: NodeId,
+        node_type: TypeRef,
+        parent_id: Option<NodeId>,
+        child_index: Option<usize>,
+        properties: impl IntoIterator<Item = (PropertyRef, Value)>,
+    ) -> Result<(), StoreError> {
+        let props: Vec<(PropertyRef, Value)> = properties.into_iter().collect();
+        self.record_op()?;
+        self.operations.push(Operation::create_node(
+            id,
+            node_type,
+            parent_id,
+            child_index,
+            props.clone(),
+        ));
+        self.staged
+            .create_node(id, node_type, parent_id, child_index, props)
+    }
+
+    fn set_property(
+        &mut self,
+        node: NodeId,
+        prop: PropertyRef,
+        val: Value,
+    ) -> Result<Option<Value>, StoreError> {
+        self.record_op()?;
+        self.operations
+            .push(Operation::set_property(node, prop, val.clone()));
+        self.staged.set_property(node, prop, val)
+    }
+
+    fn clear_property(
+        &mut self,
+        node: NodeId,
+        prop: PropertyRef,
+    ) -> Result<Option<Value>, StoreError> {
+        self.record_op()?;
+        self.operations.push(Operation::clear_property(node, prop));
+        self.staged.clear_property(node, prop)
+    }
+
+    fn delete_node(&mut self, node: NodeId) -> Result<Vec<NodeId>, StoreError> {
+        self.record_op()?;
+        self.operations.push(Operation::delete_node(node));
+        self.staged.delete_node(node)
     }
 }
 

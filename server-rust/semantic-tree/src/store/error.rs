@@ -153,3 +153,33 @@ impl fmt::Display for StoreError {
 }
 
 impl std::error::Error for StoreError {}
+
+impl StoreError {
+    /// Returns the canonical conformance error code for this store error (§32).
+    pub fn conformance_code(&self) -> &'static str {
+        match self {
+            Self::NodeIdAlreadyUsed(_) => "node_id_already_used",
+            Self::NodeNotFound(_) => "node_not_found",
+            Self::ParentNotFound(_) => "parent_not_found",
+            Self::InvalidChildrenReorder { .. } => "invalid_children_reorder",
+            Self::CycleDetected { .. } => "cycle_detected",
+            Self::MaxTreeDepthExceeded { .. } => "max_tree_depth_exceeded",
+            Self::MaxNodeCountExceeded { .. } => "max_node_count_exceeded",
+            Self::MaxStringLengthExceeded { .. } => "max_string_length_exceeded",
+            Self::MaxValueDepthExceeded { .. } => "max_value_depth_exceeded",
+            Self::MaxListLengthExceeded { .. } => "max_list_length_exceeded",
+            Self::MaxRecordPropertiesExceeded { .. } => "max_record_properties_exceeded",
+            Self::MaxModelCountExceeded { .. } => "max_model_count_exceeded",
+            Self::MaxCachedItemsPerModelExceeded { .. } => "max_cached_items_per_model_exceeded",
+            Self::MaxItemsPerModelOperationExceeded { .. } => "max_items_per_model_operation_exceeded",
+            Self::InvalidModelDelete(_) => "invalid_model_delete",
+            Self::ChildIndexOutOfBounds { .. } => "child_index_out_of_bounds",
+            Self::ModelIdAlreadyUsed(_) => "model_id_already_used",
+            Self::ModelNotFound(_) => "model_not_found",
+            Self::ItemNotFound(_) => "item_not_found",
+            Self::ModelIndexOutOfBounds { .. } => "model_index_out_of_bounds",
+            Self::DuplicateItemId { .. } => "duplicate_item_id",
+            Self::OperationError(_) => "operation_error",
+        }
+    }
+}

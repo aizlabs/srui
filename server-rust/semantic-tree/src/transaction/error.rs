@@ -58,3 +58,16 @@ impl fmt::Display for TxnError {
 }
 
 impl std::error::Error for TxnError {}
+
+impl TxnError {
+    /// Returns the canonical conformance error code for this transaction error, if applicable (§32).
+    pub fn conformance_code(&self) -> Option<&'static str> {
+        match self {
+            Self::StaleBaseRevision { .. } => Some("stale_base_revision"),
+            Self::InvalidNewRevision { .. } => Some("invalid_new_revision"),
+            Self::MaxOperationsExceeded { .. } => Some("max_operations_exceeded"),
+            Self::OpFailed { source, .. } => Some(source.conformance_code()),
+            Self::WireError(_) => None,
+        }
+    }
+}

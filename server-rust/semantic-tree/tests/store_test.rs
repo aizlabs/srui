@@ -673,6 +673,49 @@ fn test_apply_protobuf_wire_operations() {
 }
 
 #[test]
+fn test_wire_create_root_nodes_preserve_explicit_child_index() {
+    let mut store = SemanticStore::new();
+
+    // Second root inserted at index 0 (prepend)
+    let root_b = srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::CreateNode(
+            srui_protocol::CreateNodeOp {
+                node: Some(srui_protocol::NodeRecord {
+                    node_id: 2,
+                    r#type: Some(TypeRef::SURFACE.into()),
+                    parent_id: 0,
+                    child_index: 0,
+                    properties: vec![],
+                }),
+            },
+        )),
+    };
+    store.apply_operation(&root_b).expect("create root B at index 0");
+
+    // First root appended at index 1
+    let root_a = srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::CreateNode(
+            srui_protocol::CreateNodeOp {
+                node: Some(srui_protocol::NodeRecord {
+                    node_id: 1,
+                    r#type: Some(TypeRef::SURFACE.into()),
+                    parent_id: 0,
+                    child_index: 1,
+                    properties: vec![],
+                }),
+            },
+        )),
+    };
+    store.apply_operation(&root_a).expect("create root A at index 1");
+
+    assert_eq!(
+        store.root_ids(),
+        &[NodeId::new(2), NodeId::new(1)],
+        "wire root child_index must be preserved for multi-root ordering"
+    );
+}
+
+#[test]
 fn test_nested_value_depth_limit_enforced() {
     let limits = StoreLimits::with_tree_and_value_limits(64, 1000, 1024, 3, 100, 100);
     let mut store = SemanticStore::with_limits(limits);

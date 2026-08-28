@@ -38,3 +38,4 @@ See [`state-machine/README.md`](state-machine/README.md) for format specificatio
 | `12_reused_deleted_node_id_rejected.json` | `NodeId` cannot be reused even after deletion (§6.2) |
 | `13_sequential_transactions.json` | Monotonic sequential revisions (0 -> 1 -> 2 -> 3) (§12.1) |
 | `14_move_node_cycle_prevention.json` | Moving ancestor under descendant cycle prevention (§13) |
+| `15_invalid_new_revision_rejected.json` | `new_revision != base_revision + 1` rejection (§12.1) |

@@ -32,7 +32,7 @@ impl TryFrom<srui_protocol::Operation> for Operation {
                 } else {
                     Some(NodeId::new(rec.parent_id))
                 };
-                let child_index = if parent_id.is_none() || rec.child_index == u32::MAX {
+                let child_index = if rec.child_index == u32::MAX {
                     None
                 } else {
                     Some(rec.child_index as usize)
@@ -87,7 +87,7 @@ impl TryFrom<srui_protocol::Operation> for Operation {
                 } else {
                     Some(NodeId::new(move_op.new_parent_id))
                 };
-                let new_child_index = if new_parent_id.is_none() || move_op.new_child_index == u32::MAX {
+                let new_child_index = if move_op.new_child_index == u32::MAX {
                     None
                 } else {
                     Some(move_op.new_child_index as usize)

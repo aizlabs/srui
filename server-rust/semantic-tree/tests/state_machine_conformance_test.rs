@@ -159,32 +159,70 @@ fn resolve_type_ref(val: &JsonValue) -> TypeRef {
             .unwrap_or_else(|e| panic!("Unknown node type {}: {}", s, e)),
         JsonValue::Object(map) => {
             let ns = map.get("namespace_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let local = map.get("local_id").and_then(|v| v.as_u64()).unwrap() as u32;
+            let local = map
+                .get("local_id")
+                .and_then(|v| v.as_u64())
+                .expect("type_ref object missing numeric local_id field") as u32;
             TypeRef::new(ns, local)
         }
-        JsonValue::Number(n) => TypeRef::standard(n.as_u64().unwrap() as u32),
+        JsonValue::Number(n) => TypeRef::standard(
+            n.as_u64()
+                .expect("type_ref number must be a non-negative integer") as u32,
+        ),
         other => panic!("Invalid type_ref JSON: {:?}", other),
     }
 }
 
 fn resolve_property_ref(val: &JsonValue) -> PropertyRef {
     match val {
-        JsonValue::String(s) => resolve_standard_property(s)
-            .unwrap_or_else(|e| panic!("Unknown property {}: {}", s, e)),
+        JsonValue::String(s) => resolve_property_name(s),
         JsonValue::Object(map) => {
             let ns = map.get("namespace_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let local = map.get("local_id").and_then(|v| v.as_u64()).unwrap() as u32;
+            let local = map
+                .get("local_id")
+                .and_then(|v| v.as_u64())
+                .expect("property_ref object missing numeric local_id field") as u32;
             PropertyRef::new(ns, local)
         }
-        JsonValue::Number(n) => PropertyRef::standard(n.as_u64().unwrap() as u32),
+        JsonValue::Number(n) => PropertyRef::standard(
+            n.as_u64()
+                .expect("property_ref number must be a non-negative integer") as u32,
+        ),
         other => panic!("Invalid property_ref JSON: {:?}", other),
     }
 }
 
+fn resolve_property_name(name: &str) -> PropertyRef {
+    resolve_standard_property(name)
+        .unwrap_or_else(|e| panic!("Unknown property {}: {}", name, e))
+}
+
+fn lookup_enum_id(enum_name: &str) -> u32 {
+    lookup_enum_id_opt(enum_name).unwrap_or_else(|| panic!("Unknown standard enum: {}", enum_name))
+}
+
+fn lookup_enum_id_opt(enum_name: &str) -> Option<u32> {
+    if let Some(id) = lookup_standard_enum(enum_name) {
+        return Some(id);
+    }
+    const PREFIX: &str = "Enum";
+    if let Some(stripped) = enum_name.strip_prefix(PREFIX) {
+        return lookup_standard_enum(stripped);
+    }
+    let mut buf = [0u8; 80];
+    let combined_len = PREFIX.len() + enum_name.len();
+    if combined_len > buf.len() {
+        return None;
+    }
+    buf[..PREFIX.len()].copy_from_slice(PREFIX.as_bytes());
+    buf[PREFIX.len()..combined_len].copy_from_slice(enum_name.as_bytes());
+    std::str::from_utf8(&buf[..combined_len])
+        .ok()
+        .and_then(lookup_standard_enum)
+}
+
 fn resolve_enum_token(enum_name: &str, val_name: &str) -> EnumToken {
-    let enum_id = lookup_standard_enum(enum_name)
-        .or_else(|| lookup_standard_enum(&format!("Enum{}", enum_name)))
-        .unwrap_or_else(|| panic!("Unknown standard enum: {}", enum_name));
+    let enum_id = lookup_enum_id(enum_name);
 
     // Lookup value ID for the specific enum
     let val_id = match (enum_name, val_name) {
@@ -253,10 +291,10 @@ fn resolve_enum_token(enum_name: &str, val_name: &str) -> EnumToken {
     EnumToken::new(enum_id, val_id)
 }
 
-fn convert_value(val: &JsonValue) -> Value {
+fn convert_value(val: JsonValue) -> Value {
     match val {
         JsonValue::Null => Value::Null,
-        JsonValue::Bool(b) => Value::Bool(*b),
+        JsonValue::Bool(b) => Value::Bool(b),
         JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Value::SignedInt(i)
@@ -268,62 +306,97 @@ fn convert_value(val: &JsonValue) -> Value {
                 panic!("Invalid number: {:?}", n)
             }
         }
-        JsonValue::String(s) => Value::String(s.clone()),
+        JsonValue::String(s) => Value::String(s),
         JsonValue::Array(arr) => {
-            let list: Vec<Value> = arr.iter().map(convert_value).collect();
+            let list: Vec<Value> = arr.into_iter().map(convert_value).collect();
             Value::List(list)
         }
-        JsonValue::Object(map) => {
-            if let (Some(enum_val), Some(val_val)) = (map.get("enum"), map.get("value")) {
+        JsonValue::Object(mut map) => {
+            if let (Some(enum_val), Some(val_val)) = (map.remove("enum"), map.remove("value")) {
                 let enum_name = enum_val.as_str().expect("enum name string");
                 let val_name = val_val.as_str().expect("value name string");
                 Value::EnumToken(resolve_enum_token(enum_name, val_name))
-            } else if let (Some(enum_id), Some(val_id)) = (map.get("enum_id"), map.get("value_id")) {
+            } else if let (Some(enum_id), Some(val_id)) = (map.remove("enum_id"), map.remove("value_id")) {
                 Value::EnumToken(EnumToken::new(
-                    enum_id.as_u64().unwrap() as u32,
-                    val_id.as_u64().unwrap() as u32,
+                    enum_id
+                        .as_u64()
+                        .expect("enum_id must be a non-negative integer") as u32,
+                    val_id
+                        .as_u64()
+                        .expect("value_id must be a non-negative integer") as u32,
                 ))
-            } else if let Some(node_id) = map.get("node_id") {
-                Value::NodeId(NodeId::new(node_id.as_u64().unwrap()))
-            } else if let Some(item_id) = map.get("item_id") {
-                Value::ItemId(ItemId::new(item_id.as_u64().unwrap()))
-            } else if let Some(hash_str) = map.get("resource_hash") {
-                let hash = ResourceHash::from_hex(hash_str.as_str().unwrap())
-                    .expect("valid resource hash hex");
+            } else if let Some(node_id) = map.remove("node_id") {
+                Value::NodeId(NodeId::new(
+                    node_id
+                        .as_u64()
+                        .expect("node_id must be a non-negative integer"),
+                ))
+            } else if let Some(item_id) = map.remove("item_id") {
+                Value::ItemId(ItemId::new(
+                    item_id
+                        .as_u64()
+                        .expect("item_id must be a non-negative integer"),
+                ))
+            } else if let Some(hash_str) = map.remove("resource_hash") {
+                let hash = ResourceHash::from_hex(
+                    hash_str
+                        .as_str()
+                        .expect("resource_hash must be a hex string"),
+                )
+                .expect("valid resource hash hex");
                 Value::ResourceHash(hash)
-            } else if let (Some(w), Some(h)) = (map.get("width"), map.get("height")) {
-                Value::Size(Size::new(w.as_f64().unwrap(), h.as_f64().unwrap()))
-            } else if let (Some(x), Some(y), Some(w), Some(h)) =
-                (map.get("x"), map.get("y"), map.get("width"), map.get("height"))
-            {
+            } else if let (Some(w), Some(h)) = (map.remove("width"), map.remove("height")) {
+                Value::Size(Size::new(
+                    w.as_f64().expect("width must be a number"),
+                    h.as_f64().expect("height must be a number"),
+                ))
+            } else if let (Some(x), Some(y), Some(w), Some(h)) = (
+                map.remove("x"),
+                map.remove("y"),
+                map.remove("width"),
+                map.remove("height"),
+            ) {
                 Value::Rect(Rect::new(
-                    x.as_f64().unwrap(),
-                    y.as_f64().unwrap(),
-                    w.as_f64().unwrap(),
-                    h.as_f64().unwrap(),
+                    x.as_f64().expect("x must be a number"),
+                    y.as_f64().expect("y must be a number"),
+                    w.as_f64().expect("width must be a number"),
+                    h.as_f64().expect("height must be a number"),
                 ))
-            } else if let (Some(x), Some(y)) = (map.get("x"), map.get("y")) {
-                Value::Point(Point::new(x.as_f64().unwrap(), y.as_f64().unwrap()))
-            } else if let (Some(s), Some(l)) = (map.get("start"), map.get("length")) {
-                Value::Range(Range::new(s.as_u64().unwrap(), l.as_u64().unwrap()))
-            } else if let (Some(t), Some(lead), Some(b), Some(tr)) =
-                (map.get("top"), map.get("leading"), map.get("bottom"), map.get("trailing"))
-            {
+            } else if let (Some(x), Some(y)) = (map.remove("x"), map.remove("y")) {
+                Value::Point(Point::new(
+                    x.as_f64().expect("x must be a number"),
+                    y.as_f64().expect("y must be a number"),
+                ))
+            } else if let (Some(s), Some(l)) = (map.remove("start"), map.remove("length")) {
+                Value::Range(Range::new(
+                    s.as_u64().expect("start must be a non-negative integer"),
+                    l.as_u64().expect("length must be a non-negative integer"),
+                ))
+            } else if let (Some(t), Some(lead), Some(b), Some(tr)) = (
+                map.remove("top"),
+                map.remove("leading"),
+                map.remove("bottom"),
+                map.remove("trailing"),
+            ) {
                 Value::EdgeInsets(EdgeInsets::new(
-                    t.as_f64().unwrap(),
-                    lead.as_f64().unwrap(),
-                    b.as_f64().unwrap(),
-                    tr.as_f64().unwrap(),
+                    t.as_f64().expect("top must be a number"),
+                    lead.as_f64().expect("leading must be a number"),
+                    b.as_f64().expect("bottom must be a number"),
+                    tr.as_f64().expect("trailing must be a number"),
                 ))
-            } else if let (Some(rec_type), Some(props)) = (map.get("record_type"), map.get("properties")) {
-                let type_ref = resolve_type_ref(rec_type);
-                let prop_map = props.as_object().expect("record properties object");
-                let mut record_props = Vec::new();
-                for (k, v) in prop_map {
-                    let p_ref = resolve_property_ref(&JsonValue::String(k.clone()));
-                    record_props.push(Property::new(p_ref, convert_value(v)));
+            } else if let (Some(rec_type), Some(props)) = (map.remove("record_type"), map.remove("properties")) {
+                let type_ref = resolve_type_ref(&rec_type);
+                match props {
+                    JsonValue::Object(prop_map) => {
+                        let mut record_props = Vec::with_capacity(prop_map.len());
+                        for (k, v) in prop_map {
+                            let p_ref = resolve_property_name(&k);
+                            record_props.push(Property::new(p_ref, convert_value(v)));
+                        }
+                        Value::Record(SmallRecord::new(type_ref, record_props))
+                    }
+                    other => panic!("record properties must be an object, got {:?}", other),
                 }
-                Value::Record(SmallRecord::new(type_ref, record_props))
             } else {
                 panic!("Unrecognized structured value object in fixture: {:?}", map)
             }
@@ -331,54 +404,68 @@ fn convert_value(val: &JsonValue) -> Value {
     }
 }
 
-fn convert_properties(json_props: &Option<JsonValue>) -> Vec<(PropertyRef, Value)> {
-    let mut props = Vec::new();
-    if let Some(val) = json_props {
-        match val {
-            JsonValue::Object(map) => {
-                for (k, v) in map {
-                    let prop_ref = resolve_property_ref(&JsonValue::String(k.clone()));
-                    let prop_val = convert_value(v);
-                    props.push((prop_ref, prop_val));
-                }
+fn convert_properties(json_props: Option<JsonValue>) -> Vec<(PropertyRef, Value)> {
+    match json_props {
+        None => Vec::new(),
+        Some(JsonValue::Object(map)) => {
+            let mut props = Vec::with_capacity(map.len());
+            for (k, v) in map {
+                let prop_ref = resolve_property_name(&k);
+                props.push((prop_ref, convert_value(v)));
             }
-            JsonValue::Array(arr) => {
-                for item in arr {
-                    let prop_obj = item.as_object().expect("property item object");
-                    let prop_ref = resolve_property_ref(prop_obj.get("property").unwrap());
-                    let prop_val = convert_value(prop_obj.get("value").unwrap());
-                    props.push((prop_ref, prop_val));
-                }
-            }
-            _ => {}
+            props
         }
+        Some(JsonValue::Array(arr)) => {
+            let mut props = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    JsonValue::Object(mut prop_obj) => {
+                        let property = prop_obj
+                            .remove("property")
+                            .expect("property field in property item");
+                        let value = prop_obj
+                            .remove("value")
+                            .expect("value field in property item");
+                        let prop_ref = resolve_property_ref(&property);
+                        props.push((prop_ref, convert_value(value)));
+                    }
+                    other => panic!("property item must be an object, got {:?}", other),
+                }
+            }
+            props
+        }
+        Some(other) => panic!("Invalid properties JSON: {:?}", other),
     }
-    props
 }
 
-fn convert_model_item(item: &FixtureModelItem) -> ModelItem {
-    let item_id = ItemId::new(item.item_id);
-    let value = convert_value(&item.value);
-    let mut properties = HashMap::new();
-    for (k, v) in &item.properties {
-        let p_ref = resolve_property_ref(&JsonValue::String(k.clone()));
-        properties.insert(p_ref, convert_value(v));
+fn convert_model_item(item: FixtureModelItem) -> ModelItem {
+    let FixtureModelItem {
+        item_id,
+        value,
+        properties,
+    } = item;
+    let item_id = ItemId::new(item_id);
+    let value = convert_value(value);
+    let mut props_map = HashMap::with_capacity(properties.len());
+    for (k, v) in properties {
+        let p_ref = resolve_property_name(&k);
+        props_map.insert(p_ref, convert_value(v));
     }
     ModelItem {
         item_id,
         value,
-        properties,
+        properties: props_map,
     }
 }
 
-fn convert_operation(op: &FixtureOperation) -> Operation {
+fn convert_operation(op: FixtureOperation) -> Operation {
     match op.op_type.as_str() {
         "CREATE_NODE" => {
             let id = NodeId::new(op.node_id.expect("node_id for CREATE_NODE"));
             let node_type = resolve_type_ref(op.node_type.as_ref().expect("node_type for CREATE_NODE"));
             let parent_id = op.parent_id.flatten().map(NodeId::new);
             let child_index = op.child_index.flatten();
-            let properties = convert_properties(&op.properties);
+            let properties = convert_properties(op.properties);
             Operation::create_node(id, node_type, parent_id, child_index, properties)
         }
         "DELETE_NODE" => {
@@ -388,7 +475,7 @@ fn convert_operation(op: &FixtureOperation) -> Operation {
         "SET_PROPERTY" => {
             let id = NodeId::new(op.node_id.expect("node_id for SET_PROPERTY"));
             let property = resolve_property_ref(op.property.as_ref().expect("property for SET_PROPERTY"));
-            let value = convert_value(op.value.as_ref().expect("value for SET_PROPERTY"));
+            let value = convert_value(op.value.expect("value for SET_PROPERTY"));
             Operation::set_property(id, property, value)
         }
         "CLEAR_PROPERTY" => {
@@ -398,7 +485,7 @@ fn convert_operation(op: &FixtureOperation) -> Operation {
         }
         "BATCH_PROPERTY_SET" => {
             let id = NodeId::new(op.node_id.expect("node_id for BATCH_PROPERTY_SET"));
-            let properties = convert_properties(&op.properties);
+            let properties = convert_properties(op.properties);
             Operation::batch_property_set(id, properties)
         }
         "MOVE_NODE" => {
@@ -429,9 +516,8 @@ fn convert_operation(op: &FixtureOperation) -> Operation {
             let index = op.index.flatten().expect("index for MODEL_INSERT");
             let items: Vec<ModelItem> = op
                 .items
-                .as_ref()
                 .expect("items for MODEL_INSERT")
-                .iter()
+                .into_iter()
                 .map(convert_model_item)
                 .collect();
             Operation::model_insert(id, index, items)
@@ -442,9 +528,10 @@ fn convert_operation(op: &FixtureOperation) -> Operation {
             let count = op.count.flatten();
             let item_ids: Vec<ItemId> = op
                 .item_ids
-                .as_ref()
-                .map(|v| v.iter().map(|id| ItemId::new(*id)).collect())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .map(ItemId::new)
+                .collect();
             Operation::model_delete(id, index, count, item_ids)
         }
         "MODEL_UPDATE" => {
@@ -452,9 +539,8 @@ fn convert_operation(op: &FixtureOperation) -> Operation {
             let index = op.index.flatten();
             let items: Vec<ModelItem> = op
                 .items
-                .as_ref()
                 .expect("items for MODEL_UPDATE")
-                .iter()
+                .into_iter()
                 .map(convert_model_item)
                 .collect();
             Operation::model_update(id, index, items)
@@ -465,9 +551,8 @@ fn convert_operation(op: &FixtureOperation) -> Operation {
             let total_count = op.total_count.flatten();
             let items: Vec<ModelItem> = op
                 .items
-                .as_ref()
                 .expect("items for MODEL_RESET_RANGE")
-                .iter()
+                .into_iter()
                 .map(convert_model_item)
                 .collect();
             Operation::model_reset_range(id, start_index, items, total_count)
@@ -518,7 +603,7 @@ fn get_fixture_files() -> Vec<PathBuf> {
     let dir = Path::new(manifest_dir).join("../../protocol/conformance-vectors/state-machine");
     let mut files = Vec::new();
     for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("Failed to read dir {:?}: {}", dir, e)) {
-        let entry = entry.unwrap();
+        let entry = entry.unwrap_or_else(|e| panic!("Failed to read directory entry in {:?}: {}", dir, e));
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(path);
@@ -526,8 +611,8 @@ fn get_fixture_files() -> Vec<PathBuf> {
     }
     files.sort();
     assert!(
-        files.len() >= 14,
-        "Expected at least 14 conformance fixtures in {:?}, found {}",
+        files.len() >= 15,
+        "Expected at least 15 conformance fixtures in {:?}, found {}",
         dir,
         files.len()
     );
@@ -555,11 +640,10 @@ fn take_snapshot(store: &SemanticStore) -> StoreSnapshot {
     }
 
     let mut models = BTreeMap::new();
-    // Snapshot active models
-    for m_id in 1..=1000u64 {
-        if let Some(model) = store.get_model(ModelId::new(m_id)) {
+    for model_id in store.model_ids() {
+        if let Some(model) = store.get_model(model_id) {
             models.insert(
-                ModelId::new(m_id),
+                model_id,
                 (model.model_type, model.item_count, model.cached_item_count()),
             );
         }
@@ -600,7 +684,26 @@ fn collect_nodes_snapshot(
 // State-Machine Fixture Test Replayer
 // ==============================================================================
 
+fn apply_fixture_transaction(
+    store: &mut SemanticStore,
+    tx: FixtureTransaction,
+) -> Result<Revision, TxnError> {
+    let ops: Vec<Operation> = tx.operations.into_iter().map(convert_operation).collect();
+    let record = Transaction::with_revisions(
+        Revision::new(tx.base_revision),
+        Revision::new(tx.new_revision),
+        ops,
+        0,
+    );
+    store.apply_transaction_record(&record)
+}
+
 fn replay_fixture(path: &Path) {
+    let file_name = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("<unknown>");
+
     let text = fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("Failed to read fixture {:?}: {}", path, e));
     let fixture: Fixture = serde_json::from_str(&text)
@@ -611,22 +714,22 @@ fn replay_fixture(path: &Path) {
     let mut store = SemanticStore::with_limits_and_revision(limits, initial_rev);
 
     // 1. Replay setup transactions
-    for (idx, setup_tx) in fixture.setup_transactions.iter().enumerate() {
-        let ops: Vec<Operation> = setup_tx.operations.iter().map(convert_operation).collect();
-        let res = store.apply_transaction(setup_tx.base_revision, ops);
+    for (idx, setup_tx) in fixture.setup_transactions.into_iter().enumerate() {
+        let expected_revision = setup_tx.new_revision;
+        let res = apply_fixture_transaction(&mut store, setup_tx);
         assert!(
             res.is_ok(),
-            "Setup transaction #{} in {:?} failed unexpectedly: {:?}",
+            "Setup transaction #{} in {} failed unexpectedly: {:?}",
             idx,
-            path.file_name().unwrap(),
+            file_name,
             res.err()
         );
         assert_eq!(
             res.unwrap().get(),
-            setup_tx.new_revision,
-            "Setup transaction #{} revision mismatch in {:?}",
+            expected_revision,
+            "Setup transaction #{} revision mismatch in {}",
             idx,
-            path.file_name().unwrap()
+            file_name
         );
     }
 
@@ -634,17 +737,15 @@ fn replay_fixture(path: &Path) {
     let pre_snapshot = take_snapshot(&store);
 
     // 3. Replay target transaction under test
-    let target_tx = &fixture.transaction;
-    let target_ops: Vec<Operation> = target_tx.operations.iter().map(convert_operation).collect();
-    let result = store.apply_transaction(target_tx.base_revision, target_ops);
+    let result = apply_fixture_transaction(&mut store, fixture.transaction);
 
     // 4. Assert outcome
     match fixture.expected_outcome.status.as_str() {
         "success" => {
             assert!(
                 result.is_ok(),
-                "Transaction in {:?} was expected to succeed, but failed with: {:?}",
-                path.file_name().unwrap(),
+                "Transaction in {} was expected to succeed, but failed with: {:?}",
+                file_name,
                 result.err()
             );
             let committed_rev = result.unwrap();
@@ -652,14 +753,14 @@ fn replay_fixture(path: &Path) {
             assert_eq!(
                 committed_rev.get(),
                 exp_rev,
-                "Committed revision mismatch in {:?}",
-                path.file_name().unwrap()
+                "Committed revision mismatch in {}",
+                file_name
             );
             assert_eq!(
                 store.revision().get(),
                 exp_rev,
-                "Store revision mismatch in {:?}",
-                path.file_name().unwrap()
+                "Store revision mismatch in {}",
+                file_name
             );
 
             // Validate store state assertions
@@ -667,15 +768,15 @@ fn replay_fixture(path: &Path) {
                 assert_eq!(
                     store.node_count(),
                     state.node_count,
-                    "Store node_count mismatch in {:?}",
-                    path.file_name().unwrap()
+                    "Store node_count mismatch in {}",
+                    file_name
                 );
                 let exp_roots: Vec<NodeId> = state.roots.iter().map(|id| NodeId::new(*id)).collect();
                 assert_eq!(
                     store.root_ids(),
                     exp_roots.as_slice(),
-                    "Store root IDs mismatch in {:?}",
-                    path.file_name().unwrap()
+                    "Store root IDs mismatch in {}",
+                    file_name
                 );
 
                 for (id_str, exp_node) in &state.nodes {
@@ -706,10 +807,10 @@ fn replay_fixture(path: &Path) {
                     );
 
                     for (k, v) in &exp_node.properties {
-                        let prop_ref = resolve_property_ref(&JsonValue::String(k.clone()));
-                        let exp_val = convert_value(v);
+                        let prop_ref = resolve_property_name(k);
+                        let exp_val = convert_value(v.clone());
                         let actual_val = node.properties.get(&prop_ref).unwrap_or_else(|| {
-                            panic!("Property {} missing on node {} in {:?}", k, node_id, path)
+                            panic!("Property {} missing on node {} in {}", k, node_id, file_name)
                         });
                         assert_eq!(
                             actual_val, &exp_val,
@@ -723,8 +824,8 @@ fn replay_fixture(path: &Path) {
                 assert_eq!(
                     store.model_count(),
                     state.model_count,
-                    "Store model_count mismatch in {:?}",
-                    path.file_name().unwrap()
+                    "Store model_count mismatch in {}",
+                    file_name
                 );
                 for (id_str, exp_model) in &state.models {
                     let model_id = ModelId::new(id_str.parse::<u64>().expect("numeric model_id key"));
@@ -772,7 +873,7 @@ fn replay_fixture(path: &Path) {
                             model_id,
                             path
                         );
-                        let exp_val = convert_value(&exp_item.value);
+                        let exp_val = convert_value(exp_item.value.clone());
                         assert_eq!(
                             item.value, exp_val,
                             "Item value mismatch at index {} in model {} in {:?}",
@@ -785,8 +886,8 @@ fn replay_fixture(path: &Path) {
         "rejected" => {
             assert!(
                 result.is_err(),
-                "Transaction in {:?} was expected to fail, but succeeded with revision: {:?}",
-                path.file_name().unwrap(),
+                "Transaction in {} was expected to fail, but succeeded with revision: {:?}",
+                file_name,
                 result.ok()
             );
             let err = result.unwrap_err();
@@ -796,150 +897,24 @@ fn replay_fixture(path: &Path) {
                 .as_ref()
                 .expect("error_code for rejected outcome");
 
-            match exp_err_code.as_str() {
-                "stale_base_revision" => {
-                    assert!(
-                        matches!(err, TxnError::StaleBaseRevision { .. }),
-                        "Expected StaleBaseRevision, got {:?}",
-                        err
-                    );
-                }
-                "invalid_new_revision" => {
-                    assert!(
-                        matches!(err, TxnError::InvalidNewRevision { .. }),
-                        "Expected InvalidNewRevision, got {:?}",
-                        err
-                    );
-                }
-                "max_operations_exceeded" => {
-                    assert!(
-                        matches!(err, TxnError::MaxOperationsExceeded { .. }),
-                        "Expected MaxOperationsExceeded, got {:?}",
-                        err
-                    );
-                }
-                "node_id_already_used" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::NodeIdAlreadyUsed(..), .. }),
-                        "Expected NodeIdAlreadyUsed, got {:?}",
-                        err
-                    );
-                }
-                "node_not_found" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::NodeNotFound(..), .. }),
-                        "Expected NodeNotFound, got {:?}",
-                        err
-                    );
-                }
-                "parent_not_found" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::ParentNotFound(..), .. }),
-                        "Expected ParentNotFound, got {:?}",
-                        err
-                    );
-                }
-                "max_node_count_exceeded" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::MaxNodeCountExceeded { .. }, .. }),
-                        "Expected MaxNodeCountExceeded, got {:?}",
-                        err
-                    );
-                }
-                "max_tree_depth_exceeded" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::MaxTreeDepthExceeded { .. }, .. }),
-                        "Expected MaxTreeDepthExceeded, got {:?}",
-                        err
-                    );
-                }
-                "max_string_length_exceeded" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::MaxStringLengthExceeded { .. }, .. }),
-                        "Expected MaxStringLengthExceeded, got {:?}",
-                        err
-                    );
-                }
-                "max_model_count_exceeded" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::MaxModelCountExceeded { .. }, .. }),
-                        "Expected MaxModelCountExceeded, got {:?}",
-                        err
-                    );
-                }
-                "max_cached_items_per_model_exceeded" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::MaxCachedItemsPerModelExceeded { .. }, .. }),
-                        "Expected MaxCachedItemsPerModelExceeded, got {:?}",
-                        err
-                    );
-                }
-                "max_items_per_model_operation_exceeded" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::MaxItemsPerModelOperationExceeded { .. }, .. }),
-                        "Expected MaxItemsPerModelOperationExceeded, got {:?}",
-                        err
-                    );
-                }
-                "model_id_already_used" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::ModelIdAlreadyUsed(..), .. }),
-                        "Expected ModelIdAlreadyUsed, got {:?}",
-                        err
-                    );
-                }
-                "model_not_found" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::ModelNotFound(..), .. }),
-                        "Expected ModelNotFound, got {:?}",
-                        err
-                    );
-                }
-                "item_not_found" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::ItemNotFound(..), .. }),
-                        "Expected ItemNotFound, got {:?}",
-                        err
-                    );
-                }
-                "cycle_detected" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::CycleDetected { .. }, .. }),
-                        "Expected CycleDetected, got {:?}",
-                        err
-                    );
-                }
-                "child_index_out_of_bounds" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::ChildIndexOutOfBounds { .. }, .. }),
-                        "Expected ChildIndexOutOfBounds, got {:?}",
-                        err
-                    );
-                }
-                "invalid_children_reorder" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::InvalidChildrenReorder { .. }, .. }),
-                        "Expected InvalidChildrenReorder, got {:?}",
-                        err
-                    );
-                }
-                "invalid_model_delete" => {
-                    assert!(
-                        matches!(err, TxnError::OpFailed { source: StoreError::InvalidModelDelete(..), .. }),
-                        "Expected InvalidModelDelete, got {:?}",
-                        err
-                    );
-                }
-                other => panic!("Unrecognized expected error_code: {}", other),
-            }
+            let actual_code = err.conformance_code().unwrap_or("unknown_error");
+            assert_eq!(
+                actual_code,
+                exp_err_code.as_str(),
+                "Error code mismatch in {}: expected {}, got {} ({:?})",
+                file_name,
+                exp_err_code,
+                actual_code,
+                err
+            );
 
             if let Some(exp_op_idx) = fixture.expected_outcome.failed_op_index {
                 match err {
                     TxnError::OpFailed { op_index, .. } => {
                         assert_eq!(
                             op_index, exp_op_idx,
-                            "Failed operation index mismatch in {:?}",
-                            path.file_name().unwrap()
+                            "Failed operation index mismatch in {}",
+                            file_name
                         );
                     }
                     other => panic!("Expected TxnError::OpFailed with op_index, got {:?}", other),
@@ -954,15 +929,15 @@ fn replay_fixture(path: &Path) {
                 assert_eq!(
                     store.revision().get(),
                     exp_store_rev,
-                    "Store revision corrupted after transaction rollback in {:?}",
-                    path.file_name().unwrap()
+                    "Store revision corrupted after transaction rollback in {}",
+                    file_name
                 );
 
                 let post_snapshot = take_snapshot(&store);
                 assert_eq!(
                     pre_snapshot, post_snapshot,
-                    "Store state was mutated despite transaction rollback in {:?}",
-                    path.file_name().unwrap()
+                    "Store state was mutated despite transaction rollback in {}",
+                    file_name
                 );
             }
         }

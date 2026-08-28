@@ -551,6 +551,11 @@ impl SemanticStore {
         self.models.len()
     }
 
+    /// Returns an iterator over the IDs of all active models in the store (§8).
+    pub fn model_ids(&self) -> impl Iterator<Item = ModelId> + '_ {
+        self.models.keys().copied()
+    }
+
     /// Returns `true` if an active model exists with the given ID (§8).
     pub fn contains_model(&self, id: ModelId) -> bool {
         self.models.contains_key(&id)

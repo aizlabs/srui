@@ -430,6 +430,9 @@ version = "0.1.0"
 [[package]]
 name = "srui-semantic-tree"
 version = "0.1.0"
+dependencies = [
+ "srui-protocol",
+]
 
 [[package]]
 name = "srui-sessiond"

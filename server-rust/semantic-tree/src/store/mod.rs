@@ -103,7 +103,8 @@ impl SemanticStore {
     ///   migrated to structural Copy-on-Write (e.g. `im::HashMap` persistent trees offering
     ///   $O(\text{ops} \cdot \log N)$ commit cost) or in-place mutation with an undo-journal rollback
     ///   log to avoid full graph allocations per transaction.
-    pub(crate) fn clone_staging(&self) -> Self {
+    /// Creates a private staging clone of the store's node graph for atomic transaction application (§12.1).
+    pub fn clone_staging(&self) -> Self {
         Self {
             nodes: self.nodes.clone(),
             roots: self.roots.clone(),
@@ -116,7 +117,7 @@ impl SemanticStore {
     }
 
     /// Atomically commits a successful staging store and advances the committed revision (§12.1).
-    pub(crate) fn commit_staging(&mut self, staged: Self, new_revision: Revision) {
+    pub fn commit_staging(&mut self, staged: Self, new_revision: Revision) {
         self.nodes = staged.nodes;
         self.roots = staged.roots;
         self.used_ids = staged.used_ids;

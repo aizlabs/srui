@@ -17,6 +17,7 @@ let package = Package(
         .library(name: "Terminal", targets: ["Terminal"]),
         .library(name: "Resources", targets: ["Resources"]),
         .library(name: "Accessibility", targets: ["Accessibility"]),
+        .executable(name: "RendererDemoApp", targets: ["RendererDemoApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.2"),
@@ -44,7 +45,17 @@ let package = Package(
         ),
         .target(
             name: "RendererAppKit",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "RendererAppKit"
+        ),
+        .executableTarget(
+            name: "RendererDemoApp",
+            dependencies: [
+                "RendererAppKit",
+            ],
+            path: "RendererDemoApp"
         ),
         .target(
             name: "Collections",
@@ -73,6 +84,14 @@ let package = Package(
                 "Protocol",
             ],
             path: "Tests/SemanticModelTests"
+        ),
+        .testTarget(
+            name: "RendererAppKitTests",
+            dependencies: [
+                "RendererAppKit",
+                "SemanticModel",
+            ],
+            path: "Tests/RendererAppKitTests"
         ),
         .testTarget(
             name: "SRUITests",

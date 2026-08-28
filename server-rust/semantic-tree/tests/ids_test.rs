@@ -114,3 +114,35 @@ fn test_resource_hash() {
     let parsed_prefixed = ResourceHash::from_hex(&prefixed).unwrap();
     assert_eq!(hash, parsed_prefixed);
 }
+
+#[test]
+fn test_resolve_standard_enum_values() {
+    assert_eq!(
+        resolve_standard_enum_value("ActionRole", "destructive"),
+        Some(EnumToken::ACTION_ROLE_DESTRUCTIVE)
+    );
+    assert_eq!(
+        resolve_standard_enum_value("EnumActionRole", "primary"),
+        Some(EnumToken::ACTION_ROLE_PRIMARY)
+    );
+    assert_eq!(
+        resolve_standard_enum_value("Visibility", "collapsed"),
+        Some(EnumToken::VISIBILITY_COLLAPSED)
+    );
+    assert_eq!(
+        lookup_standard_enum_value(2, "destructive"),
+        Some(3)
+    );
+    assert_eq!(
+        standard_enum_value_name(2, 3),
+        Some("destructive")
+    );
+    assert_eq!(
+        resolve_standard_enum_value("ActionRole", "non_existent"),
+        None
+    );
+    assert_eq!(
+        resolve_standard_enum_value("NonExistentEnum", "val"),
+        None
+    );
+}

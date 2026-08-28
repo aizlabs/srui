@@ -34,11 +34,12 @@ pub use capability::{
 pub use event::{ClientInstanceId, Event, EventId, EventValidationError};
 
 pub use ids::{
-    lookup_standard_enum, lookup_standard_event, lookup_standard_node_type, lookup_standard_operation,
-    lookup_standard_property, resolve_standard_event, resolve_standard_node_type,
-    resolve_standard_property, standard_enum_name, standard_event_name, standard_node_type_name,
-    standard_operation_name, standard_property_name, ItemId, ModelId, NodeId,
-    ParseResourceHashError, PropertyRef, RegistryLookupError, ResourceHash, TypeRef,
+    lookup_standard_enum, lookup_standard_enum_value, lookup_standard_event,
+    lookup_standard_node_type, lookup_standard_operation, lookup_standard_property,
+    resolve_standard_enum_value, resolve_standard_event, resolve_standard_node_type,
+    resolve_standard_property, standard_enum_name, standard_enum_value_name, standard_event_name,
+    standard_node_type_name, standard_operation_name, standard_property_name, ItemId, ModelId,
+    NodeId, ParseResourceHashError, PropertyRef, RegistryLookupError, ResourceHash, TypeRef,
     StandardActionRole, StandardHorizontalAlignment, StandardImportance, StandardInputRole,
     StandardPaddingRole, StandardSelectionMode, StandardSpacingRole, StandardTextRole,
     StandardTogglePresentationHint, StandardValidationState, StandardVerticalAlignment,

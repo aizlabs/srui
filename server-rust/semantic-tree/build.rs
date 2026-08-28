@@ -314,6 +314,46 @@ fn main() {
     code.push_str("    }\n");
     code.push_str("}\n\n");
 
+    // Lookup functions for Enum values (§7.5)
+    code.push_str("pub fn resolve_standard_enum_value(enum_name: &str, value_name: &str) -> Option<EnumToken> {\n");
+    code.push_str("    match enum_name {\n");
+    for item in &registry.enums {
+        code.push_str(&format!("        {:?} | {:?} => match value_name {{\n", item.name, format!("Enum{}", item.name)));
+        for val in &item.values {
+            code.push_str(&format!("            {:?} => Some(EnumToken::new({}, {})),\n", val.name, item.id, val.id));
+        }
+        code.push_str("            _ => None,\n");
+        code.push_str("        },\n");
+    }
+    code.push_str("        _ => None,\n");
+    code.push_str("    }\n");
+    code.push_str("}\n\n");
+
+    code.push_str("pub fn lookup_standard_enum_value(enum_id: u32, value_name: &str) -> Option<u32> {\n");
+    code.push_str("    match enum_id {\n");
+    for item in &registry.enums {
+        code.push_str(&format!("        {} => match value_name {{\n", item.id));
+        for val in &item.values {
+            code.push_str(&format!("            {:?} => Some({}),\n", val.name, val.id));
+        }
+        code.push_str("            _ => None,\n");
+        code.push_str("        },\n");
+    }
+    code.push_str("        _ => None,\n");
+    code.push_str("    }\n");
+    code.push_str("}\n\n");
+
+    code.push_str("pub fn standard_enum_value_name(enum_id: u32, value_id: u32) -> Option<&'static str> {\n");
+    code.push_str("    match (enum_id, value_id) {\n");
+    for item in &registry.enums {
+        for val in &item.values {
+            code.push_str(&format!("        ({}, {}) => Some({:?}),\n", item.id, val.id, val.name));
+        }
+    }
+    code.push_str("        _ => None,\n");
+    code.push_str("    }\n");
+    code.push_str("}\n\n");
+
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("registry_tables.rs");
     fs::write(&dest_path, code).unwrap_or_else(|e| panic!("Failed to write registry_tables.rs: {}", e));

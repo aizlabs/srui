@@ -5,6 +5,7 @@ target/
 # Corpus inputs must live under the target whose harness consumes them.
 # Flat files under corpus/ are undiscoverable by cargo-fuzz and CI.
 /corpus/*
+!/corpus/README.md
 !/corpus/decode_framed/
 !/corpus/decode_framed/**
 !/corpus/decode_wire/

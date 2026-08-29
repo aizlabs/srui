@@ -41,7 +41,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
+      - name: Cache cargo-fuzz binary and registry
+        id: cache-cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('server-rust/fuzz/Cargo.lock') }}
+          restore-keys: cargo-fuzz-${{ runner.os }}-
       - name: Install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
         run: cargo install cargo-fuzz --locked
       - name: Seed fuzz corpora from conformance vectors
         run: |

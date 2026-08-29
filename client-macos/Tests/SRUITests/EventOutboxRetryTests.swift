@@ -199,6 +199,51 @@ struct EventOutboxRetryTests {
         await server.close()
     }
 
+    @Test("Cumulative seq drain retires lower-seq pending events (§18.2)")
+    func cumulativeSeqDrainRetiresLowerSeqEvents() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            via: client
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(2),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(await outbox.pendingCount == 2)
+        let sentBeforeAck = try events(in: await collector.wait(forAtLeast: 2)).count
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = second.eventId.bytes
+        ack.lastProcessedEventSeq = second.eventSeq
+        ack.status = .processed
+
+        var message = SRUIMessage()
+        message.serverEventAck = ack
+        await controller.handleIncomingMessage(message)
+
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == second.eventSeq)
+
+        await outbox.resendPendingEvents(via: client)
+        let sentAfterAck = try events(in: await collector.wait(forAtLeast: sentBeforeAck, timeout: 0.5)).count
+        #expect(sentAfterAck == sentBeforeAck)
+
+        await collector.stop()
+        await client.close()
+        await server.close()
+        _ = first
+    }
+
     @Test("A REJECTED ack settles the event so it is never replayed (§18.2)")
     func rejectedAckDropsEventInsteadOfReplayingIt() async throws {
         let (client, server) = await PipeTransport.createPair()

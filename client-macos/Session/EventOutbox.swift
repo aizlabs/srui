@@ -133,6 +133,15 @@ public actor EventOutbox {
         _lastAckedEventSeq = max(_lastAckedEventSeq, event.eventSeq)
     }
 
+    /// Applies one server acknowledgement: bulk-drains by cumulative seq, then settles by id (§18.2).
+    ///
+    /// Cumulative `last_processed_event_seq` must be applied before per-id settlement so a guard
+    /// on `_lastAckedEventSeq` cannot skip retiring lower-sequence pending events.
+    public func settleAcknowledgement(eventId: EventId, throughSeq seq: UInt64) {
+        acknowledgeEvents(throughSeq: seq)
+        acknowledgeEvent(id: eventId)
+    }
+
     /// Acknowledges every event up to and including `seq` (§18: `last_acked_event_seq`).
     ///
     /// A sequence beyond `currentEventSeq` is ignored. The server's `last_processed_event_seq` is

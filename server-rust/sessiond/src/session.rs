@@ -71,6 +71,19 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Truncates a diagnostic string to the negotiated §26 `max_string_length` (UTF-8 safe).
+pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value;
+    }
+    let mut end = max_len;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
 /// Outcome of one client event (§18.2).
 ///
 /// `Processed`, `Duplicate`, and `Rejected` are terminal and become `SERVER EVENT_ACK`; `Pending`
@@ -488,12 +501,13 @@ impl Session {
             };
 
             if let Err(error) = validation {
+                let max_string_length = guard.store.limits().max_string_length;
                 let last_processed_event_seq = guard.dedupe.settle_event(
                     event,
                     EventOutcomeRecord {
                         accepted: false,
                         revision_after_effect: current_rev.get(),
-                        reject_reason: error.to_string(),
+                        reject_reason: bound_diagnostic_string(error.to_string(), max_string_length),
                     },
                 );
                 return Ok(EventOutcome::Rejected {
@@ -562,6 +576,12 @@ impl Session {
     pub fn current_revision(&self) -> u64 {
         let guard = lock_or_recover(&self.inner);
         guard.store.revision().get()
+    }
+
+    /// Negotiated §26 string bound for wire diagnostics such as `reject_reason`.
+    pub fn max_string_length(&self) -> usize {
+        let guard = lock_or_recover(&self.inner);
+        guard.store.limits().max_string_length
     }
 
     /// Returns the total number of active nodes currently in the store (§6.2).

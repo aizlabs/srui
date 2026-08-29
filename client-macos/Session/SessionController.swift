@@ -307,8 +307,10 @@ public final class SessionController: @unchecked Sendable {
             )
         }
 
-        await outbox.acknowledgeEvent(id: eventId)
-        await outbox.acknowledgeEvents(throughSeq: ack.lastProcessedEventSeq)
+        await outbox.settleAcknowledgement(
+            eventId: eventId,
+            throughSeq: ack.lastProcessedEventSeq
+        )
     }
 
     private func handleTransaction(_ wireTx: SRUITransaction) async {

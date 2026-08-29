@@ -1,0 +1,72 @@
+{
+  "name": "invalid_children_reorder_rejected",
+  "description": "REORDER_CHILDREN with a foreign child ID is rejected with invalid_children_reorder and rolls back (§13).",
+  "spec_sections": ["§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Column",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 10,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 20,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 30,
+          "node_type": "Text",
+          "parent_id": 2,
+          "child_index": null,
+          "properties": {}
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "REORDER_CHILDREN",
+        "parent_id": 2,
+        "new_order": [30, 10, 999]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "invalid_children_reorder",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

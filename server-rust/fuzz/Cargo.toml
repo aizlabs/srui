@@ -33,3 +33,9 @@ name = "apply_transaction"
 path = "fuzz_targets/apply_transaction.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "state_sequence"
+path = "fuzz_targets/state_sequence.rs"
+test = false
+doc = false

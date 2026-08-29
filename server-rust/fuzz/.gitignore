@@ -1,2 +1,15 @@
+# Runtime artifacts and local build output.
 artifacts/
 target/
+
+# Corpus inputs must live under the target whose harness consumes them.
+# Flat files under corpus/ are undiscoverable by cargo-fuzz and CI.
+/corpus/*
+!/corpus/decode_framed/
+!/corpus/decode_framed/**
+!/corpus/decode_wire/
+!/corpus/decode_wire/**
+!/corpus/apply_transaction/
+!/corpus/apply_transaction/**
+!/corpus/state_sequence/
+!/corpus/state_sequence/**

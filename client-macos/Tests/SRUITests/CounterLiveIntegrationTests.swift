@@ -40,7 +40,6 @@ struct CounterLiveIntegrationTests {
         let progressID = NodeId(3)
         let buttonID = NodeId(4)
 
-        // 1. Server sends initial UI tree (Revision 0 -> 1)
         let initialTx = Transaction(
             baseRevision: .initial,
             newRevision: Revision(1),
@@ -67,8 +66,12 @@ struct CounterLiveIntegrationTests {
         initialMsg.transaction = initialTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(initialMsg))
 
-        // Wait for initial render mount
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await AsyncTestSupport.eventually(description: "initial transaction and renderer mount") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.handle(for: textID) != nil
+                && renderer.registry.handle(for: progressID) != nil
+                && renderer.registry.handle(for: buttonID) != nil
+        }
 
         #expect(applier.lastAppliedRevision == Revision(1))
         let textHandle = try #require(renderer.registry.handle(for: textID))
@@ -81,7 +84,6 @@ struct CounterLiveIntegrationTests {
         #expect(textField.stringValue == "Count: 0")
         #expect(progressIndicator.doubleValue == 0.0)
 
-        // Server simulated event handler loop
         let serverTask = Task.detached {
             let serverStream = serverTransport.receiveStream()
             var currentCount: UInt64 = 0
@@ -113,13 +115,14 @@ struct CounterLiveIntegrationTests {
             }
         }
 
-        // Execute 3 consecutive click-and-observe cycles (§7.7, §12.1)
         for cycle in 1...3 {
-            // Click the button in the real AppKit control
             buttonTrampoline.performAction(buttonHandle.view)
 
-            // Wait for roundtrip transaction update
-            try await Task.sleep(nanoseconds: 80_000_000)
+            try await AsyncTestSupport.eventually(description: "counter cycle \(cycle)") {
+                applier.lastAppliedRevision == Revision(UInt64(cycle + 1))
+                    && textField.stringValue == "Count: \(cycle)"
+                    && abs(progressIndicator.doubleValue - (Double(cycle) / 100.0)) < 0.0001
+            }
 
             #expect(applier.lastAppliedRevision == Revision(UInt64(cycle + 1)))
             #expect(textField.stringValue == "Count: \(cycle)")
@@ -129,5 +132,6 @@ struct CounterLiveIntegrationTests {
         serverTask.cancel()
         await controller.stop()
         await serverTransport.close()
+        _ = try? await serverTask.value
     }
 }

@@ -36,7 +36,6 @@ fn trace_limits() -> StoreLimits {
         max_model_count: 4,
         max_cached_items_per_model: 32,
         max_items_per_model_operation: 8,
-        ..StoreLimits::default()
     }
 }
 
@@ -77,7 +76,12 @@ impl LcgRng {
 // Store snapshot (observable committed state)
 // ==============================================================================
 
-type NodeSnapshot = (TypeRef, Option<NodeId>, Vec<NodeId>, BTreeMap<PropertyRef, Value>);
+type NodeSnapshot = (
+    TypeRef,
+    Option<NodeId>,
+    Vec<NodeId>,
+    BTreeMap<PropertyRef, Value>,
+);
 
 #[derive(Clone, Debug, PartialEq)]
 struct ModelSnapshot {
@@ -323,10 +327,7 @@ impl TraceGen {
             TypeRef::SURFACE,
             None,
             None,
-            [(
-                PropertyRef::LABEL,
-                Self::string_value(rng, "root"),
-            )],
+            [(PropertyRef::LABEL, Self::string_value(rng, "root"))],
         )
     }
 
@@ -349,10 +350,7 @@ impl TraceGen {
             node_type,
             parent,
             child_index,
-            [(
-                PropertyRef::LABEL,
-                Self::string_value(rng, "node"),
-            )],
+            [(PropertyRef::LABEL, Self::string_value(rng, "node"))],
         )
     }
 
@@ -429,11 +427,8 @@ impl TraceGen {
         if let Some(model_id) = self.pick_model(rng) {
             if let Some(model) = store.get_model(model_id) {
                 let index = rng.next() % (model.item_count + 1);
-                let item = ModelItem::new(
-                    self.alloc_item_id(),
-                    Self::string_value(rng, "item"),
-                    [],
-                );
+                let item =
+                    ModelItem::new(self.alloc_item_id(), Self::string_value(rng, "item"), []);
                 return Operation::model_insert(model_id, index, vec![item]);
             }
         }
@@ -456,7 +451,7 @@ struct TraceMismatch {
     rejected: bool,
 }
 
-fn run_seeded_trace(seed: u64) -> Result<(), TraceMismatch> {
+fn run_seeded_trace(seed: u64) -> Result<(), Box<TraceMismatch>> {
     let limits = trace_limits();
     let mut store = SemanticStore::with_limits(limits.clone());
     let mut gen = TraceGen::new();
@@ -482,7 +477,7 @@ fn run_seeded_trace(seed: u64) -> Result<(), TraceMismatch> {
                 let live = take_snapshot(&store);
                 let reference = reference_snapshot(&committed, &limits);
                 if live != reference {
-                    return Err(TraceMismatch {
+                    return Err(Box::new(TraceMismatch {
                         seed,
                         step,
                         committed: committed[..committed.len() - 1].to_vec(),
@@ -491,13 +486,13 @@ fn run_seeded_trace(seed: u64) -> Result<(), TraceMismatch> {
                         reference_snapshot: reference,
                         pre_snapshot,
                         rejected: false,
-                    });
+                    }));
                 }
             }
             Err(_) => {
                 let post_snapshot = take_snapshot(&store);
                 if post_snapshot != pre_snapshot {
-                    return Err(TraceMismatch {
+                    return Err(Box::new(TraceMismatch {
                         seed,
                         step,
                         committed: committed.clone(),
@@ -506,11 +501,11 @@ fn run_seeded_trace(seed: u64) -> Result<(), TraceMismatch> {
                         reference_snapshot: reference_before,
                         pre_snapshot,
                         rejected: true,
-                    });
+                    }));
                 }
                 let reference = reference_snapshot(&committed, &limits);
                 if post_snapshot != reference {
-                    return Err(TraceMismatch {
+                    return Err(Box::new(TraceMismatch {
                         seed,
                         step,
                         committed: committed.clone(),
@@ -519,7 +514,7 @@ fn run_seeded_trace(seed: u64) -> Result<(), TraceMismatch> {
                         reference_snapshot: reference,
                         pre_snapshot,
                         rejected: true,
-                    });
+                    }));
                 }
             }
         }
@@ -534,18 +529,16 @@ fn persist_failing_trace(mismatch: &TraceMismatch) {
     }
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let out_dir = PathBuf::from(manifest_dir).join("../../protocol/conformance-vectors/state-machine");
+    let out_dir =
+        PathBuf::from(manifest_dir).join("../../protocol/conformance-vectors/state-machine");
     let file_name = format!(
         "99_trace_seed_{:x}_step_{}.json",
         mismatch.seed, mismatch.step
     );
     let path = out_dir.join(&file_name);
 
-    let setup: Vec<serde_json::Value> = mismatch
-        .committed
-        .iter()
-        .map(|txn| transaction_to_json(txn))
-        .collect();
+    let setup: Vec<serde_json::Value> =
+        mismatch.committed.iter().map(transaction_to_json).collect();
 
     let fixture = serde_json::json!({
         "name": format!("trace_seed_{:x}_step_{}", mismatch.seed, mismatch.step),

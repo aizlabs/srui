@@ -684,17 +684,18 @@ final class StateMachineConformanceTests: XCTestCase {
             guard let propsDict = propsRaw as? [String: Any] else {
                 throw StoreError.operationError("record properties must be an object")
             }
-            var properties: [Property] = []
-            for (k, v) in propsDict {
-                let propRef = try resolvePropertyName(k)
-                properties.append(Property(property: propRef, value: try convertValue(v)))
-            }
+            let properties = try propsDict
+                .map { key, value in
+                    Property(
+                        property: try resolvePropertyName(key),
+                        value: try convertValue(value)
+                    )
+                }
+                .sorted { $0.property < $1.property }
             return .record(SmallRecord(typeRef: typeRef, properties: properties))
         }
-
         throw StoreError.operationError("Unrecognized structured value object in fixture: \(dict)")
     }
-
     // MARK: - Invariant Verification (§4.7, §4.16, §4.17, §7.1, §10, §32.3)
 
     /// Verifies the semantic-not-paint invariant: standard widget profile trees define portable meaning,

@@ -3,17 +3,70 @@
 SRUI Swift Registry Code Generator
 Generates client-macos/SemanticModel/RegistryTables.swift from protocol/registry.yaml.
 """
+
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import tempfile
+
 import yaml
 
 SWIFT_KEYWORDS = {
-    "associatedtype", "class", "deinit", "enum", "extension", "fileprivate", "func", "import", "init",
-    "inout", "internal", "let", "open", "operator", "private", "precedencegroup", "protocol", "public",
-    "rethrows", "static", "struct", "subscript", "typealias", "var", "break", "case", "continue", "default",
-    "defer", "do", "else", "fallthrough", "for", "guard", "if", "in", "repeat", "return", "switch", "where",
-    "while", "as", "Any", "catch", "false", "is", "nil", "super", "self", "Self", "throw", "throws", "true", "try"
+    "associatedtype",
+    "class",
+    "deinit",
+    "enum",
+    "extension",
+    "fileprivate",
+    "func",
+    "import",
+    "init",
+    "inout",
+    "internal",
+    "let",
+    "open",
+    "operator",
+    "private",
+    "precedencegroup",
+    "protocol",
+    "public",
+    "rethrows",
+    "static",
+    "struct",
+    "subscript",
+    "typealias",
+    "var",
+    "break",
+    "case",
+    "continue",
+    "default",
+    "defer",
+    "do",
+    "else",
+    "fallthrough",
+    "for",
+    "guard",
+    "if",
+    "in",
+    "repeat",
+    "return",
+    "switch",
+    "where",
+    "while",
+    "as",
+    "Any",
+    "catch",
+    "false",
+    "is",
+    "nil",
+    "super",
+    "self",
+    "Self",
+    "throw",
+    "throws",
+    "true",
+    "try",
 }
 
 
@@ -64,7 +117,11 @@ def to_camel_case(name: str) -> str:
 def to_upper_snake_case(name: str) -> str:
     result = []
     for i, c in enumerate(name):
-        if c.isupper() and i > 0 and (name[i - 1].islower() or (i + 1 < len(name) and name[i + 1].islower())):
+        if (
+            c.isupper()
+            and i > 0
+            and (name[i - 1].islower() or (i + 1 < len(name) and name[i + 1].islower()))
+        ):
             result.append("_")
         result.append(c.upper())
     return "".join(result).replace("-", "_")
@@ -121,279 +178,366 @@ def generate_swift_registry(registry_path: Path, output_path: Path) -> None:
     lines.append("")
 
     # Lookup functions
-    lines.extend([
-        "// MARK: - Lookup Functions",
-        "",
-        "public func lookupStandardNodeType(_ name: String) -> UInt32? {",
-        "    switch name {",
-    ])
+    lines.extend(
+        [
+            "// MARK: - Lookup Functions",
+            "",
+            "public func lookupStandardNodeType(_ name: String) -> UInt32? {",
+            "    switch name {",
+        ]
+    )
     for item in node_types:
         lines.append(f'    case "{item["name"]}": return {item["id"]}')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func lookupStandardNodeTypeName(_ id: UInt32) -> String? {",
-        "    switch id {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func lookupStandardNodeTypeName(_ id: UInt32) -> String? {",
+            "    switch id {",
+        ]
+    )
     for item in node_types:
         lines.append(f'    case {item["id"]}: return "{item["name"]}"')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func standardNodeTypeName(_ id: UInt32) -> String? {",
-        "    lookupStandardNodeTypeName(id)",
-        "}",
-        "",
-        "public func lookupStandardProperty(_ name: String) -> UInt32? {",
-        "    switch name {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func standardNodeTypeName(_ id: UInt32) -> String? {",
+            "    lookupStandardNodeTypeName(id)",
+            "}",
+            "",
+            "public func lookupStandardProperty(_ name: String) -> UInt32? {",
+            "    switch name {",
+        ]
+    )
     for item in properties:
         lines.append(f'    case "{item["name"]}": return {item["id"]}')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func lookupStandardPropertyName(_ id: UInt32) -> String? {",
-        "    switch id {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func lookupStandardPropertyName(_ id: UInt32) -> String? {",
+            "    switch id {",
+        ]
+    )
     for item in properties:
         lines.append(f'    case {item["id"]}: return "{item["name"]}"')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func standardPropertyName(_ id: UInt32) -> String? {",
-        "    lookupStandardPropertyName(id)",
-        "}",
-        "",
-        "public func lookupStandardEvent(_ name: String) -> UInt32? {",
-        "    switch name {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func standardPropertyName(_ id: UInt32) -> String? {",
+            "    lookupStandardPropertyName(id)",
+            "}",
+            "",
+            "public func lookupStandardEvent(_ name: String) -> UInt32? {",
+            "    switch name {",
+        ]
+    )
     for item in events:
         lines.append(f'    case "{item["name"]}": return {item["id"]}')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func lookupStandardEventName(_ id: UInt32) -> String? {",
-        "    switch id {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func lookupStandardEventName(_ id: UInt32) -> String? {",
+            "    switch id {",
+        ]
+    )
     for item in events:
         lines.append(f'    case {item["id"]}: return "{item["name"]}"')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func standardEventName(_ id: UInt32) -> String? {",
-        "    lookupStandardEventName(id)",
-        "}",
-        "",
-        "public func lookupStandardOperation(_ name: String) -> UInt32? {",
-        "    switch name {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func standardEventName(_ id: UInt32) -> String? {",
+            "    lookupStandardEventName(id)",
+            "}",
+            "",
+            "public func lookupStandardOperation(_ name: String) -> UInt32? {",
+            "    switch name {",
+        ]
+    )
     for item in operations:
         lines.append(f'    case "{item["name"]}": return {item["id"]}')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func lookupStandardOperationName(_ id: UInt32) -> String? {",
-        "    switch id {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func lookupStandardOperationName(_ id: UInt32) -> String? {",
+            "    switch id {",
+        ]
+    )
     for item in operations:
         lines.append(f'    case {item["id"]}: return "{item["name"]}"')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func standardOperationName(_ id: UInt32) -> String? {",
-        "    lookupStandardOperationName(id)",
-        "}",
-        "",
-        "public func lookupStandardEnum(_ name: String) -> UInt32? {",
-        "    switch name {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func standardOperationName(_ id: UInt32) -> String? {",
+            "    lookupStandardOperationName(id)",
+            "}",
+            "",
+            "public func lookupStandardEnum(_ name: String) -> UInt32? {",
+            "    switch name {",
+        ]
+    )
     for item in enums:
         lines.append(f'    case "{item["name"]}": return {item["id"]}')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func lookupStandardEnumName(_ id: UInt32) -> String? {",
-        "    switch id {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func lookupStandardEnumName(_ id: UInt32) -> String? {",
+            "    switch id {",
+        ]
+    )
     for item in enums:
         lines.append(f'    case {item["id"]}: return "{item["name"]}"')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func standardEnumName(_ id: UInt32) -> String? {",
-        "    lookupStandardEnumName(id)",
-        "}",
-        "",
-        "public func lookupStandardEnumValue(enumID: UInt32, valueName: String) -> UInt32? {",
-        "    switch enumID {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func standardEnumName(_ id: UInt32) -> String? {",
+            "    lookupStandardEnumName(id)",
+            "}",
+            "",
+            "public func lookupStandardEnumValue(enumID: UInt32, valueName: String) -> UInt32? {",
+            "    switch enumID {",
+        ]
+    )
     for item in enums:
-        lines.append(f'    case {item["id"]}:')
+        lines.append(f"    case {item['id']}:")
         lines.append("        switch valueName {")
         for val in item["values"]:
             lines.append(f'        case "{val["name"]}": return {val["id"]}')
         lines.append("        default: return nil")
         lines.append("        }")
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func lookupStandardEnumValueName(enumID: UInt32, valueID: UInt32) -> String? {",
-        "    switch (enumID, valueID) {",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func lookupStandardEnumValueName(enumID: UInt32, valueID: UInt32) -> String? {",
+            "    switch (enumID, valueID) {",
+        ]
+    )
     for item in enums:
         for val in item["values"]:
-            lines.append(f'    case ({item["id"]}, {val["id"]}): return "{val["name"]}"')
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-        "public func standardEnumValueName(enumID: UInt32, valueID: UInt32) -> String? {",
-        "    lookupStandardEnumValueName(enumID: enumID, valueID: valueID)",
-        "}",
-        "",
-        "public func resolveStandardEnumValue(enumName: String, valueName: String) -> EnumToken? {",
-        "    switch enumName {",
-    ])
+            lines.append(
+                f'    case ({item["id"]}, {val["id"]}): return "{val["name"]}"'
+            )
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+            "public func standardEnumValueName(enumID: UInt32, valueID: UInt32) -> String? {",
+            "    lookupStandardEnumValueName(enumID: enumID, valueID: valueID)",
+            "}",
+            "",
+            "public func resolveStandardEnumValue(enumName: String, valueName: String) -> EnumToken? {",
+            "    switch enumName {",
+        ]
+    )
     for item in enums:
         lines.append(f'    case "{item["name"]}", "Enum{item["name"]}":')
         lines.append("        switch valueName {")
         for val in item["values"]:
-            lines.append(f'        case "{val["name"]}": return EnumToken(enumID: {item["id"]}, valueID: {val["id"]})')
+            lines.append(
+                f'        case "{val["name"]}": return EnumToken(enumID: {item["id"]}, valueID: {val["id"]})'
+            )
         lines.append("        default: return nil")
         lines.append("        }")
-    lines.extend([
-        "    default: return nil",
-        "    }",
-        "}",
-        "",
-    ])
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+        ]
+    )
 
     # Extension on TypeRef
-    lines.extend([
-        "// MARK: - Standard TypeRef Constants",
-        "",
-        "extension TypeRef {",
-    ])
+    lines.extend(
+        [
+            "// MARK: - Standard TypeRef Constants",
+            "",
+            "extension TypeRef {",
+        ]
+    )
     for item in node_types:
         camel = escape_swift_identifier(to_camel_case(item["name"]))
         upper = escape_swift_identifier(to_upper_snake_case(item["name"]))
-        lines.append(f'    public static let {camel} = TypeRef.standard({item["id"]})')
+        lines.append(f"    public static let {camel} = TypeRef.standard({item['id']})")
         if upper != camel:
-            lines.append(f'    public static let {upper} = TypeRef.standard({item["id"]})')
+            lines.append(
+                f"    public static let {upper} = TypeRef.standard({item['id']})"
+            )
         if item["name"] == "RichText":
-            lines.append(f'    public static let RICHTEXT = TypeRef.standard({item["id"]})')
+            lines.append(
+                f"    public static let RICHTEXT = TypeRef.standard({item['id']})"
+            )
 
     for item in events:
         event_camel = escape_swift_identifier("event" + to_pascal_case(item["name"]))
-        event_upper = escape_swift_identifier("EVENT_" + to_upper_snake_case(item["name"]))
-        lines.append(f'    public static let {event_camel} = TypeRef.standard({item["id"]})')
-        lines.append(f'    public static let {event_upper} = TypeRef.standard({item["id"]})')
+        event_upper = escape_swift_identifier(
+            "EVENT_" + to_upper_snake_case(item["name"])
+        )
+        lines.append(
+            f"    public static let {event_camel} = TypeRef.standard({item['id']})"
+        )
+        lines.append(
+            f"    public static let {event_upper} = TypeRef.standard({item['id']})"
+        )
 
-    lines.extend([
-        "}",
-        "",
-    ])
+    lines.extend(
+        [
+            "}",
+            "",
+        ]
+    )
 
     # Extension on PropertyRef
-    lines.extend([
-        "// MARK: - Standard PropertyRef Constants",
-        "",
-        "extension PropertyRef {",
-    ])
+    lines.extend(
+        [
+            "// MARK: - Standard PropertyRef Constants",
+            "",
+            "extension PropertyRef {",
+        ]
+    )
     for item in properties:
         camel = escape_swift_identifier(to_camel_case(item["name"]))
         upper = escape_swift_identifier(to_upper_snake_case(item["name"]))
-        lines.append(f'    public static let {camel} = PropertyRef.standard({item["id"]})')
+        lines.append(
+            f"    public static let {camel} = PropertyRef.standard({item['id']})"
+        )
         if upper != camel:
-            lines.append(f'    public static let {upper} = PropertyRef.standard({item["id"]})')
-    lines.extend([
-        "}",
-        "",
-    ])
+            lines.append(
+                f"    public static let {upper} = PropertyRef.standard({item['id']})"
+            )
+    lines.extend(
+        [
+            "}",
+            "",
+        ]
+    )
 
     # Extension on EnumToken
-    lines.extend([
-        "// MARK: - Standard EnumToken Constants",
-        "",
-        "extension EnumToken {",
-    ])
+    lines.extend(
+        [
+            "// MARK: - Standard EnumToken Constants",
+            "",
+            "extension EnumToken {",
+        ]
+    )
     for item in enums:
-        enum_pascal = to_pascal_case(item["name"])
         enum_upper = to_upper_snake_case(item["name"])
         for val in item["values"]:
             val_pascal = to_pascal_case(val["name"])
             val_upper = to_upper_snake_case(val["name"])
-            token_camel = escape_swift_identifier(to_camel_case(item["name"]) + val_pascal)
+            token_camel = escape_swift_identifier(
+                to_camel_case(item["name"]) + val_pascal
+            )
             token_upper = escape_swift_identifier(f"{enum_upper}_{val_upper}")
-            lines.append(f"    public static let {token_camel} = EnumToken(enumID: {item['id']}, valueID: {val['id']})")
-            lines.append(f"    public static let {token_upper} = EnumToken(enumID: {item['id']}, valueID: {val['id']})")
-    lines.extend([
-        "}",
-        "",
-    ])
-
-    # Strongly typed Swift standard enums
-    lines.extend([
-        "// MARK: - Typed Standard Enums",
-        "",
-    ])
-    for item in enums:
-        enum_type_name = f"Standard{to_pascal_case(item['name'])}"
-        lines.extend([
-            f"public enum {enum_type_name}: UInt32, CaseIterable, Sendable {{",
-        ])
-        for val in item["values"]:
-            var_name = escape_swift_identifier(to_camel_case(val["name"]))
-            lines.append(f'    case {var_name} = {val["id"]}')
-        lines.extend([
-            "",
-            f"    public static let standardEnumID: UInt32 = {item['id']}",
-            "",
-            "    public var enumToken: EnumToken {",
-            f"        EnumToken(enumID: {item['id']}, valueID: self.rawValue)",
-            "    }",
-            "",
-            "    public init?(enumToken: EnumToken) {",
-            f"        guard enumToken.enumID == {item['id']} else {{ return nil }}",
-            "        self.init(rawValue: enumToken.valueID)",
-            "    }",
+            lines.append(
+                f"    public static let {token_camel} = EnumToken(enumID: {item['id']}, valueID: {val['id']})"
+            )
+            lines.append(
+                f"    public static let {token_upper} = EnumToken(enumID: {item['id']}, valueID: {val['id']})"
+            )
+    lines.extend(
+        [
             "}",
             "",
-        ])
+        ]
+    )
+
+    # Strongly typed Swift standard enums
+    lines.extend(
+        [
+            "// MARK: - Typed Standard Enums",
+            "",
+        ]
+    )
+    for item in enums:
+        enum_type_name = f"Standard{to_pascal_case(item['name'])}"
+        lines.extend(
+            [
+                f"public enum {enum_type_name}: UInt32, CaseIterable, Sendable {{",
+            ]
+        )
+        for val in item["values"]:
+            var_name = escape_swift_identifier(to_camel_case(val["name"]))
+            lines.append(f"    case {var_name} = {val['id']}")
+        lines.extend(
+            [
+                "",
+                f"    public static let standardEnumID: UInt32 = {item['id']}",
+                "",
+                "    public var enumToken: EnumToken {",
+                f"        EnumToken(enumID: {item['id']}, valueID: self.rawValue)",
+                "    }",
+                "",
+                "    public init?(enumToken: EnumToken) {",
+                f"        guard enumToken.enumID == {item['id']} else {{ return nil }}",
+                "        self.init(rawValue: enumToken.valueID)",
+                "    }",
+                "}",
+                "",
+            ]
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    contents = "\n".join(lines) + "\n"
+    output_mode = output_path.stat().st_mode & 0o777 if output_path.exists() else 0o644
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(file_descriptor, output_mode)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as output_file:
+            output_file.write(contents)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary_path, output_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
     print(f"Generated Swift registry tables -> {output_path}")
 
 
 def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     registry_file = repo_root / "protocol" / "registry.yaml"
-    swift_output_file = repo_root / "client-macos" / "SemanticModel" / "RegistryTables.swift"
+    swift_output_file = (
+        repo_root / "client-macos" / "SemanticModel" / "RegistryTables.swift"
+    )
 
     if not registry_file.exists():
         raise FileNotFoundError(f"Registry file not found at {registry_file}")

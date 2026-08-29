@@ -48,7 +48,7 @@ jobs:
           set -euo pipefail
           vectors="$GITHUB_WORKSPACE/protocol/conformance-vectors"
           fuzz="$GITHUB_WORKSPACE/server-rust/fuzz/corpus"
-          mkdir -p "$fuzz/decode_framed" "$fuzz/decode_wire" "$fuzz/apply_transaction"
+          mkdir -p "$fuzz/decode_framed" "$fuzz/decode_wire" "$fuzz/apply_transaction" "$fuzz/state_sequence"
           cp "$vectors/golden_framed_message.bin" "$fuzz/decode_framed/"
           cp "$vectors/malformed_overlong_varint.bin" "$fuzz/decode_framed/"
           cp "$vectors/malformed_truncated_frame.bin" "$fuzz/decode_framed/"
@@ -57,11 +57,12 @@ jobs:
           cp "$vectors/malformed/"*.bin "$fuzz/decode_wire/"
           cp "$vectors/golden_transaction.bin" "$fuzz/apply_transaction/"
           cp "$vectors/malformed/"*.bin "$fuzz/apply_transaction/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/state_sequence/"
       - name: Run bounded fuzz regression
         working-directory: server-rust/fuzz
         run: |
           set -euo pipefail
-          for target in decode_framed decode_wire apply_transaction; do
+          for target in decode_framed decode_wire apply_transaction state_sequence; do
             cargo fuzz run "$target" "corpus/$target" -- -runs=0
             cargo fuzz run "$target" "corpus/$target" -- -max_total_time=15
           done

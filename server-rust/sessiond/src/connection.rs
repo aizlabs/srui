@@ -8,19 +8,17 @@
 //! - [`async-bounded-channel`](rules/async-bounded-channel.md): all transaction and event flows use bounded queues.
 //! - [`async-cancellation-token`](rules/async-cancellation-token.md): uses [`CancellationToken`] for clean disconnection.
 
+use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
-use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use srui_protocol::{
-    srui_message, FramingError, SruiCodec, SruiMessage,
-};
 use crate::session::{ResumeOutcome, Session, SessionError};
+use srui_protocol::{srui_message, FramingError, SruiCodec, SruiMessage};
 use thiserror::Error;
 
 /// Handshake timeout in seconds (5 seconds, §18.1).
@@ -44,7 +42,7 @@ pub enum ConnectionError {
     #[error("connection closed unexpectedly")]
     ConnectionClosed,
 
-    #[error("unexpected message during handshake: {0}")]
+    #[error("unexpected message: {0}")]
     UnexpectedMessage(&'static str),
 
     #[error("client-originated transaction rejected: server is authoritative (§12, §20.2)")]
@@ -83,7 +81,10 @@ where
 
     match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
-            info!("Received ClientHello from client instance {:?}", hello.client_instance_id);
+            info!(
+                "Received ClientHello from client instance {:?}",
+                hello.client_instance_id
+            );
             let welcome = session.handle_hello(&hello)?;
             let welcome_envelope = SruiMessage {
                 msg: Some(srui_message::Msg::ServerWelcome(welcome)),
@@ -91,7 +92,10 @@ where
             framed_write.send(welcome_envelope).await?;
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
-            info!("Received ClientResume for session {} from revision {}", resume.session_id, resume.last_applied_revision);
+            info!(
+                "Received ClientResume for session {} from revision {}",
+                resume.session_id, resume.last_applied_revision
+            );
             match session.handle_resume(&resume)? {
                 ResumeOutcome::Replay {
                     welcome_msg,
@@ -124,7 +128,11 @@ where
                 }
             }
         }
-        _ => return Err(ConnectionError::UnexpectedMessage("expected ClientHello or ClientResume")),
+        _ => {
+            return Err(ConnectionError::UnexpectedMessage(
+                "expected ClientHello or ClientResume",
+            ))
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -181,23 +189,34 @@ where
     Ok(())
 }
 
-async fn handle_incoming_message(msg: SruiMessage, session: &Session) -> Result<(), ConnectionError> {
+async fn handle_incoming_message(
+    msg: SruiMessage,
+    session: &Session,
+) -> Result<(), ConnectionError> {
     match msg.msg {
         Some(srui_message::Msg::Event(event)) => {
             debug!("Processing incoming event {:?}", event.event_id);
             let _ = session.process_event(&event)?;
+            Ok(())
         }
         Some(srui_message::Msg::Transaction(tx)) => {
             warn!(
                 "Rejecting client-originated transaction rev {} -> {}; remote authority forbids client commits",
                 tx.base_revision, tx.new_revision
             );
-            return Err(ConnectionError::ClientTransactionRejected);
+            Err(ConnectionError::ClientTransactionRejected)
         }
-        Some(other) => {
-            debug!("Ignoring unhandled message during active stream: {:?}", other);
-        }
-        None => {}
+        Some(srui_message::Msg::ClientHello(_)) => Err(ConnectionError::UnexpectedMessage(
+            "ClientHello is valid only during handshake",
+        )),
+        Some(srui_message::Msg::ClientResume(_)) => Err(ConnectionError::UnexpectedMessage(
+            "ClientResume is valid only during handshake",
+        )),
+        Some(_) => Err(ConnectionError::UnexpectedMessage(
+            "server-only or unsupported message during active session",
+        )),
+        None => Err(ConnectionError::UnexpectedMessage(
+            "empty active-session envelope",
+        )),
     }
-    Ok(())
 }

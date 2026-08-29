@@ -1,42 +1,35 @@
 //! Fuzz target for decode-then-apply transaction paths (§12.1, §26).
 //!
-//! Invariants: no panic/hang; failed apply leaves store revision and counts unchanged.
+//! Invariants: no panic/hang; failed apply leaves every observable store field unchanged.
 
 #![no_main]
 
+mod store_snapshot;
+
 use libfuzzer_sys::fuzz_target;
 use srui_semantic_tree::{decode_transaction, SemanticStore};
+use store_snapshot::take_snapshot;
 
 const MAX_FUZZ_TX_BYTES: usize = 256 * 1024;
-
-fn store_fingerprint(store: &SemanticStore) -> (u64, usize, usize) {
-    (
-        store.revision().0,
-        store.node_count(),
-        store.model_count(),
-    )
-}
 
 fuzz_target!(|data: &[u8]| {
     if data.len() > MAX_FUZZ_TX_BYTES {
         return;
     }
 
-    let mut store = SemanticStore::new();
-    let before = store_fingerprint(&store);
-
-    let Ok(txn) = decode_transaction(data) else {
+    let Ok(transaction) = decode_transaction(data) else {
         return;
     };
+    let mut store = SemanticStore::new();
+    let before = take_snapshot(&store);
 
-    match store.apply_transaction_record(&txn) {
-        Ok(_) => {}
-        Err(_) => {
-            let after = store_fingerprint(&store);
-            assert_eq!(
-                before, after,
-                "failed transaction must not mutate authoritative store state"
-            );
-        }
+    if store.apply_transaction_record(&transaction).is_err() {
+        assert_eq!(
+            before,
+            take_snapshot(&store),
+            "failed transaction must not mutate any observable store state"
+        );
+    } else {
+        let _ = take_snapshot(&store);
     }
 });

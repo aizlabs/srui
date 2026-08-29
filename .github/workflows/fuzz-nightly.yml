@@ -1,0 +1,51 @@
+name: Nightly Fuzz and AddressSanitizer
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-asan:
+    name: Stateful fuzzing (ASan)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed canonical fixtures
+        run: |
+          set -euo pipefail
+          vectors="$GITHUB_WORKSPACE/protocol/conformance-vectors"
+          fuzz="$GITHUB_WORKSPACE/server-rust/fuzz/corpus"
+          mkdir -p "$fuzz/decode_framed" "$fuzz/decode_wire" "$fuzz/apply_transaction" "$fuzz/state_sequence"
+          cp "$vectors/golden_framed_message.bin" "$fuzz/decode_framed/"
+          cp "$vectors/malformed_overlong_varint.bin" "$fuzz/decode_framed/"
+          cp "$vectors/malformed_truncated_frame.bin" "$fuzz/decode_framed/"
+          cp "$vectors/golden_node_record.bin" "$fuzz/decode_wire/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/decode_wire/"
+          cp "$vectors/malformed/"*.bin "$fuzz/decode_wire/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/apply_transaction/"
+          cp "$vectors/malformed/"*.bin "$fuzz/apply_transaction/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/state_sequence/"
+      - name: Run AddressSanitizer-backed fuzz targets
+        working-directory: server-rust/fuzz
+        run: |
+          set -euo pipefail
+          # cargo-fuzz enables AddressSanitizer by default. Preserve new crash artifacts for triage.
+          for target in decode_framed decode_wire apply_transaction state_sequence; do
+            cargo fuzz run "$target" "corpus/$target" -- -max_total_time=180
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: server-rust/fuzz/artifacts/
+          if-no-files-found: ignore

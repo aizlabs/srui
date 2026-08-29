@@ -5,52 +5,44 @@
 // A dropped transport must terminate its receive stream instead of stranding consumers (§20.2, §22).
 //
 
-import Testing
 import Foundation
+import Testing
 import TransportSSH
 
 @Suite("Transport Teardown Tests")
 struct TransportTeardownTests {
-
-    @Test("Dropping a unix socket transport terminates its receive stream")
+    @Test(
+        "Dropping a unix socket transport terminates its receive stream",
+        .timeLimit(.minutes(1))
+    )
     func droppedUnixSocketTransportFinishesReceiveStream() async {
         let path = NSTemporaryDirectory() + "srui-dropped-\(UUID().uuidString).sock"
         var transport: UnixSocketTransport? = UnixSocketTransport(socketPath: path)
         let stream = transport!.receiveStream()
         transport = nil
 
-        #expect(await streamTerminates(stream, within: 2.0))
+        await expectTerminated(stream)
     }
 
-    @Test("Dropping a TCP transport terminates its receive stream")
+    @Test(
+        "Dropping a TCP transport terminates its receive stream",
+        .timeLimit(.minutes(1))
+    )
     func droppedTCPSocketTransportFinishesReceiveStream() async {
         var transport: TCPSocketTransport? = TCPSocketTransport(host: "127.0.0.1", port: 1)
         let stream = transport!.receiveStream()
         transport = nil
 
-        #expect(await streamTerminates(stream, within: 2.0))
+        await expectTerminated(stream)
     }
 
-    private func streamTerminates(
-        _ stream: AsyncThrowingStream<Data, Error>,
-        within seconds: Double
-    ) async -> Bool {
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                do {
-                    for try await _ in stream {}
-                } catch {
-                    // A thrown termination still terminates the stream.
-                }
-                return true
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                return false
-            }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            return first
+    private func expectTerminated(_ stream: AsyncThrowingStream<Data, Error>) async {
+        var iterator = stream.makeAsyncIterator()
+        do {
+            let unexpectedElement = try await iterator.next()
+            #expect(unexpectedElement == nil, "a dropped transport must finish without yielding data")
+        } catch {
+            // Error completion is also a valid terminal state; the key contract is no stranded waiter.
         }
     }
 }

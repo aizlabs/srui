@@ -450,10 +450,10 @@ public final class ControlFactory {
             progress.doubleValue = numericValue(value) ?? 0
         } else if let button = handle.view as? NSButton, handle.nodeType == .toggle {
             button.state = (value?.asBool ?? false) ? .on : .off
-        } else if let field = handle.view as? NSTextField, let string = value?.asString {
-            field.stringValue = string
-        } else if let textView = textView(in: handle), let string = value?.asString {
-            textView.string = string
+        } else if let field = handle.view as? NSTextField {
+            field.stringValue = value?.asString ?? ""
+        } else if let textView = textView(in: handle) {
+            textView.string = value?.asString ?? ""
         }
     }
 
@@ -531,23 +531,19 @@ public final class ControlFactory {
     private func applyAlignment(to handle: RenderHandle) {
         guard let stack = handle.view as? NSStackView else { return }
 
-        if stack.orientation == .vertical,
-           let token = handle.layoutMetadata.horizontalAlignment {
-            switch token {
-            case .horizontalAlignmentLeading: stack.alignment = .leading
+        if stack.orientation == .vertical {
+            switch handle.layoutMetadata.horizontalAlignment {
             case .horizontalAlignmentCenter: stack.alignment = .centerX
             case .horizontalAlignmentTrailing: stack.alignment = .trailing
             case .horizontalAlignmentFill: stack.alignment = .width
-            default: break
+            default: stack.alignment = .leading
             }
-        } else if stack.orientation == .horizontal,
-                  let token = handle.layoutMetadata.verticalAlignment {
-            switch token {
+        } else if stack.orientation == .horizontal {
+            switch handle.layoutMetadata.verticalAlignment {
             case .verticalAlignmentTop: stack.alignment = .top
-            case .verticalAlignmentCenter: stack.alignment = .centerY
             case .verticalAlignmentBottom: stack.alignment = .bottom
             case .verticalAlignmentFill: stack.alignment = .height
-            default: break
+            default: stack.alignment = .centerY
             }
         }
     }

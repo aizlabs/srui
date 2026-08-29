@@ -15,7 +15,6 @@ from validate.conformance import (
     REQUIRED_STANDARD_PROPERTIES,
     SHOULD_NODE_TYPES,
 )
-from validate.invariants import validate_category_sequence
 from validate.loader import RegistryLoadError, load_registry
 from validate.validate import ValidationResult, validate_registry_data
 
@@ -37,8 +36,12 @@ def _print_success(result: ValidationResult) -> None:
         f"  • Node Types: {node_types_count} defined "
         f"(all {len(ALL_SECTION_7_2_NODE_TYPES)} §7.2 types present)"
     )
-    print(f"    - Required tier (§7.3): {len(REQUIRED_NODE_TYPES)}/{len(REQUIRED_NODE_TYPES)} verified")
-    print(f"    - SHOULD tier (§7.3):   {len(SHOULD_NODE_TYPES)}/{len(SHOULD_NODE_TYPES)} verified")
+    print(
+        f"    - Required tier (§7.3): {len(REQUIRED_NODE_TYPES)}/{len(REQUIRED_NODE_TYPES)} verified"
+    )
+    print(
+        f"    - SHOULD tier (§7.3):   {len(SHOULD_NODE_TYPES)}/{len(SHOULD_NODE_TYPES)} verified"
+    )
     print(
         f"  • Properties: {properties_count} defined "
         f"(all {len(REQUIRED_STANDARD_PROPERTIES)} standard properties present)"
@@ -57,7 +60,9 @@ def _print_success(result: ValidationResult) -> None:
     )
     print("  • No duplicate IDs, no duplicate names, no accidental gaps in numbering.")
     print(f"  • Tier metadata verified for {len(EXPECTED_NODE_TIERS)} node types.")
-    print("  • Triple-oracle sync verified (registry.yaml ↔ srui.proto ↔ srui.pb.swift).")
+    print(
+        "  • Triple-oracle sync verified (registry.yaml ↔ srui.proto ↔ srui.pb.swift)."
+    )
 
 
 def validate_registry(registry_path: Path, *, json_output: bool = False) -> bool:
@@ -112,14 +117,18 @@ def validate_registry(registry_path: Path, *, json_output: bool = False) -> bool
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Validate SRUI protocol registry YAML.")
+    parser = argparse.ArgumentParser(
+        description="Validate SRUI protocol registry YAML."
+    )
     parser.add_argument(
         "registry",
         nargs="?",
         default=str(Path(__file__).resolve().parent.parent / "registry.yaml"),
         help="Path to registry.yaml (defaults to protocol/registry.yaml)",
     )
-    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON output.")
+    parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON output."
+    )
     args = parser.parse_args(argv)
 
     success = validate_registry(Path(args.registry), json_output=args.json)

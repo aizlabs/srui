@@ -10,7 +10,8 @@ use tokio_util::codec::Decoder;
 fn golden_framed_bytes() -> Vec<u8> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     fs::read(
-        Path::new(manifest_dir).join("../../protocol/conformance-vectors/golden_framed_message.bin"),
+        Path::new(manifest_dir)
+            .join("../../protocol/conformance-vectors/golden_framed_message.bin"),
     )
     .expect("read golden_framed_message.bin")
 }
@@ -32,7 +33,8 @@ fn sample_message() -> SruiMessage {
 
 fn build_synthetic_frame(declared_payload_len: usize, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::new();
-    prost::encode_length_delimiter(declared_payload_len, &mut frame).expect("encode length delimiter");
+    prost::encode_length_delimiter(declared_payload_len, &mut frame)
+        .expect("encode length delimiter");
     frame.extend_from_slice(payload);
     frame
 }
@@ -60,7 +62,8 @@ where
 
     if buf.is_empty() {
         last
-    } else if let Some(msg) = on_chunk(&mut codec, &mut buf).expect("final decode should not panic") {
+    } else if let Some(msg) = on_chunk(&mut codec, &mut buf).expect("final decode should not panic")
+    {
         Some(msg)
     } else {
         last
@@ -85,7 +88,10 @@ fn decode_by_split_points(frame: &[u8]) -> SruiMessage {
             .expect("second chunk decode")
             .expect("split at {split} should complete on second chunk");
         assert_eq!(decoded, expected, "split at {split}");
-        assert!(buf.is_empty(), "split at {split} should consume entire frame");
+        assert!(
+            buf.is_empty(),
+            "split at {split} should consume entire frame"
+        );
     }
     expected
 }
@@ -140,16 +146,16 @@ fn test_varint_length_prefix_boundaries_wait_for_payload() {
         let mut codec = SruiCodec::new();
         let mut buf = BytesMut::from(&frame[..prefix_len]);
         assert!(
-            codec.decode(&mut buf).expect("prefix-only decode").is_none(),
+            codec
+                .decode(&mut buf)
+                .expect("prefix-only decode")
+                .is_none(),
             "declared length {declared_len} should wait for payload"
         );
 
         buf.extend_from_slice(&frame[prefix_len..]);
         assert!(
-            matches!(
-                codec.decode(&mut buf),
-                Err(FramingError::DecodeError(_))
-            ),
+            matches!(codec.decode(&mut buf), Err(FramingError::DecodeError(_))),
             "declared length {declared_len} with zero-filled payload should fail protobuf decode"
         );
     }
@@ -216,12 +222,16 @@ fn test_overlong_varint_returns_decode_error_without_consuming() {
 
     let err = codec.decode(&mut buf).expect_err("overlong varint");
     assert!(matches!(err, FramingError::DecodeError(_)));
-    assert_eq!(buf.len(), 11, "overlong varint bytes should remain in buffer");
+    assert_eq!(
+        buf.len(),
+        11,
+        "overlong varint bytes should remain in buffer"
+    );
 }
 
 #[test]
 fn test_declared_length_exceeds_available_payload_waits_then_recovers() {
-    let truncated = vec![0x64, 0x01, 0x02, 0x03, 0x04]; // declares 100, provides 4
+    let truncated = [0x64, 0x01, 0x02, 0x03, 0x04]; // declares 100, provides 4
     let valid = encode_framed(&sample_message()).expect("encode valid frame");
 
     let mut codec = SruiCodec::new();
@@ -294,7 +304,10 @@ fn test_decoder_recovers_after_invalid_protobuf_payload() {
         codec.decode(&mut buf),
         Err(FramingError::DecodeError(_))
     ));
-    assert!(buf.is_empty(), "invalid frame should be consumed from buffer");
+    assert!(
+        buf.is_empty(),
+        "invalid frame should be consumed from buffer"
+    );
 
     buf.extend_from_slice(&valid);
     let decoded = codec

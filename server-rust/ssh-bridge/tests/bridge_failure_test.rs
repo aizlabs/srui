@@ -46,7 +46,9 @@ async fn spawn_bridge(
     session_bridge_side: tokio::io::DuplexStream,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<(), srui_ssh_bridge::BridgeError>> {
-    tokio::spawn(async move { bridge_streams(ssh_bridge_side, session_bridge_side, shutdown).await })
+    tokio::spawn(
+        async move { bridge_streams(ssh_bridge_side, session_bridge_side, shutdown).await },
+    )
 }
 
 /// Limits each `write` call to at most `max_chunk` bytes so `copy_bidirectional`
@@ -93,7 +95,10 @@ async fn partial_writes_forward_all_bytes() {
     let frame = encode_framed(&sample_hello()).expect("encode hello");
     let (mut _ssh_read, ssh_write) = tokio::io::split(ssh_client);
     let mut ssh_write = LimitedWrite::new(ssh_write, 1);
-    ssh_write.write_all(&frame).await.expect("partial writes to bridge");
+    ssh_write
+        .write_all(&frame)
+        .await
+        .expect("partial writes to bridge");
 
     let (mut session_read, _session_write) = tokio::io::split(session_daemon);
     let mut received = vec![0u8; frame.len()];
@@ -209,7 +214,10 @@ async fn one_side_close_propagates_eof_to_peer() {
     drop(ssh_framed_write);
 
     let eof = session_framed_read.next().await;
-    assert!(eof.is_none(), "session read should observe EOF after ssh close");
+    assert!(
+        eof.is_none(),
+        "session read should observe EOF after ssh close"
+    );
 
     session_write.shutdown().await.expect("close session write");
     drop(session_read);
@@ -292,7 +300,9 @@ fn binary_stderr_contains_no_protocol_bytes() {
     let frame = encode_framed(&sample_hello()).expect("encode hello");
     {
         let stdin = child.stdin.as_mut().expect("child stdin");
-        stdin.write_all(&frame).expect("write framed hello to bridge stdin");
+        stdin
+            .write_all(&frame)
+            .expect("write framed hello to bridge stdin");
     }
 
     let mut received = vec![0u8; frame.len()];
@@ -302,7 +312,6 @@ fn binary_stderr_contains_no_protocol_bytes() {
     assert_eq!(received, frame);
 
     thread::sleep(Duration::from_millis(100));
-
     child.kill().expect("terminate bridge child");
     let mut stderr_bytes = Vec::new();
     child
@@ -311,6 +320,11 @@ fn binary_stderr_contains_no_protocol_bytes() {
         .expect("child stderr")
         .read_to_end(&mut stderr_bytes)
         .expect("read stderr");
+    let status = child.wait().expect("reap bridge child");
+    assert!(
+        !status.success(),
+        "killed bridge child must not exit successfully"
+    );
 
     let stderr_text = String::from_utf8_lossy(&stderr_bytes);
     assert!(
@@ -318,7 +332,9 @@ fn binary_stderr_contains_no_protocol_bytes() {
         "stderr should contain bridge diagnostics, got: {stderr_text}"
     );
     assert!(
-        !stderr_bytes.windows(frame.len()).any(|window| window == frame),
+        !stderr_bytes
+            .windows(frame.len())
+            .any(|window| window == frame),
         "protocol frame bytes must not appear on stderr"
     );
 

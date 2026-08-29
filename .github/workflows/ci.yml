@@ -34,6 +34,38 @@ jobs:
           cargo check --workspace --all-targets
         working-directory: server-rust
 
+  fuzz:
+    name: Decoder Fuzz Regression
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed fuzz corpora from conformance vectors
+        run: |
+          set -euo pipefail
+          vectors="$GITHUB_WORKSPACE/protocol/conformance-vectors"
+          fuzz="$GITHUB_WORKSPACE/server-rust/fuzz/corpus"
+          mkdir -p "$fuzz/decode_framed" "$fuzz/decode_wire" "$fuzz/apply_transaction"
+          cp "$vectors/golden_framed_message.bin" "$fuzz/decode_framed/"
+          cp "$vectors/malformed_overlong_varint.bin" "$fuzz/decode_framed/"
+          cp "$vectors/malformed_truncated_frame.bin" "$fuzz/decode_framed/"
+          cp "$vectors/golden_node_record.bin" "$fuzz/decode_wire/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/decode_wire/"
+          cp "$vectors/malformed/"*.bin "$fuzz/decode_wire/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/apply_transaction/"
+          cp "$vectors/malformed/"*.bin "$fuzz/apply_transaction/"
+      - name: Run bounded fuzz regression
+        working-directory: server-rust/fuzz
+        run: |
+          set -euo pipefail
+          for target in decode_framed decode_wire apply_transaction; do
+            cargo fuzz run "$target" corpus -- -runs=0
+            cargo fuzz run "$target" corpus -- -max_total_time=15
+          done
+
   swift:
     name: Swift Build
     runs-on: macos-15

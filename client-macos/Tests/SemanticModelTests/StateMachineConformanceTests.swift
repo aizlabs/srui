@@ -50,6 +50,19 @@ final class StateMachineConformanceTests: XCTestCase {
         let fileManager = FileManager.default
         let fileURLs = try fileManager.contentsOfDirectory(at: vectorsDir, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
+            .filter { fileURL in
+                let name = fileURL.lastPathComponent
+                if let filter = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_VECTOR"] {
+                    return name == filter
+                }
+                if let from = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_FROM"] {
+                    if name < from { return false }
+                }
+                if let to = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_TO"] {
+                    if name > to { return false }
+                }
+                return true
+            }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
 
         XCTAssertFalse(fileURLs.isEmpty, "Found 0 conformance vector JSON files in \(vectorsDir.path)")
@@ -568,38 +581,26 @@ final class StateMachineConformanceTests: XCTestCase {
         }
 
         if let num = raw as? NSNumber {
-            // Check if boolean (in Obj-C runtime Bool is NSNumber)
             if CFGetTypeID(num) == CFBooleanGetTypeID() {
                 return .bool(num.boolValue)
             }
-            // Check if floating point (has fractional component or float type)
             let objCType = String(cString: num.objCType)
-            if objCType == "d" || objCType == "f" || num.stringValue.contains(".") {
+            if objCType == "d" || objCType == "f" {
                 return .float64(num.doubleValue)
-            } else if num.intValue < 0 {
-                return .signedInt(num.int64Value)
-            } else {
-                return .unsignedInt(num.uint64Value)
             }
+            let stringValue = num.stringValue
+            if stringValue.contains(".") || stringValue.contains("e") || stringValue.contains("E") {
+                return .float64(num.doubleValue)
+            }
+            // Avoid `intValue` — it traps on arm64 when the magnitude exceeds Int.max.
+            if stringValue.hasPrefix("-") {
+                return .signedInt(num.int64Value)
+            }
+            return .unsignedInt(num.uint64Value)
         }
 
         if let dict = raw as? [String: Any] {
-            // Enum token representation: { "enum": "TextRole", "value": "heading" }
-            if let enumName = dict["enum"] as? String, let variant = dict["value"] as? String {
-                if let token = EnumToken.resolveStandard(enumName: enumName, valueName: variant) {
-                    return .enumToken(token)
-                }
-                return .string(variant)
-            }
-
-            // General record representation
-            var properties: [Property] = []
-            for (k, v) in dict {
-                let propRef = try resolvePropertyName(k)
-                let val = try convertValue(v)
-                properties.append(Property(property: propRef, value: val))
-            }
-            return .record(SmallRecord(typeRef: TypeRef.standard(0), properties: properties))
+            return try convertStructuredValue(dict)
         }
 
         if let list = raw as? [Any] {
@@ -608,6 +609,90 @@ final class StateMachineConformanceTests: XCTestCase {
         }
 
         return .string(String(describing: raw))
+    }
+
+    private func convertStructuredValue(_ dict: [String: Any]) throws -> Value {
+        var map = dict
+
+        if let enumName = map.removeValue(forKey: "enum") as? String,
+           let variant = map.removeValue(forKey: "value") as? String {
+            if let token = EnumToken.resolveStandard(enumName: enumName, valueName: variant) {
+                return .enumToken(token)
+            }
+            return .string(variant)
+        }
+
+        if let enumID = map.removeValue(forKey: "enum_id") as? NSNumber,
+           let valueID = map.removeValue(forKey: "value_id") as? NSNumber {
+            return .enumToken(EnumToken(enumID: enumID.uint32Value, valueID: valueID.uint32Value))
+        }
+
+        if let nodeID = map.removeValue(forKey: "node_id") as? NSNumber {
+            return .nodeID(NodeId(nodeID.uint64Value))
+        }
+
+        if let itemID = map.removeValue(forKey: "item_id") as? NSNumber {
+            return .itemID(ItemId(itemID.uint64Value))
+        }
+
+        if let hashStr = map.removeValue(forKey: "resource_hash") as? String {
+            return .resourceHash(try ResourceHash(hex: hashStr))
+        }
+
+        if let x = map["x"] as? NSNumber,
+           let y = map["y"] as? NSNumber,
+           let width = map["width"] as? NSNumber,
+           let height = map["height"] as? NSNumber {
+            return .rect(Rect(
+                x: x.doubleValue,
+                y: y.doubleValue,
+                width: width.doubleValue,
+                height: height.doubleValue
+            ))
+        }
+
+        if let width = map.removeValue(forKey: "width") as? NSNumber,
+           let height = map.removeValue(forKey: "height") as? NSNumber {
+            return .size(Size(width: width.doubleValue, height: height.doubleValue))
+        }
+
+        if let x = map.removeValue(forKey: "x") as? NSNumber,
+           let y = map.removeValue(forKey: "y") as? NSNumber {
+            return .point(Point(x: x.doubleValue, y: y.doubleValue))
+        }
+
+        if let start = map.removeValue(forKey: "start") as? NSNumber,
+           let length = map.removeValue(forKey: "length") as? NSNumber {
+            return .range(SemanticRange(start: start.uint64Value, length: length.uint64Value))
+        }
+
+        if let top = map.removeValue(forKey: "top") as? NSNumber,
+           let leading = map.removeValue(forKey: "leading") as? NSNumber,
+           let bottom = map.removeValue(forKey: "bottom") as? NSNumber,
+           let trailing = map.removeValue(forKey: "trailing") as? NSNumber {
+            return .edgeInsets(EdgeInsets(
+                top: top.doubleValue,
+                leading: leading.doubleValue,
+                bottom: bottom.doubleValue,
+                trailing: trailing.doubleValue
+            ))
+        }
+
+        if let recordTypeRaw = map.removeValue(forKey: "record_type"),
+           let propsRaw = map.removeValue(forKey: "properties") {
+            let typeRef = try resolveNodeType(recordTypeRaw as? String ?? String(describing: recordTypeRaw))
+            guard let propsDict = propsRaw as? [String: Any] else {
+                throw StoreError.operationError("record properties must be an object")
+            }
+            var properties: [Property] = []
+            for (k, v) in propsDict {
+                let propRef = try resolvePropertyName(k)
+                properties.append(Property(property: propRef, value: try convertValue(v)))
+            }
+            return .record(SmallRecord(typeRef: typeRef, properties: properties))
+        }
+
+        throw StoreError.operationError("Unrecognized structured value object in fixture: \(dict)")
     }
 
     // MARK: - Invariant Verification (§4.7, §4.16, §4.17, §7.1, §10, §32.3)

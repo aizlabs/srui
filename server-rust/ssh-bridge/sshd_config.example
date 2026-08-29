@@ -1,0 +1,18 @@
+# Example OpenSSH Server Configuration for SRUI Subsystem (§19, §19.1, §20.1)
+#
+# Add this snippet to /etc/ssh/sshd_config or /etc/ssh/sshd_config.d/srui.conf
+#
+# When a client connects via `ssh -s <host> srui`, sshd launches srui-ssh-bridge
+# under the authenticated user's OS privileges with standard I/O wired to the
+# SSH channel. The bridge transparently proxies framed protocol bytes to the
+# user's private session daemon socket (srui-sessiond.sock).
+#
+# Format:
+#   Subsystem <subsystem_name> <path_to_binary> [<arguments>...]
+
+# Default configuration (connects to $XDG_RUNTIME_DIR/srui-sessiond.sock or /tmp/srui-sessiond.sock):
+Subsystem srui /usr/local/bin/srui-ssh-bridge
+
+# Or specify a custom socket path explicitly:
+# Subsystem srui /usr/local/bin/srui-ssh-bridge /run/user/1000/srui-sessiond.sock
+# Subsystem srui /usr/local/bin/srui-ssh-bridge --socket /run/user/1000/srui-sessiond.sock

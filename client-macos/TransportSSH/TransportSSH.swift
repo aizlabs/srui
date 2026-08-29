@@ -2,9 +2,10 @@
 // TransportSSH.swift
 // TransportSSH
 //
-// SRUI Transport Layer exports (§19, §20.2, §22).
+// SRUI SSH Transport Layer exports (§19, §19.1, §20.2, §22).
 //
 
 public struct TransportSSHPlaceholder {
     public init() {}
 }
+

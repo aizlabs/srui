@@ -18,7 +18,45 @@ struct RendererDemoApp {
     static func main() {
         let args = CommandLine.arguments
 
-        if let socketIndex = args.firstIndex(of: "--socket"), socketIndex + 1 < args.count {
+        if let sshIndex = args.firstIndex(of: "--ssh"), sshIndex + 1 < args.count {
+            let host = args[sshIndex + 1]
+            var port: UInt16?
+            var user: String?
+            var subsystem = "srui"
+            var identity: String?
+            var knownHosts: String?
+            var batchMode = false
+
+            if let pIdx = args.firstIndex(of: "--port"), pIdx + 1 < args.count {
+                port = UInt16(args[pIdx + 1])
+            }
+            if let uIdx = args.firstIndex(of: "--user"), uIdx + 1 < args.count {
+                user = args[uIdx + 1]
+            }
+            if let sIdx = args.firstIndex(of: "--subsystem"), sIdx + 1 < args.count {
+                subsystem = args[sIdx + 1]
+            }
+            if let iIdx = args.firstIndex(of: "--identity"), iIdx + 1 < args.count {
+                identity = args[iIdx + 1]
+            }
+            if let kIdx = args.firstIndex(of: "--known-hosts"), kIdx + 1 < args.count {
+                knownHosts = args[kIdx + 1]
+            }
+            if args.contains("--batch") {
+                batchMode = true
+            }
+
+            let config = SSHConfiguration(
+                host: host,
+                port: port,
+                user: user,
+                subsystem: subsystem,
+                identityFile: identity,
+                knownHostsFile: knownHosts,
+                batchMode: batchMode
+            )
+            runLiveSession(transport: SSHTransport(configuration: config))
+        } else if let socketIndex = args.firstIndex(of: "--socket"), socketIndex + 1 < args.count {
             let socketPath = args[socketIndex + 1]
             runLiveSession(transport: UnixSocketTransport(socketPath: socketPath))
         } else if let tcpIndex = args.firstIndex(of: "--tcp"), tcpIndex + 2 < args.count {

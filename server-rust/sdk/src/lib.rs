@@ -9,12 +9,13 @@ pub mod widgets;
 pub use session::*;
 pub use widgets::*;
 
-// Re-export standard event types, identifiers, transactions, and wire helpers (§6.1, §7.6, §7.7, §12.1, §16)
+// Re-export standard event types, identifiers, transactions, capabilities, and wire helpers (§6.1, §7.6, §7.7, §12.1, §15, §16)
 pub use srui_semantic_tree::{
     decode_event, decode_message, decode_node_record, decode_operation, decode_transaction,
     decode_value, encode_event, encode_message, encode_node_record, encode_operation,
-    encode_transaction, encode_value, ClientInstanceId, EnumToken, Event, EventId,
-    EventValidationError, NodeRecord, Revision, Transaction, TxnError, WireError,
+    encode_transaction, encode_value, CapabilitySet, ClientInstanceId, EnumToken, Event, EventId,
+    EventValidationError, NegotiationError, NodeRecord, Profile, Revision, ServerCapabilities,
+    Transaction, TxnError, WireError,
 };
 
 // =============================================================================

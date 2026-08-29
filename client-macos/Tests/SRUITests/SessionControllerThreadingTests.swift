@@ -35,6 +35,13 @@ struct SessionControllerThreadingTests {
 
         try await controller.start()
 
+        var welcome = SRUIServerWelcome()
+        welcome.sessionID = "test-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
         // 1. Server sends initial transaction (Revision 0 -> 1)
         let surfaceID = NodeId(1)
         let textID = NodeId(2)
@@ -164,11 +171,12 @@ struct SessionControllerThreadingTests {
 
         try await controller.start()
 
-        var resumeOk = SRUIServerResumeOk()
-        resumeOk.sessionID = "default"
-        var resumeMessage = SRUIMessage()
-        resumeMessage.serverResumeOk = resumeOk
-        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMessage))
+        var welcome = SRUIServerWelcome()
+        welcome.sessionID = "default"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
 
         // Mount a button
         let buttonID = NodeId(42)

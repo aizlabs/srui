@@ -59,6 +59,8 @@ public final class SessionController: @unchecked Sendable {
     public let outbox: EventOutbox
     public let decoder: ProtocolDecoder
     public let renderer: AppKitRenderer?
+    public let clientCapabilities: CapabilitySet
+    public let requiredServerProfiles: CapabilitySet
 
     private let lock = NSLock()
     private var streamDecoder = SRUIMessageStreamDecoder()
@@ -73,6 +75,8 @@ public final class SessionController: @unchecked Sendable {
     private var requestedSessionId: String?
     private var resumeAttemptId: UUID?
     private var eventDispatchEnabled = false
+    private var _negotiatedCapabilities: CapabilitySet?
+    private var _isHandshakeComplete = false
 
     public init(
         transport: any Transport,
@@ -80,7 +84,9 @@ public final class SessionController: @unchecked Sendable {
         outbox: EventOutbox = EventOutbox(),
         decoder: ProtocolDecoder = ProtocolDecoder(),
         renderer: AppKitRenderer? = nil,
-        sessionId: String? = nil
+        sessionId: String? = nil,
+        clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1],
+        requiredServerProfiles: CapabilitySet = []
     ) {
         self.transport = transport
         self.applier = applier
@@ -88,12 +94,24 @@ public final class SessionController: @unchecked Sendable {
         self.decoder = decoder
         self.renderer = renderer
         self.currentSessionId = sessionId
+        self.clientCapabilities = clientCapabilities
+        self.requiredServerProfiles = requiredServerProfiles
     }
 
     private func withStateLock<T>(_ body: () -> T) -> T {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+
+    /// Whether the handshake has completed successfully (§15).
+    public var isHandshakeComplete: Bool {
+        withStateLock { _isHandshakeComplete }
+    }
+
+    /// Active negotiated capability set with the remote server (§15).
+    public var negotiatedCapabilities: CapabilitySet? {
+        withStateLock { _negotiatedCapabilities }
     }
 
     /// Whether the local replica has stopped tracking the authoritative stream (§18).
@@ -152,15 +170,16 @@ public final class SessionController: @unchecked Sendable {
         wireActionHandler(for: renderer)
     }
 
-    /// Starts the session by sending a resume request and launching the receive loop (§18, §22.2).
+    /// Starts the session by sending a handshake request and launching the receive loop (§15, §18, §22.2).
     ///
-    /// Pending events remain retained but are not replayed until the server explicitly confirms
-    /// continuity with `SERVER RESUME_OK` or same-session `SERVER RESYNC_REQUIRED`.
+    /// Fresh connections send `CLIENT_HELLO` with client capabilities (§15). Reconnections send `CLIENT_RESUME` (§18).
+    /// The handshake must complete before any transaction or event traffic is permitted (§4 inv. 13, §15).
     public func start() async throws {
         let shouldStart = withStateLock {
             if isRunning { return false }
             isRunning = true
             eventDispatchEnabled = false
+            _isHandshakeComplete = false
             return true
         }
         guard shouldStart else { return }
@@ -173,6 +192,7 @@ public final class SessionController: @unchecked Sendable {
                     self.requestedSessionId = nil
                     self.resumeAttemptId = nil
                     self.eventDispatchEnabled = false
+                    self._isHandshakeComplete = false
                 }
             }
         }
@@ -181,26 +201,38 @@ public final class SessionController: @unchecked Sendable {
             ensureActionHandlerWired()
         }
 
-        let resumeAttemptId = await outbox.beginResumeAttempt()
-        let requestedSessionId = withStateLock {
-            let id = currentSessionId ?? "default"
-            self.requestedSessionId = id
-            self.resumeAttemptId = resumeAttemptId
-            return id
-        }
         let clientInstanceId = outbox.clientInstanceId
-        var resume = SRUIClientResume()
-        resume.sessionID = requestedSessionId
-        resume.clientInstanceID = clientInstanceId.bytes
-        resume.lastAppliedRevision = applier.lastAppliedRevision.value
-        resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
+        let requestedId = withStateLock {
+            currentSessionId ?? requestedSessionId
+        }
 
-        var envelope = SRUIMessage()
-        envelope.clientResume = resume
-        try await transport.send(data: SRUIFraming.encodeFramed(envelope))
+        if let requestedId {
+            let resumeAttemptId = await outbox.beginResumeAttempt()
+            withStateLock {
+                self.requestedSessionId = requestedId
+                self.resumeAttemptId = resumeAttemptId
+            }
+            var resume = SRUIClientResume()
+            resume.sessionID = requestedId
+            resume.clientInstanceID = clientInstanceId.bytes
+            resume.lastAppliedRevision = applier.lastAppliedRevision.value
+            resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
 
-        // Start receiving the decision before replaying anything. Full-duplex transport ordering
-        // cannot by itself prove that the old semantic session survived.
+            var envelope = SRUIMessage()
+            envelope.clientResume = resume
+            try await transport.send(data: SRUIFraming.encodeFramed(envelope))
+        } else {
+            var hello = SRUIClientHello()
+            hello.coreVersion = "0.4.0"
+            hello.profiles = clientCapabilities.toStringArray()
+            hello.clientInstanceID = clientInstanceId.bytes
+
+            var envelope = SRUIMessage()
+            envelope.clientHello = hello
+            try await transport.send(data: SRUIFraming.encodeFramed(envelope))
+        }
+
+        // Start receiving the handshake response before processing data.
         let task = Task.detached { [weak self] in
             guard let self else { return }
             await self.runReceiveLoop()
@@ -221,7 +253,7 @@ public final class SessionController: @unchecked Sendable {
 
     @discardableResult
     private func sendActivate(nodeId: NodeId, observedRevision: Revision) async throws -> Event {
-        guard withStateLock({ eventDispatchEnabled }) else {
+        guard withStateLock({ eventDispatchEnabled && _isHandshakeComplete }) else {
             throw SessionDispatchError.resumeNotConfirmed
         }
         return try await outbox.sendActivate(
@@ -264,15 +296,48 @@ public final class SessionController: @unchecked Sendable {
         await reportFailure(.transportEnded("receive stream closed by peer"))
     }
 
-    /// Processes a single wire envelope, deserializing and applying transactions serially (§12.1, §22.2).
+    /// Processes a single wire envelope, enforcing handshake completion before transactions/events (§12.1, §15, §22.2).
     public func handleIncomingMessage(_ message: SRUIMessage) async {
         guard let payload = message.msg else { return }
 
-        switch payload {
-        case .serverResumeOk(let resumeOk):
-            await handleResumeOk(resumeOk)
+        let (handshakeDone, running) = withStateLock { (_isHandshakeComplete, isRunning) }
 
+        switch payload {
         case .serverWelcome(let welcome):
+            guard !handshakeDone else {
+                await reportFailure(.protocolViolation(
+                    "Unexpected SERVER WELCOME during active session after handshake completed"
+                ))
+                return
+            }
+
+            // §15: Parse and negotiate server capabilities
+            let serverRequired = CapabilitySet.fromValidStrings(welcome.requiredProfiles)
+            let serverOptional = CapabilitySet.fromValidStrings(welcome.optionalProfiles)
+
+            let negotiated: CapabilitySet
+            do {
+                negotiated = try CapabilitySet.negotiate(
+                    clientOffered: clientCapabilities,
+                    serverRequired: serverRequired,
+                    serverOptional: serverOptional
+                )
+            } catch {
+                await reportFailure(.protocolViolation(
+                    "Capability negotiation failed: \(error)"
+                ))
+                return
+            }
+
+            // Check client's required server profiles (if configured)
+            if !requiredServerProfiles.isEmpty && !negotiated.isSuperset(of: requiredServerProfiles) {
+                let missing = requiredServerProfiles.subtracting(negotiated)
+                await reportFailure(.protocolViolation(
+                    "Server does not satisfy client required profiles: \(missing)"
+                ))
+                return
+            }
+
             let accepted = await outbox.confirmFreshSession(id: welcome.sessionID)
             guard accepted else {
                 await reportFailure(.protocolViolation(
@@ -280,24 +345,60 @@ public final class SessionController: @unchecked Sendable {
                 ))
                 return
             }
+
             withStateLock {
                 self.currentSessionId = welcome.sessionID
                 self.requestedSessionId = nil
                 self.resumeAttemptId = nil
+                self._negotiatedCapabilities = negotiated
+                self._isHandshakeComplete = true
                 self.eventDispatchEnabled = true
             }
+            SessionDiagnostics.log("Handshake completed successfully with session \(welcome.sessionID), negotiated: \(negotiated)")
+
+        case .serverResumeOk(let resumeOk):
+            withStateLock {
+                self._isHandshakeComplete = true
+            }
+            await handleResumeOk(resumeOk)
 
         case .serverResyncRequired(let resync):
+            withStateLock {
+                self._isHandshakeComplete = true
+            }
             await handleResyncRequired(resync)
 
         case .transaction(let wireTx):
+            if running && !handshakeDone {
+                await reportFailure(.protocolViolation(
+                    "Received Transaction before handshake completed"
+                ))
+                return
+            }
             await handleTransaction(wireTx)
 
+        case .event:
+            if running && !handshakeDone {
+                await reportFailure(.protocolViolation(
+                    "Received Event before handshake completed"
+                ))
+                return
+            }
+            break
+
         case .serverEventAck(let ack):
+            if running && !handshakeDone {
+                await reportFailure(.protocolViolation(
+                    "Received ServerEventAck before handshake completed"
+                ))
+                return
+            }
             await handleEventAck(ack)
 
-        default:
-            break
+        case .clientHello, .clientResume:
+            await reportFailure(.protocolViolation(
+                "Received client-originated handshake message from server"
+            ))
         }
     }
 
@@ -305,9 +406,17 @@ public final class SessionController: @unchecked Sendable {
         let (requested, attemptId) = withStateLock {
             (requestedSessionId, resumeAttemptId)
         }
-        guard requested == resumeOk.sessionID, let attemptId else {
+        guard let requested, let attemptId else {
+            await outbox.acknowledgeEvents(throughSeq: resumeOk.lastProcessedEventSeq)
+            withStateLock {
+                self.currentSessionId = resumeOk.sessionID
+                self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+            }
+            return
+        }
+        guard requested == resumeOk.sessionID else {
             await reportFailure(.protocolViolation(
-                "SERVER RESUME_OK session_id \(resumeOk.sessionID) does not match requested \(requested ?? "<none>")"
+                "SERVER RESUME_OK session_id \(resumeOk.sessionID) does not match requested \(requested)"
             ))
             return
         }
@@ -340,70 +449,77 @@ public final class SessionController: @unchecked Sendable {
         let (requested, attemptId) = withStateLock {
             (requestedSessionId, resumeAttemptId)
         }
-        guard let requested, let attemptId else {
-            await reportFailure(.protocolViolation(
-                "SERVER RESYNC_REQUIRED received without an outstanding resume"
-            ))
-            return
-        }
 
-        switch resync.continuity {
-        case .sameSession:
-            guard resync.sessionID == requested else {
-                await reportFailure(.protocolViolation(
-                    "same-session resync changed session_id from \(requested) to \(resync.sessionID)"
-                ))
-                return
-            }
-            do {
-                let accepted = try await outbox.completeSameSessionResume(
-                    id: resync.sessionID,
-                    lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                    attemptId: attemptId,
-                    via: transport,
-                    enableNewEventsAfterReplay: false
-                )
-                guard accepted else {
-                    SessionDiagnostics.log("Ignoring superseded same-session resync")
+        if let requested, let attemptId {
+            switch resync.continuity {
+            case .sameSession:
+                guard resync.sessionID == requested else {
+                    await reportFailure(.protocolViolation(
+                        "same-session resync changed session_id from \(requested) to \(resync.sessionID)"
+                    ))
                     return
                 }
-            } catch {
-                await reportFailure(.transportEnded("pending event replay failed: \(error)"))
-                return
-            }
-            withStateLock {
-                self.currentSessionId = resync.sessionID
-                self.requestedSessionId = nil
-                self.pendingResync = true
-            }
+                do {
+                    let accepted = try await outbox.completeSameSessionResume(
+                        id: resync.sessionID,
+                        lastProcessedEventSeq: resync.lastProcessedEventSeq,
+                        attemptId: attemptId,
+                        via: transport,
+                        enableNewEventsAfterReplay: false
+                    )
+                    guard accepted else {
+                        SessionDiagnostics.log("Ignoring superseded same-session resync")
+                        return
+                    }
+                } catch {
+                    await reportFailure(.transportEnded("pending event replay failed: \(error)"))
+                    return
+                }
+                withStateLock {
+                    self.currentSessionId = resync.sessionID
+                    self.requestedSessionId = nil
+                    self.pendingResync = true
+                }
 
-        case .replaced:
-            guard resync.sessionID != requested else {
+            case .replaced:
+                guard resync.sessionID != requested else {
+                    await reportFailure(.protocolViolation(
+                        "replacement resync reused expired session_id \(requested)"
+                    ))
+                    return
+                }
+                let accepted = await outbox.prepareReplacedSession(
+                    id: resync.sessionID,
+                    lastProcessedEventSeq: resync.lastProcessedEventSeq,
+                    attemptId: attemptId
+                )
+                guard accepted else {
+                    SessionDiagnostics.log("Ignoring superseded replacement resync")
+                    return
+                }
+                withStateLock {
+                    self.currentSessionId = resync.sessionID
+                    self.requestedSessionId = nil
+                    self.pendingResync = true
+                }
+
+            case .unspecified:
                 await reportFailure(.protocolViolation(
-                    "replacement resync reused expired session_id \(requested)"
+                    "SERVER RESYNC_REQUIRED received with unspecified continuity"
+                ))
+                return
+            case .UNRECOGNIZED:
+                await reportFailure(.protocolViolation(
+                    "SERVER RESYNC_REQUIRED omitted a recognized session continuity"
                 ))
                 return
             }
-            let accepted = await outbox.prepareReplacedSession(
-                id: resync.sessionID,
-                lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                attemptId: attemptId
-            )
-            guard accepted else {
-                SessionDiagnostics.log("Ignoring superseded replacement resync")
-                return
-            }
+        } else {
+            // Mid-session resync notification without an outstanding resume attempt (§18)
             withStateLock {
                 self.currentSessionId = resync.sessionID
-                self.requestedSessionId = nil
                 self.pendingResync = true
             }
-
-        case .unspecified, .UNRECOGNIZED:
-            await reportFailure(.protocolViolation(
-                "SERVER RESYNC_REQUIRED omitted a recognized session continuity"
-            ))
-            return
         }
 
         SessionDiagnostics.log(
@@ -604,6 +720,8 @@ public final class SessionController: @unchecked Sendable {
             requestedSessionId = nil
             resumeAttemptId = nil
             eventDispatchEnabled = false
+            _isHandshakeComplete = false
+            _negotiatedCapabilities = nil
             return t
         }
 

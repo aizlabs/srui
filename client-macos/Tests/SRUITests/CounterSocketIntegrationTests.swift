@@ -76,6 +76,62 @@ struct CounterSocketIntegrationTests {
         await controller.stop()
     }
 
+    @Test("Connection fails cleanly at handshake time when server requires an unsupported profile (§4 inv. 13)")
+    @MainActor
+    func mismatchedRequiredProfileFailsAtHandshake() async throws {
+        let socketPath = "/tmp/srui-counter-mismatch-\(UUID().uuidString).sock"
+        let repoRoot = Self.repositoryRoot()
+        let counterBinary = repoRoot
+            .appendingPathComponent("examples/counter/target/debug/counter")
+
+        guard FileManager.default.fileExists(atPath: counterBinary.path) else {
+            Issue.record("Counter binary not found at \(counterBinary.path). Run: cargo build --manifest-path examples/counter/Cargo.toml")
+            return
+        }
+
+        let server = Process()
+        server.executableURL = counterBinary
+        server.arguments = ["--socket", socketPath, "--require-profile", "org.srui.unsupported-feature/1"]
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+
+        try server.run()
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+            server.waitUntilExit()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
+
+        let transport = UnixSocketTransport(socketPath: socketPath)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: transport,
+            applier: applier,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        try await AsyncTestSupport.eventually(description: "handshake failure on profile mismatch against live server") {
+            controller.isDiverged && (failurePromise.load() != nil || !controller.isHandshakeComplete)
+        }
+        #expect(!controller.isHandshakeComplete)
+        #expect(applier.lastAppliedRevision == .initial)
+
+        await controller.stop()
+    }
+
     private static func repositoryRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -122,5 +178,26 @@ private enum SocketIntegrationError: Error, CustomStringConvertible {
         case .revisionTimeout(let expected, let actual):
             return "Timed out waiting for revision \(expected), still at \(actual)"
         }
+    }
+}
+
+private final class ManagedAtomic<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T
+
+    init(_ value: T) {
+        self.value = value
+    }
+
+    func store(_ newValue: T) {
+        lock.lock()
+        defer { lock.unlock() }
+        value = newValue
+    }
+
+    func load() -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }

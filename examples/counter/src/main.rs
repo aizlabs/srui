@@ -15,14 +15,26 @@ use srui_example_counter::CounterApp;
 use srui_sdk::*;
 use srui_sessiond::{handle_connection, Session};
 
+fn parse_server_capabilities(args: &[String]) -> ServerCapabilities {
+    let mut server_caps = ServerCapabilities::standard_widgets();
+    if let Some(pos) = args.iter().position(|a| a == "--require-profile") {
+        if let Some(profile_str) = args.get(pos + 1) {
+            let profile = Profile::parse(profile_str).expect("valid profile syntax");
+            server_caps.required.insert(profile);
+        }
+    }
+    server_caps
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    let capabilities = parse_server_capabilities(&args);
 
     if let Some(pos) = args.iter().position(|a| a == "--socket") {
         if let Some(socket_path_str) = args.get(pos + 1) {
             let socket_path = PathBuf::from(socket_path_str);
-            run_unix_server(socket_path).await?;
+            run_unix_server(socket_path, capabilities).await?;
             return Ok(());
         }
     }
@@ -30,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pos) = args.iter().position(|a| a == "--port") {
         if let Some(port_str) = args.get(pos + 1) {
             let port: u16 = port_str.parse().expect("valid port number");
-            run_tcp_server(port).await?;
+            run_tcp_server(port, capabilities).await?;
             return Ok(());
         }
     }
@@ -115,7 +127,10 @@ fn initialize_counter_session(session: &Arc<Session>) -> (NodeId, NodeId, NodeId
     (surface_id, text_id, progress_id, button_id)
 }
 
-async fn run_unix_server(socket_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_unix_server(
+    socket_path: PathBuf,
+    capabilities: ServerCapabilities,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -135,7 +150,10 @@ async fn run_unix_server(socket_path: PathBuf) -> Result<(), Box<dyn std::error:
     let listener = UnixListener::bind(&socket_path)?;
     info!("Listening on Unix domain socket: {:?}", socket_path);
 
-    let session = Arc::new(Session::new("counter-socket-session"));
+    let session = Arc::new(Session::with_capabilities(
+        "counter-socket-session",
+        capabilities,
+    ));
     let _ = initialize_counter_session(&session);
 
     let shutdown = CancellationToken::new();
@@ -169,7 +187,10 @@ async fn run_unix_server(socket_path: PathBuf) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-async fn run_tcp_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_tcp_server(
+    port: u16,
+    capabilities: ServerCapabilities,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -181,7 +202,10 @@ async fn run_tcp_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on TCP loopback: {}", addr);
 
-    let session = Arc::new(Session::new("counter-tcp-session"));
+    let session = Arc::new(Session::with_capabilities(
+        "counter-tcp-session",
+        capabilities,
+    ));
     let _ = initialize_counter_session(&session);
 
     let shutdown = CancellationToken::new();

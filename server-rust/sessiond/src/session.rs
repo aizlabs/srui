@@ -219,6 +219,28 @@ impl Session {
         lock_or_recover(&self.tx_broadcast).clone()
     }
 
+    /// Creates a new `Session` with the given session ID and custom server capabilities (§15).
+    pub fn with_capabilities(
+        session_id: impl Into<String>,
+        capabilities: ServerCapabilities,
+    ) -> Self {
+        let session = Self::new(session_id);
+        session.set_capabilities(capabilities);
+        session
+    }
+
+    /// Sets the server-side capabilities for this session (§15).
+    pub fn set_capabilities(&self, capabilities: ServerCapabilities) {
+        let mut guard = lock_or_recover(&self.inner);
+        guard.capabilities = capabilities;
+    }
+
+    /// Returns the configured server capabilities for this session (§15).
+    pub fn capabilities(&self) -> ServerCapabilities {
+        let guard = lock_or_recover(&self.inner);
+        guard.capabilities.clone()
+    }
+
     /// Returns the session ID.
     pub fn session_id(&self) -> String {
         let guard = lock_or_recover(&self.inner);
@@ -248,6 +270,12 @@ impl Session {
             .iter_from(from_revision)
             .map(|iter| iter.cloned().collect())
             .ok_or(SessionError::ReplayUnavailable)
+    }
+
+    /// Exports the full current semantic store state as a snapshot transaction (§18, §18.1).
+    pub fn export_snapshot_transaction(&self) -> Result<Transaction, SessionError> {
+        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        Ok(export_snapshot_transaction(&guard.store))
     }
 
     /// Evaluates a `ClientHello` handshake message, negotiates capabilities,

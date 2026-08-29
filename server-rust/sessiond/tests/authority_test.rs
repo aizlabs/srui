@@ -89,7 +89,9 @@ async fn test_unrecognized_active_session_envelope_is_ignored() {
     let shutdown = CancellationToken::new();
     session
         .transaction(|ui| {
-            Surface::builder(NodeId::new(1)).label("baseline").create(ui)?;
+            Surface::builder(NodeId::new(1))
+                .label("baseline")
+                .create(ui)?;
             Ok(())
         })
         .expect("baseline transaction");

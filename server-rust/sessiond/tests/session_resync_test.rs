@@ -157,7 +157,11 @@ fn test_handle_resume_resync_snapshot_reconstructs_tree_and_models() {
         terminal_stream_offsets: Default::default(),
     };
 
-    let (resync_msg, snapshot_tx) = match session.handle_resume(&resume).expect("resume handled") {
+    let (resync_msg, snapshot_tx) = match session
+        .bootstrap_resume(&resume)
+        .expect("resume handled")
+        .outcome
+    {
         ResumeOutcome::Resync {
             resync_msg,
             snapshot_transaction,
@@ -237,7 +241,11 @@ fn test_resync_snapshot_chunks_cached_ranges_within_item_limit() {
         last_acked_event_seq: 0,
         terminal_stream_offsets: Default::default(),
     };
-    let snapshot_tx = match session.handle_resume(&resume).expect("resume handled") {
+    let snapshot_tx = match session
+        .bootstrap_resume(&resume)
+        .expect("resume handled")
+        .outcome
+    {
         ResumeOutcome::Resync {
             snapshot_transaction,
             ..

@@ -7,6 +7,43 @@ use tokio_util::sync::CancellationToken;
 use srui_protocol::{srui_message, ClientHello, ClientResume, SruiCodec, SruiMessage, Transaction};
 use srui_sessiond::{handle_connection, Session};
 
+fn seed_fat_session(session: &Session) -> u64 {
+    use srui_sdk::{List, Surface};
+    use srui_semantic_tree::{ModelId, ModelItem, Operation, TypeRef, Value};
+
+    let model_id = ModelId::new(10);
+    session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::create_model(model_id, TypeRef::LIST, 10))?;
+            ui.apply_op(&Operation::model_reset_range(
+                model_id,
+                0,
+                [
+                    ModelItem::with_value(
+                        srui_semantic_tree::ItemId::new(1),
+                        Value::String("item-1".into()),
+                    ),
+                    ModelItem::with_value(
+                        srui_semantic_tree::ItemId::new(2),
+                        Value::String("item-2".into()),
+                    ),
+                ],
+                None,
+            ))?;
+            Surface::builder(1)
+                .label("Initial Window with Long Title to Exceed Duplex Buffer Size")
+                .create(ui)?;
+            List::builder(2)
+                .parent(1)
+                .model_ref(model_id)
+                .label("List of Items")
+                .create(ui)?;
+            Ok(())
+        })
+        .expect("seed session state");
+    session.current_revision()
+}
+
 #[tokio::test]
 async fn test_sessiond_connection_handshake_and_transaction_broadcast() {
     let session = Arc::new(Session::new("test-session"));
@@ -174,44 +211,8 @@ async fn test_sessiond_connection_resume_replay() {
 
 #[tokio::test]
 async fn test_connection_fresh_hello_backpressured_snapshot_and_concurrent_commit() {
-    use srui_sdk::{List, Surface};
-    use srui_semantic_tree::{ModelId, ModelItem, Operation, TypeRef, Value};
-
     let session = Arc::new(Session::new("test-session-backpressure"));
-
-    // Seed session with enough state so serialized snapshot exceeds 64 bytes
-    let model_id = ModelId::new(10);
-    session
-        .transaction(|ui| {
-            ui.apply_op(&Operation::create_model(model_id, TypeRef::LIST, 10))?;
-            ui.apply_op(&Operation::model_reset_range(
-                model_id,
-                0,
-                [
-                    ModelItem::with_value(
-                        srui_semantic_tree::ItemId::new(1),
-                        Value::String("item-1".into()),
-                    ),
-                    ModelItem::with_value(
-                        srui_semantic_tree::ItemId::new(2),
-                        Value::String("item-2".into()),
-                    ),
-                ],
-                None,
-            ))?;
-            Surface::builder(1)
-                .label("Initial Window with Long Title to Exceed Duplex Buffer Size")
-                .create(ui)?;
-            List::builder(2)
-                .parent(1)
-                .model_ref(model_id)
-                .label("List of Items")
-                .create(ui)?;
-            Ok(())
-        })
-        .expect("seed session state");
-
-    let initial_revision = session.current_revision();
+    let initial_revision = seed_fat_session(&session);
     assert!(initial_revision > 0);
 
     let shutdown = CancellationToken::new();
@@ -284,6 +285,95 @@ async fn test_connection_fresh_hello_backpressured_snapshot_and_concurrent_commi
     }
 
     // 5. Receive subsequent broadcast transaction
+    let broadcast_msg = client_framed_read
+        .next()
+        .await
+        .expect("receive broadcast tx")
+        .expect("decode broadcast tx");
+
+    match broadcast_msg.msg {
+        Some(srui_message::Msg::Transaction(t)) => {
+            assert_eq!(t.base_revision, initial_revision);
+            assert_eq!(t.new_revision, initial_revision + 1);
+        }
+        other => panic!("expected Transaction, got {:?}", other),
+    }
+
+    shutdown.cancel();
+    let res = server_task.await.expect("server task completed");
+    assert!(res.is_ok());
+}
+
+#[tokio::test]
+async fn test_connection_resume_resync_backpressured_snapshot_and_concurrent_commit() {
+    let session = Arc::new(Session::new("test-session-resume-backpressure"));
+    let initial_revision = seed_fat_session(&session);
+    assert!(initial_revision > 0);
+
+    let shutdown = CancellationToken::new();
+    let (client_io, server_io) = duplex(64);
+
+    let session_clone = session.clone();
+    let shutdown_clone = shutdown.clone();
+    let server_task =
+        tokio::spawn(
+            async move { handle_connection(server_io, session_clone, shutdown_clone).await },
+        );
+
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let mut client_framed_read = FramedRead::new(client_read, SruiCodec::new());
+    let mut client_framed_write = FramedWrite::new(client_write, SruiCodec::new());
+
+    let resume = SruiMessage {
+        msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            session_id: "replaced-incarnation".to_string(),
+            client_instance_id: vec![42],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+        })),
+    };
+    client_framed_write.send(resume).await.expect("send resume");
+
+    let resync_msg = client_framed_read
+        .next()
+        .await
+        .expect("receive resync")
+        .expect("decode resync");
+
+    match resync_msg.msg {
+        Some(srui_message::Msg::ServerResyncRequired(r)) => {
+            assert_eq!(r.session_id, "test-session-resume-backpressure");
+            assert_eq!(r.snapshot_revision, initial_revision);
+        }
+        other => panic!("expected ServerResyncRequired, got {:?}", other),
+    }
+
+    let next_tx = Transaction {
+        base_revision: initial_revision,
+        new_revision: initial_revision + 1,
+        priority: 1,
+        operations: vec![],
+    };
+    session
+        .commit_transaction(next_tx)
+        .expect("commit next transaction");
+
+    let snapshot_msg = client_framed_read
+        .next()
+        .await
+        .expect("receive snapshot")
+        .expect("decode snapshot");
+
+    match snapshot_msg.msg {
+        Some(srui_message::Msg::Transaction(s)) => {
+            assert_eq!(s.base_revision, 0);
+            assert_eq!(s.new_revision, initial_revision);
+            assert!(!s.operations.is_empty());
+        }
+        other => panic!("expected snapshot Transaction, got {:?}", other),
+    }
+
     let broadcast_msg = client_framed_read
         .next()
         .await

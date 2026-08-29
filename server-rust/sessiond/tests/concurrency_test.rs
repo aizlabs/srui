@@ -23,13 +23,12 @@ fn first_created_node_id(tx: &Transaction) -> Option<u64> {
 }
 
 fn commit_surface(session: &Session, node_id: u64, label: &str) -> Result<(), SessionError> {
-    session.transaction(|ui| {
-        Surface::builder(node_id)
-            .label(label)
-            .create(ui)?;
-        Ok(())
-    })
-    .map(|_| ())
+    session
+        .transaction(|ui| {
+            Surface::builder(node_id).label(label).create(ui)?;
+            Ok(())
+        })
+        .map(|_| ())
 }
 
 #[test]
@@ -237,7 +236,8 @@ async fn test_broadcast_reflects_committed_state() {
                         barrier.wait();
                         let node_id = u64::try_from(worker + 1).expect("worker id fits in u64");
                         let label = format!("broadcast-worker-{worker}");
-                        commit_surface(&session, node_id, &label).expect("transaction must succeed");
+                        commit_surface(&session, node_id, &label)
+                            .expect("transaction must succeed");
                     })
                 })
                 .collect();

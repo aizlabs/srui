@@ -113,16 +113,16 @@ where
                 "Received ClientResume for session {} from revision {}",
                 resume.session_id, resume.last_applied_revision
             );
-            match session.handle_resume(&resume)? {
+            let bootstrap = session.bootstrap_resume(&resume)?;
+            match bootstrap.outcome {
                 ResumeOutcome::Replay {
                     welcome_msg,
-                    from_revision,
+                    replayed,
                 } => {
                     let envelope = SruiMessage {
                         msg: Some(srui_message::Msg::ServerResumeOk(welcome_msg)),
                     };
                     framed_write.send(envelope).await?;
-                    let replayed = session.collect_replayed_transactions(from_revision)?;
                     for tx in replayed {
                         let tx_env = SruiMessage {
                             msg: Some(srui_message::Msg::Transaction(tx)),
@@ -144,8 +144,7 @@ where
                     framed_write.send(snapshot_env).await?;
                 }
             }
-            let tx_rx = session.subscribe_transactions()?;
-            (resume.client_instance_id, tx_rx)
+            (resume.client_instance_id, bootstrap.transactions)
         }
         _ => {
             return Err(ConnectionError::UnexpectedMessage(

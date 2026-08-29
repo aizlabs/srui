@@ -14,9 +14,7 @@ use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
-use srui_protocol::{
-    srui_message, ClientHello, SruiCodec, SruiMessage, Transaction,
-};
+use srui_protocol::{srui_message, ClientHello, SruiCodec, SruiMessage, Transaction};
 use srui_sessiond::{handle_connection, ConnectionError, Session, SessionError};
 
 const TEST_BROADCAST_CAPACITY: usize = 2;
@@ -63,12 +61,20 @@ impl ClientConnection {
         };
         write.send(hello).await.expect("send ClientHello");
 
-        let welcome = read.next().await.expect("welcome frame").expect("decode welcome");
+        let welcome = read
+            .next()
+            .await
+            .expect("welcome frame")
+            .expect("decode welcome");
         match welcome.msg {
             Some(srui_message::Msg::ServerWelcome(w)) => {
                 assert_eq!(w.session_id, session.session_id());
                 if w.initial_revision > 0 {
-                    let snapshot = read.next().await.expect("hello catch-up").expect("decode snapshot");
+                    let snapshot = read
+                        .next()
+                        .await
+                        .expect("hello catch-up")
+                        .expect("decode snapshot");
                     match snapshot.msg {
                         Some(srui_message::Msg::Transaction(tx)) => {
                             assert_eq!(tx.base_revision, 0);
@@ -153,8 +159,14 @@ async fn test_two_clients_receive_transactions_in_identical_order() {
     assert_eq!(revisions_a, vec![1, 2, 3]);
     assert_eq!(revisions_b, revisions_a);
 
-    client_a.cancel_and_join().await.expect("client A clean shutdown");
-    client_b.cancel_and_join().await.expect("client B clean shutdown");
+    client_a
+        .cancel_and_join()
+        .await
+        .expect("client A clean shutdown");
+    client_b
+        .cancel_and_join()
+        .await
+        .expect("client B clean shutdown");
 }
 
 #[tokio::test]
@@ -196,9 +208,10 @@ async fn test_lagged_broadcast_closes_connection_for_resync() {
 
     let session_clone = session.clone();
     let shutdown_clone = shutdown.clone();
-    let server_task = tokio::spawn(async move {
-        handle_connection(server_io, session_clone, shutdown_clone).await
-    });
+    let server_task =
+        tokio::spawn(
+            async move { handle_connection(server_io, session_clone, shutdown_clone).await },
+        );
 
     let (client_read, client_write) = tokio::io::split(client_io);
     let mut framed_read = FramedRead::new(client_read, SruiCodec::new());
@@ -214,7 +227,11 @@ async fn test_lagged_broadcast_closes_connection_for_resync() {
         })),
     };
     framed_write.send(hello).await.expect("send ClientHello");
-    let welcome = framed_read.next().await.expect("welcome frame").expect("decode");
+    let welcome = framed_read
+        .next()
+        .await
+        .expect("welcome frame")
+        .expect("decode");
     assert!(matches!(
         welcome.msg,
         Some(srui_message::Msg::ServerWelcome(_))

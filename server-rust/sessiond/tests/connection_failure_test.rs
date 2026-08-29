@@ -30,7 +30,7 @@ fn sample_client_hello(profiles: &[&str]) -> ClientHello {
     }
 }
 
-/// Mirrors the profile parsing loop in `Session::handle_hello` (§15).
+/// Mirrors the profile parsing loop in fresh-client handshake negotiation (§15).
 fn client_capability_set(hello: &ClientHello) -> CapabilitySet {
     let mut client_caps = CapabilitySet::new();
     for p_str in &hello.profiles {

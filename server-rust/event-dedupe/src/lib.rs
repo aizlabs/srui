@@ -19,19 +19,24 @@ use srui_protocol::Event;
 pub const DEFAULT_MAX_DEDUPE_ENTRIES: usize = 4096;
 
 /// Settled outcome of one client event, retained for replay answering (§18.2, App. B).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventOutcomeRecord {
     /// Whether the event was accepted and dispatched, or refused by validation.
     pub accepted: bool,
     /// Store revision observed after the event's side effects committed (App. B).
     pub revision_after_effect: u64,
+    /// Validation refusal returned by a replayed rejected event.
+    pub reject_reason: String,
 }
 
 /// Result of recording an event against a client's dedupe window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordOutcome {
     /// The event id had not been seen: the caller must now validate and dispatch it.
     Fresh { last_processed_event_seq: u64 },
+    /// The event is currently being dispatched by another connection. This is not terminal and
+    /// must not be acknowledged as processed or duplicate.
+    Pending { last_processed_event_seq: u64 },
     /// The event id was already settled; `prior` is the cached outcome to echo (§18.2).
     Duplicate {
         prior: EventOutcomeRecord,
@@ -47,8 +52,14 @@ pub struct EventDeduplicator {
 }
 
 #[derive(Debug, Clone)]
+enum EventRecord {
+    Pending,
+    Settled(EventOutcomeRecord),
+}
+
+#[derive(Debug, Clone)]
 struct ClientDedupeWindow {
-    seen_ids: HashMap<Bytes, EventOutcomeRecord>,
+    seen_ids: HashMap<Bytes, EventRecord>,
     order: VecDeque<Bytes>,
     max_processed_seq: u64,
 }
@@ -62,7 +73,7 @@ impl ClientDedupeWindow {
         }
     }
 
-    fn record(&mut self, event_id: &[u8], max_entries: usize) -> bool {
+    fn insert(&mut self, event_id: &[u8], record: EventRecord, max_entries: usize) -> bool {
         if self.seen_ids.contains_key(event_id) {
             return false; // Duplicate
         }
@@ -75,13 +86,7 @@ impl ClientDedupeWindow {
 
         let id = Bytes::copy_from_slice(event_id);
         self.order.push_back(id.clone());
-        self.seen_ids.insert(
-            id,
-            EventOutcomeRecord {
-                accepted: true,
-                revision_after_effect: 0,
-            },
-        );
+        self.seen_ids.insert(id, record);
         true
     }
 
@@ -125,12 +130,17 @@ impl EventDeduplicator {
         }
 
         let max_entries = self.max_entries_per_client;
+        let record = EventRecord::Settled(EventOutcomeRecord {
+            accepted: true,
+            revision_after_effect: 0,
+            reject_reason: String::new(),
+        });
         if let Some(window) = self.clients.get_mut(client_instance_id) {
-            return window.record(event_id, max_entries);
+            return window.insert(event_id, record, max_entries);
         }
 
         let mut window = ClientDedupeWindow::new();
-        let is_new = window.record(event_id, max_entries);
+        let is_new = window.insert(event_id, record, max_entries);
         self.clients
             .insert(Bytes::copy_from_slice(client_instance_id), window);
         is_new
@@ -141,50 +151,81 @@ impl EventDeduplicator {
         self.record(&event.client_instance_id, &event.event_id)
     }
 
-    /// Admits an [`Event`] into its client window, reporting whether it is fresh or a replay
-    /// of an already-settled event (§18.2).
+    /// Admits an [`Event`] into its client window, reporting whether it is fresh, currently in
+    /// flight on another connection, or a replay of an already-settled event (§18.2).
     ///
-    /// A fresh event advances that client instance's `last_processed_event_seq` immediately: the
-    /// caller settles it within the same call, as either accepted or rejected, and both are
-    /// terminal states as far as the client's retry set is concerned. A duplicate returns the
-    /// cached [`EventOutcomeRecord`] so the ack can echo the prior result instead of re-running
-    /// the action.
+    /// A fresh event is inserted as [`EventRecord::Pending`] and does not advance
+    /// `last_processed_event_seq` until [`Self::settle_event`] records its real outcome. A replay
+    /// of a pending event is non-terminal; a settled duplicate returns the cached
+    /// [`EventOutcomeRecord`] so the ack can echo the prior result without re-running the action.
     ///
-    /// An event with an empty `event_id` cannot be deduplicated and is always `Fresh`.
+    /// An event with an empty `event_id` cannot be deduplicated, is always `Fresh`, and does not
+    /// allocate a persistent per-client window.
     pub fn admit_event(&mut self, event: &Event) -> RecordOutcome {
+        if event.event_id.is_empty() {
+            return RecordOutcome::Fresh {
+                last_processed_event_seq: self.max_processed_seq(&event.client_instance_id),
+            };
+        }
+
         let max_entries = self.max_entries_per_client;
         let window = self
             .clients
             .entry(Bytes::copy_from_slice(&event.client_instance_id))
             .or_insert_with(ClientDedupeWindow::new);
 
-        if !event.event_id.is_empty() {
-            if let Some(prior) = window.seen_ids.get(event.event_id.as_slice()).copied() {
-                return RecordOutcome::Duplicate {
-                    prior,
+        if let Some(record) = window.seen_ids.get(event.event_id.as_slice()) {
+            return match record {
+                EventRecord::Pending => RecordOutcome::Pending {
                     last_processed_event_seq: window.max_processed_seq,
-                };
-            }
-            window.record(&event.event_id, max_entries);
+                },
+                EventRecord::Settled(prior) => RecordOutcome::Duplicate {
+                    prior: prior.clone(),
+                    last_processed_event_seq: window.max_processed_seq,
+                },
+            };
         }
 
-        window.max_processed_seq = window.max_processed_seq.max(event.event_seq);
+        window.insert(&event.event_id, EventRecord::Pending, max_entries);
         RecordOutcome::Fresh {
             last_processed_event_seq: window.max_processed_seq,
         }
     }
 
-    /// Records the settled outcome of a previously admitted event (App. B result cache).
-    ///
-    /// A no-op for an empty `event_id` or an entry already evicted by the sliding window.
-    pub fn settle_event(&mut self, event: &Event, outcome: EventOutcomeRecord) {
+    /// Records the settled outcome of a previously admitted event (App. B result cache) and
+    /// returns the client's cumulative settled sequence high-water mark.
+    pub fn settle_event(&mut self, event: &Event, outcome: EventOutcomeRecord) -> u64 {
+        if event.event_id.is_empty() {
+            return self.max_processed_seq(&event.client_instance_id);
+        }
+        let Some(window) = self.clients.get_mut(event.client_instance_id.as_slice()) else {
+            return 0;
+        };
+
+        window.max_processed_seq = window.max_processed_seq.max(event.event_seq);
+        if let Some(slot) = window.seen_ids.get_mut(event.event_id.as_slice()) {
+            *slot = EventRecord::Settled(outcome);
+        }
+        window.max_processed_seq
+    }
+
+    /// Removes an in-flight admission that could not be settled, allowing a later retry to run.
+    pub fn abandon_event(&mut self, event: &Event) {
         if event.event_id.is_empty() {
             return;
         }
-        if let Some(window) = self.clients.get_mut(event.client_instance_id.as_slice()) {
-            if let Some(slot) = window.seen_ids.get_mut(event.event_id.as_slice()) {
-                *slot = outcome;
-            }
+        let Some(window) = self.clients.get_mut(event.client_instance_id.as_slice()) else {
+            return;
+        };
+        let is_pending = window
+            .seen_ids
+            .get(event.event_id.as_slice())
+            .is_some_and(|record| matches!(record, EventRecord::Pending));
+        if is_pending {
+            window.seen_ids.remove(event.event_id.as_slice());
+            window
+                .order
+                .retain(|id| id.as_ref() != event.event_id.as_slice());
         }
     }
 
@@ -253,23 +294,36 @@ mod tests {
     }
 
     #[test]
-    fn test_admit_event_reports_fresh_then_duplicate_with_prior_outcome() {
+    fn test_admit_event_stays_pending_until_real_outcome_is_settled() {
         let mut dedupe = EventDeduplicator::new(10);
         let event = wire_event(b"client-1", b"evt-1", 7);
 
         match dedupe.admit_event(&event) {
             RecordOutcome::Fresh {
                 last_processed_event_seq,
-            } => assert_eq!(last_processed_event_seq, 7),
+            } => assert_eq!(last_processed_event_seq, 0),
             other => panic!("expected Fresh, got {:?}", other),
         }
 
-        dedupe.settle_event(
-            &event,
-            EventOutcomeRecord {
-                accepted: true,
-                revision_after_effect: 42,
-            },
+        // An overlapping connection must not receive a terminal acknowledgement while the first
+        // dispatch is still running.
+        assert_eq!(
+            dedupe.admit_event(&event),
+            RecordOutcome::Pending {
+                last_processed_event_seq: 0
+            }
+        );
+
+        assert_eq!(
+            dedupe.settle_event(
+                &event,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 42,
+                    reject_reason: String::new(),
+                },
+            ),
+            7
         );
 
         // §18.2: re-delivery returns the prior result instead of re-running the action.
@@ -287,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_of_rejected_event_stays_rejected() {
+    fn test_replay_of_rejected_event_stays_rejected_with_reason() {
         let mut dedupe = EventDeduplicator::new(10);
         let event = wire_event(b"client-1", b"evt-bad", 3);
 
@@ -300,39 +354,70 @@ mod tests {
             EventOutcomeRecord {
                 accepted: false,
                 revision_after_effect: 1,
+                reject_reason: "node missing".to_string(),
             },
         );
 
         match dedupe.admit_event(&event) {
-            RecordOutcome::Duplicate { prior, .. } => assert!(!prior.accepted),
+            RecordOutcome::Duplicate { prior, .. } => {
+                assert!(!prior.accepted);
+                assert_eq!(prior.reject_reason, "node missing");
+            }
             other => panic!("expected Duplicate, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_max_processed_seq_is_monotonic_and_per_client() {
+    fn test_max_processed_seq_is_monotonic_settled_and_per_client() {
         let mut dedupe = EventDeduplicator::new(10);
+        let settled = |dedupe: &mut EventDeduplicator, event: Event| {
+            assert!(matches!(
+                dedupe.admit_event(&event),
+                RecordOutcome::Fresh { .. }
+            ));
+            dedupe.settle_event(
+                &event,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 0,
+                    reject_reason: String::new(),
+                },
+            );
+        };
 
-        dedupe.admit_event(&wire_event(b"client-a", b"a1", 5));
+        let a1 = wire_event(b"client-a", b"a1", 5);
+        assert!(matches!(
+            dedupe.admit_event(&a1),
+            RecordOutcome::Fresh { .. }
+        ));
+        assert_eq!(dedupe.max_processed_seq(b"client-a"), 0);
+        dedupe.settle_event(
+            &a1,
+            EventOutcomeRecord {
+                accepted: true,
+                revision_after_effect: 0,
+                reject_reason: String::new(),
+            },
+        );
         assert_eq!(dedupe.max_processed_seq(b"client-a"), 5);
 
-        // An out-of-order or replayed lower sequence never lowers the high-water mark.
-        dedupe.admit_event(&wire_event(b"client-a", b"a2", 2));
+        // An out-of-order or replayed lower settled sequence never lowers the high-water mark.
+        settled(&mut dedupe, wire_event(b"client-a", b"a2", 2));
         assert_eq!(dedupe.max_processed_seq(b"client-a"), 5);
 
-        dedupe.admit_event(&wire_event(b"client-a", b"a3", 9));
+        settled(&mut dedupe, wire_event(b"client-a", b"a3", 9));
         assert_eq!(dedupe.max_processed_seq(b"client-a"), 9);
 
         // Scope is the client instance, exactly like the dedupe window itself.
         assert_eq!(dedupe.max_processed_seq(b"client-b"), 0);
-        dedupe.admit_event(&wire_event(b"client-b", b"b1", 1));
+        settled(&mut dedupe, wire_event(b"client-b", b"b1", 1));
         assert_eq!(dedupe.max_processed_seq(b"client-b"), 1);
         assert_eq!(dedupe.max_processed_seq(b"client-a"), 9);
         assert_eq!(dedupe.max_processed_seq(b"never-seen"), 0);
     }
 
     #[test]
-    fn test_event_without_id_is_never_deduplicated() {
+    fn test_event_without_id_is_never_deduplicated_or_allocated() {
         let mut dedupe = EventDeduplicator::new(10);
         let event = wire_event(b"client-1", b"", 4);
 
@@ -344,7 +429,8 @@ mod tests {
             dedupe.admit_event(&event),
             RecordOutcome::Fresh { .. }
         ));
-        assert_eq!(dedupe.max_processed_seq(b"client-1"), 4);
+        assert_eq!(dedupe.max_processed_seq(b"client-1"), 0);
+        assert!(dedupe.clients.is_empty());
     }
 
     #[test]

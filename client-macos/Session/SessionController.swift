@@ -280,6 +280,13 @@ public final class SessionController: @unchecked Sendable {
     /// refuses must be dropped here: leaving it pending would replay it on the next resume, which
     /// the server would refuse again, forever.
     private func handleEventAck(_ ack: SRUIServerEventAck) async {
+        guard ClientInstanceId(ack.clientInstanceID) == outbox.clientInstanceId else {
+            SessionDiagnostics.error(
+                "Ignoring event acknowledgement for a different client instance"
+            )
+            return
+        }
+
         let eventId = EventId(ack.eventID)
 
         switch ack.status {

@@ -52,6 +52,55 @@ private actor OutboxWireCollector {
     }
 }
 
+/// Transport that records each send before suspending it until the test releases that write.
+private actor GatedTransport: Transport {
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let streamContinuation: AsyncThrowingStream<Data, Error>.Continuation
+    private let sendReleaseStream: AsyncStream<Void>
+    private let sendReleaseContinuation: AsyncStream<Void>.Continuation
+    private var sentFrames: [Data] = []
+
+    init() {
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.streamContinuation = continuation
+        let (sendReleaseStream, sendReleaseContinuation) = AsyncStream<Void>.makeStream()
+        self.sendReleaseStream = sendReleaseStream
+        self.sendReleaseContinuation = sendReleaseContinuation
+    }
+
+    var sentFrameCount: Int { sentFrames.count }
+
+    func frame(at index: Int) -> Data? {
+        sentFrames.indices.contains(index) ? sentFrames[index] : nil
+    }
+
+    func waitForSendCount(_ count: Int) async {
+        while sentFrames.count < count {
+            await Task.yield()
+        }
+    }
+
+    func releaseNextSend() {
+        sendReleaseContinuation.yield()
+    }
+
+    func send(data: Data) async throws {
+        sentFrames.append(data)
+        var releases = sendReleaseStream.makeAsyncIterator()
+        _ = await releases.next()
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        sendReleaseContinuation.finish()
+        streamContinuation.finish()
+    }
+}
+
 @Suite("EventOutbox Retry Safety Tests")
 struct EventOutboxRetryTests {
 
@@ -249,6 +298,130 @@ struct EventOutboxRetryTests {
         // connection, while a fresh outbox restarts its own counter at zero. Honoring a mark the
         // outbox never issued would retire an event that was never acknowledged.
         await outbox.acknowledgeEvents(throughSeq: 5_000)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("An acknowledgement cannot overtake pending-event retention")
+    func acknowledgementDuringSendDoesNotRequeueSettledEvent() async throws {
+        let transport = GatedTransport()
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: transport, outbox: outbox)
+
+        let sendTask = Task {
+            try await outbox.sendActivate(
+                nodeId: NodeId(7),
+                observedRevision: Revision(3),
+                via: transport
+            )
+        }
+
+        await transport.waitForSendCount(1)
+        let frame = try #require(await transport.frame(at: 0))
+        let message = try decodeFramedMessage(from: frame)
+        let event = try #require(try events(in: [message]).first)
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = event.eventId.bytes
+        ack.lastProcessedEventSeq = event.eventSeq
+        ack.status = .processed
+        var ackMessage = SRUIMessage()
+        ackMessage.serverEventAck = ack
+        await controller.handleIncomingMessage(ackMessage)
+
+        #expect(await outbox.pendingCount == 0)
+        await transport.releaseNextSend()
+        _ = try await sendTask.value
+        #expect(await outbox.pendingCount == 0)
+
+        await transport.close()
+    }
+
+    @Test("Replay writes finish before a newly allocated event reaches the wire")
+    func replaySerializesConcurrentFreshSend() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(2),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let transport = GatedTransport()
+        let replayTask = Task {
+            await outbox.resendPendingEvents(via: transport)
+        }
+        await transport.waitForSendCount(1)
+
+        let freshTask = Task {
+            try await outbox.sendActivate(
+                nodeId: NodeId(3),
+                observedRevision: Revision(3),
+                via: transport
+            )
+        }
+        while await outbox.eventSeq < 3 {
+            await Task.yield()
+        }
+
+        #expect(await transport.sentFrameCount == 1)
+        let firstReplayFrame = try #require(await transport.frame(at: 0))
+        let firstReplay = try #require(
+            try events(in: [decodeFramedMessage(from: firstReplayFrame)]).first
+        )
+        #expect(firstReplay.eventId == first.eventId)
+
+        await transport.releaseNextSend()
+        await transport.waitForSendCount(2)
+        let secondReplayFrame = try #require(await transport.frame(at: 1))
+        let secondReplay = try #require(
+            try events(in: [decodeFramedMessage(from: secondReplayFrame)]).first
+        )
+        #expect(secondReplay.eventId == second.eventId)
+
+        await transport.releaseNextSend()
+        await transport.waitForSendCount(3)
+        let freshFrame = try #require(await transport.frame(at: 2))
+        let fresh = try #require(try events(in: [decodeFramedMessage(from: freshFrame)]).first)
+        #expect(fresh.eventSeq == 3)
+
+        await transport.releaseNextSend()
+        await replayTask.value
+        _ = try await freshTask.value
+        await transport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
+    @Test("An acknowledgement for another client instance is ignored")
+    func mismatchedClientAcknowledgementDoesNotDrainOutbox() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox(clientInstanceId: ClientInstanceId(string: "client-a"))
+        let controller = SessionController(transport: client, outbox: outbox)
+        let event = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: client
+        )
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = ClientInstanceId(string: "client-b").bytes
+        ack.eventID = event.eventId.bytes
+        ack.lastProcessedEventSeq = event.eventSeq
+        ack.status = .processed
+        var message = SRUIMessage()
+        message.serverEventAck = ack
+        await controller.handleIncomingMessage(message)
 
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)

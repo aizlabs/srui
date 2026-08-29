@@ -455,7 +455,8 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
             format!("click-{}", seq),
             Revision::new(observed_rev),
             button_id,
-        );
+        )
+        .with_client_instance_id(vec![10, 20, 30, 40]);
 
         // Send framed Event over the Unix socket
         let event_envelope = SruiMessage {
@@ -641,7 +642,8 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
             format!("click-{}", seq),
             Revision::new(seq),
             button_id,
-        );
+        )
+        .with_client_instance_id(vec![1, 2, 3, 4]);
 
         let event_envelope = SruiMessage {
             msg: Some(srui_message::Msg::Event(event.to_wire())),

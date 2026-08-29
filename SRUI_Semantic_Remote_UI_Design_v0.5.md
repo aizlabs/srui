@@ -1,7 +1,7 @@
 # SRUI — Semantic Remote UI Protocol
 
 **Design and reference implementation**  
-**Draft v0.4 — 27 August 2026**  
+**Draft v0.5 — 29 August 2026**
 **Normative core:** platform-neutral semantic protocol  
 **Reference client:** macOS, Swift + AppKit  
 **Reference server:** Rust, Unix-like hosts  
@@ -15,7 +15,7 @@
 
 This revision is based on the earlier SRUI v0.1 draft and the RemoteUI research by Daniel Thommes and collaborators. The v0.1 architecture had the right central ideas—replicated semantic state, stable node identities, atomic mutations, native rendering, terminal compatibility, SSH transport, and reconnect—but it mixed several concerns too closely in the same specification.
 
-v0.4 preserves the v0.3 layer boundaries and makes the semantic-state/remoting boundary, frame independence, local text interaction, thin-client architecture, and local semantic inspection explicit:
+v0.5 preserves the v0.4 layer boundaries and makes reconnect event settlement, connection-bound client identity, and ordered retry delivery explicit:
 
 1. **Application model** — remote business/domain state.
 2. **Semantic UI model** — platform-neutral UI state exposed by an application or toolkit adapter.
@@ -30,9 +30,9 @@ v0.4 preserves the v0.3 layer boundaries and makes the semantic-state/remoting b
 
 This separation is a normative requirement. A future Windows, GTK, or SWT client must be able to implement SRUI without depending on any macOS concept.
 
-### 1.1 v0.4 clarifications
+### 1.1 v0.5 clarifications
 
-v0.4 makes the following principles normative:
+v0.5 makes the following principles normative:
 
 - **synchronize meaning/state, do not remotely render ordinary GUI**: the remote host publishes semantic state and the local client renders it using the local platform;
 - the remote host is authoritative while the client retains a non-authoritative semantic replica and local presentation state;
@@ -43,7 +43,8 @@ v0.4 makes the following principles normative:
 - text editing, IME composition, caret movement, selection, clipboard integration, and ordinary editing feedback are local;
 - common widgets are semantic first, with exact drawing isolated to retained `VectorScene` extensions;
 - the base client is a thin state-replication and rendering adapter, not a downloaded application runtime;
-- the retained semantic tree is a useful local interface for rendering, accessibility, inspection, testing, and policy-gated automation.
+- the retained semantic tree is a useful local interface for rendering, accessibility, inspection, testing, and policy-gated automation;
+- reconnect handshakes bind client identity, client event writes preserve sequence order across replay, and only settled event outcomes produce terminal acknowledgements.
 
 ---
 
@@ -1097,7 +1098,9 @@ SERVER RESUME_OK
 ```
 
 Events sent but not acknowledged before the previous transport died are replayed after `RESUME`
-with their original `event_id`, and each replay is answered with its own `EVENT_ACK`.
+with their original `event_id`. The client serializes the complete replay batch with newly generated
+events so `event_seq` allocation order is also transport write order. A replay is answered only when
+the server has a settled outcome; an overlapping replay of an in-flight event remains pending.
 
 If the server still has the transaction journal, it replays missed committed transactions.
 
@@ -1153,22 +1156,33 @@ replay re-runs the action, which is exactly the failure this section exists to p
 
 Rules:
 
-- Every application-side-effect event received on an attached connection MUST be answered with
-  exactly one `SERVER EVENT_ACK` on that same connection. Acks are control-class traffic (§19.2)
-  and are never coalesced or dropped behind lower-priority traffic.
-- The ack carries the settled `event_id`, the cumulative `last_processed_event_seq` for that
-  `client_instance_id`, a status, and the `revision_after_effect` recorded in the result cache
-  (Appendix B).
+- `CLIENT HELLO` or `CLIENT RESUME` binds `client_instance_id` to the connection. An active
+  `EVENT.client_instance_id` that differs from the bound identity MUST be rejected before any
+  dedupe lookup or sequence update.
+- Before a transport send can suspend, the client MUST retain the side-effect event in its pending
+  set. All event writes, including a complete reconnect replay batch, MUST be serialized so
+  increasing `event_seq` values reach the transport in allocation order.
+- A newly admitted event is `IN_FLIGHT` until validation and handler dispatch finish. An overlapping
+  delivery of the same `(client_instance_id, event_id)` MUST NOT receive `PROCESSED`, `DUPLICATE`,
+  or `REJECTED`; it stays pending at the client and may retry after the first execution settles.
+- Every newly admitted event that settles, and every replay whose result is already settled, MUST
+  be answered with exactly one `SERVER EVENT_ACK` on the connection that carried that delivery.
+  Acks are control-class traffic (§19.2) and are never coalesced or dropped behind lower-priority
+  traffic.
+- The ack carries the bound `client_instance_id`, settled `event_id`, cumulative settled
+  `last_processed_event_seq`, status, and `revision_after_effect` recorded in the result cache
+  (Appendix B). A client MUST ignore an ack whose `client_instance_id` does not match its outbox.
 - `PROCESSED` — newly admitted, validated, and dispatched.
 - `DUPLICATE` — a replay of an already-settled `event_id`; the ack returns the prior result and the
   action is not re-run. A replay of an event that was originally refused is answered `REJECTED`
-  again, so a replay never reads as newly handled.
+  again with the original non-empty `reject_reason`, so retry diagnostics are preserved.
 - `REJECTED` — refused by event validation (unknown node, disabled node, future
   `observed_revision`). This is a rejection of the event, not a protocol violation: the connection
   stays open and the event is *settled*. Closing the connection instead would make the client
   reconnect, replay the same invalid event, and be closed again indefinitely.
-- All three statuses are terminal for that `event_id`. On receiving any of them the client removes
-  the event from its pending set and raises `last_acked_event_seq`.
+- All three ack statuses are terminal for that `event_id`. On receiving any of them the client
+  removes the event from its pending set and raises `last_acked_event_seq`.
+- Events without a stable non-empty `event_id` MUST NOT allocate persistent per-client dedupe state.
 - Acks are optional to *consume*: a client that does not recognize a status still settles the event
   by `event_id`. This is not a violation of the fail-closed rule of §4 inv. 13, which governs
   unknown **required** semantics; an acknowledgement conveys no semantic state.
@@ -2150,17 +2164,26 @@ Connection loss never commits a partial transaction.
 Event result cache:
 
 ```text
-(client_instance_id, event_id) -> {
+(client_instance_id, event_id) -> IN_FLIGHT
+
+(client_instance_id, event_id) -> SETTLED {
   status,
   optional result,
-  semantic_revision_after_effect
+  semantic_revision_after_effect,
+  reject_reason
 }
 ```
 
-`status` and `semantic_revision_after_effect` are exactly the fields returned in `SERVER EVENT_ACK`
-(§18.2); a `DUPLICATE` ack is served from this cache rather than by re-running the action.
+`IN_FLIGHT` is never a source of terminal acknowledgement. If dispatch aborts or a handler panics,
+the admission is removed so the client can retry. The settled `status`,
+`semantic_revision_after_effect`, and `reject_reason` are exactly the fields returned in
+`SERVER EVENT_ACK` (§18.2); a `DUPLICATE` ack is served from this cache rather than by re-running
+the action.
 
-This cache may be bounded by acknowledged event sequence + time, with conservative retention for destructive actions. Retention is keyed on `last_processed_event_seq`: entries at or below the sequence a client has acknowledged can no longer be replayed by that client.
+The reference cache is bounded to 4,096 entries per client instance using FIFO eviction. A future
+retention policy may additionally use acknowledged event sequence and time, with conservative
+retention for destructive actions; `CLIENT RESUME.last_acked_event_seq` is not an eviction input in
+the v0.5 reference implementation.
 
 ---
 

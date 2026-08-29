@@ -15,8 +15,8 @@ use tokio::sync::broadcast;
 use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal};
 use srui_protocol::{
-    ClientHello, ClientResume, Event, ExtensionNamespaceMapping, ServerLimits,
-    ServerResumeOk, ServerResyncRequired, ServerWelcome, Transaction,
+    ClientHello, ClientResume, Event, ExtensionNamespaceMapping, ServerLimits, ServerResumeOk,
+    ServerResyncRequired, ServerWelcome, Transaction,
 };
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
@@ -71,11 +71,12 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Settled outcome of one client event, carried to the client as `SERVER EVENT_ACK` (§18.2).
+/// Outcome of one client event (§18.2).
 ///
-/// Every variant is *terminal* for that `event_id`: once the client sees any of them it may drop
-/// the event from its retry set. `last_processed_event_seq` is the cumulative high-water mark for
-/// the event's `client_instance_id` and outlives the connection (§18).
+/// `Processed`, `Duplicate`, and `Rejected` are terminal and become `SERVER EVENT_ACK`; `Pending`
+/// is explicitly non-terminal and produces no acknowledgement. `last_processed_event_seq` is the
+/// cumulative settled high-water mark for the event's `client_instance_id` and outlives the
+/// connection (§18).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventOutcome {
     /// Newly admitted, validated, and dispatched to handlers.
@@ -83,12 +84,15 @@ pub enum EventOutcome {
         revision_after_effect: u64,
         last_processed_event_seq: u64,
     },
+    /// The same event is still being dispatched by another connection.
+    Pending { last_processed_event_seq: u64 },
     /// Replay of an already-settled `event_id`: answered from the result cache without re-running
     /// the action (§18.2, App. B). `accepted` echoes whether the original attempt was processed.
     Duplicate {
         accepted: bool,
         revision_after_effect: u64,
         last_processed_event_seq: u64,
+        reject_reason: String,
     },
     /// Refused by event validation. The event is settled, not retried.
     Rejected {
@@ -278,7 +282,11 @@ impl Session {
         let plan = {
             let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
-            if guard.journal.iter_from(resume.last_applied_revision).is_some() {
+            if guard
+                .journal
+                .iter_from(resume.last_applied_revision)
+                .is_some()
+            {
                 ResumePlan::Replay {
                     session_id: guard.session_id.clone(),
                     from_revision: resume.last_applied_revision,
@@ -429,12 +437,13 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Only infrastructure failures (a poisoned lock) remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
-        let (matching_handlers, last_processed_event_seq) = {
+        let matching_handlers = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
-            // Deduplication check (§18.2, §32.4). A replay is answered from the result cache
-            // instead of re-running the action.
-            let last_processed_event_seq = match guard.dedupe.admit_event(event) {
+            // Deduplication check (§18.2, §32.4). A settled replay is answered from the result
+            // cache; an in-flight replay remains unacknowledged so the client cannot mistake it
+            // for a completed action.
+            match guard.dedupe.admit_event(event) {
                 RecordOutcome::Duplicate {
                     prior,
                     last_processed_event_seq,
@@ -443,12 +452,18 @@ impl Session {
                         accepted: prior.accepted,
                         revision_after_effect: prior.revision_after_effect,
                         last_processed_event_seq,
+                        reject_reason: prior.reject_reason,
                     })
                 }
-                RecordOutcome::Fresh {
+                RecordOutcome::Pending {
                     last_processed_event_seq,
-                } => last_processed_event_seq,
-            };
+                } => {
+                    return Ok(EventOutcome::Pending {
+                        last_processed_event_seq,
+                    })
+                }
+                RecordOutcome::Fresh { .. } => {}
+            }
 
             let node_id = srui_semantic_tree::NodeId::new(event.node_id);
             let obs_rev = srui_semantic_tree::Revision::new(event.observed_revision);
@@ -473,11 +488,12 @@ impl Session {
             };
 
             if let Err(error) = validation {
-                guard.dedupe.settle_event(
+                let last_processed_event_seq = guard.dedupe.settle_event(
                     event,
                     EventOutcomeRecord {
                         accepted: false,
                         revision_after_effect: current_rev.get(),
+                        reject_reason: error.to_string(),
                     },
                 );
                 return Ok(EventOutcome::Rejected {
@@ -492,31 +508,48 @@ impl Session {
                 .map(srui_semantic_tree::TypeRef::from)
                 .unwrap_or(srui_semantic_tree::TypeRef::new(0, 0));
 
-            let handlers = guard
+            guard
                 .handlers
                 .get(&(node_id, event_type))
                 .cloned()
-                .unwrap_or_default();
-            (handlers, last_processed_event_seq)
+                .unwrap_or_default()
         }; // Lock released here!
 
-        for handler in matching_handlers {
-            handler(self, event);
+        let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for handler in matching_handlers {
+                handler(self, event);
+            }
+        }));
+
+        if let Err(panic_payload) = dispatch_result {
+            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            guard.dedupe.abandon_event(event);
+            drop(guard);
+
+            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            return Err(SessionError::Panicked(panic_msg));
         }
 
         // Sampled after dispatch so the ack reports the revision the side effect produced
         // (App. B `semantic_revision_after_effect`).
-        let revision_after_effect = {
+        let (revision_after_effect, last_processed_event_seq) = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
             let revision_after_effect = guard.store.revision().get();
-            guard.dedupe.settle_event(
+            let last_processed_event_seq = guard.dedupe.settle_event(
                 event,
                 EventOutcomeRecord {
                     accepted: true,
                     revision_after_effect,
+                    reject_reason: String::new(),
                 },
             );
-            revision_after_effect
+            (revision_after_effect, last_processed_event_seq)
         };
 
         Ok(EventOutcome::Processed {
@@ -525,7 +558,7 @@ impl Session {
         })
     }
 
-    /// Returns the current revision of the store.
+    /// Returns the current committed semantic revision.
     pub fn current_revision(&self) -> u64 {
         let guard = lock_or_recover(&self.inner);
         guard.store.revision().get()
@@ -714,7 +747,9 @@ mod tests {
         let session = Session::new("widget-ops-test");
         session
             .transaction(|ui| {
-                Surface::builder(1).label("Counter Application").create(ui)?;
+                Surface::builder(1)
+                    .label("Counter Application")
+                    .create(ui)?;
                 Ok(())
             })
             .expect("widget builder transaction");
@@ -786,7 +821,10 @@ mod tests {
         };
 
         match session.handle_resume(&resume).expect("resume handled") {
-            ResumeOutcome::Replay { welcome_msg, from_revision } => {
+            ResumeOutcome::Replay {
+                welcome_msg,
+                from_revision,
+            } => {
                 assert_eq!(welcome_msg.replay_from_revision, 0);
                 let replayed = session
                     .collect_replayed_transactions(from_revision)

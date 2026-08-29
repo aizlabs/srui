@@ -2,8 +2,9 @@
 //!
 //! Manages an attached client/bridge stream over Unix socket or SSH channel (§18, §20.2, §21).
 //!
-//! Every client event is settled with a `SERVER EVENT_ACK` on the same connection (§18.2), which
-//! is control-class traffic (§19.2). Validation refusals are acknowledged as `REJECTED` rather
+//! Every settled client event receives a `SERVER EVENT_ACK` on the same connection (§18.2), which
+//! is control-class traffic (§19.2). An overlapping in-flight replay remains unacknowledged until
+//! a retry can read the settled result. Validation refusals are acknowledged as `REJECTED` rather
 //! than closing the stream; only protocol violations are fatal.
 //!
 //! Conforms strictly to:
@@ -53,6 +54,9 @@ pub enum ConnectionError {
 
     #[error("client-originated transaction rejected: server is authoritative (§12, §20.2)")]
     ClientTransactionRejected,
+
+    #[error("event client_instance_id does not match the connection handshake")]
+    ClientInstanceMismatch,
 }
 
 /// Handles an active client connection stream through handshake and event processing.
@@ -85,7 +89,7 @@ where
         }
     };
 
-    match handshake_msg.msg {
+    let client_instance_id = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
                 "Received ClientHello from client instance {:?}",
@@ -96,6 +100,7 @@ where
                 msg: Some(srui_message::Msg::ServerWelcome(welcome)),
             };
             framed_write.send(welcome_envelope).await?;
+            hello.client_instance_id
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
             info!(
@@ -133,13 +138,14 @@ where
                     framed_write.send(snapshot_env).await?;
                 }
             }
+            resume.client_instance_id
         }
         _ => {
             return Err(ConnectionError::UnexpectedMessage(
                 "expected ClientHello or ClientResume",
             ))
         }
-    }
+    };
 
     // -------------------------------------------------------------------------
     // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
@@ -154,7 +160,9 @@ where
                     Some(Ok(msg)) => {
                         // Acks are control-class traffic (§19.2): emitted on the same connection,
                         // in order, never coalesced or dropped.
-                        if let Some(response) = handle_incoming_message(msg, &session).await? {
+                        if let Some(response) =
+                            handle_incoming_message(msg, &session, &client_instance_id).await?
+                        {
                             framed_write.send(response).await?;
                         }
                     }
@@ -202,17 +210,31 @@ where
 async fn handle_incoming_message(
     msg: SruiMessage,
     session: &Session,
+    client_instance_id: &[u8],
 ) -> Result<Option<SruiMessage>, ConnectionError> {
     match msg.msg {
         Some(srui_message::Msg::Event(event)) => {
-            // §18.2: a re-delivered event is answered from the result cache rather than re-run,
-            // which is correct but indistinguishable from a handled event in the logs unless
-            // recorded. Every outcome is settled with an ack so the client can retire the event
-            // from its retry set.
+            if event.client_instance_id.as_slice() != client_instance_id {
+                warn!(
+                    "Rejecting event {:?}: client_instance_id does not match handshake",
+                    event.event_id
+                );
+                return Err(ConnectionError::ClientInstanceMismatch);
+            }
+
+            // §18.2: a settled re-delivery is answered from the result cache rather than re-run.
+            // A replay observed while another connection is still dispatching stays non-terminal
+            // and receives no ack, so the client keeps it in the retry set.
             let outcome = session.process_event(&event)?;
             match &outcome {
                 EventOutcome::Processed { .. } => {
                     debug!("Handled event {:?}", event.event_id);
+                }
+                EventOutcome::Pending { .. } => {
+                    debug!(
+                        "Event {:?} (seq {}) is already in flight",
+                        event.event_id, event.event_seq
+                    );
                 }
                 EventOutcome::Duplicate { .. } => {
                     debug!(
@@ -229,10 +251,8 @@ async fn handle_incoming_message(
                     );
                 }
             }
-            Ok(Some(SruiMessage {
-                msg: Some(srui_message::Msg::ServerEventAck(build_event_ack(
-                    &event, &outcome,
-                ))),
+            Ok(build_event_ack(&event, &outcome).map(|ack| SruiMessage {
+                msg: Some(srui_message::Msg::ServerEventAck(ack)),
             }))
         }
         Some(srui_message::Msg::Transaction(tx)) => {
@@ -263,7 +283,8 @@ async fn handle_incoming_message(
 }
 
 /// Builds the `SERVER EVENT_ACK` settling one client event (§18.2, App. B).
-fn build_event_ack(event: &srui_protocol::Event, outcome: &EventOutcome) -> ServerEventAck {
+/// Returns `None` for an in-flight replay because it has no terminal outcome to acknowledge.
+fn build_event_ack(event: &srui_protocol::Event, outcome: &EventOutcome) -> Option<ServerEventAck> {
     let (status, revision_after_effect, last_processed_event_seq, reject_reason) = match outcome {
         EventOutcome::Processed {
             revision_after_effect,
@@ -274,10 +295,12 @@ fn build_event_ack(event: &srui_protocol::Event, outcome: &EventOutcome) -> Serv
             *last_processed_event_seq,
             String::new(),
         ),
+        EventOutcome::Pending { .. } => return None,
         EventOutcome::Duplicate {
             accepted,
             revision_after_effect,
             last_processed_event_seq,
+            reject_reason,
         } => (
             // §18.2: re-delivery returns the *prior* acknowledgement. A replay of an event that
             // was originally refused stays refused rather than silently reading as handled.
@@ -288,7 +311,7 @@ fn build_event_ack(event: &srui_protocol::Event, outcome: &EventOutcome) -> Serv
             },
             *revision_after_effect,
             *last_processed_event_seq,
-            String::new(),
+            reject_reason.clone(),
         ),
         EventOutcome::Rejected {
             error,
@@ -302,12 +325,12 @@ fn build_event_ack(event: &srui_protocol::Event, outcome: &EventOutcome) -> Serv
         ),
     };
 
-    ServerEventAck {
+    Some(ServerEventAck {
         client_instance_id: event.client_instance_id.clone(),
         event_id: event.event_id.clone(),
         last_processed_event_seq,
         status: status as i32,
         revision_after_effect,
         reject_reason,
-    }
+    })
 }

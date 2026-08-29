@@ -27,6 +27,9 @@ public actor EventOutbox {
     /// Send order of `pendingEvents`, so replay preserves ordering and eviction drops the oldest.
     private var pendingOrder: [EventId] = []
     private var _lastAckedEventSeq: UInt64 = 0
+    /// Tail of the FIFO transport-write chain. Actor isolation alone is insufficient because
+    /// `transport.send` is a reentrancy point; each new write task awaits this tail.
+    private var sendTail: Task<Void, Never>?
 
     public init(
         clientInstanceId: ClientInstanceId = ClientInstanceId(string: UUID().uuidString),
@@ -87,8 +90,14 @@ public actor EventOutbox {
         var msg = SRUIMessage()
         msg.event = event.toWire()
         let framedBytes = try SRUIFraming.encodeFramed(msg)
-        try await transport.send(data: framedBytes)
+
+        // Retain before the first suspension: a fast acknowledgement may arrive while send is
+        // awaiting transport completion and must be able to remove this entry exactly once.
         retainPending(event)
+        let send = enqueueSend {
+            try await transport.send(data: framedBytes)
+        }
+        try await send.value
     }
 
     /// Constructs and sends an `ACTIVATE` event in one atomic operation.
@@ -106,16 +115,15 @@ public actor EventOutbox {
     /// does not re-run the action, which is what makes an ambiguous disconnect retry-safe.
     public func resendPendingEvents(via transport: any Transport) async {
         let replay = pendingOrder.compactMap { pendingEvents[$0] }
-        for event in replay {
-            do {
+        let send = enqueueSend {
+            for event in replay {
                 var msg = SRUIMessage()
                 msg.event = event.toWire()
                 try await transport.send(data: try SRUIFraming.encodeFramed(msg))
-            } catch {
-                // Still unacknowledged: it stays pending for the next resume.
-                return
             }
         }
+        // A failed replay remains pending for the next resume.
+        _ = try? await send.value
     }
 
     /// Acknowledges event delivery by event ID.
@@ -143,6 +151,20 @@ public actor EventOutbox {
     /// Returns the count of pending unacknowledged events.
     public var pendingCount: Int {
         pendingEvents.count
+    }
+
+    private func enqueueSend(
+        _ operation: @escaping @Sendable () async throws -> Void
+    ) -> Task<Void, any Error> {
+        let predecessor = sendTail
+        let task = Task {
+            await predecessor?.value
+            try await operation()
+        }
+        sendTail = Task {
+            _ = try? await task.value
+        }
+        return task
     }
 
     /// Records a sent event for retry, evicting the oldest entries beyond the configured bound.

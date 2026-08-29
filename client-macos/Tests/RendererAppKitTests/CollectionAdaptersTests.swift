@@ -134,13 +134,13 @@ struct CollectionAdaptersTests {
         tableView.deselectAll(nil)
         #expect(interactions.isEmpty)
 
-        // 3. Multiple selection mode emits no interaction
+        // 3. Multiple selection mode emits one event per selected item ID
         adapter.selectionMode = .multiple
         tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
-        #expect(interactions.isEmpty)
-
-        tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        #expect(interactions.isEmpty)
+        #expect(interactions == [
+            .selectionChanged(nodeID: 30, itemID: ItemId(100)),
+            .selectionChanged(nodeID: 30, itemID: ItemId(200)),
+        ])
     }
 
     @Test
@@ -224,5 +224,99 @@ struct CollectionAdaptersTests {
         adapter.update(rows: ["Single Root"], outlineView: outlineView)
         #expect(adapter.items.map(\.title) == ["Single Root"])
         #expect(adapter.outlineView(outlineView, numberOfChildrenOfItem: nil) == 1)
+    }
+
+    @Test
+    func tableAdapterReusesCellIdentifierFromColumn() throws {
+        let adapter = TableCollectionAdapter(
+            nodeID: 50,
+            rows: [TableCollectionAdapter.TableRow(itemID: ItemId(1), cells: ["Alpha", "Beta"])]
+        )
+        let tableView = NSTableView()
+        let col0 = NSTableColumn(identifier: TableCollectionAdapter.columnIdentifier(for: "Service"))
+        col0.title = "Service"
+        tableView.addTableColumn(col0)
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+
+        let cell = try #require(adapter.tableView(tableView, viewFor: col0, row: 0) as? NSTextField)
+        #expect(cell.identifier == col0.identifier)
+        #expect(cell.stringValue == "Alpha")
+        #expect(cell.isAccessibilityElement() == false)
+    }
+
+    @Test
+    func tableAdapterReloadsOnlyChangedRowsWhenIdentitiesMatch() {
+        let adapter = TableCollectionAdapter(
+            nodeID: 51,
+            rows: [
+                TableCollectionAdapter.TableRow(itemID: ItemId(1), cells: ["A"]),
+                TableCollectionAdapter.TableRow(itemID: ItemId(2), cells: ["B"]),
+            ]
+        )
+        let tableView = NSTableView()
+        tableView.addTableColumn(NSTableColumn(identifier: TableCollectionAdapter.primaryColumnIdentifier))
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+
+        adapter.update(
+            rows: [
+                TableCollectionAdapter.TableRow(itemID: ItemId(1), cells: ["A"]),
+                TableCollectionAdapter.TableRow(itemID: ItemId(2), cells: ["B-updated"]),
+            ],
+            tableView: tableView
+        )
+        #expect(adapter.lastRowUpdate == .contentReload(IndexSet(integer: 1)))
+        #expect(adapter.rows[1].cells == ["B-updated"])
+
+        adapter.update(
+            rows: [
+                TableCollectionAdapter.TableRow(itemID: ItemId(2), cells: ["B-updated"]),
+                TableCollectionAdapter.TableRow(itemID: ItemId(3), cells: ["C"]),
+            ],
+            tableView: tableView
+        )
+        #expect(adapter.lastRowUpdate == .fullReload)
+    }
+
+    @Test
+    func tableAdapterExposesRowAccessibilityLabelAndSelectedState() throws {
+        let adapter = TableCollectionAdapter(
+            nodeID: 52,
+            rows: [
+                TableCollectionAdapter.TableRow(itemID: ItemId(1), cells: ["Alpha", "100", "Active"]),
+            ],
+            selectionMode: .single
+        )
+        let tableView = NSTableView()
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+
+        let rowView = try #require(adapter.tableView(tableView, rowViewForRow: 0))
+        adapter.tableView(tableView, didAdd: rowView, forRow: 0)
+        #expect(rowView.accessibilityLabel() == "Alpha, 100, Active")
+        #expect(rowView.isAccessibilitySelected() == false)
+
+        tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        adapter.tableView(tableView, didAdd: rowView, forRow: 0)
+        #expect(rowView.isAccessibilitySelected() == true)
+    }
+
+    @Test
+    func outlineAdapterReusesItemIdentityWhenTitlesMatch() {
+        let adapter = OutlineCollectionAdapter(rows: ["Branch 1", "Branch 2"])
+        let outlineView = NSOutlineView()
+        outlineView.dataSource = adapter
+        outlineView.delegate = adapter
+        let first = adapter.items[0]
+        let second = adapter.items[1]
+
+        adapter.update(rows: ["Branch 2", "Branch 1", "Branch 3"], outlineView: outlineView)
+
+        #expect(adapter.items.map(\.title) == ["Branch 2", "Branch 1", "Branch 3"])
+        #expect(adapter.items[0] === second)
+        #expect(adapter.items[1] === first)
+        #expect(adapter.items[2] !== first)
+        #expect(adapter.items[2] !== second)
     }
 }

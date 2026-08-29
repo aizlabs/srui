@@ -353,7 +353,7 @@ public final class ControlFactory {
                     let colStrings = value?.asList?.compactMap { $0.asString }
                     let fallbackTitle = handle.accessibilityMetadata.label ?? defaultLabel(for: handle.nodeType)
                     reconcileColumns(in: tableView, columns: colStrings, fallbackTitle: fallbackTitle)
-                    adapter.hasExplicitColumns = colStrings != nil && !colStrings!.isEmpty
+                    adapter.hasExplicitColumns = (colStrings?.isEmpty == false)
                     tableView.reloadData()
                 } else if property == .selectionMode {
                     let mode = value?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
@@ -442,8 +442,8 @@ public final class ControlFactory {
         }
     }
 
-    public static func columnIdentifier(at index: Int) -> NSUserInterfaceItemIdentifier {
-        NSUserInterfaceItemIdentifier("srui.column.\(index)")
+    public static func columnIdentifier(for title: String, occurrence: Int = 1) -> NSUserInterfaceItemIdentifier {
+        TableCollectionAdapter.columnIdentifier(for: title, occurrence: occurrence)
     }
 
     public func reconcileColumns(
@@ -451,58 +451,25 @@ public final class ControlFactory {
         columns: [String]?,
         fallbackTitle: String
     ) {
-        if let columns, !columns.isEmpty {
-            for (index, title) in columns.enumerated() {
-                let colID = Self.columnIdentifier(at: index)
-                if index < tableView.tableColumns.count {
-                    let col = tableView.tableColumns[index]
-                    if col.identifier != colID {
-                        col.identifier = colID
-                    }
-                    col.title = title
-                } else {
-                    let col = NSTableColumn(identifier: colID)
-                    col.title = title
-                    col.width = max(80, 360 / CGFloat(columns.count))
-                    tableView.addTableColumn(col)
-                }
-            }
-            while tableView.tableColumns.count > columns.count {
-                tableView.removeTableColumn(tableView.tableColumns.last!)
-            }
-        } else {
-            let colID = Self.columnIdentifier(at: 0)
-            if tableView.tableColumns.isEmpty {
-                let col = NSTableColumn(identifier: colID)
-                col.title = fallbackTitle
-                col.width = 360
-                tableView.addTableColumn(col)
-            } else {
-                let col = tableView.tableColumns[0]
-                col.identifier = colID
-                col.title = fallbackTitle
-                while tableView.tableColumns.count > 1 {
-                    tableView.removeTableColumn(tableView.tableColumns.last!)
-                }
-            }
-        }
+        TableCollectionAdapter.reconcileColumns(
+            in: tableView,
+            columns: columns,
+            fallbackTitle: fallbackTitle
+        )
     }
 
     public func applySelectionMode(_ mode: StandardSelectionMode, to tableView: NSTableView) {
-        switch mode {
-        case .none:
-            tableView.allowsEmptySelection = true
-            tableView.allowsMultipleSelection = false
-            tableView.selectionHighlightStyle = .none
-            tableView.deselectAll(nil)
-        case .single:
-            tableView.allowsEmptySelection = true
-            tableView.allowsMultipleSelection = false
-            tableView.selectionHighlightStyle = .regular
-        case .multiple:
-            tableView.allowsEmptySelection = true
-            tableView.allowsMultipleSelection = true
-            tableView.selectionHighlightStyle = .regular
+        TableCollectionAdapter.applySelectionMode(mode, to: tableView)
+    }
+
+    func configureCollectionScrolling(nested: Bool, handle: RenderHandle) {
+        guard let scrollView = handle.view as? NSScrollView else { return }
+        if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+           let tableView = scrollView.documentView as? NSTableView {
+            adapter.setNestedInScroll(nested, scrollView: scrollView, tableView: tableView)
+        } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
+                  let outlineView = scrollView.documentView as? NSOutlineView {
+            adapter.setNestedInScroll(nested, scrollView: scrollView, outlineView: outlineView)
         }
     }
 
@@ -516,7 +483,7 @@ public final class ControlFactory {
             let columnValues = node.getProperty(.columns)?.asList?.compactMap { $0.asString }
             let fallbackTitle = node.getProperty(.label)?.asString ?? defaultLabel(for: handle.nodeType)
             reconcileColumns(in: tableView, columns: columnValues, fallbackTitle: fallbackTitle)
-            adapter.hasExplicitColumns = columnValues != nil && !columnValues!.isEmpty
+            adapter.hasExplicitColumns = (columnValues?.isEmpty == false)
 
             let mode = node.getProperty(.selectionMode)?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
             adapter.selectionMode = mode
@@ -537,8 +504,7 @@ public final class ControlFactory {
         scrollView.borderType = .bezelBorder
 
         let tableView = NSTableView(frame: .zero)
-        tableView.usesAlternatingRowBackgroundColors = true
-        tableView.headerView = node.nodeType == .list ? nil : NSTableHeaderView()
+        TableCollectionAdapter.applyChrome(isList: node.nodeType == .list, to: tableView)
 
         let columnValues = node.getProperty(.columns)?.asList?.compactMap { $0.asString }
         let fallbackTitle = node.getProperty(.label)?.asString ?? defaultLabel(for: node.nodeType)
@@ -552,7 +518,7 @@ public final class ControlFactory {
         let adapter = TableCollectionAdapter(
             nodeID: node.id,
             rows: rows,
-            hasExplicitColumns: columnValues != nil && !columnValues!.isEmpty,
+            hasExplicitColumns: columnValues?.isEmpty == false,
             selectionMode: selectionMode,
             onInteraction: { [weak self] interaction in
                 self?.onInteraction?(interaction)
@@ -562,7 +528,9 @@ public final class ControlFactory {
         tableView.delegate = adapter
         scrollView.documentView = tableView
         scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
+        let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
+        minHeight.isActive = true
+        adapter.minHeightConstraint = minHeight
         return (scrollView, nil, adapter)
     }
 
@@ -585,7 +553,9 @@ public final class ControlFactory {
         outlineView.delegate = adapter
         scrollView.documentView = outlineView
         scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
+        let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
+        minHeight.isActive = true
+        adapter.minHeightConstraint = minHeight
         return (scrollView, nil, adapter)
     }
 

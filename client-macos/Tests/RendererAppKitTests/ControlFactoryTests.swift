@@ -138,6 +138,8 @@ struct ControlFactoryTests {
             let scroll = try #require(handle.view as? NSScrollView)
             let table = try #require(scroll.documentView as? NSTableView)
             #expect(table.headerView == nil)
+            #expect(table.usesAlternatingRowBackgroundColors == false)
+            #expect(table.style == .plain)
             #expect(handle.modelAdapter is TableCollectionAdapter)
             let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
             #expect(adapter.rows.isEmpty)
@@ -146,6 +148,8 @@ struct ControlFactoryTests {
             let scroll = try #require(handle.view as? NSScrollView)
             let table = try #require(scroll.documentView as? NSTableView)
             #expect(table.headerView != nil)
+            #expect(table.usesAlternatingRowBackgroundColors)
+            #expect(table.style == .fullWidth)
             #expect(handle.modelAdapter is TableCollectionAdapter)
 
         case .tree:
@@ -289,9 +293,9 @@ struct ControlFactoryTests {
 
         #expect(tableView.tableColumns.count == 4)
         #expect(tableView.tableColumns[0].title == "Col 1")
-        #expect(tableView.tableColumns[0].identifier == NSUserInterfaceItemIdentifier("srui.column.0"))
+        #expect(tableView.tableColumns[0].identifier == TableCollectionAdapter.columnIdentifier(for: "Col 1"))
         #expect(tableView.tableColumns[3].title == "Col 4")
-        #expect(tableView.tableColumns[3].identifier == NSUserInterfaceItemIdentifier("srui.column.3"))
+        #expect(tableView.tableColumns[3].identifier == TableCollectionAdapter.columnIdentifier(for: "Col 4"))
 
         #expect(adapter.rows.count == 2)
         #expect(adapter.rows[0].itemID == ItemId(101))
@@ -383,7 +387,7 @@ struct ControlFactoryTests {
         #expect(singleTable.selectedRow == -1)
         #expect(emittedInteractions.isEmpty)
 
-        // 3. Multiple selection mode emits no intent
+        // 3. Multiple selection mode emits one event per selected item ID
         let multipleNode = Node(
             id: 3,
             nodeType: .table,
@@ -398,7 +402,10 @@ struct ControlFactoryTests {
         #expect(multipleTable.allowsMultipleSelection == true)
 
         multipleTable.selectRowIndexes(IndexSet([0, 2]), byExtendingSelection: false)
-        #expect(emittedInteractions.isEmpty)
+        #expect(emittedInteractions == [
+            .selectionChanged(nodeID: 3, itemID: ItemId(1)),
+            .selectionChanged(nodeID: 3, itemID: ItemId(3)),
+        ])
     }
 
     @Test
@@ -696,14 +703,15 @@ struct ControlFactoryTests {
         factory.reconcileColumns(in: tableView, columns: nil, fallbackTitle: "Fallback Table")
         #expect(tableView.tableColumns.count == 1)
         #expect(tableView.tableColumns[0].title == "Fallback Table")
-        #expect(tableView.tableColumns[0].identifier == NSUserInterfaceItemIdentifier("srui.column.0"))
+        #expect(tableView.tableColumns[0].identifier == TableCollectionAdapter.primaryColumnIdentifier)
 
         // 2. Grow to 5 columns
         factory.reconcileColumns(in: tableView, columns: ["C1", "C2", "C3", "C4", "C5"], fallbackTitle: "Ignored")
         #expect(tableView.tableColumns.count == 5)
         #expect(tableView.tableColumns[0].title == "C1")
+        #expect(tableView.tableColumns[0].identifier == TableCollectionAdapter.columnIdentifier(for: "C1"))
         #expect(tableView.tableColumns[4].title == "C5")
-        #expect(tableView.tableColumns[4].identifier == NSUserInterfaceItemIdentifier("srui.column.4"))
+        #expect(tableView.tableColumns[4].identifier == TableCollectionAdapter.columnIdentifier(for: "C5"))
 
         // 3. Shrink to 0 (back to 1 fallback column)
         factory.reconcileColumns(in: tableView, columns: [], fallbackTitle: "Reset Fallback")

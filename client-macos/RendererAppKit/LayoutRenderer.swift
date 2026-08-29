@@ -108,6 +108,7 @@ public final class LayoutRenderer {
                 throw LayoutRendererError.missingSemanticNode(nodeID)
             }
             controlFactory.refreshCollection(in: handle, for: node, store: newStore)
+            configureCollectionScrolling(for: handle)
             RendererDiagnostics.log(
                 "refreshed collection node=\(nodeID) view=\(ObjectIdentifier(handle.view))"
             )
@@ -140,6 +141,7 @@ public final class LayoutRenderer {
             }
             attach(handle.view, to: parentHandle)
         }
+        configureCollectionScrolling(for: handle)
 
         for childID in node.orderedChildren {
             try mount(nodeID: childID, from: store)
@@ -203,6 +205,27 @@ public final class LayoutRenderer {
 
     private func isCollectionProperty(_ property: PropertyRef) -> Bool {
         property == .items || property == .modelRef || property == .columns || property == .selectionMode
+    }
+
+    private func configureCollectionScrolling(for handle: RenderHandle) {
+        guard handle.nodeType == .list || handle.nodeType == .table || handle.nodeType == .tree else {
+            return
+        }
+        controlFactory.configureCollectionScrolling(
+            nested: isInsideScrollContainer(handle),
+            handle: handle
+        )
+    }
+
+    private func isInsideScrollContainer(_ handle: RenderHandle) -> Bool {
+        var parentID = handle.parentID
+        while let id = parentID, let parent = registry.handle(for: id) {
+            if parent.nodeType == .scroll {
+                return true
+            }
+            parentID = parent.parentID
+        }
+        return false
     }
 
     private func tearDown() {

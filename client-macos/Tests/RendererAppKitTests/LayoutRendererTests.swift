@@ -610,6 +610,108 @@ struct LayoutRendererTests {
         #expect(tableView.tableColumns[0].title == "Only One")
     }
 
+    @Test
+    func columnReconciliationReordersExistingColumnsByTitleIdentity() throws {
+        let node = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .columns: .list([.string("Name"), .string("CPU")]),
+            ]
+        )
+        let handle = try ControlFactory().makeHandle(for: node)
+        let tableView = try #require((handle.view as? NSScrollView)?.documentView as? NSTableView)
+        let nameColumn = tableView.tableColumns[0]
+        let cpuColumn = tableView.tableColumns[1]
+
+        ControlFactory().reconcileColumns(
+            in: tableView,
+            columns: ["CPU", "Name"],
+            fallbackTitle: "Table"
+        )
+
+        #expect(tableView.tableColumns.count == 2)
+        #expect(tableView.tableColumns[0] === cpuColumn)
+        #expect(tableView.tableColumns[1] === nameColumn)
+        #expect(tableView.tableColumns[0].identifier == TableCollectionAdapter.columnIdentifier(for: "CPU"))
+        #expect(tableView.tableColumns[1].identifier == TableCollectionAdapter.columnIdentifier(for: "Name"))
+    }
+
+    @Test
+    func collectionInsideScrollDoesNotNestScrollers() throws {
+        let store = try makeStore([
+            SemanticModel.Operation.createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: .scroll, parentID: 1),
+            .createNode(id: 3, nodeType: .column, parentID: 2),
+            .createNode(
+                id: 4,
+                nodeType: .table,
+                parentID: 3,
+                properties: [
+                    Property(property: .items, value: .list([.string("A"), .string("B")])),
+                ]
+            ),
+            .createNode(
+                id: 5,
+                nodeType: .list,
+                parentID: 3,
+                properties: [
+                    Property(property: .items, value: .list([.string("L1")])),
+                ]
+            ),
+            .createNode(
+                id: 6,
+                nodeType: .tree,
+                parentID: 3,
+                properties: [
+                    Property(property: .items, value: .list([.string("T1")])),
+                ]
+            ),
+        ])
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let tableScroll = try #require(renderer.registry.view(for: 4) as? NSScrollView)
+        let listScroll = try #require(renderer.registry.view(for: 5) as? NSScrollView)
+        let treeScroll = try #require(renderer.registry.view(for: 6) as? NSScrollView)
+        let tableAdapter = try #require(renderer.registry.handle(for: 4)?.modelAdapter as? TableCollectionAdapter)
+        let listAdapter = try #require(renderer.registry.handle(for: 5)?.modelAdapter as? TableCollectionAdapter)
+        let treeAdapter = try #require(renderer.registry.handle(for: 6)?.modelAdapter as? OutlineCollectionAdapter)
+
+        #expect(tableScroll.hasVerticalScroller == false)
+        #expect(tableScroll.borderType == .noBorder)
+        #expect(tableAdapter.isNestedInScroll)
+        #expect(tableAdapter.fitHeightConstraint?.isActive == true)
+        #expect(listScroll.hasVerticalScroller == false)
+        #expect(listAdapter.isNestedInScroll)
+        #expect(treeScroll.hasVerticalScroller == false)
+        #expect(treeAdapter.isNestedInScroll)
+    }
+
+    @Test
+    func standaloneCollectionKeepsItsOwnScroller() throws {
+        let store = try makeStore([
+            SemanticModel.Operation.createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .table,
+                parentID: 1,
+                properties: [
+                    Property(property: .items, value: .list([.string("A")])),
+                ]
+            ),
+        ])
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let tableScroll = try #require(renderer.registry.view(for: 2) as? NSScrollView)
+        let adapter = try #require(renderer.registry.handle(for: 2)?.modelAdapter as? TableCollectionAdapter)
+        #expect(tableScroll.hasVerticalScroller)
+        #expect(tableScroll.borderType == .bezelBorder)
+        #expect(adapter.isNestedInScroll == false)
+        #expect(adapter.minHeightConstraint?.isActive == true)
+    }
+
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {
         var store = SemanticStore()
         for operation in operations {

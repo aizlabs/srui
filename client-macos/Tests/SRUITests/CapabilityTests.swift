@@ -104,7 +104,7 @@ struct CapabilityTests {
         let (inserted1, _) = set.insert(Profile.standardWidgetsV1)
         #expect(inserted1)
         let (inserted2, _) = set.insert(Profile.standardWidgetsV1)
-        #expect(!inserted2)
+        #expect(inserted2 == false)
         #expect(set.count == 1)
         #expect(set.contains(Profile.standardWidgetsV1))
         #expect(set.contains(string: "org.srui.standard-widgets/1"))
@@ -171,7 +171,7 @@ struct CapabilityTests {
 
         #expect(negotiated.contains(Profile.standardWidgetsV1))
         #expect(negotiated.contains(Profile.terminalV1))
-        #expect(!negotiated.contains(Profile.richtextV1)) // Offered by client but not in server required or optional
+        #expect(negotiated.contains(Profile.richtextV1) == false)
     }
 
     @Test("Negotiation fails explicitly when client lacks a required profile (§4 inv. 13)")

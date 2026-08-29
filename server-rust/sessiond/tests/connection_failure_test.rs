@@ -230,8 +230,17 @@ async fn server_welcome_contains_session_metadata() {
             assert_eq!(w.core_version, "0.4.0");
             assert_eq!(w.session_id, "welcome-fields");
             assert_eq!(w.initial_revision, 1);
-            assert_eq!(w.required_profiles, Vec::<String>::new());
-            assert_eq!(w.optional_profiles, Vec::<String>::new());
+            assert_eq!(
+                w.required_profiles,
+                vec!["org.srui.standard-widgets/1".to_string()]
+            );
+            assert_eq!(
+                w.optional_profiles,
+                vec![
+                    "org.srui.richtext/1".to_string(),
+                    "org.srui.terminal/1".to_string(),
+                ]
+            );
             assert_eq!(w.extension_namespaces.len(), 1);
             assert_eq!(
                 w.extension_namespaces[0].extension_uri,

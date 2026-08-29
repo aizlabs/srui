@@ -138,38 +138,28 @@ public enum NegotiationError: Error, Equatable, Sendable, CustomStringConvertibl
 }
 
 /// Set of capability profiles negotiated between client and server (§15).
-public struct CapabilitySet: SetAlgebra, Sequence, Equatable, Sendable, ExpressibleByArrayLiteral, CustomStringConvertible {
-    public typealias Element = Profile
+///
+/// This is `Set<Profile>` so Swift set operations come from the standard library; profile parsing
+/// and §15 negotiation live in the extension below.
+public typealias CapabilitySet = Set<Profile>
 
-    private var profiles: Set<Profile>
-
-    public init() {
-        self.profiles = Set()
-    }
-
-    public init<S: Sequence>(_ sequence: S) where S.Element == Profile {
-        self.profiles = Set(sequence)
-    }
-
-    public init(arrayLiteral elements: Profile...) {
-        self.profiles = Set(elements)
-    }
-
-    public func makeIterator() -> Set<Profile>.Iterator {
-        profiles.makeIterator()
-    }
-
+extension Set where Element == Profile {
     /// Constructs a `CapabilitySet` by parsing an array of profile strings.
+    ///
+    /// Required-profile lists on the wire must use this path: a malformed entry is unknown
+    /// required semantics and must fail explicitly (§4 inv. 13).
     public static func fromStrings(_ strings: [String]) throws -> CapabilitySet {
         var set = CapabilitySet()
         for s in strings {
-            let profile = try Profile.parse(s)
-            set.insert(profile)
+            try set.insert(string: s)
         }
         return set
     }
 
-    /// Constructs a `CapabilitySet` parsing valid profile strings and ignoring invalid entries.
+    /// Parses valid profile strings and ignores invalid entries.
+    ///
+    /// Use this only for optional / client-offered lists, where unknown profiles are omitted
+    /// without error (§15). Never use it for server-required profiles.
     public static func fromValidStrings(_ strings: [String]) -> CapabilitySet {
         var set = CapabilitySet()
         for s in strings {
@@ -180,34 +170,10 @@ public struct CapabilitySet: SetAlgebra, Sequence, Equatable, Sendable, Expressi
         return set
     }
 
-    /// Inserts a profile into the set.
-    @discardableResult
-    public mutating func insert(_ newMember: Profile) -> (inserted: Bool, memberAfterInsert: Profile) {
-        profiles.insert(newMember)
-    }
-
-    /// Updates or inserts a profile in the set.
-    @discardableResult
-    public mutating func update(with newMember: Profile) -> Profile? {
-        profiles.update(with: newMember)
-    }
-
     /// Parses and inserts a profile string into the set.
     @discardableResult
     public mutating func insert(string: String) throws -> Bool {
-        let profile = try Profile.parse(string)
-        return insert(profile).inserted
-    }
-
-    /// Removes a profile from the set, returning the removed element if it was present.
-    @discardableResult
-    public mutating func remove(_ member: Profile) -> Profile? {
-        profiles.remove(member)
-    }
-
-    /// Returns `true` if the set contains the exact specified profile and version.
-    public func contains(_ member: Profile) -> Bool {
-        profiles.contains(member)
+        insert(try Profile.parse(string)).inserted
     }
 
     /// Returns `true` if the set contains the exact profile matching the string.
@@ -218,12 +184,12 @@ public struct CapabilitySet: SetAlgebra, Sequence, Equatable, Sendable, Expressi
 
     /// Returns `true` if the set contains any version of the profile with the given name.
     public func contains(name: String) -> Bool {
-        profiles.contains { $0.name == name }
+        contains { $0.name == name }
     }
 
     /// Returns the first `Profile` matching the given name, if present.
     public func getProfile(named name: String) -> Profile? {
-        profiles.first { $0.name == name }
+        first { $0.name == name }
     }
 
     /// Returns the version number of the profile with the given name, if present.
@@ -231,69 +197,14 @@ public struct CapabilitySet: SetAlgebra, Sequence, Equatable, Sendable, Expressi
         getProfile(named: name)?.version
     }
 
-    /// Returns the number of profiles in the set.
-    public var count: Int {
-        profiles.count
-    }
-
-    /// Returns `true` if the set contains no profiles.
-    public var isEmpty: Bool {
-        profiles.isEmpty
-    }
-
-    /// Returns `true` if this set contains all profiles present in `other`.
-    public func isSuperset(of other: CapabilitySet) -> Bool {
-        other.profiles.isSubset(of: self.profiles)
-    }
-
-    /// Returns `true` if all profiles in this set are present in `other`.
-    public func isSubset(of other: CapabilitySet) -> Bool {
-        self.profiles.isSubset(of: other.profiles)
-    }
-
-    /// Computes the intersection of two capability sets.
-    public func intersection(_ other: CapabilitySet) -> CapabilitySet {
-        CapabilitySet(self.profiles.intersection(other.profiles))
-    }
-
-    /// Computes the union of two capability sets.
-    public func union(_ other: CapabilitySet) -> CapabilitySet {
-        CapabilitySet(self.profiles.union(other.profiles))
-    }
-
-    /// Computes the symmetric difference of two capability sets.
-    public func symmetricDifference(_ other: CapabilitySet) -> CapabilitySet {
-        CapabilitySet(self.profiles.symmetricDifference(other.profiles))
-    }
-
-    /// Mutates this set to contain the union with `other`.
-    public mutating func formUnion(_ other: CapabilitySet) {
-        profiles.formUnion(other.profiles)
-    }
-
-    /// Mutates this set to contain the intersection with `other`.
-    public mutating func formIntersection(_ other: CapabilitySet) {
-        profiles.formIntersection(other.profiles)
-    }
-
-    /// Mutates this set to contain the symmetric difference with `other`.
-    public mutating func formSymmetricDifference(_ other: CapabilitySet) {
-        profiles.formSymmetricDifference(other.profiles)
-    }
-
-    /// Computes the difference (`self - other`) of two capability sets.
-    public func subtracting(_ other: CapabilitySet) -> CapabilitySet {
-        CapabilitySet(self.profiles.subtracting(other.profiles))
-    }
-
     /// Returns a sorted array of formatted profile strings in this set.
     public func toStringArray() -> [String] {
-        profiles.sorted().map { $0.description }
+        sorted().map(\.description)
     }
 
     /// Returns an array of profiles in sorted order.
     public var sortedProfiles: [Profile] {
-        profiles.sorted()
+        sorted()
     }
 
     /// Computes the negotiated capability set between client-offered profiles and server requirements (§15).
@@ -311,29 +222,15 @@ public struct CapabilitySet: SetAlgebra, Sequence, Equatable, Sendable, Expressi
         serverRequired: CapabilitySet,
         serverOptional: CapabilitySet
     ) throws -> CapabilitySet {
-        // 1. §4 Invariant 13: Verify all required profiles are offered by the client
-        var missingRequired = [Profile]()
-        for req in serverRequired.sortedProfiles {
-            if !clientOffered.contains(req) {
-                missingRequired.append(req)
-            }
-        }
-
+        let missingRequired = serverRequired.sortedProfiles.filter { !clientOffered.contains($0) }
         if !missingRequired.isEmpty {
             throw NegotiationError.unsatisfiedRequiredProfiles(missing: missingRequired)
         }
 
-        // 2. Build active negotiated set: all required profiles + matching optional profiles
-        var negotiated = CapabilitySet()
-        for req in serverRequired.profiles {
-            negotiated.insert(req)
+        var negotiated = serverRequired
+        for opt in serverOptional where clientOffered.contains(opt) {
+            negotiated.insert(opt)
         }
-        for opt in serverOptional.profiles {
-            if clientOffered.contains(opt) {
-                negotiated.insert(opt)
-            }
-        }
-
         return negotiated
     }
 
@@ -347,11 +244,6 @@ public struct CapabilitySet: SetAlgebra, Sequence, Equatable, Sendable, Expressi
             serverRequired: serverRequired,
             serverOptional: serverOptional
         )
-    }
-
-    public var description: String {
-        let items = toStringArray().map { "\"\($0)\"" }.joined(separator: ", ")
-        return "CapabilitySet[\(items)]"
     }
 }
 

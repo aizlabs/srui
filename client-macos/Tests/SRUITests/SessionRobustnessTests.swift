@@ -45,8 +45,8 @@ struct SessionRobustnessTests {
         var resync = SRUIServerResyncRequired()
         resync.sessionID = "test-session"
         resync.snapshotRevision = revision
-        resync.reason = "session replaced"
-        resync.continuity = .replaced
+        resync.reason = "journal evicted"
+        resync.continuity = .sameSession
         var msg = SRUIMessage()
         msg.serverResyncRequired = resync
         return try SRUIFraming.encodeFramed(msg)

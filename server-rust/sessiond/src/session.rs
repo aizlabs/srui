@@ -167,7 +167,7 @@ pub struct Session {
 impl Session {
     /// Creates a new `Session` with the given session ID and default standard capabilities.
     pub fn new(session_id: impl Into<String>) -> Self {
-        Self::with_broadcast_capacity(session_id, TRANSACTION_BROADCAST_CAPACITY)
+        Self::with_capabilities(session_id, ServerCapabilities::standard_widgets())
     }
 
     /// Creates a session with a custom transaction broadcast channel capacity.
@@ -176,7 +176,11 @@ impl Session {
     #[doc(hidden)]
     pub fn with_broadcast_capacity(session_id: impl Into<String>, capacity: usize) -> Self {
         let (tx_broadcast, _) = broadcast::channel(capacity);
-        Self::with_broadcast_sender(session_id, tx_broadcast)
+        Self::with_broadcast_sender(
+            session_id,
+            tx_broadcast,
+            ServerCapabilities::standard_widgets(),
+        )
     }
 
     /// Drops the transaction broadcast sender so attached subscribers observe
@@ -189,6 +193,7 @@ impl Session {
     fn with_broadcast_sender(
         session_id: impl Into<String>,
         tx_broadcast: broadcast::Sender<Transaction>,
+        capabilities: ServerCapabilities,
     ) -> Self {
         let limits = ServerLimits {
             max_frame_size: 16 * 1024 * 1024,
@@ -204,7 +209,7 @@ impl Session {
             store: SemanticStore::new(),
             journal: TransactionJournal::new(1024),
             dedupe: EventDeduplicator::default(),
-            capabilities: ServerCapabilities::default(),
+            capabilities,
             limits,
             handlers: HashMap::new(),
         };
@@ -225,22 +230,8 @@ impl Session {
         session_id: impl Into<String>,
         capabilities: ServerCapabilities,
     ) -> Self {
-        let session = Self::new(session_id);
-        session.set_capabilities(capabilities);
-        session
-    }
-
-    /// Sets the server-side capabilities for this session (§15).
-    pub fn set_capabilities(&self, capabilities: ServerCapabilities) {
-        let mut guard = lock_or_recover(&self.inner);
-        guard.capabilities = capabilities;
-    }
-
-    /// Returns the configured server capabilities for this session (§15).
-    #[must_use]
-    pub fn capabilities(&self) -> ServerCapabilities {
-        let guard = lock_or_recover(&self.inner);
-        guard.capabilities.clone()
+        let (tx_broadcast, _) = broadcast::channel(TRANSACTION_BROADCAST_CAPACITY);
+        Self::with_broadcast_sender(session_id, tx_broadcast, capabilities)
     }
 
     /// Returns the session ID.
@@ -272,16 +263,6 @@ impl Session {
             .iter_from(from_revision)
             .map(|iter| iter.cloned().collect())
             .ok_or(SessionError::ReplayUnavailable)
-    }
-
-    /// Exports the full current semantic store state as a snapshot transaction (§18, §18.1).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError::LockPoisoned`] if internal session state lock cannot be acquired.
-    pub fn export_snapshot_transaction(&self) -> Result<Transaction, SessionError> {
-        let guard = lock_or_recover(&self.inner);
-        Ok(export_snapshot_transaction(&guard.store))
     }
 
     /// Evaluates a `ClientHello` handshake message, negotiates capabilities,

@@ -8,6 +8,8 @@
 // Spec sections implemented:
 // - §12.1 Revisions and transactions: transactions are applied atomically and the renderer never
 //   observes a half-committed transaction.
+// - §15 Capability negotiation: `CLIENT HELLO` / `SERVER WELCOME` establish the session; resume
+//   reuses the retained negotiated set instead of re-parsing profiles from `RESUME_OK`.
 // - §18 Reconnect and resynchronization: `CLIENT RESUME` carries `last_applied_revision` and
 //   `last_acked_event_seq`; `SERVER RESYNC_REQUIRED` is the *only* trigger for snapshot replacement.
 // - §18.2 Event settlement: server event frontiers raise `last_acked_event_seq`, while
@@ -51,6 +53,19 @@ public enum SessionDispatchError: Error, Equatable, Sendable {
     case resumeNotConfirmed
 }
 
+/// Connection handshake / data-plane phase (§15, §18).
+///
+/// Illegal `(phase, payload)` pairs fail in one place instead of combining `isRunning`,
+/// `_isHandshakeComplete`, and nil resume-attempt flags.
+private enum ProtocolPhase: Equatable {
+    case idle
+    case awaitingWelcome
+    case awaitingResume(sessionId: String, attemptId: UUID)
+    case active(negotiated: CapabilitySet)
+    case awaitingSnapshot(negotiated: CapabilitySet)
+    case failed
+}
+
 /// Central coordinator managing client session lifecycle, message decoding, store application,
 /// outbox event dispatch, and UI rendering (§22, §22.2).
 public final class SessionController: @unchecked Sendable {
@@ -75,8 +90,10 @@ public final class SessionController: @unchecked Sendable {
     private var requestedSessionId: String?
     private var resumeAttemptId: UUID?
     private var eventDispatchEnabled = false
-    private var _negotiatedCapabilities: CapabilitySet?
-    private var _isHandshakeComplete = false
+    private var phase: ProtocolPhase = .idle
+    /// Negotiated set from the last successful `SERVER WELCOME`, retained across `stop()` so a
+    /// later `CLIENT RESUME` can restore it (§15, §18).
+    private var retainedCapabilities: CapabilitySet?
 
     public init(
         transport: any Transport,
@@ -106,12 +123,26 @@ public final class SessionController: @unchecked Sendable {
 
     /// Whether the handshake has completed successfully (§15).
     public var isHandshakeComplete: Bool {
-        withStateLock { _isHandshakeComplete }
+        withStateLock {
+            switch phase {
+            case .active, .awaitingSnapshot:
+                return true
+            case .idle, .awaitingWelcome, .awaitingResume, .failed:
+                return false
+            }
+        }
     }
 
     /// Active negotiated capability set with the remote server (§15).
     public var negotiatedCapabilities: CapabilitySet? {
-        withStateLock { _negotiatedCapabilities }
+        withStateLock {
+            switch phase {
+            case .active(let negotiated), .awaitingSnapshot(let negotiated):
+                return negotiated
+            case .idle, .awaitingWelcome, .awaitingResume, .failed:
+                return nil
+            }
+        }
     }
 
     /// Whether the local replica has stopped tracking the authoritative stream (§18).
@@ -179,7 +210,7 @@ public final class SessionController: @unchecked Sendable {
             if isRunning { return false }
             isRunning = true
             eventDispatchEnabled = false
-            _isHandshakeComplete = false
+            phase = .idle
             return true
         }
         guard shouldStart else { return }
@@ -192,7 +223,7 @@ public final class SessionController: @unchecked Sendable {
                     self.requestedSessionId = nil
                     self.resumeAttemptId = nil
                     self.eventDispatchEnabled = false
-                    self._isHandshakeComplete = false
+                    self.phase = .idle
                 }
             }
         }
@@ -221,6 +252,9 @@ public final class SessionController: @unchecked Sendable {
             var envelope = SRUIMessage()
             envelope.clientResume = resume
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
+            withStateLock {
+                self.phase = .awaitingResume(sessionId: requestedId, attemptId: resumeAttemptId)
+            }
         } else {
             var hello = SRUIClientHello()
             hello.coreVersion = "0.4.0"
@@ -230,6 +264,9 @@ public final class SessionController: @unchecked Sendable {
             var envelope = SRUIMessage()
             envelope.clientHello = hello
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
+            withStateLock {
+                self.phase = .awaitingWelcome
+            }
         }
 
         // Start receiving the handshake response before processing data.
@@ -253,7 +290,11 @@ public final class SessionController: @unchecked Sendable {
 
     @discardableResult
     private func sendActivate(nodeId: NodeId, observedRevision: Revision) async throws -> Event {
-        guard withStateLock({ eventDispatchEnabled && _isHandshakeComplete }) else {
+        guard withStateLock({
+            guard eventDispatchEnabled else { return false }
+            if case .active = phase { return true }
+            return false
+        }) else {
             throw SessionDispatchError.resumeNotConfirmed
         }
         return try await outbox.sendActivate(
@@ -296,80 +337,45 @@ public final class SessionController: @unchecked Sendable {
         await reportFailure(.transportEnded("receive stream closed by peer"))
     }
 
-    /// Processes a single wire envelope, enforcing handshake completion before transactions/events (§12.1, §15, §22.2).
+    /// Processes a single wire envelope, dispatching on handshake phase (§12.1, §15, §22.2).
     public func handleIncomingMessage(_ message: SRUIMessage) async {
         guard let payload = message.msg else { return }
 
-        let (handshakeDone, running) = withStateLock { (_isHandshakeComplete, isRunning) }
+        let phase = withStateLock { self.phase }
 
         switch payload {
         case .serverWelcome(let welcome):
-            guard !handshakeDone else {
+            switch phase {
+            case .idle, .awaitingWelcome:
+                await handleWelcome(welcome)
+            case .awaitingResume, .active, .awaitingSnapshot, .failed:
                 await reportFailure(.protocolViolation(
                     "Unexpected SERVER WELCOME during active session after handshake completed"
                 ))
-                return
             }
-
-            // §15: Parse and negotiate server capabilities
-            let serverRequired = CapabilitySet.fromValidStrings(welcome.requiredProfiles)
-            let serverOptional = CapabilitySet.fromValidStrings(welcome.optionalProfiles)
-
-            let negotiated: CapabilitySet
-            do {
-                negotiated = try CapabilitySet.negotiate(
-                    clientOffered: clientCapabilities,
-                    serverRequired: serverRequired,
-                    serverOptional: serverOptional
-                )
-            } catch {
-                await reportFailure(.protocolViolation(
-                    "Capability negotiation failed: \(error)"
-                ))
-                return
-            }
-
-            // Check client's required server profiles (if configured)
-            if !requiredServerProfiles.isEmpty && !negotiated.isSuperset(of: requiredServerProfiles) {
-                let missing = requiredServerProfiles.subtracting(negotiated)
-                await reportFailure(.protocolViolation(
-                    "Server does not satisfy client required profiles: \(missing)"
-                ))
-                return
-            }
-
-            let accepted = await outbox.confirmFreshSession(id: welcome.sessionID)
-            guard accepted else {
-                await reportFailure(.protocolViolation(
-                    "SERVER WELCOME cannot replace an outstanding resume decision"
-                ))
-                return
-            }
-
-            withStateLock {
-                self.currentSessionId = welcome.sessionID
-                self.requestedSessionId = nil
-                self.resumeAttemptId = nil
-                self._negotiatedCapabilities = negotiated
-                self._isHandshakeComplete = true
-                self.eventDispatchEnabled = true
-            }
-            SessionDiagnostics.log("Handshake completed successfully with session \(welcome.sessionID), negotiated: \(negotiated)")
 
         case .serverResumeOk(let resumeOk):
-            withStateLock {
-                self._isHandshakeComplete = true
+            switch phase {
+            case .awaitingResume:
+                await handleResumeOk(resumeOk)
+            case .idle, .awaitingWelcome, .active, .awaitingSnapshot, .failed:
+                await reportFailure(.protocolViolation(
+                    "Unexpected SERVER RESUME_OK without an outstanding resume"
+                ))
             }
-            await handleResumeOk(resumeOk)
 
         case .serverResyncRequired(let resync):
-            withStateLock {
-                self._isHandshakeComplete = true
+            switch phase {
+            case .awaitingResume, .active:
+                await handleResyncRequired(resync, phase: phase)
+            case .idle, .awaitingWelcome, .awaitingSnapshot, .failed:
+                await reportFailure(.protocolViolation(
+                    "Received SERVER RESYNC_REQUIRED before handshake completed"
+                ))
             }
-            await handleResyncRequired(resync)
 
         case .transaction(let wireTx):
-            if running && !handshakeDone {
+            guard allowsDataPlane(phase) else {
                 await reportFailure(.protocolViolation(
                     "Received Transaction before handshake completed"
                 ))
@@ -378,16 +384,15 @@ public final class SessionController: @unchecked Sendable {
             await handleTransaction(wireTx)
 
         case .event:
-            if running && !handshakeDone {
+            guard allowsDataPlane(phase) else {
                 await reportFailure(.protocolViolation(
                     "Received Event before handshake completed"
                 ))
                 return
             }
-            break
 
         case .serverEventAck(let ack):
-            if running && !handshakeDone {
+            guard allowsDataPlane(phase) else {
                 await reportFailure(.protocolViolation(
                     "Received ServerEventAck before handshake completed"
                 ))
@@ -402,16 +407,78 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    private func allowsDataPlane(_ phase: ProtocolPhase) -> Bool {
+        switch phase {
+        case .active, .awaitingSnapshot:
+            return true
+        case .idle, .awaitingWelcome, .awaitingResume, .failed:
+            return false
+        }
+    }
+
+    private func handleWelcome(_ welcome: SRUIServerWelcome) async {
+        let serverRequired: CapabilitySet
+        do {
+            serverRequired = try CapabilitySet.fromStrings(welcome.requiredProfiles)
+        } catch {
+            await reportFailure(.protocolViolation(
+                "SERVER WELCOME required_profiles could not be parsed: \(error)"
+            ))
+            return
+        }
+        let serverOptional = CapabilitySet.fromValidStrings(welcome.optionalProfiles)
+
+        let negotiated: CapabilitySet
+        do {
+            negotiated = try CapabilitySet.negotiate(
+                clientOffered: clientCapabilities,
+                serverRequired: serverRequired,
+                serverOptional: serverOptional
+            )
+        } catch {
+            await reportFailure(.protocolViolation(
+                "Capability negotiation failed: \(error)"
+            ))
+            return
+        }
+
+        if !requiredServerProfiles.isEmpty && !negotiated.isSuperset(of: requiredServerProfiles) {
+            let missing = requiredServerProfiles.subtracting(negotiated)
+            await reportFailure(.protocolViolation(
+                "Server does not satisfy client required profiles: \(missing)"
+            ))
+            return
+        }
+
+        let accepted = await outbox.confirmFreshSession(id: welcome.sessionID)
+        guard accepted else {
+            await reportFailure(.protocolViolation(
+                "SERVER WELCOME cannot replace an outstanding resume decision"
+            ))
+            return
+        }
+
+        withStateLock {
+            self.currentSessionId = welcome.sessionID
+            self.requestedSessionId = nil
+            self.resumeAttemptId = nil
+            self.retainedCapabilities = negotiated
+            self.phase = .active(negotiated: negotiated)
+            self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+        }
+        SessionDiagnostics.log(
+            "Handshake completed successfully with session \(welcome.sessionID), negotiated: \(negotiated)"
+        )
+    }
+
     private func handleResumeOk(_ resumeOk: SRUIServerResumeOk) async {
         let (requested, attemptId) = withStateLock {
             (requestedSessionId, resumeAttemptId)
         }
         guard let requested, let attemptId else {
-            await outbox.acknowledgeEvents(throughSeq: resumeOk.lastProcessedEventSeq)
-            withStateLock {
-                self.currentSessionId = resumeOk.sessionID
-                self.eventDispatchEnabled = self.isRunning && !self._isDiverged
-            }
+            await reportFailure(.protocolViolation(
+                "Unexpected SERVER RESUME_OK without an outstanding resume"
+            ))
             return
         }
         guard requested == resumeOk.sessionID else {
@@ -438,14 +505,30 @@ public final class SessionController: @unchecked Sendable {
             return
         }
         withStateLock {
+            let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
             self.requestedSessionId = nil
             self.resumeAttemptId = nil
+            self.retainedCapabilities = negotiated
+            self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = self.isRunning && !self._isDiverged
         }
     }
 
-    private func handleResyncRequired(_ resync: SRUIServerResyncRequired) async {
+    private func handleResyncRequired(_ resync: SRUIServerResyncRequired, phase: ProtocolPhase) async {
+        let negotiated: CapabilitySet
+        switch phase {
+        case .active(let caps), .awaitingSnapshot(let caps):
+            negotiated = caps
+        case .awaitingResume:
+            negotiated = withStateLock { retainedCapabilities ?? clientCapabilities }
+        case .idle, .awaitingWelcome, .failed:
+            await reportFailure(.protocolViolation(
+                "Received SERVER RESYNC_REQUIRED before handshake completed"
+            ))
+            return
+        }
+
         let (requested, attemptId) = withStateLock {
             (requestedSessionId, resumeAttemptId)
         }
@@ -475,11 +558,7 @@ public final class SessionController: @unchecked Sendable {
                     await reportFailure(.transportEnded("pending event replay failed: \(error)"))
                     return
                 }
-                withStateLock {
-                    self.currentSessionId = resync.sessionID
-                    self.requestedSessionId = nil
-                    self.pendingResync = true
-                }
+                enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .replaced:
                 guard resync.sessionID != requested else {
@@ -497,11 +576,7 @@ public final class SessionController: @unchecked Sendable {
                     SessionDiagnostics.log("Ignoring superseded replacement resync")
                     return
                 }
-                withStateLock {
-                    self.currentSessionId = resync.sessionID
-                    self.requestedSessionId = nil
-                    self.pendingResync = true
-                }
+                enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
                 await reportFailure(.protocolViolation(
@@ -515,16 +590,54 @@ public final class SessionController: @unchecked Sendable {
                 return
             }
         } else {
-            // Mid-session resync notification without an outstanding resume attempt (§18)
-            withStateLock {
-                self.currentSessionId = resync.sessionID
-                self.pendingResync = true
+            switch resync.continuity {
+            case .sameSession:
+                let currentId = withStateLock { currentSessionId }
+                guard resync.sessionID == currentId else {
+                    await reportFailure(.protocolViolation(
+                        "same-session resync changed session_id from \(currentId ?? "<none>") to \(resync.sessionID)"
+                    ))
+                    return
+                }
+                enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
+
+            case .replaced:
+                let currentId = withStateLock { currentSessionId }
+                guard resync.sessionID != currentId else {
+                    await reportFailure(.protocolViolation(
+                        "replacement resync reused expired session_id \(currentId ?? "<none>")"
+                    ))
+                    return
+                }
+                enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
+
+            case .unspecified:
+                await reportFailure(.protocolViolation(
+                    "SERVER RESYNC_REQUIRED received with unspecified continuity"
+                ))
+                return
+            case .UNRECOGNIZED:
+                await reportFailure(.protocolViolation(
+                    "SERVER RESYNC_REQUIRED omitted a recognized session continuity"
+                ))
+                return
             }
         }
 
         SessionDiagnostics.log(
             "Server resync required at revision \(resync.snapshotRevision): \(resync.reason)"
         )
+    }
+
+    private func enterAwaitingSnapshot(sessionId: String, negotiated: CapabilitySet) {
+        withStateLock {
+            self.currentSessionId = sessionId
+            self.requestedSessionId = nil
+            self.pendingResync = true
+            self.eventDispatchEnabled = false
+            self.retainedCapabilities = negotiated
+            self.phase = .awaitingSnapshot(negotiated: negotiated)
+        }
     }
 
     /// Settles one outbound event against the server's acknowledgement (§18, §18.2).
@@ -612,15 +725,22 @@ public final class SessionController: @unchecked Sendable {
             )
             if isResyncSnapshot {
                 let attemptId = withStateLock { self.resumeAttemptId }
-                let accepted = if let attemptId {
-                    await outbox.finishResync(attemptId: attemptId)
-                } else {
-                    false
-                }
-                withStateLock {
-                    if accepted {
+                if let attemptId {
+                    let accepted = await outbox.finishResync(attemptId: attemptId)
+                    withStateLock {
+                        guard accepted else { return }
                         self.resumeAttemptId = nil
                         self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+                        if case .awaitingSnapshot(let negotiated) = self.phase {
+                            self.phase = .active(negotiated: negotiated)
+                        }
+                    }
+                } else {
+                    withStateLock {
+                        self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+                        if case .awaitingSnapshot(let negotiated) = self.phase {
+                            self.phase = .active(negotiated: negotiated)
+                        }
                     }
                 }
             }
@@ -664,6 +784,7 @@ public final class SessionController: @unchecked Sendable {
             if _isDiverged { return nil }
             _isDiverged = true
             eventDispatchEnabled = false
+            phase = .failed
             return _onFailure ?? { _ in }
         }
         guard let handler else { return }
@@ -720,8 +841,7 @@ public final class SessionController: @unchecked Sendable {
             requestedSessionId = nil
             resumeAttemptId = nil
             eventDispatchEnabled = false
-            _isHandshakeComplete = false
-            _negotiatedCapabilities = nil
+            phase = .idle
             return t
         }
 

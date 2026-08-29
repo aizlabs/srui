@@ -180,24 +180,3 @@ private enum SocketIntegrationError: Error, CustomStringConvertible {
         }
     }
 }
-
-private final class ManagedAtomic<T: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: T
-
-    init(_ value: T) {
-        self.value = value
-    }
-
-    func store(_ newValue: T) {
-        lock.lock()
-        defer { lock.unlock() }
-        value = newValue
-    }
-
-    func load() -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
-}

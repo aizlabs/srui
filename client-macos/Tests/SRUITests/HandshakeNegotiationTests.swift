@@ -316,25 +316,147 @@ struct HandshakeNegotiationTests {
         await controller.stop()
         await serverTransport.close()
     }
-}
 
-private final class ManagedAtomic<T: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: T
+    @Test("Unsolicited SERVER RESUME_OK without CLIENT RESUME is a protocol violation")
+    func unsolicitedResumeOkIsRejected() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
 
-    init(_ value: T) {
-        self.value = value
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "spoofed-session"
+        var resumeMsg = SRUIMessage()
+        resumeMsg.serverResumeOk = resumeOk
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMsg))
+
+        try await AsyncTestSupport.eventually(description: "unsolicited RESUME_OK rejected") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+        #expect(controller.isHandshakeComplete == false)
+        #expect(controller.negotiatedCapabilities == nil)
+
+        if let failure = failurePromise.load() {
+            if case .protocolViolation(let msg) = failure {
+                #expect(msg.contains("without an outstanding resume"))
+            } else {
+                Issue.record("Expected protocolViolation, got \(failure)")
+            }
+        }
+
+        await controller.stop()
+        await serverTransport.close()
     }
 
-    func store(_ newValue: T) {
-        lock.lock()
-        defer { lock.unlock() }
-        value = newValue
+    @Test("Malformed SERVER WELCOME required profiles fail the handshake (§4 inv. 13)")
+    func malformedRequiredProfilesFailHandshake() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = "0.4.0"
+        welcome.sessionID = "bad-required"
+        welcome.requiredProfiles = ["not-a-profile"]
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        try await AsyncTestSupport.eventually(description: "malformed required profiles fail closed") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+        #expect(controller.isHandshakeComplete == false)
+
+        if let failure = failurePromise.load() {
+            if case .protocolViolation(let msg) = failure {
+                #expect(msg.contains("required_profiles could not be parsed"))
+            } else {
+                Issue.record("Expected protocolViolation, got \(failure)")
+            }
+        }
+
+        await controller.stop()
+        await serverTransport.close()
     }
 
-    func load() -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
+    @Test("SERVER RESUME_OK restores negotiated capabilities for a resume-only session")
+    func resumeOkPopulatesNegotiatedCapabilities() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let offered: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1]
+        let controller = SessionController(
+            transport: clientTransport,
+            sessionId: "resume-session",
+            clientCapabilities: offered
+        )
+
+        try await controller.start()
+        #expect(controller.isHandshakeComplete == false)
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "resume-session"
+        var resumeMsg = SRUIMessage()
+        resumeMsg.serverResumeOk = resumeOk
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMsg))
+
+        try await AsyncTestSupport.eventually(description: "resume handshake completion") {
+            controller.isHandshakeComplete
+        }
+        #expect(controller.negotiatedCapabilities == offered)
+        #expect(controller.isDiverged == false)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    @Test("SERVER RESUME_OK after a completed WELCOME handshake is a protocol violation")
+    func strayResumeOkAfterWelcomeIsRejected() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+        try await serverTransport.send(
+            data: try SRUIFraming.encodeFramed(HandshakeFixtures.welcomeMessage(sessionId: "session-1"))
+        )
+        try await AsyncTestSupport.eventually(description: "initial handshake") {
+            controller.isHandshakeComplete
+        }
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "session-1"
+        var resumeMsg = SRUIMessage()
+        resumeMsg.serverResumeOk = resumeOk
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMsg))
+
+        try await AsyncTestSupport.eventually(description: "stray RESUME_OK rejected") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+
+        await controller.stop()
+        await serverTransport.close()
     }
 }

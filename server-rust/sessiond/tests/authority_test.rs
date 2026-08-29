@@ -60,6 +60,20 @@ async fn connect_client(
     match welcome_msg.msg {
         Some(srui_message::Msg::ServerWelcome(w)) => {
             assert_eq!(w.session_id, session.session_id());
+            if w.initial_revision > 0 {
+                let snapshot = client_framed_read
+                    .next()
+                    .await
+                    .expect("hello catch-up snapshot")
+                    .expect("decode snapshot");
+                match snapshot.msg {
+                    Some(srui_message::Msg::Transaction(tx)) => {
+                        assert_eq!(tx.base_revision, 0);
+                        assert_eq!(tx.new_revision, w.initial_revision);
+                    }
+                    other => panic!("expected hello catch-up Transaction, got {other:?}"),
+                }
+            }
         }
         other => panic!("expected ServerWelcome, got {other:?}"),
     }

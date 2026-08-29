@@ -32,12 +32,21 @@ struct SessionRobustnessTests {
         return try SRUIFraming.encodeFramed(msg)
     }
 
+    private static func framedWelcome(sessionId: String = "test-session") throws -> Data {
+        var welcome = SRUIServerWelcome()
+        welcome.sessionID = sessionId
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var msg = SRUIMessage()
+        msg.serverWelcome = welcome
+        return try SRUIFraming.encodeFramed(msg)
+    }
+
     private static func framedResyncRequired(revision: UInt64) throws -> Data {
         var resync = SRUIServerResyncRequired()
         resync.sessionID = "test-session"
         resync.snapshotRevision = revision
-        resync.reason = "session replaced"
-        resync.continuity = .replaced
+        resync.reason = "journal evicted"
+        resync.continuity = .sameSession
         var msg = SRUIMessage()
         msg.serverResyncRequired = resync
         return try SRUIFraming.encodeFramed(msg)
@@ -82,6 +91,7 @@ struct SessionRobustnessTests {
         )
         controller.attachRenderer(renderer)
         try await controller.start()
+        try await serverTransport.send(data: try Self.framedWelcome())
 
         let initialTx = Transaction(
             baseRevision: .initial,
@@ -165,11 +175,12 @@ struct SessionRobustnessTests {
         let serverStream = serverTransport.receiveStream()
         try await controller.start()
 
-        var resumeOk = SRUIServerResumeOk()
-        resumeOk.sessionID = "default"
-        var resumeMessage = SRUIMessage()
-        resumeMessage.serverResumeOk = resumeOk
-        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMessage))
+        var welcome = SRUIServerWelcome()
+        welcome.sessionID = "default"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
 
         let buttonID = NodeId(4)
         let mountTx = Transaction(
@@ -264,6 +275,7 @@ struct SessionRobustnessTests {
         )
         controller.attachRenderer(renderer)
         try await controller.start()
+        try await serverTransport.send(data: try Self.framedWelcome())
 
         try await serverTransport.send(
             data: try Self.framed(
@@ -320,6 +332,7 @@ struct SessionRobustnessTests {
         )
         controller.attachRenderer(renderer)
         try await controller.start()
+        try await serverTransport.send(data: try Self.framedWelcome())
 
         // Server evicted the journal before we ever applied anything.
         try await serverTransport.send(data: try Self.framedResyncRequired(revision: 3))
@@ -373,6 +386,7 @@ struct SessionRobustnessTests {
         )
         controller.attachRenderer(renderer)
         try await controller.start()
+        try await serverTransport.send(data: try Self.framedWelcome())
 
         try await serverTransport.send(
             data: try Self.framed(
@@ -442,6 +456,7 @@ struct SessionRobustnessTests {
             Task { await failures.record(failure) }
         }
         try await controller.start()
+        try await serverTransport.send(data: try Self.framedWelcome())
 
         try await serverTransport.send(
             data: try Self.framed(
@@ -499,6 +514,7 @@ struct SessionRobustnessTests {
         let applier = TransactionApplier()
         let controller = SessionController(transport: clientTransport, applier: applier)
         try await controller.start()
+        try await serverTransport.send(data: try Self.framedWelcome())
 
         try await serverTransport.send(
             data: try Self.framed(
@@ -529,6 +545,13 @@ struct SessionRobustnessTests {
         // must not survive: otherwise every transaction of the next session is silently dropped.
         await controller.stop()
         #expect(!controller.isDiverged)
+
+        var welcomeMsg = SRUIMessage()
+        var welcome = SRUIServerWelcome()
+        welcome.sessionID = "test-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcomeMsg.serverWelcome = welcome
+        await controller.handleIncomingMessage(welcomeMsg)
 
         var msg = SRUIMessage()
         msg.transaction = Transaction(

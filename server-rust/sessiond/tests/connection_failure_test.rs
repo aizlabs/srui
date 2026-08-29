@@ -230,8 +230,17 @@ async fn server_welcome_contains_session_metadata() {
             assert_eq!(w.core_version, "0.4.0");
             assert_eq!(w.session_id, "welcome-fields");
             assert_eq!(w.initial_revision, 1);
-            assert_eq!(w.required_profiles, Vec::<String>::new());
-            assert_eq!(w.optional_profiles, Vec::<String>::new());
+            assert_eq!(
+                w.required_profiles,
+                vec!["org.srui.standard-widgets/1".to_string()]
+            );
+            assert_eq!(
+                w.optional_profiles,
+                vec![
+                    "org.srui.richtext/1".to_string(),
+                    "org.srui.terminal/1".to_string(),
+                ]
+            );
             assert_eq!(w.extension_namespaces.len(), 1);
             assert_eq!(
                 w.extension_namespaces[0].extension_uri,
@@ -254,6 +263,19 @@ async fn server_welcome_contains_session_metadata() {
             assert_eq!(limits.max_resource_size, 50 * 1024 * 1024);
         }
         other => panic!("expected ServerWelcome, got {:?}", other),
+    }
+
+    let snapshot = client_framed_read
+        .next()
+        .await
+        .expect("hello catch-up snapshot")
+        .expect("decode snapshot");
+    match snapshot.msg {
+        Some(srui_message::Msg::Transaction(tx)) => {
+            assert_eq!(tx.base_revision, 0);
+            assert_eq!(tx.new_revision, 1);
+        }
+        other => panic!("expected hello catch-up Transaction, got {:?}", other),
     }
 
     shutdown.cancel();

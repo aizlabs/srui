@@ -76,6 +76,122 @@ struct CounterSocketIntegrationTests {
         await controller.stop()
     }
 
+    @Test("Fresh HELLO against a seeded counter session applies the catch-up snapshot")
+    @MainActor
+    func helloCatchUpSnapshotOverUnixSocket() async throws {
+        let socketPath = "/tmp/srui-counter-hello-\(UUID().uuidString).sock"
+        let repoRoot = Self.repositoryRoot()
+        let counterBinary = repoRoot
+            .appendingPathComponent("examples/counter/target/debug/counter")
+
+        guard FileManager.default.fileExists(atPath: counterBinary.path) else {
+            Issue.record("Counter binary not found at \(counterBinary.path). Run: cargo build --manifest-path examples/counter/Cargo.toml")
+            return
+        }
+
+        let server = Process()
+        server.executableURL = counterBinary
+        server.arguments = ["--socket", socketPath]
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+
+        try server.run()
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+            server.waitUntilExit()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
+
+        let transport = UnixSocketTransport(socketPath: socketPath)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        // Omit sessionId so the client sends CLIENT HELLO rather than CLIENT RESUME (§15).
+        let controller = SessionController(
+            transport: transport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+
+        try await controller.start()
+        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+        try await AsyncTestSupport.eventually(description: "HELLO catch-up enables event dispatch") {
+            controller.isEventDispatchEnabled
+        }
+
+        let textID = NodeId(2)
+        let buttonID = NodeId(4)
+
+        _ = try await controller.sendActivate(nodeId: buttonID)
+        try await Self.waitForRevision(applier, expected: Revision(2), timeoutSeconds: 5)
+
+        let textHandle = try #require(renderer.registry.handle(for: textID))
+        let textField = try #require(textHandle.view as? NSTextField)
+        #expect(textField.stringValue == "Count: 1")
+
+        await controller.stop()
+    }
+
+    @Test("Connection fails cleanly at handshake time when server requires an unsupported profile (§4 inv. 13)")
+    @MainActor
+    func mismatchedRequiredProfileFailsAtHandshake() async throws {
+        let socketPath = "/tmp/srui-counter-mismatch-\(UUID().uuidString).sock"
+        let repoRoot = Self.repositoryRoot()
+        let counterBinary = repoRoot
+            .appendingPathComponent("examples/counter/target/debug/counter")
+
+        guard FileManager.default.fileExists(atPath: counterBinary.path) else {
+            Issue.record("Counter binary not found at \(counterBinary.path). Run: cargo build --manifest-path examples/counter/Cargo.toml")
+            return
+        }
+
+        let server = Process()
+        server.executableURL = counterBinary
+        server.arguments = ["--socket", socketPath, "--require-profile", "org.srui.unsupported-feature/1"]
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+
+        try server.run()
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+            server.waitUntilExit()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
+
+        let transport = UnixSocketTransport(socketPath: socketPath)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: transport,
+            applier: applier,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        try await AsyncTestSupport.eventually(description: "handshake failure on profile mismatch against live server") {
+            controller.isDiverged && (failurePromise.load() != nil || !controller.isHandshakeComplete)
+        }
+        #expect(!controller.isHandshakeComplete)
+        #expect(applier.lastAppliedRevision == .initial)
+
+        await controller.stop()
+    }
+
     private static func repositoryRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

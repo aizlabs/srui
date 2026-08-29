@@ -253,6 +253,8 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
 
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
         ack.eventID = event.eventId.bytes
@@ -292,6 +294,8 @@ struct EventOutboxRetryTests {
         )
         #expect(await outbox.pendingCount == 2)
         let sentBeforeAck = try events(in: await collector.wait(forAtLeast: 2)).count
+
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
 
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
@@ -334,6 +338,8 @@ struct EventOutboxRetryTests {
             observedRevision: Revision(1),
             via: client
         )
+
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
 
         var secondAck = SRUIServerEventAck()
         secondAck.clientInstanceID = outbox.clientInstanceId.bytes
@@ -384,6 +390,8 @@ struct EventOutboxRetryTests {
             via: client
         )
 
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
         ack.eventID = event.eventId.bytes
@@ -423,14 +431,10 @@ struct EventOutboxRetryTests {
                 observedRevision: Revision(1),
                 via: client
             )
-            var ack = SRUIServerEventAck()
-            ack.clientInstanceID = outbox.clientInstanceId.bytes
-            ack.eventID = event.eventId.bytes
-            ack.lastProcessedEventSeq = event.eventSeq
-            ack.status = .processed
-            var message = SRUIMessage()
-            message.serverEventAck = ack
-            await controller.handleIncomingMessage(message)
+            _ = await outbox.settleAcknowledgement(
+                eventId: event.eventId,
+                throughSeq: event.eventSeq
+            )
         }
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == 3)
@@ -634,6 +638,8 @@ struct EventOutboxRetryTests {
         let message = try decodeFramedMessage(from: frame)
         let event = try #require(try events(in: [message]).first)
 
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
         ack.eventID = event.eventId.bytes
@@ -722,6 +728,8 @@ struct EventOutboxRetryTests {
             observedRevision: Revision(3),
             via: client
         )
+
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
 
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = ClientInstanceId(string: "client-b").bytes

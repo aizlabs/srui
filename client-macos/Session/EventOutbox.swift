@@ -182,6 +182,29 @@ public actor EventOutbox {
         return true
     }
 
+    /// Blocks new event allocation until a bootstrap or resync snapshot commits (§15, §18).
+    func suspendNewEvents() {
+        acceptsNewEvents = false
+    }
+
+    /// Applies the event frontier for a live-session resync without an outstanding resume attempt.
+    func applyLiveResyncFrontier(lastProcessedEventSeq: UInt64) {
+        acceptsNewEvents = false
+        acknowledgeEvents(throughSeq: lastProcessedEventSeq)
+    }
+
+    /// Abandons pending intents and binds a replacement incarnation without a resume attempt (§18).
+    func applyReplacementFrontier(id: String, lastProcessedEventSeq: UInt64) {
+        activeSessionId = id
+        acceptsNewEvents = false
+        currentEventSeq = lastProcessedEventSeq
+        _lastAckedEventSeq = lastProcessedEventSeq
+        pendingEvents.removeAll(keepingCapacity: true)
+        pendingOrder.removeAll(keepingCapacity: true)
+        acknowledgedOutOfOrder.removeAll(keepingCapacity: true)
+        sendTail = nil
+    }
+
     /// Applies one selective acknowledgement plus the server's contiguous cumulative frontier.
     /// Returns false when a draining connection delivers an ack from an expired incarnation.
     @discardableResult
@@ -219,15 +242,13 @@ public actor EventOutbox {
         attemptId: UUID
     ) -> Bool {
         guard activeResumeAttemptId == attemptId else { return false }
-        activeSessionId = id
-        acceptsNewEvents = false
-        currentEventSeq = lastProcessedEventSeq
-        _lastAckedEventSeq = lastProcessedEventSeq
-        pendingEvents.removeAll(keepingCapacity: true)
-        pendingOrder.removeAll(keepingCapacity: true)
-        acknowledgedOutOfOrder.removeAll(keepingCapacity: true)
-        sendTail = nil
+        applyReplacementFrontier(id: id, lastProcessedEventSeq: lastProcessedEventSeq)
         return true
+    }
+
+    /// Re-enables allocation after a HELLO catch-up snapshot with no resume attempt (§15, §18).
+    func allowNewEvents() {
+        acceptsNewEvents = true
     }
 
     /// Enables new events only after the snapshot for the current reconnect generation commits.

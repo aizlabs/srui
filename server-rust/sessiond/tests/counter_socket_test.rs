@@ -167,6 +167,14 @@ impl CounterConnection {
             Some(srui_message::Msg::ServerWelcome(w)) => {
                 assert_eq!(w.session_id, session.session_id());
                 assert_eq!(w.initial_revision, 1);
+                let snapshot = read.next().await.expect("hello catch-up").expect("decode snapshot");
+                match snapshot.msg {
+                    Some(srui_message::Msg::Transaction(tx)) => {
+                        assert_eq!(tx.base_revision, 0);
+                        assert_eq!(tx.new_revision, 1);
+                    }
+                    other => panic!("expected hello catch-up Transaction, got {:?}", other),
+                }
             }
             other => panic!("expected ServerWelcome, got {:?}", other),
         }
@@ -447,6 +455,19 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
         other => panic!("expected ServerWelcome envelope, got {:?}", other),
     }
 
+    let snapshot_envelope = framed_read
+        .next()
+        .await
+        .expect("hello catch-up snapshot")
+        .expect("decode snapshot");
+    match snapshot_envelope.msg {
+        Some(srui_message::Msg::Transaction(tx)) => {
+            assert_eq!(tx.base_revision, 0);
+            assert_eq!(tx.new_revision, 1);
+        }
+        other => panic!("expected hello catch-up Transaction, got {:?}", other),
+    }
+
     // 5. Drive 5 simulated button click ACTIVATE events through the Unix socket (§7.6, §16, §29)
     for seq in 1..=5 {
         let observed_rev = seq; // Before click 1, store is at rev 1; before click 2, rev 2, etc.
@@ -633,6 +654,19 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
             assert_eq!(w.initial_revision, 1);
         }
         other => panic!("expected ServerWelcome envelope, got {:?}", other),
+    }
+
+    let snapshot_envelope = framed_read
+        .next()
+        .await
+        .expect("hello catch-up snapshot")
+        .expect("decode snapshot");
+    match snapshot_envelope.msg {
+        Some(srui_message::Msg::Transaction(tx)) => {
+            assert_eq!(tx.base_revision, 0);
+            assert_eq!(tx.new_revision, 1);
+        }
+        other => panic!("expected hello catch-up Transaction, got {:?}", other),
     }
 
     // Drive 5 ACTIVATE events
@@ -964,6 +998,15 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
         assert!(matches!(
             welcome.msg,
             Some(srui_message::Msg::ServerWelcome(_))
+        ));
+        let snapshot = framed_read
+            .next()
+            .await
+            .expect("hello catch-up snapshot")
+            .expect("decode snapshot");
+        assert!(matches!(
+            snapshot.msg,
+            Some(srui_message::Msg::Transaction(_))
         ));
     }
 

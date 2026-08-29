@@ -32,6 +32,13 @@ struct SessionControllerResyncTests {
 
         try await controller.start()
 
+        var welcome = SRUIServerWelcome()
+        welcome.sessionID = "test-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
         let surfaceID = NodeId(1)
         let textID = NodeId(2)
 
@@ -60,8 +67,8 @@ struct SessionControllerResyncTests {
         var resync = SRUIServerResyncRequired()
         resync.sessionID = "test-session"
         resync.snapshotRevision = 2
-        resync.reason = "session replaced"
-        resync.continuity = .replaced
+        resync.reason = "journal evicted"
+        resync.continuity = .sameSession
         resyncMsg.serverResyncRequired = resync
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMsg))
 
@@ -107,6 +114,13 @@ struct SessionControllerResyncTests {
         controller.attachRenderer(renderer)
 
         try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.sessionID = "test-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
 
         let surfaceID = NodeId(1)
         let textID = NodeId(2)
@@ -186,6 +200,16 @@ struct SessionControllerResyncTests {
         controller.attachRenderer(renderer)
 
         let surfaceID = NodeId(1)
+
+        await controller.handleIncomingMessage({
+            var welcome = SRUIServerWelcome()
+            welcome.sessionID = "test-session"
+            welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+            var msg = SRUIMessage()
+            msg.serverWelcome = welcome
+            return msg
+        }())
+
         let badTx = Transaction(
             baseRevision: .initial,
             newRevision: Revision(1),

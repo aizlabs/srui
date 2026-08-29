@@ -11,7 +11,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientResume, SruiCodec, SruiMessage, Transaction as WireTransaction,
+    srui_message, ClientResume, SessionContinuity, SruiCodec, SruiMessage,
+    Transaction as WireTransaction,
 };
 use srui_sdk::*;
 use srui_semantic_tree::{
@@ -170,6 +171,11 @@ fn test_handle_resume_resync_snapshot_reconstructs_tree_and_models() {
 
     assert_eq!(resync_msg.session_id, "resync-snapshot-test");
     assert_eq!(resync_msg.snapshot_revision, expected_revision);
+    assert_eq!(
+        SessionContinuity::try_from(resync_msg.continuity),
+        Ok(SessionContinuity::SameSession)
+    );
+    assert_eq!(resync_msg.last_processed_event_seq, 0);
     assert_eq!(snapshot_tx.base_revision, 0);
     assert_eq!(snapshot_tx.new_revision, expected_revision);
     assert!(

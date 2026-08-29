@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
-use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, RecordOutcome};
+use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, EventSequenceError, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal};
 use srui_protocol::{
     ClientHello, ClientResume, Event, ExtensionNamespaceMapping, ServerLimits, ServerResumeOk,
-    ServerResyncRequired, ServerWelcome, Transaction,
+    ServerResyncRequired, ServerWelcome, SessionContinuity, Transaction,
 };
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
@@ -50,6 +50,9 @@ pub enum SessionError {
 
     #[error("capability negotiation error: {0}")]
     Negotiation(#[from] NegotiationError),
+
+    #[error("invalid client event sequence: {0}")]
+    EventSequence(#[from] EventSequenceError),
 
     #[error("lock poisoned")]
     LockPoisoned,
@@ -88,8 +91,8 @@ pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> Stri
 ///
 /// `Processed`, `Duplicate`, and `Rejected` are terminal and become `SERVER EVENT_ACK`; `Pending`
 /// is explicitly non-terminal and produces no acknowledgement. `last_processed_event_seq` is the
-/// cumulative settled high-water mark for the event's `client_instance_id` and outlives the
-/// connection (§18).
+/// highest contiguous settled sequence for the event's `client_instance_id`; it never crosses
+/// an in-flight or missing sequence (§18.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventOutcome {
     /// Newly admitted, validated, and dispatched to handlers.
@@ -118,12 +121,12 @@ pub enum EventOutcome {
 /// Outcome of a [`ClientResume`] handshake request.
 #[derive(Debug, Clone)]
 pub enum ResumeOutcome {
-    /// Replay available: sends `ServerResumeOk` followed by the missing transaction sequence.
+    /// The exact requested session survived: sends `ServerResumeOk` followed by replay.
     Replay {
         welcome_msg: ServerResumeOk,
         from_revision: u64,
     },
-    /// Replay window expired: client must receive full snapshot resync (§20.2).
+    /// Full snapshot required, either for a same-session journal gap or a replaced incarnation.
     Resync {
         resync_msg: ServerResyncRequired,
         snapshot_transaction: Transaction,
@@ -284,18 +287,35 @@ impl Session {
             Replay {
                 session_id: String,
                 from_revision: u64,
+                last_processed_event_seq: u64,
             },
             Resync {
                 session_id: String,
                 snapshot_revision: u64,
                 store_snapshot: SemanticStore,
+                continuity: SessionContinuity,
+                last_processed_event_seq: u64,
             },
         }
 
         let plan = {
             let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            let last_processed_event_seq = guard
+                .dedupe
+                .last_contiguous_processed_seq(&resume.client_instance_id);
 
-            if guard
+            // A session ID is an incarnation token, not a human-readable application name. A
+            // mismatch means the requested session is gone, so old client intents must not be
+            // replayed against this authoritative state.
+            if resume.session_id != guard.session_id {
+                ResumePlan::Resync {
+                    session_id: guard.session_id.clone(),
+                    snapshot_revision: guard.store.revision().get(),
+                    store_snapshot: guard.store.clone_staging(),
+                    continuity: SessionContinuity::Replaced,
+                    last_processed_event_seq,
+                }
+            } else if guard
                 .journal
                 .iter_from(resume.last_applied_revision)
                 .is_some()
@@ -303,12 +323,15 @@ impl Session {
                 ResumePlan::Replay {
                     session_id: guard.session_id.clone(),
                     from_revision: resume.last_applied_revision,
+                    last_processed_event_seq,
                 }
             } else {
                 ResumePlan::Resync {
                     session_id: guard.session_id.clone(),
                     snapshot_revision: guard.store.revision().get(),
                     store_snapshot: guard.store.clone_staging(),
+                    continuity: SessionContinuity::SameSession,
+                    last_processed_event_seq,
                 }
             }
         };
@@ -317,10 +340,12 @@ impl Session {
             ResumePlan::Replay {
                 session_id,
                 from_revision,
+                last_processed_event_seq,
             } => {
                 let welcome_msg = ServerResumeOk {
                     session_id,
                     replay_from_revision: from_revision,
+                    last_processed_event_seq,
                 };
                 Ok(ResumeOutcome::Replay {
                     welcome_msg,
@@ -331,12 +356,25 @@ impl Session {
                 session_id,
                 snapshot_revision,
                 store_snapshot,
+                continuity,
+                last_processed_event_seq,
             } => {
                 let snapshot_tx = export_snapshot_transaction(&store_snapshot);
+                let reason = match continuity {
+                    SessionContinuity::SameSession => {
+                        "client revision outside retained journal window"
+                    }
+                    SessionContinuity::Replaced => {
+                        "requested session incarnation is no longer available"
+                    }
+                    SessionContinuity::Unspecified => unreachable!("server always sets continuity"),
+                };
                 let resync_msg = ServerResyncRequired {
                     session_id,
                     snapshot_revision,
-                    reason: "client revision outside retained journal window".to_string(),
+                    reason: reason.to_string(),
+                    continuity: continuity as i32,
+                    last_processed_event_seq,
                 };
                 Ok(ResumeOutcome::Resync {
                     resync_msg,
@@ -345,8 +383,6 @@ impl Session {
             }
         }
     }
-
-    /// Registers an in-process semantic event handler for the given node and event type (§7.6, §29).
     pub fn on<F>(&self, node: impl Into<NodeId>, event_type: TypeRef, handler: F)
     where
         F: Fn(&Session, &Event) + Send + Sync + 'static,
@@ -448,7 +484,7 @@ impl Session {
     /// (§18.2). A validation failure is a *rejection of that event*, not a protocol violation: it
     /// is reported as [`EventOutcome::Rejected`] rather than an `Err`, because tearing the
     /// connection down would make the client reconnect and replay the same invalid event forever.
-    /// Only infrastructure failures (a poisoned lock) remain `Err`.
+    /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
         let matching_handlers = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
@@ -456,7 +492,7 @@ impl Session {
             // Deduplication check (§18.2, §32.4). A settled replay is answered from the result
             // cache; an in-flight replay remains unacknowledged so the client cannot mistake it
             // for a completed action.
-            match guard.dedupe.admit_event(event) {
+            match guard.dedupe.admit_event(event)? {
                 RecordOutcome::Duplicate {
                     prior,
                     last_processed_event_seq,
@@ -507,7 +543,10 @@ impl Session {
                     EventOutcomeRecord {
                         accepted: false,
                         revision_after_effect: current_rev.get(),
-                        reject_reason: bound_diagnostic_string(error.to_string(), max_string_length),
+                        reject_reason: bound_diagnostic_string(
+                            error.to_string(),
+                            max_string_length,
+                        ),
                     },
                 );
                 return Ok(EventOutcome::Rejected {
@@ -846,6 +885,7 @@ mod tests {
                 from_revision,
             } => {
                 assert_eq!(welcome_msg.replay_from_revision, 0);
+                assert_eq!(welcome_msg.last_processed_event_seq, 0);
                 let replayed = session
                     .collect_replayed_transactions(from_revision)
                     .expect("replay available");
@@ -887,6 +927,11 @@ mod tests {
             } => {
                 assert_eq!(resync_msg.session_id, "resync-test");
                 assert_eq!(resync_msg.snapshot_revision, 1025);
+                assert_eq!(
+                    SessionContinuity::try_from(resync_msg.continuity),
+                    Ok(SessionContinuity::SameSession)
+                );
+                assert_eq!(resync_msg.last_processed_event_seq, 0);
                 assert_eq!(snapshot_transaction.new_revision, 1025);
             }
             ResumeOutcome::Replay { .. } => panic!("expected resync, got replay"),

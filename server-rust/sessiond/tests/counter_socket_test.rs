@@ -789,7 +789,7 @@ async fn test_counter_duplicate_activate_across_reconnect_no_double_increment() 
 
     // Retry the same stable event_id after reconnect (§18.2 dedupe).
     resumed
-        .send_activate(COUNTER_CLIENT_A, 2, "click-dup", 2, button_id)
+        .send_activate(COUNTER_CLIENT_A, 1, "click-dup", 2, button_id)
         .await;
 
     // The replay is answered from the result cache: settled as DUPLICATE, handler not re-run, so

@@ -145,6 +145,7 @@ fn main() {
             status: EventAckStatus::Processed as i32,
             revision_after_effect: 1843,
             reject_reason: String::new(),
+            session_id: String::new(),
         })),
     };
     let event_ack_bytes = encode_framed(&event_ack).expect("encode framed ServerEventAck");

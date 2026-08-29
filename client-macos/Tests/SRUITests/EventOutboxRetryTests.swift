@@ -244,6 +244,59 @@ struct EventOutboxRetryTests {
         _ = first
     }
 
+    @Test("A selective ack beyond a gap retains the missing event (§18.2)")
+    func selectiveAckDoesNotCrossMissingSequence() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            via: client
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(2),
+            observedRevision: Revision(1),
+            via: client
+        )
+
+        var secondAck = SRUIServerEventAck()
+        secondAck.clientInstanceID = outbox.clientInstanceId.bytes
+        secondAck.eventID = second.eventId.bytes
+        secondAck.lastProcessedEventSeq = 0
+        secondAck.status = .processed
+        var secondMessage = SRUIMessage()
+        secondMessage.serverEventAck = secondAck
+        await controller.handleIncomingMessage(secondMessage)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        await outbox.resendPendingEvents(via: client)
+        let replayedMessages = await collector.wait(forAtLeast: 3)
+        let replayed = try #require(try events(in: replayedMessages).last)
+        #expect(replayed.eventId == first.eventId)
+
+        var firstAck = SRUIServerEventAck()
+        firstAck.clientInstanceID = outbox.clientInstanceId.bytes
+        firstAck.eventID = first.eventId.bytes
+        firstAck.lastProcessedEventSeq = 2
+        firstAck.status = .processed
+        var firstMessage = SRUIMessage()
+        firstMessage.serverEventAck = firstAck
+        await controller.handleIncomingMessage(firstMessage)
+
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == 2)
+
+        await collector.stop()
+        await client.close()
+        await server.close()
+    }
+
     @Test("A REJECTED ack settles the event so it is never replayed (§18.2)")
     func rejectedAckDropsEventInsteadOfReplayingIt() async throws {
         let (client, server) = await PipeTransport.createPair()
@@ -324,6 +377,145 @@ struct EventOutboxRetryTests {
 
         await controller.stop()
         await collector.stop()
+        await server.close()
+    }
+
+    @Test("Pending events wait for explicit same-session resume confirmation")
+    func pendingEventsWaitForSameSessionConfirmation() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        let pending = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+        let controller = SessionController(
+            transport: client,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await controller.start()
+
+        let beforeDecision = await collector.wait(forAtLeast: 1)
+        #expect(try events(in: beforeDecision).isEmpty)
+        await #expect(throws: SessionDispatchError.self) {
+            try await controller.sendActivate(nodeId: NodeId(8))
+        }
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "session-old"
+        resumeOk.lastProcessedEventSeq = 0
+        var response = SRUIMessage()
+        response.serverResumeOk = resumeOk
+        await controller.handleIncomingMessage(response)
+
+        let afterDecision = await collector.wait(forAtLeast: 2)
+        let replayed = try #require(try events(in: afterDecision).last)
+        #expect(replayed.eventId == pending.eventId)
+        #expect(replayed.eventSeq == pending.eventSeq)
+
+        await controller.stop()
+        await collector.stop()
+        await seedClient.close()
+        await seedServer.close()
+        await server.close()
+    }
+
+    @Test("A superseded resume response cannot replay or rebind the outbox")
+    func supersededResumeResponseIsIgnored() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        let pending = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let (firstClient, firstServer) = await PipeTransport.createPair()
+        let firstCollector = OutboxWireCollector()
+        await firstCollector.start(draining: firstServer)
+        let firstController = SessionController(
+            transport: firstClient,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await firstController.start()
+        _ = await firstCollector.wait(forAtLeast: 1)
+
+        let (secondClient, secondServer) = await PipeTransport.createPair()
+        let secondCollector = OutboxWireCollector()
+        await secondCollector.start(draining: secondServer)
+        let secondController = SessionController(
+            transport: secondClient,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await secondController.start()
+        _ = await secondCollector.wait(forAtLeast: 1)
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "session-old"
+        var response = SRUIMessage()
+        response.serverResumeOk = resumeOk
+
+        await firstController.handleIncomingMessage(response)
+        let firstMessages = await firstCollector.wait(forAtLeast: 1)
+        #expect(try events(in: firstMessages).isEmpty)
+
+        await secondController.handleIncomingMessage(response)
+        let secondMessages = await secondCollector.wait(forAtLeast: 2)
+        let replayed = try #require(try events(in: secondMessages).last)
+        #expect(replayed.eventId == pending.eventId)
+
+        await firstController.stop()
+        await secondController.stop()
+        await firstCollector.stop()
+        await secondCollector.stop()
+        await seedClient.close()
+        await seedServer.close()
+        await firstServer.close()
+        await secondServer.close()
+    }
+
+    @Test("A replacement session abandons old pending intents and resets its sequence")
+    func replacementSessionAbandonsPendingEvents() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let (client, server) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: client,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await controller.start()
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = "session-new"
+        resync.snapshotRevision = 9
+        resync.reason = "requested session expired"
+        resync.continuity = .replaced
+        resync.lastProcessedEventSeq = 4
+        var response = SRUIMessage()
+        response.serverResyncRequired = resync
+        await controller.handleIncomingMessage(response)
+
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == 4)
+        #expect(await outbox.eventSeq == 4)
+
+        await controller.stop()
+        await seedClient.close()
+        await seedServer.close()
         await server.close()
     }
 

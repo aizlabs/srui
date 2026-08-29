@@ -13,7 +13,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientResume, SruiCodec, SruiMessage, Transaction,
+    srui_message, ClientResume, SessionContinuity, SruiCodec, SruiMessage, Transaction,
 };
 use srui_sessiond::{handle_connection, ConnectionError, Session};
 
@@ -78,6 +78,7 @@ impl ResumeConnection {
             Some(srui_message::Msg::ServerResumeOk(ok)) => {
                 assert_eq!(ok.session_id, expected_session_id);
                 assert_eq!(ok.replay_from_revision, replay_from);
+                assert_eq!(ok.last_processed_event_seq, 0);
             }
             other => panic!("expected ServerResumeOk, got {:?}", other),
         }
@@ -155,37 +156,44 @@ async fn test_resume_at_earliest_retained_revision_replays_full_range() {
 }
 
 #[tokio::test]
-async fn test_wrong_session_id_rejected() {
+async fn test_wrong_session_id_requires_replacement_resync() {
     let session = Arc::new(Session::new("resume-authoritative"));
     session.commit_transaction(make_tx(0)).unwrap();
 
     let mut conn = ResumeConnection::open(session).await;
-    conn.send_resume("wrong-session-id", 0).await;
+    conn.send_resume("expired-session-id", 0).await;
 
-    // The session daemon owns session IDs (§20.2). A mismatched ClientResume.session_id
-    // must not be echoed back; the authoritative ID is returned instead.
     let msg = conn
         .read
         .next()
         .await
-        .expect("resume ok frame")
+        .expect("resync-required frame")
         .expect("decode");
     match msg.msg {
-        Some(srui_message::Msg::ServerResumeOk(ok)) => {
-            assert_ne!(ok.session_id, "wrong-session-id");
-            assert_eq!(ok.session_id, "resume-authoritative");
-            assert_eq!(ok.replay_from_revision, 0);
+        Some(srui_message::Msg::ServerResyncRequired(resync)) => {
+            assert_eq!(resync.session_id, "resume-authoritative");
+            assert_eq!(resync.snapshot_revision, 1);
+            assert_eq!(
+                SessionContinuity::try_from(resync.continuity),
+                Ok(SessionContinuity::Replaced)
+            );
+            assert_eq!(resync.last_processed_event_seq, 0);
         }
-        other => panic!("expected ServerResumeOk, got {:?}", other),
+        other => panic!("expected ServerResyncRequired, got {:?}", other),
     }
 
-    let replay = conn.read.next().await.expect("replay frame").expect("decode");
-    match replay.msg {
+    let snapshot = conn
+        .read
+        .next()
+        .await
+        .expect("snapshot frame")
+        .expect("decode");
+    match snapshot.msg {
         Some(srui_message::Msg::Transaction(tx)) => {
             assert_eq!(tx.base_revision, 0);
             assert_eq!(tx.new_revision, 1);
         }
-        other => panic!("expected replay transaction, got {:?}", other),
+        other => panic!("expected snapshot transaction, got {:?}", other),
     }
 
     conn.close().await;

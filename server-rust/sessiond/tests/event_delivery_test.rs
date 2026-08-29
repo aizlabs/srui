@@ -246,7 +246,7 @@ async fn test_duplicate_event_id_same_client_no_repeat_side_effects() {
     assert_eq!(first_ack.revision_after_effect, 2);
     drain_one_transaction(&mut client_read).await;
 
-    send_activate(&mut client_write, CLIENT_A, 2, "evt-dup", 1, btn).await;
+    send_activate(&mut client_write, CLIENT_A, 1, "evt-dup", 1, btn).await;
     // The replay is settled from the result cache with the *prior* outcome (§18.2), and no
     // transaction follows because the handler did not run again.
     let dup_ack = recv_event_ack(&mut client_read).await;
@@ -385,6 +385,8 @@ async fn test_in_flight_replay_is_not_acknowledged_as_settled() {
     let probe_ack = recv_event_ack(&mut read_overlap).await;
     assert_eq!(probe_ack.event_id, b"evt-probe");
     assert_eq!(probe_ack.status(), EventAckStatus::Rejected);
+    // Sequence 1 is still in flight, so settling sequence 2 cannot cross the gap.
+    assert_eq!(probe_ack.last_processed_event_seq, 0);
     assert_no_pending_frame(&mut read_overlap).await;
 
     let (lock, wake) = &*release;
@@ -394,11 +396,14 @@ async fn test_in_flight_replay_is_not_acknowledged_as_settled() {
     let first_ack = recv_event_ack(&mut read_a).await;
     assert_eq!(first_ack.status(), EventAckStatus::Processed);
     assert_eq!(first_ack.revision_after_effect, 1);
+    // Once sequence 1 settles, the contiguous frontier jumps across already-settled sequence 2.
+    assert_eq!(first_ack.last_processed_event_seq, 2);
 
     send_activate(&mut write_overlap, CLIENT_A, 1, "evt-in-flight", 1, btn).await;
     let settled_replay = recv_event_ack(&mut read_overlap).await;
     assert_eq!(settled_replay.status(), EventAckStatus::Duplicate);
     assert_eq!(settled_replay.revision_after_effect, 1);
+    assert_eq!(settled_replay.last_processed_event_seq, 2);
 
     shutdown.cancel();
     assert!(task_a.await.expect("server task join").is_ok());
@@ -464,7 +469,7 @@ async fn test_missing_node_event_rejected_without_mutation() {
     );
 
     let original_reason = ack.reject_reason.clone();
-    send_activate(&mut client_write, CLIENT_A, 2, "evt-missing", 1, missing).await;
+    send_activate(&mut client_write, CLIENT_A, 1, "evt-missing", 1, missing).await;
     let replay_ack = recv_event_ack(&mut client_read).await;
     assert_eq!(replay_ack.status(), EventAckStatus::Rejected);
     assert_eq!(replay_ack.reject_reason, original_reason);

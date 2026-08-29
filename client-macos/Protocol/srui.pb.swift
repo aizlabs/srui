@@ -1198,6 +1198,49 @@ public nonisolated enum Srui_Protocol_EventAckStatus: SwiftProtobuf.Enum, Swift.
 
 }
 
+/// Machine-readable session identity continuity for a full snapshot response.
+public nonisolated enum Srui_Protocol_SessionContinuity: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+
+  /// The requested semantic session survived; pending events may be replayed.
+  case sameSession // = 1
+
+  /// The requested incarnation is gone; old pending events must be abandoned.
+  case replaced // = 2
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .sameSession
+    case 2: self = .replaced
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .sameSession: return 1
+    case .replaced: return 2
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_SessionContinuity] = [
+    .unspecified,
+    .sameSession,
+    .replaced,
+  ]
+
+}
+
 public nonisolated struct Srui_Protocol_TypeRef: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2012,9 +2055,10 @@ public nonisolated struct Srui_Protocol_Event: Sendable {
 
   public var clientInstanceID: Data = Data()
 
+  /// Positive contiguous sequence within client_instance_id (§18.2)
   public var eventSeq: UInt64 = 0
 
-  /// Globally unique within session lifetime (§18.2)
+  /// Non-empty; stable with event_seq across every replay (§18.2)
   public var eventID: Data = Data()
 
   public var observedRevision: UInt64 = 0
@@ -2042,8 +2086,8 @@ public nonisolated struct Srui_Protocol_Event: Sendable {
 /// Server acknowledgement settling exactly one client event (§18, §18.2, §19.2).
 ///
 /// The dedupe cache keyed on (client_instance_id, event_id) is the *idempotency*
-/// mechanism; this ack is the *settlement* mechanism that lets the client retire the
-/// event from its retry set and raise `ClientResume.last_acked_event_seq`.
+/// mechanism; this ack selectively settles event_id. The client raises
+/// `ClientResume.last_acked_event_seq` only across a contiguous settled prefix.
 public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2054,7 +2098,7 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
   /// The event this ack settles (§18.2)
   public var eventID: Data = Data()
 
-  /// Cumulative high-water mark for this client instance
+  /// Highest contiguous settled event_seq (§18.2)
   public var lastProcessedEventSeq: UInt64 = 0
 
   public var status: Srui_Protocol_EventAckStatus = .unspecified
@@ -2064,6 +2108,9 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
 
   /// Diagnostic only, bounded by max_string_length (§26)
   public var rejectReason: String = String()
+
+  /// Incarnation that produced this acknowledgement (§18)
+  public var sessionID: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2197,6 +2244,7 @@ public nonisolated struct Srui_Protocol_ClientResume: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
+  /// Opaque incarnation token received from SERVER_WELCOME/RESUME responses.
   public var sessionID: String = String()
 
   public var clientInstanceID: Data = Data()
@@ -2217,9 +2265,13 @@ public nonisolated struct Srui_Protocol_ServerResumeOk: Sendable {
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
+  /// MUST exactly equal the requested session_id.
   public var sessionID: String = String()
 
   public var replayFromRevision: UInt64 = 0
+
+  /// Highest contiguous settled event sequence for this client in this session.
+  public var lastProcessedEventSeq: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2236,6 +2288,11 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
   public var snapshotRevision: UInt64 = 0
 
   public var reason: String = String()
+
+  public var continuity: Srui_Protocol_SessionContinuity = .unspecified
+
+  /// Highest contiguous settled event sequence for this client in session_id.
+  public var lastProcessedEventSeq: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2408,6 +2465,10 @@ nonisolated extension Srui_Protocol_NullValue: SwiftProtobuf._ProtoNameProviding
 
 nonisolated extension Srui_Protocol_EventAckStatus: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0EVENT_ACK_STATUS_UNSPECIFIED\0\u{1}EVENT_ACK_STATUS_PROCESSED\0\u{1}EVENT_ACK_STATUS_DUPLICATE\0\u{1}EVENT_ACK_STATUS_REJECTED\0")
+}
+
+nonisolated extension Srui_Protocol_SessionContinuity: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0SESSION_CONTINUITY_UNSPECIFIED\0\u{1}SESSION_CONTINUITY_SAME_SESSION\0\u{1}SESSION_CONTINUITY_REPLACED\0")
 }
 
 nonisolated extension Srui_Protocol_TypeRef: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
@@ -4059,7 +4120,7 @@ nonisolated extension Srui_Protocol_Event: SwiftProtobuf.Message, SwiftProtobuf.
 
 nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerEventAck"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_id\0\u{3}last_processed_event_seq\0\u{1}status\0\u{3}revision_after_effect\0\u{3}reject_reason\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_id\0\u{3}last_processed_event_seq\0\u{1}status\0\u{3}revision_after_effect\0\u{3}reject_reason\0\u{3}session_id\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4073,6 +4134,7 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
       case 4: try { try decoder.decodeSingularEnumField(value: &self.status) }()
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.revisionAfterEffect) }()
       case 6: try { try decoder.decodeSingularStringField(value: &self.rejectReason) }()
+      case 7: try { try decoder.decodeSingularStringField(value: &self.sessionID) }()
       default: break
       }
     }
@@ -4097,6 +4159,9 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
     if !self.rejectReason.isEmpty {
       try visitor.visitSingularStringField(value: self.rejectReason, fieldNumber: 6)
     }
+    if !self.sessionID.isEmpty {
+      try visitor.visitSingularStringField(value: self.sessionID, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4107,6 +4172,7 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
     if lhs.status != rhs.status {return false}
     if lhs.revisionAfterEffect != rhs.revisionAfterEffect {return false}
     if lhs.rejectReason != rhs.rejectReason {return false}
+    if lhs.sessionID != rhs.sessionID {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4427,7 +4493,7 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
 
 nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerResumeOk"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}replay_from_revision\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}replay_from_revision\0\u{3}last_processed_event_seq\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4437,6 +4503,7 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularStringField(value: &self.sessionID) }()
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.replayFromRevision) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.lastProcessedEventSeq) }()
       default: break
       }
     }
@@ -4449,12 +4516,16 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
     if self.replayFromRevision != 0 {
       try visitor.visitSingularUInt64Field(value: self.replayFromRevision, fieldNumber: 2)
     }
+    if self.lastProcessedEventSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.lastProcessedEventSeq, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: Srui_Protocol_ServerResumeOk, rhs: Srui_Protocol_ServerResumeOk) -> Bool {
     if lhs.sessionID != rhs.sessionID {return false}
     if lhs.replayFromRevision != rhs.replayFromRevision {return false}
+    if lhs.lastProcessedEventSeq != rhs.lastProcessedEventSeq {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4462,7 +4533,7 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
 
 nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerResyncRequired"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0\u{1}continuity\0\u{3}last_processed_event_seq\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4473,6 +4544,8 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
       case 1: try { try decoder.decodeSingularStringField(value: &self.sessionID) }()
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.snapshotRevision) }()
       case 3: try { try decoder.decodeSingularStringField(value: &self.reason) }()
+      case 4: try { try decoder.decodeSingularEnumField(value: &self.continuity) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.lastProcessedEventSeq) }()
       default: break
       }
     }
@@ -4488,6 +4561,12 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if !self.reason.isEmpty {
       try visitor.visitSingularStringField(value: self.reason, fieldNumber: 3)
     }
+    if self.continuity != .unspecified {
+      try visitor.visitSingularEnumField(value: self.continuity, fieldNumber: 4)
+    }
+    if self.lastProcessedEventSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.lastProcessedEventSeq, fieldNumber: 5)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4495,6 +4574,8 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if lhs.sessionID != rhs.sessionID {return false}
     if lhs.snapshotRevision != rhs.snapshotRevision {return false}
     if lhs.reason != rhs.reason {return false}
+    if lhs.continuity != rhs.continuity {return false}
+    if lhs.lastProcessedEventSeq != rhs.lastProcessedEventSeq {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

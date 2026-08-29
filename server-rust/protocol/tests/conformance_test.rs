@@ -427,6 +427,7 @@ fn create_authored_event_ack() -> SruiMessage {
             status: EventAckStatus::Processed as i32,
             revision_after_effect: 1843,
             reject_reason: String::new(),
+            session_id: String::new(),
         })),
     }
 }

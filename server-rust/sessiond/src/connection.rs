@@ -251,7 +251,13 @@ async fn handle_incoming_message(
                     );
                 }
             }
-            Ok(build_event_ack(&event, &outcome, session.max_string_length()).map(|ack| SruiMessage {
+            Ok(build_event_ack(
+                &event,
+                &outcome,
+                session.max_string_length(),
+                session.session_id(),
+            )
+            .map(|ack| SruiMessage {
                 msg: Some(srui_message::Msg::ServerEventAck(ack)),
             }))
         }
@@ -288,6 +294,7 @@ fn build_event_ack(
     event: &srui_protocol::Event,
     outcome: &EventOutcome,
     max_string_length: usize,
+    session_id: String,
 ) -> Option<ServerEventAck> {
     let (status, revision_after_effect, last_processed_event_seq, reject_reason) = match outcome {
         EventOutcome::Processed {
@@ -336,5 +343,6 @@ fn build_event_ack(
         status: status as i32,
         revision_after_effect,
         reject_reason: crate::session::bound_diagnostic_string(reject_reason, max_string_length),
+        session_id,
     })
 }

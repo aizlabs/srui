@@ -1,0 +1,58 @@
+{
+  "name": "max_list_elements_at_limit",
+  "description": "Setting a list property with exactly max_list_length elements succeeds (§26).",
+  "spec_sections": ["§26"],
+  "initial_limits": {
+    "max_list_length": 3
+  },
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {}
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 1,
+        "property": "items",
+        "value": [1, 2, 3]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 1,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [],
+          "properties": {
+            "items": [1, 2, 3]
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

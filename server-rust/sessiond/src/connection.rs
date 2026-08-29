@@ -46,6 +46,9 @@ pub enum ConnectionError {
 
     #[error("unexpected message during handshake: {0}")]
     UnexpectedMessage(&'static str),
+
+    #[error("client-originated transaction rejected: server is authoritative (§12, §20.2)")]
+    ClientTransactionRejected,
 }
 
 /// Handles an active client connection stream through handshake and event processing.
@@ -185,8 +188,11 @@ async fn handle_incoming_message(msg: SruiMessage, session: &Session) -> Result<
             let _ = session.process_event(&event)?;
         }
         Some(srui_message::Msg::Transaction(tx)) => {
-            debug!("Applying incoming transaction rev {} -> {}", tx.base_revision, tx.new_revision);
-            let _ = session.commit_transaction(tx)?;
+            warn!(
+                "Rejecting client-originated transaction rev {} -> {}; remote authority forbids client commits",
+                tx.base_revision, tx.new_revision
+            );
+            return Err(ConnectionError::ClientTransactionRejected);
         }
         Some(other) => {
             debug!("Ignoring unhandled message during active stream: {:?}", other);

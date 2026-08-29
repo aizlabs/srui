@@ -1,0 +1,90 @@
+{
+  "name": "failed_new_revision_not_consumed_rejected",
+  "description": "A rejected transaction with an invalid new_revision leaves the store at the current committed revision; the proposed new_revision slot is not consumed (§12.1).",
+  "spec_sections": ["§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Retry Baseline"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Click Me",
+            "enabled": true
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 99,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 2,
+        "property": "label",
+        "value": "Would Commit"
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "Would Appear"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "invalid_new_revision",
+    "expected_store_revision": 1,
+    "rollback_verified": true,
+    "store_state": {
+      "node_count": 2,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [2],
+          "properties": {
+            "label": "Retry Baseline"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Click Me",
+            "enabled": true
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

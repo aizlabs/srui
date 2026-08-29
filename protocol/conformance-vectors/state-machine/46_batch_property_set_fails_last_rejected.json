@@ -1,0 +1,93 @@
+{
+  "name": "batch_property_set_fails_last_rejected",
+  "description": "BATCH_PROPERTY_SET as the failing final operation rolls back all prior successful node and property mutations in the same transaction (§12.1, §13).",
+  "spec_sections": ["§12.1", "§13", "§26"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Batch Fail Last Baseline"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Table",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {}
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 1,
+        "property": "label",
+        "value": "Staged Surface Label"
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 3,
+        "node_type": "Text",
+        "parent_id": 2,
+        "child_index": null,
+        "properties": {
+          "text": "Staged Row Label"
+        }
+      },
+      {
+        "type": "BATCH_PROPERTY_SET",
+        "node_id": 2,
+        "properties": {
+          "model_ref": 999,
+          "label": "Missing Model"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_not_found",
+    "failed_op_index": 2,
+    "expected_store_revision": 1,
+    "rollback_verified": true,
+    "store_state": {
+      "node_count": 2,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [2],
+          "properties": {
+            "label": "Batch Fail Last Baseline"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Table",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {}
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

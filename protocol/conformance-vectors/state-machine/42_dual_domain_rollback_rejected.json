@@ -1,0 +1,99 @@
+{
+  "name": "dual_domain_rollback_rejected",
+  "description": "When a transaction mutates both the node graph and collection models then fails on a final node op, both domains roll back with zero side effects (§4.5, §8, §12.1, §13).",
+  "spec_sections": ["§4.5", "§8", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Dual Domain Baseline"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "Table",
+          "item_count": 1000
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 1,
+        "property": "label",
+        "value": "Mutated Label"
+      },
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 0,
+        "items": [
+          {
+            "item_id": 50,
+            "value": "Staged Row",
+            "properties": {
+              "text": "Staged"
+            }
+          }
+        ]
+      },
+      {
+        "type": "CREATE_NODE",
+        "node_id": 2,
+        "node_type": "Button",
+        "parent_id": 999,
+        "child_index": null,
+        "properties": {
+          "label": "Orphan Button"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "parent_not_found",
+    "failed_op_index": 2,
+    "expected_store_revision": 1,
+    "rollback_verified": true,
+    "store_state": {
+      "node_count": 1,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [],
+          "properties": {
+            "label": "Dual Domain Baseline"
+          }
+        }
+      },
+      "model_count": 1,
+      "models": {
+        "10": {
+          "model_id": 10,
+          "model_type": "Table",
+          "item_count": 1000,
+          "cached_item_count": 0,
+          "cached_ranges": [],
+          "items": {}
+        }
+      }
+    }
+  }
+}

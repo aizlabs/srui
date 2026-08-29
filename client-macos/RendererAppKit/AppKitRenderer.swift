@@ -7,9 +7,9 @@ public final class AppKitRenderer {
     public let controlFactory: ControlFactory
     public let layoutRenderer: LayoutRenderer
 
-    public var onAction: (@MainActor (NodeId, TypeRef) -> Void)? {
-        get { controlFactory.onAction }
-        set { controlFactory.onAction = newValue }
+    public var onInteraction: (@MainActor (SemanticInteraction) -> Void)? {
+        get { controlFactory.onInteraction }
+        set { controlFactory.onInteraction = newValue }
     }
 
     public init() {

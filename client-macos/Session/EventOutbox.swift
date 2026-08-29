@@ -98,6 +98,19 @@ public actor EventOutbox {
         ).withClientInstanceId(clientInstanceId)
     }
 
+    /// Constructs a client-originated selection-changed event (§7.6).
+    public func makeSelectionChangedEvent(nodeId: NodeId, observedRevision: Revision, itemId: ItemId) -> Event {
+        let seq = nextEventSeq()
+        let id = generateEventId()
+        return Event.selectionChanged(
+            eventSeq: seq,
+            eventId: id,
+            observedRevision: observedRevision,
+            nodeId: nodeId,
+            itemId: itemId
+        ).withClientInstanceId(clientInstanceId)
+    }
+
     /// Serializes and sends an event over the given transport (§16, §22).
     public func sendEvent(_ event: Event, via transport: any Transport) async throws {
         var msg = SRUIMessage()
@@ -121,6 +134,30 @@ public actor EventOutbox {
         }
         try ensureSequenceWindowCapacity()
         let event = makeActivateEvent(nodeId: nodeId, observedRevision: observedRevision)
+        try await sendEvent(event, via: transport)
+        return event
+    }
+
+    /// Constructs and sends a `VALUE_CHANGED` event without creating a sequence beyond the window.
+    @discardableResult
+    public func sendValueChanged(nodeId: NodeId, observedRevision: Revision, value: Value, via transport: any Transport) async throws -> Event {
+        guard acceptsNewEvents else {
+            throw EventOutboxError.resumeNotConfirmed
+        }
+        try ensureSequenceWindowCapacity()
+        let event = makeValueChangedEvent(nodeId: nodeId, observedRevision: observedRevision, value: value)
+        try await sendEvent(event, via: transport)
+        return event
+    }
+
+    /// Constructs and sends a `SELECTION_CHANGED` event without creating a sequence beyond the window.
+    @discardableResult
+    public func sendSelectionChanged(nodeId: NodeId, observedRevision: Revision, itemId: ItemId, via transport: any Transport) async throws -> Event {
+        guard acceptsNewEvents else {
+            throw EventOutboxError.resumeNotConfirmed
+        }
+        try ensureSequenceWindowCapacity()
+        let event = makeSelectionChangedEvent(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId)
         try await sendEvent(event, via: transport)
         return event
     }

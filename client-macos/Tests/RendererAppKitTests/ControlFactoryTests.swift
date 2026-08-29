@@ -107,6 +107,7 @@ struct ControlFactoryTests {
             let toggle = try #require(handle.view as? NSButton)
             #expect(toggle.title == "Toggle")
             #expect(toggle.state == .off)
+            #expect(handle.actionTrampoline is ActionTrampoline)
 
         case .textInput:
             let field = try #require(handle.view as? NSTextField)
@@ -137,6 +138,8 @@ struct ControlFactoryTests {
             let scroll = try #require(handle.view as? NSScrollView)
             let table = try #require(scroll.documentView as? NSTableView)
             #expect(table.headerView == nil)
+            #expect(table.usesAlternatingRowBackgroundColors == false)
+            #expect(table.style == .plain)
             #expect(handle.modelAdapter is TableCollectionAdapter)
             let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
             #expect(adapter.rows.isEmpty)
@@ -145,6 +148,8 @@ struct ControlFactoryTests {
             let scroll = try #require(handle.view as? NSScrollView)
             let table = try #require(scroll.documentView as? NSTableView)
             #expect(table.headerView != nil)
+            #expect(table.usesAlternatingRowBackgroundColors)
+            #expect(table.style == .fullWidth)
             #expect(handle.modelAdapter is TableCollectionAdapter)
 
         case .tree:
@@ -179,7 +184,7 @@ struct ControlFactoryTests {
         switch nodeType {
         case .list, .table:
             let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
-            #expect(adapter.rows == ["Alpha", "Beta"])
+            #expect(adapter.rows.map(\.cells) == [["Alpha"], ["Beta"]])
             let table = try #require(
                 (handle.view as? NSScrollView)?.documentView as? NSTableView
             )
@@ -190,7 +195,7 @@ struct ControlFactoryTests {
                 value: .list([.string("Gamma")]),
                 to: handle
             )
-            #expect(adapter.rows == ["Gamma"])
+            #expect(adapter.rows.map(\.cells) == [["Gamma"]])
             #expect(table.numberOfRows == 1)
 
         case .tree:
@@ -215,6 +220,236 @@ struct ControlFactoryTests {
         if let adapter = handle.modelAdapter as? TableCollectionAdapter {
             #expect(adapter.rows.isEmpty)
         }
+    }
+
+    @Test
+    func buttonAndToggleEmitSemanticInteractions() throws {
+        let factory = ControlFactory()
+        var receivedInteractions: [SemanticInteraction] = []
+        factory.onInteraction = { interaction in
+            receivedInteractions.append(interaction)
+        }
+
+        let buttonHandle = try factory.makeHandle(for: Node(id: 10, nodeType: .button))
+        let button = try #require(buttonHandle.view as? NSButton)
+        let buttonTrampoline = try #require(buttonHandle.actionTrampoline as? ActionTrampoline)
+        buttonTrampoline.performButtonAction(button)
+
+        #expect(receivedInteractions == [.activate(nodeID: 10)])
+
+        let toggleHandle = try factory.makeHandle(for: Node(id: 11, nodeType: .toggle))
+        let toggle = try #require(toggleHandle.view as? NSButton)
+        let toggleTrampoline = try #require(toggleHandle.actionTrampoline as? ActionTrampoline)
+
+        toggle.state = .on
+        toggleTrampoline.performToggleAction(toggle)
+        #expect(receivedInteractions == [.activate(nodeID: 10), .valueChanged(nodeID: 11, value: .bool(true))])
+
+        toggle.state = .off
+        toggleTrampoline.performToggleAction(toggle)
+        #expect(receivedInteractions == [
+            .activate(nodeID: 10),
+            .valueChanged(nodeID: 11, value: .bool(true)),
+            .valueChanged(nodeID: 11, value: .bool(false)),
+        ])
+    }
+
+    @Test
+    func modelBackedTableResolvesModelWithFourColumnsAndCells() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(42)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [
+                ModelItem(
+                    itemID: ItemId(101),
+                    value: .list([.string("Row1-C1"), .string("Row1-C2"), .string("Row1-C3"), .string("Row1-C4")])
+                ),
+                ModelItem(
+                    itemID: ItemId(102),
+                    value: .list([.string("Row2-C1"), .string("Row2-C2"), .string("Row2-C3"), .string("Row2-C4")])
+                ),
+            ]
+        )
+
+        let tableNode = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .columns: .list([.string("Col 1"), .string("Col 2"), .string("Col 3"), .string("Col 4")]),
+                .modelRef: .unsignedInt(modelID.value),
+                .selectionMode: .enumToken(.selectionModeSingle),
+            ]
+        )
+        try store.createNode(id: 1, nodeType: .table, properties: tableNode.propertyEntries)
+
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: tableNode, store: store)
+
+        let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
+        let tableView = try #require((handle.view as? NSScrollView)?.documentView as? NSTableView)
+
+        #expect(tableView.tableColumns.count == 4)
+        #expect(tableView.tableColumns[0].title == "Col 1")
+        #expect(tableView.tableColumns[0].identifier == TableCollectionAdapter.columnIdentifier(for: "Col 1"))
+        #expect(tableView.tableColumns[3].title == "Col 4")
+        #expect(tableView.tableColumns[3].identifier == TableCollectionAdapter.columnIdentifier(for: "Col 4"))
+
+        #expect(adapter.rows.count == 2)
+        #expect(adapter.rows[0].itemID == ItemId(101))
+        #expect(adapter.rows[0].cells == ["Row1-C1", "Row1-C2", "Row1-C3", "Row1-C4"])
+        #expect(adapter.rows[1].itemID == ItemId(102))
+        #expect(adapter.rows[1].cells == ["Row2-C1", "Row2-C2", "Row2-C3", "Row2-C4"])
+
+        // Check cell view rendering
+        let cellView0 = try #require(adapter.tableView(tableView, viewFor: tableView.tableColumns[0], row: 0) as? NSTextField)
+        #expect(cellView0.stringValue == "Row1-C1")
+        let cellView3 = try #require(adapter.tableView(tableView, viewFor: tableView.tableColumns[3], row: 1) as? NSTextField)
+        #expect(cellView3.stringValue == "Row2-C4")
+    }
+
+    @Test
+    func modelRefPresentWithAbsentOrUncachedModelRendersEmptyRowsWithoutInlineFallback() throws {
+        var store = SemanticStore()
+        let absentModelID = ModelId(999)
+        let uncachedModelID = ModelId(998)
+        try store.createModel(id: uncachedModelID, modelType: .table, itemCount: 2)
+
+        let factory = ControlFactory()
+        for modelID in [absentModelID, uncachedModelID] {
+            let node = Node(
+                id: 1,
+                nodeType: .table,
+                properties: [
+                    .modelRef: .unsignedInt(modelID.value),
+                    .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
+                ]
+            )
+
+            let handle = try factory.makeHandle(for: node, store: store)
+            let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
+
+            // A present MODEL_REF is authoritative even when the model is absent or uncached.
+            #expect(adapter.rows.isEmpty)
+        }
+    }
+
+    @Test
+    func selectionModesAndUserEventRouting() throws {
+        let factory = ControlFactory()
+        var emittedInteractions: [SemanticInteraction] = []
+        factory.onInteraction = { emittedInteractions.append($0) }
+
+        let rows = [
+            TableCollectionAdapter.TableRow(itemID: ItemId(1), cells: ["Alpha"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(2), cells: ["Beta"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(3), cells: ["Gamma"]),
+        ]
+
+        // 1. None selection mode rejects selection
+        let noneNode = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .selectionMode: .enumToken(.selectionModeNone),
+            ]
+        )
+        let noneHandle = try factory.makeHandle(for: noneNode)
+        let noneTable = try #require((noneHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let noneAdapter = try #require(noneHandle.modelAdapter as? TableCollectionAdapter)
+        noneAdapter.update(rows: rows, tableView: noneTable)
+        #expect(noneTable.selectionHighlightStyle == .none)
+        #expect(noneAdapter.tableView(noneTable, shouldSelectRow: 0) == false)
+
+        // 2. Single selection mode emits exactly one event for genuine user selection
+        let singleNode = Node(
+            id: 2,
+            nodeType: .table,
+            properties: [
+                .selectionMode: .enumToken(.selectionModeSingle),
+            ]
+        )
+        let singleHandle = try factory.makeHandle(for: singleNode)
+        let singleTable = try #require((singleHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let singleAdapter = try #require(singleHandle.modelAdapter as? TableCollectionAdapter)
+        singleAdapter.update(rows: rows, tableView: singleTable)
+        #expect(singleTable.allowsMultipleSelection == false)
+        #expect(singleTable.selectionHighlightStyle == .regular)
+
+        singleTable.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        #expect(emittedInteractions == [.selectionChanged(nodeID: 2, itemID: ItemId(2))])
+        emittedInteractions.removeAll()
+
+        singleAdapter.selectionMode = .none
+        factory.applySelectionMode(.none, to: singleTable)
+        #expect(singleTable.selectedRow == -1)
+        #expect(emittedInteractions.isEmpty)
+
+        // 3. Multiple selection mode emits one event per selected item ID
+        let multipleNode = Node(
+            id: 3,
+            nodeType: .table,
+            properties: [
+                .selectionMode: .enumToken(.selectionModeMultiple),
+            ]
+        )
+        let multipleHandle = try factory.makeHandle(for: multipleNode)
+        let multipleTable = try #require((multipleHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let multipleAdapter = try #require(multipleHandle.modelAdapter as? TableCollectionAdapter)
+        multipleAdapter.update(rows: rows, tableView: multipleTable)
+        #expect(multipleTable.allowsMultipleSelection == true)
+
+        multipleTable.selectRowIndexes(IndexSet([0, 2]), byExtendingSelection: false)
+        #expect(emittedInteractions == [
+            .selectionChanged(nodeID: 3, itemID: ItemId(1)),
+            .selectionChanged(nodeID: 3, itemID: ItemId(3)),
+        ])
+    }
+
+    @Test
+    func adapterUpdatePreservesSelectionByItemIdWithZeroRestorationEvents() throws {
+        let factory = ControlFactory()
+        var emittedInteractions: [SemanticInteraction] = []
+        factory.onInteraction = { emittedInteractions.append($0) }
+
+        let node = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .selectionMode: .enumToken(.selectionModeSingle),
+            ]
+        )
+        let handle = try factory.makeHandle(for: node)
+        let tableView = try #require((handle.view as? NSScrollView)?.documentView as? NSTableView)
+        let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
+
+        let initialRows = [
+            TableCollectionAdapter.TableRow(itemID: ItemId(10), cells: ["Row 10"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(20), cells: ["Row 20"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(30), cells: ["Row 30"]),
+        ]
+        adapter.update(rows: initialRows, tableView: tableView)
+
+        // Select row 1 (itemID 20)
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        #expect(tableView.selectedRow == 1)
+        emittedInteractions.removeAll()
+
+        // Update rows with insertion at index 0 (shifting itemID 20 to index 2)
+        let updatedRows = [
+            TableCollectionAdapter.TableRow(itemID: ItemId(5), cells: ["Row 5 (New)"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(10), cells: ["Row 10"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(20), cells: ["Row 20"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(30), cells: ["Row 30"]),
+        ]
+        adapter.update(rows: updatedRows, tableView: tableView)
+
+        // Selection should be preserved at new index 2
+        #expect(tableView.selectedRow == 2)
+        // Zero restoration events emitted
+        #expect(emittedInteractions.isEmpty)
     }
 
     @Test(arguments: [
@@ -423,5 +658,88 @@ struct ControlFactoryTests {
 
         // `value` (property 13) is applied after `selected` (property 10).
         #expect((handle.view as? NSButton)?.state == .on)
+    }
+
+    @Test
+    func tableRowsHandlesDiverseValueVariants() throws {
+        let modelID = ModelId(77)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [
+                ModelItem(itemID: ItemId(1), value: .null),
+                ModelItem(itemID: ItemId(2), value: .bool(true)),
+                ModelItem(itemID: ItemId(3), value: .signedInt(-42)),
+                ModelItem(itemID: ItemId(4), value: .float64(3.1415)),
+            ]
+        )
+
+        let node = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .modelRef: .unsignedInt(modelID.value),
+            ]
+        )
+
+        let factory = ControlFactory()
+        let rows = factory.tableRows(for: node, store: store)
+
+        #expect(rows.count == 4)
+        #expect(rows[0].cells == [""])
+        #expect(rows[1].cells == ["true"])
+        #expect(rows[2].cells == ["-42"])
+        #expect(rows[3].cells.first?.starts(with: "3.14") == true)
+    }
+
+    @Test
+    func columnReconciliationHandlesEdgeCases() {
+        let factory = ControlFactory()
+        let tableView = NSTableView()
+
+        // 1. Initial 0 columns creates 1 fallback column
+        factory.reconcileColumns(in: tableView, columns: nil, fallbackTitle: "Fallback Table")
+        #expect(tableView.tableColumns.count == 1)
+        #expect(tableView.tableColumns[0].title == "Fallback Table")
+        #expect(tableView.tableColumns[0].identifier == TableCollectionAdapter.primaryColumnIdentifier)
+
+        // 2. Grow to 5 columns
+        factory.reconcileColumns(in: tableView, columns: ["C1", "C2", "C3", "C4", "C5"], fallbackTitle: "Ignored")
+        #expect(tableView.tableColumns.count == 5)
+        #expect(tableView.tableColumns[0].title == "C1")
+        #expect(tableView.tableColumns[0].identifier == TableCollectionAdapter.columnIdentifier(for: "C1"))
+        #expect(tableView.tableColumns[4].title == "C5")
+        #expect(tableView.tableColumns[4].identifier == TableCollectionAdapter.columnIdentifier(for: "C5"))
+
+        // 3. Shrink to 0 (back to 1 fallback column)
+        factory.reconcileColumns(in: tableView, columns: [], fallbackTitle: "Reset Fallback")
+        #expect(tableView.tableColumns.count == 1)
+        #expect(tableView.tableColumns[0].title == "Reset Fallback")
+    }
+
+    @Test
+    func toggleEmitsAlternatingValueChangedInteractions() throws {
+        let factory = ControlFactory()
+        var receivedValues: [Bool] = []
+        factory.onInteraction = { interaction in
+            if case .valueChanged(nodeID: 99, value: .bool(let b)) = interaction {
+                receivedValues.append(b)
+            }
+        }
+
+        let handle = try factory.makeHandle(for: Node(id: 99, nodeType: .toggle))
+        let button = try #require(handle.view as? NSButton)
+        let trampoline = try #require(handle.actionTrampoline as? ActionTrampoline)
+
+        button.state = .on
+        trampoline.performToggleAction(button)
+        button.state = .off
+        trampoline.performToggleAction(button)
+        button.state = .on
+        trampoline.performToggleAction(button)
+
+        #expect(receivedValues == [true, false, true])
     }
 }

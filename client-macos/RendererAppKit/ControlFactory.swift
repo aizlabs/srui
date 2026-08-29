@@ -9,33 +9,39 @@ public enum ControlFactoryError: Error, Equatable, Sendable {
 @MainActor
 public final class ActionTrampoline: NSObject {
     public let nodeID: NodeId
-    public let eventType: TypeRef
-    public let handler: @MainActor (NodeId, TypeRef) -> Void
+    public let handler: @MainActor (SemanticInteraction) -> Void
 
     public init(
         nodeID: NodeId,
-        eventType: TypeRef = .EVENT_ACTIVATE,
-        handler: @escaping @MainActor (NodeId, TypeRef) -> Void
+        handler: @escaping @MainActor (SemanticInteraction) -> Void
     ) {
         self.nodeID = nodeID
-        self.eventType = eventType
         self.handler = handler
     }
 
+    @objc public func performButtonAction(_ sender: Any?) {
+        handler(.activate(nodeID: nodeID))
+    }
+
+    @objc public func performToggleAction(_ sender: Any?) {
+        let isOn = (sender as? NSButton)?.state == .on
+        handler(.valueChanged(nodeID: nodeID, value: .bool(isOn)))
+    }
+
     @objc public func performAction(_ sender: Any?) {
-        handler(nodeID, eventType)
+        performButtonAction(sender)
     }
 }
 
 /// Creates native controls for the required §7.3 tier and applies scalar properties in place.
 @MainActor
 public final class ControlFactory {
-    /// Semantic action callback invoked when a native interactive control is activated (§7.6, §7.7).
-    public var onAction: (@MainActor (NodeId, TypeRef) -> Void)?
+    /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
+    public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
 
     public init() {}
 
-    public func makeHandle(for node: Node) throws -> RenderHandle {
+    public func makeHandle(for node: Node, store: SemanticStore? = nil) throws -> RenderHandle {
         let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
 
         switch node.nodeType {
@@ -110,16 +116,21 @@ public final class ControlFactory {
         case .button:
             let button = NSButton(title: "Button", target: nil, action: nil)
             button.bezelStyle = .rounded
-            let trampoline = ActionTrampoline(nodeID: node.id, eventType: .EVENT_ACTIVATE) { [weak self] nodeID, type in
-                self?.onAction?(nodeID, type)
+            let trampoline = ActionTrampoline(nodeID: node.id) { [weak self] interaction in
+                self?.onInteraction?(interaction)
             }
             button.target = trampoline
-            button.action = #selector(ActionTrampoline.performAction(_:))
+            button.action = #selector(ActionTrampoline.performButtonAction(_:))
             result = (button, nil, nil, trampoline)
 
         case .toggle:
             let toggle = NSButton(checkboxWithTitle: "Toggle", target: nil, action: nil)
-            result = (toggle, nil, nil, nil)
+            let trampoline = ActionTrampoline(nodeID: node.id) { [weak self] interaction in
+                self?.onInteraction?(interaction)
+            }
+            toggle.target = trampoline
+            toggle.action = #selector(ActionTrampoline.performToggleAction(_:))
+            result = (toggle, nil, nil, trampoline)
 
         case .textInput:
             let field = NSTextField(frame: .zero)
@@ -180,7 +191,7 @@ public final class ControlFactory {
             result = (scrollView, nil, nil, nil)
 
         case .list, .table:
-            let table = makeTable(for: node)
+            let table = makeTable(for: node, store: store)
             result = (table.0, table.1, table.2, nil)
 
         case .tree:
@@ -204,7 +215,7 @@ public final class ControlFactory {
             modelAdapter: result.adapter,
             actionTrampoline: result.trampoline
         )
-        apply(node: node, to: handle)
+        apply(node: node, to: handle, store: store)
         return handle
     }
 
@@ -217,13 +228,16 @@ public final class ControlFactory {
         node.propertyEntries.sorted { $0.0 < $1.0 }
     }
 
-    public func apply(node: Node, to handle: RenderHandle) {
+    public func apply(node: Node, to handle: RenderHandle, store: SemanticStore? = nil) {
         for (property, value) in Self.orderedPropertyEntries(of: node) {
-            apply(property: property, value: value, to: handle)
+            apply(property: property, value: value, to: handle, store: store)
+        }
+        if handle.nodeType == .table || handle.nodeType == .list {
+            refreshCollection(in: handle, for: node, store: store ?? SemanticStore())
         }
     }
 
-    public func apply(property: PropertyRef, value: Value?, to handle: RenderHandle) {
+    public func apply(property: PropertyRef, value: Value?, to handle: RenderHandle, store: SemanticStore? = nil) {
         switch property {
         case .label:
             let label = value?.asString
@@ -234,7 +248,11 @@ public final class ControlFactory {
                 button.title = label ?? defaultLabel(for: handle.nodeType)
             }
             if let table = tableView(in: handle) {
-                table.tableColumns.first?.title = label ?? defaultLabel(for: handle.nodeType)
+                let adapter = handle.modelAdapter as? TableCollectionAdapter
+                let hasExplicitColumns = adapter?.hasExplicitColumns ?? false
+                if !hasExplicitColumns {
+                    table.tableColumns.first?.title = label ?? defaultLabel(for: handle.nodeType)
+                }
             }
 
         case .accessibleDescription:
@@ -253,44 +271,68 @@ public final class ControlFactory {
         case .visibility:
             // §7.4: `hidden` is invisible but retains layout space; only `collapsed` is
             // removed from layout calculation.
-            let token = value?.asEnumToken
-            handle.view.isHidden = token == .visibilityCollapsed
-            handle.view.alphaValue = token == .visibilityHidden ? 0 : 1
+            switch value?.asEnumToken {
+            case .visibilityHidden:
+                handle.view.isHidden = false
+                handle.view.alphaValue = 0
+            case .visibilityCollapsed:
+                handle.view.isHidden = true
+                handle.view.alphaValue = 1
+            default:
+                handle.view.isHidden = false
+                handle.view.alphaValue = 1
+            }
 
         case .enabled:
-            (handle.view as? NSControl)?.isEnabled = value?.asBool ?? true
+            let enabled = value?.asBool ?? true
+            if let control = handle.view as? NSControl {
+                control.isEnabled = enabled
+            }
 
         case .readOnly:
             let readOnly = value?.asBool ?? false
             if let field = handle.view as? NSTextField {
-                field.isEditable = readOnly == false
+                field.isEditable = !readOnly
             }
-            textView(in: handle)?.isEditable = readOnly == false
+            if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+                textView.isEditable = !readOnly
+            }
 
         case .busy:
-            guard let progress = handle.view as? NSProgressIndicator else { break }
             let busy = value?.asBool ?? false
-            progress.isIndeterminate = busy
-            busy ? progress.startAnimation(nil) : progress.stopAnimation(nil)
+            if let progress = handle.view as? NSProgressIndicator {
+                progress.isIndeterminate = busy
+                if busy {
+                    progress.startAnimation(nil)
+                } else {
+                    progress.stopAnimation(nil)
+                }
+            }
 
         case .selected:
+            let selected = value?.asBool ?? false
             if let button = handle.view as? NSButton {
-                button.state = (value?.asBool ?? false) ? .on : .off
+                button.state = selected ? .on : .off
             }
 
         case .text:
-            let text = value?.asString ?? ""
             if let field = handle.view as? NSTextField {
-                field.stringValue = text
-            } else if let textView = textView(in: handle) {
-                textView.string = text
+                field.stringValue = value?.asString ?? ""
+            }
+            if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+                textView.string = value?.asString ?? ""
+            }
+            if let textView = handle.view as? NSTextView {
+                textView.string = value?.asString ?? ""
             }
 
         case .value:
             applyValue(value, to: handle)
 
         case .placeholder:
-            (handle.view as? NSTextField)?.placeholderString = value?.asString
+            if let field = handle.view as? NSTextField {
+                field.placeholderString = value?.asString
+            }
 
         case .resource:
             // lc-debt: no client resource cache exists yet (§14; the Resources target is a stub),
@@ -304,8 +346,40 @@ public final class ControlFactory {
                 "resource node=\(handle.nodeID) hash=\(handle.pendingResourceHash?.description ?? "none") unresolved (§14)"
             )
 
-        case .items:
-            updateCollection(value, in: handle)
+        case .items, .modelRef, .columns, .selectionMode:
+            if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+               let tableView = tableView(in: handle) {
+                if property == .columns {
+                    let colStrings = value?.asList?.compactMap { $0.asString }
+                    let fallbackTitle = handle.accessibilityMetadata.label ?? defaultLabel(for: handle.nodeType)
+                    reconcileColumns(in: tableView, columns: colStrings, fallbackTitle: fallbackTitle)
+                    adapter.hasExplicitColumns = (colStrings?.isEmpty == false)
+                    tableView.reloadData()
+                } else if property == .selectionMode {
+                    let mode = value?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+                    adapter.selectionMode = mode
+                    applySelectionMode(mode, to: tableView)
+                } else if property == .modelRef {
+                    let modelID = value?.asUnsignedInt.map { ModelId($0) }
+                    if let modelID, let store, let model = store.getModel(modelID) {
+                        let rows = model.iterCachedItems().map { (_, item) in
+                            TableCollectionAdapter.TableRow(itemID: item.itemID, cells: cells(from: item.value))
+                        }
+                        adapter.update(rows: rows, tableView: tableView)
+                    } else {
+                        adapter.update(rows: [], tableView: tableView)
+                    }
+                } else if property == .items {
+                    let rows = (value?.asList ?? []).map { val in
+                        TableCollectionAdapter.TableRow(itemID: nil, cells: cells(from: val))
+                    }
+                    adapter.update(rows: rows, tableView: tableView)
+                }
+            } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
+                      let outlineView = outlineView(in: handle) {
+                let rows = inlineOutlineRows(from: value)
+                adapter.update(rows: rows, outlineView: outlineView)
+            }
 
         case .horizontalAlignment:
             handle.layoutMetadata.horizontalAlignment = value?.asEnumToken
@@ -360,7 +434,7 @@ public final class ControlFactory {
         case .role:
             applyRole(value?.asEnumToken, to: handle)
 
-        case .presentationHint, .validationState, .modelRef, .actionKey, .columns, .selectionMode:
+        case .presentationHint, .validationState, .actionKey:
             break
 
         default:
@@ -368,26 +442,95 @@ public final class ControlFactory {
         }
     }
 
-    private func makeTable(for node: Node) -> (NSView, NSWindow?, AnyObject?) {
+    public static func columnIdentifier(for title: String, occurrence: Int = 1) -> NSUserInterfaceItemIdentifier {
+        TableCollectionAdapter.columnIdentifier(for: title, occurrence: occurrence)
+    }
+
+    public func reconcileColumns(
+        in tableView: NSTableView,
+        columns: [String]?,
+        fallbackTitle: String
+    ) {
+        TableCollectionAdapter.reconcileColumns(
+            in: tableView,
+            columns: columns,
+            fallbackTitle: fallbackTitle
+        )
+    }
+
+    public func applySelectionMode(_ mode: StandardSelectionMode, to tableView: NSTableView) {
+        TableCollectionAdapter.applySelectionMode(mode, to: tableView)
+    }
+
+    func configureCollectionScrolling(nested: Bool, handle: RenderHandle) {
+        guard let scrollView = handle.view as? NSScrollView else { return }
+        if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+           let tableView = scrollView.documentView as? NSTableView {
+            adapter.setNestedInScroll(nested, scrollView: scrollView, tableView: tableView)
+        } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
+                  let outlineView = scrollView.documentView as? NSOutlineView {
+            adapter.setNestedInScroll(nested, scrollView: scrollView, outlineView: outlineView)
+        }
+    }
+
+    public func refreshCollection(
+        in handle: RenderHandle,
+        for node: Node,
+        store: SemanticStore
+    ) {
+        if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+           let tableView = tableView(in: handle) {
+            let columnValues = node.getProperty(.columns)?.asList?.compactMap { $0.asString }
+            let fallbackTitle = node.getProperty(.label)?.asString ?? defaultLabel(for: handle.nodeType)
+            reconcileColumns(in: tableView, columns: columnValues, fallbackTitle: fallbackTitle)
+            adapter.hasExplicitColumns = (columnValues?.isEmpty == false)
+
+            let mode = node.getProperty(.selectionMode)?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+            adapter.selectionMode = mode
+            applySelectionMode(mode, to: tableView)
+
+            let newRows = tableRows(for: node, store: store)
+            adapter.update(rows: newRows, tableView: tableView)
+        } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
+                  let outlineView = outlineView(in: handle) {
+            let rows = inlineOutlineRows(from: node.getProperty(.items))
+            adapter.update(rows: rows, outlineView: outlineView)
+        }
+    }
+
+    private func makeTable(for node: Node, store: SemanticStore?) -> (NSView, NSWindow?, AnyObject?) {
         let scrollView = NSScrollView(frame: .zero)
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
 
         let tableView = NSTableView(frame: .zero)
-        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("content"))
-        column.title = node.nodeType == .list ? "List" : "Table"
-        column.width = 360
-        tableView.addTableColumn(column)
-        tableView.headerView = node.nodeType == .list ? nil : NSTableHeaderView()
-        tableView.usesAlternatingRowBackgroundColors = true
+        TableCollectionAdapter.applyChrome(isList: node.nodeType == .list, to: tableView)
 
-        let rows = rows(from: node.getProperty(.items))
-        let adapter = TableCollectionAdapter(rows: rows)
+        let columnValues = node.getProperty(.columns)?.asList?.compactMap { $0.asString }
+        let fallbackTitle = node.getProperty(.label)?.asString ?? defaultLabel(for: node.nodeType)
+        reconcileColumns(in: tableView, columns: columnValues, fallbackTitle: fallbackTitle)
+
+        let modeToken = node.getProperty(.selectionMode)?.asEnumToken
+        let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+        applySelectionMode(selectionMode, to: tableView)
+
+        let rows = tableRows(for: node, store: store)
+        let adapter = TableCollectionAdapter(
+            nodeID: node.id,
+            rows: rows,
+            hasExplicitColumns: columnValues?.isEmpty == false,
+            selectionMode: selectionMode,
+            onInteraction: { [weak self] interaction in
+                self?.onInteraction?(interaction)
+            }
+        )
         tableView.dataSource = adapter
         tableView.delegate = adapter
         scrollView.documentView = tableView
         scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
+        let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
+        minHeight.isActive = true
+        adapter.minHeightConstraint = minHeight
         return (scrollView, nil, adapter)
     }
 
@@ -404,30 +547,54 @@ public final class ControlFactory {
         outlineView.outlineTableColumn = column
         outlineView.headerView = nil
 
-        let rows = rows(from: node.getProperty(.items))
+        let rows = inlineOutlineRows(from: node.getProperty(.items))
         let adapter = OutlineCollectionAdapter(rows: rows)
         outlineView.dataSource = adapter
         outlineView.delegate = adapter
         scrollView.documentView = outlineView
         scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
-        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
+        let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
+        minHeight.isActive = true
+        adapter.minHeightConstraint = minHeight
         return (scrollView, nil, adapter)
     }
 
-    private func rows(from value: Value?) -> [String] {
-        guard let values = value?.asList else { return [] }
-        return values.map { $0.asString ?? $0.description }
+    private func cellString(from value: Value) -> String {
+        if let str = value.asString { return str }
+        if value == .null { return "" }
+        return value.description
     }
 
-    private func updateCollection(_ value: Value?, in handle: RenderHandle) {
-        let rows = rows(from: value)
-        if let adapter = handle.modelAdapter as? TableCollectionAdapter,
-           let tableView = tableView(in: handle) {
-            adapter.update(rows: rows, tableView: tableView)
-        } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
-                  let outlineView = outlineView(in: handle) {
-            adapter.update(rows: rows, outlineView: outlineView)
+    private func cells(from value: Value) -> [String] {
+        if case .list(let items) = value {
+            return items.map(cellString(from:))
         }
+        return [cellString(from: value)]
+    }
+
+    public func tableRows(for node: Node, store: SemanticStore?) -> [TableCollectionAdapter.TableRow] {
+        if let modelID = node.modelRef {
+            if let store, let model = store.getModel(modelID) {
+                return model.iterCachedItems().map { (_, item) in
+                    TableCollectionAdapter.TableRow(
+                        itemID: item.itemID,
+                        cells: cells(from: item.value)
+                    )
+                }
+            } else {
+                return []
+            }
+        } else {
+            guard let values = node.getProperty(.items)?.asList else { return [] }
+            return values.map { val in
+                TableCollectionAdapter.TableRow(itemID: nil, cells: cells(from: val))
+            }
+        }
+    }
+
+    private func inlineOutlineRows(from value: Value?) -> [String] {
+        guard let values = value?.asList else { return [] }
+        return values.map { $0.asString ?? ($0 == .null ? "" : $0.description) }
     }
 
     private func tableView(in handle: RenderHandle) -> NSTableView? {

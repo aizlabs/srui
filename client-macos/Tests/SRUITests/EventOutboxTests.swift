@@ -9,7 +9,7 @@ import Testing
 import Foundation
 import SemanticModel
 import Protocol
-import Session
+@testable import Session
 import TransportSSH
 
 @Suite("EventOutbox Tests")
@@ -75,6 +75,128 @@ struct EventOutboxTests {
         #expect(decodedEvent.clientInstanceId == clientInstanceId)
     }
 
+    @Test("EventOutbox creates and serializes VALUE_CHANGED event")
+    func valueChangedEventSerialization() async throws {
+        let clientInstanceId = ClientInstanceId(string: "client-test-val")
+        let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+
+        let nodeId = NodeId(200)
+        let observedRevision = Revision(50)
+        let value = Value.bool(true)
+
+        let event = await outbox.makeValueChangedEvent(nodeId: nodeId, observedRevision: observedRevision, value: value)
+
+        #expect(event.eventSeq == 1)
+        #expect(event.nodeId == nodeId)
+        #expect(event.observedRevision == observedRevision)
+        #expect(event.eventType == .EVENT_VALUE_CHANGED)
+        #expect(event.boolArg == true)
+        #expect(event.clientInstanceId == clientInstanceId)
+
+        // Verify wire roundtrip
+        var msg = SRUIMessage()
+        msg.event = event.toWire()
+        let framedBytes = try SRUIFraming.encodeFramed(msg)
+
+        let decodedMsg = try decodeFramedMessage(from: framedBytes)
+        guard case .event(let wireEvent) = decodedMsg.msg else {
+            Issue.record("Expected event message payload")
+            return
+        }
+
+        let decodedEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        #expect(decodedEvent.eventSeq == 1)
+        #expect(decodedEvent.nodeId == nodeId)
+        #expect(decodedEvent.eventType == .EVENT_VALUE_CHANGED)
+        #expect(decodedEvent.boolArg == true)
+    }
+
+    @Test("EventOutbox creates and serializes SELECTION_CHANGED event")
+    func selectionChangedEventSerialization() async throws {
+        let clientInstanceId = ClientInstanceId(string: "client-test-sel")
+        let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+
+        let nodeId = NodeId(300)
+        let observedRevision = Revision(75)
+        let itemId = ItemId(999)
+
+        let event = await outbox.makeSelectionChangedEvent(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId)
+
+        #expect(event.eventSeq == 1)
+        #expect(event.nodeId == nodeId)
+        #expect(event.observedRevision == observedRevision)
+        #expect(event.eventType == .EVENT_SELECTION_CHANGED)
+        #expect(event.itemIdArg == itemId)
+        #expect(event.clientInstanceId == clientInstanceId)
+
+        // Verify wire roundtrip
+        var msg = SRUIMessage()
+        msg.event = event.toWire()
+        let framedBytes = try SRUIFraming.encodeFramed(msg)
+
+        let decodedMsg = try decodeFramedMessage(from: framedBytes)
+        guard case .event(let wireEvent) = decodedMsg.msg else {
+            Issue.record("Expected event message payload")
+            return
+        }
+
+        let decodedEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        #expect(decodedEvent.eventSeq == 1)
+        #expect(decodedEvent.nodeId == nodeId)
+        #expect(decodedEvent.eventType == .EVENT_SELECTION_CHANGED)
+        #expect(decodedEvent.itemIdArg == itemId)
+    }
+
+    @Test("Mixed event types share contiguous monotonic sequences and are retained")
+    func mixedEventTypesContiguousSequences() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+
+        let ev1 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        let ev2 = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(true), via: client)
+        let ev3 = try await outbox.sendSelectionChanged(nodeId: NodeId(3), observedRevision: Revision(1), itemId: ItemId(42), via: client)
+
+        #expect(ev1.eventSeq == 1)
+        #expect(ev2.eventSeq == 2)
+        #expect(ev3.eventSeq == 3)
+
+        #expect(await outbox.eventSeq == 3)
+        #expect(await outbox.pendingCount == 3)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Permission and window capacity behavior across event send APIs")
+    func permissionAndCapacityBehavior() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox(maxPendingEvents: 2)
+
+        // 1. Fill capacity (2 events)
+        _ = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        _ = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(true), via: client)
+
+        // 3rd event should throw sequenceWindowExhausted
+        await #expect(throws: EventOutboxError.sequenceWindowExhausted(limit: 2)) {
+            try await outbox.sendSelectionChanged(nodeId: NodeId(3), observedRevision: Revision(1), itemId: ItemId(10), via: client)
+        }
+
+        // 2. Suspended outbox throws resumeNotConfirmed
+        await outbox.suspendNewEvents()
+        await #expect(throws: EventOutboxError.resumeNotConfirmed) {
+            try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        }
+        await #expect(throws: EventOutboxError.resumeNotConfirmed) {
+            try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(true), via: client)
+        }
+        await #expect(throws: EventOutboxError.resumeNotConfirmed) {
+            try await outbox.sendSelectionChanged(nodeId: NodeId(3), observedRevision: Revision(1), itemId: ItemId(10), via: client)
+        }
+
+        await client.close()
+        await server.close()
+    }
+
     @Test("EventOutbox sendActivate transmits framed event over Transport")
     func sendActivateOverTransport() async throws {
         let (client, server) = await PipeTransport.createPair()
@@ -110,6 +232,96 @@ struct EventOutboxTests {
         #expect(decodedEvent.eventId == sentEvent.eventId)
         #expect(decodedEvent.nodeId == NodeId(7))
         #expect(decodedEvent.observedRevision == Revision(10))
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Same-session resume replays unacknowledged events in original order with original identity")
+    func sameSessionResumeReplay() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+
+        let ev1 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        let ev2 = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(true), via: client)
+        let ev3 = try await outbox.sendSelectionChanged(nodeId: NodeId(3), observedRevision: Revision(1), itemId: ItemId(42), via: client)
+
+        #expect(await outbox.pendingCount == 3)
+
+        // Settle ack through seq 1
+        _ = await outbox.settleAcknowledgement(eventId: ev1.eventId, throughSeq: 1, sessionId: nil)
+        #expect(await outbox.pendingCount == 2)
+
+        await client.close()
+        await server.close()
+
+        // Reconnect on a fresh transport pair and complete same-session resume
+        let (client2, server2) = await PipeTransport.createPair()
+        let attemptId = await outbox.beginResumeAttempt()
+        let serverStream2 = server2.receiveStream()
+
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-123",
+            lastProcessedEventSeq: 1,
+            attemptId: attemptId,
+            via: client2,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+
+        // Read replayed messages from server2 (should be ev2 and ev3)
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var replayedEvents: [Event] = []
+        for try await chunk in serverStream2 {
+            let messages = try streamDecoder.appendAndExtract(incoming: chunk)
+            for msg in messages {
+                if case .event(let wireEvent) = msg.msg {
+                    let domainEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+                    replayedEvents.append(domainEvent)
+                }
+            }
+            if replayedEvents.count >= 2 {
+                break
+            }
+        }
+
+        #expect(replayedEvents.count == 2)
+        #expect(replayedEvents[0].eventSeq == ev2.eventSeq)
+        #expect(replayedEvents[0].eventId == ev2.eventId)
+        #expect(replayedEvents[1].eventSeq == ev3.eventSeq)
+        #expect(replayedEvents[1].eventId == ev3.eventId)
+
+        // Next new event continues monotonically from seq 4
+        let ev4 = try await outbox.sendActivate(nodeId: NodeId(4), observedRevision: Revision(2), via: client2)
+        #expect(ev4.eventSeq == 4)
+
+        await client2.close()
+        await server2.close()
+    }
+
+    @Test("Replaced session abandons pending events and resets sequence")
+    func replacedSessionResetsSequence() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+
+        _ = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        _ = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(false), via: client)
+        #expect(await outbox.pendingCount == 2)
+
+        let attemptId = await outbox.beginResumeAttempt()
+        let accepted = await outbox.prepareReplacedSession(
+            id: "new-incarnation",
+            lastProcessedEventSeq: 0,
+            attemptId: attemptId
+        )
+        #expect(accepted)
+        #expect(await outbox.pendingCount == 0)
+
+        await outbox.allowNewEvents()
+
+        let freshEvent = try await outbox.sendActivate(nodeId: NodeId(10), observedRevision: Revision(1), via: client)
+        #expect(freshEvent.eventSeq == 1)
+        #expect(await outbox.pendingCount == 1)
 
         await client.close()
         await server.close()

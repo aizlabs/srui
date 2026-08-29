@@ -178,25 +178,39 @@ public final class SessionController: @unchecked Sendable {
         guard !actionHandlerWired else { return }
         actionHandlerWired = true
 
-        renderer.onAction = { [weak self] nodeID, typeRef in
+        renderer.onInteraction = { [weak self] interaction in
             guard let self else { return }
-            guard typeRef == .EVENT_ACTIVATE || typeRef == TypeRef.standard(1) else { return }
 
             // §7.7: `observed_revision` is the revision the user was actually looking at when the
-            // control was activated, and the server validates that the action is still enabled and
-            // permitted at that revision. It must therefore be sampled synchronously here on the
+            // control was interacted with, and the server validates that the action is still enabled
+            // and permitted at that revision. It must therefore be sampled synchronously here on the
             // MainActor — reading it after a suspension point would report a revision the user
             // never saw and defeat that staleness check.
             let observedRev = self.applier.currentSnapshot.revision
 
             Task {
                 do {
-                    try await self.sendActivate(
-                        nodeId: nodeID,
-                        observedRevision: observedRev
-                    )
+                    switch interaction {
+                    case .activate(let nodeID):
+                        try await self.sendActivate(
+                            nodeId: nodeID,
+                            observedRevision: observedRev
+                        )
+                    case .valueChanged(let nodeID, let value):
+                        try await self.sendValueChanged(
+                            nodeId: nodeID,
+                            observedRevision: observedRev,
+                            value: value
+                        )
+                    case .selectionChanged(let nodeID, let itemID):
+                        try await self.sendSelectionChanged(
+                            nodeId: nodeID,
+                            observedRevision: observedRev,
+                            itemId: itemID
+                        )
+                    }
                 } catch {
-                    SessionDiagnostics.error("ACTIVATE dispatch failed: \(error)")
+                    SessionDiagnostics.error("Interaction dispatch failed: \(error)")
                 }
             }
         }
@@ -307,6 +321,54 @@ public final class SessionController: @unchecked Sendable {
         return try await outbox.sendActivate(
             nodeId: nodeId,
             observedRevision: observedRevision,
+            via: transport
+        )
+    }
+
+    /// Dispatches a manual value change event for the given node ID (§7.6).
+    @discardableResult
+    public func sendValueChanged(nodeId: NodeId, value: Value) async throws -> Event {
+        let snapshot = applier.currentSnapshot
+        return try await sendValueChanged(nodeId: nodeId, observedRevision: snapshot.revision, value: value)
+    }
+
+    @discardableResult
+    private func sendValueChanged(nodeId: NodeId, observedRevision: Revision, value: Value) async throws -> Event {
+        guard withStateLock({
+            guard eventDispatchEnabled else { return false }
+            if case .active = phase { return true }
+            return false
+        }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
+        return try await outbox.sendValueChanged(
+            nodeId: nodeId,
+            observedRevision: observedRevision,
+            value: value,
+            via: transport
+        )
+    }
+
+    /// Dispatches a manual selection change event for the given node ID (§7.6).
+    @discardableResult
+    public func sendSelectionChanged(nodeId: NodeId, itemId: ItemId) async throws -> Event {
+        let snapshot = applier.currentSnapshot
+        return try await sendSelectionChanged(nodeId: nodeId, observedRevision: snapshot.revision, itemId: itemId)
+    }
+
+    @discardableResult
+    private func sendSelectionChanged(nodeId: NodeId, observedRevision: Revision, itemId: ItemId) async throws -> Event {
+        guard withStateLock({
+            guard eventDispatchEnabled else { return false }
+            if case .active = phase { return true }
+            return false
+        }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
+        return try await outbox.sendSelectionChanged(
+            nodeId: nodeId,
+            observedRevision: observedRevision,
+            itemId: itemId,
             via: transport
         )
     }

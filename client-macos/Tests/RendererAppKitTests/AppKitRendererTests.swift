@@ -137,6 +137,132 @@ struct AppKitRendererTests {
             )
         }
     }
+    @Test
+    func collectionPropertyApplyThrowsWhenRenderHandleIsMissing() throws {
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+        ])
+        let renderer = AppKitRenderer()
+        try renderer.attach(store: store)
+
+        let collectionUpdate = SemanticModel.Operation.setProperty(
+            id: 2,
+            property: .columns,
+            value: .list([.string("Name")])
+        )
+        let newStore = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: .table, parentID: 1),
+            collectionUpdate,
+        ])
+
+        #expect(throws: LayoutRendererError.missingRenderHandle(2)) {
+            try renderer.apply(
+                transaction: Transaction(
+                    baseRevision: store.revision,
+                    operations: [collectionUpdate]
+                ),
+                newStore: newStore
+            )
+        }
+    }
+
+    @Test
+    func appKitRendererForwardsAllThreeSemanticInteractions() throws {
+        var receivedInteractions: [SemanticInteraction] = []
+        let renderer = AppKitRenderer()
+        renderer.onInteraction = { interaction in
+            receivedInteractions.append(interaction)
+        }
+
+        let modelID = ModelId(100)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [
+                ModelItem(itemID: ItemId(501), value: .string("Item 501")),
+                ModelItem(itemID: ItemId(502), value: .string("Item 502")),
+            ]
+        )
+
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(id: 10, nodeType: .button, parentID: 1, properties: [
+            Property(property: .label, value: .string("Click"))
+        ])
+        try store.createNode(id: 20, nodeType: .toggle, parentID: 1, properties: [
+            Property(property: .label, value: .string("Toggle"))
+        ])
+        try store.createNode(id: 30, nodeType: .table, parentID: 1, properties: [
+            Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+            Property(property: .selectionMode, value: .enumToken(.selectionModeSingle)),
+        ])
+
+        try renderer.attach(store: store)
+
+        // 1. Button click
+        let buttonHandle = try #require(renderer.registry.handle(for: 10))
+        let button = try #require(buttonHandle.view as? NSButton)
+        let buttonTrampoline = try #require(buttonHandle.actionTrampoline as? ActionTrampoline)
+        buttonTrampoline.performButtonAction(button)
+        #expect(receivedInteractions == [.activate(nodeID: 10)])
+        receivedInteractions.removeAll()
+
+        // 2. Toggle click
+        let toggleHandle = try #require(renderer.registry.handle(for: 20))
+        let toggle = try #require(toggleHandle.view as? NSButton)
+        let toggleTrampoline = try #require(toggleHandle.actionTrampoline as? ActionTrampoline)
+        toggle.state = .on
+        toggleTrampoline.performToggleAction(toggle)
+        #expect(receivedInteractions == [.valueChanged(nodeID: 20, value: .bool(true))])
+        receivedInteractions.removeAll()
+
+        // 3. Table row selection
+        let tableHandle = try #require(renderer.registry.handle(for: 30))
+        let tableView = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        #expect(receivedInteractions == [.selectionChanged(nodeID: 30, itemID: ItemId(502))])
+    }
+
+    @Test
+    func appKitRendererAppliesModelMutationsIncrementally() throws {
+        let modelID = ModelId(200)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
+        try store.modelInsert(id: modelID, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("Initial Item"))])
+
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(id: 2, nodeType: .table, parentID: 1, properties: [
+            Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+        ])
+
+        let renderer = AppKitRenderer()
+        try renderer.attach(store: store)
+
+        let tableBefore = try #require(renderer.registry.view(for: 2))
+        let windowBefore = try #require(renderer.registry.handle(for: 1)?.window)
+        let adapter = try #require(renderer.registry.handle(for: 2)?.modelAdapter as? TableCollectionAdapter)
+        #expect(adapter.rows.map(\.cells) == [["Initial Item"]])
+
+        let insertOp = Operation.modelInsert(
+            id: modelID,
+            index: 1,
+            items: [ModelItem(itemID: ItemId(2), value: .string("Second Item"))]
+        )
+        var newStore = store
+        try insertOp.apply(to: &newStore)
+
+        let classifications = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [insertOp]),
+            newStore: newStore
+        )
+
+        #expect(classifications == [.modelContent(modelID: modelID)])
+        #expect(renderer.registry.view(for: 2) === tableBefore)
+        #expect(renderer.registry.handle(for: 1)?.window === windowBefore)
+        #expect(adapter.rows.map(\.cells) == [["Initial Item"], ["Second Item"]])
+    }
 
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {
         var store = SemanticStore()

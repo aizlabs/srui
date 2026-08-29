@@ -29,6 +29,10 @@ private final class DemoApplicationDelegate: NSObject, NSApplicationDelegate {
     private let applier = TransactionApplier()
 
     func start() {
+        renderer.onInteraction = { interaction in
+            RendererDiagnostics.log("demo interaction received: \(interaction)")
+        }
+
         let transaction = DemoFixtures.initial(
             baseRevision: applier.currentSnapshot.revision
         )
@@ -62,20 +66,23 @@ private final class DemoApplicationDelegate: NSObject, NSApplicationDelegate {
     @objc
     private func applyScalarFixture() {
         let observedIDs: [NodeId] = [
+            DemoFixtures.surfaceID,
             DemoFixtures.progressID,
             DemoFixtures.titleID,
             DemoFixtures.buttonID,
             DemoFixtures.toggleID,
+            DemoFixtures.tableID,
         ]
         let identities = Dictionary(uniqueKeysWithValues: observedIDs.compactMap { nodeID in
             renderer.registry.view(for: nodeID).map { (nodeID, ObjectIdentifier($0)) }
         })
+        let windowIdentity = renderer.registry.handle(for: DemoFixtures.surfaceID)?.window.map { ObjectIdentifier($0) }
 
         let transaction = DemoFixtures.scalarUpdate(
             baseRevision: applier.currentSnapshot.revision
         )
         guard case .success = applier.apply(record: transaction) else {
-            fatalError("Scalar renderer demo transaction failed")
+            fatalError("Scalar/model renderer demo transaction failed")
         }
         let committedSnapshot = applier.currentSnapshot
 
@@ -85,20 +92,27 @@ private final class DemoApplicationDelegate: NSObject, NSApplicationDelegate {
                 newStore: committedSnapshot.store
             )
         } catch {
-            fatalError("Scalar renderer demo update failed: \(error)")
+            fatalError("Scalar/model renderer demo update failed: \(error)")
         }
 
         for (nodeID, identity) in identities {
             guard let view = renderer.registry.view(for: nodeID) else {
-                fatalError("Scalar update removed render handle \(nodeID)")
+                fatalError("Update removed render handle \(nodeID)")
             }
             precondition(
                 ObjectIdentifier(view) == identity,
-                "Scalar update rebuilt render handle \(nodeID)"
+                "Update rebuilt render handle \(nodeID)"
             )
         }
-        RendererDiagnostics.log("demo scalar transaction updated observed controls in place")
-        logFrames(phase: "scalar")
+        if let windowIdentity {
+            let currentWindow = renderer.registry.handle(for: DemoFixtures.surfaceID)?.window.map { ObjectIdentifier($0) }
+            precondition(
+                currentWindow == windowIdentity,
+                "Update rebuilt surface NSWindow"
+            )
+        }
+        RendererDiagnostics.log("demo transaction updated observed controls, table, and model in place")
+        logFrames(phase: "scalar_and_model")
     }
 
     private func logFrames(phase: String) {
@@ -135,11 +149,31 @@ private enum DemoFixtures {
     static let tableID = NodeId(19)
     static let treeID = NodeId(20)
     static let statusID = NodeId(21)
+    static let modelID = ModelId(100)
 
     static func initial(baseRevision: Revision) -> Transaction {
         Transaction(
             baseRevision: baseRevision,
             operations: [
+                .createModel(id: modelID, modelType: .table, itemCount: 0),
+                .modelInsert(
+                    id: modelID,
+                    index: 0,
+                    items: [
+                        ModelItem(
+                            itemID: ItemId(1),
+                            value: .list([.string("Alpha"), .string("100"), .string("Active"), .string("US-East")])
+                        ),
+                        ModelItem(
+                            itemID: ItemId(2),
+                            value: .list([.string("Beta"), .string("200"), .string("Pending"), .string("EU-West")])
+                        ),
+                        ModelItem(
+                            itemID: ItemId(3),
+                            value: .list([.string("Gamma"), .string("300"), .string("Idle"), .string("AP-South")])
+                        ),
+                    ]
+                ),
                 .createNode(
                     id: surfaceID,
                     nodeType: .surface,
@@ -274,11 +308,12 @@ private enum DemoFixtures {
                     nodeType: .table,
                     parentID: columnID,
                     properties: [
-                        Property(property: .label, value: .string("Table column")),
                         Property(
-                            property: .items,
-                            value: .list([.string("Table row 1"), .string("Table row 2")])
-                        )
+                            property: .columns,
+                            value: .list([.string("Service"), .string("Port"), .string("Status"), .string("Region")])
+                        ),
+                        Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+                        Property(property: .selectionMode, value: .enumToken(.selectionModeSingle)),
                     ]
                 ),
                 .createNode(
@@ -299,7 +334,7 @@ private enum DemoFixtures {
                     properties: [
                         Property(
                             property: .text,
-                            value: .string("A scalar fixture transaction will run after 1.5 seconds.")
+                            value: .string("A scalar and model fixture transaction will run after 1.5 seconds.")
                         ),
                         Property(property: .role, value: .enumToken(.textRoleStatus))
                     ]
@@ -327,8 +362,29 @@ private enum DemoFixtures {
                 .setProperty(
                     id: statusID,
                     property: .text,
-                    value: .string("Scalar SET_PROPERTY preserved every observed NSView identity.")
+                    value: .string("Scalar and model mutations preserved every observed NSView and NSWindow identity.")
                 ),
+                .modelInsert(
+                    id: modelID,
+                    index: 1,
+                    items: [
+                        ModelItem(
+                            itemID: ItemId(4),
+                            value: .list([.string("Delta-New"), .string("400"), .string("Active"), .string("US-West")])
+                        )
+                    ]
+                ),
+                .modelUpdate(
+                    id: modelID,
+                    index: 0,
+                    items: [
+                        ModelItem(
+                            itemID: ItemId(1),
+                            value: .list([.string("Alpha-Updated"), .string("101"), .string("Active"), .string("US-East")])
+                        )
+                    ]
+                ),
+                .modelDelete(id: modelID, index: nil, count: nil, itemIds: [ItemId(3)]),
             ]
         )
     }

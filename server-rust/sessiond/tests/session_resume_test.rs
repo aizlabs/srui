@@ -73,7 +73,12 @@ impl ResumeConnection {
     }
 
     async fn expect_resume_ok(&mut self, expected_session_id: &str, replay_from: u64) {
-        let msg = self.read.next().await.expect("resume ok frame").expect("decode");
+        let msg = self
+            .read
+            .next()
+            .await
+            .expect("resume ok frame")
+            .expect("decode");
         match msg.msg {
             Some(srui_message::Msg::ServerResumeOk(ok)) => {
                 assert_eq!(ok.session_id, expected_session_id);
@@ -139,7 +144,12 @@ async fn test_resume_at_earliest_retained_revision_replays_full_range() {
     let mut count = 0usize;
     let mut expected_base = 1u64;
     while expected_base < 1025 {
-        let msg = conn.read.next().await.expect("replay frame").expect("decode");
+        let msg = conn
+            .read
+            .next()
+            .await
+            .expect("replay frame")
+            .expect("decode");
         match msg.msg {
             Some(srui_message::Msg::Transaction(tx)) => {
                 assert_eq!(tx.base_revision, expected_base);
@@ -212,7 +222,12 @@ async fn test_replayed_transactions_are_contiguous_and_ordered() {
 
     let mut expected_base = 0u64;
     for _ in 0..5 {
-        let msg = conn.read.next().await.expect("replay frame").expect("decode");
+        let msg = conn
+            .read
+            .next()
+            .await
+            .expect("replay frame")
+            .expect("decode");
         match msg.msg {
             Some(srui_message::Msg::Transaction(tx)) => {
                 assert_eq!(tx.base_revision, expected_base);
@@ -242,9 +257,10 @@ async fn test_transaction_committed_during_replay_delivered_once_after_boundary(
 
     let session_clone = session.clone();
     let shutdown_clone = shutdown.clone();
-    let server_task = tokio::spawn(async move {
-        handle_connection(server_io, session_clone, shutdown_clone).await
-    });
+    let server_task =
+        tokio::spawn(
+            async move { handle_connection(server_io, session_clone, shutdown_clone).await },
+        );
 
     let (client_read, client_write) = tokio::io::split(client_io);
     let mut read = FramedRead::new(client_read, SruiCodec::new());
@@ -293,7 +309,11 @@ async fn test_transaction_committed_during_replay_delivered_once_after_boundary(
     commit_task.await.expect("commit task");
 
     // Post-replay broadcast must deliver the concurrent commit exactly once.
-    let tx3 = read.next().await.expect("post-replay tx 2->3").expect("decode");
+    let tx3 = read
+        .next()
+        .await
+        .expect("post-replay tx 2->3")
+        .expect("decode");
     match tx3.msg {
         Some(srui_message::Msg::Transaction(t)) => {
             assert_eq!(t.base_revision, 2);

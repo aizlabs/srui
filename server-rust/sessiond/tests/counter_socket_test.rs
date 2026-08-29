@@ -162,12 +162,20 @@ impl CounterConnection {
         };
         write.send(hello).await.expect("send ClientHello");
 
-        let welcome = read.next().await.expect("welcome frame").expect("decode welcome");
+        let welcome = read
+            .next()
+            .await
+            .expect("welcome frame")
+            .expect("decode welcome");
         match welcome.msg {
             Some(srui_message::Msg::ServerWelcome(w)) => {
                 assert_eq!(w.session_id, session.session_id());
                 assert_eq!(w.initial_revision, 1);
-                let snapshot = read.next().await.expect("hello catch-up").expect("decode snapshot");
+                let snapshot = read
+                    .next()
+                    .await
+                    .expect("hello catch-up")
+                    .expect("decode snapshot");
                 match snapshot.msg {
                     Some(srui_message::Msg::Transaction(tx)) => {
                         assert_eq!(tx.base_revision, 0);
@@ -225,7 +233,12 @@ impl CounterConnection {
     }
 
     async fn expect_resume_ok(&mut self, replay_from: u64) {
-        let msg = self.read.next().await.expect("resume ok frame").expect("decode");
+        let msg = self
+            .read
+            .next()
+            .await
+            .expect("resume ok frame")
+            .expect("decode");
         match msg.msg {
             Some(srui_message::Msg::ServerResumeOk(ok)) => {
                 assert_eq!(ok.replay_from_revision, replay_from);
@@ -247,7 +260,10 @@ impl CounterConnection {
         let envelope = SruiMessage {
             msg: Some(srui_message::Msg::Event(event.to_wire())),
         };
-        self.write.send(envelope).await.expect("send ACTIVATE event");
+        self.write
+            .send(envelope)
+            .await
+            .expect("send ACTIVATE event");
     }
 
     async fn recv_transaction(&mut self) -> srui_protocol::Transaction {
@@ -439,7 +455,10 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
             client_metadata: Default::default(),
         })),
     };
-    framed_write.send(hello).await.expect("send client hello frame");
+    framed_write
+        .send(hello)
+        .await
+        .expect("send client hello frame");
 
     let welcome_envelope = framed_read
         .next()
@@ -511,7 +530,10 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
 
         let wire_tx = match response_envelope.msg {
             Some(srui_message::Msg::Transaction(tx)) => tx,
-            other => panic!("expected Transaction envelope for click {}, got {:?}", seq, other),
+            other => panic!(
+                "expected Transaction envelope for click {}, got {:?}",
+                seq, other
+            ),
         };
 
         // Construct expected domain Transaction matching Task 11's in-memory encode
@@ -541,11 +563,18 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
         assert_eq!(session.current_revision(), seq + 1);
         session.with_store(|store| {
             let text_widget = Text::from_store(store, text_id).expect("text widget exists");
-            assert_eq!(text_widget.text(store), Some(format!("Count: {}", seq).as_str()));
+            assert_eq!(
+                text_widget.text(store),
+                Some(format!("Count: {}", seq).as_str())
+            );
 
-            let prog_widget = Progress::from_store(store, progress_id).expect("progress widget exists");
+            let prog_widget =
+                Progress::from_store(store, progress_id).expect("progress widget exists");
             assert_eq!(prog_widget.value(store), Some((seq as f64) / 100.0));
-            assert_eq!(prog_widget.value_description(store), Some(format!("{} / 100", seq).as_str()));
+            assert_eq!(
+                prog_widget.value_description(store),
+                Some(format!("{} / 100", seq).as_str())
+            );
         });
     }
 
@@ -622,9 +651,10 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
 
     let session_clone = session.clone();
     let shutdown_clone = shutdown.clone();
-    let server_task = tokio::spawn(async move {
-        handle_connection(server_io, session_clone, shutdown_clone).await
-    });
+    let server_task =
+        tokio::spawn(
+            async move { handle_connection(server_io, session_clone, shutdown_clone).await },
+        );
 
     let (client_read, client_write) = tokio::io::split(client_io);
     let mut framed_read = FramedRead::new(client_read, SruiCodec::new());
@@ -640,7 +670,10 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
             client_metadata: Default::default(),
         })),
     };
-    framed_write.send(hello).await.expect("send client hello frame");
+    framed_write
+        .send(hello)
+        .await
+        .expect("send client hello frame");
 
     let welcome_envelope = framed_read
         .next()
@@ -671,13 +704,8 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
 
     // Drive 5 ACTIVATE events
     for seq in 1..=5 {
-        let event = Event::activate(
-            seq,
-            format!("click-{}", seq),
-            Revision::new(seq),
-            button_id,
-        )
-        .with_client_instance_id(vec![1, 2, 3, 4]);
+        let event = Event::activate(seq, format!("click-{}", seq), Revision::new(seq), button_id)
+            .with_client_instance_id(vec![1, 2, 3, 4]);
 
         let event_envelope = SruiMessage {
             msg: Some(srui_message::Msg::Event(event.to_wire())),
@@ -709,7 +737,10 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
 
         let wire_tx = match response_envelope.msg {
             Some(srui_message::Msg::Transaction(tx)) => tx,
-            other => panic!("expected Transaction envelope for click {}, got {:?}", seq, other),
+            other => panic!(
+                "expected Transaction envelope for click {}, got {:?}",
+                seq, other
+            ),
         };
 
         let expected_domain_tx = Transaction::new(
@@ -735,11 +766,18 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
         assert_eq!(session.current_revision(), seq + 1);
         session.with_store(|store| {
             let text_widget = Text::from_store(store, text_id).expect("text widget exists");
-            assert_eq!(text_widget.text(store), Some(format!("Count: {}", seq).as_str()));
+            assert_eq!(
+                text_widget.text(store),
+                Some(format!("Count: {}", seq).as_str())
+            );
 
-            let prog_widget = Progress::from_store(store, progress_id).expect("progress widget exists");
+            let prog_widget =
+                Progress::from_store(store, progress_id).expect("progress widget exists");
             assert_eq!(prog_widget.value(store), Some((seq as f64) / 100.0));
-            assert_eq!(prog_widget.value_description(store), Some(format!("{} / 100", seq).as_str()));
+            assert_eq!(
+                prog_widget.value_description(store),
+                Some(format!("{} / 100", seq).as_str())
+            );
         });
     }
 
@@ -756,8 +794,7 @@ async fn test_counter_disconnect_before_tx_resume_replays_without_double_increme
     let fixture = CounterFixture::new("counter-disconnect-resume");
     let button_id = fixture.button_id;
 
-    let mut conn =
-        CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
+    let mut conn = CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
 
     conn.send_activate(COUNTER_CLIENT_A, 1, "click-1", 1, button_id)
         .await;
@@ -772,12 +809,8 @@ async fn test_counter_disconnect_before_tx_resume_replays_without_double_increme
     let server_result = conn.disconnect_abruptly().await;
     assert!(server_result.is_ok());
 
-    let mut resumed = CounterConnection::connect_resume(
-        fixture.session.clone(),
-        COUNTER_CLIENT_A,
-        1,
-    )
-    .await;
+    let mut resumed =
+        CounterConnection::connect_resume(fixture.session.clone(), COUNTER_CLIENT_A, 1).await;
     resumed.expect_resume_ok(1).await;
 
     let replayed = resumed.recv_transaction().await;
@@ -787,7 +820,10 @@ async fn test_counter_disconnect_before_tx_resume_replays_without_double_increme
     assert_eq!(fixture.session.current_revision(), 2);
 
     resumed.expect_no_message(Duration::from_millis(100)).await;
-    resumed.cancel_and_join().await.expect("resume connection clean exit");
+    resumed
+        .cancel_and_join()
+        .await
+        .expect("resume connection clean exit");
 }
 
 #[tokio::test]
@@ -795,8 +831,7 @@ async fn test_counter_duplicate_activate_across_reconnect_no_double_increment() 
     let fixture = CounterFixture::new("counter-dup-reconnect");
     let button_id = fixture.button_id;
 
-    let mut conn =
-        CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
+    let mut conn = CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
 
     conn.send_activate(COUNTER_CLIENT_A, 1, "click-dup", 1, button_id)
         .await;
@@ -808,18 +843,14 @@ async fn test_counter_duplicate_activate_across_reconnect_no_double_increment() 
     assert_eq!(tx.new_revision, 2);
     fixture.assert_count(1);
 
-    conn.disconnect_abruptly().await.expect("first connection exit");
+    conn.disconnect_abruptly()
+        .await
+        .expect("first connection exit");
 
-    let mut resumed = CounterConnection::connect_resume(
-        fixture.session.clone(),
-        COUNTER_CLIENT_A,
-        2,
-    )
-    .await;
+    let mut resumed =
+        CounterConnection::connect_resume(fixture.session.clone(), COUNTER_CLIENT_A, 2).await;
     resumed.expect_resume_ok(2).await;
-    resumed
-        .expect_no_message(Duration::from_millis(100))
-        .await;
+    resumed.expect_no_message(Duration::from_millis(100)).await;
 
     // Retry the same stable event_id after reconnect (§18.2 dedupe).
     resumed
@@ -832,13 +863,14 @@ async fn test_counter_duplicate_activate_across_reconnect_no_double_increment() 
     assert_eq!(dup_ack.status(), EventAckStatus::Duplicate);
     assert_eq!(dup_ack.event_id, b"click-dup");
     assert_eq!(dup_ack.revision_after_effect, 2);
-    resumed
-        .expect_no_message(Duration::from_millis(100))
-        .await;
+    resumed.expect_no_message(Duration::from_millis(100)).await;
 
     assert_eq!(fixture.session.current_revision(), 2);
     fixture.assert_count(1);
-    resumed.cancel_and_join().await.expect("resume connection clean exit");
+    resumed
+        .cancel_and_join()
+        .await
+        .expect("resume connection clean exit");
 }
 
 #[tokio::test]
@@ -846,8 +878,7 @@ async fn test_counter_disabled_button_rejects_activate() {
     let fixture = CounterFixture::new("counter-disabled-button");
     let button_id = fixture.button_id;
 
-    let mut conn =
-        CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
+    let mut conn = CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
 
     fixture
         .session
@@ -885,8 +916,7 @@ async fn test_counter_future_revision_event_rejects_activate() {
     let fixture = CounterFixture::new("counter-future-revision");
     let button_id = fixture.button_id;
 
-    let mut conn =
-        CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
+    let mut conn = CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
 
     conn.send_activate(COUNTER_CLIENT_A, 1, "click-future", 99, button_id)
         .await;
@@ -912,10 +942,8 @@ async fn test_two_counter_clients_receive_identical_revisions() {
     let fixture = CounterFixture::new("counter-two-clients");
     let button_id = fixture.button_id;
 
-    let mut client_a =
-        CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
-    let mut client_b =
-        CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_B).await;
+    let mut client_a = CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_A).await;
+    let mut client_b = CounterConnection::connect(fixture.session.clone(), COUNTER_CLIENT_B).await;
 
     client_a
         .send_activate(COUNTER_CLIENT_A, 1, "click-a", 1, button_id)
@@ -939,8 +967,14 @@ async fn test_two_counter_clients_receive_identical_revisions() {
     fixture.assert_count(1);
     assert_eq!(fixture.session.current_revision(), 2);
 
-    client_a.cancel_and_join().await.expect("client A clean exit");
-    client_b.cancel_and_join().await.expect("client B clean exit");
+    client_a
+        .cancel_and_join()
+        .await
+        .expect("client A clean exit");
+    client_b
+        .cancel_and_join()
+        .await
+        .expect("client B clean exit");
 }
 
 #[tokio::test]
@@ -959,12 +993,14 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
     let shutdown_a_clone = shutdown_a.clone();
     let shutdown_b_clone = shutdown_b.clone();
 
-    let server_a = tokio::spawn(async move {
-        handle_connection(server_io_a, session_a, shutdown_a_clone).await
-    });
-    let server_b = tokio::spawn(async move {
-        handle_connection(server_io_b, session_b, shutdown_b_clone).await
-    });
+    let server_a =
+        tokio::spawn(
+            async move { handle_connection(server_io_a, session_a, shutdown_a_clone).await },
+        );
+    let server_b =
+        tokio::spawn(
+            async move { handle_connection(server_io_b, session_b, shutdown_b_clone).await },
+        );
 
     let (read_a, write_a) = tokio::io::split(client_io_a);
     let (read_b, write_b) = tokio::io::split(client_io_b);
@@ -1056,7 +1092,13 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
     }
 
     framed_write_b
-        .send(wire_activate(COUNTER_CLIENT_B, 2, "click-b-2", 2, button_id))
+        .send(wire_activate(
+            COUNTER_CLIENT_B,
+            2,
+            "click-b-2",
+            2,
+            button_id,
+        ))
         .await
         .expect("send second ACTIVATE on surviving client");
 
@@ -1092,4 +1134,3 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
         "surviving client connection should exit cleanly"
     );
 }
-

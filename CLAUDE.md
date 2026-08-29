@@ -18,6 +18,10 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings   # CI gates on clean lint
 cargo test -p srui-semantic-tree --test store_test      # one integration test file
 cargo test -p srui-semantic-tree apply_transaction       # one test by name substring
+cargo fmt -p srui-sessiond                              # format only the crate you changed
+```
+
+Never run `cargo fmt --all` (or bare `cargo fmt`) from `server-rust/`. That workspace has nine members; `--all` rewrites every crate and dirties files you did not touch. Format with `cargo fmt -p <crate>` (repeat `-p` for each crate you edited).
 
 # Swift client — from client-macos/
 swift build
@@ -85,6 +89,7 @@ Layering is enforced by CI, not just convention:
 
 ## Conventions
 
+- Rust format/lint: `cargo fmt -p <crate>` and `cargo clippy -p <crate> --all-targets -- -D warnings`. Do not `cargo fmt --all`.
 - Rust module docs open with a `//!` block listing the spec sections implemented; keep that list current when a module gains or loses responsibility.
 - Swift files carry an equivalent header comment, plus the AppKit prohibition note in `SemanticModel`.
 - `benchmarks/*` and `examples/coding-agent-demo`, `examples/process-monitor` are README-only placeholders; only `examples/counter` is real code.

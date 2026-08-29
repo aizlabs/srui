@@ -89,42 +89,40 @@ where
         }
     };
 
-    let client_instance_id = match handshake_msg.msg {
+    let (client_instance_id, mut tx_rx) = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
                 "Received ClientHello from client instance {:?}",
                 hello.client_instance_id
             );
-            let (welcome, snapshot) = session.handle_hello(&hello)?;
+            let bootstrap = session.bootstrap_fresh_client(&hello)?;
             let welcome_envelope = SruiMessage {
-                msg: Some(srui_message::Msg::ServerWelcome(welcome)),
+                msg: Some(srui_message::Msg::ServerWelcome(bootstrap.welcome)),
             };
             framed_write.send(welcome_envelope).await?;
-            // Catch-up is sent before `subscribe_transactions` so a concurrent commit cannot
-            // overtake the snapshot while the client still has `pendingResync` set (§15, §18).
-            if let Some(snapshot) = snapshot {
+            if let Some(snapshot) = bootstrap.snapshot {
                 let snapshot_envelope = SruiMessage {
                     msg: Some(srui_message::Msg::Transaction(snapshot)),
                 };
                 framed_write.send(snapshot_envelope).await?;
             }
-            hello.client_instance_id
+            (hello.client_instance_id, bootstrap.transactions)
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
             info!(
                 "Received ClientResume for session {} from revision {}",
                 resume.session_id, resume.last_applied_revision
             );
-            match session.handle_resume(&resume)? {
+            let bootstrap = session.bootstrap_resume(&resume)?;
+            match bootstrap.outcome {
                 ResumeOutcome::Replay {
                     welcome_msg,
-                    from_revision,
+                    replayed,
                 } => {
                     let envelope = SruiMessage {
                         msg: Some(srui_message::Msg::ServerResumeOk(welcome_msg)),
                     };
                     framed_write.send(envelope).await?;
-                    let replayed = session.collect_replayed_transactions(from_revision)?;
                     for tx in replayed {
                         let tx_env = SruiMessage {
                             msg: Some(srui_message::Msg::Transaction(tx)),
@@ -146,19 +144,18 @@ where
                     framed_write.send(snapshot_env).await?;
                 }
             }
-            resume.client_instance_id
+            (resume.client_instance_id, bootstrap.transactions)
         }
         _ => {
             return Err(ConnectionError::UnexpectedMessage(
                 "expected ClientHello or ClientResume",
-            ))
+            ));
         }
     };
 
     // -------------------------------------------------------------------------
     // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
     // -------------------------------------------------------------------------
-    let mut tx_rx = session.subscribe_transactions()?;
 
     loop {
         tokio::select! {

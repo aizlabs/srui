@@ -8,21 +8,22 @@
 //! Conforms to [`async-bounded-channel`](rules/async-bounded-channel.md):
 //! transaction broadcast channels are strictly bounded.
 
+mod handshake;
+mod snapshot;
+
+pub use handshake::{FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome};
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
 use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, EventSequenceError, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal};
-use srui_protocol::{
-    ClientHello, ClientResume, Event, ExtensionNamespaceMapping, ServerLimits, ServerResumeOk,
-    ServerResyncRequired, ServerWelcome, SessionContinuity, Transaction,
-};
+use srui_protocol::{Event, ServerLimits, Transaction};
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
-    CapabilitySet, EventValidationError, NegotiationError, NodeId, Profile, PropertyRef,
-    SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef, Value,
-    DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
+    EventValidationError, NegotiationError, NodeId, PropertyRef, SemanticStore, ServerCapabilities,
+    StoreError, TxnError, TypeRef, Value, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
     DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 use thiserror::Error;
@@ -74,6 +75,17 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+pub(crate) fn subscribe_tx_broadcast(
+    tx_broadcast: &Mutex<Option<broadcast::Sender<Transaction>>>,
+) -> Result<broadcast::Receiver<Transaction>, SessionError> {
+    tx_broadcast
+        .lock()
+        .map_err(|_| SessionError::LockPoisoned)?
+        .as_ref()
+        .map(|sender| sender.subscribe())
+        .ok_or(SessionError::BroadcastClosed)
+}
+
 /// Truncates a diagnostic string to the negotiated §26 `max_string_length` (UTF-8 safe).
 pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> String {
     if value.len() <= max_len {
@@ -118,29 +130,14 @@ pub enum EventOutcome {
     },
 }
 
-/// Outcome of a [`ClientResume`] handshake request.
-#[derive(Debug, Clone)]
-pub enum ResumeOutcome {
-    /// The exact requested session survived: sends `ServerResumeOk` followed by replay.
-    Replay {
-        welcome_msg: ServerResumeOk,
-        from_revision: u64,
-    },
-    /// Full snapshot required, either for a same-session journal gap or a replaced incarnation.
-    Resync {
-        resync_msg: ServerResyncRequired,
-        snapshot_transaction: Transaction,
-    },
-}
-
-struct SessionInner {
-    session_id: String,
-    store: SemanticStore,
-    journal: TransactionJournal,
-    dedupe: EventDeduplicator,
-    capabilities: ServerCapabilities,
-    limits: ServerLimits,
-    handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
+pub(crate) struct SessionInner {
+    pub(crate) session_id: String,
+    pub(crate) store: SemanticStore,
+    pub(crate) journal: TransactionJournal,
+    pub(crate) dedupe: EventDeduplicator,
+    pub(crate) capabilities: ServerCapabilities,
+    pub(crate) limits: ServerLimits,
+    pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
 }
 
 impl std::fmt::Debug for SessionInner {
@@ -160,8 +157,8 @@ impl std::fmt::Debug for SessionInner {
 /// Authoritative session controller managing the distributed UI graph.
 #[derive(Debug, Clone)]
 pub struct Session {
-    inner: Arc<Mutex<SessionInner>>,
-    tx_broadcast: Arc<Mutex<Option<broadcast::Sender<Transaction>>>>,
+    pub(crate) inner: Arc<Mutex<SessionInner>>,
+    pub(crate) tx_broadcast: Arc<Mutex<Option<broadcast::Sender<Transaction>>>>,
 }
 
 impl Session {
@@ -246,10 +243,7 @@ impl Session {
     /// dropped the sender. That hook is test-only, but it is reachable from a live session, and a
     /// panic here would take down the connection-accept task rather than failing one connection.
     pub fn subscribe_transactions(&self) -> Result<broadcast::Receiver<Transaction>, SessionError> {
-        lock_or_recover(&self.tx_broadcast)
-            .as_ref()
-            .map(|sender| sender.subscribe())
-            .ok_or(SessionError::BroadcastClosed)
+        subscribe_tx_broadcast(&self.tx_broadcast)
     }
 
     /// Collects transactions to replay starting at `from_revision` using a borrowed journal iterator.
@@ -265,150 +259,7 @@ impl Session {
             .ok_or(SessionError::ReplayUnavailable)
     }
 
-    /// Evaluates a `ClientHello` handshake message, negotiates capabilities,
-    /// and returns the `ServerWelcome` envelope plus a catch-up snapshot when the
-    /// session already has committed state (§15, §18).
-    pub fn handle_hello(
-        &self,
-        hello: &ClientHello,
-    ) -> Result<(ServerWelcome, Option<Transaction>), SessionError> {
-        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-
-        let mut client_caps = CapabilitySet::new();
-        for p_str in &hello.profiles {
-            if let Ok(p) = Profile::parse(p_str) {
-                client_caps.insert(p);
-            }
-        }
-
-        let _negotiated = guard.capabilities.negotiate(&client_caps)?;
-
-        let initial_revision = guard.store.revision().get();
-        let welcome = ServerWelcome {
-            core_version: "0.4.0".to_string(),
-            required_profiles: guard.capabilities.required.to_string_vec(),
-            optional_profiles: guard.capabilities.optional.to_string_vec(),
-            session_id: guard.session_id.clone(),
-            initial_revision,
-            extension_namespaces: vec![ExtensionNamespaceMapping {
-                extension_uri: "org.srui.standard-widgets".to_string(),
-                namespace_id: 0,
-            }],
-            limits: Some(guard.limits),
-        };
-
-        let snapshot = if initial_revision > 0 {
-            Some(export_snapshot_transaction(&guard.store))
-        } else {
-            None
-        };
-
-        Ok((welcome, snapshot))
-    }
-
-    /// Evaluates a `ClientResume` reconnection request (§20.2, §21, §32.5).
-    pub fn handle_resume(&self, resume: &ClientResume) -> Result<ResumeOutcome, SessionError> {
-        #[allow(clippy::large_enum_variant)]
-        enum ResumePlan {
-            Replay {
-                session_id: String,
-                from_revision: u64,
-                last_processed_event_seq: u64,
-            },
-            Resync {
-                session_id: String,
-                snapshot_revision: u64,
-                store_snapshot: SemanticStore,
-                continuity: SessionContinuity,
-                last_processed_event_seq: u64,
-            },
-        }
-
-        let plan = {
-            let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-            let last_processed_event_seq = guard
-                .dedupe
-                .last_contiguous_processed_seq(&resume.client_instance_id);
-
-            // A session ID is an incarnation token, not a human-readable application name. A
-            // mismatch means the requested session is gone, so old client intents must not be
-            // replayed against this authoritative state.
-            if resume.session_id != guard.session_id {
-                ResumePlan::Resync {
-                    session_id: guard.session_id.clone(),
-                    snapshot_revision: guard.store.revision().get(),
-                    store_snapshot: guard.store.clone_staging(),
-                    continuity: SessionContinuity::Replaced,
-                    last_processed_event_seq,
-                }
-            } else if guard
-                .journal
-                .iter_from(resume.last_applied_revision)
-                .is_some()
-            {
-                ResumePlan::Replay {
-                    session_id: guard.session_id.clone(),
-                    from_revision: resume.last_applied_revision,
-                    last_processed_event_seq,
-                }
-            } else {
-                ResumePlan::Resync {
-                    session_id: guard.session_id.clone(),
-                    snapshot_revision: guard.store.revision().get(),
-                    store_snapshot: guard.store.clone_staging(),
-                    continuity: SessionContinuity::SameSession,
-                    last_processed_event_seq,
-                }
-            }
-        };
-
-        match plan {
-            ResumePlan::Replay {
-                session_id,
-                from_revision,
-                last_processed_event_seq,
-            } => {
-                let welcome_msg = ServerResumeOk {
-                    session_id,
-                    replay_from_revision: from_revision,
-                    last_processed_event_seq,
-                };
-                Ok(ResumeOutcome::Replay {
-                    welcome_msg,
-                    from_revision,
-                })
-            }
-            ResumePlan::Resync {
-                session_id,
-                snapshot_revision,
-                store_snapshot,
-                continuity,
-                last_processed_event_seq,
-            } => {
-                let snapshot_tx = export_snapshot_transaction(&store_snapshot);
-                let reason = match continuity {
-                    SessionContinuity::SameSession => {
-                        "client revision outside retained journal window"
-                    }
-                    SessionContinuity::Replaced => {
-                        "requested session incarnation is no longer available"
-                    }
-                    SessionContinuity::Unspecified => unreachable!("server always sets continuity"),
-                };
-                let resync_msg = ServerResyncRequired {
-                    session_id,
-                    snapshot_revision,
-                    reason: reason.to_string(),
-                    continuity: continuity as i32,
-                    last_processed_event_seq,
-                };
-                Ok(ResumeOutcome::Resync {
-                    resync_msg,
-                    snapshot_transaction: snapshot_tx,
-                })
-            }
-        }
-    }
+    /// Registers an event handler for `node` and `event_type` (§29).
     pub fn on<F>(&self, node: impl Into<NodeId>, event_type: TypeRef, handler: F)
     where
         F: Fn(&Session, &Event) + Send + Sync + 'static,
@@ -528,14 +379,14 @@ impl Session {
                         revision_after_effect: prior.revision_after_effect,
                         last_processed_event_seq,
                         reject_reason: prior.reject_reason,
-                    })
+                    });
                 }
                 RecordOutcome::Pending {
                     last_processed_event_seq,
                 } => {
                     return Ok(EventOutcome::Pending {
                         last_processed_event_seq,
-                    })
+                    });
                 }
                 RecordOutcome::Fresh { .. } => {}
             }
@@ -683,134 +534,6 @@ impl Session {
     }
 }
 
-/// Appends one `MODEL_RESET_RANGE` operation carrying `items` starting at `start_index` (§13, §26).
-fn push_model_reset_range(
-    ops: &mut Vec<srui_protocol::Operation>,
-    model_id: u64,
-    start_index: u64,
-    items: Vec<srui_protocol::ModelItem>,
-) {
-    ops.push(srui_protocol::Operation {
-        op: Some(srui_protocol::operation::Op::ModelResetRange(
-            srui_protocol::ModelResetRangeOp {
-                model_id,
-                start_index,
-                items,
-                total_count: 0,
-            },
-        )),
-    });
-}
-
-fn export_snapshot_transaction(store: &SemanticStore) -> Transaction {
-    let mut ops = Vec::new();
-
-    let mut model_ids: Vec<_> = store.model_ids().collect();
-    model_ids.sort_by_key(|id| id.get());
-    for model_id in model_ids {
-        if let Some(model) = store.get_model(model_id) {
-            ops.push(srui_protocol::Operation {
-                op: Some(srui_protocol::operation::Op::CreateModel(
-                    srui_protocol::CreateModelOp {
-                        model_id: model.id.get(),
-                        model_type: Some(model.model_type.into()),
-                        item_count: model.item_count,
-                    },
-                )),
-            });
-
-            // §26: a model may cache up to `max_cached_items_per_model` (100_000) items, but a
-            // single model operation may carry at most `max_items_per_model_operation` (10_000).
-            // An unchunked range therefore produces a snapshot that every conforming client must
-            // reject — and a rejected resync snapshot leaves the client waiting for a snapshot it
-            // will reject again (§18).
-            for range in model.cached_ranges() {
-                let mut chunk_start = range.start;
-                let mut chunk: Vec<srui_protocol::ModelItem> = Vec::new();
-
-                for idx in range.start..range.start + range.length {
-                    match model.get_item_by_index(idx) {
-                        Some(item) => {
-                            if chunk.is_empty() {
-                                chunk_start = idx;
-                            }
-                            chunk.push(srui_protocol::ModelItem::from(item));
-                            if chunk.len() == DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION {
-                                push_model_reset_range(
-                                    &mut ops,
-                                    model.id.get(),
-                                    chunk_start,
-                                    std::mem::take(&mut chunk),
-                                );
-                            }
-                        }
-                        // `items` are positional from `start_index`, so a hole must end the run
-                        // rather than shift every later item down by one.
-                        None => {
-                            if !chunk.is_empty() {
-                                push_model_reset_range(
-                                    &mut ops,
-                                    model.id.get(),
-                                    chunk_start,
-                                    std::mem::take(&mut chunk),
-                                );
-                            }
-                        }
-                    }
-                }
-
-                if !chunk.is_empty() {
-                    push_model_reset_range(&mut ops, model.id.get(), chunk_start, chunk);
-                }
-            }
-        }
-    }
-
-    fn visit_node(
-        store: &SemanticStore,
-        node_id: srui_semantic_tree::NodeId,
-        child_index: u32,
-        ops: &mut Vec<srui_protocol::Operation>,
-    ) {
-        if let Some(node) = store.get_node(node_id) {
-            let record = srui_protocol::NodeRecord {
-                node_id: node.id.get(),
-                r#type: Some(node.node_type.into()),
-                parent_id: node.parent_id.map(|p| p.get()).unwrap_or(0),
-                child_index,
-                properties: node
-                    .properties
-                    .iter()
-                    .map(|(p, v)| srui_protocol::Property {
-                        property: Some((*p).into()),
-                        value: Some(v.clone().into()),
-                    })
-                    .collect(),
-            };
-            ops.push(srui_protocol::Operation {
-                op: Some(srui_protocol::operation::Op::CreateNode(
-                    srui_protocol::CreateNodeOp { node: Some(record) },
-                )),
-            });
-
-            for (idx, &child_id) in node.ordered_children.iter().enumerate() {
-                visit_node(store, child_id, idx as u32, ops);
-            }
-        }
-    }
-
-    for (idx, &root_id) in store.root_ids().iter().enumerate() {
-        visit_node(store, root_id, idx as u32, &mut ops);
-    }
-
-    Transaction {
-        base_revision: 0,
-        new_revision: store.revision().get(),
-        priority: 0,
-        operations: ops,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,111 +586,5 @@ mod tests {
         session.poison_lock_for_test();
         assert_eq!(session.session_id(), "poison-test");
         assert_eq!(session.current_revision(), 0);
-    }
-
-    #[test]
-    fn test_session_lifecycle() {
-        let session = Session::new("test-session");
-        assert_eq!(session.session_id(), "test-session");
-        assert_eq!(session.current_revision(), 0);
-
-        // ClientHello
-        let hello = ClientHello {
-            core_version: "0.4.0".to_string(),
-            profiles: vec!["org.srui.standard-widgets/1".to_string()],
-            limits: None,
-            client_instance_id: vec![1, 2],
-            client_metadata: Default::default(),
-        };
-
-        let (welcome, snapshot) = session.handle_hello(&hello).expect("hello negotiated");
-        assert_eq!(welcome.session_id, "test-session");
-        assert_eq!(welcome.initial_revision, 0);
-        assert!(snapshot.is_none());
-
-        // Commit transaction
-        let tx = Transaction {
-            base_revision: 0,
-            new_revision: 1,
-            priority: 1,
-            operations: vec![],
-        };
-
-        let committed = session.commit_transaction(tx).expect("commit tx");
-        assert_eq!(committed.new_revision, 1);
-        assert_eq!(session.current_revision(), 1);
-
-        let (welcome_after, snapshot_after) = session.handle_hello(&hello).expect("hello after commit");
-        assert_eq!(welcome_after.initial_revision, 1);
-        let snapshot = snapshot_after.expect("hello catch-up snapshot");
-        assert_eq!(snapshot.base_revision, 0);
-        assert_eq!(snapshot.new_revision, 1);
-
-        // Resume replay
-        let resume = ClientResume {
-            session_id: "test-session".to_string(),
-            client_instance_id: vec![1, 2],
-            last_applied_revision: 0,
-            last_acked_event_seq: 0,
-            terminal_stream_offsets: Default::default(),
-        };
-
-        match session.handle_resume(&resume).expect("resume handled") {
-            ResumeOutcome::Replay {
-                welcome_msg,
-                from_revision,
-            } => {
-                assert_eq!(welcome_msg.replay_from_revision, 0);
-                assert_eq!(welcome_msg.last_processed_event_seq, 0);
-                let replayed = session
-                    .collect_replayed_transactions(from_revision)
-                    .expect("replay available");
-                assert_eq!(replayed.len(), 1);
-                assert_eq!(replayed[0].new_revision, 1);
-            }
-            ResumeOutcome::Resync { .. } => panic!("expected replay, got resync"),
-        }
-    }
-
-    #[test]
-    fn test_handle_resume_resync_after_journal_eviction() {
-        let session = Session::new("resync-test");
-
-        // Journal capacity is 1024; commit 1025 txs to evict revision 0 from replay window.
-        for rev in 0..1025 {
-            let tx = Transaction {
-                base_revision: rev,
-                new_revision: rev + 1,
-                priority: 1,
-                operations: vec![],
-            };
-            session.commit_transaction(tx).expect("commit tx");
-        }
-        assert_eq!(session.current_revision(), 1025);
-
-        let resume = ClientResume {
-            session_id: "resync-test".to_string(),
-            client_instance_id: vec![1],
-            last_applied_revision: 0,
-            last_acked_event_seq: 0,
-            terminal_stream_offsets: Default::default(),
-        };
-
-        match session.handle_resume(&resume).expect("resume handled") {
-            ResumeOutcome::Resync {
-                resync_msg,
-                snapshot_transaction,
-            } => {
-                assert_eq!(resync_msg.session_id, "resync-test");
-                assert_eq!(resync_msg.snapshot_revision, 1025);
-                assert_eq!(
-                    SessionContinuity::try_from(resync_msg.continuity),
-                    Ok(SessionContinuity::SameSession)
-                );
-                assert_eq!(resync_msg.last_processed_event_seq, 0);
-                assert_eq!(snapshot_transaction.new_revision, 1025);
-            }
-            ResumeOutcome::Replay { .. } => panic!("expected resync, got replay"),
-        }
     }
 }

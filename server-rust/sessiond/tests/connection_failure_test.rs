@@ -15,13 +15,10 @@ use srui_protocol::{
     srui_message, ClientHello, Event, FramingError, SruiCodec, SruiMessage, Transaction,
 };
 use srui_semantic_tree::{
-    CapabilitySet, NegotiationError, Profile, ServerCapabilities,
-    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
-    DEFAULT_MAX_TREE_DEPTH,
+    CapabilitySet, NegotiationError, Profile, ServerCapabilities, DEFAULT_MAX_NODE_COUNT,
+    DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
-use srui_sessiond::{
-    handle_connection, ConnectionError, Session, SessionError, HANDSHAKE_TIMEOUT,
-};
+use srui_sessiond::{handle_connection, ConnectionError, Session, SessionError, HANDSHAKE_TIMEOUT};
 
 fn sample_client_hello(profiles: &[&str]) -> ClientHello {
     ClientHello {
@@ -33,7 +30,7 @@ fn sample_client_hello(profiles: &[&str]) -> ClientHello {
     }
 }
 
-/// Mirrors the profile parsing loop in `Session::handle_hello` (§15).
+/// Mirrors the profile parsing loop in fresh-client handshake negotiation (§15).
 fn client_capability_set(hello: &ClientHello) -> CapabilitySet {
     let mut client_caps = CapabilitySet::new();
     for p_str in &hello.profiles {
@@ -147,7 +144,10 @@ async fn transaction_as_first_message_is_rejected() {
             operations: vec![],
         })),
     };
-    client_framed_write.send(tx_msg).await.expect("send transaction");
+    client_framed_write
+        .send(tx_msg)
+        .await
+        .expect("send transaction");
 
     let result = handle.await.expect("server task join");
     assert!(matches!(
@@ -180,7 +180,10 @@ async fn event_as_first_message_is_rejected() {
             arguments: vec![],
         })),
     };
-    client_framed_write.send(event_msg).await.expect("send event");
+    client_framed_write
+        .send(event_msg)
+        .await
+        .expect("send event");
 
     let result = handle.await.expect("server task join");
     assert!(matches!(
@@ -256,10 +259,7 @@ async fn server_welcome_contains_session_metadata() {
             );
             assert_eq!(limits.max_tree_depth, DEFAULT_MAX_TREE_DEPTH as u32);
             assert_eq!(limits.max_node_count, DEFAULT_MAX_NODE_COUNT as u32);
-            assert_eq!(
-                limits.max_string_length,
-                DEFAULT_MAX_STRING_LENGTH as u32
-            );
+            assert_eq!(limits.max_string_length, DEFAULT_MAX_STRING_LENGTH as u32);
             assert_eq!(limits.max_resource_size, 50 * 1024 * 1024);
         }
         other => panic!("expected ServerWelcome, got {:?}", other),
@@ -382,18 +382,53 @@ fn invalid_profile_syntax_is_not_silently_accepted() {
     ));
 }
 
-#[test]
-fn handshake_negotiation_failure_is_session_error() {
-    let server = standard_widgets_server();
-    let hello = sample_client_hello(&["org.srui.terminal/1"]);
-    let client_caps = client_capability_set(&hello);
-    let negotiation_err = server.negotiate(&client_caps).unwrap_err();
+#[tokio::test]
+async fn handshake_negotiation_failure_is_session_error() {
+    let session = Arc::new(Session::new("test-session-negotiation-fail"));
 
-    let connection_err = ConnectionError::Session(SessionError::Negotiation(negotiation_err));
-    assert!(matches!(
-        connection_err,
-        ConnectionError::Session(SessionError::Negotiation(
-            NegotiationError::UnsatisfiedRequiredProfiles { .. }
-        ))
-    ));
+    // Populate session with pre-existing state
+    let tx = Transaction {
+        base_revision: 0,
+        new_revision: 1,
+        priority: 1,
+        operations: vec![],
+    };
+    session
+        .commit_transaction(tx)
+        .expect("commit initial transaction");
+    assert_eq!(session.current_revision(), 1);
+
+    let shutdown = CancellationToken::new();
+    let (client_io, server_io) = duplex(4096);
+    let handle = spawn_server(server_io, session.clone(), shutdown.clone()).await;
+
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let mut client_framed_read = FramedRead::new(client_read, SruiCodec::new());
+    let mut client_framed_write = FramedWrite::new(client_write, SruiCodec::new());
+
+    // Send ClientHello with incompatible profiles
+    let hello = SruiMessage {
+        msg: Some(srui_message::Msg::ClientHello(sample_client_hello(&[
+            "org.srui.terminal/1",
+        ]))),
+    };
+    client_framed_write.send(hello).await.expect("send hello");
+
+    // Server should terminate with ConnectionError::Session(SessionError::Negotiation(...))
+    let server_result = handle.await.expect("server task join");
+    match server_result {
+        Err(ConnectionError::Session(SessionError::Negotiation(
+            NegotiationError::UnsatisfiedRequiredProfiles { missing },
+        ))) => {
+            assert_eq!(missing, vec![Profile::standard_widgets_v1()]);
+        }
+        other => panic!("expected SessionError::Negotiation, got {:?}", other),
+    }
+
+    // Assert the peer receives no envelope before stream close
+    let next_msg = client_framed_read.next().await;
+    assert!(
+        next_msg.is_none(),
+        "peer must receive no envelopes when negotiation fails"
+    );
 }

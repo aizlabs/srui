@@ -399,6 +399,7 @@ impl ServerCapabilities {
     }
 
     /// Constructs a standard server capability configuration requiring standard widgets v1 (§7, §15).
+    #[must_use]
     pub fn standard_widgets() -> Self {
         let mut required = CapabilitySet::new();
         required.insert(Profile::standard_widgets_v1());

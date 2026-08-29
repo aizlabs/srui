@@ -138,7 +138,9 @@ public enum NegotiationError: Error, Equatable, Sendable, CustomStringConvertibl
 }
 
 /// Set of capability profiles negotiated between client and server (§15).
-public struct CapabilitySet: Equatable, Sendable, ExpressibleByArrayLiteral, CustomStringConvertible {
+public struct CapabilitySet: SetAlgebra, Sequence, Equatable, Sendable, ExpressibleByArrayLiteral, CustomStringConvertible {
+    public typealias Element = Profile
+
     private var profiles: Set<Profile>
 
     public init() {
@@ -151,6 +153,10 @@ public struct CapabilitySet: Equatable, Sendable, ExpressibleByArrayLiteral, Cus
 
     public init(arrayLiteral elements: Profile...) {
         self.profiles = Set(elements)
+    }
+
+    public func makeIterator() -> Set<Profile>.Iterator {
+        profiles.makeIterator()
     }
 
     /// Constructs a `CapabilitySet` by parsing an array of profile strings.
@@ -174,28 +180,34 @@ public struct CapabilitySet: Equatable, Sendable, ExpressibleByArrayLiteral, Cus
         return set
     }
 
-    /// Inserts a profile into the set, returning `true` if it was newly inserted.
+    /// Inserts a profile into the set.
     @discardableResult
-    public mutating func insert(_ profile: Profile) -> Bool {
-        profiles.insert(profile).inserted
+    public mutating func insert(_ newMember: Profile) -> (inserted: Bool, memberAfterInsert: Profile) {
+        profiles.insert(newMember)
+    }
+
+    /// Updates or inserts a profile in the set.
+    @discardableResult
+    public mutating func update(with newMember: Profile) -> Profile? {
+        profiles.update(with: newMember)
     }
 
     /// Parses and inserts a profile string into the set.
     @discardableResult
     public mutating func insert(string: String) throws -> Bool {
         let profile = try Profile.parse(string)
-        return insert(profile)
+        return insert(profile).inserted
     }
 
-    /// Removes a profile from the set, returning `true` if it was present.
+    /// Removes a profile from the set, returning the removed element if it was present.
     @discardableResult
-    public mutating func remove(_ profile: Profile) -> Bool {
-        profiles.remove(profile) != nil
+    public mutating func remove(_ member: Profile) -> Profile? {
+        profiles.remove(member)
     }
 
     /// Returns `true` if the set contains the exact specified profile and version.
-    public func contains(_ profile: Profile) -> Bool {
-        profiles.contains(profile)
+    public func contains(_ member: Profile) -> Bool {
+        profiles.contains(member)
     }
 
     /// Returns `true` if the set contains the exact profile matching the string.
@@ -247,6 +259,26 @@ public struct CapabilitySet: Equatable, Sendable, ExpressibleByArrayLiteral, Cus
     /// Computes the union of two capability sets.
     public func union(_ other: CapabilitySet) -> CapabilitySet {
         CapabilitySet(self.profiles.union(other.profiles))
+    }
+
+    /// Computes the symmetric difference of two capability sets.
+    public func symmetricDifference(_ other: CapabilitySet) -> CapabilitySet {
+        CapabilitySet(self.profiles.symmetricDifference(other.profiles))
+    }
+
+    /// Mutates this set to contain the union with `other`.
+    public mutating func formUnion(_ other: CapabilitySet) {
+        profiles.formUnion(other.profiles)
+    }
+
+    /// Mutates this set to contain the intersection with `other`.
+    public mutating func formIntersection(_ other: CapabilitySet) {
+        profiles.formIntersection(other.profiles)
+    }
+
+    /// Mutates this set to contain the symmetric difference with `other`.
+    public mutating func formSymmetricDifference(_ other: CapabilitySet) {
+        profiles.formSymmetricDifference(other.profiles)
     }
 
     /// Computes the difference (`self - other`) of two capability sets.

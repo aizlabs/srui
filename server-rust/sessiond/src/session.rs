@@ -220,6 +220,7 @@ impl Session {
     }
 
     /// Creates a new `Session` with the given session ID and custom server capabilities (§15).
+    #[must_use]
     pub fn with_capabilities(
         session_id: impl Into<String>,
         capabilities: ServerCapabilities,
@@ -236,6 +237,7 @@ impl Session {
     }
 
     /// Returns the configured server capabilities for this session (§15).
+    #[must_use]
     pub fn capabilities(&self) -> ServerCapabilities {
         let guard = lock_or_recover(&self.inner);
         guard.capabilities.clone()
@@ -273,8 +275,12 @@ impl Session {
     }
 
     /// Exports the full current semantic store state as a snapshot transaction (§18, §18.1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::LockPoisoned`] if internal session state lock cannot be acquired.
     pub fn export_snapshot_transaction(&self) -> Result<Transaction, SessionError> {
-        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let guard = lock_or_recover(&self.inner);
         Ok(export_snapshot_transaction(&guard.store))
     }
 

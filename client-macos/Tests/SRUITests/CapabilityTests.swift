@@ -101,9 +101,9 @@ struct CapabilityTests {
         #expect(set.isEmpty)
         #expect(set.count == 0)
 
-        let inserted1 = set.insert(Profile.standardWidgetsV1)
+        let (inserted1, _) = set.insert(Profile.standardWidgetsV1)
         #expect(inserted1)
-        let inserted2 = set.insert(Profile.standardWidgetsV1)
+        let (inserted2, _) = set.insert(Profile.standardWidgetsV1)
         #expect(!inserted2)
         #expect(set.count == 1)
         #expect(set.contains(Profile.standardWidgetsV1))
@@ -112,13 +112,13 @@ struct CapabilityTests {
         #expect(set.getVersion(named: "org.srui.standard-widgets") == 1)
 
         let removed1 = set.remove(Profile.standardWidgetsV1)
-        #expect(removed1)
+        #expect(removed1 == Profile.standardWidgetsV1)
         let removed2 = set.remove(Profile.standardWidgetsV1)
-        #expect(!removed2)
+        #expect(removed2 == nil)
         #expect(set.isEmpty)
     }
 
-    @Test("CapabilitySet set algebra: intersection, union, difference")
+    @Test("CapabilitySet set algebra: intersection, union, difference, sequence")
     func capabilitySetAlgebra() {
         let setA: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1]
         let setB: CapabilitySet = [Profile.terminalV1, Profile.richtextV1]
@@ -132,9 +132,23 @@ struct CapabilityTests {
         let diff = setA.subtracting(setB)
         #expect(diff == [Profile.standardWidgetsV1])
 
+        let symDiff = setA.symmetricDifference(setB)
+        #expect(symDiff == [Profile.standardWidgetsV1, Profile.richtextV1])
+
+        var mutatingSet = setA
+        mutatingSet.formIntersection(setB)
+        #expect(mutatingSet == [Profile.terminalV1])
+
         #expect(setA.isSuperset(of: [Profile.terminalV1]))
         let subsetTest: CapabilitySet = [Profile.terminalV1]
         #expect(subsetTest.isSubset(of: setA))
+
+        // Sequence iteration
+        var iterated = [Profile]()
+        for profile in setA {
+            iterated.append(profile)
+        }
+        #expect(iterated.count == 2)
     }
 
     // MARK: - Capability Negotiation (§15, §4 Invariant 13)

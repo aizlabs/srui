@@ -1,7 +1,7 @@
 # SRUI — Semantic Remote UI Protocol
 
 **Design and reference implementation**  
-**Draft v0.4 — 27 August 2026**  
+**Draft v0.6 — 29 August 2026**
 **Normative core:** platform-neutral semantic protocol  
 **Reference client:** macOS, Swift + AppKit  
 **Reference server:** Rust, Unix-like hosts  
@@ -15,7 +15,7 @@
 
 This revision is based on the earlier SRUI v0.1 draft and the RemoteUI research by Daniel Thommes and collaborators. The v0.1 architecture had the right central ideas—replicated semantic state, stable node identities, atomic mutations, native rendering, terminal compatibility, SSH transport, and reconnect—but it mixed several concerns too closely in the same specification.
 
-v0.4 preserves the v0.3 layer boundaries and makes the semantic-state/remoting boundary, frame independence, local text interaction, thin-client architecture, and local semantic inspection explicit:
+v0.6 preserves the v0.5 layer boundaries and defines TCP-style selective event settlement, a contiguous processed frontier, and bounded receive/send windows:
 
 1. **Application model** — remote business/domain state.
 2. **Semantic UI model** — platform-neutral UI state exposed by an application or toolkit adapter.
@@ -30,9 +30,9 @@ v0.4 preserves the v0.3 layer boundaries and makes the semantic-state/remoting b
 
 This separation is a normative requirement. A future Windows, GTK, or SWT client must be able to implement SRUI without depending on any macOS concept.
 
-### 1.1 v0.4 clarifications
+### 1.1 v0.6 clarifications
 
-v0.4 makes the following principles normative:
+v0.6 makes the following principles normative:
 
 - **synchronize meaning/state, do not remotely render ordinary GUI**: the remote host publishes semantic state and the local client renders it using the local platform;
 - the remote host is authoritative while the client retains a non-authoritative semantic replica and local presentation state;
@@ -43,8 +43,8 @@ v0.4 makes the following principles normative:
 - text editing, IME composition, caret movement, selection, clipboard integration, and ordinary editing feedback are local;
 - common widgets are semantic first, with exact drawing isolated to retained `VectorScene` extensions;
 - the base client is a thin state-replication and rendering adapter, not a downloaded application runtime;
-- the retained semantic tree is a useful local interface for rendering, accessibility, inspection, testing, and policy-gated automation.
-
+- the retained semantic tree is a useful local interface for rendering, accessibility, inspection, testing, and policy-gated automation;
+- reconnect handshakes bind client identity and explicitly distinguish the same session incarnation from an authoritative replacement; selective event acknowledgements and a contiguous processed frontier preserve retry safety only within the confirmed incarnation.
 ---
 
 ## 2. Historical basis
@@ -213,7 +213,7 @@ The **Protocol Core** contains no widget names. It defines the distributed-state
 
 ### 6.1 Core objects
 
-- **Session** — durable logical application/UI session.
+- **Session** — logical application/UI incarnation, optionally durable.
 - **Connection** — transient transport attachment to a session.
 - **Node** — identified semantic object with type, parent/children, and typed properties.
 - **Model** — optional non-tree data source used by collections.
@@ -571,6 +571,11 @@ POINTER_DOWN {
 ```
 
 Coordinates are expressed in the scene's documented logical coordinate system, not global screen pixels. Pointer streams are rate-limited/coalescible where semantics permit.
+
+For each `client_instance_id`, side-effect events use positive, contiguous `event_seq` values starting at
+1. Once allocated, a sequence MUST be retained until terminal settlement; a client MUST apply
+backpressure rather than discard an unacknowledged sequence or allocate beyond its negotiated send
+window. A replay preserves both `event_id` and `event_seq`.
 
 ---
 
@@ -997,6 +1002,23 @@ message Event {
   TypeRef event_type = 6;
   repeated Property arguments = 7;
 }
+
+enum EventAckStatus {
+  EVENT_ACK_STATUS_UNSPECIFIED = 0;
+  EVENT_ACK_STATUS_PROCESSED = 1;
+  EVENT_ACK_STATUS_DUPLICATE = 2;
+  EVENT_ACK_STATUS_REJECTED = 3;
+}
+
+message ServerEventAck {
+  bytes client_instance_id = 1;
+  bytes event_id = 2;
+  uint64 last_processed_event_seq = 3;
+  EventAckStatus status = 4;
+  uint64 revision_after_effect = 5;
+  string reject_reason = 6;
+  string session_id = 7;
+}
 ```
 
 Tiny UI messages are not compressed. Large snapshots/resources may negotiate zstd, but compression must not delay high-priority control traffic.
@@ -1034,6 +1056,12 @@ EXPIRED
 
 A network failure moves a session from `ATTACHED` to `DETACHED`; it does not terminate the application unless policy explicitly says so.
 
+`session_id` is an opaque, globally unique **incarnation token**, not a reusable application name.
+A server process restart MUST mint a new token unless it atomically restores the authoritative
+semantic state, transaction journal, event result cache, and per-client contiguous event frontiers
+of the old incarnation. Reusing an ID after restoring only some of that state falsely authorizes
+stale-event replay.
+
 The server retains detached sessions for a configurable TTL or indefinitely when the user requests a persistent session.
 
 ---
@@ -1050,7 +1078,24 @@ last_acked_event_seq
 per-terminal received stream offsets
 ```
 
-On a new authenticated transport:
+In steady state each client event is settled by an acknowledgement:
+
+```text
+CLIENT EVENT
+  client_instance_id = c17
+  event_seq = 593
+  event_id = e123
+
+SERVER EVENT_ACK
+  session_id = abc
+  client_instance_id = c17
+  event_id = e123
+  last_processed_event_seq = 593
+  status = PROCESSED
+  revision_after_effect = 1843
+```
+
+On a new authenticated transport the client first asks to resume a specific incarnation:
 
 ```text
 CLIENT RESUME
@@ -1058,23 +1103,65 @@ CLIENT RESUME
   client_instance_id = c17
   last_applied_revision = 1842
   last_acked_event_seq = 593
-
-SERVER RESUME_OK
-  replay_from_revision = 1843
 ```
 
-If the server still has the transaction journal, it replays missed committed transactions.
+The client MUST retain pending events but MUST NOT replay them or generate new semantic events until
+the server provides a machine-readable continuity decision. UI-state similarity is not a valid
+substitute for this decision.
 
-If not:
+If the exact incarnation survived and its journal still covers the gap:
+
+```text
+SERVER RESUME_OK
+  session_id = abc
+  replay_from_revision = 1843
+  last_processed_event_seq = 593
+```
+
+`SERVER RESUME_OK.session_id` MUST exactly equal the requested ID. The client first applies the
+reported contiguous event frontier, then replays the remaining pending events with their original
+`event_id` and `event_seq`. The complete replay batch is serialized before newly generated events.
+
+If the same incarnation survived but its transaction journal no longer covers the gap:
 
 ```text
 SERVER RESYNC_REQUIRED
+  session_id = abc
+  continuity = SAME_SESSION
   snapshot_revision = 2210
+  last_processed_event_seq = 593
 ```
 
-The client discards authoritative semantic state and applies a consistent snapshot.
+The client applies the event frontier, may replay remaining old events, discards its semantic
+replica, and applies the consistent snapshot. New user events remain disabled until that snapshot
+commits.
 
-Local presentation state such as window geometry and scroll position may be restored after resync only when the server declares compatible identity continuity.
+If the requested incarnation expired, crashed without durable restoration, or was otherwise
+replaced:
+
+```text
+SERVER RESYNC_REQUIRED
+  session_id = def
+  continuity = REPLACED
+  snapshot_revision = 17
+  last_processed_event_seq = 0
+```
+
+The client MUST abandon every unresolved event and text edit belonging to the expired incarnation.
+It resets its event outbox to the replacement session's reported frontier, discards the old semantic
+replica, and applies the fresh authoritative snapshot. It MUST NOT replay an old event merely
+because the server reports a lower frontier. This deliberately chooses possible loss of an
+unacknowledged user intent across application/session failure over applying stale intent twice or
+against unrelated state.
+
+The server, not the client, decides continuity. The client MUST NOT infer replacement from a
+snapshot looking “far away” from its prior state. An unknown or omitted continuity value is a
+required-semantics failure and does not authorize replay. Resume attempts are generation-bound per
+outbox: starting a newer attempt supersedes every older attempt, and a delayed response from a
+superseded connection MUST NOT replay events, rebind the outbox, or enable new event allocation.
+
+Local presentation state such as window geometry and scroll position may be restored after resync
+only when the server declares compatible identity continuity.
 
 ### 18.1 Transaction journal
 
@@ -1108,6 +1195,61 @@ Every application-side-effect event therefore contains a stable `event_id`. The 
 
 This gives retry-safe behavior across ambiguous disconnects.
 
+**Acknowledgement is normative.** The dedupe cache and the acknowledgement are two different
+mechanisms and neither replaces the other: the cache keyed on `(client_instance_id, event_id)`
+provides *idempotency*, so a replay is safe; the ack provides *settlement*, so the client knows it
+may stop replaying. Without the ack the retry set only ever grows and a bounded result cache eventually rolls.
+The cache and frontier MUST remain valid for the lifetime of the session incarnation. If a server
+restart cannot restore them together with authoritative state, that incarnation has expired and
+the server returns `continuity = REPLACED`; the client then abandons its old retry set rather than
+re-running it against the replacement session.
+
+Rules:
+
+- Pending events may be replayed only after `RESUME_OK` or a `SAME_SESSION` resync for the
+  exact requested session incarnation. A `REPLACED` resync abandons the old retry set.
+- `CLIENT HELLO` or `CLIENT RESUME` binds `client_instance_id` to the connection. An active
+  `EVENT.client_instance_id` that differs from the bound identity MUST be rejected before any
+  dedupe lookup or sequence update.
+- Before a transport send can suspend, the client MUST retain the side-effect event in its pending
+  set. All event writes, including a complete reconnect replay batch, MUST be serialized so
+  increasing `event_seq` values reach the transport in allocation order.
+- The sender and receiver maintain bounded sequence windows. A new sequence MUST be greater than
+  `last_processed_event_seq` and within the negotiated receive window. Reusing a sequence for a
+  different `event_id`, changing the sequence of a replay, or sending beyond the receive window is
+  a protocol error. Window exhaustion applies backpressure; it MUST NOT evict an `IN_FLIGHT` event.
+- A newly admitted event is `IN_FLIGHT` until validation and handler dispatch finish. An overlapping
+  delivery of the same `(client_instance_id, event_id)` MUST NOT receive `PROCESSED`,
+  `DUPLICATE`, or `REJECTED`; it stays pending at the client and may retry after the first
+  execution settles.
+- Every newly admitted event that settles, and every replay whose result is already settled, MUST
+  be answered with exactly one `SERVER EVENT_ACK` on the connection that carried that delivery.
+  Acks are control-class traffic (§19.2) and are never coalesced or dropped behind lower-priority
+  traffic.
+- Each terminal ack is a selective acknowledgement for its `event_id`. The client removes that
+  event from its retry set even when an earlier sequence remains pending, but it MUST NOT advance
+  `last_acked_event_seq` across the gap.
+- `last_processed_event_seq` is the highest **contiguous** settled sequence, analogous to a TCP
+  cumulative ACK; it is never merely the largest sequence observed. If sequence 2 settles while
+  sequence 1 is pending, an ack for sequence 2 reports frontier 0. When sequence 1 later settles,
+  the frontier advances directly to 2.
+- A server that settles events out of order tracks the bounded set beyond the contiguous frontier.
+  A client likewise tracks selectively acknowledged sequences beyond `last_acked_event_seq`.
+  Either side advances its frontier only while the next sequence is known settled.
+- The ack carries the session incarnation, bound `client_instance_id`, settled `event_id`,
+  contiguous `last_processed_event_seq`, status, and `revision_after_effect` recorded in the
+  result cache (Appendix B). A client MUST ignore an ack whose session or `client_instance_id`
+  does not match its active outbox; this prevents a draining old connection from settling events
+  allocated after a replacement session reset.
+- `PROCESSED` — newly admitted, validated, and dispatched.
+- `DUPLICATE` — a replay of an already-settled `event_id`; the ack returns the prior result and
+  the action is not re-run. A replay of an event that was originally refused is answered
+  `REJECTED` again with the original non-empty `reject_reason`.
+- `REJECTED` — refused by event validation (unknown node, disabled node, future
+  `observed_revision`). This is a terminal rejection of that event, not a protocol violation.
+- An event without a stable non-empty `event_id` is a protocol error and MUST be rejected before allocating persistent per-client dedupe state.
+- Acks are optional to consume: an unknown optional status still settles its `event_id`, but never
+  authorizes the client to cross a sequence gap.
 ### 18.3 Pending text edits
 
 Text editing can remain locally responsive while events are awaiting acknowledgement.
@@ -1171,7 +1313,7 @@ Within the SRUI stream:
 
 | Logical class | Priority | Examples |
 |---|---:|---|
-| control | highest | HELLO, WELCOME, errors, resume, ACK |
+| control | highest | HELLO, WELCOME, errors, resume, EVENT_ACK (§18.2) |
 | input | highest | semantic user events |
 | UI | high | committed transactions |
 | terminal | high/normal | interactive PTY bytes |
@@ -1724,6 +1866,10 @@ maximum pending unacknowledged events
 maximum terminal escape payload lengths
 ```
 
+`maximum pending unacknowledged events` bounds the client's retry set, which is drained by
+`SERVER EVENT_ACK` (§18.2). Reaching the bound means events are being discarded before they were
+known to be processed, so an eviction there MUST be reported rather than silently dropped.
+
 Further rules:
 
 - resource hashes are verified before cache commit;
@@ -1954,6 +2100,10 @@ while detached for journal retention period
 beyond journal retention period
 ```
 
+The "after side effect but before ACK" boundary is the ambiguous window of §18.2: the client
+replays the event on resume and the server must answer `DUPLICATE` from its result cache rather
+than re-running the action.
+
 Verify deterministic replay/resync and no duplicate side effects.
 
 ### 31.6 Terminal benchmark
@@ -2074,21 +2224,47 @@ TERMINATING -> EXPIRED
 
 Connection loss never commits a partial transaction.
 
-Event result cache:
+Event result and receive-window state:
 
 ```text
-(client_instance_id, event_id) -> {
+(client_instance_id, event_id) -> IN_FLIGHT {
+  event_seq
+}
+
+(client_instance_id, event_id) -> SETTLED {
+  event_seq,
   status,
   optional result,
-  semantic_revision_after_effect
+  semantic_revision_after_effect,
+  reject_reason
+}
+
+client_instance_id -> {
+  last_contiguous_processed_seq,
+  settled_out_of_order
 }
 ```
 
-This cache may be bounded by acknowledged event sequence + time, with conservative retention for destructive actions.
+`IN_FLIGHT` is never a source of terminal acknowledgement. If dispatch aborts or a handler panics,
+the admission is removed so the client can retry. The settled fields are returned in
+`SERVER EVENT_ACK` (§18.2); a replay is served from this cache rather than re-running the action.
+
+`settled_out_of_order` is a bounded selective-ack set. Settling a sequence greater than
+`last_contiguous_processed_seq + 1` records it without advancing the cumulative frontier. Settling
+the missing next sequence advances the frontier and consumes every now-contiguous entry, exactly
+like a TCP receiver consuming buffered data after a gap closes.
+
+The reference receive/result window is bounded to 4,096 sequence slots per client instance.
+Entries at or below the contiguous frontier are eligible for FIFO result eviction; `IN_FLIGHT` and
+out-of-order settled entries are not evicted to admit a farther sequence. The client reference
+window is 256 slots and applies backpressure instead of dropping an unacknowledged event.
+`CLIENT RESUME.last_acked_event_seq` remains a retention hint rather than an authority to mark
+unprocessed server events as settled. `SERVER RESUME_OK` and `SERVER RESYNC_REQUIRED` report the
+server's contiguous frontier for the bound client before any replay. The dedupe state belongs to
+the session incarnation; durable restoration must persist it with the authoritative state, while a
+replacement incarnation explicitly causes the client to abandon its old pending set.
 
 ---
-
-# Appendix C — Security equivalence to ordinary SSH terminal use
 
 The intended comparison is:
 
@@ -2146,4 +2322,4 @@ SRUI is therefore designed to inherit SSH's identity/transport security while ex
 
 ---
 
-**End of SRUI design draft v0.2**
+**End of SRUI design draft v0.6**

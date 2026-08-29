@@ -60,7 +60,8 @@ struct SessionControllerResyncTests {
         var resync = SRUIServerResyncRequired()
         resync.sessionID = "test-session"
         resync.snapshotRevision = 2
-        resync.reason = "journal evicted"
+        resync.reason = "session replaced"
+        resync.continuity = .replaced
         resyncMsg.serverResyncRequired = resync
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMsg))
 

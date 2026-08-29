@@ -627,6 +627,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "srui-protocol",
+ "thiserror",
 ]
 
 [[package]]

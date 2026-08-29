@@ -36,7 +36,8 @@ struct SessionRobustnessTests {
         var resync = SRUIServerResyncRequired()
         resync.sessionID = "test-session"
         resync.snapshotRevision = revision
-        resync.reason = "journal evicted"
+        resync.reason = "session replaced"
+        resync.continuity = .replaced
         var msg = SRUIMessage()
         msg.serverResyncRequired = resync
         return try SRUIFraming.encodeFramed(msg)
@@ -164,6 +165,12 @@ struct SessionRobustnessTests {
         let serverStream = serverTransport.receiveStream()
         try await controller.start()
 
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "default"
+        var resumeMessage = SRUIMessage()
+        resumeMessage.serverResumeOk = resumeOk
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMessage))
+
         let buttonID = NodeId(4)
         let mountTx = Transaction(
             baseRevision: .initial,
@@ -213,15 +220,14 @@ struct SessionRobustnessTests {
         await controller.stop()
         await serverTransport.close()
     }
+    // MARK: - §18.2: the pending-event sequence window is bounded
 
-    // MARK: - §18.2: the pending-event cache is bounded
-
-    @Test("Outbox bounds its pending (unacknowledged) event cache")
+    @Test("Outbox applies backpressure without discarding an unacknowledged sequence")
     func outboxBoundsPendingEventCache() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
         let outbox = EventOutbox()
 
-        for _ in 0..<600 {
+        for _ in 0..<EventOutbox.defaultMaxPendingEvents {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(1),
@@ -229,9 +235,15 @@ struct SessionRobustnessTests {
             )
         }
 
-        // §18.2 / App. B: the dedupe + retry cache is explicitly a *bounded* cache.
-        let pending = await outbox.pendingCount
-        #expect(pending <= 256, "pending event cache grew unbounded: \(pending)")
+        await #expect(throws: EventOutboxError.self) {
+            try await outbox.sendActivate(
+                nodeId: NodeId(7),
+                observedRevision: Revision(1),
+                via: clientTransport
+            )
+        }
+        #expect(await outbox.pendingCount == EventOutbox.defaultMaxPendingEvents)
+        #expect(await outbox.eventSeq == UInt64(EventOutbox.defaultMaxPendingEvents))
 
         await clientTransport.close()
         await serverTransport.close()

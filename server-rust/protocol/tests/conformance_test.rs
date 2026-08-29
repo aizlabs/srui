@@ -355,6 +355,14 @@ fn test_cross_language_rust_vs_swift_byte_equality() {
         rust_framed_bytes, golden_framed_bytes,
         "Rust-encoded Framed SruiMessage does not match golden bytes"
     );
+
+    // 4. Rust-encoded Framed ServerEventAck must match golden fixture bit-for-bit (§18.2)
+    let rust_ack_bytes = encode_framed(&create_authored_event_ack()).unwrap();
+    let golden_ack_bytes = fs::read(vectors_dir.join("golden_event_ack.bin")).unwrap();
+    assert_eq!(
+        rust_ack_bytes, golden_ack_bytes,
+        "Rust-encoded Framed ServerEventAck does not match golden bytes"
+    );
 }
 
 #[test]
@@ -404,6 +412,84 @@ fn test_direct_encode_golden_framed_message_matches_wire_bytes() {
         msg: Some(srui_message::Msg::Transaction(create_authored_transaction())),
     };
     let encoded = encode_framed(&msg).expect("encode framed");
+
+    assert_eq!(to_hex(&encoded), expected_hex);
+    assert_eq!(encoded, fixture_bytes);
+}
+
+/// Authors the golden `ServerEventAck` envelope from scratch (§18.2), independently of the fixture.
+fn create_authored_event_ack() -> SruiMessage {
+    SruiMessage {
+        msg: Some(srui_message::Msg::ServerEventAck(ServerEventAck {
+            client_instance_id: b"c17".to_vec(),
+            event_id: b"e123".to_vec(),
+            last_processed_event_seq: 593,
+            status: EventAckStatus::Processed as i32,
+            revision_after_effect: 1843,
+            reject_reason: String::new(),
+            session_id: String::new(),
+        })),
+    }
+}
+
+#[test]
+fn test_decode_golden_event_ack_against_expected_json() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let ack_spec = &spec["vectors"]["golden_event_ack"];
+
+    let filename = ack_spec["file"].as_str().expect("file name");
+    let expected_hex = ack_spec["hex"].as_str().expect("hex");
+    let expected_byte_len = ack_spec["byte_length"].as_u64().expect("byte_length") as usize;
+    let expected = &ack_spec["expected"];
+
+    let fixture_path = vectors_dir.join(filename);
+    let bytes = fs::read(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to read fixture from {:?}: {}", fixture_path, e));
+
+    assert_eq!(bytes.len(), expected_byte_len, "Fixture byte length mismatch");
+    assert_eq!(to_hex(&bytes), expected_hex, "Fixture hex mismatch");
+
+    let decoded: SruiMessage = decode_framed(&bytes[..]).expect("Decode framed ServerEventAck");
+    match decoded.msg {
+        Some(srui_message::Msg::ServerEventAck(ref ack)) => {
+            assert_eq!(
+                ack.client_instance_id,
+                expected["client_instance_id"].as_str().unwrap().as_bytes()
+            );
+            assert_eq!(ack.event_id, expected["event_id"].as_str().unwrap().as_bytes());
+            assert_eq!(
+                ack.last_processed_event_seq,
+                expected["last_processed_event_seq"].as_u64().unwrap()
+            );
+            assert_eq!(ack.status, expected["status"].as_u64().unwrap() as i32);
+            assert_eq!(
+                ack.status(),
+                EventAckStatus::Processed,
+                "status_name {} in expected.json",
+                expected["status_name"].as_str().unwrap()
+            );
+            assert_eq!(
+                ack.revision_after_effect,
+                expected["revision_after_effect"].as_u64().unwrap()
+            );
+            assert_eq!(ack.reject_reason, expected["reject_reason"].as_str().unwrap());
+        }
+        other => panic!("Expected ServerEventAck in framed message, got {:?}", other),
+    }
+
+    let roundtrip = encode_framed(&decoded).expect("re-encode framed");
+    assert_eq!(roundtrip, bytes, "Roundtrip re-encode framed mismatch");
+}
+
+#[test]
+fn test_direct_encode_golden_event_ack_matches_wire_bytes() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let ack_spec = &spec["vectors"]["golden_event_ack"];
+    let filename = ack_spec["file"].as_str().unwrap();
+    let expected_hex = ack_spec["hex"].as_str().unwrap();
+    let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
+
+    let encoded = encode_framed(&create_authored_event_ack()).expect("encode framed");
 
     assert_eq!(to_hex(&encoded), expected_hex);
     assert_eq!(encoded, fixture_bytes);

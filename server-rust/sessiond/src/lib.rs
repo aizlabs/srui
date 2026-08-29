@@ -6,4 +6,6 @@ pub mod connection;
 pub mod session;
 
 pub use connection::{handle_connection, ConnectionError, HANDSHAKE_TIMEOUT};
-pub use session::{ResumeOutcome, Session, SessionError, TRANSACTION_BROADCAST_CAPACITY};
+pub use session::{
+    EventOutcome, ResumeOutcome, Session, SessionError, TRANSACTION_BROADCAST_CAPACITY,
+};

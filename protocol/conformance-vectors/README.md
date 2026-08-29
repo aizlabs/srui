@@ -11,6 +11,7 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 | `golden_node_record.bin` | A `NodeRecord` (Button #42, §7.1 example) |
 | `golden_transaction.bin` | A `Transaction` with three operations (§12.1 example) |
 | `golden_framed_message.bin` | Length-prefixed framed `SruiMessage` containing a transaction |
+| `golden_event_ack.bin` | Length-prefixed framed `SruiMessage` containing a `ServerEventAck` (§18.2) |
 | `malformed_overlong_varint.bin` | Truncated/overlong varint rejection check |
 | `malformed_truncated_frame.bin` | Truncated length-prefixed frame rejection check |
 

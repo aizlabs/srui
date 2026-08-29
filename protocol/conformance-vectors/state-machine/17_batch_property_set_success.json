@@ -1,0 +1,80 @@
+{
+  "name": "batch_property_set_success",
+  "description": "BATCH_PROPERTY_SET atomically sets multiple properties on a single node in one operation (§13 BATCH_PROPERTY_SET, §26).",
+  "spec_sections": ["§13", "§26", "§12.1"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Batch Demo"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {
+            "label": "Initial Label"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "BATCH_PROPERTY_SET",
+        "node_id": 2,
+        "properties": {
+          "label": "Updated Label",
+          "enabled": false,
+          "role": { "enum": "ActionRole", "value": "destructive" }
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 2,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [2],
+          "properties": {
+            "label": "Batch Demo"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Button",
+          "parent_id": 1,
+          "ordered_children": [],
+          "properties": {
+            "label": "Updated Label",
+            "enabled": false
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

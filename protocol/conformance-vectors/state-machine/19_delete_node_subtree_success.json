@@ -1,0 +1,107 @@
+{
+  "name": "delete_node_subtree_success",
+  "description": "DELETE_NODE removes the target node and its entire descendant subtree recursively (§13 DELETE_NODE, §6.2).",
+  "spec_sections": ["§6.2", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Delete Subtree Demo"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 2,
+          "node_type": "Column",
+          "parent_id": 1,
+          "child_index": null,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 3,
+          "node_type": "Row",
+          "parent_id": 2,
+          "child_index": 0,
+          "properties": {}
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 5,
+          "node_type": "Text",
+          "parent_id": 3,
+          "child_index": null,
+          "properties": {
+            "text": "Nested Text"
+          }
+        },
+        {
+          "type": "CREATE_NODE",
+          "node_id": 4,
+          "node_type": "Button",
+          "parent_id": 2,
+          "child_index": 1,
+          "properties": {
+            "label": "Keep Me"
+          }
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "DELETE_NODE",
+        "node_id": 3
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 2,
+    "store_state": {
+      "node_count": 3,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [2],
+          "properties": {
+            "label": "Delete Subtree Demo"
+          }
+        },
+        "2": {
+          "node_id": 2,
+          "node_type": "Column",
+          "parent_id": 1,
+          "ordered_children": [4],
+          "properties": {}
+        },
+        "4": {
+          "node_id": 4,
+          "node_type": "Button",
+          "parent_id": 2,
+          "ordered_children": [],
+          "properties": {
+            "label": "Keep Me"
+          }
+        }
+      },
+      "model_count": 0,
+      "models": {}
+    }
+  }
+}

@@ -374,14 +374,7 @@ final class StateMachineConformanceTests: XCTestCase {
             let parentID = (dict["parent_id"] as? NSNumber).map { NodeId($0.uint64Value) }
             let childIndex = dict["child_index"] as? Int
 
-            var properties: [Property] = []
-            if let propsDict = dict["properties"] as? [String: Any] {
-                for (k, v) in propsDict {
-                    let propRef = try resolvePropertyName(k)
-                    let val = try convertValue(v)
-                    properties.append(Property(property: propRef, value: val))
-                }
-            }
+            let properties = try parseFixtureProperties(dict["properties"], fileName: fileName)
             return .createNode(
                 id: nodeID,
                 nodeType: nodeType,
@@ -421,14 +414,7 @@ final class StateMachineConformanceTests: XCTestCase {
 
         case "BATCH_PROPERTY_SET":
             let nodeID = NodeId(try getUInt64(dict, key: "node_id", fileName: fileName))
-            var properties: [Property] = []
-            if let propsDict = dict["properties"] as? [String: Any] {
-                for (k, v) in propsDict {
-                    let propRef = try resolvePropertyName(k)
-                    let val = try convertValue(v)
-                    properties.append(Property(property: propRef, value: val))
-                }
-            }
+            let properties = try parseFixtureProperties(dict["properties"], fileName: fileName)
             return .batchPropertySet(id: nodeID, properties: properties)
 
         case "CREATE_MODEL":
@@ -504,16 +490,68 @@ final class StateMachineConformanceTests: XCTestCase {
     }
 
     private func resolvePropertyName(_ name: String) throws -> PropertyRef {
-        if let standard = try? resolveStandardProperty(name).get() {
-            return standard
+        try resolvePropertyRef(name)
+    }
+
+    private func resolvePropertyRef(_ raw: Any) throws -> PropertyRef {
+        if let name = raw as? String {
+            if let standard = try? resolveStandardProperty(name).get() {
+                return standard
+            }
+            if let num = UInt32(name) {
+                return PropertyRef.standard(num)
+            }
+            if name == "model_ref" {
+                return PropertyRef.modelRef
+            }
+            return PropertyRef(namespaceID: standardNamespaceID, localID: UInt32(bitPattern: Int32(name.hashValue)))
         }
-        if let num = UInt32(name) {
-            return PropertyRef.standard(num)
+
+        if let dict = raw as? [String: Any] {
+            let namespaceID = (dict["namespace_id"] as? NSNumber)?.uint32Value ?? standardNamespaceID
+            guard let localID = (dict["local_id"] as? NSNumber)?.uint32Value else {
+                throw StoreError.operationError("property_ref object missing numeric local_id field")
+            }
+            return PropertyRef(namespaceID: namespaceID, localID: localID)
         }
-        if name == "model_ref" {
-            return PropertyRef.modelRef
+
+        if let num = raw as? NSNumber {
+            return PropertyRef.standard(num.uint32Value)
         }
-        return PropertyRef(namespaceID: standardNamespaceID, localID: UInt32(bitPattern: Int32(name.hashValue)))
+
+        throw StoreError.operationError("Invalid property_ref JSON: \(raw)")
+    }
+
+    private func parseFixtureProperties(_ raw: Any?, fileName: String) throws -> [Property] {
+        guard let raw else { return [] }
+
+        if let propsDict = raw as? [String: Any] {
+            var properties: [Property] = []
+            for (k, v) in propsDict {
+                let propRef = try resolvePropertyName(k)
+                let val = try convertValue(v)
+                properties.append(Property(property: propRef, value: val))
+            }
+            return properties
+        }
+
+        if let propsArray = raw as? [[String: Any]] {
+            var properties: [Property] = []
+            for item in propsArray {
+                guard let propertyRaw = item["property"] else {
+                    throw StoreError.operationError("[\(fileName)] property field missing in property item")
+                }
+                guard let valueRaw = item["value"] else {
+                    throw StoreError.operationError("[\(fileName)] value field missing in property item")
+                }
+                let propRef = try resolvePropertyRef(propertyRaw)
+                let val = try convertValue(valueRaw)
+                properties.append(Property(property: propRef, value: val))
+            }
+            return properties
+        }
+
+        throw StoreError.operationError("[\(fileName)] Invalid properties JSON: \(raw)")
     }
 
     private func convertValue(_ raw: Any?) throws -> Value {

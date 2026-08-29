@@ -89,6 +89,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
 
     public func tableViewSelectionDidChange(_ notification: Notification) {
         guard !isSuppressingSelectionEvents else { return }
+        guard selectionMode == .single else { return }
         guard let tableView = notification.object as? NSTableView else { return }
         let selectedIndexes = tableView.selectedRowIndexes
         guard selectedIndexes.count == 1, let selectedRow = selectedIndexes.first else {

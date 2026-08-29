@@ -236,4 +236,94 @@ struct EventOutboxTests {
         await client.close()
         await server.close()
     }
+
+    @Test("Same-session resume replays unacknowledged events in original order with original identity")
+    func sameSessionResumeReplay() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+
+        let ev1 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        let ev2 = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(true), via: client)
+        let ev3 = try await outbox.sendSelectionChanged(nodeId: NodeId(3), observedRevision: Revision(1), itemId: ItemId(42), via: client)
+
+        #expect(await outbox.pendingCount == 3)
+
+        // Settle ack through seq 1
+        _ = await outbox.settleAcknowledgement(eventId: ev1.eventId, throughSeq: 1, sessionId: nil)
+        #expect(await outbox.pendingCount == 2)
+
+        await client.close()
+        await server.close()
+
+        // Reconnect on a fresh transport pair and complete same-session resume
+        let (client2, server2) = await PipeTransport.createPair()
+        let attemptId = await outbox.beginResumeAttempt()
+        let serverStream2 = server2.receiveStream()
+
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-123",
+            lastProcessedEventSeq: 1,
+            attemptId: attemptId,
+            via: client2,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+
+        // Read replayed messages from server2 (should be ev2 and ev3)
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var replayedEvents: [Event] = []
+        for try await chunk in serverStream2 {
+            let messages = try streamDecoder.appendAndExtract(incoming: chunk)
+            for msg in messages {
+                if case .event(let wireEvent) = msg.msg {
+                    let domainEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+                    replayedEvents.append(domainEvent)
+                }
+            }
+            if replayedEvents.count >= 2 {
+                break
+            }
+        }
+
+        #expect(replayedEvents.count == 2)
+        #expect(replayedEvents[0].eventSeq == ev2.eventSeq)
+        #expect(replayedEvents[0].eventId == ev2.eventId)
+        #expect(replayedEvents[1].eventSeq == ev3.eventSeq)
+        #expect(replayedEvents[1].eventId == ev3.eventId)
+
+        // Next new event continues monotonically from seq 4
+        let ev4 = try await outbox.sendActivate(nodeId: NodeId(4), observedRevision: Revision(2), via: client2)
+        #expect(ev4.eventSeq == 4)
+
+        await client2.close()
+        await server2.close()
+    }
+
+    @Test("Replaced session abandons pending events and resets sequence")
+    func replacedSessionResetsSequence() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+
+        _ = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        _ = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(false), via: client)
+        #expect(await outbox.pendingCount == 2)
+
+        let attemptId = await outbox.beginResumeAttempt()
+        let accepted = await outbox.prepareReplacedSession(
+            id: "new-incarnation",
+            lastProcessedEventSeq: 0,
+            attemptId: attemptId
+        )
+        #expect(accepted)
+        #expect(await outbox.pendingCount == 0)
+
+        await outbox.allowNewEvents()
+
+        let freshEvent = try await outbox.sendActivate(nodeId: NodeId(10), observedRevision: Revision(1), via: client)
+        #expect(freshEvent.eventSeq == 1)
+        #expect(await outbox.pendingCount == 1)
+
+        await client.close()
+        await server.close()
+    }
 }

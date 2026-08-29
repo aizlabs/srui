@@ -441,6 +441,175 @@ struct LayoutRendererTests {
         #expect(adapter.rows.map(\.cells) == [["M2-A", "M2-B"]])
     }
 
+    @Test
+    func multipleTablesReferencingSameModelAreBothUpdatedInPlace() throws {
+        let modelID = ModelId(50)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 1)
+        try store.modelInsert(id: modelID, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("Initial"))])
+
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(id: 2, nodeType: .table, parentID: 1, properties: [
+            Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+        ])
+        try store.createNode(id: 3, nodeType: .table, parentID: 1, properties: [
+            Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+        ])
+
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let table2View = try #require(renderer.registry.view(for: 2))
+        let table3View = try #require(renderer.registry.view(for: 3))
+        let adapter2 = try #require(renderer.registry.handle(for: 2)?.modelAdapter as? TableCollectionAdapter)
+        let adapter3 = try #require(renderer.registry.handle(for: 3)?.modelAdapter as? TableCollectionAdapter)
+
+        #expect(adapter2.rows.map(\.cells) == [["Initial"]])
+        #expect(adapter3.rows.map(\.cells) == [["Initial"]])
+
+        let insertOp = Operation.modelInsert(
+            id: modelID,
+            index: 1,
+            items: [ModelItem(itemID: ItemId(2), value: .string("Second Item"))]
+        )
+        var newStore = store
+        try insertOp.apply(to: &newStore)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [insertOp]),
+            newStore: newStore
+        )
+
+        // Both tables updated in place with preserved view identity
+        #expect(renderer.registry.view(for: 2) === table2View)
+        #expect(renderer.registry.view(for: 3) === table3View)
+        #expect(adapter2.rows.map(\.cells) == [["Initial"], ["Second Item"]])
+        #expect(adapter3.rows.map(\.cells) == [["Initial"], ["Second Item"]])
+    }
+
+    @Test
+    func tablesReferencingDifferentModelsOnlyUpdateReferencingHandle() throws {
+        let model1 = ModelId(10)
+        let model2 = ModelId(20)
+        var store = SemanticStore()
+        try store.createModel(id: model1, modelType: .table, itemCount: 1)
+        try store.modelInsert(id: model1, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("M1 Item"))])
+        try store.createModel(id: model2, modelType: .table, itemCount: 1)
+        try store.modelInsert(id: model2, index: 0, items: [ModelItem(itemID: ItemId(2), value: .string("M2 Item"))])
+
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(id: 2, nodeType: .table, parentID: 1, properties: [
+            Property(property: .modelRef, value: .unsignedInt(model1.value)),
+        ])
+        try store.createNode(id: 3, nodeType: .table, parentID: 1, properties: [
+            Property(property: .modelRef, value: .unsignedInt(model2.value)),
+        ])
+
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let adapter2 = try #require(renderer.registry.handle(for: 2)?.modelAdapter as? TableCollectionAdapter)
+        let adapter3 = try #require(renderer.registry.handle(for: 3)?.modelAdapter as? TableCollectionAdapter)
+
+        // Mutate model 1 only
+        let insertOp = Operation.modelInsert(
+            id: model1,
+            index: 1,
+            items: [ModelItem(itemID: ItemId(10), value: .string("M1 New"))]
+        )
+        var newStore = store
+        try insertOp.apply(to: &newStore)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [insertOp]),
+            newStore: newStore
+        )
+
+        #expect(adapter2.rows.map(\.cells) == [["M1 Item"], ["M1 New"]])
+        #expect(adapter3.rows.map(\.cells) == [["M2 Item"]])
+    }
+
+    @Test
+    func mixedStructuralAndModelTransactionRemountsCleanly() throws {
+        let modelID = ModelId(30)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 1)
+        try store.modelInsert(id: modelID, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("Row 1"))])
+
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(id: 2, nodeType: .table, parentID: 1, properties: [
+            Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+        ])
+
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        // Mixed transaction: createNode (structural) + modelInsert
+        let createOp = Operation.createNode(id: 3, nodeType: .text, parentID: 1, properties: [
+            Property(property: .text, value: .string("Footer Text"))
+        ])
+        let insertOp = Operation.modelInsert(
+            id: modelID,
+            index: 1,
+            items: [ModelItem(itemID: ItemId(2), value: .string("Row 2"))]
+        )
+
+        var newStore = store
+        try createOp.apply(to: &newStore)
+        try insertOp.apply(to: &newStore)
+
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [createOp, insertOp]),
+            newStore: newStore
+        )
+
+        #expect(renderer.registry.count == 3)
+        #expect(renderer.registry.handle(for: 3) != nil)
+        let adapter = try #require(renderer.registry.handle(for: 2)?.modelAdapter as? TableCollectionAdapter)
+        #expect(adapter.rows.map(\.cells) == [["Row 1"], ["Row 2"]])
+    }
+
+    @Test
+    func columnReconciliationPreservesColumnObjectsWhileUpdatingTitles() throws {
+        let node = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .columns: .list([.string("Col A"), .string("Col B")]),
+            ]
+        )
+        let handle = try ControlFactory().makeHandle(for: node)
+        let tableView = try #require((handle.view as? NSScrollView)?.documentView as? NSTableView)
+
+        #expect(tableView.tableColumns.count == 2)
+        let col0Before = tableView.tableColumns[0]
+        let col1Before = tableView.tableColumns[1]
+        #expect(col0Before.title == "Col A")
+        #expect(col1Before.title == "Col B")
+
+        // Update columns: rename Col A -> First, rename Col B -> Second, add Third
+        ControlFactory().reconcileColumns(
+            in: tableView,
+            columns: ["First", "Second", "Third"],
+            fallbackTitle: "Table"
+        )
+
+        #expect(tableView.tableColumns.count == 3)
+        #expect(tableView.tableColumns[0] === col0Before)
+        #expect(tableView.tableColumns[0].title == "First")
+        #expect(tableView.tableColumns[1] === col1Before)
+        #expect(tableView.tableColumns[1].title == "Second")
+        #expect(tableView.tableColumns[2].title == "Third")
+
+        // Shrink columns down to 1
+        ControlFactory().reconcileColumns(
+            in: tableView,
+            columns: ["Only One"],
+            fallbackTitle: "Table"
+        )
+        #expect(tableView.tableColumns.count == 1)
+        #expect(tableView.tableColumns[0] === col0Before)
+        #expect(tableView.tableColumns[0].title == "Only One")
+    }
+
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {
         var store = SemanticStore()
         for operation in operations {

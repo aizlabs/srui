@@ -643,4 +643,86 @@ struct ControlFactoryTests {
         // `value` (property 13) is applied after `selected` (property 10).
         #expect((handle.view as? NSButton)?.state == .on)
     }
+
+    @Test
+    func tableRowsHandlesDiverseValueVariants() throws {
+        let modelID = ModelId(77)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 4)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [
+                ModelItem(itemID: ItemId(1), value: .null),
+                ModelItem(itemID: ItemId(2), value: .bool(true)),
+                ModelItem(itemID: ItemId(3), value: .signedInt(-42)),
+                ModelItem(itemID: ItemId(4), value: .float64(3.1415)),
+            ]
+        )
+
+        let node = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .modelRef: .unsignedInt(modelID.value),
+            ]
+        )
+
+        let factory = ControlFactory()
+        let rows = factory.tableRows(for: node, store: store)
+
+        #expect(rows.count == 4)
+        #expect(rows[0].cells == [""])
+        #expect(rows[1].cells == ["true"])
+        #expect(rows[2].cells == ["-42"])
+        #expect(rows[3].cells.first?.starts(with: "3.14") == true)
+    }
+
+    @Test
+    func columnReconciliationHandlesEdgeCases() {
+        let factory = ControlFactory()
+        let tableView = NSTableView()
+
+        // 1. Initial 0 columns creates 1 fallback column
+        factory.reconcileColumns(in: tableView, columns: nil, fallbackTitle: "Fallback Table")
+        #expect(tableView.tableColumns.count == 1)
+        #expect(tableView.tableColumns[0].title == "Fallback Table")
+        #expect(tableView.tableColumns[0].identifier == NSUserInterfaceItemIdentifier("srui.column.0"))
+
+        // 2. Grow to 5 columns
+        factory.reconcileColumns(in: tableView, columns: ["C1", "C2", "C3", "C4", "C5"], fallbackTitle: "Ignored")
+        #expect(tableView.tableColumns.count == 5)
+        #expect(tableView.tableColumns[0].title == "C1")
+        #expect(tableView.tableColumns[4].title == "C5")
+        #expect(tableView.tableColumns[4].identifier == NSUserInterfaceItemIdentifier("srui.column.4"))
+
+        // 3. Shrink to 0 (back to 1 fallback column)
+        factory.reconcileColumns(in: tableView, columns: [], fallbackTitle: "Reset Fallback")
+        #expect(tableView.tableColumns.count == 1)
+        #expect(tableView.tableColumns[0].title == "Reset Fallback")
+    }
+
+    @Test
+    func toggleEmitsAlternatingValueChangedInteractions() throws {
+        let factory = ControlFactory()
+        var receivedValues: [Bool] = []
+        factory.onInteraction = { interaction in
+            if case .valueChanged(nodeID: 99, value: .bool(let b)) = interaction {
+                receivedValues.append(b)
+            }
+        }
+
+        let handle = try factory.makeHandle(for: Node(id: 99, nodeType: .toggle))
+        let button = try #require(handle.view as? NSButton)
+        let trampoline = try #require(handle.actionTrampoline as? ActionTrampoline)
+
+        button.state = .on
+        trampoline.performToggleAction(button)
+        button.state = .off
+        trampoline.performToggleAction(button)
+        button.state = .on
+        trampoline.performToggleAction(button)
+
+        #expect(receivedValues == [true, false, true])
+    }
 }

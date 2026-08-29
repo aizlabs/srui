@@ -39,12 +39,9 @@ public actor TCPSocketTransport: Transport {
     }
 
     deinit {
+        // The latch owns the descriptor and closes it exactly once, deferring to the reader thread
+        // if one is parked in `read(2)`.
         readLatch.stop()
-        let fd = socketFD
-        if fd >= 0 {
-            Darwin.shutdown(fd, SHUT_RDWR)
-            Darwin.close(fd)
-        }
         // Otherwise a consumer still iterating `receiveStream()` would hang forever. Drop the
         // termination handler first: it captures `self` weakly, and forming that reference while
         // the actor is mid-deallocation traps.
@@ -92,6 +89,7 @@ public actor TCPSocketTransport: Transport {
         }
 
         self.socketFD = fd
+        readLatch.adopt(descriptor: fd)
         startReadingLoop()
     }
 
@@ -152,15 +150,19 @@ public actor TCPSocketTransport: Transport {
     /// would park one of the cooperative pool's threads for the lifetime of the connection (§22.2).
     private func startReadingLoop() {
         guard readThread == nil else { return }
-        let fd = self.socketFD
         let cont = self.continuation
         let latch = self.readLatch
 
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
 
-            while !latch.isStopped {
+            while true {
+                // The latch hands out the descriptor only while it is guaranteed open, and takes it
+                // back in `endRead()`, so the number can never be recycled underneath this `read`.
+                guard let fd = latch.beginRead() else { break }
                 let bytesRead = Darwin.read(fd, &buffer, buffer.count)
+                let err = errno
+                latch.endRead()
 
                 if bytesRead > 0 {
                     cont.yield(Data(buffer[0..<bytesRead]))
@@ -169,7 +171,6 @@ public actor TCPSocketTransport: Transport {
                     cont.finish()
                     return
                 } else {
-                    let err = errno
                     if err == EINTR {
                         continue
                     }
@@ -193,16 +194,14 @@ public actor TCPSocketTransport: Transport {
         guard !isClosed else { return }
         isClosed = true
 
-        // Latch first, then shutdown to wake a blocked `read`, then release the descriptor. `send`
-        // and `close` are both actor-isolated, so no write can be in flight against this fd here.
+        // The latch stops the loop, shuts the socket down to wake a blocked `read`, and closes the
+        // descriptor — or hands that close to the reader if it is inside `read(2)` right now. That
+        // ordering is what makes joining the reader thread unnecessary: the number is never
+        // released while the reader might still use it. `send` and `close` are both actor-isolated,
+        // so no write can be in flight against this fd here.
         readLatch.stop()
         readThread = nil
+        socketFD = -1
         continuation.finish()
-
-        if socketFD >= 0 {
-            Darwin.shutdown(socketFD, SHUT_RDWR)
-            Darwin.close(socketFD)
-            socketFD = -1
-        }
     }
 }

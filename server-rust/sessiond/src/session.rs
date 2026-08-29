@@ -22,8 +22,8 @@ use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     CapabilitySet, EventValidationError, NegotiationError, NodeId, Profile, PropertyRef,
     SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef, Value,
-    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
-    DEFAULT_MAX_TREE_DEPTH,
+    DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
+    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 use thiserror::Error;
 
@@ -59,6 +59,9 @@ pub enum SessionError {
 
     #[error("replay unavailable for requested revision")]
     ReplayUnavailable,
+
+    #[error("transaction broadcast channel is closed")]
+    BroadcastClosed,
 
     #[error("transaction panicked: {0}")]
     Panicked(String),
@@ -176,11 +179,15 @@ impl Session {
     }
 
     /// Subscribes to committed transaction broadcasts (§20.2).
-    pub fn subscribe_transactions(&self) -> broadcast::Receiver<Transaction> {
+    ///
+    /// Returns [`SessionError::BroadcastClosed`] once [`Session::close_transaction_broadcast`] has
+    /// dropped the sender. That hook is test-only, but it is reachable from a live session, and a
+    /// panic here would take down the connection-accept task rather than failing one connection.
+    pub fn subscribe_transactions(&self) -> Result<broadcast::Receiver<Transaction>, SessionError> {
         lock_or_recover(&self.tx_broadcast)
             .as_ref()
-            .expect("transaction broadcast closed")
-            .subscribe()
+            .map(|sender| sender.subscribe())
+            .ok_or(SessionError::BroadcastClosed)
     }
 
     /// Collects transactions to replay starting at `from_revision` using a borrowed journal iterator.
@@ -481,6 +488,25 @@ impl Session {
     }
 }
 
+/// Appends one `MODEL_RESET_RANGE` operation carrying `items` starting at `start_index` (§13, §26).
+fn push_model_reset_range(
+    ops: &mut Vec<srui_protocol::Operation>,
+    model_id: u64,
+    start_index: u64,
+    items: Vec<srui_protocol::ModelItem>,
+) {
+    ops.push(srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::ModelResetRange(
+            srui_protocol::ModelResetRangeOp {
+                model_id,
+                start_index,
+                items,
+                total_count: 0,
+            },
+        )),
+    });
+}
+
 fn export_snapshot_transaction(store: &SemanticStore) -> Transaction {
     let mut ops = Vec::new();
 
@@ -498,22 +524,48 @@ fn export_snapshot_transaction(store: &SemanticStore) -> Transaction {
                 )),
             });
 
+            // §26: a model may cache up to `max_cached_items_per_model` (100_000) items, but a
+            // single model operation may carry at most `max_items_per_model_operation` (10_000).
+            // An unchunked range therefore produces a snapshot that every conforming client must
+            // reject — and a rejected resync snapshot leaves the client waiting for a snapshot it
+            // will reject again (§18).
             for range in model.cached_ranges() {
-                let items: Vec<srui_protocol::ModelItem> = (range.start..range.start + range.length)
-                    .filter_map(|idx| model.get_item_by_index(idx))
-                    .map(srui_protocol::ModelItem::from)
-                    .collect();
-                if !items.is_empty() {
-                    ops.push(srui_protocol::Operation {
-                        op: Some(srui_protocol::operation::Op::ModelResetRange(
-                            srui_protocol::ModelResetRangeOp {
-                                model_id: model.id.get(),
-                                start_index: range.start,
-                                items,
-                                total_count: 0,
-                            },
-                        )),
-                    });
+                let mut chunk_start = range.start;
+                let mut chunk: Vec<srui_protocol::ModelItem> = Vec::new();
+
+                for idx in range.start..range.start + range.length {
+                    match model.get_item_by_index(idx) {
+                        Some(item) => {
+                            if chunk.is_empty() {
+                                chunk_start = idx;
+                            }
+                            chunk.push(srui_protocol::ModelItem::from(item));
+                            if chunk.len() == DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION {
+                                push_model_reset_range(
+                                    &mut ops,
+                                    model.id.get(),
+                                    chunk_start,
+                                    std::mem::take(&mut chunk),
+                                );
+                            }
+                        }
+                        // `items` are positional from `start_index`, so a hole must end the run
+                        // rather than shift every later item down by one.
+                        None => {
+                            if !chunk.is_empty() {
+                                push_model_reset_range(
+                                    &mut ops,
+                                    model.id.get(),
+                                    chunk_start,
+                                    std::mem::take(&mut chunk),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !chunk.is_empty() {
+                    push_model_reset_range(&mut ops, model.id.get(), chunk_start, chunk);
                 }
             }
         }

@@ -252,10 +252,23 @@ async fn test_transaction_broadcast_closed_exits_connection_cleanly() {
     );
 }
 
+/// A connection accepted after the broadcast sender was dropped must fail that one connection,
+/// not panic the accept task (§20.2).
+#[tokio::test]
+async fn test_subscribe_after_broadcast_closed_reports_error() {
+    let session = Session::new("broadcast-closed-subscribe");
+    session.close_transaction_broadcast();
+
+    assert!(matches!(
+        session.subscribe_transactions(),
+        Err(SessionError::BroadcastClosed)
+    ));
+}
+
 #[tokio::test]
 async fn test_transaction_broadcast_closed_notifies_subscribers() {
     let session = Session::new("broadcast-closed-subscriber");
-    let mut rx = session.subscribe_transactions();
+    let mut rx = session.subscribe_transactions().expect("broadcast open");
     session.close_transaction_broadcast();
 
     assert!(matches!(rx.recv().await, Err(RecvError::Closed)));

@@ -138,7 +138,7 @@ where
     // -------------------------------------------------------------------------
     // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
     // -------------------------------------------------------------------------
-    let mut tx_rx = session.subscribe_transactions();
+    let mut tx_rx = session.subscribe_transactions()?;
 
     loop {
         tokio::select! {
@@ -195,8 +195,16 @@ async fn handle_incoming_message(
 ) -> Result<(), ConnectionError> {
     match msg.msg {
         Some(srui_message::Msg::Event(event)) => {
-            debug!("Processing incoming event {:?}", event.event_id);
-            let _ = session.process_event(&event)?;
+            // §18.2: a re-delivered event is dropped by the dedupe cache rather than re-run, which
+            // is correct but indistinguishable from a handled event in the logs unless recorded.
+            if session.process_event(&event)? {
+                debug!("Handled event {:?}", event.event_id);
+            } else {
+                debug!(
+                    "Ignored duplicate event {:?} (seq {})",
+                    event.event_id, event.event_seq
+                );
+            }
             Ok(())
         }
         Some(srui_message::Msg::Transaction(tx)) => {
@@ -215,8 +223,13 @@ async fn handle_incoming_message(
         Some(_) => Err(ConnectionError::UnexpectedMessage(
             "server-only or unsupported message during active session",
         )),
-        None => Err(ConnectionError::UnexpectedMessage(
-            "empty active-session envelope",
-        )),
+        // prost decodes any envelope whose oneof field number this build does not know to `None`,
+        // so failing here would drop the connection of a client speaking a newer protocol. §4
+        // inv. 13 requires unknown *required* semantics to fail closed; an unrecognized optional
+        // envelope is ignored instead.
+        None => {
+            warn!("Ignoring empty or unrecognized active-session envelope");
+            Ok(())
+        }
     }
 }

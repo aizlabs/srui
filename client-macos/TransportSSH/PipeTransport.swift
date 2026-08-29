@@ -13,6 +13,9 @@ public actor PipeTransport: Transport {
     /// Weak so that `createPair` does not build a retain cycle between the two ends. The caller of
     /// `createPair` holds both, which is what keeps them alive.
     private weak var peer: PipeTransport?
+    /// The peer's continuation, held strongly: only this end feeds the peer's stream, so releasing
+    /// this end must be able to hand the survivor an EOF even after `peer` has been zeroed.
+    private var peerContinuation: AsyncThrowingStream<Data, Error>.Continuation?
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 
@@ -28,6 +31,16 @@ public actor PipeTransport: Transport {
         }
     }
 
+    deinit {
+        // `peer` is weak, so releasing one end no longer tears the other down through `close()`.
+        // Without finishing here, a consumer iterating either side's `receiveStream()` would never
+        // observe EOF and would hang forever. Drop the termination handler first: it captures
+        // `self` weakly, and forming that reference mid-deallocation traps.
+        continuation.onTermination = nil
+        continuation.finish()
+        peerContinuation?.finish()
+    }
+
     /// Creates a connected bidirectional pair of in-memory pipe transports.
     public static func createPair() async -> (client: PipeTransport, server: PipeTransport) {
         let client = PipeTransport()
@@ -39,6 +52,13 @@ public actor PipeTransport: Transport {
 
     public func setPeer(_ peer: PipeTransport) {
         self.peer = peer
+        self.peerContinuation = peer.streamContinuation
+    }
+
+    /// The continuation feeding this end's `receiveStream()`. Shared with the peer so either side
+    /// can terminate the other's stream when it goes away.
+    nonisolated var streamContinuation: AsyncThrowingStream<Data, Error>.Continuation {
+        continuation
     }
 
     public func send(data: Data) async throws {
@@ -66,6 +86,7 @@ public actor PipeTransport: Transport {
         continuation.finish()
         let targetPeer = peer
         peer = nil
+        peerContinuation = nil
         if let targetPeer {
             await targetPeer.close()
         }

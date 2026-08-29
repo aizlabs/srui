@@ -66,12 +66,57 @@ async fn connect_client(
     (client_framed_write, client_framed_read, server_task)
 }
 
+/// §4 inv. 13: only unknown *required* semantics fail closed. prost decodes an envelope whose
+/// oneof field number this build does not know to `None`, exactly like an empty envelope, so
+/// treating that as fatal would drop connections from clients speaking a newer protocol.
+#[tokio::test]
+async fn test_unrecognized_active_session_envelope_is_ignored() {
+    let session = Arc::new(Session::new("unknown-envelope"));
+    let shutdown = CancellationToken::new();
+    session
+        .transaction(|ui| {
+            Surface::builder(NodeId::new(1)).label("baseline").create(ui)?;
+            Ok(())
+        })
+        .expect("baseline transaction");
+
+    let (mut client_write, mut client_read, server_task) =
+        connect_client(session.clone(), shutdown.clone()).await;
+    client_write
+        .send(SruiMessage::default())
+        .await
+        .expect("send unrecognized envelope");
+
+    // The connection must still be serving: a transaction committed afterwards reaches this client.
+    session
+        .transaction(|ui| {
+            Surface::builder(NodeId::new(2))
+                .label("still connected")
+                .create(ui)?;
+            Ok(())
+        })
+        .expect("post-unknown-envelope transaction");
+    let message = timeout(Duration::from_secs(2), client_read.next())
+        .await
+        .expect("receive timed out")
+        .expect("stream closed by unrecognized envelope")
+        .expect("frame decode");
+    assert!(matches!(
+        message.msg,
+        Some(srui_message::Msg::Transaction(_))
+    ));
+    assert_eq!(session.current_revision(), 2);
+
+    shutdown.cancel();
+    server_task.await.expect("join").expect("clean shutdown");
+}
+
 #[tokio::test]
 async fn test_client_transaction_rejected_without_mutating_authority() {
     let session = Arc::new(Session::new("authority-test"));
     let shutdown = CancellationToken::new();
     let surface_id = NodeId::new(1);
-    let mut broadcast_rx = session.subscribe_transactions();
+    let mut broadcast_rx = session.subscribe_transactions().expect("broadcast open");
     session
         .transaction(|ui| {
             Surface::builder(surface_id)
@@ -149,7 +194,7 @@ async fn test_client_transaction_on_pristine_session_rejected() {
         .collect_replayed_transactions(0)
         .expect("empty journal replay");
     assert!(baseline_journal.is_empty());
-    let mut broadcast_rx = session.subscribe_transactions();
+    let mut broadcast_rx = session.subscribe_transactions().expect("broadcast open");
 
     let (mut client_write, _client_read, server_task) =
         connect_client(session.clone(), shutdown).await;
@@ -217,7 +262,6 @@ async fn test_active_session_rejects_handshake_server_and_empty_messages() {
             },
             "server-only or unsupported message during active session",
         ),
-        (SruiMessage::default(), "empty active-session envelope"),
     ];
 
     for (case_index, (message, expected_error)) in cases.into_iter().enumerate() {

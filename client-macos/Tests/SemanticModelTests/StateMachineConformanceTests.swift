@@ -80,10 +80,13 @@ final class StateMachineConformanceTests: XCTestCase {
         let json = try XCTUnwrap(jsonObject, "Invalid JSON in \(url.lastPathComponent)")
 
         let fileName = url.lastPathComponent
-        let initialRevision = (json["initial_revision"] as? NSNumber)?.uint64Value ?? 0
+        let initialRevision = try jsonUInt64(json, "initial_revision", fileName: fileName) ?? 0
 
         // 1. Configure store limits
-        let limits = parseLimits(json["initial_limits"] as? [String: Any] ?? json["store_limits"] as? [String: Any])
+        let limits = try parseLimits(
+            json["initial_limits"] as? [String: Any] ?? json["store_limits"] as? [String: Any],
+            fileName: fileName
+        )
         let applier = TransactionApplier(limits: limits, initialRevision: Revision(initialRevision))
 
         // 2. Run setup transactions
@@ -122,7 +125,7 @@ final class StateMachineConformanceTests: XCTestCase {
                 return
             }
 
-            if let expRev = (outcomeDict["committed_revision"] as? NSNumber)?.uint64Value {
+            if let expRev = try jsonUInt64(outcomeDict, "committed_revision", fileName: fileName) {
                 XCTAssertEqual(committedRev.value, expRev, "[\(fileName)] Committed revision mismatch")
                 XCTAssertEqual(applier.store.revision.value, expRev, "[\(fileName)] Store revision mismatch")
             }
@@ -146,13 +149,20 @@ final class StateMachineConformanceTests: XCTestCase {
                 "[\(fileName)] Error code mismatch (expected \(expErrorCode), got \(String(describing: actualErrorCode)))"
             )
 
-            if let expFailedOp = outcomeDict["failed_op_index"] as? Int {
-                if case .opFailed(let opIdx, _) = txnError {
-                    XCTAssertEqual(opIdx, expFailedOp, "[\(fileName)] Failed operation index mismatch")
+            if let expFailedOp = try jsonInt(outcomeDict, "failed_op_index", fileName: fileName) {
+                // A fixture that names the failing operation must actually get an operation
+                // failure: silently accepting any other rejection would let the vector pass while
+                // testing a different code path than the Rust harness does.
+                guard case .opFailed(let opIdx, _) = txnError else {
+                    XCTFail(
+                        "[\(fileName)] Expected opFailed carrying index \(expFailedOp), got \(txnError)"
+                    )
+                    return
                 }
+                XCTAssertEqual(opIdx, expFailedOp, "[\(fileName)] Failed operation index mismatch")
             }
 
-            if let expStoreRev = (outcomeDict["expected_store_revision"] as? NSNumber)?.uint64Value {
+            if let expStoreRev = try jsonUInt64(outcomeDict, "expected_store_revision", fileName: fileName) {
                 XCTAssertEqual(
                     applier.store.revision.value,
                     expStoreRev,
@@ -160,7 +170,7 @@ final class StateMachineConformanceTests: XCTestCase {
                 )
             }
 
-            if let rollbackVerified = outcomeDict["rollback_verified"] as? Bool, rollbackVerified {
+            if try jsonBool(outcomeDict, "rollback_verified", fileName: fileName) == true {
                 let postTxnSnapshot = takeSnapshot(applier.store)
                 XCTAssertEqual(
                     postTxnSnapshot,
@@ -245,15 +255,17 @@ final class StateMachineConformanceTests: XCTestCase {
     // MARK: - State Verifications
 
     private func verifyStoreState(_ store: SemanticStore, expectedState: [String: Any], fileName: String) throws {
-        if let expNodeCount = expectedState["node_count"] as? Int {
-            XCTAssertEqual(store.nodeCount, expNodeCount, "[\(fileName)] Store nodeCount mismatch")
-        }
+        // `node_count` and `roots` are non-optional in the Rust fixture struct, so they are
+        // required here too: an omitted field must fail the vector, not skip the check.
+        let expNodeCount = try requiredInt(expectedState, "node_count", fileName: fileName)
+        XCTAssertEqual(store.nodeCount, expNodeCount, "[\(fileName)] Store nodeCount mismatch")
 
-        if let expRoots = expectedState["roots"] as? [NSNumber] {
-            let actualRoots = store.rootIDs.map { $0.value }
-            let expectedRootValues = expRoots.map { $0.uint64Value }
-            XCTAssertEqual(actualRoots, expectedRootValues, "[\(fileName)] Roots mismatch")
-        }
+        let expectedRootValues = try requiredUInt64Array(expectedState, "roots", fileName: fileName)
+        XCTAssertEqual(
+            store.rootIDs.map { $0.value },
+            expectedRootValues,
+            "[\(fileName)] Roots mismatch"
+        )
 
         if let nodesDict = expectedState["nodes"] as? [String: [String: Any]] {
             for (nodeIDStr, expNode) in nodesDict {
@@ -267,15 +279,19 @@ final class StateMachineConformanceTests: XCTestCase {
                 }
 
                 if let hasParent = expNode["parent_id"] {
-                    if let pidNum = hasParent as? NSNumber {
-                        XCTAssertEqual(node.parentID, NodeId(pidNum.uint64Value), "[\(fileName)] Node \(nodeID) parent mismatch")
+                    if let parentValue = try jsonUInt64(expNode, "parent_id", fileName: fileName) {
+                        XCTAssertEqual(node.parentID, NodeId(parentValue), "[\(fileName)] Node \(nodeID) parent mismatch")
                     } else if hasParent is NSNull {
                         XCTAssertNil(node.parentID, "[\(fileName)] Node \(nodeID) should have nil parent")
                     }
                 }
 
-                if let expChildren = expNode["ordered_children"] as? [NSNumber] {
-                    let expChildIDs = expChildren.map { NodeId($0.uint64Value) }
+                if expNode["ordered_children"] != nil {
+                    let expChildIDs = try requiredUInt64Array(
+                        expNode,
+                        "ordered_children",
+                        fileName: fileName
+                    ).map { NodeId($0) }
                     XCTAssertEqual(node.orderedChildren, expChildIDs, "[\(fileName)] Node \(nodeID) ordered_children mismatch")
                 }
 
@@ -290,9 +306,10 @@ final class StateMachineConformanceTests: XCTestCase {
             }
         }
 
-        if let expModelCount = expectedState["model_count"] as? Int {
-            XCTAssertEqual(store.modelCount, expModelCount, "[\(fileName)] Store modelCount mismatch")
-        }
+        // `model_count` carries a serde default of 0 on the Rust side, so an absent field means
+        // "expect no models" rather than "do not check".
+        let expModelCount = try jsonInt(expectedState, "model_count", fileName: fileName) ?? 0
+        XCTAssertEqual(store.modelCount, expModelCount, "[\(fileName)] Store modelCount mismatch")
 
         if let modelsDict = expectedState["models"] as? [String: [String: Any]] {
             for (modelIDStr, expModel) in modelsDict {
@@ -300,21 +317,20 @@ final class StateMachineConformanceTests: XCTestCase {
                 let modelID = ModelId(modelIDVal)
                 let model = try XCTUnwrap(store.getModel(modelID), "[\(fileName)] Model \(modelID) missing from store")
 
-                if let expItemCount = (expModel["item_count"] as? NSNumber)?.uint64Value {
-                    XCTAssertEqual(model.itemCount, expItemCount, "[\(fileName)] Model \(modelID) itemCount mismatch")
-                }
+                // Both are non-optional in the Rust `FixtureModel`.
+                let expItemCount = try requiredUInt64(expModel, "item_count", fileName: fileName)
+                XCTAssertEqual(model.itemCount, expItemCount, "[\(fileName)] Model \(modelID) itemCount mismatch")
 
-                if let expCachedCount = expModel["cached_item_count"] as? Int {
-                    XCTAssertEqual(model.cachedItemCount, expCachedCount, "[\(fileName)] Model \(modelID) cachedItemCount mismatch")
-                }
+                let expCachedCount = try requiredInt(expModel, "cached_item_count", fileName: fileName)
+                XCTAssertEqual(model.cachedItemCount, expCachedCount, "[\(fileName)] Model \(modelID) cachedItemCount mismatch")
 
                 if let expRanges = expModel["cached_ranges"] as? [[String: Any]] {
                     let actualRanges = model.cachedRanges()
                     XCTAssertEqual(actualRanges.count, expRanges.count, "[\(fileName)] Model \(modelID) cached_ranges count mismatch")
                     for (i, rJson) in expRanges.enumerated() {
                         if i < actualRanges.count {
-                            let start = (rJson["start"] as? NSNumber)?.uint64Value ?? 0
-                            let length = (rJson["length"] as? NSNumber)?.uint64Value ?? 0
+                            let start = try requiredUInt64(rJson, "start", fileName: fileName)
+                            let length = try requiredUInt64(rJson, "length", fileName: fileName)
                             XCTAssertEqual(actualRanges[i].start, start, "[\(fileName)] Model \(modelID) range [\(i)] start mismatch")
                             XCTAssertEqual(actualRanges[i].length, length, "[\(fileName)] Model \(modelID) range [\(i)] length mismatch")
                         }
@@ -325,9 +341,8 @@ final class StateMachineConformanceTests: XCTestCase {
                     for (idxStr, expItem) in itemsDict {
                         guard let idx = UInt64(idxStr) else { continue }
                         let item = try XCTUnwrap(model.getItemByIndex(idx), "[\(fileName)] Item at index \(idx) missing in model \(modelID)")
-                        if let expItemId = (expItem["item_id"] as? NSNumber)?.uint64Value {
-                            XCTAssertEqual(item.itemID.value, expItemId, "[\(fileName)] Item ID mismatch at index \(idx)")
-                        }
+                        let expItemId = try requiredUInt64(expItem, "item_id", fileName: fileName)
+                        XCTAssertEqual(item.itemID.value, expItemId, "[\(fileName)] Item ID mismatch at index \(idx)")
                         if let expValJson = expItem["value"] {
                             let expVal = try convertValue(expValJson)
                             XCTAssertEqual(item.value, expVal, "[\(fileName)] Item value mismatch at index \(idx)")
@@ -340,26 +355,30 @@ final class StateMachineConformanceTests: XCTestCase {
 
     // MARK: - Parsers and Converters
 
-    private func parseLimits(_ dict: [String: Any]?) -> StoreLimits {
+    private func parseLimits(_ dict: [String: Any]?, fileName: String) throws -> StoreLimits {
         guard let d = dict else { return StoreLimits() }
         var limits = StoreLimits()
-        if let v = d["max_tree_depth"] as? Int { limits.maxTreeDepth = v }
-        if let v = d["max_node_count"] as? Int { limits.maxNodeCount = v }
-        if let v = d["max_transaction_operations"] as? Int { limits.maxTransactionOperations = v }
-        if let v = d["max_string_length"] as? Int { limits.maxStringLength = v }
-        if let v = d["max_value_depth"] as? Int { limits.maxValueDepth = v }
-        if let v = d["max_list_length"] as? Int ?? d["max_list_elements"] as? Int { limits.maxListElements = v }
-        if let v = d["max_record_properties"] as? Int { limits.maxRecordProperties = v }
-        if let v = d["max_model_count"] as? Int { limits.maxModelCount = v }
-        if let v = d["max_cached_items_per_model"] as? Int { limits.maxCachedItemsPerModel = v }
-        if let v = d["max_items_per_model_operation"] as? Int { limits.maxItemsPerModelOperation = v }
+        // A silently dropped limit here is the worst failure mode in this harness: the vector then
+        // runs against 1 MiB strings / 100k nodes instead of the tiny bounds it was written to
+        // exercise, and every §26 rejection vector passes for the wrong reason.
+        if let v = try jsonInt(d, "max_tree_depth", fileName: fileName) { limits.maxTreeDepth = v }
+        if let v = try jsonInt(d, "max_node_count", fileName: fileName) { limits.maxNodeCount = v }
+        if let v = try jsonInt(d, "max_transaction_operations", fileName: fileName) { limits.maxTransactionOperations = v }
+        if let v = try jsonInt(d, "max_string_length", fileName: fileName) { limits.maxStringLength = v }
+        if let v = try jsonInt(d, "max_value_depth", fileName: fileName) { limits.maxValueDepth = v }
+        if let v = try jsonInt(d, "max_list_length", fileName: fileName)
+            ?? (try jsonInt(d, "max_list_elements", fileName: fileName)) { limits.maxListElements = v }
+        if let v = try jsonInt(d, "max_record_properties", fileName: fileName) { limits.maxRecordProperties = v }
+        if let v = try jsonInt(d, "max_model_count", fileName: fileName) { limits.maxModelCount = v }
+        if let v = try jsonInt(d, "max_cached_items_per_model", fileName: fileName) { limits.maxCachedItemsPerModel = v }
+        if let v = try jsonInt(d, "max_items_per_model_operation", fileName: fileName) { limits.maxItemsPerModelOperation = v }
         return limits
     }
 
     private func parseTransaction(_ dict: [String: Any], fileName: String) throws -> Transaction {
-        let baseRev = (dict["base_revision"] as? NSNumber)?.uint64Value ?? 0
-        let newRev = (dict["new_revision"] as? NSNumber)?.uint64Value ?? (baseRev + 1)
-        let priority = (dict["priority"] as? NSNumber)?.uint32Value ?? 0
+        let baseRev = try jsonUInt64(dict, "base_revision", fileName: fileName) ?? 0
+        let newRev = try jsonUInt64(dict, "new_revision", fileName: fileName) ?? (baseRev + 1)
+        let priority = try jsonUInt32(dict, "priority", fileName: fileName) ?? 0
 
         var ops: [StoreOperation] = []
         if let rawOps = dict["operations"] as? [[String: Any]] {
@@ -384,8 +403,10 @@ final class StateMachineConformanceTests: XCTestCase {
             let nodeID = NodeId(try getUInt64(dict, key: "node_id", fileName: fileName))
             let nodeTypeStr = try XCTUnwrap(dict["node_type"] as? String, "[\(fileName)] CREATE_NODE missing node_type")
             let nodeType = try resolveNodeType(nodeTypeStr)
-            let parentID = (dict["parent_id"] as? NSNumber).map { NodeId($0.uint64Value) }
-            let childIndex = dict["child_index"] as? Int
+            let parentID = try jsonUInt64(dict, "parent_id", fileName: fileName).map { NodeId($0) }
+            // A dropped `child_index` silently changes CREATE_NODE from "insert at index n" to
+            // "append", which is a different operation than the vector describes.
+            let childIndex = try jsonInt(dict, "child_index", fileName: fileName)
 
             let properties = try parseFixtureProperties(dict["properties"], fileName: fileName)
             return .createNode(
@@ -415,8 +436,8 @@ final class StateMachineConformanceTests: XCTestCase {
 
         case "MOVE_NODE":
             let nodeID = NodeId(try getUInt64(dict, key: "node_id", fileName: fileName))
-            let newParentID = (dict["new_parent_id"] as? NSNumber).map { NodeId($0.uint64Value) }
-            let newChildIndex = dict["new_child_index"] as? Int
+            let newParentID = try jsonUInt64(dict, "new_parent_id", fileName: fileName).map { NodeId($0) }
+            let newChildIndex = try jsonInt(dict, "new_child_index", fileName: fileName)
             return .moveNode(id: nodeID, newParentID: newParentID, newChildIndex: newChildIndex)
 
         case "REORDER_CHILDREN":
@@ -446,14 +467,16 @@ final class StateMachineConformanceTests: XCTestCase {
 
         case "MODEL_DELETE":
             let modelID = ModelId(try getUInt64(dict, key: "model_id", fileName: fileName))
-            let index = (dict["index"] as? NSNumber)?.uint64Value
-            let count = (dict["count"] as? NSNumber)?.uint64Value
-            let itemIds = (dict["item_ids"] as? [NSNumber])?.map { ItemId($0.uint64Value) } ?? []
+            let index = try jsonUInt64(dict, "index", fileName: fileName)
+            let count = try jsonUInt64(dict, "count", fileName: fileName)
+            let itemIds = dict["item_ids"] == nil
+                ? []
+                : try requiredUInt64Array(dict, "item_ids", fileName: fileName).map { ItemId($0) }
             return .modelDelete(id: modelID, index: index, count: count, itemIds: itemIds)
 
         case "MODEL_UPDATE":
             let modelID = ModelId(try getUInt64(dict, key: "model_id", fileName: fileName))
-            let index = (dict["index"] as? NSNumber)?.uint64Value
+            let index = try jsonUInt64(dict, "index", fileName: fileName)
             let rawItems = try XCTUnwrap(dict["items"] as? [[String: Any]], "[\(fileName)] MODEL_UPDATE missing items")
             let items = try rawItems.map { try convertModelItem($0) }
             return .modelUpdate(id: modelID, index: index, items: items)
@@ -461,7 +484,7 @@ final class StateMachineConformanceTests: XCTestCase {
         case "MODEL_RESET_RANGE":
             let modelID = ModelId(try getUInt64(dict, key: "model_id", fileName: fileName))
             let startIndex = try getUInt64(dict, key: "start_index", fileName: fileName)
-            let totalCount = (dict["total_count"] as? NSNumber)?.uint64Value
+            let totalCount = try jsonUInt64(dict, "total_count", fileName: fileName)
             let rawItems = try XCTUnwrap(dict["items"] as? [[String: Any]], "[\(fileName)] MODEL_RESET_RANGE missing items")
             let items = try rawItems.map { try convertModelItem($0) }
             return .modelResetRange(id: modelID, startIndex: startIndex, items: items, totalCount: totalCount)
@@ -472,8 +495,7 @@ final class StateMachineConformanceTests: XCTestCase {
     }
 
     private func convertModelItem(_ dict: [String: Any]) throws -> ModelItem {
-        let itemIDNum = try XCTUnwrap(dict["item_id"] as? NSNumber, "ModelItem missing item_id")
-        let itemID = ItemId(itemIDNum.uint64Value)
+        let itemID = ItemId(try requiredUInt64(dict, "item_id", fileName: "model item"))
         let val = try convertValue(dict["value"])
         var properties: [PropertyRef: Value] = [:]
         if let propsDict = dict["properties"] as? [String: Any] {
@@ -485,11 +507,111 @@ final class StateMachineConformanceTests: XCTestCase {
         return ModelItem(itemID: itemID, value: val, properties: properties)
     }
 
-    private func getUInt64(_ dict: [String: Any], key: String, fileName: String) throws -> UInt64 {
-        guard let num = dict[key] as? NSNumber else {
-            throw StoreError.operationError("[\(fileName)] Missing or invalid numeric field: \(key)")
+    // MARK: - Strict fixture number accessors (§32)
+    //
+    // `JSONSerialization` yields every JSON number as `NSNumber`, and `as? Int` returns nil for a
+    // value outside `Int`'s range or a fractional literal while happily accepting `true`/`false`.
+    // Every such silent nil used to skip an assertion or drop an operation field, so a fixture
+    // could pass here while the typed Rust harness (`FixtureLimits`, `FixtureStoreState`) verified
+    // something else entirely. These accessors fail loudly instead: absent is nil, present-but-
+    // unrepresentable throws.
+
+    private func jsonNumber(_ raw: Any) -> NSNumber? {
+        guard let num = raw as? NSNumber else { return nil }
+        // JSON booleans bridge to `NSNumber`; they are never counts, indices, or limits.
+        guard CFGetTypeID(num) != CFBooleanGetTypeID() else { return nil }
+        return num
+    }
+
+    private func jsonInt(_ dict: [String: Any], _ key: String, fileName: String) throws -> Int? {
+        guard let raw = dict[key], !(raw is NSNull) else { return nil }
+        guard let num = jsonNumber(raw) else {
+            throw StoreError.operationError("[\(fileName)] Field '\(key)' is not a JSON number: \(raw)")
         }
-        return num.uint64Value
+        let value = num.intValue
+        guard NSNumber(value: value) == num else {
+            throw StoreError.operationError(
+                "[\(fileName)] Field '\(key)' (\(num)) is not representable as Int"
+            )
+        }
+        return value
+    }
+
+    private func jsonUInt64(_ dict: [String: Any], _ key: String, fileName: String) throws -> UInt64? {
+        guard let raw = dict[key], !(raw is NSNull) else { return nil }
+        guard let num = jsonNumber(raw) else {
+            throw StoreError.operationError("[\(fileName)] Field '\(key)' is not a JSON number: \(raw)")
+        }
+        let value = num.uint64Value
+        guard NSNumber(value: value) == num else {
+            throw StoreError.operationError(
+                "[\(fileName)] Field '\(key)' (\(num)) is not representable as UInt64"
+            )
+        }
+        return value
+    }
+
+    private func jsonUInt32(_ dict: [String: Any], _ key: String, fileName: String) throws -> UInt32? {
+        guard let value = try jsonUInt64(dict, key, fileName: fileName) else { return nil }
+        guard let narrowed = UInt32(exactly: value) else {
+            throw StoreError.operationError("[\(fileName)] Field '\(key)' (\(value)) exceeds UInt32")
+        }
+        return narrowed
+    }
+
+    private func jsonBool(_ dict: [String: Any], _ key: String, fileName: String) throws -> Bool? {
+        guard let raw = dict[key], !(raw is NSNull) else { return nil }
+        guard let num = raw as? NSNumber, CFGetTypeID(num) == CFBooleanGetTypeID() else {
+            throw StoreError.operationError("[\(fileName)] Field '\(key)' is not a JSON boolean: \(raw)")
+        }
+        return num.boolValue
+    }
+
+    /// Required counterparts — these mirror the non-`Option` fields of the Rust fixture structs, so
+    /// an omitted field is a fixture error rather than a skipped assertion.
+    private func requiredInt(_ dict: [String: Any], _ key: String, fileName: String) throws -> Int {
+        guard let value = try jsonInt(dict, key, fileName: fileName) else {
+            throw StoreError.operationError("[\(fileName)] Missing required integer field: \(key)")
+        }
+        return value
+    }
+
+    private func requiredUInt64(_ dict: [String: Any], _ key: String, fileName: String) throws -> UInt64 {
+        guard let value = try jsonUInt64(dict, key, fileName: fileName) else {
+            throw StoreError.operationError("[\(fileName)] Missing required integer field: \(key)")
+        }
+        return value
+    }
+
+    private func requiredUInt64Array(
+        _ dict: [String: Any],
+        _ key: String,
+        fileName: String
+    ) throws -> [UInt64] {
+        guard let raw = dict[key] else {
+            throw StoreError.operationError("[\(fileName)] Missing required array field: \(key)")
+        }
+        guard let elements = raw as? [Any] else {
+            throw StoreError.operationError("[\(fileName)] Field '\(key)' is not an array: \(raw)")
+        }
+        return try elements.enumerated().map { index, element in
+            guard let num = jsonNumber(element) else {
+                throw StoreError.operationError(
+                    "[\(fileName)] Field '\(key)[\(index)]' is not a JSON number: \(element)"
+                )
+            }
+            let value = num.uint64Value
+            guard NSNumber(value: value) == num else {
+                throw StoreError.operationError(
+                    "[\(fileName)] Field '\(key)[\(index)]' (\(num)) is not representable as UInt64"
+                )
+            }
+            return value
+        }
+    }
+
+    private func getUInt64(_ dict: [String: Any], key: String, fileName: String) throws -> UInt64 {
+        try requiredUInt64(dict, key, fileName: fileName)
     }
 
     private func resolveNodeType(_ name: String) throws -> TypeRef {

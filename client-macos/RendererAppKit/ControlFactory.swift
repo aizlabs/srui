@@ -451,9 +451,20 @@ public final class ControlFactory {
         } else if let button = handle.view as? NSButton, handle.nodeType == .toggle {
             button.state = (value?.asBool ?? false) ? .on : .off
         } else if let field = handle.view as? NSTextField {
-            field.stringValue = value?.asString ?? ""
+            // A cleared property blanks the control, but a `value` of some other type is not a
+            // string this control can show: ignore it rather than wiping the rendered text on a
+            // type mismatch (§4 inv. 13).
+            if let value {
+                if let string = value.asString { field.stringValue = string }
+            } else {
+                field.stringValue = ""
+            }
         } else if let textView = textView(in: handle) {
-            textView.string = value?.asString ?? ""
+            if let value {
+                if let string = value.asString { textView.string = string }
+            } else {
+                textView.string = ""
+            }
         }
     }
 
@@ -531,19 +542,26 @@ public final class ControlFactory {
     private func applyAlignment(to handle: RenderHandle) {
         guard let stack = handle.view as? NSStackView else { return }
 
+        // A cleared alignment restores the platform default; a *known* token maps to its AppKit
+        // equivalent; an unrecognized or wrong-family token is ignored rather than coerced into an
+        // alignment the server never asked for (§4 inv. 13).
         if stack.orientation == .vertical {
             switch handle.layoutMetadata.horizontalAlignment {
+            case nil: stack.alignment = .centerX
+            case .horizontalAlignmentLeading: stack.alignment = .leading
             case .horizontalAlignmentCenter: stack.alignment = .centerX
             case .horizontalAlignmentTrailing: stack.alignment = .trailing
             case .horizontalAlignmentFill: stack.alignment = .width
-            default: stack.alignment = .leading
+            default: break
             }
         } else if stack.orientation == .horizontal {
             switch handle.layoutMetadata.verticalAlignment {
+            case nil: stack.alignment = .centerY
             case .verticalAlignmentTop: stack.alignment = .top
+            case .verticalAlignmentCenter: stack.alignment = .centerY
             case .verticalAlignmentBottom: stack.alignment = .bottom
             case .verticalAlignmentFill: stack.alignment = .height
-            default: stack.alignment = .centerY
+            default: break
             }
         }
     }

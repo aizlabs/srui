@@ -149,6 +149,16 @@ public final class SessionController: @unchecked Sendable {
         }
         guard shouldStart else { return }
 
+        // A handshake that never reaches the server leaves no receive loop behind, so the started
+        // latch must not survive the throw: otherwise every later `start()` returns early at the
+        // guard above and the controller is wedged with no reader and no diagnostics (§18).
+        var didStart = false
+        defer {
+            if !didStart {
+                withStateLock { self.isRunning = false }
+            }
+        }
+
         await MainActor.run {
             ensureActionHandlerWired()
         }
@@ -181,6 +191,7 @@ public final class SessionController: @unchecked Sendable {
         withStateLock {
             self.receiveTask = task
         }
+        didStart = true
     }
 
     /// Dispatches a manual activation event for the given node ID (§7.7).
@@ -205,7 +216,7 @@ public final class SessionController: @unchecked Sendable {
                     messages = try streamDecoder.appendAndExtract(incoming: chunk)
                 } catch {
                     await reportFailure(.decodeFailed("frame decode failed: \(error)"))
-                    break
+                    return
                 }
 
                 for msg in messages {
@@ -214,7 +225,17 @@ public final class SessionController: @unchecked Sendable {
             }
         } catch {
             await reportFailure(.transportEnded("\(error)"))
+            return
         }
+
+        // A peer that closes cleanly finishes the stream *without* throwing (socket EOF calls
+        // `continuation.finish()`), so falling out of the loop here is the common disconnect, not a
+        // normal shutdown. Unless `stop()` asked for the teardown, this is terminal for the replica
+        // and must be reported so the caller reconnects and resumes rather than sitting on a live
+        // session with no reader (§18, §4 inv. 13).
+        let stoppedIntentionally = Task.isCancelled || withStateLock { !isRunning }
+        guard !stoppedIntentionally else { return }
+        await reportFailure(.transportEnded("receive stream closed by peer"))
     }
 
     /// Processes a single wire envelope, deserializing and applying transactions serially (§12.1, §22.2).
@@ -369,6 +390,13 @@ public final class SessionController: @unchecked Sendable {
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
             // mount state may survive.
             streamDecoder = SRUIMessageStreamDecoder()
+            // The server answers the next `CLIENT RESUME` with replay or a fresh snapshot, so the
+            // divergence latch and the resync latch must not outlive this session either: a
+            // surviving `_isDiverged` makes `handleTransaction` silently discard every transaction
+            // of the next one, and a surviving `pendingResync` would treat its first transaction as
+            // a snapshot (§18, §4 inv. 13).
+            _isDiverged = false
+            pendingResync = false
             return t
         }
 

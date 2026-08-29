@@ -416,6 +416,144 @@ struct SessionRobustnessTests {
         await serverTransport.close()
     }
 
+    // MARK: - §18 / §4 inv. 13: a clean peer EOF is a failure, not a normal shutdown
+
+    @Test("A peer that closes the stream cleanly reports a transport failure")
+    @MainActor
+    func cleanPeerEOFReportsTransportFailure() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let controller = SessionController(transport: clientTransport, applier: applier)
+
+        let failures = FailureBox()
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+        try await controller.start()
+
+        try await serverTransport.send(
+            data: try Self.framed(
+                Transaction(
+                    baseRevision: .initial,
+                    newRevision: Revision(1),
+                    operations: Self.surfaceAndText("Count: 0")
+                )
+            )
+        )
+        #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+
+        // A socket EOF finishes the receive stream *without* throwing. The session must still fail
+        // loudly so the caller reconnects and resumes (§18, §4 inv. 13).
+        await serverTransport.close()
+
+        #expect(await Self.waitUntil { await failures.count == 1 })
+        let reported = await failures.first
+        guard case .transportEnded = reported else {
+            Issue.record("clean EOF must report .transportEnded, got \(String(describing: reported))")
+            return
+        }
+        #expect(controller.isDiverged, "a session with no reader must not look healthy")
+
+        await controller.stop()
+    }
+
+    @Test("stop() does not report a failure when the stream finishes")
+    @MainActor
+    func intentionalStopReportsNoFailure() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(transport: clientTransport)
+
+        let failures = FailureBox()
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+        try await controller.start()
+
+        await controller.stop()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        #expect(await failures.count == 0, "an intentional stop is not a session failure")
+        #expect(!controller.isDiverged)
+
+        await serverTransport.close()
+    }
+
+    // MARK: - §18: a stopped session must be restartable
+
+    @Test("stop() clears the divergence and resync latches so the next session tracks again")
+    @MainActor
+    func stopClearsDivergenceLatch() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let controller = SessionController(transport: clientTransport, applier: applier)
+        try await controller.start()
+
+        try await serverTransport.send(
+            data: try Self.framed(
+                Transaction(
+                    baseRevision: .initial,
+                    newRevision: Revision(1),
+                    operations: Self.surfaceAndText("Count: 0")
+                )
+            )
+        )
+        #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+
+        // Diverge: revisions 2...5 were never delivered.
+        try await serverTransport.send(
+            data: try Self.framed(
+                Transaction(
+                    baseRevision: Revision(5),
+                    newRevision: Revision(6),
+                    operations: [
+                        .setProperty(id: NodeId(2), property: .text, value: .string("Count: 5")),
+                    ]
+                )
+            )
+        )
+        #expect(await Self.waitUntil { controller.isDiverged })
+
+        // A restart re-handshakes and the server answers with replay or a snapshot, so the latch
+        // must not survive: otherwise every transaction of the next session is silently dropped.
+        await controller.stop()
+        #expect(!controller.isDiverged)
+
+        var msg = SRUIMessage()
+        msg.transaction = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(id: NodeId(2), property: .text, value: .string("Count: 1")),
+            ]
+        ).toWire()
+        await controller.handleIncomingMessage(msg)
+
+        #expect(applier.lastAppliedRevision == Revision(2))
+        #expect(applier.store.node(for: NodeId(2))?.getProperty(.text) == .string("Count: 1"))
+
+        await serverTransport.close()
+    }
+
+    @Test("A handshake that fails to send leaves the controller startable")
+    @MainActor
+    func failedHandshakeDoesNotWedgeController() async throws {
+        let transport = FlakyTransport(failFirstSend: true)
+        let applier = TransactionApplier()
+        let controller = SessionController(transport: transport, applier: applier)
+
+        await #expect(throws: TransportError.self) {
+            try await controller.start()
+        }
+        #expect(await transport.sentFrameCount == 0)
+
+        // The failed attempt started nothing, so the second attempt must actually run — not return
+        // early on a stale `isRunning` latch.
+        try await controller.start()
+        #expect(await transport.sentFrameCount == 1, "restart must re-send CLIENT RESUME (§18)")
+
+        await controller.stop()
+    }
+
     // MARK: - Transport lifecycle
 
     @Test("A closed socket transport refuses to silently reconnect")
@@ -442,6 +580,25 @@ struct SessionRobustnessTests {
         }
     }
 
+    @Test("Releasing one pipe end gives the survivor an EOF instead of hanging it")
+    func releasedPipePeerFinishesSurvivorStream() async throws {
+        var pair: (client: PipeTransport, server: PipeTransport)? = await PipeTransport.createPair()
+        let survivor = pair!.client
+        let stream = survivor.receiveStream()
+
+        let ended = EndedFlag()
+        let consumer = Task {
+            for try await _ in stream {}
+            await ended.markEnded()
+        }
+
+        // Only the peer feeds `survivor`'s stream, so dropping it must terminate that stream.
+        pair = nil
+
+        #expect(await Self.waitUntil { await ended.isEnded })
+        consumer.cancel()
+    }
+
     @Test("A connected pipe pair is released once callers drop it")
     func pipeTransportPairDoesNotLeak() async throws {
         weak var weakClient: PipeTransport?
@@ -457,4 +614,56 @@ struct SessionRobustnessTests {
         #expect(weakClient == nil, "PipeTransport pair retains itself through a peer cycle")
         #expect(weakServer == nil, "PipeTransport pair retains itself through a peer cycle")
     }
+}
+
+/// Records that an `AsyncThrowingStream` consumer observed end-of-stream.
+private actor EndedFlag {
+    private var ended = false
+    func markEnded() { ended = true }
+    var isEnded: Bool { ended }
+}
+
+/// Transport whose first `send` fails, modelling a handshake that never reaches the server.
+private actor FlakyTransport: Transport {
+    private var failNextSend: Bool
+    private var sentFrames: [Data] = []
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+
+    init(failFirstSend: Bool) {
+        self.failNextSend = failFirstSend
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.continuation = continuation
+    }
+
+    var sentFrameCount: Int { sentFrames.count }
+
+    func send(data: Data) async throws {
+        if failNextSend {
+            failNextSend = false
+            throw TransportError.closed
+        }
+        sentFrames.append(data)
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        continuation.finish()
+    }
+}
+
+/// Collects session failures reported from the receive loop's non-isolated callback.
+private actor FailureBox {
+    private var failures: [SessionFailure] = []
+
+    func record(_ failure: SessionFailure) {
+        failures.append(failure)
+    }
+
+    var count: Int { failures.count }
+    var first: SessionFailure? { failures.first }
 }

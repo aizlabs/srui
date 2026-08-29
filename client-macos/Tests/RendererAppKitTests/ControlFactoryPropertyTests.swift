@@ -181,12 +181,87 @@ struct ControlFactoryPropertyTests {
         #expect(row.layoutMetadata.verticalAlignment == .verticalAlignmentBottom)
         #expect(rowStack.alignment == .bottom)
 
+        // A cleared alignment restores AppKit's own default for the orientation, not an arbitrary
+        // edge: `NSStackView` centers on the cross axis unless told otherwise.
         factory.apply(property: .horizontalAlignment, value: nil, to: column)
         factory.apply(property: .verticalAlignment, value: nil, to: row)
         #expect(column.layoutMetadata.horizontalAlignment == nil)
-        #expect(columnStack.alignment == .leading)
+        #expect(columnStack.alignment == .centerX)
         #expect(row.layoutMetadata.verticalAlignment == nil)
         #expect(rowStack.alignment == .centerY)
+
+        factory.apply(
+            property: .horizontalAlignment,
+            value: .enumToken(.horizontalAlignmentLeading),
+            to: column
+        )
+        #expect(columnStack.alignment == .leading)
+        factory.apply(
+            property: .verticalAlignment,
+            value: .enumToken(.verticalAlignmentTop),
+            to: row
+        )
+        #expect(rowStack.alignment == .top)
+    }
+
+    /// §4 inv. 13: an unrecognized token is not silently coerced into some other alignment.
+    @Test
+    func unknownAlignmentTokenLeavesStackAlignmentUnchanged() throws {
+        let factory = ControlFactory()
+        let column = try factory.makeHandle(for: Node(id: 1, nodeType: .column))
+        let row = try factory.makeHandle(for: Node(id: 2, nodeType: .row))
+        let columnStack = try #require(column.view as? NSStackView)
+        let rowStack = try #require(row.view as? NSStackView)
+
+        factory.apply(
+            property: .horizontalAlignment,
+            value: .enumToken(.horizontalAlignmentTrailing),
+            to: column
+        )
+        factory.apply(
+            property: .verticalAlignment,
+            value: .enumToken(.verticalAlignmentBottom),
+            to: row
+        )
+        #expect(columnStack.alignment == .trailing)
+        #expect(rowStack.alignment == .bottom)
+
+        // Unassigned value in the alignment enums, and a token from the wrong alignment family.
+        factory.apply(
+            property: .horizontalAlignment,
+            value: .enumToken(EnumToken(enumID: 9, valueID: 99)),
+            to: column
+        )
+        factory.apply(
+            property: .verticalAlignment,
+            value: .enumToken(.horizontalAlignmentLeading),
+            to: row
+        )
+        #expect(columnStack.alignment == .trailing)
+        #expect(rowStack.alignment == .bottom)
+    }
+
+    /// A `value` of the wrong type is not content this control can show; wiping the rendered text
+    /// would turn a type mismatch into visible data loss (§4 inv. 13).
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func nonStringValueLeavesTextUnchanged(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+
+        factory.apply(property: .value, value: .string("typed"), to: handle)
+        factory.apply(property: .value, value: .signedInt(42), to: handle)
+
+        if let field = handle.view as? NSTextField {
+            #expect(field.stringValue == "typed")
+            factory.apply(property: .value, value: nil, to: handle)
+            #expect(field.stringValue == "")
+        } else if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+            #expect(textView.string == "typed")
+            factory.apply(property: .value, value: nil, to: handle)
+            #expect(textView.string == "")
+        } else {
+            Issue.record("unexpected view for \(nodeType)")
+        }
     }
 
     @Test

@@ -16,7 +16,7 @@ use srui_protocol::{
 use srui_sdk::*;
 use srui_semantic_tree::{
     ItemId, ModelId, ModelItem, NodeId, Operation, Revision, SemanticStore,
-    StoreLimits, Transaction, TxnError, TypeRef, Value,
+    StoreLimits, Transaction, TxnError, TypeRef, Value, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
 };
 use srui_sessiond::{handle_connection, ResumeOutcome, Session};
 
@@ -184,6 +184,83 @@ fn test_handle_resume_resync_snapshot_reconstructs_tree_and_models() {
     );
 
     let replayed = apply_resync_snapshot(snapshot_tx).expect("apply resync snapshot");
+    session.with_store(|store| assert_stores_equivalent(store, &replayed));
+}
+
+/// §26: a model may cache far more items than a single model operation may carry, so the snapshot
+/// exporter must chunk a cached range at `max_items_per_model_operation`. An unchunked range makes
+/// the snapshot undecodable for every conforming client, which then waits forever for a snapshot it
+/// will reject again (§18).
+#[test]
+fn test_resync_snapshot_chunks_cached_ranges_within_item_limit() {
+    const TOTAL_ITEMS: u64 = 25_000;
+    let seed_chunk = DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION as u64;
+
+    let session = Session::new("resync-chunked-model");
+    let model_id = ModelId::new(20);
+    session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::create_model(model_id, TypeRef::LIST, TOTAL_ITEMS))?;
+            let mut start = 0u64;
+            while start < TOTAL_ITEMS {
+                let end = (start + seed_chunk).min(TOTAL_ITEMS);
+                let items: Vec<ModelItem> = (start..end)
+                    .map(|idx| ModelItem::with_value(ItemId::new(idx + 1), Value::UnsignedInt(idx)))
+                    .collect();
+                ui.apply_op(&Operation::model_reset_range(model_id, start, items, None))?;
+                start = end;
+            }
+
+            Surface::builder(1).label("Root").create(ui)?;
+            List::builder(2).parent(1).model_ref(model_id).create(ui)?;
+            Ok(())
+        })
+        .expect("seed model larger than one model operation");
+
+    // The seeding ops are adjacent, so the store holds a single 25_000-item cached range.
+    session.with_store(|store| {
+        let model = store.get_model(model_id).expect("seeded model");
+        assert_eq!(model.cached_ranges().len(), 1);
+        assert_eq!(model.cached_item_count(), TOTAL_ITEMS as usize);
+    });
+
+    let seeded_revision = session.current_revision();
+    evict_journal_window(&session, seeded_revision);
+
+    let resume = srui_protocol::ClientResume {
+        session_id: "resync-chunked-model".to_string(),
+        client_instance_id: vec![9],
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+    };
+    let snapshot_tx = match session.handle_resume(&resume).expect("resume handled") {
+        ResumeOutcome::Resync {
+            snapshot_transaction,
+            ..
+        } => snapshot_transaction,
+        ResumeOutcome::Replay { .. } => panic!("expected resync, got replay"),
+    };
+
+    let mut exported_items = 0usize;
+    let mut reset_ops = 0usize;
+    for op in &snapshot_tx.operations {
+        if let Some(srui_protocol::operation::Op::ModelResetRange(reset)) = &op.op {
+            reset_ops += 1;
+            exported_items += reset.items.len();
+            assert!(
+                reset.items.len() <= DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+                "MODEL_RESET_RANGE carries {} items, over the §26 per-operation limit of {}",
+                reset.items.len(),
+                DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION
+            );
+        }
+    }
+    assert_eq!(reset_ops, 3);
+    assert_eq!(exported_items, TOTAL_ITEMS as usize);
+
+    // The decisive assertion: a client enforcing the default §26 limits can apply the snapshot.
+    let replayed = apply_resync_snapshot(snapshot_tx).expect("apply chunked resync snapshot");
     session.with_store(|store| assert_stores_equivalent(store, &replayed));
 }
 

@@ -12,26 +12,65 @@ import Darwin
 import Glibc
 #endif
 
-/// Signals a blocking reader thread to stop before it re-enters `read(2)`.
+/// Owns the socket descriptor read by a blocking reader thread, and closes it exactly once.
 ///
-/// The reader owns a raw fd by value. Without this latch an `EINTR` retry could re-enter `read`
-/// after `close()` already released the descriptor, at which point the number may have been
-/// recycled by an unrelated `open` elsewhere in the process and the loop would publish another
-/// file's bytes as protocol frames.
+/// A stop flag alone is not enough: `while !isStopped { read(fd) }` is check-then-act, so the
+/// reader can pass the check, be descheduled while `close()` runs to completion, and then call
+/// `read` on a descriptor number the kernel has already recycled to an unrelated `open` elsewhere
+/// in the process — silently consuming another owner's bytes. The latch therefore keeps the
+/// descriptor: a stop requested while the reader is inside `read(2)` only shuts the socket down (to
+/// wake it) and defers the `close(2)` to the reader on its way out, so the number can never be
+/// recycled while the reader might still touch it.
 final class SocketReadLatch: @unchecked Sendable {
     private let lock = NSLock()
     private var _isStopped = false
+    private var fd: Int32 = -1
+    private var readerHoldsFD = false
 
-    var isStopped: Bool {
+    /// Transfers ownership of `descriptor` to the latch. After this only the latch closes it.
+    func adopt(descriptor: Int32) {
         lock.lock()
-        defer { lock.unlock() }
-        return _isStopped
+        fd = descriptor
+        lock.unlock()
     }
 
+    /// Returns the descriptor to read from, or `nil` once stopped, claiming it for the reader.
+    func beginRead() -> Int32? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !_isStopped, fd >= 0 else { return nil }
+        readerHoldsFD = true
+        return fd
+    }
+
+    /// Releases the reader's claim, performing the deferred close if a stop landed mid-read.
+    func endRead() {
+        lock.lock()
+        readerHoldsFD = false
+        let doomed = _isStopped ? fd : -1
+        if doomed >= 0 { fd = -1 }
+        lock.unlock()
+
+        if doomed >= 0 {
+            Darwin.close(doomed)
+        }
+    }
+
+    /// Stops the loop, wakes a blocked `read(2)`, and releases the descriptor unless the reader is
+    /// currently inside `read`, in which case `endRead()` closes it.
     func stop() {
         lock.lock()
         _isStopped = true
+        let current = fd
+        let readerBusy = readerHoldsFD
+        if current >= 0 && !readerBusy { fd = -1 }
         lock.unlock()
+
+        guard current >= 0 else { return }
+        Darwin.shutdown(current, SHUT_RDWR)
+        if !readerBusy {
+            Darwin.close(current)
+        }
     }
 }
 
@@ -60,12 +99,9 @@ public actor UnixSocketTransport: Transport {
     }
 
     deinit {
+        // The latch owns the descriptor and closes it exactly once, deferring to the reader thread
+        // if one is parked in `read(2)`.
         readLatch.stop()
-        let fd = socketFD
-        if fd >= 0 {
-            Darwin.shutdown(fd, SHUT_RDWR)
-            Darwin.close(fd)
-        }
         // Otherwise a consumer still iterating `receiveStream()` would hang forever. Drop the
         // termination handler first: it captures `self` weakly, and forming that reference while
         // the actor is mid-deallocation traps.
@@ -123,6 +159,7 @@ public actor UnixSocketTransport: Transport {
         }
 
         self.socketFD = fd
+        readLatch.adopt(descriptor: fd)
         startReadingLoop()
     }
 
@@ -186,15 +223,19 @@ public actor UnixSocketTransport: Transport {
     /// of the connection, starving the same pool that decodes and applies transactions (§22.2).
     private func startReadingLoop() {
         guard readThread == nil else { return }
-        let fd = self.socketFD
         let cont = self.continuation
         let latch = self.readLatch
 
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
 
-            while !latch.isStopped {
+            while true {
+                // The latch hands out the descriptor only while it is guaranteed open, and takes it
+                // back in `endRead()`, so the number can never be recycled underneath this `read`.
+                guard let fd = latch.beginRead() else { break }
                 let bytesRead = Darwin.read(fd, &buffer, buffer.count)
+                let err = errno
+                latch.endRead()
 
                 if bytesRead > 0 {
                     cont.yield(Data(buffer[0..<bytesRead]))
@@ -203,7 +244,6 @@ public actor UnixSocketTransport: Transport {
                     cont.finish()
                     return
                 } else {
-                    let err = errno
                     if err == EINTR {
                         continue
                     }
@@ -227,16 +267,14 @@ public actor UnixSocketTransport: Transport {
         guard !isClosed else { return }
         isClosed = true
 
-        // Latch first, then shutdown to wake a blocked `read`, then release the descriptor. `send`
-        // and `close` are both actor-isolated, so no write can be in flight against this fd here.
+        // The latch stops the loop, shuts the socket down to wake a blocked `read`, and closes the
+        // descriptor — or hands that close to the reader if it is inside `read(2)` right now. That
+        // ordering is what makes joining the reader thread unnecessary: the number is never
+        // released while the reader might still use it. `send` and `close` are both actor-isolated,
+        // so no write can be in flight against this fd here.
         readLatch.stop()
         readThread = nil
+        socketFD = -1
         continuation.finish()
-
-        if socketFD >= 0 {
-            Darwin.shutdown(socketFD, SHUT_RDWR)
-            Darwin.close(socketFD)
-            socketFD = -1
-        }
     }
 }

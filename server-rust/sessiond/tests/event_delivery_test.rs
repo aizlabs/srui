@@ -14,10 +14,12 @@ use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
-use srui_protocol::{srui_message, ClientHello, SruiCodec, SruiMessage};
+use srui_protocol::{
+    srui_message, ClientHello, EventAckStatus, ServerEventAck, SruiCodec, SruiMessage,
+};
 use srui_sdk::{Button, NodeId, ACTIVATE, LABEL};
-use srui_semantic_tree::{Event, EventValidationError};
-use srui_sessiond::{handle_connection, ConnectionError, Session, SessionError};
+use srui_semantic_tree::Event;
+use srui_sessiond::{handle_connection, ConnectionError, Session};
 
 const CLIENT_A: &[u8] = b"client-instance-a";
 const CLIENT_B: &[u8] = b"client-instance-b";
@@ -110,6 +112,45 @@ async fn drain_one_transaction(read: &mut ClientRead) {
     }
 }
 
+/// Reads the `SERVER EVENT_ACK` settling the event just sent on this connection (§18.2).
+///
+/// The ack always precedes any transaction the handler commits: the handler runs inline in
+/// `process_event`, so the commit is merely queued on the broadcast channel while the ack is
+/// written straight back to this connection.
+async fn recv_event_ack(read: &mut ClientRead) -> ServerEventAck {
+    let msg = timeout(Duration::from_secs(2), read.next())
+        .await
+        .expect("timed out waiting for event ack")
+        .expect("stream ended while waiting for event ack")
+        .expect("decode event ack frame");
+    match msg.msg {
+        Some(srui_message::Msg::ServerEventAck(ack)) => ack,
+        other => panic!("expected ServerEventAck envelope, got {:?}", other),
+    }
+}
+
+/// Closes the client end and asserts the connection loop exited cleanly rather than with an error.
+///
+/// A rejected event must leave the stream usable (§18.2), so the only way this connection ends is
+/// the client hanging up.
+async fn assert_connection_survived(
+    write: ClientWrite,
+    read: ClientRead,
+    server_task: tokio::task::JoinHandle<Result<(), ConnectionError>>,
+) {
+    drop(write);
+    drop(read);
+    let result = timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server task timed out after a rejected event")
+        .expect("server task join");
+    assert!(
+        result.is_ok(),
+        "a rejected event must not tear down the connection, got {:?}",
+        result
+    );
+}
+
 async fn assert_no_pending_frame(read: &mut ClientRead) {
     let pending = timeout(Duration::from_millis(50), read.next())
         .await
@@ -194,9 +235,19 @@ async fn test_duplicate_event_id_same_client_no_repeat_side_effects() {
 
     send_activate(&mut client_write, CLIENT_A, 1, "evt-dup", 1, btn).await;
     wait_until(Duration::from_secs(2), || invocations.load(Ordering::SeqCst) == 1).await;
+    let first_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(first_ack.status(), EventAckStatus::Processed);
+    assert_eq!(first_ack.revision_after_effect, 2);
     drain_one_transaction(&mut client_read).await;
 
     send_activate(&mut client_write, CLIENT_A, 2, "evt-dup", 1, btn).await;
+    // The replay is settled from the result cache with the *prior* outcome (§18.2), and no
+    // transaction follows because the handler did not run again.
+    let dup_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(dup_ack.status(), EventAckStatus::Duplicate);
+    assert_eq!(dup_ack.event_id, b"evt-dup");
+    assert_eq!(dup_ack.revision_after_effect, 2);
+    assert_eq!(dup_ack.last_processed_event_seq, 1);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_no_pending_frame(&mut client_read).await;
 
@@ -223,9 +274,9 @@ async fn test_different_client_instances_dedupe_isolated() {
 
     let shutdown = CancellationToken::new();
 
-    let (mut write_a, _read_a, _task_a) =
+    let (mut write_a, mut read_a, _task_a) =
         connect_client(session.clone(), shutdown.clone(), CLIENT_A).await;
-    let (mut write_b, _read_b, _task_b) =
+    let (mut write_b, mut read_b, _task_b) =
         connect_client(session.clone(), shutdown.clone(), CLIENT_B).await;
 
     // Same event ID from two client instances must both dispatch.
@@ -234,6 +285,45 @@ async fn test_different_client_instances_dedupe_isolated() {
     wait_until(Duration::from_secs(2), || invocations.load(Ordering::SeqCst) == 2).await;
 
     assert_eq!(invocations.load(Ordering::SeqCst), 2);
+
+    // Each connection is acked for its own event, and the sequence high-water mark is scoped to
+    // the `client_instance_id` just like the dedupe window (§18, §18.2).
+    let ack_a = recv_event_ack(&mut read_a).await;
+    assert_eq!(ack_a.status(), EventAckStatus::Processed);
+    assert_eq!(ack_a.client_instance_id, CLIENT_A);
+    assert_eq!(ack_a.last_processed_event_seq, 1);
+
+    let ack_b = recv_event_ack(&mut read_b).await;
+    assert_eq!(ack_b.status(), EventAckStatus::Processed);
+    assert_eq!(ack_b.client_instance_id, CLIENT_B);
+    assert_eq!(ack_b.last_processed_event_seq, 1);
+}
+
+#[tokio::test]
+async fn test_ack_sequence_advances_monotonically_across_events() {
+    let session = Arc::new(Session::new("ack-seq-monotonic"));
+    let btn = NodeId::new(1);
+    seed_button(&session, btn);
+
+    let shutdown = CancellationToken::new();
+    let (mut client_write, mut client_read, _server_task) =
+        connect_client(session.clone(), shutdown, CLIENT_A).await;
+
+    for seq in 1..=3u64 {
+        send_activate(
+            &mut client_write,
+            CLIENT_A,
+            seq,
+            &format!("evt-{seq}"),
+            1,
+            btn,
+        )
+        .await;
+        let ack = recv_event_ack(&mut client_read).await;
+        assert_eq!(ack.status(), EventAckStatus::Processed);
+        assert_eq!(ack.event_id, format!("evt-{seq}").as_bytes());
+        assert_eq!(ack.last_processed_event_seq, seq);
+    }
 }
 
 #[tokio::test]
@@ -249,23 +339,29 @@ async fn test_missing_node_event_rejected_without_mutation() {
     });
 
     let shutdown = CancellationToken::new();
-    let (mut client_write, _client_read, server_task) =
+    let (mut client_write, mut client_read, server_task) =
         connect_client(session.clone(), shutdown, CLIENT_A).await;
 
     let missing = NodeId::new(999);
     send_activate(&mut client_write, CLIENT_A, 1, "evt-missing", 1, missing).await;
 
-    let server_result = server_task.await.expect("server task join");
-    match server_result {
-        Err(ConnectionError::Session(SessionError::EventValidation(
-            EventValidationError::NodeNotFound(id),
-        ))) => assert_eq!(id, missing),
-        other => panic!("expected NodeNotFound session error, got {:?}", other),
-    }
+    // §18.2: the event is settled as REJECTED, not answered by closing the connection — a torn
+    // connection would be resumed and the same invalid event replayed forever.
+    let ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(ack.status(), EventAckStatus::Rejected);
+    assert_eq!(ack.event_id, b"evt-missing");
+    assert_eq!(ack.last_processed_event_seq, 1);
+    assert!(
+        ack.reject_reason.contains("999"),
+        "reject_reason should name the missing node, got {:?}",
+        ack.reject_reason
+    );
 
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(session.current_revision(), 1);
     assert_eq!(session.node_count(), 1);
+
+    assert_connection_survived(client_write, client_read, server_task).await;
 }
 
 #[tokio::test]
@@ -292,22 +388,25 @@ async fn test_disabled_node_event_rejected_without_mutation() {
     });
 
     let shutdown = CancellationToken::new();
-    let (mut client_write, _client_read, server_task) =
+    let (mut client_write, mut client_read, server_task) =
         connect_client(session.clone(), shutdown, CLIENT_A).await;
 
     send_activate(&mut client_write, CLIENT_A, 1, "evt-disabled", 1, disabled_btn).await;
 
-    let server_result = server_task.await.expect("server task join");
-    match server_result {
-        Err(ConnectionError::Session(SessionError::EventValidation(
-            EventValidationError::NodeDisabled(id),
-        ))) => assert_eq!(id, disabled_btn),
-        other => panic!("expected NodeDisabled session error, got {:?}", other),
-    }
+    let ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(ack.status(), EventAckStatus::Rejected);
+    assert_eq!(ack.event_id, b"evt-disabled");
+    assert!(
+        ack.reject_reason.contains("disabled"),
+        "reject_reason should name the refusal, got {:?}",
+        ack.reject_reason
+    );
 
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(session.current_revision(), 1);
     assert_eq!(session.node_count(), 2);
+
+    assert_connection_survived(client_write, client_read, server_task).await;
 }
 
 #[tokio::test]
@@ -323,24 +422,25 @@ async fn test_future_revision_event_rejected_without_mutation() {
     });
 
     let shutdown = CancellationToken::new();
-    let (mut client_write, _client_read, server_task) =
+    let (mut client_write, mut client_read, server_task) =
         connect_client(session.clone(), shutdown, CLIENT_A).await;
 
     send_activate(&mut client_write, CLIENT_A, 1, "evt-future", 99, btn).await;
 
-    let server_result = server_task.await.expect("server task join");
-    match server_result {
-        Err(ConnectionError::Session(SessionError::EventValidation(
-            EventValidationError::FutureRevision { observed, current },
-        ))) => {
-            assert_eq!(observed.get(), 99);
-            assert_eq!(current.get(), 1);
-        }
-        other => panic!("expected FutureRevision session error, got {:?}", other),
-    }
+    let ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(ack.status(), EventAckStatus::Rejected);
+    assert_eq!(ack.event_id, b"evt-future");
+    assert_eq!(ack.revision_after_effect, 1);
+    assert!(
+        ack.reject_reason.contains("99"),
+        "reject_reason should name the future revision, got {:?}",
+        ack.reject_reason
+    );
 
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(session.current_revision(), 1);
+
+    assert_connection_survived(client_write, client_read, server_task).await;
 }
 
 #[tokio::test]
@@ -364,7 +464,7 @@ async fn test_rejected_events_do_not_advance_revision() {
         .expect("journal replay");
 
     let shutdown = CancellationToken::new();
-    let (mut client_write, _client_read, server_task) =
+    let (mut client_write, mut client_read, server_task) =
         connect_client(session.clone(), shutdown, CLIENT_A).await;
 
     send_activate(
@@ -377,7 +477,11 @@ async fn test_rejected_events_do_not_advance_revision() {
     )
     .await;
 
-    let _ = server_task.await.expect("server task join");
+    assert_eq!(
+        recv_event_ack(&mut client_read).await.status(),
+        EventAckStatus::Rejected
+    );
+    assert_connection_survived(client_write, client_read, server_task).await;
 
     assert_eq!(session.current_revision(), baseline_revision);
     let journal_after = session
@@ -410,6 +514,10 @@ async fn test_handler_reentry_transaction_no_deadlock() {
         connect_client(session.clone(), shutdown, CLIENT_A).await;
 
     send_activate(&mut client_write, CLIENT_A, 1, "evt-reentry", 1, btn).await;
+    assert_eq!(
+        recv_event_ack(&mut client_read).await.status(),
+        EventAckStatus::Processed
+    );
     drain_one_transaction(&mut client_read).await;
 
     assert_eq!(session.current_revision(), 2);

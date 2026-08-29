@@ -1155,6 +1155,49 @@ public nonisolated enum Srui_Protocol_NullValue: SwiftProtobuf.Enum, Swift.CaseI
 
 }
 
+/// Settlement status of a single client event (§18.2, Appendix B).
+public nonisolated enum Srui_Protocol_EventAckStatus: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case processed // = 1
+  case duplicate // = 2
+  case rejected // = 3
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .processed
+    case 2: self = .duplicate
+    case 3: self = .rejected
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .processed: return 1
+    case .duplicate: return 2
+    case .rejected: return 3
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_EventAckStatus] = [
+    .unspecified,
+    .processed,
+    .duplicate,
+    .rejected,
+  ]
+
+}
+
 public nonisolated struct Srui_Protocol_TypeRef: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -1996,6 +2039,37 @@ public nonisolated struct Srui_Protocol_Event: Sendable {
   fileprivate var _eventType: Srui_Protocol_TypeRef? = nil
 }
 
+/// Server acknowledgement settling exactly one client event (§18, §18.2, §19.2).
+///
+/// The dedupe cache keyed on (client_instance_id, event_id) is the *idempotency*
+/// mechanism; this ack is the *settlement* mechanism that lets the client retire the
+/// event from its retry set and raise `ClientResume.last_acked_event_seq`.
+public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var clientInstanceID: Data = Data()
+
+  /// The event this ack settles (§18.2)
+  public var eventID: Data = Data()
+
+  /// Cumulative high-water mark for this client instance
+  public var lastProcessedEventSeq: UInt64 = 0
+
+  public var status: Srui_Protocol_EventAckStatus = .unspecified
+
+  /// Store revision after side effects (Appendix B)
+  public var revisionAfterEffect: UInt64 = 0
+
+  /// Diagnostic only, bounded by max_string_length (§26)
+  public var rejectReason: String = String()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 /// Negotiated operational boundaries (§15) to prevent unbounded memory allocation
 /// on variable-length wire fields (strings, byte arrays, collections, transactions).
 public nonisolated struct Srui_Protocol_ClientLimits: Sendable {
@@ -2231,6 +2305,14 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     set {msg = .event(newValue)}
   }
 
+  public var serverEventAck: Srui_Protocol_ServerEventAck {
+    get {
+      if case .serverEventAck(let v)? = msg {return v}
+      return Srui_Protocol_ServerEventAck()
+    }
+    set {msg = .serverEventAck(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Msg: Equatable, Sendable {
@@ -2241,6 +2323,7 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     case serverResyncRequired(Srui_Protocol_ServerResyncRequired)
     case transaction(Srui_Protocol_Transaction)
     case event(Srui_Protocol_Event)
+    case serverEventAck(Srui_Protocol_ServerEventAck)
 
   }
 
@@ -2321,6 +2404,10 @@ nonisolated extension Srui_Protocol_StandardOperation: SwiftProtobuf._ProtoNameP
 
 nonisolated extension Srui_Protocol_NullValue: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0NULL_VALUE\0")
+}
+
+nonisolated extension Srui_Protocol_EventAckStatus: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0EVENT_ACK_STATUS_UNSPECIFIED\0\u{1}EVENT_ACK_STATUS_PROCESSED\0\u{1}EVENT_ACK_STATUS_DUPLICATE\0\u{1}EVENT_ACK_STATUS_REJECTED\0")
 }
 
 nonisolated extension Srui_Protocol_TypeRef: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
@@ -3970,6 +4057,61 @@ nonisolated extension Srui_Protocol_Event: SwiftProtobuf.Message, SwiftProtobuf.
   }
 }
 
+nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ServerEventAck"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_id\0\u{3}last_processed_event_seq\0\u{1}status\0\u{3}revision_after_effect\0\u{3}reject_reason\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.clientInstanceID) }()
+      case 2: try { try decoder.decodeSingularBytesField(value: &self.eventID) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.lastProcessedEventSeq) }()
+      case 4: try { try decoder.decodeSingularEnumField(value: &self.status) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.revisionAfterEffect) }()
+      case 6: try { try decoder.decodeSingularStringField(value: &self.rejectReason) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.clientInstanceID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.clientInstanceID, fieldNumber: 1)
+    }
+    if !self.eventID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.eventID, fieldNumber: 2)
+    }
+    if self.lastProcessedEventSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.lastProcessedEventSeq, fieldNumber: 3)
+    }
+    if self.status != .unspecified {
+      try visitor.visitSingularEnumField(value: self.status, fieldNumber: 4)
+    }
+    if self.revisionAfterEffect != 0 {
+      try visitor.visitSingularUInt64Field(value: self.revisionAfterEffect, fieldNumber: 5)
+    }
+    if !self.rejectReason.isEmpty {
+      try visitor.visitSingularStringField(value: self.rejectReason, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ServerEventAck, rhs: Srui_Protocol_ServerEventAck) -> Bool {
+    if lhs.clientInstanceID != rhs.clientInstanceID {return false}
+    if lhs.eventID != rhs.eventID {return false}
+    if lhs.lastProcessedEventSeq != rhs.lastProcessedEventSeq {return false}
+    if lhs.status != rhs.status {return false}
+    if lhs.revisionAfterEffect != rhs.revisionAfterEffect {return false}
+    if lhs.rejectReason != rhs.rejectReason {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
 nonisolated extension Srui_Protocol_ClientLimits: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ClientLimits"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}max_frame_size\0\u{3}max_transaction_operations\0\u{3}max_tree_depth\0\u{3}max_node_count\0\u{3}max_string_length\0\u{3}max_resource_size\0")
@@ -4360,7 +4502,7 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
 
 nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SruiMessage"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4459,6 +4601,19 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
           self.msg = .event(v)
         }
       }()
+      case 8: try {
+        var v: Srui_Protocol_ServerEventAck?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .serverEventAck(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .serverEventAck(v)
+        }
+      }()
       default: break
       }
     }
@@ -4497,6 +4652,10 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
     case .event?: try {
       guard case .event(let v)? = self.msg else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
+    }()
+    case .serverEventAck?: try {
+      guard case .serverEventAck(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
     }()
     case nil: break
     }

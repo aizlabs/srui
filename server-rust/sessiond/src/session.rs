@@ -1,7 +1,7 @@
 //! # Session State & Transaction Coordination
 //!
 //! Authoritative state owner managing [`SemanticStore`], [`TransactionJournal`],
-//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §20.2, §21).
+//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §20.2, §21, App. B).
 //!
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
-use srui_event_dedupe::EventDeduplicator;
+use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal};
 use srui_protocol::{
     ClientHello, ClientResume, Event, ExtensionNamespaceMapping, ServerLimits,
@@ -69,6 +69,33 @@ pub enum SessionError {
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Settled outcome of one client event, carried to the client as `SERVER EVENT_ACK` (§18.2).
+///
+/// Every variant is *terminal* for that `event_id`: once the client sees any of them it may drop
+/// the event from its retry set. `last_processed_event_seq` is the cumulative high-water mark for
+/// the event's `client_instance_id` and outlives the connection (§18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventOutcome {
+    /// Newly admitted, validated, and dispatched to handlers.
+    Processed {
+        revision_after_effect: u64,
+        last_processed_event_seq: u64,
+    },
+    /// Replay of an already-settled `event_id`: answered from the result cache without re-running
+    /// the action (§18.2, App. B). `accepted` echoes whether the original attempt was processed.
+    Duplicate {
+        accepted: bool,
+        revision_after_effect: u64,
+        last_processed_event_seq: u64,
+    },
+    /// Refused by event validation. The event is settled, not retried.
+    Rejected {
+        error: EventValidationError,
+        revision_after_effect: u64,
+        last_processed_event_seq: u64,
+    },
 }
 
 /// Outcome of a [`ClientResume`] handshake request.
@@ -396,37 +423,68 @@ impl Session {
     /// Processes an incoming client event: checks for deduplication,
     /// validates interactive status against the store, and dispatches to registered handlers (§7.7, §27, §29).
     ///
-    /// Returns `Ok(true)` if newly accepted and valid, or `Ok(false)` if duplicate.
-    pub fn process_event(&self, event: &Event) -> Result<bool, SessionError> {
-        let matching_handlers = {
+    /// Returns the settled [`EventOutcome`], which the connection turns into a `SERVER EVENT_ACK`
+    /// (§18.2). A validation failure is a *rejection of that event*, not a protocol violation: it
+    /// is reported as [`EventOutcome::Rejected`] rather than an `Err`, because tearing the
+    /// connection down would make the client reconnect and replay the same invalid event forever.
+    /// Only infrastructure failures (a poisoned lock) remain `Err`.
+    pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
+        let (matching_handlers, last_processed_event_seq) = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
-            // Deduplication check (§18.2, §32.4)
-            if !guard.dedupe.record_event(event) {
-                return Ok(false); // Duplicate event ignored
-            }
+            // Deduplication check (§18.2, §32.4). A replay is answered from the result cache
+            // instead of re-running the action.
+            let last_processed_event_seq = match guard.dedupe.admit_event(event) {
+                RecordOutcome::Duplicate {
+                    prior,
+                    last_processed_event_seq,
+                } => {
+                    return Ok(EventOutcome::Duplicate {
+                        accepted: prior.accepted,
+                        revision_after_effect: prior.revision_after_effect,
+                        last_processed_event_seq,
+                    })
+                }
+                RecordOutcome::Fresh {
+                    last_processed_event_seq,
+                } => last_processed_event_seq,
+            };
 
             let node_id = srui_semantic_tree::NodeId::new(event.node_id);
             let obs_rev = srui_semantic_tree::Revision::new(event.observed_revision);
+            let current_rev = guard.store.revision();
 
-            if obs_rev > guard.store.revision() {
-                return Err(SessionError::EventValidation(
-                    EventValidationError::FutureRevision {
-                        observed: obs_rev,
-                        current: guard.store.revision(),
+            let validation = if obs_rev > current_rev {
+                Err(EventValidationError::FutureRevision {
+                    observed: obs_rev,
+                    current: current_rev,
+                })
+            } else {
+                match guard.store.get_node(node_id) {
+                    None => Err(EventValidationError::NodeNotFound(node_id)),
+                    Some(node) => {
+                        if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
+                            Err(EventValidationError::NodeDisabled(node_id))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            };
+
+            if let Err(error) = validation {
+                guard.dedupe.settle_event(
+                    event,
+                    EventOutcomeRecord {
+                        accepted: false,
+                        revision_after_effect: current_rev.get(),
                     },
-                ));
-            }
-
-            let node = guard
-                .store
-                .get_node(node_id)
-                .ok_or(EventValidationError::NodeNotFound(node_id))?;
-
-            if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
-                return Err(SessionError::EventValidation(
-                    EventValidationError::NodeDisabled(node_id),
-                ));
+                );
+                return Ok(EventOutcome::Rejected {
+                    error,
+                    revision_after_effect: current_rev.get(),
+                    last_processed_event_seq,
+                });
             }
 
             let event_type = event
@@ -434,18 +492,37 @@ impl Session {
                 .map(srui_semantic_tree::TypeRef::from)
                 .unwrap_or(srui_semantic_tree::TypeRef::new(0, 0));
 
-            guard
+            let handlers = guard
                 .handlers
                 .get(&(node_id, event_type))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (handlers, last_processed_event_seq)
         }; // Lock released here!
 
         for handler in matching_handlers {
             handler(self, event);
         }
 
-        Ok(true)
+        // Sampled after dispatch so the ack reports the revision the side effect produced
+        // (App. B `semantic_revision_after_effect`).
+        let revision_after_effect = {
+            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            let revision_after_effect = guard.store.revision().get();
+            guard.dedupe.settle_event(
+                event,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect,
+                },
+            );
+            revision_after_effect
+        };
+
+        Ok(EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        })
     }
 
     /// Returns the current revision of the store.

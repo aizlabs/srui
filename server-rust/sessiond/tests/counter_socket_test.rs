@@ -25,11 +25,11 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientHello, ClientResume, FramingError, SruiCodec, SruiMessage,
+    srui_message, ClientHello, ClientResume, EventAckStatus, FramingError, ServerEventAck,
+    SruiCodec, SruiMessage,
 };
 use srui_sdk::*;
-use srui_semantic_tree::EventValidationError;
-use srui_sessiond::{handle_connection, ConnectionError, Session, SessionError};
+use srui_sessiond::{handle_connection, ConnectionError, Session};
 
 const COUNTER_CLIENT_A: &[u8] = &[10, 20, 30, 40];
 const COUNTER_CLIENT_B: &[u8] = &[50, 60, 70, 80];
@@ -254,6 +254,23 @@ impl CounterConnection {
         }
     }
 
+    /// Consumes the `SERVER EVENT_ACK` settling the event this connection just sent (§18.2).
+    ///
+    /// The ack precedes any transaction the event's handler commits: the handler runs inline in
+    /// `process_event`, so the commit is only queued on the broadcast channel while the ack is
+    /// written directly to this connection.
+    async fn recv_event_ack(&mut self) -> ServerEventAck {
+        let msg = timeout(Duration::from_secs(2), self.read.next())
+            .await
+            .expect("timed out waiting for event ack")
+            .expect("stream ended while waiting for event ack")
+            .expect("decode event ack frame");
+        match msg.msg {
+            Some(srui_message::Msg::ServerEventAck(ack)) => ack,
+            other => panic!("expected ServerEventAck envelope, got {:?}", other),
+        }
+    }
+
     async fn expect_no_message(&mut self, wait: Duration) {
         let pending = timeout(wait, self.read.next()).await;
         match pending {
@@ -449,6 +466,20 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
             .await
             .expect("send activate event frame");
 
+        // The event is settled first (§18.2), then the committed transaction is broadcast.
+        let ack_envelope = framed_read
+            .next()
+            .await
+            .expect("receive event ack")
+            .expect("decode event ack frame");
+        match ack_envelope.msg {
+            Some(srui_message::Msg::ServerEventAck(ack)) => {
+                assert_eq!(ack.status(), EventAckStatus::Processed);
+                assert_eq!(ack.last_processed_event_seq, seq);
+            }
+            other => panic!("expected ServerEventAck for click {}, got {:?}", seq, other),
+        }
+
         // Receive framed Transaction response over the Unix socket
         let response_envelope = framed_read
             .next()
@@ -620,6 +651,20 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
             .await
             .expect("send activate event frame");
 
+        // The event is settled first (§18.2), then the committed transaction is broadcast.
+        let ack_envelope = framed_read
+            .next()
+            .await
+            .expect("receive event ack")
+            .expect("decode event ack frame");
+        match ack_envelope.msg {
+            Some(srui_message::Msg::ServerEventAck(ack)) => {
+                assert_eq!(ack.status(), EventAckStatus::Processed);
+                assert_eq!(ack.last_processed_event_seq, seq);
+            }
+            other => panic!("expected ServerEventAck for click {}, got {:?}", seq, other),
+        }
+
         let response_envelope = framed_read
             .next()
             .await
@@ -719,6 +764,10 @@ async fn test_counter_duplicate_activate_across_reconnect_no_double_increment() 
 
     conn.send_activate(COUNTER_CLIENT_A, 1, "click-dup", 1, button_id)
         .await;
+    let ack = conn.recv_event_ack().await;
+    assert_eq!(ack.status(), EventAckStatus::Processed);
+    assert_eq!(ack.event_id, b"click-dup");
+    assert_eq!(ack.last_processed_event_seq, 1);
     let tx = conn.recv_transaction().await;
     assert_eq!(tx.new_revision, 2);
     fixture.assert_count(1);
@@ -740,6 +789,13 @@ async fn test_counter_duplicate_activate_across_reconnect_no_double_increment() 
     resumed
         .send_activate(COUNTER_CLIENT_A, 2, "click-dup", 2, button_id)
         .await;
+
+    // The replay is answered from the result cache: settled as DUPLICATE, handler not re-run, so
+    // no transaction follows.
+    let dup_ack = resumed.recv_event_ack().await;
+    assert_eq!(dup_ack.status(), EventAckStatus::Duplicate);
+    assert_eq!(dup_ack.event_id, b"click-dup");
+    assert_eq!(dup_ack.revision_after_effect, 2);
     resumed
         .expect_no_message(Duration::from_millis(100))
         .await;
@@ -769,16 +825,23 @@ async fn test_counter_disabled_button_rejects_activate() {
     conn.send_activate(COUNTER_CLIENT_A, 1, "click-disabled", 2, button_id)
         .await;
 
-    let server_result = conn.server_task.await.expect("server task join");
-    match server_result {
-        Err(ConnectionError::Session(SessionError::EventValidation(
-            EventValidationError::NodeDisabled(id),
-        ))) => assert_eq!(id, button_id),
-        other => panic!("expected NodeDisabled session error, got {:?}", other),
-    }
+    // §18.2: validation refusal settles the event with a REJECTED ack. Closing the connection
+    // instead would make the client resume, replay the same invalid event, and be closed again.
+    let ack = conn.recv_event_ack().await;
+    assert_eq!(ack.status(), EventAckStatus::Rejected);
+    assert_eq!(ack.event_id, b"click-disabled");
+    assert_eq!(ack.last_processed_event_seq, 1);
+    assert!(
+        ack.reject_reason.contains("disabled"),
+        "reject_reason should name the refusal, got {:?}",
+        ack.reject_reason
+    );
 
+    // The connection survives and no state changed.
+    conn.expect_no_message(Duration::from_millis(100)).await;
     assert_eq!(fixture.session.current_revision(), 2);
     fixture.assert_count(0);
+    conn.cancel_and_join().await.expect("connection clean exit");
 }
 
 #[tokio::test]
@@ -792,19 +855,20 @@ async fn test_counter_future_revision_event_rejects_activate() {
     conn.send_activate(COUNTER_CLIENT_A, 1, "click-future", 99, button_id)
         .await;
 
-    let server_result = conn.server_task.await.expect("server task join");
-    match server_result {
-        Err(ConnectionError::Session(SessionError::EventValidation(
-            EventValidationError::FutureRevision { observed, current },
-        ))) => {
-            assert_eq!(observed.get(), 99);
-            assert_eq!(current.get(), 1);
-        }
-        other => panic!("expected FutureRevision session error, got {:?}", other),
-    }
+    let ack = conn.recv_event_ack().await;
+    assert_eq!(ack.status(), EventAckStatus::Rejected);
+    assert_eq!(ack.event_id, b"click-future");
+    assert_eq!(ack.revision_after_effect, 1);
+    assert!(
+        ack.reject_reason.contains("99"),
+        "reject_reason should name the future revision, got {:?}",
+        ack.reject_reason
+    );
 
+    conn.expect_no_message(Duration::from_millis(100)).await;
     assert_eq!(fixture.session.current_revision(), 1);
     fixture.assert_count(0);
+    conn.cancel_and_join().await.expect("connection clean exit");
 }
 
 #[tokio::test]
@@ -820,6 +884,12 @@ async fn test_two_counter_clients_receive_identical_revisions() {
     client_a
         .send_activate(COUNTER_CLIENT_A, 1, "click-a", 1, button_id)
         .await;
+
+    // The ack is unicast to the originating connection; client B sees only the broadcast
+    // transaction (§18.2, §20.2).
+    let ack_a = client_a.recv_event_ack().await;
+    assert_eq!(ack_a.status(), EventAckStatus::Processed);
+    assert_eq!(ack_a.client_instance_id, COUNTER_CLIENT_A);
 
     let tx_a = client_a.recv_transaction().await;
     let tx_b = client_b.recv_transaction().await;
@@ -900,6 +970,16 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
         .await
         .expect("send ACTIVATE on surviving client");
 
+    let ack_b = timeout(Duration::from_secs(2), framed_read_b.next())
+        .await
+        .expect("timed out waiting for client B event ack")
+        .expect("client B stream ended")
+        .expect("decode client B event ack");
+    assert!(matches!(
+        ack_b.msg,
+        Some(srui_message::Msg::ServerEventAck(_))
+    ));
+
     let tx_b = timeout(Duration::from_secs(2), framed_read_b.next())
         .await
         .expect("timed out waiting for client B transaction")
@@ -934,6 +1014,16 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
         .send(wire_activate(COUNTER_CLIENT_B, 2, "click-b-2", 2, button_id))
         .await
         .expect("send second ACTIVATE on surviving client");
+
+    let ack_b2 = timeout(Duration::from_secs(2), framed_read_b.next())
+        .await
+        .expect("timed out waiting for second client B event ack")
+        .expect("client B stream ended")
+        .expect("decode second client B event ack");
+    assert!(matches!(
+        ack_b2.msg,
+        Some(srui_message::Msg::ServerEventAck(_))
+    ));
 
     let tx_b2 = timeout(Duration::from_secs(2), framed_read_b.next())
         .await

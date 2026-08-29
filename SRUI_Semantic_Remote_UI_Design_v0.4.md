@@ -997,6 +997,22 @@ message Event {
   TypeRef event_type = 6;
   repeated Property arguments = 7;
 }
+
+enum EventAckStatus {
+  EVENT_ACK_STATUS_UNSPECIFIED = 0;
+  EVENT_ACK_STATUS_PROCESSED = 1;
+  EVENT_ACK_STATUS_DUPLICATE = 2;
+  EVENT_ACK_STATUS_REJECTED = 3;
+}
+
+message ServerEventAck {
+  bytes client_instance_id = 1;
+  bytes event_id = 2;
+  uint64 last_processed_event_seq = 3;
+  EventAckStatus status = 4;
+  uint64 revision_after_effect = 5;
+  string reject_reason = 6;
+}
 ```
 
 Tiny UI messages are not compressed. Large snapshots/resources may negotiate zstd, but compression must not delay high-priority control traffic.
@@ -1050,6 +1066,23 @@ last_acked_event_seq
 per-terminal received stream offsets
 ```
 
+`last_acked_event_seq` is raised **only** by a `SERVER EVENT_ACK` (§18.2). In steady state each
+client event is settled by exactly one ack on the connection that carried it:
+
+```text
+CLIENT EVENT
+  client_instance_id = c17
+  event_seq = 593
+  event_id = e123
+
+SERVER EVENT_ACK
+  client_instance_id = c17
+  event_id = e123
+  last_processed_event_seq = 593
+  status = PROCESSED
+  revision_after_effect = 1843
+```
+
 On a new authenticated transport:
 
 ```text
@@ -1062,6 +1095,9 @@ CLIENT RESUME
 SERVER RESUME_OK
   replay_from_revision = 1843
 ```
+
+Events sent but not acknowledged before the previous transport died are replayed after `RESUME`
+with their original `event_id`, and each replay is answered with its own `EVENT_ACK`.
 
 If the server still has the transaction journal, it replays missed committed transactions.
 
@@ -1107,6 +1143,35 @@ The client must not send a second semantically independent delete after reconnec
 Every application-side-effect event therefore contains a stable `event_id`. The server keeps a bounded deduplication/result cache. Re-delivery of the same event returns the prior acknowledgement/result and does not re-run the action.
 
 This gives retry-safe behavior across ambiguous disconnects.
+
+**Acknowledgement is normative.** The dedupe cache and the acknowledgement are two different
+mechanisms and neither replaces the other: the cache keyed on `(client_instance_id, event_id)`
+provides *idempotency*, so a replay is safe; the ack provides *settlement*, so the client knows it
+may stop replaying. Without the ack the retry set only ever grows, and a bounded cache eventually
+rolls or is lost to a server restart while the client is still replaying — at which point the
+replay re-runs the action, which is exactly the failure this section exists to prevent.
+
+Rules:
+
+- Every application-side-effect event received on an attached connection MUST be answered with
+  exactly one `SERVER EVENT_ACK` on that same connection. Acks are control-class traffic (§19.2)
+  and are never coalesced or dropped behind lower-priority traffic.
+- The ack carries the settled `event_id`, the cumulative `last_processed_event_seq` for that
+  `client_instance_id`, a status, and the `revision_after_effect` recorded in the result cache
+  (Appendix B).
+- `PROCESSED` — newly admitted, validated, and dispatched.
+- `DUPLICATE` — a replay of an already-settled `event_id`; the ack returns the prior result and the
+  action is not re-run. A replay of an event that was originally refused is answered `REJECTED`
+  again, so a replay never reads as newly handled.
+- `REJECTED` — refused by event validation (unknown node, disabled node, future
+  `observed_revision`). This is a rejection of the event, not a protocol violation: the connection
+  stays open and the event is *settled*. Closing the connection instead would make the client
+  reconnect, replay the same invalid event, and be closed again indefinitely.
+- All three statuses are terminal for that `event_id`. On receiving any of them the client removes
+  the event from its pending set and raises `last_acked_event_seq`.
+- Acks are optional to *consume*: a client that does not recognize a status still settles the event
+  by `event_id`. This is not a violation of the fail-closed rule of §4 inv. 13, which governs
+  unknown **required** semantics; an acknowledgement conveys no semantic state.
 
 ### 18.3 Pending text edits
 
@@ -1171,7 +1236,7 @@ Within the SRUI stream:
 
 | Logical class | Priority | Examples |
 |---|---:|---|
-| control | highest | HELLO, WELCOME, errors, resume, ACK |
+| control | highest | HELLO, WELCOME, errors, resume, EVENT_ACK (§18.2) |
 | input | highest | semantic user events |
 | UI | high | committed transactions |
 | terminal | high/normal | interactive PTY bytes |
@@ -1724,6 +1789,10 @@ maximum pending unacknowledged events
 maximum terminal escape payload lengths
 ```
 
+`maximum pending unacknowledged events` bounds the client's retry set, which is drained by
+`SERVER EVENT_ACK` (§18.2). Reaching the bound means events are being discarded before they were
+known to be processed, so an eviction there MUST be reported rather than silently dropped.
+
 Further rules:
 
 - resource hashes are verified before cache commit;
@@ -1954,6 +2023,10 @@ while detached for journal retention period
 beyond journal retention period
 ```
 
+The "after side effect but before ACK" boundary is the ambiguous window of §18.2: the client
+replays the event on resume and the server must answer `DUPLICATE` from its result cache rather
+than re-running the action.
+
 Verify deterministic replay/resync and no duplicate side effects.
 
 ### 31.6 Terminal benchmark
@@ -2084,7 +2157,10 @@ Event result cache:
 }
 ```
 
-This cache may be bounded by acknowledged event sequence + time, with conservative retention for destructive actions.
+`status` and `semantic_revision_after_effect` are exactly the fields returned in `SERVER EVENT_ACK`
+(§18.2); a `DUPLICATE` ack is served from this cache rather than by re-running the action.
+
+This cache may be bounded by acknowledged event sequence + time, with conservative retention for destructive actions. Retention is keyed on `last_processed_event_seq`: entries at or below the sequence a client has acknowledged can no longer be replayed by that client.
 
 ---
 

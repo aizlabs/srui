@@ -10,6 +10,8 @@
 //   observes a half-committed transaction.
 // - §18 Reconnect and resynchronization: `CLIENT RESUME` carries `last_applied_revision` and
 //   `last_acked_event_seq`; `SERVER RESYNC_REQUIRED` is the *only* trigger for snapshot replacement.
+// - §18.2 Event settlement: `SERVER EVENT_ACK` is the only thing that raises
+//   `last_acked_event_seq` and drains the outbox's retry set.
 // - §22.2 Threading: network IO and protobuf decoding run off the main actor; AppKit mutations
 //   are dispatched to `MainActor`.
 // - §4 inv. 13: unrecoverable divergence fails explicitly instead of degrading silently.
@@ -264,9 +266,42 @@ public final class SessionController: @unchecked Sendable {
         case .transaction(let wireTx):
             await handleTransaction(wireTx)
 
+        case .serverEventAck(let ack):
+            await handleEventAck(ack)
+
         default:
             break
         }
+    }
+
+    /// Settles one outbound event against the server's acknowledgement (§18, §18.2).
+    ///
+    /// Every status is terminal for that `event_id` — including `rejected`. An event the server
+    /// refuses must be dropped here: leaving it pending would replay it on the next resume, which
+    /// the server would refuse again, forever.
+    private func handleEventAck(_ ack: SRUIServerEventAck) async {
+        let eventId = EventId(ack.eventID)
+
+        switch ack.status {
+        case .rejected:
+            SessionDiagnostics.error(
+                "Server rejected event \(eventId) at revision \(ack.revisionAfterEffect): \(ack.rejectReason)"
+            )
+        case .processed, .duplicate:
+            SessionDiagnostics.log(
+                "Event \(eventId) settled as \(ack.status) at revision \(ack.revisionAfterEffect)"
+            )
+        case .unspecified, .UNRECOGNIZED:
+            // An ack is optional-to-consume: §4 inv. 13 requires unknown *required* semantics to
+            // fail closed, and a settlement status this build does not know is not one. Settle by
+            // id and keep going rather than stranding the event in the retry set forever.
+            SessionDiagnostics.log(
+                "Event \(eventId) settled with unrecognized ack status \(ack.status)"
+            )
+        }
+
+        await outbox.acknowledgeEvent(id: eventId)
+        await outbox.acknowledgeEvents(throughSeq: ack.lastProcessedEventSeq)
     }
 
     private func handleTransaction(_ wireTx: SRUITransaction) async {

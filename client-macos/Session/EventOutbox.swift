@@ -2,7 +2,7 @@
 // EventOutbox.swift
 // Session
 //
-// Outbound semantic event queue, monotonic sequence tracking, and retry-safe event dispatch (§7.7, §16, §18.2, §22).
+// Outbound semantic event queue, monotonic sequence tracking, and retry-safe event dispatch (§7.7, §16, §18.2, §22, §26).
 //
 
 import Foundation
@@ -126,8 +126,13 @@ public actor EventOutbox {
     }
 
     /// Acknowledges every event up to and including `seq` (§18: `last_acked_event_seq`).
+    ///
+    /// A sequence beyond `currentEventSeq` is ignored. The server's `last_processed_event_seq` is
+    /// cumulative per `client_instance_id` and outlives the connection, while a freshly constructed
+    /// `EventOutbox` restarts its own counter at zero; honoring a stale-high mark would retire
+    /// events this outbox has only just sent and that were never acknowledged.
     public func acknowledgeEvents(throughSeq seq: UInt64) {
-        guard seq > _lastAckedEventSeq else { return }
+        guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return }
         _lastAckedEventSeq = seq
         for (id, event) in pendingEvents where event.eventSeq <= seq {
             pendingEvents.removeValue(forKey: id)
@@ -147,7 +152,12 @@ public actor EventOutbox {
         }
         while pendingOrder.count > maxPendingEvents {
             let evicted = pendingOrder.removeFirst()
-            pendingEvents.removeValue(forKey: evicted)
+            let dropped = pendingEvents.removeValue(forKey: evicted)
+            // §26 bounds "maximum pending unacknowledged events", but an eviction here discards an
+            // event that may never have been processed, so it must be visible rather than silent.
+            SessionDiagnostics.error(
+                "Pending event outbox full at \(maxPendingEvents); dropping unacknowledged event \(evicted) (seq \(dropped?.eventSeq ?? 0))"
+            )
         }
     }
 }

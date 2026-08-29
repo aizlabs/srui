@@ -23,6 +23,8 @@ public typealias SRUIServerWelcome = Srui_Protocol_ServerWelcome
 public typealias SRUIClientResume = Srui_Protocol_ClientResume
 public typealias SRUIServerResumeOk = Srui_Protocol_ServerResumeOk
 public typealias SRUIServerResyncRequired = Srui_Protocol_ServerResyncRequired
+public typealias SRUIServerEventAck = Srui_Protocol_ServerEventAck
+public typealias SRUIEventAckStatus = Srui_Protocol_EventAckStatus
 public typealias SRUIMessage = Srui_Protocol_SruiMessage
 
 public typealias SRUIModelItem = Srui_Protocol_ModelItem

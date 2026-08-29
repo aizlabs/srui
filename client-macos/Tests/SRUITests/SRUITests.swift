@@ -461,6 +461,78 @@ final class SRUITests: XCTestCase {
         XCTAssertEqual(encodedData, fixtureData, "Authored Swift Framed SruiMessage byte mismatch against golden fixture")
     }
 
+    /// Authors the golden `ServerEventAck` envelope from scratch (§18.2), independently of the fixture.
+    private func createAuthoredEventAck() -> Srui_Protocol_SruiMessage {
+        var ack = Srui_Protocol_ServerEventAck()
+        ack.clientInstanceID = Data("c17".utf8)
+        ack.eventID = Data("e123".utf8)
+        ack.lastProcessedEventSeq = 593
+        ack.status = .processed
+        ack.revisionAfterEffect = 1843
+        ack.rejectReason = ""
+
+        var msg = Srui_Protocol_SruiMessage()
+        msg.serverEventAck = ack
+        return msg
+    }
+
+    func testDecodeGoldenEventAckAgainstExpectedJSON() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let ackSpec = vectors["golden_event_ack"] as? [String: Any],
+              let filename = ackSpec["file"] as? String,
+              let expectedHex = ackSpec["hex"] as? String,
+              let expectedSHA256 = ackSpec["sha256"] as? String,
+              let expectedByteLen = ackSpec["byte_length"] as? Int,
+              let expected = ackSpec["expected"] as? [String: Any] else {
+            XCTFail("Malformed expected.json structure for golden_event_ack")
+            return
+        }
+
+        let fileURL = conformanceVectorsDir.appendingPathComponent(filename)
+        let data = try Data(contentsOf: fileURL)
+
+        // 1. Assert raw bytes match canonical specification
+        XCTAssertEqual(data.count, expectedByteLen, "Fixture byte length mismatch")
+        XCTAssertEqual(hexString(from: data), expectedHex, "Fixture hex mismatch")
+        XCTAssertEqual(sha256String(from: data), expectedSHA256, "Fixture SHA256 mismatch")
+
+        // 2. Decode framed message and assert against JSON oracle
+        let decoded = try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: data)
+        guard case .serverEventAck(let ack)? = decoded.msg else {
+            XCTFail("Expected serverEventAck in framed message, got \(String(describing: decoded.msg))")
+            return
+        }
+        XCTAssertEqual(ack.clientInstanceID, Data((expected["client_instance_id"] as? String ?? "").utf8))
+        XCTAssertEqual(ack.eventID, Data((expected["event_id"] as? String ?? "").utf8))
+        XCTAssertEqual(ack.lastProcessedEventSeq, UInt64(expected["last_processed_event_seq"] as? Int ?? -1))
+        XCTAssertEqual(ack.status.rawValue, expected["status"] as? Int ?? -1)
+        XCTAssertEqual(ack.status, .processed, "status_name \(expected["status_name"] as? String ?? "?")")
+        XCTAssertEqual(ack.revisionAfterEffect, UInt64(expected["revision_after_effect"] as? Int ?? -1))
+        XCTAssertEqual(ack.rejectReason, expected["reject_reason"] as? String ?? "<missing>")
+
+        // 3. Re-encode and verify identical wire bytes
+        let roundtripData = try SRUIFraming.encodeFramed(decoded)
+        XCTAssertEqual(roundtripData, data, "Roundtrip re-encode framed mismatch")
+    }
+
+    func testDirectEncodeGoldenEventAckMatchesWireBytes() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let ackSpec = vectors["golden_event_ack"] as? [String: Any],
+              let filename = ackSpec["file"] as? String,
+              let expectedHex = ackSpec["hex"] as? String else {
+            XCTFail("Malformed expected.json structure for golden_event_ack")
+            return
+        }
+
+        let fixtureData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+        let encodedData = try SRUIFraming.encodeFramed(createAuthoredEventAck())
+
+        XCTAssertEqual(hexString(from: encodedData), expectedHex, "Authored Swift Framed ServerEventAck hex mismatch")
+        XCTAssertEqual(encodedData, fixtureData, "Authored Swift Framed ServerEventAck byte mismatch against golden fixture")
+    }
+
     func testLengthDelimitedFraming() throws {
         var msg = Srui_Protocol_SruiMessage()
         msg.transaction = createAuthoredTransaction()

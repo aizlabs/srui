@@ -118,6 +118,145 @@ struct EventOutboxRetryTests {
         await server.close()
     }
 
+    @Test("A SERVER EVENT_ACK settles the event and raises last_acked_event_seq (§18.2)")
+    func serverEventAckDrainsPendingEvent() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+
+        let event = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: client
+        )
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = event.eventId.bytes
+        ack.lastProcessedEventSeq = event.eventSeq
+        ack.status = .processed
+        ack.revisionAfterEffect = 4
+
+        var message = SRUIMessage()
+        message.serverEventAck = ack
+        await controller.handleIncomingMessage(message)
+
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == event.eventSeq)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("A REJECTED ack settles the event so it is never replayed (§18.2)")
+    func rejectedAckDropsEventInsteadOfReplayingIt() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+
+        let event = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: client
+        )
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = event.eventId.bytes
+        ack.lastProcessedEventSeq = event.eventSeq
+        ack.status = .rejected
+        ack.rejectReason = "node 7 is disabled"
+
+        var message = SRUIMessage()
+        message.serverEventAck = ack
+        await controller.handleIncomingMessage(message)
+
+        // Left pending, the rejected event would be replayed on every resume and refused every
+        // time — an unbounded loop the ack exists to break.
+        #expect(await outbox.pendingCount == 0)
+        await outbox.resendPendingEvents(via: client)
+
+        let messages = await collector.wait(forAtLeast: 1)
+        #expect(try events(in: messages).count == 1)
+
+        await collector.stop()
+        await client.close()
+        await server.close()
+    }
+
+    @Test("A resume after every event is acknowledged replays nothing (§18)")
+    func resumeAfterAcksReplaysNothing() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox, sessionId: "session-9")
+
+        for node in 1...3 {
+            let event = try await outbox.sendActivate(
+                nodeId: NodeId(UInt64(node)),
+                observedRevision: Revision(1),
+                via: client
+            )
+            var ack = SRUIServerEventAck()
+            ack.clientInstanceID = outbox.clientInstanceId.bytes
+            ack.eventID = event.eventId.bytes
+            ack.lastProcessedEventSeq = event.eventSeq
+            ack.status = .processed
+            var message = SRUIMessage()
+            message.serverEventAck = ack
+            await controller.handleIncomingMessage(message)
+        }
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == 3)
+
+        let beforeResume = try events(in: await collector.wait(forAtLeast: 3)).count
+        try await controller.start()
+
+        // The handshake frame arrives; nothing after it is a replayed event.
+        let messages = await collector.wait(forAtLeast: beforeResume + 1)
+        #expect(try events(in: messages).count == beforeResume)
+        let resume = try #require(messages.compactMap { message -> SRUIClientResume? in
+            guard case .clientResume(let resume) = message.msg else { return nil }
+            return resume
+        }.first)
+        #expect(resume.lastAckedEventSeq == 3)
+
+        await controller.stop()
+        await collector.stop()
+        await server.close()
+    }
+
+    @Test("A high-water mark beyond this outbox's own sequence is ignored (§18)")
+    func staleHighWaterMarkDoesNotRetireUnackedEvents() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: client
+        )
+        #expect(await outbox.pendingCount == 1)
+
+        // The server tracks `last_processed_event_seq` per client_instance_id and it outlives the
+        // connection, while a fresh outbox restarts its own counter at zero. Honoring a mark the
+        // outbox never issued would retire an event that was never acknowledged.
+        await outbox.acknowledgeEvents(throughSeq: 5_000)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        await client.close()
+        await server.close()
+    }
+
     @Test("The resume handshake reports the last acknowledged event sequence (§18)")
     func handshakeReportsLastAckedEventSeq() async throws {
         let (client, server) = await PipeTransport.createPair()

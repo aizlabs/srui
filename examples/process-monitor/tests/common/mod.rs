@@ -51,13 +51,8 @@ pub fn fixture(initial: ProcessSnapshot) -> Fixture {
     ));
     let source = FakeProcessSource::new(initial);
     let terminator = RecordingTerminator::default();
-    let monitor = Monitor::start(
-        session.clone(),
-        source.boxed(),
-        terminator.boxed(),
-        Some(UID),
-    )
-    .expect("monitor starts");
+    let monitor = Monitor::start(session.clone(), source.boxed(), terminator.boxed(), UID)
+        .expect("monitor starts");
     Fixture {
         monitor,
         source,

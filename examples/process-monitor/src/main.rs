@@ -64,19 +64,102 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     })
 }
 
-/// Removes a stale socket path, refusing to unlink anything that is not a Unix socket.
-fn clear_stale_socket(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::FileTypeExt;
+/// A socket path this process created and is therefore allowed to unlink.
+struct OwnedSocket {
+    path: PathBuf,
+    /// `(device, inode)` of the endpoint created by this process.
+    identity: (u64, u64),
+}
+
+impl OwnedSocket {
+    /// Removes the socket, but only while the path still resolves to the endpoint we bound.
+    ///
+    /// If a replacement server has since taken the path over, its socket has a different inode and
+    /// is left alone.
+    fn remove(&self) {
+        match socket_identity(&self.path) {
+            Ok(Some(identity)) if identity == self.identity => {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    warn!("failed to remove {}: {error}", self.path.display());
+                }
+            }
+            Ok(Some(_)) => warn!(
+                "leaving {} in place: it now belongs to another server",
+                self.path.display()
+            ),
+            Ok(None) | Err(_) => {}
+        }
+    }
+}
+
+/// Returns the `(device, inode)` identity of `path` when it is a Unix socket.
+///
+/// `Ok(None)` means the path does not exist; a path that exists but is not a socket is an error, so
+/// an unrelated file is never a removal candidate.
+fn socket_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            Ok(Some((metadata.dev(), metadata.ino())))
+        }
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!("{} exists and is not a Unix socket", path.display()),
         )),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err),
     }
+}
+
+/// Binds `path`, refusing to displace a socket another server is still listening on.
+///
+/// An existing socket is probed by connecting to it: a successful connection means a live server
+/// owns the endpoint and this process must not start. Only a socket that refuses connections is
+/// treated as stale and unlinked.
+async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if socket_identity(path)?.is_some() {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "{} is already served by a running process; pass a different --socket",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                info!("removing stale socket {}", path.display());
+                std::fs::remove_file(path)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let listener = UnixListener::bind(path)?;
+    let identity = socket_identity(path)?.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "{} vanished immediately after bind",
+            path.display()
+        ))
+    })?;
+    Ok((
+        listener,
+        OwnedSocket {
+            path: path.to_path_buf(),
+            identity,
+        },
+    ))
 }
 
 #[tokio::main]
@@ -124,6 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Bind before sampling so a duplicate instance fails fast and never disturbs the live server.
+    let (listener, owned_socket) = bind_owned_socket(&options.socket_path).await?;
+    info!(
+        "listening on Unix domain socket: {}",
+        options.socket_path.display()
+    );
+
     let uid = effective_uid();
     let monitor = {
         let session = session.clone();
@@ -133,12 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // placeholder.
             let source = SysinfoProcessSource::new();
             std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-            Monitor::start(
-                session,
-                Box::new(source),
-                Box::new(SignalTerminator),
-                Some(uid),
-            )
+            Monitor::start(session, Box::new(source), Box::new(SignalTerminator), uid)
         })
         .await??
     };
@@ -168,16 +253,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-
-    clear_stale_socket(&options.socket_path)?;
-    if let Some(parent) = options.socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let listener = UnixListener::bind(&options.socket_path)?;
-    info!(
-        "listening on Unix domain socket: {}",
-        options.socket_path.display()
-    );
 
     loop {
         tokio::select! {
@@ -209,7 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!("task ended abnormally: {error}");
         }
     }
-    let _ = clear_stale_socket(&options.socket_path);
+    owned_socket.remove();
     info!("process monitor shutdown complete");
     Ok(())
 }

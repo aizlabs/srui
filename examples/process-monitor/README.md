@@ -33,6 +33,9 @@ Guardrails that are always in force:
   `ProcessKey(pid, start_time)` it assigned, then re-reads the live process's start time immediately
   before signalling. A mismatch (or a vanished PID) is refused as stale, so a recycled PID can never
   be hit.
+- **Single-process targets only.** PID 0 is denylisted and the numeric target is validated before
+  `kill(2)` is called, so a process-group (`0`, negative) or broadcast (`-1`) target — which a
+  `u32 as i32` cast could otherwise produce — can never be signalled.
 - **No shell.** Termination goes through `kill(2)` via `nix`. The example never constructs a command
   line and never invokes `sh`, `bash`, `zsh`, or `system()`.
 - **PID text is never trusted.** Row text, PID text, row index, labels and `action_key` sent by the
@@ -44,8 +47,9 @@ By default (`show_all = false`) the table lists processes owned by the effective
 monitor. Turning on **Show all processes** switches to the full enumeration. This filter is
 authoritative server behaviour: the client never invents or applies it locally. The toggle's
 authoritative `VALUE` is confirmed back to the client in the same transaction that republishes
-membership. A process whose owner the platform does not report is shown rather than silently hidden
-(§4 inv. 13).
+membership. Filtered mode means exactly "owned by the effective user": a process whose owner the
+platform does not report cannot be proven to be yours, so it is excluded until **Show all
+processes** is enabled.
 
 Rows are sorted by `(pid, start_time)` — deliberately *not* by CPU, which would reorder most rows
 every second and force structural model churn (§23).
@@ -74,8 +78,11 @@ Options:
 | `--socket <path>` | Unix socket to bind. Defaults to the `srui-ssh-bridge` convention. |
 | `--wire-stats` | Log the framed byte size and operation mix of every committed transaction. |
 
-A malformed or missing option argument is rejected with a clear error. A stale socket path is only
-removed after verifying it really is a Unix socket; the socket is removed again on clean shutdown.
+A malformed or missing option argument is rejected with a clear error. An existing socket path is
+only unlinked after verifying that it is a Unix socket *and* that nothing answers a connection on
+it: if another server is live there, this instance refuses to start instead of stealing the
+endpoint. On clean shutdown the socket is removed only while the path still resolves to the
+endpoint this process bound, so a replacement server's socket is left alone.
 All diagnostics go to stderr, so a bridged stdout stays a pure binary protocol stream (§19.1).
 `Ctrl-C` stops accepting connections, cancels connection and polling tasks, cleans up the socket,
 and exits without panicking.

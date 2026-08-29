@@ -10,7 +10,7 @@ use srui_example_process_monitor::*;
 use srui_sdk::{ItemId, Operation, Value};
 
 fn seeded_state(processes: Vec<ProcessRecord>) -> MonitorState {
-    let mut state = MonitorState::with_denylist(Some(UID), HashSet::new());
+    let mut state = MonitorState::with_denylist(UID, HashSet::new());
     state.seed(&snapshot(25.0, processes));
     state
 }

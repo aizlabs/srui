@@ -205,7 +205,7 @@ fn selection_is_cleared_when_the_selected_process_is_filtered_out() {
 }
 
 #[test]
-fn processes_without_a_resolvable_owner_are_not_silently_hidden() {
+fn processes_without_a_resolvable_owner_are_excluded_until_show_all() {
     let fixture = common::fixture(snapshot(
         10.0,
         vec![
@@ -213,5 +213,13 @@ fn processes_without_a_resolvable_owner_are_not_silently_hidden() {
             record(12, 1, "unowned", 1.0, MIB, None),
         ],
     ));
+    // Filtered mode means exactly "owned by the effective user": unproven ownership is excluded.
+    assert_eq!(visible_pids(&fixture.monitor), vec![11]);
+
+    let event = toggle_event(1, fixture.session.current_revision(), Value::Bool(true));
+    fixture
+        .session
+        .process_event(&event)
+        .expect("event accepted");
     assert_eq!(visible_pids(&fixture.monitor), vec![11, 12]);
 }

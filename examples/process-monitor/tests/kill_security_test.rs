@@ -147,13 +147,8 @@ fn an_os_refusal_is_reported_without_crashing() {
     let terminator = srui_example_process_monitor::testing::RecordingTerminator::with_result(Err(
         TerminateError::PermissionDenied,
     ));
-    let monitor = Monitor::start(
-        session.clone(),
-        source.boxed(),
-        terminator.boxed(),
-        Some(UID),
-    )
-    .expect("monitor starts");
+    let monitor = Monitor::start(session.clone(), source.boxed(), terminator.boxed(), UID)
+        .expect("monitor starts");
 
     let item = monitor.with_state(|state| state.visible()[0].item_id);
     let event = selection_event(1, session.current_revision(), item);
@@ -183,10 +178,27 @@ fn a_malformed_activation_does_not_crash_or_terminate() {
 }
 
 #[test]
-fn the_default_denylist_covers_pid_1_and_this_process() {
+fn the_default_denylist_covers_pid_0_pid_1_and_this_process() {
     let fixture = common::base_fixture();
     fixture.monitor.with_state(|state| {
+        assert!(state.denylist().contains(&0));
         assert!(state.denylist().contains(&1));
         assert!(state.denylist().contains(&std::process::id()));
     });
+}
+
+#[test]
+fn pid_0_is_denied_because_it_would_signal_a_process_group() {
+    // macOS reports a real PID 0 (`kernel_task`), so this row can genuinely be selected.
+    let fixture = fixture(snapshot(
+        10.0,
+        vec![
+            record(0, 1, "kernel_task", 1.0, MIB, Some(UID)),
+            record(20, 1_000, "beta", 2.0, 2 * MIB, Some(UID)),
+        ],
+    ));
+    select(&fixture, 0);
+
+    assert_eq!(fixture.monitor.kill_selected(), KillOutcome::Denied(0));
+    assert!(fixture.terminator.calls().is_empty());
 }

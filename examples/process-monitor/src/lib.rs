@@ -234,6 +234,8 @@ pub trait ProcessSource: Send {
 /// Failure modes of a termination request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminateError {
+    /// The PID does not denote exactly one process and must never be signalled.
+    InvalidTarget(u32),
     /// The caller lacks permission to signal the target.
     PermissionDenied,
     /// The target process no longer exists.
@@ -245,10 +247,26 @@ pub enum TerminateError {
 impl std::fmt::Display for TerminateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidTarget(pid) => {
+                write!(f, "{pid} is not a single-process signal target")
+            }
             Self::PermissionDenied => write!(f, "permission denied"),
             Self::NoSuchProcess => write!(f, "no such process"),
             Self::Other(msg) => write!(f, "{msg}"),
         }
+    }
+}
+
+/// Converts a numeric PID into a `kill(2)` target that can only ever mean one process.
+///
+/// `kill(2)` gives non-positive PIDs broadcast semantics: `0` signals the caller's entire process
+/// group, `-1` every process the caller may signal, and any other negative value a process group.
+/// A `u32 as i32` cast can produce all three (`0` directly, and anything above `i32::MAX` by
+/// wrapping negative), so the value is validated instead of cast.
+pub fn signal_target_pid(pid: u32) -> Result<i32, TerminateError> {
+    match i32::try_from(pid) {
+        Ok(target) if target > 0 => Ok(target),
+        _ => Err(TerminateError::InvalidTarget(pid)),
     }
 }
 
@@ -283,7 +301,7 @@ pub enum KillOutcome {
 #[derive(Debug, Clone)]
 pub struct MonitorState {
     show_all: bool,
-    effective_uid: Option<u32>,
+    effective_uid: u32,
     selected_item: Option<ItemId>,
     next_item_id: u64,
     key_to_item: HashMap<ProcessKey, ItemId>,
@@ -335,15 +353,17 @@ impl TickPlan {
 
 impl MonitorState {
     /// Constructs state for the given effective user, denylisting PID 1 and this process (§27).
-    pub fn new(effective_uid: Option<u32>) -> Self {
+    pub fn new(effective_uid: u32) -> Self {
         let mut denylist = HashSet::new();
+        // PID 0 is not a process: `kill(2)` would read it as "my whole process group".
+        denylist.insert(0);
         denylist.insert(1);
         denylist.insert(std::process::id());
         Self::with_denylist(effective_uid, denylist)
     }
 
     /// Constructs state with an explicit denylist (tests supply deterministic values).
-    pub fn with_denylist(effective_uid: Option<u32>, denylist: HashSet<u32>) -> Self {
+    pub fn with_denylist(effective_uid: u32, denylist: HashSet<u32>) -> Self {
         Self {
             show_all: false,
             effective_uid,
@@ -429,16 +449,13 @@ impl MonitorState {
         )
     }
 
+    /// Filtered mode means exactly "owned by the effective user".
+    ///
+    /// A process whose owner the platform does not report cannot be proven to be the effective
+    /// user's, so it is excluded until the user asks for the full enumeration. Failing open here
+    /// would silently widen the documented filter (§27).
     fn is_visible(&self, record: &ProcessRecord, show_all: bool) -> bool {
-        if show_all {
-            return true;
-        }
-        match (self.effective_uid, record.uid) {
-            (Some(effective), Some(owner)) => effective == owner,
-            // Without a resolvable owner identity the server cannot claim ownership: fall back to
-            // showing the process rather than silently hiding system state (§4 inv. 13).
-            _ => true,
-        }
+        show_all || record.uid == Some(self.effective_uid)
     }
 
     fn plan(
@@ -810,7 +827,7 @@ impl Monitor {
         session: Arc<Session>,
         mut source: Box<dyn ProcessSource>,
         terminator: Box<dyn ProcessTerminator>,
-        effective_uid: Option<u32>,
+        effective_uid: u32,
     ) -> Result<Arc<Self>, SessionError> {
         let snapshot = source.sample();
         let mut state = MonitorState::new(effective_uid);
@@ -1148,7 +1165,11 @@ impl ProcessTerminator for SignalTerminator {
         use nix::sys::signal::{kill, Signal};
         use nix::unistd::Pid;
 
-        match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
+        // Validated before `Pid` is constructed: a process-group or broadcast target must never
+        // reach `kill(2)` (§27).
+        let target = signal_target_pid(pid)?;
+
+        match kill(Pid::from_raw(target), Signal::SIGTERM) {
             Ok(()) => Ok(()),
             Err(Errno::EPERM) => Err(TerminateError::PermissionDenied),
             Err(Errno::ESRCH) => Err(TerminateError::NoSuchProcess),

@@ -90,9 +90,8 @@ final class StateMachineConformanceTests: XCTestCase {
             }
         }
 
-        // Snapshot pre-transaction state for rollback verification
-        let preTxnStore = applier.store.cloneStaging()
-        let preTxnRevision = applier.store.revision
+        // Snapshot pre-transaction state for rollback verification (matches Rust take_snapshot)
+        let preTxnSnapshot = takeSnapshot(applier.store)
 
         // 3. Parse and apply test transaction
         let txnDict = try XCTUnwrap(json["transaction"] as? [String: Any], "[\(fileName)] Missing 'transaction' object")
@@ -149,25 +148,84 @@ final class StateMachineConformanceTests: XCTestCase {
             }
 
             if let rollbackVerified = outcomeDict["rollback_verified"] as? Bool, rollbackVerified {
+                let postTxnSnapshot = takeSnapshot(applier.store)
                 XCTAssertEqual(
-                    applier.store.revision,
-                    preTxnRevision,
-                    "[\(fileName)] Rollback revision mismatch"
-                )
-                XCTAssertEqual(
-                    applier.store.nodeCount,
-                    preTxnStore.nodeCount,
-                    "[\(fileName)] Rollback nodeCount mismatch"
-                )
-                XCTAssertEqual(
-                    applier.store.modelCount,
-                    preTxnStore.modelCount,
-                    "[\(fileName)] Rollback modelCount mismatch"
+                    postTxnSnapshot,
+                    preTxnSnapshot,
+                    "[\(fileName)] Store state was mutated despite transaction rollback"
                 )
             }
 
         default:
             XCTFail("[\(fileName)] Unknown outcome status: \(status)")
+        }
+    }
+
+    // MARK: - Store Snapshot (rollback parity with Rust take_snapshot)
+
+    private struct NodeSnapshot: Equatable {
+        let nodeType: TypeRef
+        let parentID: NodeId?
+        let orderedChildren: [NodeId]
+        let properties: [PropertyRef: Value]
+    }
+
+    private struct ModelSnapshot: Equatable {
+        let modelType: TypeRef
+        let itemCount: UInt64
+        let cachedItemCount: Int
+    }
+
+    private struct StoreSnapshot: Equatable {
+        let revision: Revision
+        let nodeCount: Int
+        let roots: [NodeId]
+        let nodes: [NodeId: NodeSnapshot]
+        let modelCount: Int
+        let models: [ModelId: ModelSnapshot]
+    }
+
+    private func takeSnapshot(_ store: SemanticStore) -> StoreSnapshot {
+        var nodes: [NodeId: NodeSnapshot] = [:]
+        for root in store.rootIDs {
+            collectNodesSnapshot(store, id: root, into: &nodes)
+        }
+
+        var models: [ModelId: ModelSnapshot] = [:]
+        for modelID in store.modelIDs {
+            if let model = store.getModel(modelID) {
+                models[modelID] = ModelSnapshot(
+                    modelType: model.modelType,
+                    itemCount: model.itemCount,
+                    cachedItemCount: model.cachedItemCount
+                )
+            }
+        }
+
+        return StoreSnapshot(
+            revision: store.revision,
+            nodeCount: store.nodeCount,
+            roots: store.rootIDs,
+            nodes: nodes,
+            modelCount: store.modelCount,
+            models: models
+        )
+    }
+
+    private func collectNodesSnapshot(
+        _ store: SemanticStore,
+        id: NodeId,
+        into nodes: inout [NodeId: NodeSnapshot]
+    ) {
+        guard let node = store.getNode(id) else { return }
+        nodes[id] = NodeSnapshot(
+            nodeType: node.nodeType,
+            parentID: node.parentID,
+            orderedChildren: node.orderedChildren,
+            properties: node.properties
+        )
+        for child in node.orderedChildren {
+            collectNodesSnapshot(store, id: child, into: &nodes)
         }
     }
 

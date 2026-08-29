@@ -118,6 +118,17 @@ pub enum EventOutcome {
     },
 }
 
+/// Result of an atomic fresh-client handshake bootstrap (§15, §18, §20.2).
+#[derive(Debug)]
+pub struct FreshClientBootstrap {
+    /// Negotiated welcome parameters sent to the fresh client (§15).
+    pub welcome: ServerWelcome,
+    /// Catch-up snapshot transaction for populated sessions, or `None` if revision is 0 (§18).
+    pub snapshot: Option<Transaction>,
+    /// Bounded broadcast receiver capturing every subsequent transaction committed to the session (§20.2).
+    pub transactions: broadcast::Receiver<Transaction>,
+}
+
 /// Outcome of a [`ClientResume`] handshake request.
 #[derive(Debug, Clone)]
 pub enum ResumeOutcome {
@@ -131,6 +142,42 @@ pub enum ResumeOutcome {
         resync_msg: ServerResyncRequired,
         snapshot_transaction: Transaction,
     },
+}
+
+fn prepare_hello(
+    inner: &SessionInner,
+    hello: &ClientHello,
+) -> Result<(ServerWelcome, Option<Transaction>), SessionError> {
+    let mut client_caps = CapabilitySet::new();
+    for p_str in &hello.profiles {
+        if let Ok(p) = Profile::parse(p_str) {
+            client_caps.insert(p);
+        }
+    }
+
+    let _negotiated = inner.capabilities.negotiate(&client_caps)?;
+
+    let initial_revision = inner.store.revision().get();
+    let welcome = ServerWelcome {
+        core_version: "0.4.0".to_string(),
+        required_profiles: inner.capabilities.required.to_string_vec(),
+        optional_profiles: inner.capabilities.optional.to_string_vec(),
+        session_id: inner.session_id.clone(),
+        initial_revision,
+        extension_namespaces: vec![ExtensionNamespaceMapping {
+            extension_uri: "org.srui.standard-widgets".to_string(),
+            namespace_id: 0,
+        }],
+        limits: Some(inner.limits),
+    };
+
+    let snapshot = if initial_revision > 0 {
+        Some(export_snapshot_transaction(&inner.store))
+    } else {
+        None
+    };
+
+    Ok((welcome, snapshot))
 }
 
 struct SessionInner {
@@ -268,42 +315,60 @@ impl Session {
     /// Evaluates a `ClientHello` handshake message, negotiates capabilities,
     /// and returns the `ServerWelcome` envelope plus a catch-up snapshot when the
     /// session already has committed state (§15, §18).
+    ///
+    /// # Errors
+    /// Returns [`SessionError::Negotiation`] if capability negotiation fails against client profiles.
+    /// Returns [`SessionError::LockPoisoned`] if the internal session mutex is poisoned.
     pub fn handle_hello(
         &self,
         hello: &ClientHello,
     ) -> Result<(ServerWelcome, Option<Transaction>), SessionError> {
         let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        prepare_hello(&guard, hello)
+    }
 
-        let mut client_caps = CapabilitySet::new();
-        for p_str in &hello.profiles {
-            if let Ok(p) = Profile::parse(p_str) {
-                client_caps.insert(p);
-            }
-        }
+    /// Atomically prepares a fresh client handshake and subscribes it to transactions (§15, §18, §20.2).
+    ///
+    /// Evaluates `ClientHello`, negotiates capabilities, constructs `ServerWelcome`, exports a catch-up
+    /// snapshot when `initial_revision > 0`, and subscribes to `tx_broadcast` while holding the session
+    /// lock so no concurrent transaction commit can be missed between snapshot export and subscription.
+    ///
+    /// # Lock Order
+    /// Acquires `inner -> tx_broadcast`. All other session operations acquire at most one of these mutexes,
+    /// preserving strict deadlock freedom.
+    ///
+    /// # Revision-Zero Omission
+    /// When `initial_revision == 0`, `snapshot` is `None` because an empty `0 -> 0` snapshot violates normal
+    /// transaction invariants.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::Negotiation`] if capability negotiation fails against client profiles.
+    /// Returns [`SessionError::LockPoisoned`] if an internal mutex is poisoned.
+    /// Returns [`SessionError::BroadcastClosed`] if the transaction broadcast sender has been closed.
+    pub fn bootstrap_fresh_client(
+        &self,
+        hello: &ClientHello,
+    ) -> Result<FreshClientBootstrap, SessionError> {
+        let inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let (welcome, snapshot) = prepare_hello(&inner_guard, hello)?;
 
-        let _negotiated = guard.capabilities.negotiate(&client_caps)?;
+        let tx_guard = self
+            .tx_broadcast
+            .lock()
+            .map_err(|_| SessionError::LockPoisoned)?;
+        let transactions = tx_guard
+            .as_ref()
+            .map(|sender| sender.subscribe())
+            .ok_or(SessionError::BroadcastClosed)?;
 
-        let initial_revision = guard.store.revision().get();
-        let welcome = ServerWelcome {
-            core_version: "0.4.0".to_string(),
-            required_profiles: guard.capabilities.required.to_string_vec(),
-            optional_profiles: guard.capabilities.optional.to_string_vec(),
-            session_id: guard.session_id.clone(),
-            initial_revision,
-            extension_namespaces: vec![ExtensionNamespaceMapping {
-                extension_uri: "org.srui.standard-widgets".to_string(),
-                namespace_id: 0,
-            }],
-            limits: Some(guard.limits),
-        };
+        drop(tx_guard);
+        drop(inner_guard);
 
-        let snapshot = if initial_revision > 0 {
-            Some(export_snapshot_transaction(&guard.store))
-        } else {
-            None
-        };
-
-        Ok((welcome, snapshot))
+        Ok(FreshClientBootstrap {
+            welcome,
+            snapshot,
+            transactions,
+        })
     }
 
     /// Evaluates a `ClientResume` reconnection request (§20.2, §21, §32.5).
@@ -528,14 +593,14 @@ impl Session {
                         revision_after_effect: prior.revision_after_effect,
                         last_processed_event_seq,
                         reject_reason: prior.reject_reason,
-                    })
+                    });
                 }
                 RecordOutcome::Pending {
                     last_processed_event_seq,
                 } => {
                     return Ok(EventOutcome::Pending {
                         last_processed_event_seq,
-                    })
+                    });
                 }
                 RecordOutcome::Fresh { .. } => {}
             }
@@ -897,7 +962,8 @@ mod tests {
         assert_eq!(committed.new_revision, 1);
         assert_eq!(session.current_revision(), 1);
 
-        let (welcome_after, snapshot_after) = session.handle_hello(&hello).expect("hello after commit");
+        let (welcome_after, snapshot_after) =
+            session.handle_hello(&hello).expect("hello after commit");
         assert_eq!(welcome_after.initial_revision, 1);
         let snapshot = snapshot_after.expect("hello catch-up snapshot");
         assert_eq!(snapshot.base_revision, 0);
@@ -969,5 +1035,46 @@ mod tests {
             }
             ResumeOutcome::Replay { .. } => panic!("expected resync, got replay"),
         }
+    }
+
+    #[test]
+    fn test_bootstrap_fresh_client() {
+        let session = Session::new("test-bootstrap-session");
+        let hello = ClientHello {
+            core_version: "0.4.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: vec![1, 2],
+            client_metadata: Default::default(),
+        };
+
+        let mut bootstrap0 = session
+            .bootstrap_fresh_client(&hello)
+            .expect("bootstrap rev0");
+        assert_eq!(bootstrap0.welcome.session_id, "test-bootstrap-session");
+        assert_eq!(bootstrap0.welcome.initial_revision, 0);
+        assert!(bootstrap0.snapshot.is_none());
+
+        let tx = Transaction {
+            base_revision: 0,
+            new_revision: 1,
+            priority: 1,
+            operations: vec![],
+        };
+        session.commit_transaction(tx).expect("commit tx");
+
+        let rec_tx = bootstrap0
+            .transactions
+            .try_recv()
+            .expect("receive broadcast");
+        assert_eq!(rec_tx.new_revision, 1);
+
+        let bootstrap1 = session
+            .bootstrap_fresh_client(&hello)
+            .expect("bootstrap rev1");
+        assert_eq!(bootstrap1.welcome.initial_revision, 1);
+        let snapshot = bootstrap1.snapshot.expect("snapshot for rev1");
+        assert_eq!(snapshot.base_revision, 0);
+        assert_eq!(snapshot.new_revision, 1);
     }
 }

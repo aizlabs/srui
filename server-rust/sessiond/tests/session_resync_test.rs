@@ -11,13 +11,13 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientResume, SessionContinuity, SruiCodec, SruiMessage,
+    srui_message, ClientHello, ClientResume, SessionContinuity, SruiCodec, SruiMessage,
     Transaction as WireTransaction,
 };
 use srui_sdk::*;
 use srui_semantic_tree::{
-    ItemId, ModelId, ModelItem, NodeId, Operation, Revision, SemanticStore,
-    StoreLimits, Transaction, TxnError, TypeRef, Value, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+    ItemId, ModelId, ModelItem, NodeId, Operation, Revision, SemanticStore, StoreLimits,
+    Transaction, TxnError, TypeRef, Value, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
 };
 use srui_sessiond::{handle_connection, ResumeOutcome, Session};
 
@@ -41,12 +41,8 @@ fn seed_session_with_tree_and_models(session: &Session) -> u64 {
                 None,
             ))?;
 
-            Surface::builder(1)
-                .label("Second Root")
-                .create(ui)?;
-            Surface::builder(2)
-                .label("First Root")
-                .create(ui)?;
+            Surface::builder(1).label("Second Root").create(ui)?;
+            Surface::builder(2).label("First Root").create(ui)?;
 
             List::builder(3)
                 .parent(2)
@@ -182,10 +178,7 @@ fn test_handle_resume_resync_snapshot_reconstructs_tree_and_models() {
         snapshot_tx
             .operations
             .iter()
-            .any(|op| matches!(
-                op.op,
-                Some(srui_protocol::operation::Op::CreateModel(_))
-            )),
+            .any(|op| matches!(op.op, Some(srui_protocol::operation::Op::CreateModel(_)))),
         "snapshot must export collection models"
     );
 
@@ -206,7 +199,11 @@ fn test_resync_snapshot_chunks_cached_ranges_within_item_limit() {
     let model_id = ModelId::new(20);
     session
         .transaction(|ui| {
-            ui.apply_op(&Operation::create_model(model_id, TypeRef::LIST, TOTAL_ITEMS))?;
+            ui.apply_op(&Operation::create_model(
+                model_id,
+                TypeRef::LIST,
+                TOTAL_ITEMS,
+            ))?;
             let mut start = 0u64;
             while start < TOTAL_ITEMS {
                 let end = (start + seed_chunk).min(TOTAL_ITEMS);
@@ -282,9 +279,10 @@ async fn test_connection_resync_delivers_snapshot_matching_authoritative_store()
 
     let session_clone = session.clone();
     let shutdown_clone = shutdown.clone();
-    let server_task = tokio::spawn(async move {
-        handle_connection(server_io, session_clone, shutdown_clone).await
-    });
+    let server_task =
+        tokio::spawn(
+            async move { handle_connection(server_io, session_clone, shutdown_clone).await },
+        );
 
     let (client_read, client_write) = tokio::io::split(client_io);
     let mut framed_read = FramedRead::new(client_read, SruiCodec::new());
@@ -334,12 +332,130 @@ async fn test_connection_resync_delivers_snapshot_matching_authoritative_store()
         assert_eq!(list.model_ref(store), Some(ModelId::new(10)));
         assert_eq!(list.label(store), Some("Services"));
         let model = store.get_model(ModelId::new(10)).expect("list model");
-        assert_eq!(model.get_item_by_index(0).unwrap().value, Value::String("alpha".into()));
-        assert_eq!(model.get_item_by_index(1).unwrap().value, Value::String("beta".into()));
+        assert_eq!(
+            model.get_item_by_index(0).unwrap().value,
+            Value::String("alpha".into())
+        );
+        assert_eq!(
+            model.get_item_by_index(1).unwrap().value,
+            Value::String("beta".into())
+        );
     });
 
     shutdown.cancel();
     drop(framed_write);
     drop(framed_read);
     let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
+    let session = Session::new("bootstrap-populated-test");
+    let seeded_revision = seed_session_with_tree_and_models(&session);
+    assert!(seeded_revision > 0);
+
+    let hello = ClientHello {
+        core_version: "0.4.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
+        limits: None,
+        client_instance_id: vec![1, 2, 3],
+        client_metadata: Default::default(),
+    };
+
+    let mut bootstrap = session
+        .bootstrap_fresh_client(&hello)
+        .expect("bootstrap succeeds");
+    assert_eq!(bootstrap.welcome.session_id, "bootstrap-populated-test");
+    assert_eq!(bootstrap.welcome.initial_revision, seeded_revision);
+
+    let snapshot = bootstrap
+        .snapshot
+        .expect("snapshot must be present for nonzero revision");
+    assert_eq!(bootstrap.welcome.initial_revision, snapshot.new_revision);
+    assert_eq!(snapshot.base_revision, 0);
+    assert_eq!(snapshot.new_revision, seeded_revision);
+
+    // Verify snapshot operation presence for both nodes and models
+    let has_create_model = snapshot
+        .operations
+        .iter()
+        .any(|op| matches!(op.op, Some(srui_protocol::operation::Op::CreateModel(_))));
+    let has_model_items = snapshot.operations.iter().any(|op| {
+        matches!(
+            op.op,
+            Some(srui_protocol::operation::Op::ModelResetRange(_))
+        )
+    });
+    let has_create_node = snapshot
+        .operations
+        .iter()
+        .any(|op| matches!(op.op, Some(srui_protocol::operation::Op::CreateNode(_))));
+    assert!(has_create_model, "snapshot must contain CreateModel ops");
+    assert!(has_model_items, "snapshot must contain ModelResetRange ops");
+    assert!(has_create_node, "snapshot must contain CreateNode ops");
+
+    // Applying the snapshot to a fresh SemanticStore produces a store equivalent to the authoritative store
+    let replayed = apply_resync_snapshot(snapshot.clone()).expect("apply snapshot to fresh store");
+    session.with_store(|store| assert_stores_equivalent(store, &replayed));
+
+    // A commit immediately after bootstrap is received from bootstrap.transactions with base_revision == snapshot.new_revision
+    let next_tx = WireTransaction {
+        base_revision: seeded_revision,
+        new_revision: seeded_revision + 1,
+        priority: 1,
+        operations: vec![],
+    };
+    session
+        .commit_transaction(next_tx)
+        .expect("commit next transaction");
+
+    let received = bootstrap
+        .transactions
+        .recv()
+        .await
+        .expect("receive transaction");
+    assert_eq!(received.base_revision, snapshot.new_revision);
+    assert_eq!(received.new_revision, snapshot.new_revision + 1);
+}
+
+#[tokio::test]
+async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() {
+    let session = Session::new("bootstrap-rev0-test");
+    assert_eq!(session.current_revision(), 0);
+
+    let hello = ClientHello {
+        core_version: "0.4.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
+        limits: None,
+        client_instance_id: vec![4, 5, 6],
+        client_metadata: Default::default(),
+    };
+
+    let mut bootstrap = session
+        .bootstrap_fresh_client(&hello)
+        .expect("bootstrap rev0");
+    assert_eq!(bootstrap.welcome.initial_revision, 0);
+    assert!(
+        bootstrap.snapshot.is_none(),
+        "revision-zero bootstrap must omit snapshot"
+    );
+
+    // Receiver captures the first 0 -> 1 transaction
+    let first_tx = WireTransaction {
+        base_revision: 0,
+        new_revision: 1,
+        priority: 1,
+        operations: vec![],
+    };
+    session
+        .commit_transaction(first_tx)
+        .expect("commit first tx");
+
+    let received = bootstrap
+        .transactions
+        .recv()
+        .await
+        .expect("receive first transaction");
+    assert_eq!(received.base_revision, 0);
+    assert_eq!(received.new_revision, 1);
 }

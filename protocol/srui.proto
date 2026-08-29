@@ -4,7 +4,7 @@ package srui.protocol;
 
 // =============================================================================
 // SRUI Protocol Buffers Wire Schema
-// Reference: SRUI Design Document v0.4 (§6.4, §6.5, §7.2–7.7, §8, §13, §15, §16, §18)
+// Reference: SRUI Design Document v0.6 (§6.4, §6.5, §7.2–7.7, §8, §13, §15, §16, §18)
 // Registry: protocol/registry.yaml (Namespace 0)
 // =============================================================================
 
@@ -452,12 +452,35 @@ message Transaction {
 
 message Event {
   bytes client_instance_id = 1;
-  uint64 event_seq = 2;
-  bytes event_id = 3; // Globally unique within session lifetime (§18.2)
+  uint64 event_seq = 2; // Positive contiguous sequence within client_instance_id (§18.2)
+  bytes event_id = 3; // Non-empty; stable with event_seq across every replay (§18.2)
   uint64 observed_revision = 4;
   uint64 node_id = 5;
   TypeRef event_type = 6;
   repeated Property arguments = 7;
+}
+
+// Settlement status of a single client event (§18.2, Appendix B).
+enum EventAckStatus {
+  EVENT_ACK_STATUS_UNSPECIFIED = 0;
+  EVENT_ACK_STATUS_PROCESSED = 1;
+  EVENT_ACK_STATUS_DUPLICATE = 2;
+  EVENT_ACK_STATUS_REJECTED = 3;
+}
+
+// Server acknowledgement settling exactly one client event (§18, §18.2, §19.2).
+//
+// The dedupe cache keyed on (client_instance_id, event_id) is the *idempotency*
+// mechanism; this ack selectively settles event_id. The client raises
+// `ClientResume.last_acked_event_seq` only across a contiguous settled prefix.
+message ServerEventAck {
+  bytes client_instance_id = 1;
+  bytes event_id = 2; // The event this ack settles (§18.2)
+  uint64 last_processed_event_seq = 3; // Highest contiguous settled event_seq (§18.2)
+  EventAckStatus status = 4;
+  uint64 revision_after_effect = 5; // Store revision after side effects (Appendix B)
+  string reject_reason = 6; // Diagnostic only, bounded by max_string_length (§26)
+  string session_id = 7; // Incarnation that produced this acknowledgement (§18)
 }
 
 // -----------------------------------------------------------------------------
@@ -508,6 +531,7 @@ message ServerWelcome {
 }
 
 message ClientResume {
+  // Opaque incarnation token received from SERVER_WELCOME/RESUME responses.
   string session_id = 1;
   bytes client_instance_id = 2;
   uint64 last_applied_revision = 3;
@@ -515,15 +539,30 @@ message ClientResume {
   map<uint64, uint64> terminal_stream_offsets = 5;
 }
 
+// Machine-readable session identity continuity for a full snapshot response.
+enum SessionContinuity {
+  SESSION_CONTINUITY_UNSPECIFIED = 0;
+  // The requested semantic session survived; pending events may be replayed.
+  SESSION_CONTINUITY_SAME_SESSION = 1;
+  // The requested incarnation is gone; old pending events must be abandoned.
+  SESSION_CONTINUITY_REPLACED = 2;
+}
+
 message ServerResumeOk {
+  // MUST exactly equal the requested session_id.
   string session_id = 1;
   uint64 replay_from_revision = 2;
+  // Highest contiguous settled event sequence for this client in this session.
+  uint64 last_processed_event_seq = 3;
 }
 
 message ServerResyncRequired {
   string session_id = 1;
   uint64 snapshot_revision = 2;
   string reason = 3;
+  SessionContinuity continuity = 4;
+  // Highest contiguous settled event sequence for this client in session_id.
+  uint64 last_processed_event_seq = 5;
 }
 
 // -----------------------------------------------------------------------------
@@ -539,5 +578,6 @@ message SruiMessage {
     ServerResyncRequired server_resync_required = 5;
     Transaction transaction = 6;
     Event event = 7;
+    ServerEventAck server_event_ack = 8;
   }
 }

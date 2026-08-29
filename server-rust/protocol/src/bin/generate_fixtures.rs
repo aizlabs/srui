@@ -136,13 +136,30 @@ fn main() {
     fs::write(out_dir.join("golden_framed_message.bin"), &framed_bytes).expect("write golden_framed_message.bin");
     println!("Wrote golden_framed_message.bin ({} bytes)", framed_bytes.len());
 
-    // 4. Construct Malformed Fixture: Overlong Varint (11 bytes, exceeds 64-bit 10-byte limit)
+    // 4. Construct golden Framed ServerEventAck (§18.2)
+    let event_ack = SruiMessage {
+        msg: Some(srui_message::Msg::ServerEventAck(ServerEventAck {
+            client_instance_id: b"c17".to_vec(),
+            event_id: b"e123".to_vec(),
+            last_processed_event_seq: 593,
+            status: EventAckStatus::Processed as i32,
+            revision_after_effect: 1843,
+            reject_reason: String::new(),
+            session_id: String::new(),
+        })),
+    };
+    let event_ack_bytes = encode_framed(&event_ack).expect("encode framed ServerEventAck");
+    fs::write(out_dir.join("golden_event_ack.bin"), &event_ack_bytes)
+        .expect("write golden_event_ack.bin");
+    println!("Wrote golden_event_ack.bin ({} bytes)", event_ack_bytes.len());
+
+    // 5. Construct Malformed Fixture: Overlong Varint (11 bytes, exceeds 64-bit 10-byte limit)
     let overlong_varint_bytes = vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
     fs::write(out_dir.join("malformed_overlong_varint.bin"), &overlong_varint_bytes)
         .expect("write malformed_overlong_varint.bin");
     println!("Wrote malformed_overlong_varint.bin ({} bytes)", overlong_varint_bytes.len());
 
-    // 5. Construct Malformed Fixture: Truncated Frame (declares 100 bytes length, has only 4)
+    // 6. Construct Malformed Fixture: Truncated Frame (declares 100 bytes length, has only 4)
     let truncated_frame_bytes = vec![0x64, 0x01, 0x02, 0x03, 0x04];
     fs::write(out_dir.join("malformed_truncated_frame.bin"), &truncated_frame_bytes)
         .expect("write malformed_truncated_frame.bin");

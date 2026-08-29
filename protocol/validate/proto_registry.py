@@ -72,7 +72,11 @@ def _parse_proto_enums(proto_text: str) -> dict[str, dict[str, int]]:
     return enums
 
 
-PROTO_SKIP_ENUMS = frozenset({"NullValue"})
+# Proto-local enums that are transport bookkeeping, not namespace-0 semantic values, and so have
+# no registry.yaml counterpart. Adding one here must not change the registry counts asserted by
+# server-rust/semantic-tree/build.rs or the generated RegistryTables.swift.
+#   - EventAckStatus: settlement status of a `ServerEventAck` (§18.2), never carried in a Value.
+PROTO_SKIP_ENUMS = frozenset({"NullValue", "EventAckStatus"})
 
 
 def _normalize_symbol(name: str) -> str:

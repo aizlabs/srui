@@ -10,6 +10,8 @@
 //   observes a half-committed transaction.
 // - §18 Reconnect and resynchronization: `CLIENT RESUME` carries `last_applied_revision` and
 //   `last_acked_event_seq`; `SERVER RESYNC_REQUIRED` is the *only* trigger for snapshot replacement.
+// - §18.2 Event settlement: server event frontiers raise `last_acked_event_seq`, while
+//   per-event acknowledgements selectively drain the outbox's retry set.
 // - §22.2 Threading: network IO and protobuf decoding run off the main actor; AppKit mutations
 //   are dispatched to `MainActor`.
 // - §4 inv. 13: unrecoverable divergence fails explicitly instead of degrading silently.
@@ -29,6 +31,8 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
     case replicaDiverged(TxnError)
     /// A wire frame or transaction payload could not be decoded (§16, §26).
     case decodeFailed(String)
+    /// A required handshake invariant was violated.
+    case protocolViolation(String)
     /// The transport stream ended or errored.
     case transportEnded(String)
 
@@ -36,9 +40,15 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
         switch self {
         case .replicaDiverged(let err): return "local replica diverged: \(err)"
         case .decodeFailed(let msg): return "decode failed: \(msg)"
+        case .protocolViolation(let msg): return "protocol violation: \(msg)"
         case .transportEnded(let msg): return "transport ended: \(msg)"
         }
     }
+}
+
+/// Event dispatch is disabled until the server proves session identity continuity (§18).
+public enum SessionDispatchError: Error, Equatable, Sendable {
+    case resumeNotConfirmed
 }
 
 /// Central coordinator managing client session lifecycle, message decoding, store application,
@@ -60,6 +70,9 @@ public final class SessionController: @unchecked Sendable {
     private var actionHandlerWired = false
     private var _isDiverged = false
     private var _onFailure: (@Sendable (SessionFailure) -> Void)?
+    private var requestedSessionId: String?
+    private var resumeAttemptId: UUID?
+    private var eventDispatchEnabled = false
 
     public init(
         transport: any Transport,
@@ -122,10 +135,9 @@ public final class SessionController: @unchecked Sendable {
 
             Task {
                 do {
-                    try await self.outbox.sendActivate(
+                    try await self.sendActivate(
                         nodeId: nodeID,
-                        observedRevision: observedRev,
-                        via: self.transport
+                        observedRevision: observedRev
                     )
                 } catch {
                     SessionDiagnostics.error("ACTIVATE dispatch failed: \(error)")
@@ -140,22 +152,28 @@ public final class SessionController: @unchecked Sendable {
         wireActionHandler(for: renderer)
     }
 
-    /// Starts the session by sending initial handshake and launching the background receive loop (§18, §22.2).
+    /// Starts the session by sending a resume request and launching the receive loop (§18, §22.2).
+    ///
+    /// Pending events remain retained but are not replayed until the server explicitly confirms
+    /// continuity with `SERVER RESUME_OK` or same-session `SERVER RESYNC_REQUIRED`.
     public func start() async throws {
         let shouldStart = withStateLock {
             if isRunning { return false }
             isRunning = true
+            eventDispatchEnabled = false
             return true
         }
         guard shouldStart else { return }
 
-        // A handshake that never reaches the server leaves no receive loop behind, so the started
-        // latch must not survive the throw: otherwise every later `start()` returns early at the
-        // guard above and the controller is wedged with no reader and no diagnostics (§18).
         var didStart = false
         defer {
             if !didStart {
-                withStateLock { self.isRunning = false }
+                withStateLock {
+                    self.isRunning = false
+                    self.requestedSessionId = nil
+                    self.resumeAttemptId = nil
+                    self.eventDispatchEnabled = false
+                }
             }
         }
 
@@ -163,26 +181,26 @@ public final class SessionController: @unchecked Sendable {
             ensureActionHandlerWired()
         }
 
-        // 1. Send Handshake (§15, §18)
+        let resumeAttemptId = await outbox.beginResumeAttempt()
+        let requestedSessionId = withStateLock {
+            let id = currentSessionId ?? "default"
+            self.requestedSessionId = id
+            self.resumeAttemptId = resumeAttemptId
+            return id
+        }
         let clientInstanceId = outbox.clientInstanceId
         var resume = SRUIClientResume()
-        resume.sessionID = withStateLock { currentSessionId } ?? "default"
+        resume.sessionID = requestedSessionId
         resume.clientInstanceID = clientInstanceId.bytes
         resume.lastAppliedRevision = applier.lastAppliedRevision.value
-        // §18: the resume request carries the last acknowledged event sequence so the server can
-        // bound its event-deduplication cache and replay acknowledgements (§18.2, App. B).
         resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
 
         var envelope = SRUIMessage()
         envelope.clientResume = resume
-        let framedHandshake = try SRUIFraming.encodeFramed(envelope)
-        try await transport.send(data: framedHandshake)
+        try await transport.send(data: SRUIFraming.encodeFramed(envelope))
 
-        // 2. Replay events that were sent but never acknowledged, reusing their original
-        //    `event_id` so the server's dedupe cache recognizes them as retries (§18.2).
-        await outbox.resendPendingEvents(via: transport)
-
-        // 3. Launch background message processing loop (§22.2)
+        // Start receiving the decision before replaying anything. Full-duplex transport ordering
+        // cannot by itself prove that the old semantic session survived.
         let task = Task.detached { [weak self] in
             guard let self else { return }
             await self.runReceiveLoop()
@@ -198,9 +216,17 @@ public final class SessionController: @unchecked Sendable {
     @discardableResult
     public func sendActivate(nodeId: NodeId) async throws -> Event {
         let snapshot = applier.currentSnapshot
+        return try await sendActivate(nodeId: nodeId, observedRevision: snapshot.revision)
+    }
+
+    @discardableResult
+    private func sendActivate(nodeId: NodeId, observedRevision: Revision) async throws -> Event {
+        guard withStateLock({ eventDispatchEnabled }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
         return try await outbox.sendActivate(
             nodeId: nodeId,
-            observedRevision: snapshot.revision,
+            observedRevision: observedRevision,
             via: transport
         )
     }
@@ -244,29 +270,182 @@ public final class SessionController: @unchecked Sendable {
 
         switch payload {
         case .serverResumeOk(let resumeOk):
-            withStateLock {
-                self.currentSessionId = resumeOk.sessionID
-            }
+            await handleResumeOk(resumeOk)
 
         case .serverWelcome(let welcome):
+            let accepted = await outbox.confirmFreshSession(id: welcome.sessionID)
+            guard accepted else {
+                await reportFailure(.protocolViolation(
+                    "SERVER WELCOME cannot replace an outstanding resume decision"
+                ))
+                return
+            }
             withStateLock {
                 self.currentSessionId = welcome.sessionID
+                self.requestedSessionId = nil
+                self.resumeAttemptId = nil
+                self.eventDispatchEnabled = true
             }
 
         case .serverResyncRequired(let resync):
-            withStateLock {
-                self.pendingResync = true
-            }
-            SessionDiagnostics.log(
-                "Server resync required at revision \(resync.snapshotRevision): \(resync.reason)"
-            )
+            await handleResyncRequired(resync)
 
         case .transaction(let wireTx):
             await handleTransaction(wireTx)
 
+        case .serverEventAck(let ack):
+            await handleEventAck(ack)
+
         default:
             break
         }
+    }
+
+    private func handleResumeOk(_ resumeOk: SRUIServerResumeOk) async {
+        let (requested, attemptId) = withStateLock {
+            (requestedSessionId, resumeAttemptId)
+        }
+        guard requested == resumeOk.sessionID, let attemptId else {
+            await reportFailure(.protocolViolation(
+                "SERVER RESUME_OK session_id \(resumeOk.sessionID) does not match requested \(requested ?? "<none>")"
+            ))
+            return
+        }
+
+        let accepted = await outbox.completeSameSessionResume(
+            id: resumeOk.sessionID,
+            lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
+            attemptId: attemptId,
+            via: transport,
+            enableNewEventsAfterReplay: true
+        )
+        guard accepted else {
+            SessionDiagnostics.log("Ignoring superseded SERVER RESUME_OK")
+            return
+        }
+        withStateLock {
+            self.currentSessionId = resumeOk.sessionID
+            self.requestedSessionId = nil
+            self.resumeAttemptId = nil
+            self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+        }
+    }
+
+    private func handleResyncRequired(_ resync: SRUIServerResyncRequired) async {
+        let (requested, attemptId) = withStateLock {
+            (requestedSessionId, resumeAttemptId)
+        }
+        guard let requested, let attemptId else {
+            await reportFailure(.protocolViolation(
+                "SERVER RESYNC_REQUIRED received without an outstanding resume"
+            ))
+            return
+        }
+
+        switch resync.continuity {
+        case .sameSession:
+            guard resync.sessionID == requested else {
+                await reportFailure(.protocolViolation(
+                    "same-session resync changed session_id from \(requested) to \(resync.sessionID)"
+                ))
+                return
+            }
+            let accepted = await outbox.completeSameSessionResume(
+                id: resync.sessionID,
+                lastProcessedEventSeq: resync.lastProcessedEventSeq,
+                attemptId: attemptId,
+                via: transport,
+                enableNewEventsAfterReplay: false
+            )
+            guard accepted else {
+                SessionDiagnostics.log("Ignoring superseded same-session resync")
+                return
+            }
+            withStateLock {
+                self.currentSessionId = resync.sessionID
+                self.requestedSessionId = nil
+                self.pendingResync = true
+            }
+
+        case .replaced:
+            guard resync.sessionID != requested else {
+                await reportFailure(.protocolViolation(
+                    "replacement resync reused expired session_id \(requested)"
+                ))
+                return
+            }
+            let accepted = await outbox.prepareReplacedSession(
+                id: resync.sessionID,
+                lastProcessedEventSeq: resync.lastProcessedEventSeq,
+                attemptId: attemptId
+            )
+            guard accepted else {
+                SessionDiagnostics.log("Ignoring superseded replacement resync")
+                return
+            }
+            withStateLock {
+                self.currentSessionId = resync.sessionID
+                self.requestedSessionId = nil
+                self.pendingResync = true
+            }
+
+        case .unspecified, .UNRECOGNIZED:
+            await reportFailure(.protocolViolation(
+                "SERVER RESYNC_REQUIRED omitted a recognized session continuity"
+            ))
+            return
+        }
+
+        SessionDiagnostics.log(
+            "Server resync required at revision \(resync.snapshotRevision): \(resync.reason)"
+        )
+    }
+
+    /// Settles one outbound event against the server's acknowledgement (§18, §18.2).
+    ///
+    /// Every status is terminal for that `event_id` — including `rejected`. An event the server
+    /// refuses must be dropped here: leaving it pending would replay it on the next resume, which
+    /// the server would refuse again, forever.
+    private func handleEventAck(_ ack: SRUIServerEventAck) async {
+        guard ClientInstanceId(ack.clientInstanceID) == outbox.clientInstanceId else {
+            SessionDiagnostics.error(
+                "Ignoring event acknowledgement for a different client instance"
+            )
+            return
+        }
+
+        let eventId = EventId(ack.eventID)
+        let ackSessionId = ack.sessionID.isEmpty ? nil : ack.sessionID
+        let belongsToActiveSession = await outbox.settleAcknowledgement(
+            eventId: eventId,
+            throughSeq: ack.lastProcessedEventSeq,
+            sessionId: ackSessionId
+        )
+        guard belongsToActiveSession else {
+            SessionDiagnostics.error(
+                "Ignoring event acknowledgement from expired session \(ack.sessionID)"
+            )
+            return
+        }
+
+        switch ack.status {
+        case .rejected:
+            SessionDiagnostics.error(
+                "Server rejected event \(eventId) at revision \(ack.revisionAfterEffect): \(ack.rejectReason)"
+            )
+        case .processed, .duplicate:
+            SessionDiagnostics.log(
+                "Event \(eventId) settled as \(ack.status) at revision \(ack.revisionAfterEffect)"
+            )
+        case .unspecified, .UNRECOGNIZED:
+            // An ack is optional-to-consume: §4 inv. 13 requires unknown *required* semantics to
+            // fail closed, and a settlement status this build does not know is not one. Settle by
+            // id and keep going rather than stranding the event in the retry set forever.
+            SessionDiagnostics.log(
+                "Event \(eventId) settled with unrecognized ack status \(ack.status)"
+            )
+        }
+
     }
 
     private func handleTransaction(_ wireTx: SRUITransaction) async {
@@ -305,6 +484,20 @@ public final class SessionController: @unchecked Sendable {
                 snapshot: snapshot,
                 forceRemount: isResyncSnapshot
             )
+            if isResyncSnapshot {
+                let attemptId = withStateLock { self.resumeAttemptId }
+                let accepted = if let attemptId {
+                    await outbox.finishResync(attemptId: attemptId)
+                } else {
+                    false
+                }
+                withStateLock {
+                    if accepted {
+                        self.resumeAttemptId = nil
+                        self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+                    }
+                }
+            }
 
         case .failure(let err):
             await handleTransactionRejection(err, isResyncSnapshot: isResyncSnapshot)
@@ -344,6 +537,7 @@ public final class SessionController: @unchecked Sendable {
         let handler: (@Sendable (SessionFailure) -> Void)? = withStateLock {
             if _isDiverged { return nil }
             _isDiverged = true
+            eventDispatchEnabled = false
             return _onFailure ?? { _ in }
         }
         guard let handler else { return }
@@ -397,6 +591,9 @@ public final class SessionController: @unchecked Sendable {
             // a snapshot (§18, §4 inv. 13).
             _isDiverged = false
             pendingResync = false
+            requestedSessionId = nil
+            resumeAttemptId = nil
+            eventDispatchEnabled = false
             return t
         }
 

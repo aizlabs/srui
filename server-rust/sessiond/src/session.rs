@@ -1,7 +1,7 @@
 //! # Session State & Transaction Coordination
 //!
 //! Authoritative state owner managing [`SemanticStore`], [`TransactionJournal`],
-//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §20.2, §21).
+//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §20.2, §21, App. B).
 //!
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
@@ -12,11 +12,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
-use srui_event_dedupe::EventDeduplicator;
+use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, EventSequenceError, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal};
 use srui_protocol::{
-    ClientHello, ClientResume, Event, ExtensionNamespaceMapping, ServerLimits,
-    ServerResumeOk, ServerResyncRequired, ServerWelcome, Transaction,
+    ClientHello, ClientResume, Event, ExtensionNamespaceMapping, ServerLimits, ServerResumeOk,
+    ServerResyncRequired, ServerWelcome, SessionContinuity, Transaction,
 };
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
@@ -51,6 +51,9 @@ pub enum SessionError {
     #[error("capability negotiation error: {0}")]
     Negotiation(#[from] NegotiationError),
 
+    #[error("invalid client event sequence: {0}")]
+    EventSequence(#[from] EventSequenceError),
+
     #[error("lock poisoned")]
     LockPoisoned,
 
@@ -71,15 +74,59 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Truncates a diagnostic string to the negotiated §26 `max_string_length` (UTF-8 safe).
+pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> String {
+    if value.len() <= max_len {
+        return value;
+    }
+    let mut end = max_len;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+/// Outcome of one client event (§18.2).
+///
+/// `Processed`, `Duplicate`, and `Rejected` are terminal and become `SERVER EVENT_ACK`; `Pending`
+/// is explicitly non-terminal and produces no acknowledgement. `last_processed_event_seq` is the
+/// highest contiguous settled sequence for the event's `client_instance_id`; it never crosses
+/// an in-flight or missing sequence (§18.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventOutcome {
+    /// Newly admitted, validated, and dispatched to handlers.
+    Processed {
+        revision_after_effect: u64,
+        last_processed_event_seq: u64,
+    },
+    /// The same event is still being dispatched by another connection.
+    Pending { last_processed_event_seq: u64 },
+    /// Replay of an already-settled `event_id`: answered from the result cache without re-running
+    /// the action (§18.2, App. B). `accepted` echoes whether the original attempt was processed.
+    Duplicate {
+        accepted: bool,
+        revision_after_effect: u64,
+        last_processed_event_seq: u64,
+        reject_reason: String,
+    },
+    /// Refused by event validation. The event is settled, not retried.
+    Rejected {
+        error: EventValidationError,
+        revision_after_effect: u64,
+        last_processed_event_seq: u64,
+    },
+}
+
 /// Outcome of a [`ClientResume`] handshake request.
 #[derive(Debug, Clone)]
 pub enum ResumeOutcome {
-    /// Replay available: sends `ServerResumeOk` followed by the missing transaction sequence.
+    /// The exact requested session survived: sends `ServerResumeOk` followed by replay.
     Replay {
         welcome_msg: ServerResumeOk,
         from_revision: u64,
     },
-    /// Replay window expired: client must receive full snapshot resync (§20.2).
+    /// Full snapshot required, either for a same-session journal gap or a replaced incarnation.
     Resync {
         resync_msg: ServerResyncRequired,
         snapshot_transaction: Transaction,
@@ -240,27 +287,51 @@ impl Session {
             Replay {
                 session_id: String,
                 from_revision: u64,
+                last_processed_event_seq: u64,
             },
             Resync {
                 session_id: String,
                 snapshot_revision: u64,
                 store_snapshot: SemanticStore,
+                continuity: SessionContinuity,
+                last_processed_event_seq: u64,
             },
         }
 
         let plan = {
             let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            let last_processed_event_seq = guard
+                .dedupe
+                .last_contiguous_processed_seq(&resume.client_instance_id);
 
-            if guard.journal.iter_from(resume.last_applied_revision).is_some() {
+            // A session ID is an incarnation token, not a human-readable application name. A
+            // mismatch means the requested session is gone, so old client intents must not be
+            // replayed against this authoritative state.
+            if resume.session_id != guard.session_id {
+                ResumePlan::Resync {
+                    session_id: guard.session_id.clone(),
+                    snapshot_revision: guard.store.revision().get(),
+                    store_snapshot: guard.store.clone_staging(),
+                    continuity: SessionContinuity::Replaced,
+                    last_processed_event_seq,
+                }
+            } else if guard
+                .journal
+                .iter_from(resume.last_applied_revision)
+                .is_some()
+            {
                 ResumePlan::Replay {
                     session_id: guard.session_id.clone(),
                     from_revision: resume.last_applied_revision,
+                    last_processed_event_seq,
                 }
             } else {
                 ResumePlan::Resync {
                     session_id: guard.session_id.clone(),
                     snapshot_revision: guard.store.revision().get(),
                     store_snapshot: guard.store.clone_staging(),
+                    continuity: SessionContinuity::SameSession,
+                    last_processed_event_seq,
                 }
             }
         };
@@ -269,10 +340,12 @@ impl Session {
             ResumePlan::Replay {
                 session_id,
                 from_revision,
+                last_processed_event_seq,
             } => {
                 let welcome_msg = ServerResumeOk {
                     session_id,
                     replay_from_revision: from_revision,
+                    last_processed_event_seq,
                 };
                 Ok(ResumeOutcome::Replay {
                     welcome_msg,
@@ -283,12 +356,25 @@ impl Session {
                 session_id,
                 snapshot_revision,
                 store_snapshot,
+                continuity,
+                last_processed_event_seq,
             } => {
                 let snapshot_tx = export_snapshot_transaction(&store_snapshot);
+                let reason = match continuity {
+                    SessionContinuity::SameSession => {
+                        "client revision outside retained journal window"
+                    }
+                    SessionContinuity::Replaced => {
+                        "requested session incarnation is no longer available"
+                    }
+                    SessionContinuity::Unspecified => unreachable!("server always sets continuity"),
+                };
                 let resync_msg = ServerResyncRequired {
                     session_id,
                     snapshot_revision,
-                    reason: "client revision outside retained journal window".to_string(),
+                    reason: reason.to_string(),
+                    continuity: continuity as i32,
+                    last_processed_event_seq,
                 };
                 Ok(ResumeOutcome::Resync {
                     resync_msg,
@@ -297,8 +383,6 @@ impl Session {
             }
         }
     }
-
-    /// Registers an in-process semantic event handler for the given node and event type (§7.6, §29).
     pub fn on<F>(&self, node: impl Into<NodeId>, event_type: TypeRef, handler: F)
     where
         F: Fn(&Session, &Event) + Send + Sync + 'static,
@@ -396,37 +480,80 @@ impl Session {
     /// Processes an incoming client event: checks for deduplication,
     /// validates interactive status against the store, and dispatches to registered handlers (§7.7, §27, §29).
     ///
-    /// Returns `Ok(true)` if newly accepted and valid, or `Ok(false)` if duplicate.
-    pub fn process_event(&self, event: &Event) -> Result<bool, SessionError> {
+    /// Returns the settled [`EventOutcome`], which the connection turns into a `SERVER EVENT_ACK`
+    /// (§18.2). A validation failure is a *rejection of that event*, not a protocol violation: it
+    /// is reported as [`EventOutcome::Rejected`] rather than an `Err`, because tearing the
+    /// connection down would make the client reconnect and replay the same invalid event forever.
+    /// Infrastructure failures and invalid receive-window sequences remain `Err`.
+    pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
         let matching_handlers = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
-            // Deduplication check (§18.2, §32.4)
-            if !guard.dedupe.record_event(event) {
-                return Ok(false); // Duplicate event ignored
+            // Deduplication check (§18.2, §32.4). A settled replay is answered from the result
+            // cache; an in-flight replay remains unacknowledged so the client cannot mistake it
+            // for a completed action.
+            match guard.dedupe.admit_event(event)? {
+                RecordOutcome::Duplicate {
+                    prior,
+                    last_processed_event_seq,
+                } => {
+                    return Ok(EventOutcome::Duplicate {
+                        accepted: prior.accepted,
+                        revision_after_effect: prior.revision_after_effect,
+                        last_processed_event_seq,
+                        reject_reason: prior.reject_reason,
+                    })
+                }
+                RecordOutcome::Pending {
+                    last_processed_event_seq,
+                } => {
+                    return Ok(EventOutcome::Pending {
+                        last_processed_event_seq,
+                    })
+                }
+                RecordOutcome::Fresh { .. } => {}
             }
 
             let node_id = srui_semantic_tree::NodeId::new(event.node_id);
             let obs_rev = srui_semantic_tree::Revision::new(event.observed_revision);
+            let current_rev = guard.store.revision();
 
-            if obs_rev > guard.store.revision() {
-                return Err(SessionError::EventValidation(
-                    EventValidationError::FutureRevision {
-                        observed: obs_rev,
-                        current: guard.store.revision(),
+            let validation = if obs_rev > current_rev {
+                Err(EventValidationError::FutureRevision {
+                    observed: obs_rev,
+                    current: current_rev,
+                })
+            } else {
+                match guard.store.get_node(node_id) {
+                    None => Err(EventValidationError::NodeNotFound(node_id)),
+                    Some(node) => {
+                        if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
+                            Err(EventValidationError::NodeDisabled(node_id))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+            };
+
+            if let Err(error) = validation {
+                let max_string_length = guard.store.limits().max_string_length;
+                let last_processed_event_seq = guard.dedupe.settle_event(
+                    event,
+                    EventOutcomeRecord {
+                        accepted: false,
+                        revision_after_effect: current_rev.get(),
+                        reject_reason: bound_diagnostic_string(
+                            error.to_string(),
+                            max_string_length,
+                        ),
                     },
-                ));
-            }
-
-            let node = guard
-                .store
-                .get_node(node_id)
-                .ok_or(EventValidationError::NodeNotFound(node_id))?;
-
-            if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
-                return Err(SessionError::EventValidation(
-                    EventValidationError::NodeDisabled(node_id),
-                ));
+                );
+                return Ok(EventOutcome::Rejected {
+                    error,
+                    revision_after_effect: current_rev.get(),
+                    last_processed_event_seq,
+                });
             }
 
             let event_type = event
@@ -441,17 +568,59 @@ impl Session {
                 .unwrap_or_default()
         }; // Lock released here!
 
-        for handler in matching_handlers {
-            handler(self, event);
+        let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for handler in matching_handlers {
+                handler(self, event);
+            }
+        }));
+
+        if let Err(panic_payload) = dispatch_result {
+            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            guard.dedupe.abandon_event(event);
+            drop(guard);
+
+            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            return Err(SessionError::Panicked(panic_msg));
         }
 
-        Ok(true)
+        // Sampled after dispatch so the ack reports the revision the side effect produced
+        // (App. B `semantic_revision_after_effect`).
+        let (revision_after_effect, last_processed_event_seq) = {
+            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            let revision_after_effect = guard.store.revision().get();
+            let last_processed_event_seq = guard.dedupe.settle_event(
+                event,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect,
+                    reject_reason: String::new(),
+                },
+            );
+            (revision_after_effect, last_processed_event_seq)
+        };
+
+        Ok(EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        })
     }
 
-    /// Returns the current revision of the store.
+    /// Returns the current committed semantic revision.
     pub fn current_revision(&self) -> u64 {
         let guard = lock_or_recover(&self.inner);
         guard.store.revision().get()
+    }
+
+    /// Negotiated §26 string bound for wire diagnostics such as `reject_reason`.
+    pub fn max_string_length(&self) -> usize {
+        let guard = lock_or_recover(&self.inner);
+        guard.store.limits().max_string_length
     }
 
     /// Returns the total number of active nodes currently in the store (§6.2).
@@ -637,7 +806,9 @@ mod tests {
         let session = Session::new("widget-ops-test");
         session
             .transaction(|ui| {
-                Surface::builder(1).label("Counter Application").create(ui)?;
+                Surface::builder(1)
+                    .label("Counter Application")
+                    .create(ui)?;
                 Ok(())
             })
             .expect("widget builder transaction");
@@ -709,8 +880,12 @@ mod tests {
         };
 
         match session.handle_resume(&resume).expect("resume handled") {
-            ResumeOutcome::Replay { welcome_msg, from_revision } => {
+            ResumeOutcome::Replay {
+                welcome_msg,
+                from_revision,
+            } => {
                 assert_eq!(welcome_msg.replay_from_revision, 0);
+                assert_eq!(welcome_msg.last_processed_event_seq, 0);
                 let replayed = session
                     .collect_replayed_transactions(from_revision)
                     .expect("replay available");
@@ -752,6 +927,11 @@ mod tests {
             } => {
                 assert_eq!(resync_msg.session_id, "resync-test");
                 assert_eq!(resync_msg.snapshot_revision, 1025);
+                assert_eq!(
+                    SessionContinuity::try_from(resync_msg.continuity),
+                    Ok(SessionContinuity::SameSession)
+                );
+                assert_eq!(resync_msg.last_processed_event_seq, 0);
                 assert_eq!(snapshot_transaction.new_revision, 1025);
             }
             ResumeOutcome::Replay { .. } => panic!("expected resync, got replay"),

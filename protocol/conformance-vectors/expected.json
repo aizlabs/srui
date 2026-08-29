@@ -145,6 +145,22 @@
         "priority": 1,
         "operation_count": 3
       }
+    },
+    "golden_event_ack": {
+      "file": "golden_event_ack.bin",
+      "sha256": "88af509836da7f88dcb106c55f33be2d974d9fcda4cdc5e39769eea0a8c70593",
+      "hex": "1542130a0363313712046531323318d104200128b30e",
+      "byte_length": 22,
+      "expected": {
+        "msg_type": "server_event_ack",
+        "client_instance_id": "c17",
+        "event_id": "e123",
+        "last_processed_event_seq": 593,
+        "status": 1,
+        "status_name": "PROCESSED",
+        "revision_after_effect": 1843,
+        "reject_reason": ""
+      }
     }
   },
   "malformed_vectors": {

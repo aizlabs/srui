@@ -35,6 +35,12 @@ struct CounterLiveIntegrationTests {
 
         try await controller.start()
 
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "default"
+        var resumeMessage = SRUIMessage()
+        resumeMessage.serverResumeOk = resumeOk
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMessage))
+
         let surfaceID = NodeId(1)
         let textID = NodeId(2)
         let progressID = NodeId(3)

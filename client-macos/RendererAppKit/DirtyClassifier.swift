@@ -6,6 +6,7 @@ public enum DirtyClassification: Equatable, Sendable {
     case layoutAffecting(nodeID: NodeId, property: PropertyRef)
     case accessibilityOnly(nodeID: NodeId, property: PropertyRef)
     case resourceArrival(nodeID: NodeId, property: PropertyRef)
+    case modelContent(modelID: ModelId)
     case structureAffecting(operation: Operation)
 
     public var isStructureAffecting: Bool {
@@ -14,8 +15,8 @@ public enum DirtyClassification: Equatable, Sendable {
     }
 }
 
-/// Conservative §23 dirty classification. Scalar node properties remain eligible for
-/// in-place mutation; graph and model operations take the structural path.
+/// Conservative §23 dirty classification. Scalar node properties and model content mutations
+/// remain eligible for in-place mutation; graph mutations and model creation take the structural path.
 public enum DirtyClassifier {
     public static func classify(_ operation: Operation) -> [DirtyClassification] {
         switch operation {
@@ -28,15 +29,17 @@ public enum DirtyClassifier {
                 classify(nodeID: nodeID, property: $0.property)
             }
 
+        case .modelInsert(let id, _, _),
+             .modelDelete(let id, _, _, _),
+             .modelUpdate(let id, _, _),
+             .modelResetRange(let id, _, _, _):
+            return [.modelContent(modelID: id)]
+
         case .createNode,
              .deleteNode,
              .moveNode,
              .reorderChildren,
-             .createModel,
-             .modelInsert,
-             .modelDelete,
-             .modelUpdate,
-             .modelResetRange:
+             .createModel:
             return [.structureAffecting(operation: operation)]
         }
     }

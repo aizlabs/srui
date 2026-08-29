@@ -7,8 +7,8 @@ public enum LayoutRendererError: Error, Equatable, Sendable {
     case missingParentHandle(NodeId)
 }
 
-/// Retained hierarchy coordinator. Scalar mutations update existing handles; structural
-/// mutations currently take a conservative full-remount path.
+/// Retained hierarchy coordinator. Scalar mutations and model content updates update existing
+/// handles in place; graph mutations and model creation take a conservative full-remount path.
 @MainActor
 public final class LayoutRenderer {
     public let registry: RenderRegistry
@@ -55,23 +55,60 @@ public final class LayoutRenderer {
         }
 
         RendererDiagnostics.log(
-            "transaction revision=\(transaction.newRevision) scalar operations=\(transaction.operations.count)"
+            "transaction revision=\(transaction.newRevision) non-structural operations=\(transaction.operations.count)"
         )
+
+        var changedModelIDs: Set<ModelId> = []
+        for classification in classifications {
+            if case .modelContent(let modelID) = classification {
+                changedModelIDs.insert(modelID)
+            }
+        }
+
+        var affectedCollectionNodeIDs: Set<NodeId> = []
         for operation in transaction.operations {
             switch operation {
             case .setProperty(let nodeID, let property, _),
                  .clearProperty(let nodeID, let property):
-                try apply(property: property, nodeID: nodeID, store: newStore)
+                if isCollectionProperty(property) {
+                    affectedCollectionNodeIDs.insert(nodeID)
+                } else {
+                    try apply(property: property, nodeID: nodeID, store: newStore)
+                }
 
             case .batchPropertySet(let nodeID, let properties):
                 for property in properties {
-                    try apply(property: property.property, nodeID: nodeID, store: newStore)
+                    if isCollectionProperty(property.property) {
+                        affectedCollectionNodeIDs.insert(nodeID)
+                    } else {
+                        try apply(property: property.property, nodeID: nodeID, store: newStore)
+                    }
                 }
 
             default:
                 break
             }
         }
+
+        if !changedModelIDs.isEmpty {
+            for handle in registry.allHandles {
+                if let node = newStore.getNode(handle.nodeID),
+                   let modelRef = node.modelRef,
+                   changedModelIDs.contains(modelRef) {
+                    affectedCollectionNodeIDs.insert(handle.nodeID)
+                }
+            }
+        }
+
+        for nodeID in affectedCollectionNodeIDs {
+            guard let handle = registry.handle(for: nodeID) else { continue }
+            guard let node = newStore.getNode(nodeID) else { continue }
+            controlFactory.refreshCollection(in: handle, for: node, store: newStore)
+            RendererDiagnostics.log(
+                "refreshed collection node=\(nodeID) view=\(ObjectIdentifier(handle.view))"
+            )
+        }
+
         return classifications
     }
 
@@ -87,7 +124,7 @@ public final class LayoutRenderer {
             throw LayoutRendererError.missingSemanticNode(nodeID)
         }
 
-        let handle = try controlFactory.makeHandle(for: node)
+        let handle = try controlFactory.makeHandle(for: node, store: store)
         try registry.register(handle)
         RendererDiagnostics.log(
             "mounted node=\(node.id) type=\(node.nodeType) parent=\(node.parentID?.description ?? "root")"
@@ -152,11 +189,16 @@ public final class LayoutRenderer {
         controlFactory.apply(
             property: property,
             value: node.getProperty(property),
-            to: handle
+            to: handle,
+            store: store
         )
         RendererDiagnostics.log(
             "updated node=\(nodeID) property=\(property) view=\(ObjectIdentifier(handle.view))"
         )
+    }
+
+    private func isCollectionProperty(_ property: PropertyRef) -> Bool {
+        property == .items || property == .modelRef || property == .columns || property == .selectionMode
     }
 
     private func tearDown() {

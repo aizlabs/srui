@@ -198,6 +198,249 @@ struct LayoutRendererTests {
         #expect(second.isDescendant(of: scrollView))
     }
 
+    @Test
+    func allFourModelMutationsUpdateTableInPlaceAndPreserveIdentity() throws {
+        let modelID = ModelId(10)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 2)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [
+                ModelItem(itemID: ItemId(1), value: .string("Alpha")),
+                ModelItem(itemID: ItemId(2), value: .string("Beta")),
+            ]
+        )
+        try store.createNode(
+            id: 1,
+            nodeType: .surface,
+            properties: [Property(property: .label, value: .string("Test Window"))]
+        )
+        try store.createNode(
+            id: 2,
+            nodeType: .table,
+            parentID: 1,
+            properties: [
+                Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+                Property(property: .selectionMode, value: .enumToken(.selectionModeSingle)),
+            ]
+        )
+        try store.createNode(
+            id: 3,
+            nodeType: .text,
+            parentID: 1,
+            properties: [Property(property: .text, value: .string("Status"))]
+        )
+
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let windowBefore = try #require(renderer.registry.handle(for: 1)?.window)
+        let tableBefore = try #require(renderer.registry.view(for: 2))
+        let textBefore = try #require(renderer.registry.view(for: 3))
+
+        let adapter = try #require(renderer.registry.handle(for: 2)?.modelAdapter as? TableCollectionAdapter)
+        #expect(adapter.rows.map(\.cells) == [["Alpha"], ["Beta"]])
+
+        // 1. MODEL_INSERT
+        let insertOp = Operation.modelInsert(
+            id: modelID,
+            index: 1,
+            items: [ModelItem(itemID: ItemId(3), value: .string("Gamma"))]
+        )
+        var storeAfterInsert = store
+        try insertOp.apply(to: &storeAfterInsert)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [insertOp]),
+            newStore: storeAfterInsert
+        )
+        #expect(adapter.rows.map(\.cells) == [["Alpha"], ["Gamma"], ["Beta"]])
+        #expect(renderer.registry.handle(for: 1)?.window === windowBefore)
+        #expect(renderer.registry.view(for: 2) === tableBefore)
+        #expect(renderer.registry.view(for: 3) === textBefore)
+
+        // 2. MODEL_UPDATE
+        let updateOp = Operation.modelUpdate(
+            id: modelID,
+            index: 0,
+            items: [ModelItem(itemID: ItemId(1), value: .string("Alpha Prime"))]
+        )
+        var storeAfterUpdate = storeAfterInsert
+        try updateOp.apply(to: &storeAfterUpdate)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: storeAfterInsert.revision, operations: [updateOp]),
+            newStore: storeAfterUpdate
+        )
+        #expect(adapter.rows.map(\.cells) == [["Alpha Prime"], ["Gamma"], ["Beta"]])
+        #expect(renderer.registry.view(for: 2) === tableBefore)
+
+        // 3. MODEL_DELETE
+        let deleteOp = Operation.modelDelete(id: modelID, index: 2, count: 1, itemIds: [])
+        var storeAfterDelete = storeAfterUpdate
+        try deleteOp.apply(to: &storeAfterDelete)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: storeAfterUpdate.revision, operations: [deleteOp]),
+            newStore: storeAfterDelete
+        )
+        #expect(adapter.rows.map(\.cells) == [["Alpha Prime"], ["Gamma"]])
+        #expect(renderer.registry.view(for: 2) === tableBefore)
+
+        // 4. MODEL_RESET_RANGE
+        let resetOp = Operation.modelResetRange(
+            id: modelID,
+            startIndex: 0,
+            items: [
+                ModelItem(itemID: ItemId(10), value: .string("Fresh 1")),
+                ModelItem(itemID: ItemId(20), value: .string("Fresh 2")),
+            ],
+            totalCount: 2
+        )
+        var storeAfterReset = storeAfterDelete
+        try resetOp.apply(to: &storeAfterReset)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: storeAfterDelete.revision, operations: [resetOp]),
+            newStore: storeAfterReset
+        )
+        #expect(adapter.rows.map(\.cells) == [["Fresh 1"], ["Fresh 2"]])
+        #expect(renderer.registry.view(for: 2) === tableBefore)
+    }
+
+    @Test
+    func insertionDrivenIndexShiftsPreserveSelectionByItemId() throws {
+        let modelID = ModelId(20)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .table, itemCount: 3)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [
+                ModelItem(itemID: ItemId(10), value: .string("Item 10")),
+                ModelItem(itemID: ItemId(20), value: .string("Item 20")),
+                ModelItem(itemID: ItemId(30), value: .string("Item 30")),
+            ]
+        )
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(
+            id: 2,
+            nodeType: .table,
+            parentID: 1,
+            properties: [
+                Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+                Property(property: .selectionMode, value: .enumToken(.selectionModeSingle)),
+            ]
+        )
+
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let tableHandle = try #require(renderer.registry.handle(for: 2))
+        let tableView = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+
+        // User selects row 1 (ItemId 20)
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        #expect(tableView.selectedRow == 1)
+
+        // Insert item at index 0 -> item 20 moves to index 2
+        let insertOp = Operation.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [ModelItem(itemID: ItemId(5), value: .string("Item 5"))]
+        )
+        var newStore = store
+        try insertOp.apply(to: &newStore)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [insertOp]),
+            newStore: newStore
+        )
+
+        // Selection should be preserved on row index 2 (ItemId 20)
+        #expect(tableView.selectedRow == 2)
+    }
+
+    @Test
+    func inPlaceChangesToColumnsModelRefAndSelectionMode() throws {
+        let model1 = ModelId(100)
+        let model2 = ModelId(200)
+
+        var store = SemanticStore()
+        try store.createModel(id: model1, modelType: .table, itemCount: 1)
+        try store.modelInsert(id: model1, index: 0, items: [ModelItem(itemID: ItemId(1), value: .list([.string("M1-A"), .string("M1-B")]))])
+        try store.createModel(id: model2, modelType: .table, itemCount: 1)
+        try store.modelInsert(id: model2, index: 0, items: [ModelItem(itemID: ItemId(2), value: .list([.string("M2-A"), .string("M2-B")]))])
+
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(
+            id: 2,
+            nodeType: .table,
+            parentID: 1,
+            properties: [
+                Property(property: .columns, value: .list([.string("Col 1"), .string("Col 2")])),
+                Property(property: .modelRef, value: .unsignedInt(model1.value)),
+                Property(property: .selectionMode, value: .enumToken(.selectionModeNone)),
+            ]
+        )
+
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let tableHandle = try #require(renderer.registry.handle(for: 2))
+        let tableIdentity = ObjectIdentifier(tableHandle.view)
+        let tableView = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        let adapter = try #require(tableHandle.modelAdapter as? TableCollectionAdapter)
+
+        #expect(tableView.tableColumns.count == 2)
+        #expect(adapter.rows.map(\.cells) == [["M1-A", "M1-B"]])
+        #expect(tableView.selectionHighlightStyle == .none)
+
+        // 1. Reconfigure columns in place
+        let reconfigColumnsOp = Operation.setProperty(
+            id: 2,
+            property: .columns,
+            value: .list([.string("Header A"), .string("Header B"), .string("Header C"), .string("Header D")])
+        )
+        var storeColumns = store
+        try reconfigColumnsOp.apply(to: &storeColumns)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [reconfigColumnsOp]),
+            newStore: storeColumns
+        )
+        #expect(ObjectIdentifier(tableHandle.view) == tableIdentity)
+        #expect(tableView.tableColumns.count == 4)
+        #expect(tableView.tableColumns[0].title == "Header A")
+        #expect(tableView.tableColumns[3].title == "Header D")
+
+        // 2. Reconfigure selectionMode in place
+        let reconfigSelectionOp = Operation.setProperty(
+            id: 2,
+            property: .selectionMode,
+            value: .enumToken(.selectionModeSingle)
+        )
+        var storeSelection = storeColumns
+        try reconfigSelectionOp.apply(to: &storeSelection)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: storeColumns.revision, operations: [reconfigSelectionOp]),
+            newStore: storeSelection
+        )
+        #expect(ObjectIdentifier(tableHandle.view) == tableIdentity)
+        #expect(tableView.selectionHighlightStyle == .regular)
+        #expect(tableView.allowsMultipleSelection == false)
+
+        // 3. Reconfigure modelRef in place
+        let reconfigModelOp = Operation.setProperty(
+            id: 2,
+            property: .modelRef,
+            value: .unsignedInt(model2.value)
+        )
+        var storeModel = storeSelection
+        try reconfigModelOp.apply(to: &storeModel)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: storeSelection.revision, operations: [reconfigModelOp]),
+            newStore: storeModel
+        )
+        #expect(ObjectIdentifier(tableHandle.view) == tableIdentity)
+        #expect(adapter.rows.map(\.cells) == [["M2-A", "M2-B"]])
+    }
+
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {
         var store = SemanticStore()
         for operation in operations {

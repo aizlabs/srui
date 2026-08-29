@@ -83,8 +83,10 @@ struct SessionControllerThreadingTests {
         let bytes1 = try SRUIFraming.encodeFramed(msg1)
         try await serverTransport.send(data: bytes1)
 
-        // Allow background loop to decode and MainActor to apply
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // Await until both applier and renderer have processed the initial mount
+        while applier.lastAppliedRevision < Revision(1) || renderer.registry.count < 4 {
+            await Task.yield()
+        }
 
         // Verify initial mount
         #expect(applier.lastAppliedRevision == Revision(1))
@@ -112,7 +114,10 @@ struct SessionControllerThreadingTests {
         let bytes2 = try SRUIFraming.encodeFramed(msg2)
         try await serverTransport.send(data: bytes2)
 
-        try await Task.sleep(nanoseconds: 50_000_000)
+        while applier.lastAppliedRevision < Revision(2) {
+            await Task.yield()
+        }
+        await Task.yield()
 
         // Verify scalar update in place
         #expect(applier.lastAppliedRevision == Revision(2))
@@ -153,9 +158,9 @@ struct SessionControllerThreadingTests {
         #expect(currentSnapshot.store == initialStore)
     }
 
-    @Test("Button action invokes outbox and transmits ACTIVATE event over transport")
+    @Test("Button, toggle, and table interactions route through outbox and capture observed revision")
     @MainActor
-    func buttonActionDispatchesActivateEvent() async throws {
+    func buttonToggleAndTableRouting() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
         let applier = TransactionApplier()
         let outbox = EventOutbox()
@@ -172,21 +177,40 @@ struct SessionControllerThreadingTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
-        welcome.sessionID = "default"
+        welcome.sessionID = "interaction-session"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
 
-        // Mount a button
-        let buttonID = NodeId(42)
+        let modelID = ModelId(99)
+        let buttonID = NodeId(10)
+        let toggleID = NodeId(11)
+        let tableID = NodeId(12)
+
         let mountTx = Transaction(
             baseRevision: .initial,
             newRevision: Revision(1),
             operations: [
+                .createModel(id: modelID, modelType: .table, itemCount: 2),
+                .modelInsert(
+                    id: modelID,
+                    index: 0,
+                    items: [
+                        ModelItem(itemID: ItemId(1), value: .string("Item 1")),
+                        ModelItem(itemID: ItemId(2), value: .string("Item 2")),
+                    ]
+                ),
                 .createNode(id: NodeId(1), nodeType: .surface),
                 .createNode(id: buttonID, nodeType: .button, parentID: NodeId(1), properties: [
-                    Property(property: .label, value: .string("Click Me"))
+                    Property(property: .label, value: .string("Click"))
+                ]),
+                .createNode(id: toggleID, nodeType: .toggle, parentID: NodeId(1), properties: [
+                    Property(property: .label, value: .string("Toggle"))
+                ]),
+                .createNode(id: tableID, nodeType: .table, parentID: NodeId(1), properties: [
+                    Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+                    Property(property: .selectionMode, value: .enumToken(.selectionModeSingle)),
                 ]),
             ]
         )
@@ -195,43 +219,83 @@ struct SessionControllerThreadingTests {
         mountMsg.transaction = mountTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMsg))
 
-        try await Task.sleep(nanoseconds: 50_000_000)
+        while applier.lastAppliedRevision < Revision(1) || renderer.registry.count < 4 {
+            await Task.yield()
+        }
+
+        // Advance revision to Revision(2) with a scalar update
+        let rev2Tx = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(id: buttonID, property: .label, value: .string("Click Rev 2"))
+            ]
+        )
+        var rev2Msg = SRUIMessage()
+        rev2Msg.transaction = rev2Tx.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(rev2Msg))
+
+        while applier.lastAppliedRevision < Revision(2) {
+            await Task.yield()
+        }
+        await Task.yield()
 
         let buttonHandle = try #require(renderer.registry.handle(for: buttonID))
-        let button = try #require(buttonHandle.view as? NSButton)
+        let toggleHandle = try #require(renderer.registry.handle(for: toggleID))
+        let tableHandle = try #require(renderer.registry.handle(for: tableID))
 
-        // Trigger button action via target-action trampoline
+        let button = try #require(buttonHandle.view as? NSButton)
+        let toggle = try #require(toggleHandle.view as? NSButton)
+        let tableView = try #require((tableHandle.view as? NSScrollView)?.documentView as? NSTableView)
+
         let serverStream = serverTransport.receiveStream()
 
-        let trampoline = try #require(buttonHandle.actionTrampoline as? ActionTrampoline)
-        trampoline.performAction(button)
+        // 1. Trigger button
+        let buttonTrampoline = try #require(buttonHandle.actionTrampoline as? ActionTrampoline)
+        buttonTrampoline.performButtonAction(button)
 
-        // Read outgoing event on server
-        var receivedEventData: Data?
+        // 2. Trigger toggle
+        let toggleTrampoline = try #require(toggleHandle.actionTrampoline as? ActionTrampoline)
+        toggle.state = .on
+        toggleTrampoline.performToggleAction(toggle)
+
+        // 3. Trigger table selection (select row 1 -> ItemId 2)
+        tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+
+        // Collect 3 events on server
+        var collectedEvents: [Event] = []
+        var streamDecoder = SRUIMessageStreamDecoder()
         for try await chunk in serverStream {
-            // Note: the handshake ClientResume was sent first, so decode messages
-            var streamDecoder = SRUIMessageStreamDecoder()
             let messages = try streamDecoder.appendAndExtract(incoming: chunk)
-            if let eventMsg = messages.first(where: {
-                if case .event = $0.msg { return true }
-                return false
-            }) {
-                receivedEventData = try SRUIFraming.encodeFramed(eventMsg)
+            for msg in messages {
+                if case .event(let wireEvent) = msg.msg {
+                    let domainEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+                    collectedEvents.append(domainEvent)
+                }
+            }
+            if collectedEvents.count >= 3 {
                 break
             }
         }
 
-        let nonNilData = try #require(receivedEventData)
-        let decodedMsg = try decodeFramedMessage(from: nonNilData)
-        guard case .event(let wireEvent) = decodedMsg.msg else {
-            Issue.record("Expected event message payload")
-            return
-        }
-        let event = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        #expect(collectedEvents.count == 3)
 
-        #expect(event.nodeId == buttonID)
-        #expect(event.eventType == .EVENT_ACTIVATE)
-        #expect(event.observedRevision == Revision(1))
+        // Event 1: Button ACTIVATE
+        #expect(collectedEvents[0].nodeId == buttonID)
+        #expect(collectedEvents[0].eventType == .EVENT_ACTIVATE)
+        #expect(collectedEvents[0].observedRevision == Revision(2))
+
+        // Event 2: Toggle VALUE_CHANGED
+        #expect(collectedEvents[1].nodeId == toggleID)
+        #expect(collectedEvents[1].eventType == .EVENT_VALUE_CHANGED)
+        #expect(collectedEvents[1].boolArg == true)
+        #expect(collectedEvents[1].observedRevision == Revision(2))
+
+        // Event 3: Table SELECTION_CHANGED
+        #expect(collectedEvents[2].nodeId == tableID)
+        #expect(collectedEvents[2].eventType == .EVENT_SELECTION_CHANGED)
+        #expect(collectedEvents[2].itemIdArg == ItemId(2))
+        #expect(collectedEvents[2].observedRevision == Revision(2))
 
         await controller.stop()
         await serverTransport.close()

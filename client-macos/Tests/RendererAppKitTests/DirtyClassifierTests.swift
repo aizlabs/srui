@@ -56,22 +56,37 @@ struct DirtyClassifierTests {
         .moveNode(id: 2, newParentID: 1, newChildIndex: 0),
         .reorderChildren(parentID: 1, newOrder: [2, 3]),
         .createModel(id: ModelId(1), modelType: .list, itemCount: 0),
-        .modelInsert(
-            id: ModelId(1),
-            index: 0,
-            items: [ModelItem(itemID: ItemId(1), value: .string("item"))]
+    ]
+
+    private static let modelContentOperations: [(Operation, ModelId)] = [
+        (
+            .modelInsert(
+                id: ModelId(1),
+                index: 0,
+                items: [ModelItem(itemID: ItemId(1), value: .string("item"))]
+            ),
+            ModelId(1)
         ),
-        .modelDelete(id: ModelId(1), index: 0, count: 1, itemIds: []),
-        .modelUpdate(
-            id: ModelId(1),
-            index: 0,
-            items: [ModelItem(itemID: ItemId(1), value: .string("updated"))]
+        (
+            .modelDelete(id: ModelId(2), index: 0, count: 1, itemIds: []),
+            ModelId(2)
         ),
-        .modelResetRange(
-            id: ModelId(1),
-            startIndex: 0,
-            items: [ModelItem(itemID: ItemId(2), value: .string("reset"))],
-            totalCount: 1
+        (
+            .modelUpdate(
+                id: ModelId(3),
+                index: 0,
+                items: [ModelItem(itemID: ItemId(1), value: .string("updated"))]
+            ),
+            ModelId(3)
+        ),
+        (
+            .modelResetRange(
+                id: ModelId(4),
+                startIndex: 0,
+                items: [ModelItem(itemID: ItemId(2), value: .string("reset"))],
+                totalCount: 1
+            ),
+            ModelId(4)
         ),
     ]
 
@@ -132,6 +147,14 @@ struct DirtyClassifierTests {
 
         #expect(classifications == [.structureAffecting(operation: operation)])
         #expect(classifications.allSatisfy { $0.isStructureAffecting })
+    }
+
+    @Test(arguments: modelContentOperations)
+    func modelContentOperationsClassifyAsModelContent(opCase: (Operation, ModelId)) {
+        let classifications = DirtyClassifier.classify(opCase.0)
+
+        #expect(classifications == [.modelContent(modelID: opCase.1)])
+        #expect(!classifications.contains { $0.isStructureAffecting })
     }
 
     @Test(arguments: scalarOperations)

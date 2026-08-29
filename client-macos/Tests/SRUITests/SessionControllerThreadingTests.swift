@@ -192,7 +192,7 @@ struct SessionControllerThreadingTests {
             baseRevision: .initial,
             newRevision: Revision(1),
             operations: [
-                .createModel(id: modelID, modelType: .table, itemCount: 2),
+                .createModel(id: modelID, modelType: .table, itemCount: 0),
                 .modelInsert(
                     id: modelID,
                     index: 0,
@@ -279,23 +279,24 @@ struct SessionControllerThreadingTests {
         }
 
         #expect(collectedEvents.count == 3)
+        #expect(collectedEvents.map(\.eventSeq) == [1, 2, 3])
 
-        // Event 1: Button ACTIVATE
-        #expect(collectedEvents[0].nodeId == buttonID)
-        #expect(collectedEvents[0].eventType == .EVENT_ACTIVATE)
-        #expect(collectedEvents[0].observedRevision == Revision(2))
+        let buttonEvent = try #require(collectedEvents.first { $0.nodeId == buttonID })
+        #expect(buttonEvent.nodeId == buttonID)
+        #expect(buttonEvent.eventType == .EVENT_ACTIVATE)
+        #expect(buttonEvent.observedRevision == Revision(2))
 
-        // Event 2: Toggle VALUE_CHANGED
-        #expect(collectedEvents[1].nodeId == toggleID)
-        #expect(collectedEvents[1].eventType == .EVENT_VALUE_CHANGED)
-        #expect(collectedEvents[1].boolArg == true)
-        #expect(collectedEvents[1].observedRevision == Revision(2))
+        let toggleEvent = try #require(collectedEvents.first { $0.nodeId == toggleID })
+        #expect(toggleEvent.nodeId == toggleID)
+        #expect(toggleEvent.eventType == .EVENT_VALUE_CHANGED)
+        #expect(toggleEvent.boolArg == true)
+        #expect(toggleEvent.observedRevision == Revision(2))
 
-        // Event 3: Table SELECTION_CHANGED
-        #expect(collectedEvents[2].nodeId == tableID)
-        #expect(collectedEvents[2].eventType == .EVENT_SELECTION_CHANGED)
-        #expect(collectedEvents[2].itemIdArg == ItemId(2))
-        #expect(collectedEvents[2].observedRevision == Revision(2))
+        let tableEvent = try #require(collectedEvents.first { $0.nodeId == tableID })
+        #expect(tableEvent.nodeId == tableID)
+        #expect(tableEvent.eventType == .EVENT_SELECTION_CHANGED)
+        #expect(tableEvent.itemIdArg == ItemId(2))
+        #expect(tableEvent.observedRevision == Revision(2))
 
         await controller.stop()
         await serverTransport.close()

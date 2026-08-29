@@ -137,6 +137,35 @@ struct AppKitRendererTests {
             )
         }
     }
+    @Test
+    func collectionPropertyApplyThrowsWhenRenderHandleIsMissing() throws {
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+        ])
+        let renderer = AppKitRenderer()
+        try renderer.attach(store: store)
+
+        let collectionUpdate = SemanticModel.Operation.setProperty(
+            id: 2,
+            property: .columns,
+            value: .list([.string("Name")])
+        )
+        let newStore = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: .table, parentID: 1),
+            collectionUpdate,
+        ])
+
+        #expect(throws: LayoutRendererError.missingRenderHandle(2)) {
+            try renderer.apply(
+                transaction: Transaction(
+                    baseRevision: store.revision,
+                    operations: [collectionUpdate]
+                ),
+                newStore: newStore
+            )
+        }
+    }
 
     @Test
     func appKitRendererForwardsAllThreeSemanticInteractions() throws {
@@ -148,7 +177,7 @@ struct AppKitRendererTests {
 
         let modelID = ModelId(100)
         var store = SemanticStore()
-        try store.createModel(id: modelID, modelType: .table, itemCount: 2)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(
             id: modelID,
             index: 0,
@@ -200,7 +229,7 @@ struct AppKitRendererTests {
     func appKitRendererAppliesModelMutationsIncrementally() throws {
         let modelID = ModelId(200)
         var store = SemanticStore()
-        try store.createModel(id: modelID, modelType: .table, itemCount: 1)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(id: modelID, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("Initial Item"))])
 
         try store.createNode(id: 1, nodeType: .surface)

@@ -494,6 +494,7 @@ public final class ControlFactory {
             tableView.allowsEmptySelection = true
             tableView.allowsMultipleSelection = false
             tableView.selectionHighlightStyle = .none
+            tableView.deselectAll(nil)
         case .single:
             tableView.allowsEmptySelection = true
             tableView.allowsMultipleSelection = false

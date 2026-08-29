@@ -101,8 +101,12 @@ public final class LayoutRenderer {
         }
 
         for nodeID in affectedCollectionNodeIDs {
-            guard let handle = registry.handle(for: nodeID) else { continue }
-            guard let node = newStore.getNode(nodeID) else { continue }
+            guard let handle = registry.handle(for: nodeID) else {
+                throw LayoutRendererError.missingRenderHandle(nodeID)
+            }
+            guard let node = newStore.getNode(nodeID) else {
+                throw LayoutRendererError.missingSemanticNode(nodeID)
+            }
             controlFactory.refreshCollection(in: handle, for: node, store: newStore)
             RendererDiagnostics.log(
                 "refreshed collection node=\(nodeID) view=\(ObjectIdentifier(handle.view))"

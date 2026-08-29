@@ -202,7 +202,7 @@ struct LayoutRendererTests {
     func allFourModelMutationsUpdateTableInPlaceAndPreserveIdentity() throws {
         let modelID = ModelId(10)
         var store = SemanticStore()
-        try store.createModel(id: modelID, modelType: .table, itemCount: 2)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(
             id: modelID,
             index: 0,
@@ -309,7 +309,7 @@ struct LayoutRendererTests {
     func insertionDrivenIndexShiftsPreserveSelectionByItemId() throws {
         let modelID = ModelId(20)
         var store = SemanticStore()
-        try store.createModel(id: modelID, modelType: .table, itemCount: 3)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(
             id: modelID,
             index: 0,
@@ -363,9 +363,9 @@ struct LayoutRendererTests {
         let model2 = ModelId(200)
 
         var store = SemanticStore()
-        try store.createModel(id: model1, modelType: .table, itemCount: 1)
+        try store.createModel(id: model1, modelType: .table, itemCount: 0)
         try store.modelInsert(id: model1, index: 0, items: [ModelItem(itemID: ItemId(1), value: .list([.string("M1-A"), .string("M1-B")]))])
-        try store.createModel(id: model2, modelType: .table, itemCount: 1)
+        try store.createModel(id: model2, modelType: .table, itemCount: 0)
         try store.modelInsert(id: model2, index: 0, items: [ModelItem(itemID: ItemId(2), value: .list([.string("M2-A"), .string("M2-B")]))])
 
         try store.createNode(id: 1, nodeType: .surface)
@@ -445,7 +445,7 @@ struct LayoutRendererTests {
     func multipleTablesReferencingSameModelAreBothUpdatedInPlace() throws {
         let modelID = ModelId(50)
         var store = SemanticStore()
-        try store.createModel(id: modelID, modelType: .table, itemCount: 1)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(id: modelID, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("Initial"))])
 
         try store.createNode(id: 1, nodeType: .surface)
@@ -491,9 +491,9 @@ struct LayoutRendererTests {
         let model1 = ModelId(10)
         let model2 = ModelId(20)
         var store = SemanticStore()
-        try store.createModel(id: model1, modelType: .table, itemCount: 1)
+        try store.createModel(id: model1, modelType: .table, itemCount: 0)
         try store.modelInsert(id: model1, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("M1 Item"))])
-        try store.createModel(id: model2, modelType: .table, itemCount: 1)
+        try store.createModel(id: model2, modelType: .table, itemCount: 0)
         try store.modelInsert(id: model2, index: 0, items: [ModelItem(itemID: ItemId(2), value: .string("M2 Item"))])
 
         try store.createNode(id: 1, nodeType: .surface)
@@ -531,7 +531,7 @@ struct LayoutRendererTests {
     func mixedStructuralAndModelTransactionRemountsCleanly() throws {
         let modelID = ModelId(30)
         var store = SemanticStore()
-        try store.createModel(id: modelID, modelType: .table, itemCount: 1)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(id: modelID, index: 0, items: [ModelItem(itemID: ItemId(1), value: .string("Row 1"))])
 
         try store.createNode(id: 1, nodeType: .surface)

@@ -155,7 +155,7 @@ private enum DemoFixtures {
         Transaction(
             baseRevision: baseRevision,
             operations: [
-                .createModel(id: modelID, modelType: .table, itemCount: 3),
+                .createModel(id: modelID, modelType: .table, itemCount: 0),
                 .modelInsert(
                     id: modelID,
                     index: 0,
@@ -384,7 +384,7 @@ private enum DemoFixtures {
                         )
                     ]
                 ),
-                .modelDelete(id: modelID, index: 3, count: 1, itemIds: [ItemId(3)]),
+                .modelDelete(id: modelID, index: nil, count: nil, itemIds: [ItemId(3)]),
             ]
         )
     }

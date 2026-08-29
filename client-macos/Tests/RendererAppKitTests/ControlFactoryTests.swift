@@ -254,7 +254,7 @@ struct ControlFactoryTests {
     func modelBackedTableResolvesModelWithFourColumnsAndCells() throws {
         var store = SemanticStore()
         let modelID = ModelId(42)
-        try store.createModel(id: modelID, modelType: .table, itemCount: 2)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(
             id: modelID,
             index: 0,
@@ -307,25 +307,29 @@ struct ControlFactoryTests {
     }
 
     @Test
-    func modelRefPresentWithAbsentOrEmptyModelRendersEmptyRowsWithoutInlineFallback() throws {
-        let store = SemanticStore()
+    func modelRefPresentWithAbsentOrUncachedModelRendersEmptyRowsWithoutInlineFallback() throws {
+        var store = SemanticStore()
         let absentModelID = ModelId(999)
-
-        let node = Node(
-            id: 1,
-            nodeType: .table,
-            properties: [
-                .modelRef: .unsignedInt(absentModelID.value),
-                .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
-            ]
-        )
+        let uncachedModelID = ModelId(998)
+        try store.createModel(id: uncachedModelID, modelType: .table, itemCount: 2)
 
         let factory = ControlFactory()
-        let handle = try factory.makeHandle(for: node, store: store)
-        let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
+        for modelID in [absentModelID, uncachedModelID] {
+            let node = Node(
+                id: 1,
+                nodeType: .table,
+                properties: [
+                    .modelRef: .unsignedInt(modelID.value),
+                    .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
+                ]
+            )
 
-        // Must render empty rows and NOT fall back to inline items
-        #expect(adapter.rows.isEmpty)
+            let handle = try factory.makeHandle(for: node, store: store)
+            let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
+
+            // A present MODEL_REF is authoritative even when the model is absent or uncached.
+            #expect(adapter.rows.isEmpty)
+        }
     }
 
     @Test
@@ -373,6 +377,11 @@ struct ControlFactoryTests {
         singleTable.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
         #expect(emittedInteractions == [.selectionChanged(nodeID: 2, itemID: ItemId(2))])
         emittedInteractions.removeAll()
+
+        singleAdapter.selectionMode = .none
+        factory.applySelectionMode(.none, to: singleTable)
+        #expect(singleTable.selectedRow == -1)
+        #expect(emittedInteractions.isEmpty)
 
         // 3. Multiple selection mode emits no intent
         let multipleNode = Node(
@@ -648,7 +657,7 @@ struct ControlFactoryTests {
     func tableRowsHandlesDiverseValueVariants() throws {
         let modelID = ModelId(77)
         var store = SemanticStore()
-        try store.createModel(id: modelID, modelType: .table, itemCount: 4)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 0)
         try store.modelInsert(
             id: modelID,
             index: 0,

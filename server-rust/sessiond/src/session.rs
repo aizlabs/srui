@@ -111,13 +111,35 @@ impl std::fmt::Debug for SessionInner {
 #[derive(Debug, Clone)]
 pub struct Session {
     inner: Arc<Mutex<SessionInner>>,
-    tx_broadcast: broadcast::Sender<Transaction>,
+    tx_broadcast: Arc<Mutex<Option<broadcast::Sender<Transaction>>>>,
 }
 
 impl Session {
     /// Creates a new `Session` with the given session ID and default standard capabilities.
     pub fn new(session_id: impl Into<String>) -> Self {
-        let (tx_broadcast, _) = broadcast::channel(TRANSACTION_BROADCAST_CAPACITY);
+        Self::with_broadcast_capacity(session_id, TRANSACTION_BROADCAST_CAPACITY)
+    }
+
+    /// Creates a session with a custom transaction broadcast channel capacity.
+    ///
+    /// Intended for integration tests that exercise lag/resync behavior (§20.2).
+    #[doc(hidden)]
+    pub fn with_broadcast_capacity(session_id: impl Into<String>, capacity: usize) -> Self {
+        let (tx_broadcast, _) = broadcast::channel(capacity);
+        Self::with_broadcast_sender(session_id, tx_broadcast)
+    }
+
+    /// Drops the transaction broadcast sender so attached subscribers observe
+    /// [`broadcast::error::RecvError::Closed`] (§20.2).
+    #[doc(hidden)]
+    pub fn close_transaction_broadcast(&self) {
+        lock_or_recover(&self.tx_broadcast).take();
+    }
+
+    fn with_broadcast_sender(
+        session_id: impl Into<String>,
+        tx_broadcast: broadcast::Sender<Transaction>,
+    ) -> Self {
         let limits = ServerLimits {
             max_frame_size: 16 * 1024 * 1024,
             max_transaction_operations: DEFAULT_MAX_TRANSACTION_OPERATIONS as u32,
@@ -139,8 +161,12 @@ impl Session {
 
         Self {
             inner: Arc::new(Mutex::new(inner)),
-            tx_broadcast,
+            tx_broadcast: Arc::new(Mutex::new(Some(tx_broadcast))),
         }
+    }
+
+    fn broadcast_sender(&self) -> Option<broadcast::Sender<Transaction>> {
+        lock_or_recover(&self.tx_broadcast).clone()
     }
 
     /// Returns the session ID.
@@ -151,7 +177,10 @@ impl Session {
 
     /// Subscribes to committed transaction broadcasts (§20.2).
     pub fn subscribe_transactions(&self) -> broadcast::Receiver<Transaction> {
-        self.tx_broadcast.subscribe()
+        lock_or_recover(&self.tx_broadcast)
+            .as_ref()
+            .expect("transaction broadcast closed")
+            .subscribe()
     }
 
     /// Collects transactions to replay starting at `from_revision` using a borrowed journal iterator.
@@ -334,7 +363,9 @@ impl Session {
         };
 
         // Broadcast to attached bridges outside of the mutex lock (§20.2, async-no-lock-await)
-        let _ = self.tx_broadcast.send(tx);
+        if let Some(tx_broadcast) = self.broadcast_sender() {
+            let _ = tx_broadcast.send(tx);
+        }
         Ok(val)
     }
 
@@ -349,7 +380,9 @@ impl Session {
         }
 
         // Broadcast to attached bridges outside of the mutex lock
-        let _ = self.tx_broadcast.send(tx.clone());
+        if let Some(tx_broadcast) = self.broadcast_sender() {
+            let _ = tx_broadcast.send(tx.clone());
+        }
         Ok(tx)
     }
 

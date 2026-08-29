@@ -25,7 +25,8 @@ struct RendererDemoApp {
             var subsystem = "srui"
             var identity: String?
             var knownHosts: String?
-            var batchMode = false
+            var batchMode = true
+            var connectTimeout: TimeInterval = 30.0
 
             if let pIdx = args.firstIndex(of: "--port"), pIdx + 1 < args.count {
                 port = UInt16(args[pIdx + 1])
@@ -42,8 +43,12 @@ struct RendererDemoApp {
             if let kIdx = args.firstIndex(of: "--known-hosts"), kIdx + 1 < args.count {
                 knownHosts = args[kIdx + 1]
             }
-            if args.contains("--batch") {
-                batchMode = true
+            if args.contains("--interactive") {
+                batchMode = false
+            }
+            if let tIdx = args.firstIndex(of: "--connect-timeout"), tIdx + 1 < args.count,
+               let seconds = TimeInterval(args[tIdx + 1]) {
+                connectTimeout = seconds
             }
 
             let config = SSHConfiguration(
@@ -53,7 +58,8 @@ struct RendererDemoApp {
                 subsystem: subsystem,
                 identityFile: identity,
                 knownHostsFile: knownHosts,
-                batchMode: batchMode
+                batchMode: batchMode,
+                connectTimeout: connectTimeout
             )
             runLiveSession(transport: SSHTransport(configuration: config))
         } else if let socketIndex = args.firstIndex(of: "--socket"), socketIndex + 1 < args.count {

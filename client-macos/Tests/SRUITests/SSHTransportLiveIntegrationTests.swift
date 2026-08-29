@@ -65,10 +65,12 @@ struct SSHTransportLiveIntegrationTests {
         try userPubData.write(to: URL(fileURLWithPath: authKeysPath))
 
         // Write host public key to known_hosts
-        let port: UInt16 = Self.findFreePort()
-        let hostPubStr = try String(contentsOf: URL(fileURLWithPath: "\(hostKeyPath).pub"), encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
-        let knownHostsEntry = "[127.0.0.1]:\(port) \(hostPubStr)\n"
-        try knownHostsEntry.write(to: URL(fileURLWithPath: knownHostsPath), atomically: true, encoding: .utf8)
+        let port = SSHTestSupport.findFreePort()
+        try SSHTestSupport.writeKnownHosts(
+            port: port,
+            hostPublicKeyPath: hostKeyPath,
+            to: knownHostsPath
+        )
 
         // Write sshd_config configuring srui subsystem to invoke srui-ssh-bridge pointing to counter socket (§19, §20.1)
         let sshdConfigContent = """
@@ -135,12 +137,15 @@ struct SSHTransportLiveIntegrationTests {
         let controller = SessionController(
             transport: transport,
             applier: applier,
-            renderer: renderer
+            renderer: renderer,
+            sessionId: "counter-socket-session"
         )
         controller.attachRenderer(renderer)
 
         try await controller.start()
-        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+        try await AsyncTestSupport.eventually(description: "initial revision over SSH") {
+            applier.lastAppliedRevision == Revision(1)
+        }
 
         let textID = NodeId(2)
         let buttonID = NodeId(4)
@@ -148,7 +153,16 @@ struct SSHTransportLiveIntegrationTests {
         // 4. Perform 3 consecutive click-and-observe cycles over SSH transport
         for cycle in 1...3 {
             _ = try await controller.sendActivate(nodeId: buttonID)
-            try await Self.waitForRevision(applier, expected: Revision(UInt64(cycle + 1)), timeoutSeconds: 5)
+            try await AsyncTestSupport.eventually(description: "counter cycle \(cycle) over SSH") {
+                guard applier.lastAppliedRevision == Revision(UInt64(cycle + 1)) else {
+                    return false
+                }
+                guard let textHandle = renderer.registry.handle(for: textID),
+                      let textField = textHandle.view as? NSTextField else {
+                    return false
+                }
+                return textField.stringValue == "Count: \(cycle)"
+            }
 
             let textHandle = try #require(renderer.registry.handle(for: textID))
             let textField = try #require(textHandle.view as? NSTextField)
@@ -174,61 +188,6 @@ struct SSHTransportLiveIntegrationTests {
             }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
-        throw SSHIntegrationError.timeout("Timed out waiting for socket at \(path)")
-    }
-
-    private static func waitForRevision(
-        _ applier: TransactionApplier,
-        expected: Revision,
-        timeoutSeconds: TimeInterval
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while Date() < deadline {
-            if applier.lastAppliedRevision == expected {
-                return
-            }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        throw SSHIntegrationError.timeout("Timed out waiting for revision \(expected), still at \(applier.lastAppliedRevision)")
-    }
-
-    private static func findFreePort() -> UInt16 {
-        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return UInt16.random(in: 23000...28000) }
-        defer { Darwin.close(fd) }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        addr.sin_port = 0
-        let len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let bindRes = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Darwin.bind(fd, sa, len)
-            }
-        }
-        if bindRes == 0 {
-            var actualAddr = sockaddr_in()
-            var actualLen = len
-            let getRes = withUnsafeMutablePointer(to: &actualAddr) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    Darwin.getsockname(fd, sa, &actualLen)
-                }
-            }
-            if getRes == 0 {
-                return UInt16(bigEndian: actualAddr.sin_port)
-            }
-        }
-        return UInt16.random(in: 23000...28000)
-    }
-}
-
-private enum SSHIntegrationError: Error, CustomStringConvertible {
-    case timeout(String)
-
-    var description: String {
-        switch self {
-        case .timeout(let msg):
-            return msg
-        }
+        throw AsyncTestTimeout(description: "Timed out waiting for socket at \(path)")
     }
 }

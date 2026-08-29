@@ -36,6 +36,25 @@ struct TransportTeardownTests {
         await expectTerminated(stream)
     }
 
+    @Test(
+        "Dropping an SSH transport terminates its receive stream",
+        .timeLimit(.minutes(1))
+    )
+    func droppedSSHTransportFinishesReceiveStream() async {
+        var transport: SSHTransport? = SSHTransport(
+            configuration: SSHConfiguration(
+                host: "127.0.0.1",
+                port: 1,
+                batchMode: true,
+                connectTimeout: 1.0
+            )
+        )
+        let stream = transport!.receiveStream()
+        transport = nil
+
+        await expectTerminated(stream)
+    }
+
     private func expectTerminated(_ stream: AsyncThrowingStream<Data, Error>) async {
         var iterator = stream.makeAsyncIterator()
         do {

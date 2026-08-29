@@ -9,7 +9,7 @@ import Testing
 import Foundation
 import SemanticModel
 import Protocol
-import Session
+@testable import Session
 import TransportSSH
 
 /// Drains one side of a transport and decodes the framed messages it carries.
@@ -101,6 +101,30 @@ private actor GatedTransport: Transport {
     }
 }
 
+/// Transport that fails every send with a fixed error (for replay failure tests).
+private actor FailingTransport: Transport {
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let streamContinuation: AsyncThrowingStream<Data, Error>.Continuation
+
+    init() {
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.streamContinuation = continuation
+    }
+
+    func send(data: Data) async throws {
+        throw TransportError.ioError("simulated replay transport failure")
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        streamContinuation.finish()
+    }
+}
+
 @Suite("EventOutbox Retry Safety Tests")
 struct EventOutboxRetryTests {
 
@@ -127,7 +151,7 @@ struct EventOutboxRetryTests {
 
         // The connection died before the acknowledgement arrived; the resume replays the event.
         // A fresh event_id here would be a second, semantically independent action (§18.2).
-        await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(via: client)
 
         let messages = await collector.wait(forAtLeast: 2)
         let decoded = try events(in: messages)
@@ -161,10 +185,58 @@ struct EventOutboxRetryTests {
         #expect(await outbox.lastAckedEventSeq == event.eventSeq)
 
         // Nothing is pending, so a resume replays nothing.
-        await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(via: client)
 
         await client.close()
         await server.close()
+    }
+
+    @Test("Replay failure blocks same-session resume from enabling new events")
+    func replayFailureBlocksDispatchEnablement() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let attemptId = await outbox.beginResumeAttempt()
+        let failing = FailingTransport()
+
+        var replayFailed = false
+        do {
+            _ = try await outbox.completeSameSessionResume(
+                id: "session-a",
+                lastProcessedEventSeq: 0,
+                attemptId: attemptId,
+                via: failing,
+                enableNewEventsAfterReplay: true
+            )
+        } catch let error as TransportError {
+            replayFailed = true
+            if case .ioError(let message) = error {
+                #expect(message.contains("simulated replay transport failure"))
+            } else {
+                Issue.record("Expected ioError, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected TransportError, got \(error)")
+        }
+        #expect(replayFailed)
+
+        await #expect(throws: EventOutboxError.resumeNotConfirmed) {
+            try await outbox.sendActivate(
+                nodeId: NodeId(8),
+                observedRevision: Revision(3),
+                via: seedClient
+            )
+        }
+        #expect(await outbox.pendingCount == 1)
+
+        await seedClient.close()
+        await seedServer.close()
+        await failing.close()
     }
 
     @Test("A SERVER EVENT_ACK settles the event and raises last_acked_event_seq (§18.2)")
@@ -234,7 +306,7 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == second.eventSeq)
 
-        await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(via: client)
         let sentAfterAck = try events(in: await collector.wait(forAtLeast: sentBeforeAck, timeout: 0.5)).count
         #expect(sentAfterAck == sentBeforeAck)
 
@@ -275,7 +347,7 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
 
-        await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(via: client)
         let replayedMessages = await collector.wait(forAtLeast: 3)
         let replayed = try #require(try events(in: replayedMessages).last)
         #expect(replayed.eventId == first.eventId)
@@ -326,7 +398,7 @@ struct EventOutboxRetryTests {
         // Left pending, the rejected event would be replayed on every resume and refused every
         // time — an unbounded loop the ack exists to break.
         #expect(await outbox.pendingCount == 0)
-        await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(via: client)
 
         let messages = await collector.wait(forAtLeast: 1)
         #expect(try events(in: messages).count == 1)
@@ -596,7 +668,7 @@ struct EventOutboxRetryTests {
 
         let transport = GatedTransport()
         let replayTask = Task {
-            await outbox.resendPendingEvents(via: transport)
+            try await outbox.resendPendingEvents(via: transport)
         }
         await transport.waitForSendCount(1)
 
@@ -633,7 +705,7 @@ struct EventOutboxRetryTests {
         #expect(fresh.eventSeq == 3)
 
         await transport.releaseNextSend()
-        await replayTask.value
+        try await replayTask.value
         _ = try await freshTask.value
         await transport.close()
         await seedClient.close()

@@ -16,19 +16,22 @@ fn default_socket_path() -> PathBuf {
         .join("srui-sessiond.sock")
 }
 
-fn parse_socket_path() -> PathBuf {
+fn parse_socket_path() -> Result<PathBuf, String> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--socket") {
-        if let Some(path_str) = args.get(pos + 1) {
-            return PathBuf::from(path_str);
+        match args.get(pos + 1) {
+            Some(path_str) if !path_str.starts_with('-') => Ok(PathBuf::from(path_str)),
+            _ => Err("--socket requires a path argument".into()),
         }
-    }
-    if let Some(first_arg) = args.get(1) {
+    } else if let Some(first_arg) = args.get(1) {
         if !first_arg.starts_with('-') {
-            return PathBuf::from(first_arg);
+            Ok(PathBuf::from(first_arg))
+        } else {
+            Ok(default_socket_path())
         }
+    } else {
+        Ok(default_socket_path())
     }
-    default_socket_path()
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -43,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting srui-ssh-bridge proxy (§19, §19.1, §20.1)...");
 
-    let socket_path = parse_socket_path();
+    let socket_path = parse_socket_path().map_err(|message| {
+        error!("{message}");
+        message
+    })?;
 
     info!("Connecting to session daemon socket at {:?}", socket_path);
     let session_stream = UnixStream::connect(&socket_path).await.map_err(|e| {

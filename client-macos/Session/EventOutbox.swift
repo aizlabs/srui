@@ -126,7 +126,10 @@ public actor EventOutbox {
     }
 
     /// Replays every unacknowledged event in original send order with its original identity.
-    public func resendPendingEvents(via transport: any Transport) async {
+    ///
+    /// Failures propagate to the caller so resume cannot enable new events until every retained
+    /// write succeeds (§18.2).
+    public func resendPendingEvents(via transport: any Transport) async throws {
         let replay = pendingOrder.compactMap { pendingEvents[$0] }
         let send = enqueueSend {
             for event in replay {
@@ -135,8 +138,7 @@ public actor EventOutbox {
                 try await transport.send(data: try SRUIFraming.encodeFramed(msg))
             }
         }
-        // A failed replay remains pending for the next resume.
-        _ = try? await send.value
+        try await send.value
     }
 
     /// Selectively acknowledges one event ID. A later sequence does not cross an earlier gap.
@@ -162,11 +164,11 @@ public actor EventOutbox {
         attemptId: UUID,
         via transport: any Transport,
         enableNewEventsAfterReplay: Bool
-    ) async -> Bool {
+    ) async throws -> Bool {
         guard activeResumeAttemptId == attemptId else { return false }
         activeSessionId = id
         acknowledgeEvents(throughSeq: lastProcessedEventSeq)
-        await resendPendingEvents(via: transport)
+        try await resendPendingEvents(via: transport)
         guard activeResumeAttemptId == attemptId else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
         return true

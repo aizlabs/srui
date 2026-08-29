@@ -2,7 +2,7 @@
 #
 # Add this snippet to /etc/ssh/sshd_config or /etc/ssh/sshd_config.d/srui.conf
 #
-# When a client connects via `ssh -s <host> srui`, sshd launches srui-ssh-bridge
+# When a client connects via `ssh <host> -s srui`, sshd launches srui-ssh-bridge
 # under the authenticated user's OS privileges with standard I/O wired to the
 # SSH channel. The bridge transparently proxies framed protocol bytes to the
 # user's private session daemon socket (srui-sessiond.sock).

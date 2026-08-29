@@ -40,8 +40,12 @@ struct SSHTransportPostureTests {
             #expect(args[sIndex + 1] == "srui", "Expected fixed subsystem 'srui' following -s (§19.1)")
         }
 
-        // Host destination must be present
+        // Host destination must be present (before -s on macOS OpenSSH)
         #expect(args.contains("remote.example.com"))
+        if let sIndex = args.firstIndex(of: "-s") {
+            #expect(sIndex > 0)
+            #expect(args[sIndex - 1] == "remote.example.com")
+        }
 
         // Ensure no shell command injection wrappers are present
         #expect(!args.contains("/bin/sh"))
@@ -96,5 +100,36 @@ struct SSHTransportPostureTests {
         #expect(args.contains("Compression=no"))
         #expect(args.contains("StrictHostKeyChecking=yes"))
         #expect(args.contains("127.0.0.1"))
+    }
+
+    @Test("Blocked extraOptions cannot weaken normative §19.1 posture")
+    func blockedExtraOptionsCannotWeakenPosture() {
+        let config = SSHConfiguration(
+            host: "remote.example.com",
+            extraOptions: [
+                "StrictHostKeyChecking": "no",
+                "ClearAllForwardings": "no",
+                "ForwardAgent": "yes",
+                "LocalForward": "8080:127.0.0.1:80",
+                "Compression": "no",
+            ]
+        )
+        let args = config.buildArguments()
+
+        #expect(!args.contains("StrictHostKeyChecking=no"))
+        #expect(args.contains("StrictHostKeyChecking=yes"))
+        #expect(!args.contains("ClearAllForwardings=no"))
+        #expect(args.contains("ClearAllForwardings=yes"))
+        #expect(!args.contains("ForwardAgent=yes"))
+        #expect(!args.contains("LocalForward=8080:127.0.0.1:80"))
+        #expect(args.contains("Compression=no"))
+
+        if let strictIdx = args.firstIndex(of: "StrictHostKeyChecking=yes") {
+            if let compressionIdx = args.firstIndex(of: "Compression=no") {
+                #expect(strictIdx > compressionIdx, "Posture flags must follow filtered extraOptions")
+            }
+        } else {
+            Issue.record("Missing StrictHostKeyChecking=yes")
+        }
     }
 }

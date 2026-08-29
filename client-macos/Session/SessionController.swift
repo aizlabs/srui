@@ -312,15 +312,20 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        let accepted = await outbox.completeSameSessionResume(
-            id: resumeOk.sessionID,
-            lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
-            attemptId: attemptId,
-            via: transport,
-            enableNewEventsAfterReplay: true
-        )
-        guard accepted else {
-            SessionDiagnostics.log("Ignoring superseded SERVER RESUME_OK")
+        do {
+            let accepted = try await outbox.completeSameSessionResume(
+                id: resumeOk.sessionID,
+                lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
+                attemptId: attemptId,
+                via: transport,
+                enableNewEventsAfterReplay: true
+            )
+            guard accepted else {
+                SessionDiagnostics.log("Ignoring superseded SERVER RESUME_OK")
+                return
+            }
+        } catch {
+            await reportFailure(.transportEnded("pending event replay failed: \(error)"))
             return
         }
         withStateLock {
@@ -350,15 +355,20 @@ public final class SessionController: @unchecked Sendable {
                 ))
                 return
             }
-            let accepted = await outbox.completeSameSessionResume(
-                id: resync.sessionID,
-                lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                attemptId: attemptId,
-                via: transport,
-                enableNewEventsAfterReplay: false
-            )
-            guard accepted else {
-                SessionDiagnostics.log("Ignoring superseded same-session resync")
+            do {
+                let accepted = try await outbox.completeSameSessionResume(
+                    id: resync.sessionID,
+                    lastProcessedEventSeq: resync.lastProcessedEventSeq,
+                    attemptId: attemptId,
+                    via: transport,
+                    enableNewEventsAfterReplay: false
+                )
+                guard accepted else {
+                    SessionDiagnostics.log("Ignoring superseded same-session resync")
+                    return
+                }
+            } catch {
+                await reportFailure(.transportEnded("pending event replay failed: \(error)"))
                 return
             }
             withStateLock {

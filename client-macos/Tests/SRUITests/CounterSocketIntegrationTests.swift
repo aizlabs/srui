@@ -53,7 +53,8 @@ struct CounterSocketIntegrationTests {
         let controller = SessionController(
             transport: transport,
             applier: applier,
-            renderer: renderer
+            renderer: renderer,
+            sessionId: "counter-socket-session"
         )
         controller.attachRenderer(renderer)
 

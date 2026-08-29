@@ -16,6 +16,19 @@ public enum StrictHostKeyCheckingMode: String, Sendable, Equatable {
 
 /// Configuration options for establishing an SSH transport session (§19, §19.1, §25).
 public struct SSHConfiguration: Sendable, Equatable {
+    /// OpenSSH `-o` keys that must not appear in `extraOptions` because they can weaken §19.1 posture.
+    public static let blockedExtraOptionKeys: Set<String> = [
+        "StrictHostKeyChecking",
+        "ClearAllForwardings",
+        "ExitOnForwardFailure",
+        "ForwardAgent",
+        "LocalForward",
+        "RemoteForward",
+        "DynamicForward",
+        "ProxyCommand",
+        "PermitLocalCommand",
+    ]
+
     /// Remote host name or IP address.
     public var host: String
 
@@ -43,7 +56,7 @@ public struct SSHConfiguration: Sendable, Equatable {
     /// Connection timeout in seconds (`-o ConnectTimeout=N`).
     public var connectTimeout: TimeInterval?
 
-    /// Additional `-o` options.
+    /// Additional `-o` options. Keys in `blockedExtraOptionKeys` are ignored so posture flags always win.
     public var extraOptions: [String: String]
 
     /// Path to system SSH binary (defaults to `/usr/bin/ssh`).
@@ -83,15 +96,25 @@ public struct SSHConfiguration: Sendable, Equatable {
     /// - `-o ExitOnForwardFailure=yes`: Exit immediately if any forwarding fails.
     /// - `-o StrictHostKeyChecking=...`: Enforce strict host-key verification with fail-closed semantics.
     /// - `-s <subsystem>`: Request fixed subsystem, preventing shell command interpolation.
+    ///
+    /// Normative posture flags are appended **after** filtered `extraOptions` so they cannot be overridden.
     public func buildArguments() -> [String] {
         var args: [String] = [
-            "-T",                           // §19.1: No PTY for SRUI protocol channel
-            "-x",                           // §19.1: No X11 forwarding
-            "-a",                           // §19.1: No agent forwarding by default
-            "-o", "ClearAllForwardings=yes",// §19.1: No ad hoc port forwards
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "StrictHostKeyChecking=\(strictHostKeyChecking.rawValue)" // §19.1: Fail closed on host-key changes
+            "-T", // §19.1: No PTY for SRUI protocol channel
+            "-x", // §19.1: No X11 forwarding
+            "-a", // §19.1: No agent forwarding by default
         ]
+
+        for (key, value) in extraOptions.sorted(by: { $0.key < $1.key }) {
+            guard !Self.blockedExtraOptionKeys.contains(key) else { continue }
+            args.append(contentsOf: ["-o", "\(key)=\(value)"])
+        }
+
+        args.append(contentsOf: [
+            "-o", "ClearAllForwardings=yes", // §19.1: No ad hoc port forwards
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "StrictHostKeyChecking=\(strictHostKeyChecking.rawValue)", // §19.1: Fail closed on host-key changes
+        ])
 
         if let knownHostsFile {
             args.append(contentsOf: ["-o", "UserKnownHostsFile=\(knownHostsFile)"])
@@ -104,10 +127,6 @@ public struct SSHConfiguration: Sendable, Equatable {
         if let connectTimeout {
             let seconds = max(1, Int(connectTimeout))
             args.append(contentsOf: ["-o", "ConnectTimeout=\(seconds)"])
-        }
-
-        for (key, value) in extraOptions.sorted(by: { $0.key < $1.key }) {
-            args.append(contentsOf: ["-o", "\(key)=\(value)"])
         }
 
         if let port {
@@ -123,10 +142,9 @@ public struct SSHConfiguration: Sendable, Equatable {
             args.append(contentsOf: ["-o", "IdentitiesOnly=yes"])
         }
 
-        // Destination host
+        // §19.1: Fixed subsystem request rather than a shell-interpolated command string.
+        // Host precedes `-s` for compatibility with macOS OpenSSH (verified by live integration tests).
         args.append(host)
-
-        // §19.1: Fixed subsystem request rather than a shell-interpolated command string
         args.append(contentsOf: ["-s", subsystem])
 
         return args

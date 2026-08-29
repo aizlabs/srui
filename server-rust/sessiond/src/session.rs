@@ -22,8 +22,8 @@ use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     CapabilitySet, EventValidationError, NegotiationError, NodeId, Profile, PropertyRef,
     SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef, Value,
-    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
-    DEFAULT_MAX_TREE_DEPTH,
+    DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
+    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 use thiserror::Error;
 
@@ -59,6 +59,9 @@ pub enum SessionError {
 
     #[error("replay unavailable for requested revision")]
     ReplayUnavailable,
+
+    #[error("transaction broadcast channel is closed")]
+    BroadcastClosed,
 
     #[error("transaction panicked: {0}")]
     Panicked(String),
@@ -111,13 +114,35 @@ impl std::fmt::Debug for SessionInner {
 #[derive(Debug, Clone)]
 pub struct Session {
     inner: Arc<Mutex<SessionInner>>,
-    tx_broadcast: broadcast::Sender<Transaction>,
+    tx_broadcast: Arc<Mutex<Option<broadcast::Sender<Transaction>>>>,
 }
 
 impl Session {
     /// Creates a new `Session` with the given session ID and default standard capabilities.
     pub fn new(session_id: impl Into<String>) -> Self {
-        let (tx_broadcast, _) = broadcast::channel(TRANSACTION_BROADCAST_CAPACITY);
+        Self::with_broadcast_capacity(session_id, TRANSACTION_BROADCAST_CAPACITY)
+    }
+
+    /// Creates a session with a custom transaction broadcast channel capacity.
+    ///
+    /// Intended for integration tests that exercise lag/resync behavior (§20.2).
+    #[doc(hidden)]
+    pub fn with_broadcast_capacity(session_id: impl Into<String>, capacity: usize) -> Self {
+        let (tx_broadcast, _) = broadcast::channel(capacity);
+        Self::with_broadcast_sender(session_id, tx_broadcast)
+    }
+
+    /// Drops the transaction broadcast sender so attached subscribers observe
+    /// [`broadcast::error::RecvError::Closed`] (§20.2).
+    #[doc(hidden)]
+    pub fn close_transaction_broadcast(&self) {
+        lock_or_recover(&self.tx_broadcast).take();
+    }
+
+    fn with_broadcast_sender(
+        session_id: impl Into<String>,
+        tx_broadcast: broadcast::Sender<Transaction>,
+    ) -> Self {
         let limits = ServerLimits {
             max_frame_size: 16 * 1024 * 1024,
             max_transaction_operations: DEFAULT_MAX_TRANSACTION_OPERATIONS as u32,
@@ -139,8 +164,12 @@ impl Session {
 
         Self {
             inner: Arc::new(Mutex::new(inner)),
-            tx_broadcast,
+            tx_broadcast: Arc::new(Mutex::new(Some(tx_broadcast))),
         }
+    }
+
+    fn broadcast_sender(&self) -> Option<broadcast::Sender<Transaction>> {
+        lock_or_recover(&self.tx_broadcast).clone()
     }
 
     /// Returns the session ID.
@@ -150,8 +179,15 @@ impl Session {
     }
 
     /// Subscribes to committed transaction broadcasts (§20.2).
-    pub fn subscribe_transactions(&self) -> broadcast::Receiver<Transaction> {
-        self.tx_broadcast.subscribe()
+    ///
+    /// Returns [`SessionError::BroadcastClosed`] once [`Session::close_transaction_broadcast`] has
+    /// dropped the sender. That hook is test-only, but it is reachable from a live session, and a
+    /// panic here would take down the connection-accept task rather than failing one connection.
+    pub fn subscribe_transactions(&self) -> Result<broadcast::Receiver<Transaction>, SessionError> {
+        lock_or_recover(&self.tx_broadcast)
+            .as_ref()
+            .map(|sender| sender.subscribe())
+            .ok_or(SessionError::BroadcastClosed)
     }
 
     /// Collects transactions to replay starting at `from_revision` using a borrowed journal iterator.
@@ -334,7 +370,9 @@ impl Session {
         };
 
         // Broadcast to attached bridges outside of the mutex lock (§20.2, async-no-lock-await)
-        let _ = self.tx_broadcast.send(tx);
+        if let Some(tx_broadcast) = self.broadcast_sender() {
+            let _ = tx_broadcast.send(tx);
+        }
         Ok(val)
     }
 
@@ -349,7 +387,9 @@ impl Session {
         }
 
         // Broadcast to attached bridges outside of the mutex lock
-        let _ = self.tx_broadcast.send(tx.clone());
+        if let Some(tx_broadcast) = self.broadcast_sender() {
+            let _ = tx_broadcast.send(tx.clone());
+        }
         Ok(tx)
     }
 
@@ -448,8 +488,88 @@ impl Session {
     }
 }
 
+/// Appends one `MODEL_RESET_RANGE` operation carrying `items` starting at `start_index` (§13, §26).
+fn push_model_reset_range(
+    ops: &mut Vec<srui_protocol::Operation>,
+    model_id: u64,
+    start_index: u64,
+    items: Vec<srui_protocol::ModelItem>,
+) {
+    ops.push(srui_protocol::Operation {
+        op: Some(srui_protocol::operation::Op::ModelResetRange(
+            srui_protocol::ModelResetRangeOp {
+                model_id,
+                start_index,
+                items,
+                total_count: 0,
+            },
+        )),
+    });
+}
+
 fn export_snapshot_transaction(store: &SemanticStore) -> Transaction {
     let mut ops = Vec::new();
+
+    let mut model_ids: Vec<_> = store.model_ids().collect();
+    model_ids.sort_by_key(|id| id.get());
+    for model_id in model_ids {
+        if let Some(model) = store.get_model(model_id) {
+            ops.push(srui_protocol::Operation {
+                op: Some(srui_protocol::operation::Op::CreateModel(
+                    srui_protocol::CreateModelOp {
+                        model_id: model.id.get(),
+                        model_type: Some(model.model_type.into()),
+                        item_count: model.item_count,
+                    },
+                )),
+            });
+
+            // §26: a model may cache up to `max_cached_items_per_model` (100_000) items, but a
+            // single model operation may carry at most `max_items_per_model_operation` (10_000).
+            // An unchunked range therefore produces a snapshot that every conforming client must
+            // reject — and a rejected resync snapshot leaves the client waiting for a snapshot it
+            // will reject again (§18).
+            for range in model.cached_ranges() {
+                let mut chunk_start = range.start;
+                let mut chunk: Vec<srui_protocol::ModelItem> = Vec::new();
+
+                for idx in range.start..range.start + range.length {
+                    match model.get_item_by_index(idx) {
+                        Some(item) => {
+                            if chunk.is_empty() {
+                                chunk_start = idx;
+                            }
+                            chunk.push(srui_protocol::ModelItem::from(item));
+                            if chunk.len() == DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION {
+                                push_model_reset_range(
+                                    &mut ops,
+                                    model.id.get(),
+                                    chunk_start,
+                                    std::mem::take(&mut chunk),
+                                );
+                            }
+                        }
+                        // `items` are positional from `start_index`, so a hole must end the run
+                        // rather than shift every later item down by one.
+                        None => {
+                            if !chunk.is_empty() {
+                                push_model_reset_range(
+                                    &mut ops,
+                                    model.id.get(),
+                                    chunk_start,
+                                    std::mem::take(&mut chunk),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if !chunk.is_empty() {
+                    push_model_reset_range(&mut ops, model.id.get(), chunk_start, chunk);
+                }
+            }
+        }
+    }
 
     fn visit_node(
         store: &SemanticStore,

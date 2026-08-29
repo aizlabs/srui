@@ -47,7 +47,11 @@ struct RendererDemoApp {
         )
         controller.attachRenderer(renderer)
 
+        // `NSApplication.delegate` is a weak reference, so the delegate must be owned somewhere that
+        // outlives this scope. A plain local can be released right after its last use, leaving the
+        // app with a nil delegate and no termination callbacks at all.
         let delegate = LiveApplicationDelegate(controller: controller, renderer: renderer)
+        LiveApplicationDelegate.retained = delegate
         application.delegate = delegate
         application.finishLaunching()
         delegate.start()
@@ -58,8 +62,12 @@ struct RendererDemoApp {
 
 @MainActor
 private final class LiveApplicationDelegate: NSObject, NSApplicationDelegate {
+    /// Strong owner for the delegate, which `NSApplication` only references weakly.
+    static var retained: LiveApplicationDelegate?
+
     private let controller: SessionController
     private let renderer: AppKitRenderer
+    private var isStopping = false
 
     init(controller: SessionController, renderer: AppKitRenderer) {
         self.controller = controller
@@ -81,12 +89,20 @@ private final class LiveApplicationDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        let semaphore = DispatchSemaphore(value: 0)
+    /// Shuts the session down before the process exits.
+    ///
+    /// This must not block the main thread waiting on a `Task`: an unstructured `Task` created here
+    /// inherits `MainActor` isolation, so blocking the main thread would prevent it from ever
+    /// starting and deadlock termination. `.terminateLater` keeps the run loop alive instead, and
+    /// `reply(toApplicationShouldTerminate:)` resumes the quit once cleanup finishes.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isStopping else { return .terminateNow }
+        isStopping = true
+
         Task {
             await controller.stop()
-            semaphore.signal()
+            NSApplication.shared.reply(toApplicationShouldTerminate: true)
         }
-        semaphore.wait()
+        return .terminateLater
     }
 }

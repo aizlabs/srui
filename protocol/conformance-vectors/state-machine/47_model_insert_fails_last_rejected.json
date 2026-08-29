@@ -1,0 +1,130 @@
+{
+  "name": "model_insert_fails_last_rejected",
+  "description": "MODEL_INSERT as the failing final operation rolls back all prior successful node and model mutations in the same transaction (§8, §12.1, §13).",
+  "spec_sections": ["§8", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {
+            "label": "Model Fail Last Baseline"
+          }
+        },
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "List",
+          "item_count": 50
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 101,
+              "value": "Existing Item",
+              "properties": {
+                "text": "Existing"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "SET_PROPERTY",
+        "node_id": 1,
+        "property": "label",
+        "value": "Staged Surface Label"
+      },
+      {
+        "type": "MODEL_UPDATE",
+        "model_id": 10,
+        "index": null,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "Updated Existing Item",
+            "properties": {
+              "text": "Updated"
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 0,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "Duplicate Item",
+            "properties": {
+              "text": "Duplicate"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "duplicate_item_id",
+    "failed_op_index": 2,
+    "expected_store_revision": 1,
+    "rollback_verified": true,
+    "store_state": {
+      "node_count": 1,
+      "roots": [1],
+      "nodes": {
+        "1": {
+          "node_id": 1,
+          "node_type": "Surface",
+          "parent_id": null,
+          "ordered_children": [],
+          "properties": {
+            "label": "Model Fail Last Baseline"
+          }
+        }
+      },
+      "model_count": 1,
+      "models": {
+        "10": {
+          "model_id": 10,
+          "model_type": "List",
+          "item_count": 51,
+          "cached_item_count": 1,
+          "cached_ranges": [
+            {
+              "start": 0,
+              "length": 1
+            }
+          ],
+          "items": {
+            "0": {
+              "item_id": 101,
+              "value": "Existing Item",
+              "properties": {
+                "text": "Existing"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

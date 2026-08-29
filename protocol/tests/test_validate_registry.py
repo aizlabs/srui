@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import yaml
-
 from validate.cli import validate_registry
 from validate.conformance import (
     ALL_SECTION_7_2_NODE_TYPES,
@@ -47,14 +48,68 @@ def test_validate_registry_json_success(capsys: pytest.CaptureFixture[str]) -> N
     assert payload["summary"]["node_types"] == len(ALL_SECTION_7_2_NODE_TYPES)
 
 
+def test_validate_registry_subprocess_json_contract() -> None:
+    command = [
+        sys.executable,
+        str(REGISTRY_PATH.parent / "validate_registry.py"),
+        "--json",
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is True
+    assert payload["registry"] == str(REGISTRY_PATH.resolve())
+    assert payload["errors"] == []
+
+
+def test_validate_registry_subprocess_malformed_input_contract(tmp_path: Path) -> None:
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("{not valid yaml", encoding="utf-8")
+    command = [
+        sys.executable,
+        str(REGISTRY_PATH.parent / "validate_registry.py"),
+        str(malformed),
+        "--json",
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert completed.returncode == 1
+    assert completed.stderr == ""
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is False
+    assert payload["errors"]
+
+
+def test_validate_registry_subprocess_missing_input_contract(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.yaml"
+    command = [
+        sys.executable,
+        str(REGISTRY_PATH.parent / "validate_registry.py"),
+        str(missing),
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+
+    assert completed.returncode == 1
+    assert completed.stderr == ""
+    assert "Registry file not found" in completed.stdout
+
+
 def test_conformance_constants_match_registry() -> None:
     registry = load_registry(REGISTRY_PATH)
 
     node_names = {entry["name"] for entry in registry["node_types"]}
     assert node_names == ALL_SECTION_7_2_NODE_TYPES
-    assert {entry["name"] for entry in registry["node_types"] if entry["tier"] == "required"} == REQUIRED_NODE_TYPES
-    assert {entry["name"] for entry in registry["node_types"] if entry["tier"] == "should"} == SHOULD_NODE_TYPES
-    assert {entry["name"]: entry["tier"] for entry in registry["node_types"]} == EXPECTED_NODE_TIERS
+    assert {
+        entry["name"] for entry in registry["node_types"] if entry["tier"] == "required"
+    } == REQUIRED_NODE_TYPES
+    assert {
+        entry["name"] for entry in registry["node_types"] if entry["tier"] == "should"
+    } == SHOULD_NODE_TYPES
+    assert {
+        entry["name"]: entry["tier"] for entry in registry["node_types"]
+    } == EXPECTED_NODE_TIERS
 
     prop_names = {entry["name"] for entry in registry["properties"]}
     assert REQUIRED_PROPERTIES_SECTION_7_4 <= prop_names
@@ -64,7 +119,9 @@ def test_conformance_constants_match_registry() -> None:
     enum_names = {entry["name"] for entry in registry["enums"]}
     assert enum_names >= set(REQUIRED_ENUM_VALUES.keys())
     for enum_name, expected_values in REQUIRED_ENUM_VALUES.items():
-        values = next(entry for entry in registry["enums"] if entry["name"] == enum_name)["values"]
+        values = next(
+            entry for entry in registry["enums"] if entry["name"] == enum_name
+        )["values"]
         assert {value["name"] for value in values} == expected_values
 
     event_names = {entry["name"] for entry in registry["events"]}
@@ -82,6 +139,7 @@ def test_proto_registry_ids_match() -> None:
 
 def test_proto_matches_conformance_python_constants() -> None:
     from validate.proto_registry import validate_proto_conformance_py_sync
+
     result = validate_proto_conformance_py_sync()
     assert result.ok, result.errors
 
@@ -93,18 +151,25 @@ def test_missing_control_specific_property_fails() -> None:
     ]
     result = validate_registry_data(registry)
     assert not result.ok
-    assert any("control-specific properties" in err and "columns" in err for err in result.errors)
+    assert any(
+        "control-specific properties" in err and "columns" in err
+        for err in result.errors
+    )
 
 
 def test_missing_supporting_enum_value_fails() -> None:
     registry = load_registry(REGISTRY_PATH)
-    visibility = next(enum for enum in registry["enums"] if enum["name"] == "Visibility")
+    visibility = next(
+        enum for enum in registry["enums"] if enum["name"] == "Visibility"
+    )
     visibility["values"] = [
         value for value in visibility["values"] if value["name"] != "collapsed"
     ]
     result = validate_registry_data(registry)
     assert not result.ok
-    assert any("enums.Visibility" in err and "collapsed" in err for err in result.errors)
+    assert any(
+        "enums.Visibility" in err and "collapsed" in err for err in result.errors
+    )
 
 
 def test_duplicate_property_id_fails() -> None:
@@ -130,7 +195,9 @@ def test_missing_required_node_type_fails() -> None:
     ]
     result = validate_registry_data(registry)
     assert not result.ok
-    assert any("Missing required-tier" in err and "Button" in err for err in result.errors)
+    assert any(
+        "Missing required-tier" in err and "Button" in err for err in result.errors
+    )
 
 
 def test_invalid_node_tier_fails() -> None:
@@ -139,7 +206,10 @@ def test_invalid_node_tier_fails() -> None:
     button["tier"] = "should"
     result = validate_registry_data(registry)
     assert not result.ok
-    assert any("Entry 'Button' has tier 'should', expected 'required'." in err for err in result.errors)
+    assert any(
+        "Entry 'Button' has tier 'should', expected 'required'." in err
+        for err in result.errors
+    )
 
 
 def test_invalid_property_value_type_fails() -> None:
@@ -148,16 +218,23 @@ def test_invalid_property_value_type_fails() -> None:
     enabled["value_type"] = "integer"
     result = validate_registry_data(registry)
     assert not result.ok
-    assert any("Entry 'enabled' has invalid value_type 'integer'." in err for err in result.errors)
+    assert any(
+        "Entry 'enabled' has invalid value_type 'integer'." in err
+        for err in result.errors
+    )
 
 
 def test_invalid_event_kind_fails() -> None:
     registry = load_registry(REGISTRY_PATH)
-    activate = next(event for event in registry["events"] if event["name"] == "ACTIVATE")
+    activate = next(
+        event for event in registry["events"] if event["name"] == "ACTIVATE"
+    )
     activate["kind"] = "pointer"
     result = validate_registry_data(registry)
     assert not result.ok
-    assert any("Entry 'ACTIVATE' has invalid kind 'pointer'." in err for err in result.errors)
+    assert any(
+        "Entry 'ACTIVATE' has invalid kind 'pointer'." in err for err in result.errors
+    )
 
 
 def test_load_registry_rejects_invalid_yaml(tmp_path: Path) -> None:

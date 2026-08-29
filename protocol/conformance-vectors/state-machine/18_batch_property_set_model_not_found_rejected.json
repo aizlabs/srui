@@ -1,0 +1,43 @@
+{
+  "name": "batch_property_set_model_not_found_rejected",
+  "description": "BATCH_PROPERTY_SET referencing a non-existent model via model_ref is rejected with model_not_found and rolled back (§8, §12.1, §13).",
+  "spec_sections": ["§8", "§12.1", "§13", "§26"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_NODE",
+          "node_id": 1,
+          "node_type": "Table",
+          "parent_id": null,
+          "child_index": null,
+          "properties": {}
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "BATCH_PROPERTY_SET",
+        "node_id": 1,
+        "properties": {
+          "model_ref": 999,
+          "label": "Processes"
+        }
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_not_found",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

@@ -34,6 +34,50 @@ jobs:
           cargo check --workspace --all-targets
         working-directory: server-rust
 
+  fuzz:
+    name: Decoder Fuzz Regression
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Cache cargo-fuzz binary and registry
+        id: cache-cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('server-rust/fuzz/Cargo.lock') }}
+          restore-keys: cargo-fuzz-${{ runner.os }}-
+      - name: Install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked
+      - name: Seed fuzz corpora from conformance vectors
+        run: |
+          set -euo pipefail
+          vectors="$GITHUB_WORKSPACE/protocol/conformance-vectors"
+          fuzz="$GITHUB_WORKSPACE/server-rust/fuzz/corpus"
+          mkdir -p "$fuzz/decode_framed" "$fuzz/decode_wire" "$fuzz/apply_transaction" "$fuzz/state_sequence"
+          cp "$vectors/golden_framed_message.bin" "$fuzz/decode_framed/"
+          cp "$vectors/malformed_overlong_varint.bin" "$fuzz/decode_framed/"
+          cp "$vectors/malformed_truncated_frame.bin" "$fuzz/decode_framed/"
+          cp "$vectors/golden_node_record.bin" "$fuzz/decode_wire/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/decode_wire/"
+          cp "$vectors/malformed/"*.bin "$fuzz/decode_wire/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/apply_transaction/"
+          cp "$vectors/malformed/"*.bin "$fuzz/apply_transaction/"
+          cp "$vectors/golden_transaction.bin" "$fuzz/state_sequence/"
+      - name: Run bounded fuzz regression
+        working-directory: server-rust/fuzz
+        run: |
+          set -euo pipefail
+          for target in decode_framed decode_wire apply_transaction state_sequence; do
+            cargo fuzz run "$target" "corpus/$target" -- -runs=0
+            cargo fuzz run "$target" "corpus/$target" -- -max_total_time=15
+          done
+
   swift:
     name: Swift Build
     runs-on: macos-15

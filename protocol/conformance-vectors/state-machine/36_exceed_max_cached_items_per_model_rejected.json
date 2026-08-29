@@ -1,0 +1,70 @@
+{
+  "name": "exceed_max_cached_items_per_model_rejected",
+  "description": "Inserting items that would exceed max_cached_items_per_model is rejected with max_cached_items_per_model_exceeded and rolled back (§8, §26).",
+  "spec_sections": ["§8", "§12.1", "§26"],
+  "initial_limits": {
+    "max_cached_items_per_model": 3
+  },
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "List",
+          "item_count": 10000
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 1,
+              "value": "alpha",
+              "properties": {}
+            },
+            {
+              "item_id": 2,
+              "value": "beta",
+              "properties": {}
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 2,
+        "items": [
+          {
+            "item_id": 3,
+            "value": "gamma",
+            "properties": {}
+          },
+          {
+            "item_id": 4,
+            "value": "delta",
+            "properties": {}
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "max_cached_items_per_model_exceeded",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

@@ -18,4 +18,6 @@ srui-sdk = { path = "../sdk" }
 srui-journal = { path = "../journal" }
 srui-event-dedupe = { path = "../event-dedupe" }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 

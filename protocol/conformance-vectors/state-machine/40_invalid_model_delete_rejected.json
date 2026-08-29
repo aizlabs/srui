@@ -1,0 +1,58 @@
+{
+  "name": "invalid_model_delete_rejected",
+  "description": "MODEL_DELETE combining item_ids with an index/count range is rejected with invalid_model_delete and rolled back (§8, §13).",
+  "spec_sections": ["§8", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "List",
+          "item_count": 100
+        },
+        {
+          "type": "MODEL_RESET_RANGE",
+          "model_id": 10,
+          "start_index": 0,
+          "total_count": null,
+          "items": [
+            {
+              "item_id": 1,
+              "value": "row-a",
+              "properties": {}
+            },
+            {
+              "item_id": 2,
+              "value": "row-b",
+              "properties": {}
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_DELETE",
+        "model_id": 10,
+        "index": 0,
+        "count": 2,
+        "item_ids": [1, 2]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "invalid_model_delete",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

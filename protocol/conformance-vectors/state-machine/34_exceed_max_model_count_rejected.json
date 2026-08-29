@@ -1,0 +1,54 @@
+{
+  "name": "exceed_max_model_count_rejected",
+  "description": "Attempting to create more collection models than allowed by max_model_count is rejected with max_model_count_exceeded and rolled back (§8, §26).",
+  "spec_sections": ["§8", "§12.1", "§26"],
+  "initial_limits": {
+    "max_model_count": 2
+  },
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 1,
+          "model_type": "List",
+          "item_count": 100
+        }
+      ]
+    },
+    {
+      "base_revision": 1,
+      "new_revision": 2,
+      "operations": [
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 2,
+          "model_type": "Table",
+          "item_count": 50
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 2,
+    "new_revision": 3,
+    "operations": [
+      {
+        "type": "CREATE_MODEL",
+        "model_id": 3,
+        "model_type": "List",
+        "item_count": 10
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "max_model_count_exceeded",
+    "failed_op_index": 0,
+    "expected_store_revision": 2,
+    "rollback_verified": true
+  }
+}

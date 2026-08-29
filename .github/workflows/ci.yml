@@ -62,8 +62,8 @@ jobs:
         run: |
           set -euo pipefail
           for target in decode_framed decode_wire apply_transaction; do
-            cargo fuzz run "$target" corpus -- -runs=0
-            cargo fuzz run "$target" corpus -- -max_total_time=15
+            cargo fuzz run "$target" "corpus/$target" -- -runs=0
+            cargo fuzz run "$target" "corpus/$target" -- -max_total_time=15
           done
 
   swift:

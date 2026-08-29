@@ -95,11 +95,19 @@ where
                 "Received ClientHello from client instance {:?}",
                 hello.client_instance_id
             );
-            let welcome = session.handle_hello(&hello)?;
+            let (welcome, snapshot) = session.handle_hello(&hello)?;
             let welcome_envelope = SruiMessage {
                 msg: Some(srui_message::Msg::ServerWelcome(welcome)),
             };
             framed_write.send(welcome_envelope).await?;
+            // Catch-up is sent before `subscribe_transactions` so a concurrent commit cannot
+            // overtake the snapshot while the client still has `pendingResync` set (§15, §18).
+            if let Some(snapshot) = snapshot {
+                let snapshot_envelope = SruiMessage {
+                    msg: Some(srui_message::Msg::Transaction(snapshot)),
+                };
+                framed_write.send(snapshot_envelope).await?;
+            }
             hello.client_instance_id
         }
         Some(srui_message::Msg::ClientResume(resume)) => {

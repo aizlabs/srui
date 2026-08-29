@@ -459,4 +459,47 @@ struct HandshakeNegotiationTests {
         await controller.stop()
         await serverTransport.close()
     }
+
+    @Test("WELCOME with a nonzero initial revision applies the following snapshot before enabling dispatch")
+    func helloCatchUpSnapshotIsApplied() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        try await controller.start()
+
+        var welcome = HandshakeFixtures.welcomeMessage(sessionId: "hello-bootstrap").serverWelcome
+        welcome.initialRevision = 1
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        try await AsyncTestSupport.eventually(description: "handshake complete while awaiting snapshot") {
+            controller.isHandshakeComplete
+        }
+        #expect(applier.lastAppliedRevision == .initial)
+
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [.createNode(id: NodeId(1), nodeType: .surface)]
+        )
+        var snapshotMsg = SRUIMessage()
+        snapshotMsg.transaction = snapshot.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMsg))
+
+        try await AsyncTestSupport.eventually(description: "hello catch-up snapshot applied") {
+            applier.lastAppliedRevision == Revision(1) && controller.isEventDispatchEnabled
+        }
+        #expect(controller.isDiverged == false)
+        #expect(controller.negotiatedCapabilities == [Profile.standardWidgetsV1])
+        _ = try await controller.sendActivate(nodeId: NodeId(1))
+
+        await controller.stop()
+        await serverTransport.close()
+    }
 }

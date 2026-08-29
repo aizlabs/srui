@@ -67,6 +67,16 @@ impl ClientConnection {
         match welcome.msg {
             Some(srui_message::Msg::ServerWelcome(w)) => {
                 assert_eq!(w.session_id, session.session_id());
+                if w.initial_revision > 0 {
+                    let snapshot = read.next().await.expect("hello catch-up").expect("decode snapshot");
+                    match snapshot.msg {
+                        Some(srui_message::Msg::Transaction(tx)) => {
+                            assert_eq!(tx.base_revision, 0);
+                            assert_eq!(tx.new_revision, w.initial_revision);
+                        }
+                        other => panic!("expected hello catch-up Transaction, got {:?}", other),
+                    }
+                }
             }
             other => panic!("expected ServerWelcome, got {:?}", other),
         }

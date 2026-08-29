@@ -11,7 +11,8 @@
 // - §15 Capability negotiation: `CLIENT HELLO` / `SERVER WELCOME` establish the session; resume
 //   reuses the retained negotiated set instead of re-parsing profiles from `RESUME_OK`.
 // - §18 Reconnect and resynchronization: `CLIENT RESUME` carries `last_applied_revision` and
-//   `last_acked_event_seq`; `SERVER RESYNC_REQUIRED` is the *only* trigger for snapshot replacement.
+//   `last_acked_event_seq`. `SERVER RESYNC_REQUIRED` and a HELLO catch-up snapshot (when
+//   `WELCOME.initial_revision > 0`) replace the replica; incremental transactions never do.
 // - §18.2 Event settlement: server event frontiers raise `last_acked_event_seq`, while
 //   per-event acknowledgements selectively drain the outbox's retry set.
 // - §22.2 Threading: network IO and protobuf decoding run off the main actor; AppKit mutations
@@ -119,6 +120,12 @@ public final class SessionController: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+
+    /// Whether user events may be sent. False during handshake and while a catch-up or
+    /// resync snapshot is still outstanding (§15, §18).
+    public var isEventDispatchEnabled: Bool {
+        withStateLock { eventDispatchEnabled }
     }
 
     /// Whether the handshake has completed successfully (§15).
@@ -366,9 +373,9 @@ public final class SessionController: @unchecked Sendable {
 
         case .serverResyncRequired(let resync):
             switch phase {
-            case .awaitingResume, .active:
+            case .awaitingResume, .active, .awaitingSnapshot:
                 await handleResyncRequired(resync, phase: phase)
-            case .idle, .awaitingWelcome, .awaitingSnapshot, .failed:
+            case .idle, .awaitingWelcome, .failed:
                 await reportFailure(.protocolViolation(
                     "Received SERVER RESYNC_REQUIRED before handshake completed"
                 ))
@@ -463,8 +470,17 @@ public final class SessionController: @unchecked Sendable {
             self.requestedSessionId = nil
             self.resumeAttemptId = nil
             self.retainedCapabilities = negotiated
-            self.phase = .active(negotiated: negotiated)
-            self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+            if welcome.initialRevision > 0 {
+                self.pendingResync = true
+                self.eventDispatchEnabled = false
+                self.phase = .awaitingSnapshot(negotiated: negotiated)
+            } else {
+                self.phase = .active(negotiated: negotiated)
+                self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+            }
+        }
+        if welcome.initialRevision > 0 {
+            await outbox.suspendNewEvents()
         }
         SessionDiagnostics.log(
             "Handshake completed successfully with session \(welcome.sessionID), negotiated: \(negotiated)"
@@ -599,6 +615,9 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                await outbox.applyLiveResyncFrontier(
+                    lastProcessedEventSeq: resync.lastProcessedEventSeq
+                )
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .replaced:
@@ -609,6 +628,10 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                await outbox.applyReplacementFrontier(
+                    id: resync.sessionID,
+                    lastProcessedEventSeq: resync.lastProcessedEventSeq
+                )
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
@@ -699,10 +722,11 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        // §18: a snapshot replaces authoritative state, so it is driven *only* by an explicit
-        // `SERVER RESYNC_REQUIRED`. `base_revision == 0` is not by itself evidence of a snapshot —
-        // a stale or duplicated copy of the initial transaction carries it too, and treating that
-        // as a snapshot would wipe a live replica and regress the revision (§12.1).
+        // §18: a snapshot replaces authoritative state only when `pendingResync` is set —
+        // `SERVER RESYNC_REQUIRED` or a HELLO catch-up after `WELCOME.initial_revision > 0`.
+        // `base_revision == 0` is not by itself evidence of a snapshot: a stale copy of the
+        // initial transaction carries it too, and treating that as a snapshot would wipe a live
+        // replica (§12.1).
         let isResyncSnapshot = withStateLock { pendingResync }
 
         // Apply and capture the committed snapshot in a single critical section so the renderer is
@@ -714,39 +738,44 @@ public final class SessionController: @unchecked Sendable {
         switch applyResult {
         case .success(let snapshot):
             if isResyncSnapshot {
-                // Only consume the pending-resync latch once the snapshot actually committed;
-                // clearing it on failure would strand the client with no path back to a resync.
-                withStateLock { self.pendingResync = false }
+                // Enable dispatch before the renderer mounts so the first click after catch-up
+                // is accepted. Clearing the latch only after a successful apply keeps a rejected
+                // snapshot from stranding the client with no path back to a usable tree (§18).
+                await completeSnapshotCatchUp()
             }
             await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,
                 snapshot: snapshot,
                 forceRemount: isResyncSnapshot
             )
-            if isResyncSnapshot {
-                let attemptId = withStateLock { self.resumeAttemptId }
-                if let attemptId {
-                    let accepted = await outbox.finishResync(attemptId: attemptId)
-                    withStateLock {
-                        guard accepted else { return }
-                        self.resumeAttemptId = nil
-                        self.eventDispatchEnabled = self.isRunning && !self._isDiverged
-                        if case .awaitingSnapshot(let negotiated) = self.phase {
-                            self.phase = .active(negotiated: negotiated)
-                        }
-                    }
-                } else {
-                    withStateLock {
-                        self.eventDispatchEnabled = self.isRunning && !self._isDiverged
-                        if case .awaitingSnapshot(let negotiated) = self.phase {
-                            self.phase = .active(negotiated: negotiated)
-                        }
-                    }
-                }
-            }
 
         case .failure(let err):
             await handleTransactionRejection(err, isResyncSnapshot: isResyncSnapshot)
+        }
+    }
+
+    /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.
+    private func completeSnapshotCatchUp() async {
+        withStateLock { self.pendingResync = false }
+        let attemptId = withStateLock { self.resumeAttemptId }
+        if let attemptId {
+            let accepted = await outbox.finishResync(attemptId: attemptId)
+            withStateLock {
+                guard accepted else { return }
+                self.resumeAttemptId = nil
+                self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+                if case .awaitingSnapshot(let negotiated) = self.phase {
+                    self.phase = .active(negotiated: negotiated)
+                }
+            }
+        } else {
+            await outbox.allowNewEvents()
+            withStateLock {
+                self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+                if case .awaitingSnapshot(let negotiated) = self.phase {
+                    self.phase = .active(negotiated: negotiated)
+                }
+            }
         }
     }
 

@@ -266,8 +266,12 @@ impl Session {
     }
 
     /// Evaluates a `ClientHello` handshake message, negotiates capabilities,
-    /// and returns the `ServerWelcome` envelope (§15, §18).
-    pub fn handle_hello(&self, hello: &ClientHello) -> Result<ServerWelcome, SessionError> {
+    /// and returns the `ServerWelcome` envelope plus a catch-up snapshot when the
+    /// session already has committed state (§15, §18).
+    pub fn handle_hello(
+        &self,
+        hello: &ClientHello,
+    ) -> Result<(ServerWelcome, Option<Transaction>), SessionError> {
         let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
         let mut client_caps = CapabilitySet::new();
@@ -279,12 +283,13 @@ impl Session {
 
         let _negotiated = guard.capabilities.negotiate(&client_caps)?;
 
+        let initial_revision = guard.store.revision().get();
         let welcome = ServerWelcome {
             core_version: "0.4.0".to_string(),
             required_profiles: guard.capabilities.required.to_string_vec(),
             optional_profiles: guard.capabilities.optional.to_string_vec(),
             session_id: guard.session_id.clone(),
-            initial_revision: guard.store.revision().get(),
+            initial_revision,
             extension_namespaces: vec![ExtensionNamespaceMapping {
                 extension_uri: "org.srui.standard-widgets".to_string(),
                 namespace_id: 0,
@@ -292,7 +297,13 @@ impl Session {
             limits: Some(guard.limits),
         };
 
-        Ok(welcome)
+        let snapshot = if initial_revision > 0 {
+            Some(export_snapshot_transaction(&guard.store))
+        } else {
+            None
+        };
+
+        Ok((welcome, snapshot))
     }
 
     /// Evaluates a `ClientResume` reconnection request (§20.2, §21, §32.5).
@@ -869,9 +880,10 @@ mod tests {
             client_metadata: Default::default(),
         };
 
-        let welcome = session.handle_hello(&hello).expect("hello negotiated");
+        let (welcome, snapshot) = session.handle_hello(&hello).expect("hello negotiated");
         assert_eq!(welcome.session_id, "test-session");
         assert_eq!(welcome.initial_revision, 0);
+        assert!(snapshot.is_none());
 
         // Commit transaction
         let tx = Transaction {
@@ -884,6 +896,12 @@ mod tests {
         let committed = session.commit_transaction(tx).expect("commit tx");
         assert_eq!(committed.new_revision, 1);
         assert_eq!(session.current_revision(), 1);
+
+        let (welcome_after, snapshot_after) = session.handle_hello(&hello).expect("hello after commit");
+        assert_eq!(welcome_after.initial_revision, 1);
+        let snapshot = snapshot_after.expect("hello catch-up snapshot");
+        assert_eq!(snapshot.base_revision, 0);
+        assert_eq!(snapshot.new_revision, 1);
 
         // Resume replay
         let resume = ClientResume {

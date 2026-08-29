@@ -451,6 +451,41 @@ impl Session {
 fn export_snapshot_transaction(store: &SemanticStore) -> Transaction {
     let mut ops = Vec::new();
 
+    let mut model_ids: Vec<_> = store.model_ids().collect();
+    model_ids.sort_by_key(|id| id.get());
+    for model_id in model_ids {
+        if let Some(model) = store.get_model(model_id) {
+            ops.push(srui_protocol::Operation {
+                op: Some(srui_protocol::operation::Op::CreateModel(
+                    srui_protocol::CreateModelOp {
+                        model_id: model.id.get(),
+                        model_type: Some(model.model_type.into()),
+                        item_count: model.item_count,
+                    },
+                )),
+            });
+
+            for range in model.cached_ranges() {
+                let items: Vec<srui_protocol::ModelItem> = (range.start..range.start + range.length)
+                    .filter_map(|idx| model.get_item_by_index(idx))
+                    .map(srui_protocol::ModelItem::from)
+                    .collect();
+                if !items.is_empty() {
+                    ops.push(srui_protocol::Operation {
+                        op: Some(srui_protocol::operation::Op::ModelResetRange(
+                            srui_protocol::ModelResetRangeOp {
+                                model_id: model.id.get(),
+                                start_index: range.start,
+                                items,
+                                total_count: 0,
+                            },
+                        )),
+                    });
+                }
+            }
+        }
+    }
+
     fn visit_node(
         store: &SemanticStore,
         node_id: srui_semantic_tree::NodeId,

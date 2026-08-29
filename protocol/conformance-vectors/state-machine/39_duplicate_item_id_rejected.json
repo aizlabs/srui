@@ -1,0 +1,57 @@
+{
+  "name": "duplicate_item_id_rejected",
+  "description": "Inserting an item whose item_id already exists in the model cache is rejected with duplicate_item_id and rolled back (§8, §13).",
+  "spec_sections": ["§8", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "List",
+          "item_count": 100
+        },
+        {
+          "type": "MODEL_INSERT",
+          "model_id": 10,
+          "index": 0,
+          "items": [
+            {
+              "item_id": 101,
+              "value": "Existing Item",
+              "properties": {}
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 1,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "Duplicate Item",
+            "properties": {}
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "duplicate_item_id",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

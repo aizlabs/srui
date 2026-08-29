@@ -1,0 +1,40 @@
+{
+  "name": "model_index_out_of_bounds_rejected",
+  "description": "MODEL_DELETE with an index range extending past item_count is rejected with model_index_out_of_bounds and rolled back (§8, §13).",
+  "spec_sections": ["§8", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [
+    {
+      "base_revision": 0,
+      "new_revision": 1,
+      "operations": [
+        {
+          "type": "CREATE_MODEL",
+          "model_id": 10,
+          "model_type": "List",
+          "item_count": 10
+        }
+      ]
+    }
+  ],
+  "transaction": {
+    "base_revision": 1,
+    "new_revision": 2,
+    "operations": [
+      {
+        "type": "MODEL_DELETE",
+        "model_id": 10,
+        "index": 5,
+        "count": 100,
+        "item_ids": []
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_index_out_of_bounds",
+    "failed_op_index": 0,
+    "expected_store_revision": 1,
+    "rollback_verified": true
+  }
+}

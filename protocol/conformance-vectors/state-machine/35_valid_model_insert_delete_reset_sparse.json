@@ -1,0 +1,135 @@
+{
+  "name": "valid_model_insert_delete_reset_sparse",
+  "description": "Collection model lifecycle at configured limits: insert at begin/middle/sparse edge, MODEL_RESET_RANGE, delete by item_id and by index range (§8, §12.1, §13, §26).",
+  "spec_sections": ["§8", "§12.1", "§13", "§26"],
+  "initial_limits": {
+    "max_model_count": 1,
+    "max_cached_items_per_model": 6,
+    "max_items_per_model_operation": 2
+  },
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "CREATE_MODEL",
+        "model_id": 10,
+        "model_type": "List",
+        "item_count": 10000
+      },
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 0,
+        "items": [
+          {
+            "item_id": 101,
+            "value": "Row A",
+            "properties": {
+              "text": "A"
+            }
+          },
+          {
+            "item_id": 102,
+            "value": "Row B",
+            "properties": {
+              "text": "B"
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 10,
+        "index": 1,
+        "items": [
+          {
+            "item_id": 103,
+            "value": "Row C",
+            "properties": {
+              "text": "C"
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_RESET_RANGE",
+        "model_id": 10,
+        "start_index": 5000,
+        "total_count": null,
+        "items": [
+          {
+            "item_id": 201,
+            "value": "Sparse R1",
+            "properties": {
+              "text": "R1"
+            }
+          },
+          {
+            "item_id": 202,
+            "value": "Sparse R2",
+            "properties": {
+              "text": "R2"
+            }
+          }
+        ]
+      },
+      {
+        "type": "MODEL_DELETE",
+        "model_id": 10,
+        "index": null,
+        "count": null,
+        "item_ids": [101]
+      },
+      {
+        "type": "MODEL_DELETE",
+        "model_id": 10,
+        "index": 4998,
+        "count": 3,
+        "item_ids": []
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "success",
+    "committed_revision": 1,
+    "store_state": {
+      "node_count": 0,
+      "roots": [],
+      "nodes": {},
+      "model_count": 1,
+      "models": {
+        "10": {
+          "model_id": 10,
+          "model_type": "List",
+          "item_count": 9999,
+          "cached_item_count": 2,
+          "cached_ranges": [
+            {
+              "start": 0,
+              "length": 2
+            }
+          ],
+          "items": {
+            "0": {
+              "item_id": 103,
+              "value": "Row C",
+              "properties": {
+                "text": "C"
+              }
+            },
+            "1": {
+              "item_id": 102,
+              "value": "Row B",
+              "properties": {
+                "text": "B"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "model_not_found_rejected",
+  "description": "Attempting a collection model mutation on an unknown model_id is rejected with model_not_found and rolled back (§8, §13).",
+  "spec_sections": ["§8", "§12.1", "§13"],
+  "initial_revision": 0,
+  "setup_transactions": [],
+  "transaction": {
+    "base_revision": 0,
+    "new_revision": 1,
+    "operations": [
+      {
+        "type": "MODEL_INSERT",
+        "model_id": 99,
+        "index": 0,
+        "items": [
+          {
+            "item_id": 1,
+            "value": "orphan insert",
+            "properties": {}
+          }
+        ]
+      }
+    ]
+  },
+  "expected_outcome": {
+    "status": "rejected",
+    "error_code": "model_not_found",
+    "failed_op_index": 0,
+    "expected_store_revision": 0,
+    "rollback_verified": true
+  }
+}

@@ -213,4 +213,47 @@ struct CapabilityTests {
         #expect(negotiated.contains(Profile.standardWidgetsV1))
         #expect(negotiated.contains(Profile.terminalV1))
     }
+
+    @Test("CapabilitySet fromStrings and fromValidStrings handling")
+    func fromStringsHandling() throws {
+        let validStrings = ["org.srui.standard-widgets/1", "org.srui.terminal/1"]
+        let set1 = try CapabilitySet.fromStrings(validStrings)
+        #expect(set1.count == 2)
+        #expect(set1.contains(Profile.standardWidgetsV1))
+
+        let mixedStrings = ["org.srui.standard-widgets/1", "invalid-profile-no-version", "org.srui.terminal/1"]
+        #expect(throws: ParseProfileError.self) {
+            try CapabilitySet.fromStrings(mixedStrings)
+        }
+
+        let setValidOnly = CapabilitySet.fromValidStrings(mixedStrings)
+        #expect(setValidOnly.count == 2)
+        #expect(setValidOnly.contains(Profile.standardWidgetsV1))
+        #expect(setValidOnly.contains(Profile.terminalV1))
+    }
+
+    @Test("NegotiationError and ParseProfileError descriptive messages")
+    func errorDescriptions() {
+        let missing = [Profile.standardWidgetsV1, Profile.terminalV1]
+        let err = NegotiationError.unsatisfiedRequiredProfiles(missing: missing)
+        #expect(err.description.contains("org.srui.standard-widgets/1"))
+        #expect(err.description.contains("org.srui.terminal/1"))
+
+        #expect(ParseProfileError.emptyString.description == "profile string is empty")
+        #expect(ParseProfileError.emptyName.description == "profile name is empty")
+        #expect(ParseProfileError.missingVersionDelimiter("bad").description.contains("missing version delimiter"))
+        #expect(ParseProfileError.invalidVersion("x").description.contains("invalid profile version"))
+    }
+
+    @Test("CapabilitySet insert string and update with Profile")
+    func insertStringAndUpdate() throws {
+        var set = CapabilitySet()
+        let inserted = try set.insert(string: "org.srui.standard-widgets/1")
+        #expect(inserted)
+        let dup = try set.insert(string: "org.srui.standard-widgets/1")
+        #expect(!dup)
+
+        let updated = set.update(with: Profile.standardWidgetsV1)
+        #expect(updated == Profile.standardWidgetsV1)
+    }
 }

@@ -208,6 +208,114 @@ struct HandshakeNegotiationTests {
         await controller.stop()
         await serverTransport.close()
     }
+
+    @Test("Client fails cleanly when server does not satisfy client required profiles")
+    func clientRequiredProfilesMismatchFails() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1, Profile.terminalV1],
+            requiredServerProfiles: [Profile.terminalV1] // Client requires terminal
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        // 1. Drain ClientHello
+        let serverStream = serverTransport.receiveStream()
+        var streamDecoder = SRUIMessageStreamDecoder()
+        for try await chunk in serverStream {
+            let messages = try streamDecoder.appendAndExtract(incoming: chunk)
+            if messages.contains(where: { if case .clientHello = $0.msg { return true } else { return false } }) {
+                break
+            }
+        }
+
+        // 2. Server sends ServerWelcome that ONLY provides standard-widgets (not terminal)
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = "0.4.0"
+        welcome.sessionID = "server-missing-client-req"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.optionalProfiles = []
+        welcome.initialRevision = 0
+
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        // 3. Client must fail because terminal was required by client
+        try await AsyncTestSupport.eventually(description: "client required profile mismatch") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+        #expect(!controller.isHandshakeComplete)
+
+        if let failure = failurePromise.load() {
+            if case .protocolViolation(let msg) = failure {
+                #expect(msg.contains("Server does not satisfy client required profiles"))
+            } else {
+                Issue.record("Expected protocolViolation, got \(failure)")
+            }
+        }
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    @Test("Outbound event dispatch is rejected before handshake completion")
+    func eventDispatchRejectedBeforeHandshake() async throws {
+        let (clientTransport, _) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        #expect(!controller.isHandshakeComplete)
+        await #expect(throws: SessionDispatchError.resumeNotConfirmed) {
+            try await controller.sendActivate(nodeId: NodeId(1))
+        }
+    }
+
+    @Test("Client-originated message received from server is rejected as protocol violation")
+    func clientOriginatedMessageFromServerIsRejected() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        // Server sends ClientHello back to client
+        var hello = SRUIClientHello()
+        hello.coreVersion = "0.4.0"
+        var helloMsg = SRUIMessage()
+        helloMsg.clientHello = hello
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(helloMsg))
+
+        try await AsyncTestSupport.eventually(description: "rejection of client message from server") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+
+        if let failure = failurePromise.load() {
+            if case .protocolViolation(let msg) = failure {
+                #expect(msg.contains("client-originated handshake message"))
+            } else {
+                Issue.record("Expected protocolViolation, got \(failure)")
+            }
+        }
+
+        await controller.stop()
+        await serverTransport.close()
+    }
 }
 
 private final class ManagedAtomic<T: Sendable>: @unchecked Sendable {

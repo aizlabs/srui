@@ -160,6 +160,11 @@ public final class SessionController: @unchecked Sendable {
         withStateLock { _isDiverged }
     }
 
+    /// Current active session ID assigned by the server or requested during resume (§15, §18).
+    public var sessionId: String? {
+        withStateLock { currentSessionId }
+    }
+
     /// Invoked when the session stops tracking the authoritative stream. Always also reported to
     /// stderr, so a session can never fail completely silently (§4 inv. 13).
     public var onFailure: (@Sendable (SessionFailure) -> Void)? {

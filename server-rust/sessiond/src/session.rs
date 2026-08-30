@@ -17,6 +17,34 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
+/// Lifecycle states of an authoritative semantic session (§17, App. B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionState {
+    /// No active transport attachment; application and semantic store remain alive (§17).
+    Detached,
+    /// At least one transport connection is actively attached and streaming (§17).
+    Attached,
+    /// Session is terminating (§17; triggering policy stubbed in Task 22).
+    Terminating,
+    /// Session has expired and is discarded (§17; triggering policy stubbed in Task 22).
+    Expired,
+}
+
+/// Mints an opaque, globally unique 128-bit session incarnation token (§17).
+///
+/// Returns a 32-character lowercase hex string with 128 bits of cryptographic entropy.
+/// A server process restart MUST mint a fresh token and MUST NOT reuse tokens across runs (§17).
+pub fn mint_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("failed to generate random bytes for session_id");
+    let mut s = String::with_capacity(32);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
 use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, EventSequenceError, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal};
 use srui_protocol::{Event, ServerLimits, Transaction};
@@ -132,6 +160,8 @@ pub enum EventOutcome {
 
 pub(crate) struct SessionInner {
     pub(crate) session_id: String,
+    pub(crate) state: SessionState,
+    pub(crate) attached_connections: usize,
     pub(crate) store: SemanticStore,
     pub(crate) journal: TransactionJournal,
     pub(crate) dedupe: EventDeduplicator,
@@ -144,6 +174,8 @@ impl std::fmt::Debug for SessionInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionInner")
             .field("session_id", &self.session_id)
+            .field("state", &self.state)
+            .field("attached_connections", &self.attached_connections)
             .field("store", &self.store)
             .field("journal", &self.journal)
             .field("dedupe", &self.dedupe)
@@ -151,6 +183,22 @@ impl std::fmt::Debug for SessionInner {
             .field("limits", &self.limits)
             .field("handler_count", &self.handlers.len())
             .finish()
+    }
+}
+
+/// RAII guard representing an active transport attachment to a [`Session`] (§17).
+///
+/// When dropped (e.g. upon transport EOF, error, cancellation, or bridge death),
+/// automatically decrements the session's attached connection count and transitions
+/// `ATTACHED -> DETACHED` when the last connection drops (§17).
+#[derive(Debug)]
+pub struct AttachmentGuard {
+    session: Session,
+}
+
+impl Drop for AttachmentGuard {
+    fn drop(&mut self) {
+        self.session.detach_internal();
     }
 }
 
@@ -162,6 +210,18 @@ pub struct Session {
 }
 
 impl Session {
+    /// Creates a new `Session` with a freshly minted, globally unique incarnation token (§17).
+    #[must_use]
+    pub fn mint() -> Self {
+        Self::mint_with_capabilities(ServerCapabilities::standard_widgets())
+    }
+
+    /// Creates a new `Session` with a freshly minted, globally unique incarnation token and custom capabilities (§15, §17).
+    #[must_use]
+    pub fn mint_with_capabilities(capabilities: ServerCapabilities) -> Self {
+        Self::with_capabilities(mint_session_id(), capabilities)
+    }
+
     /// Creates a new `Session` with the given session ID and default standard capabilities.
     pub fn new(session_id: impl Into<String>) -> Self {
         Self::with_capabilities(session_id, ServerCapabilities::standard_widgets())
@@ -203,6 +263,8 @@ impl Session {
 
         let inner = SessionInner {
             session_id: session_id.into(),
+            state: SessionState::Detached,
+            attached_connections: 0,
             store: SemanticStore::new(),
             journal: TransactionJournal::new(1024),
             dedupe: EventDeduplicator::default(),
@@ -235,6 +297,79 @@ impl Session {
     pub fn session_id(&self) -> String {
         let guard = lock_or_recover(&self.inner);
         guard.session_id.clone()
+    }
+
+    /// Returns the current lifecycle state of the session (§17).
+    pub fn state(&self) -> SessionState {
+        let guard = lock_or_recover(&self.inner);
+        guard.state
+    }
+
+    /// Returns the number of currently attached transport connections (§17).
+    pub fn attached_count(&self) -> usize {
+        let guard = lock_or_recover(&self.inner);
+        guard.attached_connections
+    }
+
+    /// Returns `true` if at least one transport connection is attached (§17).
+    pub fn is_attached(&self) -> bool {
+        self.state() == SessionState::Attached
+    }
+
+    /// Returns `true` if the session is detached from all transports (§17).
+    pub fn is_detached(&self) -> bool {
+        self.state() == SessionState::Detached
+    }
+
+    /// Attaches a transport connection to this session (§17, App. B).
+    ///
+    /// Increments the attached connection count and transitions `DETACHED -> ATTACHED`.
+    /// Returns an [`AttachmentGuard`] that automatically decrements the count and transitions
+    /// back to `DETACHED` when dropped.
+    #[must_use]
+    pub fn attach(&self) -> AttachmentGuard {
+        {
+            let mut guard = lock_or_recover(&self.inner);
+            guard.attached_connections = guard.attached_connections.saturating_add(1);
+            if guard.state == SessionState::Detached {
+                guard.state = SessionState::Attached;
+                tracing::info!(
+                    "Session {} transitioned to ATTACHED (active attachments: {})",
+                    guard.session_id,
+                    guard.attached_connections
+                );
+            }
+        }
+        AttachmentGuard {
+            session: self.clone(),
+        }
+    }
+
+    /// Internal helper to detach a transport connection (§17, App. B).
+    pub(crate) fn detach_internal(&self) {
+        let mut guard = lock_or_recover(&self.inner);
+        guard.attached_connections = guard.attached_connections.saturating_sub(1);
+        if guard.attached_connections == 0 && guard.state == SessionState::Attached {
+            guard.state = SessionState::Detached;
+            tracing::info!(
+                "Session {} transitioned to DETACHED (active attachments: 0); retaining application state",
+                guard.session_id
+            );
+        }
+    }
+
+    /// Marks the session as terminating (§17; triggering policy stubbed in Task 22).
+    pub fn terminate(&self) {
+        let mut guard = lock_or_recover(&self.inner);
+        guard.state = SessionState::Terminating;
+        tracing::info!("Session {} marked as TERMINATING", guard.session_id);
+    }
+
+    /// Marks the session as expired (§17; triggering policy stubbed in Task 22).
+    pub fn expire(&self) {
+        let mut guard = lock_or_recover(&self.inner);
+        guard.state = SessionState::Expired;
+        tracing::info!("Session {} marked as EXPIRED", guard.session_id);
     }
 
     /// Subscribes to committed transaction broadcasts (§20.2).

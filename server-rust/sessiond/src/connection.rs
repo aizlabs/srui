@@ -154,8 +154,12 @@ where
     };
 
     // -------------------------------------------------------------------------
-    // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
+    // Phase 2: Multiplexed Event & Transaction Streaming (§17, §18, §20)
     // -------------------------------------------------------------------------
+
+    // Attach active connection to session (§17, App. B).
+    // Drops when this connection stream ends, transitioning ATTACHED -> DETACHED.
+    let _attachment = session.attach();
 
     loop {
         tokio::select! {

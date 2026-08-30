@@ -94,7 +94,10 @@ struct TestClientConnection {
 }
 
 impl TestClientConnection {
-    async fn connect_fresh(session: Arc<Session>, client_instance_id: &[u8]) -> (Self, String, u64) {
+    async fn connect_fresh(
+        session: Arc<Session>,
+        client_instance_id: &[u8],
+    ) -> (Self, String, u64) {
         let shutdown = CancellationToken::new();
         let (client_io, server_io) = duplex(1024 * 1024);
 
@@ -169,7 +172,10 @@ impl TestClientConnection {
         let envelope = SruiMessage {
             msg: Some(srui_message::Msg::Event(event.to_wire())),
         };
-        self.write.send(envelope).await.expect("send activate event");
+        self.write
+            .send(envelope)
+            .await
+            .expect("send activate event");
     }
 
     async fn recv_event_ack(&mut self) -> srui_protocol::ServerEventAck {
@@ -217,7 +223,7 @@ async fn test_session_state_lifecycle_attached_detached() {
     assert_eq!(session_id1, session.session_id());
     assert_eq!(rev1, 0);
 
-    // Yield to let sessiond connection task reach Phase 2
+    // Yield to let the connection task attach at transport connect (§17)
     tokio::task::yield_now().await;
     assert_eq!(session.state(), SessionState::Attached);
     assert_eq!(session.attached_count(), 1);
@@ -306,8 +312,14 @@ async fn test_sessiond_sequential_connections_state_survival() {
     // -------------------------------------------------------------------------
     let (mut conn_b, conn_b_sid, conn_b_rev) =
         TestClientConnection::connect_fresh(session.clone(), &[30, 40]).await;
-    assert_eq!(conn_b_sid, initial_session_id, "session_id must survive across disconnect");
-    assert_eq!(conn_b_rev, 4, "committed revision 4 must survive across disconnect");
+    assert_eq!(
+        conn_b_sid, initial_session_id,
+        "session_id must survive across disconnect"
+    );
+    assert_eq!(
+        conn_b_rev, 4,
+        "committed revision 4 must survive across disconnect"
+    );
 
     tokio::task::yield_now().await;
     assert_eq!(session.state(), SessionState::Attached);
@@ -340,8 +352,34 @@ async fn test_sessiond_sequential_connections_state_survival() {
     assert_eq!(session.state(), SessionState::Detached);
 }
 
+#[tokio::test]
+async fn test_session_attached_while_awaiting_handshake() {
+    let session = Arc::new(Session::mint());
+    assert_eq!(session.state(), SessionState::Detached);
+
+    let shutdown = CancellationToken::new();
+    let (client_io, server_io) = duplex(1024 * 1024);
+    let session_clone = session.clone();
+    let shutdown_clone = shutdown.clone();
+    let server_task =
+        tokio::spawn(
+            async move { handle_connection(server_io, session_clone, shutdown_clone).await },
+        );
+
+    // Server attached at transport connect and is blocked waiting for ClientHello (§17, App. B).
+    tokio::task::yield_now().await;
+    assert_eq!(session.state(), SessionState::Attached);
+    assert_eq!(session.attached_count(), 1);
+
+    drop(client_io);
+    let _ = server_task.await;
+    tokio::task::yield_now().await;
+    assert_eq!(session.state(), SessionState::Detached);
+    assert_eq!(session.attached_count(), 0);
+}
+
 #[test]
-fn test_session_id_incarnation_uniqueness_across_restarts() {
+fn test_mint_session_id_produces_unique_tokens_in_process() {
     let mut ids = HashSet::new();
     const ITERATIONS: usize = 1_000;
 
@@ -349,7 +387,8 @@ fn test_session_id_incarnation_uniqueness_across_restarts() {
         let id = mint_session_id();
         assert_eq!(id.len(), 32, "session_id must be a 32-character hex token");
         assert!(
-            id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "session_id must be lowercase hex"
         );
         assert!(
@@ -358,6 +397,100 @@ fn test_session_id_incarnation_uniqueness_across_restarts() {
         );
     }
     assert_eq!(ids.len(), ITERATIONS);
+}
+
+async fn read_session_id_from_counter_sessiond(socket_path: &std::path::Path) -> String {
+    let stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .expect("connect to sessiond unix socket");
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut read = FramedRead::new(read_half, SruiCodec::new());
+    let mut write = FramedWrite::new(write_half, SruiCodec::new());
+
+    let hello = SruiMessage {
+        msg: Some(srui_message::Msg::ClientHello(ClientHello {
+            core_version: "0.4.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: vec![7, 7],
+            client_metadata: Default::default(),
+        })),
+    };
+    write.send(hello).await.expect("send ClientHello");
+
+    let welcome_frame = read
+        .next()
+        .await
+        .expect("welcome frame")
+        .expect("decode welcome");
+    let session_id = match welcome_frame.msg {
+        Some(srui_message::Msg::ServerWelcome(w)) => w.session_id,
+        other => panic!("expected ServerWelcome, got {:?}", other),
+    };
+
+    // Counter bootstrap sends a catch-up snapshot when initial_revision > 0.
+    let snapshot_frame = read
+        .next()
+        .await
+        .expect("snapshot frame")
+        .expect("decode snapshot");
+    match snapshot_frame.msg {
+        Some(srui_message::Msg::Transaction(tx)) => {
+            assert_eq!(tx.base_revision, 0);
+            assert_eq!(tx.new_revision, 1);
+        }
+        other => panic!("expected snapshot Transaction, got {:?}", other),
+    }
+
+    session_id
+}
+
+#[tokio::test]
+async fn test_sessiond_process_restart_mints_unique_session_ids() {
+    let temp_dir = std::env::temp_dir().join(format!("srui-sd-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+    let mut seen = HashSet::new();
+    const ITERATIONS: usize = 5;
+
+    for iteration in 0..ITERATIONS {
+        let socket_path = temp_dir.join(format!("sessiond-{iteration}.sock"));
+        let _ = std::fs::remove_file(&socket_path);
+
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_srui-sessiond"))
+            .arg("--socket")
+            .arg(&socket_path)
+            .arg("--app")
+            .arg("counter")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn srui-sessiond");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !socket_path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for sessiond socket at {}",
+                socket_path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let session_id = read_session_id_from_counter_sessiond(&socket_path).await;
+        assert_eq!(session_id.len(), 32);
+        assert!(
+            seen.insert(session_id.clone()),
+            "sessiond restart {iteration} reused session_id {session_id}"
+        );
+
+        child.kill().await.expect("kill sessiond");
+        let status = child.wait().await.expect("wait for sessiond");
+        assert!(!status.success(), "sessiond should exit after kill");
+    }
+
+    assert_eq!(seen.len(), ITERATIONS);
+    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[tokio::test]

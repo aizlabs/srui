@@ -922,7 +922,20 @@ public final class SessionController: @unchecked Sendable {
         let task = withStateLock { () -> Task<Void, Never>? in
             guard isRunning else { return nil }
             isRunning = false
-            let t = receiveTask
+            eventDispatchEnabled = false
+            return receiveTask
+        }
+
+        guard let task else { return }
+
+        // Close the transport first so the receive loop drains any buffered catch-up frames
+        // (welcome snapshot, replay) while handshake phase is still valid. Resetting `phase` or
+        // cancelling the task before that completes rejects in-flight transactions as protocol
+        // violations even though the server sent them in order (§15, §18).
+        await transport.close()
+        await task.value
+
+        withStateLock {
             receiveTask = nil
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
             // mount state may survive.
@@ -936,16 +949,11 @@ public final class SessionController: @unchecked Sendable {
             pendingResync = false
             requestedSessionId = nil
             resumeAttemptId = nil
-            eventDispatchEnabled = false
             phase = .idle
-            return t
         }
 
         await MainActor.run {
             self.hasMountedInitialTree = false
         }
-
-        task?.cancel()
-        await transport.close()
     }
 }

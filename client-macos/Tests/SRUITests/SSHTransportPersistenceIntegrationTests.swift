@@ -262,7 +262,10 @@ struct SSHTransportPersistenceIntegrationTests {
 
             try await controller.start()
             try await AsyncTestSupport.eventually(description: "handshake on restart \(iteration)") {
-                controller.sessionId != nil
+                guard controller.sessionId != nil else { return false }
+                guard applier.lastAppliedRevision == Revision(1) else { return false }
+                guard controller.isHandshakeComplete else { return false }
+                return !controller.isDiverged
             }
 
             let sid = try #require(controller.sessionId)

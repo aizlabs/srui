@@ -109,7 +109,10 @@ fn test_transaction_atomicity_and_rollback_on_err() {
     session
         .transaction(|ui| {
             Surface::builder(root).label("Initial").create(ui)?;
-            Text::builder(text).parent(root).text("Initial Text").create(ui)?;
+            Text::builder(text)
+                .parent(root)
+                .text("Initial Text")
+                .create(ui)?;
             Ok(())
         })
         .unwrap();
@@ -121,11 +124,16 @@ fn test_transaction_atomicity_and_rollback_on_err() {
     let new_node = NodeId::new(3);
     let result: Result<(), SdkError> = session.transaction(|ui| {
         ui.set(text, TEXT, "Mutated Text")?;
-        Button::builder(new_node).parent(root).label("Temp").create(ui)?;
+        Button::builder(new_node)
+            .parent(root)
+            .label("Temp")
+            .create(ui)?;
         assert_eq!(ui.node_count(), 3); // visible in staging
 
         // Deliberate StoreError return
-        Err(StoreError::OperationError("simulated store rejection".into()))
+        Err(StoreError::OperationError(
+            "simulated store rejection".into(),
+        ))
     });
 
     assert!(result.is_err());
@@ -167,7 +175,10 @@ fn test_transaction_atomicity_and_rollback_on_panic() {
     session
         .transaction(|ui| {
             Surface::builder(root).create(ui)?;
-            Button::builder(btn).parent(root).label("Original Label").create(ui)?;
+            Button::builder(btn)
+                .parent(root)
+                .label("Original Label")
+                .create(ui)?;
             Ok(())
         })
         .unwrap();
@@ -210,8 +221,14 @@ fn test_event_validation_rejections() {
     session
         .transaction(|ui| {
             Surface::builder(root).create(ui)?;
-            Button::builder(enabled_btn).parent(root).enabled(true).create(ui)?;
-            Button::builder(disabled_btn).parent(root).enabled(false).create(ui)?;
+            Button::builder(enabled_btn)
+                .parent(root)
+                .enabled(true)
+                .create(ui)?;
+            Button::builder(disabled_btn)
+                .parent(root)
+                .enabled(false)
+                .create(ui)?;
             Ok(())
         })
         .unwrap();
@@ -308,7 +325,11 @@ fn test_transaction_sync_and_complex_mutations() {
                 .create(ui)
                 .unwrap();
             Row::builder(row).parent(surface).create(ui).unwrap();
-            Toggle::switch(tgl).parent(row).value(true).create(ui).unwrap();
+            Toggle::switch(tgl)
+                .parent(row)
+                .value(true)
+                .create(ui)
+                .unwrap();
         })
         .unwrap();
 
@@ -318,7 +339,10 @@ fn test_transaction_sync_and_complex_mutations() {
     session.with_store(|store| {
         let t = Toggle::from_store(store, tgl).unwrap();
         assert_eq!(t.value(store), Some(true));
-        assert_eq!(t.presentation_hint(store), Some(TogglePresentationHint::Switch));
+        assert_eq!(
+            t.presentation_hint(store),
+            Some(TogglePresentationHint::Switch)
+        );
     });
 
     // Test delete and move within transaction

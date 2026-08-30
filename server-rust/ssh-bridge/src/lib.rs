@@ -7,10 +7,10 @@
 //! - [`async-tokio-runtime`](rules/async-tokio-runtime.md): designed for `current_thread` single-task efficiency.
 //! - [`async-cancellation-token`](rules/async-cancellation-token.md): cleanly detaches upon SSH session termination.
 
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use thiserror::Error;
 
 /// Errors returned by the bridge forwarder.
 #[derive(Debug, Error)]

@@ -19,7 +19,9 @@ use srui_semantic_tree::*;
 
 fn load_fixture_bytes(filename: &str) -> Vec<u8> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let path = Path::new(manifest_dir).join("../../protocol/conformance-vectors").join(filename);
+    let path = Path::new(manifest_dir)
+        .join("../../protocol/conformance-vectors")
+        .join(filename);
     fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {:?}: {}", path, e))
 }
 
@@ -117,15 +119,24 @@ fn test_counter_example_transaction_serialization_and_fresh_store_replay() {
     assert_eq!(fresh_store.node_count(), original_store.node_count());
     assert_eq!(fresh_store.root_ids(), original_store.root_ids());
     assert_eq!(
-        fresh_store.get_node(text_id).unwrap().get_property(PropertyRef::TEXT),
+        fresh_store
+            .get_node(text_id)
+            .unwrap()
+            .get_property(PropertyRef::TEXT),
         Some(&Value::from("Count: 0"))
     );
     assert_eq!(
-        fresh_store.get_node(progress_id).unwrap().get_property(PropertyRef::VALUE),
+        fresh_store
+            .get_node(progress_id)
+            .unwrap()
+            .get_property(PropertyRef::VALUE),
         Some(&Value::from(0.0f64))
     );
     assert_eq!(
-        fresh_store.get_node(progress_id).unwrap().get_property(PropertyRef::VALUE_DESCRIPTION),
+        fresh_store
+            .get_node(progress_id)
+            .unwrap()
+            .get_property(PropertyRef::VALUE_DESCRIPTION),
         Some(&Value::from("0 / 100"))
     );
 
@@ -139,7 +150,11 @@ fn test_counter_example_transaction_serialization_and_fresh_store_replay() {
         let click_txn = Transaction::new(
             base_rev,
             vec![
-                Operation::set_property(text_id, PropertyRef::TEXT, Value::from(count_text.clone())),
+                Operation::set_property(
+                    text_id,
+                    PropertyRef::TEXT,
+                    Value::from(count_text.clone()),
+                ),
                 Operation::set_property(progress_id, PropertyRef::VALUE, Value::from(progress_val)),
                 Operation::set_property(
                     progress_id,
@@ -171,15 +186,24 @@ fn test_counter_example_transaction_serialization_and_fresh_store_replay() {
         assert_eq!(fresh_store.revision(), Revision::new(count + 1));
         assert_eq!(fresh_store.node_count(), 4);
         assert_eq!(
-            fresh_store.get_node(text_id).unwrap().get_property(PropertyRef::TEXT),
+            fresh_store
+                .get_node(text_id)
+                .unwrap()
+                .get_property(PropertyRef::TEXT),
             Some(&Value::from(count_text))
         );
         assert_eq!(
-            fresh_store.get_node(progress_id).unwrap().get_property(PropertyRef::VALUE),
+            fresh_store
+                .get_node(progress_id)
+                .unwrap()
+                .get_property(PropertyRef::VALUE),
             Some(&Value::from(progress_val))
         );
         assert_eq!(
-            fresh_store.get_node(progress_id).unwrap().get_property(PropertyRef::VALUE_DESCRIPTION),
+            fresh_store
+                .get_node(progress_id)
+                .unwrap()
+                .get_property(PropertyRef::VALUE_DESCRIPTION),
             Some(&Value::from(progress_desc))
         );
     }
@@ -199,14 +223,21 @@ fn test_counter_example_transaction_serialization_and_fresh_store_replay() {
 #[test]
 fn test_decode_task2_golden_node_record_fixture() {
     let bytes = load_fixture_bytes("golden_node_record.bin");
-    assert_eq!(bytes.len(), 48, "Task 2 golden NodeRecord byte length is 48");
+    assert_eq!(
+        bytes.len(),
+        48,
+        "Task 2 golden NodeRecord byte length is 48"
+    );
 
     // Decode through new path: decode_node_record(&bytes)
     let node_record = decode_node_record(&bytes).expect("decode golden_node_record.bin");
 
     // Assert in-memory structure matches Task 2 expected specification
     assert_eq!(node_record.node_id, NodeId::new(42));
-    assert_eq!(node_record.node_type, TypeRef::standard(StandardNodeType::NodeTypeButton as u32));
+    assert_eq!(
+        node_record.node_type,
+        TypeRef::standard(StandardNodeType::NodeTypeButton as u32)
+    );
     assert_eq!(node_record.parent_id, Some(NodeId::new(1)));
     assert_eq!(node_record.child_index, Some(0));
     assert_eq!(node_record.properties.len(), 3);
@@ -234,13 +265,20 @@ fn test_decode_task2_golden_node_record_fixture() {
 
     // Re-encode back to protobuf bytes and assert bit-for-bit equality with Task 2 golden fixture
     let roundtrip_bytes = encode_node_record(&node_record);
-    assert_eq!(roundtrip_bytes, bytes, "Re-encoded NodeRecord must match golden fixture bytes");
+    assert_eq!(
+        roundtrip_bytes, bytes,
+        "Re-encoded NodeRecord must match golden fixture bytes"
+    );
 }
 
 #[test]
 fn test_decode_task2_golden_transaction_fixture() {
     let bytes = load_fixture_bytes("golden_transaction.bin");
-    assert_eq!(bytes.len(), 102, "Task 2 golden Transaction byte length is 102");
+    assert_eq!(
+        bytes.len(),
+        102,
+        "Task 2 golden Transaction byte length is 102"
+    );
 
     // Decode through new path: decode_transaction(&bytes)
     let txn = decode_transaction(&bytes).expect("decode golden_transaction.bin");
@@ -261,19 +299,29 @@ fn test_decode_task2_golden_transaction_fixture() {
             properties,
         } => {
             assert_eq!(*id, NodeId::new(19));
-            assert_eq!(*node_type, TypeRef::standard(StandardNodeType::NodeTypeText as u32));
+            assert_eq!(
+                *node_type,
+                TypeRef::standard(StandardNodeType::NodeTypeText as u32)
+            );
             assert_eq!(*parent_id, Some(NodeId::new(2)));
             assert_eq!(*child_index, Some(3));
             assert_eq!(properties.len(), 1);
             assert_eq!(properties[0].0, PropertyRef::TEXT);
-            assert_eq!(properties[0].1, Value::String("27 tests passed".to_string()));
+            assert_eq!(
+                properties[0].1,
+                Value::String("27 tests passed".to_string())
+            );
         }
         other => panic!("Expected CreateNode for op 0, got {:?}", other),
     }
 
     // Op 1: SetProperty (node_id=4, property=VALUE, value=0.71)
     match &txn.operations[1] {
-        Operation::SetProperty { id, property, value } => {
+        Operation::SetProperty {
+            id,
+            property,
+            value,
+        } => {
             assert_eq!(*id, NodeId::new(4));
             assert_eq!(*property, PropertyRef::VALUE);
             assert_eq!(*value, Value::Float64(0.71));
@@ -294,16 +342,24 @@ fn test_decode_task2_golden_transaction_fixture() {
 
     // Re-encode back to protobuf bytes and assert bit-for-bit equality with Task 2 golden fixture
     let roundtrip_bytes = encode_transaction(&txn);
-    assert_eq!(roundtrip_bytes, bytes, "Re-encoded Transaction must match golden fixture bytes");
+    assert_eq!(
+        roundtrip_bytes, bytes,
+        "Re-encoded Transaction must match golden fixture bytes"
+    );
 }
 
 #[test]
 fn test_decode_task2_golden_framed_message_fixture() {
     let bytes = load_fixture_bytes("golden_framed_message.bin");
-    assert_eq!(bytes.len(), 105, "Task 2 golden Framed SruiMessage byte length is 105");
+    assert_eq!(
+        bytes.len(),
+        105,
+        "Task 2 golden Framed SruiMessage byte length is 105"
+    );
 
     // Decode framed top-level SruiMessage
-    let msg: srui_protocol::SruiMessage = decode_framed(&bytes[..]).expect("decode golden_framed_message.bin");
+    let msg: srui_protocol::SruiMessage =
+        decode_framed(&bytes[..]).expect("decode golden_framed_message.bin");
 
     // Extract transaction payload
     match msg.msg {
@@ -314,7 +370,10 @@ fn test_decode_task2_golden_framed_message_fixture() {
             assert_eq!(txn.priority, 1);
             assert_eq!(txn.operations.len(), 3);
         }
-        other => panic!("Expected Transaction payload in framed message, got {:?}", other),
+        other => panic!(
+            "Expected Transaction payload in framed message, got {:?}",
+            other
+        ),
     }
 }
 
@@ -348,7 +407,10 @@ fn test_all_17_value_variants_wire_byte_roundtrip() {
         Value::Record(SmallRecord::new(
             TypeRef::standard(1),
             vec![
-                Property::new(PropertyRef::LABEL, Value::String("Record Title".to_string())),
+                Property::new(
+                    PropertyRef::LABEL,
+                    Value::String("Record Title".to_string()),
+                ),
                 Property::new(PropertyRef::VALUE, Value::Float64(0.95)),
             ],
         )),
@@ -359,7 +421,11 @@ fn test_all_17_value_variants_wire_byte_roundtrip() {
     for (idx, val) in variants.into_iter().enumerate() {
         // Serialize to bytes
         let bytes = encode_value(&val);
-        assert!(!bytes.is_empty(), "Encoded Value variant {} must not be empty", idx + 1);
+        assert!(
+            !bytes.is_empty(),
+            "Encoded Value variant {} must not be empty",
+            idx + 1
+        );
 
         // Inherent method roundtrip
         let val_bytes_inherent = val.to_wire_bytes();
@@ -367,7 +433,12 @@ fn test_all_17_value_variants_wire_byte_roundtrip() {
 
         // Deserialize back
         let back = decode_value(&bytes).unwrap_or_else(|e| {
-            panic!("Failed to decode value variant #{}: {:?}: {}", idx + 1, val, e)
+            panic!(
+                "Failed to decode value variant #{}: {:?}: {}",
+                idx + 1,
+                val,
+                e
+            )
         });
 
         assert_eq!(val, back, "Roundtrip mismatch on variant #{}", idx + 1);
@@ -407,13 +478,13 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
             NodeId::new(42),
             TypeRef::new(1, 100), // Extension namespace 1
             [
-                (PropertyRef::LABEL, Value::String("Custom Action".to_string())),
+                (
+                    PropertyRef::LABEL,
+                    Value::String("Custom Action".to_string()),
+                ),
                 (PropertyRef::VALUE, Value::Float64(123.456)),
                 (PropertyRef::ENABLED, Value::Bool(true)),
-                (
-                    PropertyRef::new(1, 1),
-                    Value::Point(Point::new(10.0, 20.0)),
-                ),
+                (PropertyRef::new(1, 1), Value::Point(Point::new(10.0, 20.0))),
             ],
         ),
     ];
@@ -421,16 +492,19 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
     for (idx, event) in events.into_iter().enumerate() {
         // Serialize to wire bytes
         let bytes = encode_event(&event);
-        assert!(!bytes.is_empty(), "Encoded Event #{} must not be empty", idx + 1);
+        assert!(
+            !bytes.is_empty(),
+            "Encoded Event #{} must not be empty",
+            idx + 1
+        );
 
         // Inherent method roundtrip
         let bytes_inherent = event.to_wire_bytes();
         assert_eq!(bytes, bytes_inherent);
 
         // Deserialize back
-        let back = decode_event(&bytes).unwrap_or_else(|e| {
-            panic!("Failed to decode event #{}: {:?}: {}", idx + 1, event, e)
-        });
+        let back = decode_event(&bytes)
+            .unwrap_or_else(|e| panic!("Failed to decode event #{}: {:?}: {}", idx + 1, event, e));
 
         assert_eq!(event, back, "Roundtrip mismatch on event #{}", idx + 1);
     }
@@ -463,7 +537,10 @@ fn test_all_12_operations_wire_byte_roundtrip() {
         // 5. MoveNode
         Operation::move_node(NodeId::new(50), Some(NodeId::new(5)), Some(1)),
         // 6. ReorderChildren
-        Operation::reorder_children(NodeId::new(60), [NodeId::new(3), NodeId::new(1), NodeId::new(2)]),
+        Operation::reorder_children(
+            NodeId::new(60),
+            [NodeId::new(3), NodeId::new(1), NodeId::new(2)],
+        ),
         // 7. BatchPropertySet
         Operation::batch_property_set(
             NodeId::new(70),
@@ -504,21 +581,28 @@ fn test_all_12_operations_wire_byte_roundtrip() {
         ),
     ];
 
-    assert_eq!(ops.len(), 12, "Must test all 12 standard operation variants");
+    assert_eq!(
+        ops.len(),
+        12,
+        "Must test all 12 standard operation variants"
+    );
 
     for (idx, op) in ops.into_iter().enumerate() {
         // Serialize to wire bytes
         let bytes = encode_operation(&op);
-        assert!(!bytes.is_empty(), "Encoded Operation #{} must not be empty", idx + 1);
+        assert!(
+            !bytes.is_empty(),
+            "Encoded Operation #{} must not be empty",
+            idx + 1
+        );
 
         // Inherent method roundtrip
         let bytes_inherent = op.to_wire_bytes();
         assert_eq!(bytes, bytes_inherent);
 
         // Deserialize back
-        let back = decode_operation(&bytes).unwrap_or_else(|e| {
-            panic!("Failed to decode operation #{}: {:?}: {}", idx + 1, op, e)
-        });
+        let back = decode_operation(&bytes)
+            .unwrap_or_else(|e| panic!("Failed to decode operation #{}: {:?}: {}", idx + 1, op, e));
 
         assert_eq!(op, back, "Roundtrip mismatch on operation #{}", idx + 1);
     }
@@ -541,8 +625,14 @@ fn test_node_record_conversions_and_operations() {
         ],
     );
 
-    assert_eq!(rec.get_property(PropertyRef::LABEL), Some(&Value::String("Submit".to_string())));
-    assert_eq!(rec.get_property(PropertyRef::ENABLED), Some(&Value::Bool(true)));
+    assert_eq!(
+        rec.get_property(PropertyRef::LABEL),
+        Some(&Value::String("Submit".to_string()))
+    );
+    assert_eq!(
+        rec.get_property(PropertyRef::ENABLED),
+        Some(&Value::Bool(true))
+    );
     assert!(rec.has_property(PropertyRef::LABEL));
     assert!(!rec.has_property(PropertyRef::TEXT));
 
@@ -610,13 +700,21 @@ fn test_malformed_protobuf_bytes_rejected_cleanly() {
         child_index: 0,
         properties: vec![],
     };
-    let err_node = NodeRecord::try_from(wire_node_missing_type).expect_err("must fail without type");
-    assert!(matches!(err_node, WireError::MissingField("NodeRecord.type")));
+    let err_node =
+        NodeRecord::try_from(wire_node_missing_type).expect_err("must fail without type");
+    assert!(matches!(
+        err_node,
+        WireError::MissingField("NodeRecord.type")
+    ));
 
     // 4. Invalid resource hash length in Value
     let wire_val_bad_hash = srui_protocol::Value {
         value: Some(srui_protocol::value::Value::ResourceHash(vec![1, 2, 3])), // only 3 bytes, not 32
     };
-    let err_val = Value::try_from(wire_val_bad_hash).expect_err("must fail with invalid hash length");
-    assert!(matches!(err_val, ValueConversionError::InvalidResourceHashLength(3)));
+    let err_val =
+        Value::try_from(wire_val_bad_hash).expect_err("must fail with invalid hash length");
+    assert!(matches!(
+        err_val,
+        ValueConversionError::InvalidResourceHashLength(3)
+    ));
 }

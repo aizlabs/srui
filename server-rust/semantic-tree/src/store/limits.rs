@@ -54,7 +54,11 @@ impl Default for StoreLimits {
 
 impl StoreLimits {
     /// Creates a new `StoreLimits` with specified basic tree limits and default nested value & model limits.
-    pub const fn new(max_tree_depth: usize, max_node_count: usize, max_string_length: usize) -> Self {
+    pub const fn new(
+        max_tree_depth: usize,
+        max_node_count: usize,
+        max_string_length: usize,
+    ) -> Self {
         Self {
             max_tree_depth,
             max_node_count,

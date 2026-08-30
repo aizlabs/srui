@@ -21,7 +21,10 @@ fn test_construct_and_compare_all_17_value_variants() {
         Value::List(vec![Value::Bool(true), Value::Bool(false)]),
         Value::Record(SmallRecord::new(
             TypeRef::new(0, 1),
-            vec![Property::new(PropertyRef::new(0, 1), Value::String("foo".to_string()))],
+            vec![Property::new(
+                PropertyRef::new(0, 1),
+                Value::String("foo".to_string()),
+            )],
         )),
     ];
 
@@ -59,7 +62,10 @@ fn test_protobuf_wire_roundtrip_all_variants() {
         Value::List(vec![Value::Bool(true), Value::SignedInt(123)]),
         Value::Record(SmallRecord::new(
             TypeRef::new(0, 1),
-            vec![Property::new(PropertyRef::new(0, 1), Value::String("foo".to_string()))],
+            vec![Property::new(
+                PropertyRef::new(0, 1),
+                Value::String("foo".to_string()),
+            )],
         )),
     ];
 

@@ -30,28 +30,47 @@ fn default_socket_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("srui-sessiond.sock")
 }
-fn parse_args() -> (PathBuf, Option<String>) {
+#[derive(Debug, Clone)]
+struct DaemonConfig {
+    socket_path: PathBuf,
+    app_name: Option<String>,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: default_socket_path(),
+            app_name: None,
+        }
+    }
+}
+
+fn parse_args() -> DaemonConfig {
     let args: Vec<String> = std::env::args().collect();
-    let mut socket_path = None;
-    let mut app_name = None;
+    let mut config = DaemonConfig::default();
 
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--socket" && i + 1 < args.len() {
-            socket_path = Some(PathBuf::from(&args[i + 1]));
-            i += 2;
-        } else if args[i] == "--app" && i + 1 < args.len() {
-            app_name = Some(args[i + 1].clone());
-            i += 2;
-        } else if !args[i].starts_with('-') && socket_path.is_none() {
-            socket_path = Some(PathBuf::from(&args[i]));
-            i += 1;
-        } else {
-            i += 1;
+        match args[i].as_str() {
+            "--socket" if i + 1 < args.len() => {
+                config.socket_path = PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            "--app" if i + 1 < args.len() => {
+                config.app_name = Some(args[i + 1].clone());
+                i += 2;
+            }
+            arg if !arg.starts_with('-') => {
+                config.socket_path = PathBuf::from(arg);
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 
-    (socket_path.unwrap_or_else(default_socket_path), app_name)
+    config
 }
 
 fn initialize_counter_app(session: &Arc<Session>) {
@@ -104,7 +123,7 @@ fn initialize_counter_app(session: &Arc<Session>) {
             ui.set(text, TEXT, format!("Count: {}", next_val))?;
             ui.set(prog, VALUE, (next_val as f64) / 100.0)?;
             ui.set(prog, VALUE_DESCRIPTION, format!("{} / 100", next_val))?;
-            info!("Counter incremented to {}", next_val);
+            info!(count = next_val, "Counter incremented");
             Ok(())
         })
         .expect("counter increment transaction failed");
@@ -126,35 +145,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting srui-sessiond daemon (§20.2)...");
 
-    let (socket_path, app_name) = parse_args();
+    let config = parse_args();
 
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
+    if config.socket_path.exists() {
+        let _ = std::fs::remove_file(&config.socket_path);
     }
 
-    if let Some(parent) = socket_path.parent() {
+    if let Some(parent) = config.socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let listener = UnixListener::bind(&socket_path)?;
-    info!("Listening on Unix domain socket: {:?}", socket_path);
+    let listener = UnixListener::bind(&config.socket_path)?;
+    info!(socket_path = ?config.socket_path, "Listening on Unix domain socket");
 
     // Mint a fresh, globally unique session incarnation token (§17)
     let session = Arc::new(Session::mint());
     info!(
-        "Minted session incarnation token {} (initial state: {:?})",
-        session.session_id(),
-        session.state()
+        session_id = %session.session_id(),
+        state = %session.state(),
+        "Minted session incarnation token"
     );
 
-    if let Some(app) = app_name.as_deref() {
+    if let Some(app) = config.app_name.as_deref() {
         match app {
             "counter" => {
                 info!("Initializing built-in counter application adapter (§20.2, §29)...");
                 initialize_counter_app(&session);
             }
             other => {
-                warn!("Unknown application adapter: {}", other);
+                warn!(app = %other, "Unknown application adapter requested");
             }
         }
     }
@@ -209,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Clean up socket file
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&config.socket_path);
     info!("srui-sessiond daemon shutdown complete.");
     Ok(())
 }

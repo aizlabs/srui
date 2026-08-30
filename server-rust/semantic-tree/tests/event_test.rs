@@ -1,6 +1,6 @@
 use srui_semantic_tree::{
-    resolve_standard_event, ClientInstanceId, Event, EventId, EventValidationError, ItemId,
-    NodeId, PropertyRef, Revision, SemanticStore, Size, TypeRef, Value,
+    resolve_standard_event, ClientInstanceId, Event, EventId, EventValidationError, ItemId, NodeId,
+    PropertyRef, Revision, SemanticStore, Size, TypeRef, Value,
 };
 
 #[test]
@@ -167,7 +167,9 @@ fn test_event_validation_node_interactive() {
     assert!(enabled_event.validate_node_interactive(&store).is_ok());
 
     let disabled_event = Event::activate(2, "evt-2", 0, disabled_btn);
-    let err = disabled_event.validate_node_interactive(&store).unwrap_err();
+    let err = disabled_event
+        .validate_node_interactive(&store)
+        .unwrap_err();
     assert_eq!(err, EventValidationError::NodeDisabled(disabled_btn));
 }
 
@@ -177,11 +179,15 @@ fn test_event_validation_observed_revision() {
 
     // Past revision is valid (client was at rev 3 when clicking)
     let past_event = Event::activate(1, "evt-1", 3, 100);
-    assert!(past_event.validate_observed_revision(store_revision).is_ok());
+    assert!(past_event
+        .validate_observed_revision(store_revision)
+        .is_ok());
 
     // Current revision is valid
     let curr_event = Event::activate(2, "evt-2", 5, 100);
-    assert!(curr_event.validate_observed_revision(store_revision).is_ok());
+    assert!(curr_event
+        .validate_observed_revision(store_revision)
+        .is_ok());
 
     // Future revision is invalid (client claims to have observed revision 6 while store is at 5)
     let future_event = Event::activate(3, "evt-3", 6, 100);
@@ -199,10 +205,7 @@ fn test_event_validation_observed_revision() {
 
 #[test]
 fn test_event_full_validation() {
-    let mut store = SemanticStore::with_limits_and_revision(
-        Default::default(),
-        Revision::new(10),
-    );
+    let mut store = SemanticStore::with_limits_and_revision(Default::default(), Revision::new(10));
     let surface_id = NodeId::new(1);
     let button_id = NodeId::new(2);
 

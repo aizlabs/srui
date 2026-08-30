@@ -41,7 +41,9 @@ impl Profile {
             return Err(ParseProfileError::EmptyName);
         }
         if version == 0 {
-            return Err(ParseProfileError::InvalidVersion("version must be >= 1".to_string()));
+            return Err(ParseProfileError::InvalidVersion(
+                "version must be >= 1".to_string(),
+            ));
         }
         Ok(Self {
             name: trimmed.to_string(),
@@ -132,7 +134,9 @@ impl FromStr for Profile {
             .map_err(|_| ParseProfileError::InvalidVersion(version_str.to_string()))?;
 
         if version == 0 {
-            return Err(ParseProfileError::InvalidVersion("version must be >= 1".to_string()));
+            return Err(ParseProfileError::InvalidVersion(
+                "version must be >= 1".to_string(),
+            ));
         }
 
         Ok(Self {
@@ -286,7 +290,11 @@ impl CapabilitySet {
     /// Computes the intersection of two capability sets.
     pub fn intersection(&self, other: &CapabilitySet) -> Self {
         Self {
-            profiles: self.profiles.intersection(&other.profiles).cloned().collect(),
+            profiles: self
+                .profiles
+                .intersection(&other.profiles)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -410,7 +418,10 @@ impl ServerCapabilities {
     }
 
     /// Computes the negotiated capability set for a connecting client's offered profiles (§15).
-    pub fn negotiate(&self, client_offered: &CapabilitySet) -> Result<CapabilitySet, NegotiationError> {
+    pub fn negotiate(
+        &self,
+        client_offered: &CapabilitySet,
+    ) -> Result<CapabilitySet, NegotiationError> {
         CapabilitySet::negotiate(client_offered, &self.required, &self.optional)
     }
 }
@@ -419,9 +430,7 @@ impl ServerCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NegotiationError {
     /// One or more required profiles (§15) were not offered by the client.
-    UnsatisfiedRequiredProfiles {
-        missing: Vec<Profile>,
-    },
+    UnsatisfiedRequiredProfiles { missing: Vec<Profile> },
 }
 
 impl fmt::Display for NegotiationError {

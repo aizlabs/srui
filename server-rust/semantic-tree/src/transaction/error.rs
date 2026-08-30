@@ -18,15 +18,9 @@ pub enum TxnError {
         actual: Revision,
     },
     /// Transaction exceeds the configured maximum operations limit (§26).
-    MaxOperationsExceeded {
-        limit: usize,
-        actual: usize,
-    },
+    MaxOperationsExceeded { limit: usize, actual: usize },
     /// An operation within the transaction failed during application.
-    OpFailed {
-        op_index: usize,
-        source: StoreError,
-    },
+    OpFailed { op_index: usize, source: StoreError },
     /// Wire transaction payload decoding or conversion failed.
     WireError(String),
 }

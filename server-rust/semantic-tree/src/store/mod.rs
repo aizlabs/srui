@@ -169,7 +169,9 @@ impl SemanticStore {
 
     /// Returns a slice of the ordered child IDs for the given parent node.
     pub fn children_of(&self, parent_id: NodeId) -> Option<&[NodeId]> {
-        self.nodes.get(&parent_id).map(|n| n.ordered_children.as_slice())
+        self.nodes
+            .get(&parent_id)
+            .map(|n| n.ordered_children.as_slice())
     }
 
     /// Returns the parent ID of the given node, if it exists and has a parent.
@@ -262,7 +264,10 @@ impl SemanticStore {
 
         // 5. Validate insertion index if parent specified
         if let Some(pid) = parent_id {
-            let parent_node = self.nodes.get(&pid).expect("parent existence verified above");
+            let parent_node = self
+                .nodes
+                .get(&pid)
+                .expect("parent existence verified above");
             let child_count = parent_node.ordered_children.len();
             if let Some(idx) = child_index {
                 if idx > child_count {
@@ -277,7 +282,10 @@ impl SemanticStore {
         // 6. Insert into parent's ordered_children or roots
         match parent_id {
             Some(pid) => {
-                let parent_node = self.nodes.get_mut(&pid).expect("parent existence verified above");
+                let parent_node = self
+                    .nodes
+                    .get_mut(&pid)
+                    .expect("parent existence verified above");
                 match child_index {
                     Some(idx) => parent_node.ordered_children.insert(idx, id),
                     None => parent_node.ordered_children.push(id),
@@ -306,7 +314,11 @@ impl SemanticStore {
     }
 
     /// Validates referential integrity for semantic properties (e.g. ensuring `PropertyRef::MODEL_REF` references an existing model).
-    fn validate_property_references(&self, prop: PropertyRef, val: &Value) -> Result<(), StoreError> {
+    fn validate_property_references(
+        &self,
+        prop: PropertyRef,
+        val: &Value,
+    ) -> Result<(), StoreError> {
         if prop == PropertyRef::MODEL_REF {
             let model_id = match val {
                 Value::UnsignedInt(u) => ModelId::new(*u),
@@ -365,13 +377,23 @@ impl SemanticStore {
     ) -> Result<Option<Value>, StoreError> {
         self.limits.validate_value(&val)?;
         self.validate_property_references(prop, &val)?;
-        let node = self.nodes.get_mut(&id).ok_or(StoreError::NodeNotFound(id))?;
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(StoreError::NodeNotFound(id))?;
         Ok(node.properties.insert(prop, val))
     }
 
     /// Clears a property from a node (§13 CLEAR_PROPERTY).
-    pub fn clear_property(&mut self, id: NodeId, prop: PropertyRef) -> Result<Option<Value>, StoreError> {
-        let node = self.nodes.get_mut(&id).ok_or(StoreError::NodeNotFound(id))?;
+    pub fn clear_property(
+        &mut self,
+        id: NodeId,
+        prop: PropertyRef,
+    ) -> Result<Option<Value>, StoreError> {
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(StoreError::NodeNotFound(id))?;
         Ok(node.properties.remove(&prop))
     }
 
@@ -387,7 +409,10 @@ impl SemanticStore {
             self.validate_property_references(*prop, val)?;
         }
 
-        let node = self.nodes.get_mut(&id).ok_or(StoreError::NodeNotFound(id))?;
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .ok_or(StoreError::NodeNotFound(id))?;
         for (prop, val) in prop_list {
             node.properties.insert(prop, val);
         }
@@ -432,10 +457,9 @@ impl SemanticStore {
         // 2. Tree depth limit validation (§26)
         let subtree_depth = self.subtree_depth(id);
         let new_parent_depth = match new_parent_id {
-            Some(pid) => {
-                self.node_depth(pid)
-                    .ok_or(StoreError::ParentNotFound(pid))?
-            }
+            Some(pid) => self
+                .node_depth(pid)
+                .ok_or(StoreError::ParentNotFound(pid))?,
             None => 0,
         };
         let new_total_depth = new_parent_depth + subtree_depth;
@@ -446,11 +470,20 @@ impl SemanticStore {
             });
         }
 
-        let old_parent_id = self.nodes.get(&id).expect("node existence verified").parent_id;
+        let old_parent_id = self
+            .nodes
+            .get(&id)
+            .expect("node existence verified")
+            .parent_id;
 
         // 3. Validate new_child_index bounds against current destination container length
         let current_dest_len = match new_parent_id {
-            Some(pid) => self.nodes.get(&pid).expect("parent existence verified").ordered_children.len(),
+            Some(pid) => self
+                .nodes
+                .get(&pid)
+                .expect("parent existence verified")
+                .ordered_children
+                .len(),
             None => self.roots.len(),
         };
 
@@ -504,8 +537,15 @@ impl SemanticStore {
     }
 
     /// Reorders the children of a parent node to match a given sequence (§13 REORDER_CHILDREN).
-    pub fn reorder_children(&mut self, parent_id: NodeId, new_order: &[NodeId]) -> Result<(), StoreError> {
-        let parent_node = self.nodes.get(&parent_id).ok_or(StoreError::ParentNotFound(parent_id))?;
+    pub fn reorder_children(
+        &mut self,
+        parent_id: NodeId,
+        new_order: &[NodeId],
+    ) -> Result<(), StoreError> {
+        let parent_node = self
+            .nodes
+            .get(&parent_id)
+            .ok_or(StoreError::ParentNotFound(parent_id))?;
         let current_children = &parent_node.ordered_children;
 
         if new_order.len() != current_children.len() {
@@ -537,7 +577,10 @@ impl SemanticStore {
             }
         }
 
-        let parent_node_mut = self.nodes.get_mut(&parent_id).expect("parent existence verified");
+        let parent_node_mut = self
+            .nodes
+            .get_mut(&parent_id)
+            .expect("parent existence verified");
         parent_node_mut.ordered_children = new_order.to_vec();
         Ok(())
     }
@@ -640,7 +683,10 @@ impl SemanticStore {
             }
         }
 
-        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        let model = self
+            .models
+            .get_mut(&id)
+            .ok_or(StoreError::ModelNotFound(id))?;
         let projected_cached = model.cached_item_count() + items.len();
         if projected_cached > self.limits.max_cached_items_per_model {
             return Err(StoreError::MaxCachedItemsPerModelExceeded {
@@ -668,7 +714,10 @@ impl SemanticStore {
         item_ids: &[ItemId],
     ) -> Result<(), StoreError> {
         self.limits.validate_model_items_batch(item_ids.len())?;
-        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        let model = self
+            .models
+            .get_mut(&id)
+            .ok_or(StoreError::ModelNotFound(id))?;
         model.delete_items(index, count, item_ids)
     }
 
@@ -688,7 +737,10 @@ impl SemanticStore {
             }
         }
 
-        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        let model = self
+            .models
+            .get_mut(&id)
+            .ok_or(StoreError::ModelNotFound(id))?;
         model.update_items(index, items)
     }
 
@@ -709,7 +761,10 @@ impl SemanticStore {
             }
         }
 
-        let model = self.models.get_mut(&id).ok_or(StoreError::ModelNotFound(id))?;
+        let model = self
+            .models
+            .get_mut(&id)
+            .ok_or(StoreError::ModelNotFound(id))?;
         let end_index = start_index.saturating_add(items.len() as u64);
         let removed_in_range = model
             .iter_cached_items()

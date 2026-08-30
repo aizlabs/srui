@@ -63,9 +63,7 @@ pub enum Operation {
         properties: Vec<(PropertyRef, Value)>,
     },
     /// Deletes a node and all descendants recursively (§13 DELETE_NODE, §6.2).
-    DeleteNode {
-        id: NodeId,
-    },
+    DeleteNode { id: NodeId },
     /// Sets or updates a property on a node (§13 SET_PROPERTY, §26).
     SetProperty {
         id: NodeId,
@@ -73,10 +71,7 @@ pub enum Operation {
         value: Value,
     },
     /// Clears a property from a node (§13 CLEAR_PROPERTY).
-    ClearProperty {
-        id: NodeId,
-        property: PropertyRef,
-    },
+    ClearProperty { id: NodeId, property: PropertyRef },
     /// Moves a node to a new parent or index (§13 MOVE_NODE, §26).
     MoveNode {
         id: NodeId,
@@ -178,7 +173,10 @@ impl Operation {
     }
 
     /// Convenience constructor for [`Operation::ReorderChildren`].
-    pub fn reorder_children(parent_id: NodeId, new_order: impl IntoIterator<Item = NodeId>) -> Self {
+    pub fn reorder_children(
+        parent_id: NodeId,
+        new_order: impl IntoIterator<Item = NodeId>,
+    ) -> Self {
         Self::ReorderChildren {
             parent_id,
             new_order: new_order.into_iter().collect(),
@@ -302,7 +300,9 @@ impl Operation {
                 id,
                 property,
                 value,
-            } => store.set_property(*id, *property, value.clone()).map(|_| ()),
+            } => store
+                .set_property(*id, *property, value.clone())
+                .map(|_| ()),
             Self::ClearProperty { id, property } => {
                 store.clear_property(*id, *property).map(|_| ())
             }

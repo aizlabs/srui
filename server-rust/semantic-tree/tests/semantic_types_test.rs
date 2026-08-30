@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use srui_semantic_tree::*;
+use std::collections::{HashMap, HashSet};
 
 #[test]
 fn test_all_value_variants_construction_and_equality() {
@@ -55,7 +55,10 @@ fn test_all_value_variants_construction_and_equality() {
     let hash_bytes = [0x42u8; 32];
     let hash_val = Value::ResourceHash(ResourceHash::new(hash_bytes));
     assert_eq!(hash_val, Value::from(ResourceHash::new(hash_bytes)));
-    assert_eq!(hash_val.as_resource_hash(), Some(ResourceHash::new(hash_bytes)));
+    assert_eq!(
+        hash_val.as_resource_hash(),
+        Some(ResourceHash::new(hash_bytes))
+    );
 
     // 10. EnumToken
     let enum_val = Value::EnumToken(EnumToken::new(2, 2)); // ActionRole::primary
@@ -80,12 +83,21 @@ fn test_all_value_variants_construction_and_equality() {
     // 14. Rect tuple
     let rect_val = Value::Rect(Rect::new(10.0, 20.0, 100.0, 200.0));
     assert_eq!(rect_val, Value::from(Rect::new(10.0, 20.0, 100.0, 200.0)));
-    assert_eq!(rect_val.as_rect(), Some(Rect::new(10.0, 20.0, 100.0, 200.0)));
+    assert_eq!(
+        rect_val.as_rect(),
+        Some(Rect::new(10.0, 20.0, 100.0, 200.0))
+    );
 
     // 15. EdgeInsets tuple
     let insets_val = Value::EdgeInsets(EdgeInsets::new(5.0, 10.0, 15.0, 20.0));
-    assert_eq!(insets_val, Value::from(EdgeInsets::new(5.0, 10.0, 15.0, 20.0)));
-    assert_eq!(insets_val.as_edge_insets(), Some(EdgeInsets::new(5.0, 10.0, 15.0, 20.0)));
+    assert_eq!(
+        insets_val,
+        Value::from(EdgeInsets::new(5.0, 10.0, 15.0, 20.0))
+    );
+    assert_eq!(
+        insets_val.as_edge_insets(),
+        Some(EdgeInsets::new(5.0, 10.0, 15.0, 20.0))
+    );
 
     // 16. List of scalars
     let list_data = vec![Value::from(10i64), Value::from(20i64), Value::from(30i64)];
@@ -144,7 +156,10 @@ fn test_typeref_and_propertyref_hashing_and_maps() {
 
     assert_eq!(prop_map.get(&PropertyRef::standard(1)), Some(&"label"));
     assert_eq!(prop_map.get(&PropertyRef::standard(13)), Some(&"value"));
-    assert_eq!(prop_map.get(&PropertyRef::new(1, 200)), Some(&"custom_prop"));
+    assert_eq!(
+        prop_map.get(&PropertyRef::new(1, 200)),
+        Some(&"custom_prop")
+    );
     assert_eq!(prop_map.get(&PropertyRef::standard(7)), None);
 
     assert!(prop_set.contains(&PropertyRef::standard(1)));
@@ -155,66 +170,210 @@ fn test_typeref_and_propertyref_hashing_and_maps() {
 #[test]
 fn test_standard_registry_lookups() {
     // Check known node types match registry.yaml
-    assert_eq!(resolve_standard_node_type("Surface").unwrap(), TypeRef::SURFACE);
-    assert_eq!(resolve_standard_node_type("Dialog").unwrap(), TypeRef::DIALOG);
+    assert_eq!(
+        resolve_standard_node_type("Surface").unwrap(),
+        TypeRef::SURFACE
+    );
+    assert_eq!(
+        resolve_standard_node_type("Dialog").unwrap(),
+        TypeRef::DIALOG
+    );
     assert_eq!(resolve_standard_node_type("Row").unwrap(), TypeRef::ROW);
-    assert_eq!(resolve_standard_node_type("Column").unwrap(), TypeRef::COLUMN);
+    assert_eq!(
+        resolve_standard_node_type("Column").unwrap(),
+        TypeRef::COLUMN
+    );
     assert_eq!(resolve_standard_node_type("Grid").unwrap(), TypeRef::GRID);
-    assert_eq!(resolve_standard_node_type("Spacer").unwrap(), TypeRef::SPACER);
-    assert_eq!(resolve_standard_node_type("Separator").unwrap(), TypeRef::SEPARATOR);
-    assert_eq!(resolve_standard_node_type("Scroll").unwrap(), TypeRef::SCROLL);
+    assert_eq!(
+        resolve_standard_node_type("Spacer").unwrap(),
+        TypeRef::SPACER
+    );
+    assert_eq!(
+        resolve_standard_node_type("Separator").unwrap(),
+        TypeRef::SEPARATOR
+    );
+    assert_eq!(
+        resolve_standard_node_type("Scroll").unwrap(),
+        TypeRef::SCROLL
+    );
     assert_eq!(resolve_standard_node_type("Text").unwrap(), TypeRef::TEXT);
-    assert_eq!(resolve_standard_node_type("RichText").unwrap(), TypeRef::RICHTEXT);
-    assert_eq!(resolve_standard_node_type("RichText").unwrap(), TypeRef::RICH_TEXT);
-    assert_eq!(resolve_standard_node_type("Button").unwrap(), TypeRef::BUTTON);
-    assert_eq!(resolve_standard_node_type("Toggle").unwrap(), TypeRef::TOGGLE);
-    assert_eq!(resolve_standard_node_type("TextInput").unwrap(), TypeRef::TEXT_INPUT);
-    assert_eq!(resolve_standard_node_type("TextArea").unwrap(), TypeRef::TEXT_AREA);
-    assert_eq!(resolve_standard_node_type("Progress").unwrap(), TypeRef::PROGRESS);
+    assert_eq!(
+        resolve_standard_node_type("RichText").unwrap(),
+        TypeRef::RICHTEXT
+    );
+    assert_eq!(
+        resolve_standard_node_type("RichText").unwrap(),
+        TypeRef::RICH_TEXT
+    );
+    assert_eq!(
+        resolve_standard_node_type("Button").unwrap(),
+        TypeRef::BUTTON
+    );
+    assert_eq!(
+        resolve_standard_node_type("Toggle").unwrap(),
+        TypeRef::TOGGLE
+    );
+    assert_eq!(
+        resolve_standard_node_type("TextInput").unwrap(),
+        TypeRef::TEXT_INPUT
+    );
+    assert_eq!(
+        resolve_standard_node_type("TextArea").unwrap(),
+        TypeRef::TEXT_AREA
+    );
+    assert_eq!(
+        resolve_standard_node_type("Progress").unwrap(),
+        TypeRef::PROGRESS
+    );
     assert_eq!(resolve_standard_node_type("Image").unwrap(), TypeRef::IMAGE);
     assert_eq!(resolve_standard_node_type("List").unwrap(), TypeRef::LIST);
     assert_eq!(resolve_standard_node_type("Table").unwrap(), TypeRef::TABLE);
     assert_eq!(resolve_standard_node_type("Tree").unwrap(), TypeRef::TREE);
-    assert_eq!(resolve_standard_node_type("Select").unwrap(), TypeRef::SELECT);
-    assert_eq!(resolve_standard_node_type("ChoiceGroup").unwrap(), TypeRef::CHOICE_GROUP);
-    assert_eq!(resolve_standard_node_type("Slider").unwrap(), TypeRef::SLIDER);
-    assert_eq!(resolve_standard_node_type("NumberInput").unwrap(), TypeRef::NUMBER_INPUT);
+    assert_eq!(
+        resolve_standard_node_type("Select").unwrap(),
+        TypeRef::SELECT
+    );
+    assert_eq!(
+        resolve_standard_node_type("ChoiceGroup").unwrap(),
+        TypeRef::CHOICE_GROUP
+    );
+    assert_eq!(
+        resolve_standard_node_type("Slider").unwrap(),
+        TypeRef::SLIDER
+    );
+    assert_eq!(
+        resolve_standard_node_type("NumberInput").unwrap(),
+        TypeRef::NUMBER_INPUT
+    );
     assert_eq!(resolve_standard_node_type("Tabs").unwrap(), TypeRef::TABS);
     assert_eq!(resolve_standard_node_type("Split").unwrap(), TypeRef::SPLIT);
     assert_eq!(resolve_standard_node_type("Menu").unwrap(), TypeRef::MENU);
-    assert_eq!(resolve_standard_node_type("Toolbar").unwrap(), TypeRef::TOOLBAR);
+    assert_eq!(
+        resolve_standard_node_type("Toolbar").unwrap(),
+        TypeRef::TOOLBAR
+    );
 
     // Check all 30 standard property constants match registry.yaml
-    assert_eq!(resolve_standard_property("label").unwrap(), PropertyRef::LABEL);
-    assert_eq!(resolve_standard_property("accessible_description").unwrap(), PropertyRef::ACCESSIBLE_DESCRIPTION);
-    assert_eq!(resolve_standard_property("role").unwrap(), PropertyRef::ROLE);
-    assert_eq!(resolve_standard_property("value_description").unwrap(), PropertyRef::VALUE_DESCRIPTION);
-    assert_eq!(resolve_standard_property("actions").unwrap(), PropertyRef::ACTIONS);
-    assert_eq!(resolve_standard_property("visibility").unwrap(), PropertyRef::VISIBILITY);
-    assert_eq!(resolve_standard_property("enabled").unwrap(), PropertyRef::ENABLED);
-    assert_eq!(resolve_standard_property("read_only").unwrap(), PropertyRef::READ_ONLY);
-    assert_eq!(resolve_standard_property("busy").unwrap(), PropertyRef::BUSY);
-    assert_eq!(resolve_standard_property("selected").unwrap(), PropertyRef::SELECTED);
-    assert_eq!(resolve_standard_property("validation_state").unwrap(), PropertyRef::VALIDATION_STATE);
-    assert_eq!(resolve_standard_property("text").unwrap(), PropertyRef::TEXT);
-    assert_eq!(resolve_standard_property("value").unwrap(), PropertyRef::VALUE);
-    assert_eq!(resolve_standard_property("placeholder").unwrap(), PropertyRef::PLACEHOLDER);
-    assert_eq!(resolve_standard_property("resource").unwrap(), PropertyRef::RESOURCE);
-    assert_eq!(resolve_standard_property("items").unwrap(), PropertyRef::ITEMS);
-    assert_eq!(resolve_standard_property("model_ref").unwrap(), PropertyRef::MODEL_REF);
-    assert_eq!(resolve_standard_property("horizontal_alignment").unwrap(), PropertyRef::HORIZONTAL_ALIGNMENT);
-    assert_eq!(resolve_standard_property("vertical_alignment").unwrap(), PropertyRef::VERTICAL_ALIGNMENT);
-    assert_eq!(resolve_standard_property("grow").unwrap(), PropertyRef::GROW);
-    assert_eq!(resolve_standard_property("shrink").unwrap(), PropertyRef::SHRINK);
-    assert_eq!(resolve_standard_property("minimum_size").unwrap(), PropertyRef::MINIMUM_SIZE);
-    assert_eq!(resolve_standard_property("maximum_size").unwrap(), PropertyRef::MAXIMUM_SIZE);
-    assert_eq!(resolve_standard_property("preferred_size").unwrap(), PropertyRef::PREFERRED_SIZE);
-    assert_eq!(resolve_standard_property("spacing_role").unwrap(), PropertyRef::SPACING_ROLE);
-    assert_eq!(resolve_standard_property("padding_role").unwrap(), PropertyRef::PADDING_ROLE);
-    assert_eq!(resolve_standard_property("presentation_hint").unwrap(), PropertyRef::PRESENTATION_HINT);
-    assert_eq!(resolve_standard_property("action_key").unwrap(), PropertyRef::ACTION_KEY);
-    assert_eq!(resolve_standard_property("columns").unwrap(), PropertyRef::COLUMNS);
-    assert_eq!(resolve_standard_property("selection_mode").unwrap(), PropertyRef::SELECTION_MODE);
+    assert_eq!(
+        resolve_standard_property("label").unwrap(),
+        PropertyRef::LABEL
+    );
+    assert_eq!(
+        resolve_standard_property("accessible_description").unwrap(),
+        PropertyRef::ACCESSIBLE_DESCRIPTION
+    );
+    assert_eq!(
+        resolve_standard_property("role").unwrap(),
+        PropertyRef::ROLE
+    );
+    assert_eq!(
+        resolve_standard_property("value_description").unwrap(),
+        PropertyRef::VALUE_DESCRIPTION
+    );
+    assert_eq!(
+        resolve_standard_property("actions").unwrap(),
+        PropertyRef::ACTIONS
+    );
+    assert_eq!(
+        resolve_standard_property("visibility").unwrap(),
+        PropertyRef::VISIBILITY
+    );
+    assert_eq!(
+        resolve_standard_property("enabled").unwrap(),
+        PropertyRef::ENABLED
+    );
+    assert_eq!(
+        resolve_standard_property("read_only").unwrap(),
+        PropertyRef::READ_ONLY
+    );
+    assert_eq!(
+        resolve_standard_property("busy").unwrap(),
+        PropertyRef::BUSY
+    );
+    assert_eq!(
+        resolve_standard_property("selected").unwrap(),
+        PropertyRef::SELECTED
+    );
+    assert_eq!(
+        resolve_standard_property("validation_state").unwrap(),
+        PropertyRef::VALIDATION_STATE
+    );
+    assert_eq!(
+        resolve_standard_property("text").unwrap(),
+        PropertyRef::TEXT
+    );
+    assert_eq!(
+        resolve_standard_property("value").unwrap(),
+        PropertyRef::VALUE
+    );
+    assert_eq!(
+        resolve_standard_property("placeholder").unwrap(),
+        PropertyRef::PLACEHOLDER
+    );
+    assert_eq!(
+        resolve_standard_property("resource").unwrap(),
+        PropertyRef::RESOURCE
+    );
+    assert_eq!(
+        resolve_standard_property("items").unwrap(),
+        PropertyRef::ITEMS
+    );
+    assert_eq!(
+        resolve_standard_property("model_ref").unwrap(),
+        PropertyRef::MODEL_REF
+    );
+    assert_eq!(
+        resolve_standard_property("horizontal_alignment").unwrap(),
+        PropertyRef::HORIZONTAL_ALIGNMENT
+    );
+    assert_eq!(
+        resolve_standard_property("vertical_alignment").unwrap(),
+        PropertyRef::VERTICAL_ALIGNMENT
+    );
+    assert_eq!(
+        resolve_standard_property("grow").unwrap(),
+        PropertyRef::GROW
+    );
+    assert_eq!(
+        resolve_standard_property("shrink").unwrap(),
+        PropertyRef::SHRINK
+    );
+    assert_eq!(
+        resolve_standard_property("minimum_size").unwrap(),
+        PropertyRef::MINIMUM_SIZE
+    );
+    assert_eq!(
+        resolve_standard_property("maximum_size").unwrap(),
+        PropertyRef::MAXIMUM_SIZE
+    );
+    assert_eq!(
+        resolve_standard_property("preferred_size").unwrap(),
+        PropertyRef::PREFERRED_SIZE
+    );
+    assert_eq!(
+        resolve_standard_property("spacing_role").unwrap(),
+        PropertyRef::SPACING_ROLE
+    );
+    assert_eq!(
+        resolve_standard_property("padding_role").unwrap(),
+        PropertyRef::PADDING_ROLE
+    );
+    assert_eq!(
+        resolve_standard_property("presentation_hint").unwrap(),
+        PropertyRef::PRESENTATION_HINT
+    );
+    assert_eq!(
+        resolve_standard_property("action_key").unwrap(),
+        PropertyRef::ACTION_KEY
+    );
+    assert_eq!(
+        resolve_standard_property("columns").unwrap(),
+        PropertyRef::COLUMNS
+    );
+    assert_eq!(
+        resolve_standard_property("selection_mode").unwrap(),
+        PropertyRef::SELECTION_MODE
+    );
 
     // Check all 27 standard node types round-trip with their names
     for (id, name) in STANDARD_NODE_TYPES {
@@ -237,7 +396,10 @@ fn test_standard_registry_lookups() {
     assert_eq!(EnumToken::ACTION_ROLE_DESTRUCTIVE, EnumToken::new(2, 3));
     assert_eq!(EnumToken::INPUT_ROLE_SEARCH, EnumToken::new(3, 2));
     assert_eq!(EnumToken::IMPORTANCE_EMPHASIZED, EnumToken::new(4, 2));
-    assert_eq!(EnumToken::TOGGLE_PRESENTATION_HINT_CHECKBOX, EnumToken::new(5, 2));
+    assert_eq!(
+        EnumToken::TOGGLE_PRESENTATION_HINT_CHECKBOX,
+        EnumToken::new(5, 2)
+    );
     assert_eq!(EnumToken::VISIBILITY_VISIBLE, EnumToken::new(6, 1));
     assert_eq!(EnumToken::SPACING_ROLE_TIGHT, EnumToken::new(7, 2));
     assert_eq!(EnumToken::PADDING_ROLE_RELAXED, EnumToken::new(8, 4));
@@ -250,7 +412,10 @@ fn test_standard_registry_lookups() {
     let action_role = StandardActionRole::Destructive;
     let token: EnumToken = action_role.into();
     assert_eq!(token, EnumToken::ACTION_ROLE_DESTRUCTIVE);
-    assert_eq!(StandardActionRole::try_from(token).unwrap(), StandardActionRole::Destructive);
+    assert_eq!(
+        StandardActionRole::try_from(token).unwrap(),
+        StandardActionRole::Destructive
+    );
 }
 
 #[test]
@@ -264,7 +429,15 @@ fn test_unknown_registry_lookup_fails_cleanly() {
         }
     }
 
-    let bad_props = ["title", "width", "height", "color", "background", "unknown_prop", ""];
+    let bad_props = [
+        "title",
+        "width",
+        "height",
+        "color",
+        "background",
+        "unknown_prop",
+        "",
+    ];
     for bad in bad_props {
         let res = resolve_standard_property(bad);
         match res {
@@ -277,14 +450,16 @@ fn test_unknown_registry_lookup_fails_cleanly() {
 #[test]
 fn test_resource_hash_hex_encoding_and_error_handling() {
     let raw = [
-        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
-        0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
-        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+        0xee, 0xff,
     ];
     let hash = ResourceHash::new(raw);
     let hex = hash.to_hex();
-    assert_eq!(hex, "0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff");
+    assert_eq!(
+        hex,
+        "0123456789abcdeffedcba987654321000112233445566778899aabbccddeeff"
+    );
 
     // Roundtrip
     let parsed = ResourceHash::from_hex(&hex).expect("parsed hex");

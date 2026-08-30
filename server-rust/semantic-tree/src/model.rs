@@ -361,11 +361,8 @@ impl Model {
 
             // Remove only cached items within the deleted range in O(k log N)
             if self.items.range(idx..idx + cnt).next().is_some() {
-                let cached_keys_in_range: SmallVec<[u64; 16]> = self
-                    .items
-                    .range(idx..idx + cnt)
-                    .map(|(&k, _)| k)
-                    .collect();
+                let cached_keys_in_range: SmallVec<[u64; 16]> =
+                    self.items.range(idx..idx + cnt).map(|(&k, _)| k).collect();
                 for k in cached_keys_in_range {
                     if let Some(removed) = self.items.remove(&k) {
                         self.id_to_index.remove(&removed.item_id);

@@ -59,8 +59,11 @@ fn main() {
     };
 
     let mut node_bytes = Vec::new();
-    node_record.encode(&mut node_bytes).expect("encode NodeRecord");
-    fs::write(out_dir.join("golden_node_record.bin"), &node_bytes).expect("write golden_node_record.bin");
+    node_record
+        .encode(&mut node_bytes)
+        .expect("encode NodeRecord");
+    fs::write(out_dir.join("golden_node_record.bin"), &node_bytes)
+        .expect("write golden_node_record.bin");
     println!("Wrote golden_node_record.bin ({} bytes)", node_bytes.len());
 
     // 2. Construct golden Transaction
@@ -85,7 +88,9 @@ fn main() {
                                 local_id: StandardProperty::PropertyText as u32,
                             }),
                             value: Some(Value {
-                                value: Some(value::Value::StringValue("27 tests passed".to_string())),
+                                value: Some(value::Value::StringValue(
+                                    "27 tests passed".to_string(),
+                                )),
                             }),
                         }],
                     }),
@@ -124,8 +129,11 @@ fn main() {
     };
 
     let mut tx_bytes = Vec::new();
-    transaction.encode(&mut tx_bytes).expect("encode Transaction");
-    fs::write(out_dir.join("golden_transaction.bin"), &tx_bytes).expect("write golden_transaction.bin");
+    transaction
+        .encode(&mut tx_bytes)
+        .expect("encode Transaction");
+    fs::write(out_dir.join("golden_transaction.bin"), &tx_bytes)
+        .expect("write golden_transaction.bin");
     println!("Wrote golden_transaction.bin ({} bytes)", tx_bytes.len());
 
     // 3. Construct golden Framed SruiMessage
@@ -133,8 +141,12 @@ fn main() {
         msg: Some(srui_message::Msg::Transaction(transaction)),
     };
     let framed_bytes = encode_framed(&framed_message).expect("encode framed SruiMessage");
-    fs::write(out_dir.join("golden_framed_message.bin"), &framed_bytes).expect("write golden_framed_message.bin");
-    println!("Wrote golden_framed_message.bin ({} bytes)", framed_bytes.len());
+    fs::write(out_dir.join("golden_framed_message.bin"), &framed_bytes)
+        .expect("write golden_framed_message.bin");
+    println!(
+        "Wrote golden_framed_message.bin ({} bytes)",
+        framed_bytes.len()
+    );
 
     // 4. Construct golden Framed ServerEventAck (§18.2)
     let event_ack = SruiMessage {
@@ -151,17 +163,34 @@ fn main() {
     let event_ack_bytes = encode_framed(&event_ack).expect("encode framed ServerEventAck");
     fs::write(out_dir.join("golden_event_ack.bin"), &event_ack_bytes)
         .expect("write golden_event_ack.bin");
-    println!("Wrote golden_event_ack.bin ({} bytes)", event_ack_bytes.len());
+    println!(
+        "Wrote golden_event_ack.bin ({} bytes)",
+        event_ack_bytes.len()
+    );
 
     // 5. Construct Malformed Fixture: Overlong Varint (11 bytes, exceeds 64-bit 10-byte limit)
-    let overlong_varint_bytes = vec![0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01];
-    fs::write(out_dir.join("malformed_overlong_varint.bin"), &overlong_varint_bytes)
-        .expect("write malformed_overlong_varint.bin");
-    println!("Wrote malformed_overlong_varint.bin ({} bytes)", overlong_varint_bytes.len());
+    let overlong_varint_bytes = vec![
+        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
+    ];
+    fs::write(
+        out_dir.join("malformed_overlong_varint.bin"),
+        &overlong_varint_bytes,
+    )
+    .expect("write malformed_overlong_varint.bin");
+    println!(
+        "Wrote malformed_overlong_varint.bin ({} bytes)",
+        overlong_varint_bytes.len()
+    );
 
     // 6. Construct Malformed Fixture: Truncated Frame (declares 100 bytes length, has only 4)
     let truncated_frame_bytes = vec![0x64, 0x01, 0x02, 0x03, 0x04];
-    fs::write(out_dir.join("malformed_truncated_frame.bin"), &truncated_frame_bytes)
-        .expect("write malformed_truncated_frame.bin");
-    println!("Wrote malformed_truncated_frame.bin ({} bytes)", truncated_frame_bytes.len());
+    fs::write(
+        out_dir.join("malformed_truncated_frame.bin"),
+        &truncated_frame_bytes,
+    )
+    .expect("write malformed_truncated_frame.bin");
+    println!(
+        "Wrote malformed_truncated_frame.bin ({} bytes)",
+        truncated_frame_bytes.len()
+    );
 }

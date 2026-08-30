@@ -17,23 +17,18 @@ use srui_semantic_tree::EnumToken;
 use crate::StoreMut;
 
 pub use srui_semantic_tree::{
-    ItemId, ModelId, Node, NodeId, Operation, PropertyRef, ResourceHash,
-    SemanticStore, Size, StoreError, TypeRef, Value,
+    ItemId, ModelId, Node, NodeId, Operation, PropertyRef, ResourceHash, SemanticStore, Size,
+    StoreError, TypeRef, Value,
 };
 
 // Re-export standard enums with canonical, ergonomic names (§7.4, §7.5)
 pub use srui_semantic_tree::{
-    StandardActionRole as ActionRole,
-    StandardHorizontalAlignment as HorizontalAlignment,
-    StandardImportance as Importance,
-    StandardInputRole as InputRole,
-    StandardPaddingRole as PaddingRole,
-    StandardSelectionMode as SelectionMode,
-    StandardSpacingRole as SpacingRole,
-    StandardTextRole as TextRole,
+    StandardActionRole as ActionRole, StandardHorizontalAlignment as HorizontalAlignment,
+    StandardImportance as Importance, StandardInputRole as InputRole,
+    StandardPaddingRole as PaddingRole, StandardSelectionMode as SelectionMode,
+    StandardSpacingRole as SpacingRole, StandardTextRole as TextRole,
     StandardTogglePresentationHint as TogglePresentationHint,
-    StandardValidationState as ValidationState,
-    StandardVerticalAlignment as VerticalAlignment,
+    StandardValidationState as ValidationState, StandardVerticalAlignment as VerticalAlignment,
     StandardVisibility as Visibility,
 };
 
@@ -819,28 +814,231 @@ macro_rules! impl_model_ref_prop {
 
 macro_rules! impl_common_layout_props {
     ($widget:ident, $builder:ident) => {
-        impl_enum_prop!($widget, $builder, HorizontalAlignment, horizontal_alignment, horizontal_alignment_of, get_horizontal_alignment, set_horizontal_alignment, set_horizontal_alignment_for, op_set_horizontal_alignment, op_set_horizontal_alignment_for, clear_horizontal_alignment, clear_horizontal_alignment_for, op_clear_horizontal_alignment, op_clear_horizontal_alignment_for, PropertyRef::HORIZONTAL_ALIGNMENT, "Horizontal alignment within parent layout (§7.4).");
-        impl_enum_prop!($widget, $builder, VerticalAlignment, vertical_alignment, vertical_alignment_of, get_vertical_alignment, set_vertical_alignment, set_vertical_alignment_for, op_set_vertical_alignment, op_set_vertical_alignment_for, clear_vertical_alignment, clear_vertical_alignment_for, op_clear_vertical_alignment, op_clear_vertical_alignment_for, PropertyRef::VERTICAL_ALIGNMENT, "Vertical alignment within parent layout (§7.4).");
-        impl_f64_prop!($widget, $builder, grow, grow_of, get_grow, set_grow, set_grow_for, op_set_grow, op_set_grow_for, clear_grow, clear_grow_for, op_clear_grow, op_clear_grow_for, PropertyRef::GROW, "Relative flex grow weight (§7.4).");
-        impl_f64_prop!($widget, $builder, shrink, shrink_of, get_shrink, set_shrink, set_shrink_for, op_set_shrink, op_set_shrink_for, clear_shrink, clear_shrink_for, op_clear_shrink, op_clear_shrink_for, PropertyRef::SHRINK, "Relative flex shrink weight (§7.4).");
-        impl_size_prop!($widget, $builder, preferred_size, preferred_size_of, get_preferred_size, set_preferred_size, set_preferred_size_for, op_set_preferred_size, op_set_preferred_size_for, clear_preferred_size, clear_preferred_size_for, op_clear_preferred_size, op_clear_preferred_size_for, PropertyRef::PREFERRED_SIZE, "Preferred logical dimensions (§7.4).");
-        impl_size_prop!($widget, $builder, minimum_size, minimum_size_of, get_minimum_size, set_minimum_size, set_minimum_size_for, op_set_minimum_size, op_set_minimum_size_for, clear_minimum_size, clear_minimum_size_for, op_clear_minimum_size, op_clear_minimum_size_for, PropertyRef::MINIMUM_SIZE, "Minimum logical dimensions (§7.4).");
-        impl_size_prop!($widget, $builder, maximum_size, maximum_size_of, get_maximum_size, set_maximum_size, set_maximum_size_for, op_set_maximum_size, op_set_maximum_size_for, clear_maximum_size, clear_maximum_size_for, op_clear_maximum_size, op_clear_maximum_size_for, PropertyRef::MAXIMUM_SIZE, "Maximum logical dimensions (§7.4).");
+        impl_enum_prop!(
+            $widget,
+            $builder,
+            HorizontalAlignment,
+            horizontal_alignment,
+            horizontal_alignment_of,
+            get_horizontal_alignment,
+            set_horizontal_alignment,
+            set_horizontal_alignment_for,
+            op_set_horizontal_alignment,
+            op_set_horizontal_alignment_for,
+            clear_horizontal_alignment,
+            clear_horizontal_alignment_for,
+            op_clear_horizontal_alignment,
+            op_clear_horizontal_alignment_for,
+            PropertyRef::HORIZONTAL_ALIGNMENT,
+            "Horizontal alignment within parent layout (§7.4)."
+        );
+        impl_enum_prop!(
+            $widget,
+            $builder,
+            VerticalAlignment,
+            vertical_alignment,
+            vertical_alignment_of,
+            get_vertical_alignment,
+            set_vertical_alignment,
+            set_vertical_alignment_for,
+            op_set_vertical_alignment,
+            op_set_vertical_alignment_for,
+            clear_vertical_alignment,
+            clear_vertical_alignment_for,
+            op_clear_vertical_alignment,
+            op_clear_vertical_alignment_for,
+            PropertyRef::VERTICAL_ALIGNMENT,
+            "Vertical alignment within parent layout (§7.4)."
+        );
+        impl_f64_prop!(
+            $widget,
+            $builder,
+            grow,
+            grow_of,
+            get_grow,
+            set_grow,
+            set_grow_for,
+            op_set_grow,
+            op_set_grow_for,
+            clear_grow,
+            clear_grow_for,
+            op_clear_grow,
+            op_clear_grow_for,
+            PropertyRef::GROW,
+            "Relative flex grow weight (§7.4)."
+        );
+        impl_f64_prop!(
+            $widget,
+            $builder,
+            shrink,
+            shrink_of,
+            get_shrink,
+            set_shrink,
+            set_shrink_for,
+            op_set_shrink,
+            op_set_shrink_for,
+            clear_shrink,
+            clear_shrink_for,
+            op_clear_shrink,
+            op_clear_shrink_for,
+            PropertyRef::SHRINK,
+            "Relative flex shrink weight (§7.4)."
+        );
+        impl_size_prop!(
+            $widget,
+            $builder,
+            preferred_size,
+            preferred_size_of,
+            get_preferred_size,
+            set_preferred_size,
+            set_preferred_size_for,
+            op_set_preferred_size,
+            op_set_preferred_size_for,
+            clear_preferred_size,
+            clear_preferred_size_for,
+            op_clear_preferred_size,
+            op_clear_preferred_size_for,
+            PropertyRef::PREFERRED_SIZE,
+            "Preferred logical dimensions (§7.4)."
+        );
+        impl_size_prop!(
+            $widget,
+            $builder,
+            minimum_size,
+            minimum_size_of,
+            get_minimum_size,
+            set_minimum_size,
+            set_minimum_size_for,
+            op_set_minimum_size,
+            op_set_minimum_size_for,
+            clear_minimum_size,
+            clear_minimum_size_for,
+            op_clear_minimum_size,
+            op_clear_minimum_size_for,
+            PropertyRef::MINIMUM_SIZE,
+            "Minimum logical dimensions (§7.4)."
+        );
+        impl_size_prop!(
+            $widget,
+            $builder,
+            maximum_size,
+            maximum_size_of,
+            get_maximum_size,
+            set_maximum_size,
+            set_maximum_size_for,
+            op_set_maximum_size,
+            op_set_maximum_size_for,
+            clear_maximum_size,
+            clear_maximum_size_for,
+            op_clear_maximum_size,
+            op_clear_maximum_size_for,
+            PropertyRef::MAXIMUM_SIZE,
+            "Maximum logical dimensions (§7.4)."
+        );
     };
 }
 
 macro_rules! impl_common_state_props {
     ($widget:ident, $builder:ident) => {
-        impl_enum_prop!($widget, $builder, Visibility, visibility, visibility_of, get_visibility, set_visibility, set_visibility_for, op_set_visibility, op_set_visibility_for, clear_visibility, clear_visibility_for, op_clear_visibility, op_clear_visibility_for, PropertyRef::VISIBILITY, "Visibility and layout participation (§7.4).");
-        impl_bool_prop!($widget, $builder, enabled, enabled_of, get_enabled, is_enabled, is_enabled_of, is_enabled_for, set_enabled, set_enabled_for, op_set_enabled, op_set_enabled_for, clear_enabled, clear_enabled_for, op_clear_enabled, op_clear_enabled_for, PropertyRef::ENABLED, "Whether the node is interactive (§7.4).");
-        impl_bool_prop!($widget, $builder, busy, busy_of, get_busy, is_busy, is_busy_of, is_busy_for, set_busy, set_busy_for, op_set_busy, op_set_busy_for, clear_busy, clear_busy_for, op_clear_busy, op_clear_busy_for, PropertyRef::BUSY, "Whether the node is performing an asynchronous operation (§7.4).");
+        impl_enum_prop!(
+            $widget,
+            $builder,
+            Visibility,
+            visibility,
+            visibility_of,
+            get_visibility,
+            set_visibility,
+            set_visibility_for,
+            op_set_visibility,
+            op_set_visibility_for,
+            clear_visibility,
+            clear_visibility_for,
+            op_clear_visibility,
+            op_clear_visibility_for,
+            PropertyRef::VISIBILITY,
+            "Visibility and layout participation (§7.4)."
+        );
+        impl_bool_prop!(
+            $widget,
+            $builder,
+            enabled,
+            enabled_of,
+            get_enabled,
+            is_enabled,
+            is_enabled_of,
+            is_enabled_for,
+            set_enabled,
+            set_enabled_for,
+            op_set_enabled,
+            op_set_enabled_for,
+            clear_enabled,
+            clear_enabled_for,
+            op_clear_enabled,
+            op_clear_enabled_for,
+            PropertyRef::ENABLED,
+            "Whether the node is interactive (§7.4)."
+        );
+        impl_bool_prop!(
+            $widget,
+            $builder,
+            busy,
+            busy_of,
+            get_busy,
+            is_busy,
+            is_busy_of,
+            is_busy_for,
+            set_busy,
+            set_busy_for,
+            op_set_busy,
+            op_set_busy_for,
+            clear_busy,
+            clear_busy_for,
+            op_clear_busy,
+            op_clear_busy_for,
+            PropertyRef::BUSY,
+            "Whether the node is performing an asynchronous operation (§7.4)."
+        );
     };
 }
 
 macro_rules! impl_container_spacing_props {
     ($widget:ident, $builder:ident) => {
-        impl_enum_prop!($widget, $builder, SpacingRole, spacing_role, spacing_role_of, get_spacing_role, set_spacing_role, set_spacing_role_for, op_set_spacing_role, op_set_spacing_role_for, clear_spacing_role, clear_spacing_role_for, op_clear_spacing_role, op_clear_spacing_role_for, PropertyRef::SPACING_ROLE, "Semantic inter-item spacing (§7.4).");
-        impl_enum_prop!($widget, $builder, PaddingRole, padding_role, padding_role_of, get_padding_role, set_padding_role, set_padding_role_for, op_set_padding_role, op_set_padding_role_for, clear_padding_role, clear_padding_role_for, op_clear_padding_role, op_clear_padding_role_for, PropertyRef::PADDING_ROLE, "Semantic container padding (§7.4).");
+        impl_enum_prop!(
+            $widget,
+            $builder,
+            SpacingRole,
+            spacing_role,
+            spacing_role_of,
+            get_spacing_role,
+            set_spacing_role,
+            set_spacing_role_for,
+            op_set_spacing_role,
+            op_set_spacing_role_for,
+            clear_spacing_role,
+            clear_spacing_role_for,
+            op_clear_spacing_role,
+            op_clear_spacing_role_for,
+            PropertyRef::SPACING_ROLE,
+            "Semantic inter-item spacing (§7.4)."
+        );
+        impl_enum_prop!(
+            $widget,
+            $builder,
+            PaddingRole,
+            padding_role,
+            padding_role_of,
+            get_padding_role,
+            set_padding_role,
+            set_padding_role_for,
+            op_set_padding_role,
+            op_set_padding_role_for,
+            clear_padding_role,
+            clear_padding_role_for,
+            op_clear_padding_role,
+            op_clear_padding_role_for,
+            PropertyRef::PADDING_ROLE,
+            "Semantic container padding (§7.4)."
+        );
     };
 }
 
@@ -854,8 +1052,40 @@ impl_widget_boilerplate!(
     TypeRef::SURFACE,
     "Top-level window or surface content root (§7.2, §7.3 Required Tier)."
 );
-impl_string_prop!(Surface, SurfaceBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Window title or surface accessibility label.");
-impl_string_prop!(Surface, SurfaceBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description.");
+impl_string_prop!(
+    Surface,
+    SurfaceBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Window title or surface accessibility label."
+);
+impl_string_prop!(
+    Surface,
+    SurfaceBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description."
+);
 impl_common_state_props!(Surface, SurfaceBuilder);
 impl_container_spacing_props!(Surface, SurfaceBuilder);
 impl_common_layout_props!(Surface, SurfaceBuilder);
@@ -873,7 +1103,23 @@ impl_widget_boilerplate!(
 impl_container_spacing_props!(Row, RowBuilder);
 impl_common_state_props!(Row, RowBuilder);
 impl_common_layout_props!(Row, RowBuilder);
-impl_string_prop!(Row, RowBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description.");
+impl_string_prop!(
+    Row,
+    RowBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description."
+);
 
 // =============================================================================
 // 3. Column (§7.2, §7.3 Required Tier, TypeRef::COLUMN / id 4)
@@ -888,7 +1134,23 @@ impl_widget_boilerplate!(
 impl_container_spacing_props!(Column, ColumnBuilder);
 impl_common_state_props!(Column, ColumnBuilder);
 impl_common_layout_props!(Column, ColumnBuilder);
-impl_string_prop!(Column, ColumnBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description.");
+impl_string_prop!(
+    Column,
+    ColumnBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description."
+);
 
 // =============================================================================
 // 4. Grid (§7.2, §7.3 Required Tier, TypeRef::GRID / id 5)
@@ -903,8 +1165,40 @@ impl_widget_boilerplate!(
 impl_container_spacing_props!(Grid, GridBuilder);
 impl_common_state_props!(Grid, GridBuilder);
 impl_common_layout_props!(Grid, GridBuilder);
-impl_list_prop!(Grid, GridBuilder, columns, columns_of, get_columns, set_columns, set_columns_for, op_set_columns, op_set_columns_for, clear_columns, clear_columns_for, op_clear_columns, op_clear_columns_for, PropertyRef::COLUMNS, "Grid column specifications or metadata (§7.4).");
-impl_string_prop!(Grid, GridBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description.");
+impl_list_prop!(
+    Grid,
+    GridBuilder,
+    columns,
+    columns_of,
+    get_columns,
+    set_columns,
+    set_columns_for,
+    op_set_columns,
+    op_set_columns_for,
+    clear_columns,
+    clear_columns_for,
+    op_clear_columns,
+    op_clear_columns_for,
+    PropertyRef::COLUMNS,
+    "Grid column specifications or metadata (§7.4)."
+);
+impl_string_prop!(
+    Grid,
+    GridBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description."
+);
 
 // =============================================================================
 // 5. Spacer (§7.2, §7.3 Required Tier, TypeRef::SPACER / id 6)
@@ -917,7 +1211,24 @@ impl_widget_boilerplate!(
     "Flexible empty layout item for spacing and alignment (§7.2, §7.3 Required Tier)."
 );
 impl_common_layout_props!(Spacer, SpacerBuilder);
-impl_enum_prop!(Spacer, SpacerBuilder, Visibility, visibility, visibility_of, get_visibility, set_visibility, set_visibility_for, op_set_visibility, op_set_visibility_for, clear_visibility, clear_visibility_for, op_clear_visibility, op_clear_visibility_for, PropertyRef::VISIBILITY, "Visibility and layout participation (§7.4).");
+impl_enum_prop!(
+    Spacer,
+    SpacerBuilder,
+    Visibility,
+    visibility,
+    visibility_of,
+    get_visibility,
+    set_visibility,
+    set_visibility_for,
+    op_set_visibility,
+    op_set_visibility_for,
+    clear_visibility,
+    clear_visibility_for,
+    op_clear_visibility,
+    op_clear_visibility_for,
+    PropertyRef::VISIBILITY,
+    "Visibility and layout participation (§7.4)."
+);
 
 // =============================================================================
 // 6. Separator (§7.2, §7.3 Required Tier, TypeRef::SEPARATOR / id 7)
@@ -931,7 +1242,23 @@ impl_widget_boilerplate!(
 );
 impl_common_layout_props!(Separator, SeparatorBuilder);
 impl_common_state_props!(Separator, SeparatorBuilder);
-impl_string_prop!(Separator, SeparatorBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description.");
+impl_string_prop!(
+    Separator,
+    SeparatorBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description."
+);
 
 // =============================================================================
 // 7. Text (§7.2, §7.3 Required Tier, TypeRef::TEXT / id 9)
@@ -943,12 +1270,110 @@ impl_widget_boilerplate!(
     TypeRef::TEXT,
     "Non-editable static or dynamic text label (§7.2, §7.3 Required Tier)."
 );
-impl_string_prop!(Text, TextBuilder, text, text_of, get_text, set_text, set_text_for, op_set_text, op_set_text_for, clear_text, clear_text_for, op_clear_text, op_clear_text_for, PropertyRef::TEXT, "Primary text content (§7.4).");
-impl_enum_prop!(Text, TextBuilder, TextRole, role, role_of, get_role, set_role, set_role_for, op_set_role, op_set_role_for, clear_role, clear_role_for, op_clear_role, op_clear_role_for, PropertyRef::ROLE, "Semantic text role (§7.5).");
-impl_enum_prop!(Text, TextBuilder, Importance, importance, importance_of, get_importance, set_importance, set_importance_for, op_set_importance, op_set_importance_for, clear_importance, clear_importance_for, op_clear_importance, op_clear_importance_for, PropertyRef::ROLE, "Semantic emphasis level (§7.5).");
-impl_string_prop!(Text, TextBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Primary label or accessibility name (§7.4).");
-impl_string_prop!(Text, TextBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
-impl_string_prop!(Text, TextBuilder, value_description, value_description_of, get_value_description, set_value_description, set_value_description_for, op_set_value_description, op_set_value_description_for, clear_value_description, clear_value_description_for, op_clear_value_description, op_clear_value_description_for, PropertyRef::VALUE_DESCRIPTION, "Human-readable value description (§7.4).");
+impl_string_prop!(
+    Text,
+    TextBuilder,
+    text,
+    text_of,
+    get_text,
+    set_text,
+    set_text_for,
+    op_set_text,
+    op_set_text_for,
+    clear_text,
+    clear_text_for,
+    op_clear_text,
+    op_clear_text_for,
+    PropertyRef::TEXT,
+    "Primary text content (§7.4)."
+);
+impl_enum_prop!(
+    Text,
+    TextBuilder,
+    TextRole,
+    role,
+    role_of,
+    get_role,
+    set_role,
+    set_role_for,
+    op_set_role,
+    op_set_role_for,
+    clear_role,
+    clear_role_for,
+    op_clear_role,
+    op_clear_role_for,
+    PropertyRef::ROLE,
+    "Semantic text role (§7.5)."
+);
+impl_enum_prop!(
+    Text,
+    TextBuilder,
+    Importance,
+    importance,
+    importance_of,
+    get_importance,
+    set_importance,
+    set_importance_for,
+    op_set_importance,
+    op_set_importance_for,
+    clear_importance,
+    clear_importance_for,
+    op_clear_importance,
+    op_clear_importance_for,
+    PropertyRef::ROLE,
+    "Semantic emphasis level (§7.5)."
+);
+impl_string_prop!(
+    Text,
+    TextBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Primary label or accessibility name (§7.4)."
+);
+impl_string_prop!(
+    Text,
+    TextBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
+impl_string_prop!(
+    Text,
+    TextBuilder,
+    value_description,
+    value_description_of,
+    get_value_description,
+    set_value_description,
+    set_value_description_for,
+    op_set_value_description,
+    op_set_value_description_for,
+    clear_value_description,
+    clear_value_description_for,
+    op_clear_value_description,
+    op_clear_value_description_for,
+    PropertyRef::VALUE_DESCRIPTION,
+    "Human-readable value description (§7.4)."
+);
 impl_common_state_props!(Text, TextBuilder);
 impl_common_layout_props!(Text, TextBuilder);
 
@@ -962,12 +1387,113 @@ impl_widget_boilerplate!(
     TypeRef::RICHTEXT,
     "Selectable structured text with semantic annotations (§7.2, §7.3 Required Tier, §9)."
 );
-impl_string_prop!(RichText, RichTextBuilder, text, text_of, get_text, set_text, set_text_for, op_set_text, op_set_text_for, clear_text, clear_text_for, op_clear_text, op_clear_text_for, PropertyRef::TEXT, "Primary structured text content (§7.4, §9).");
-impl_enum_prop!(RichText, RichTextBuilder, TextRole, role, role_of, get_role, set_role, set_role_for, op_set_role, op_set_role_for, clear_role, clear_role_for, op_clear_role, op_clear_role_for, PropertyRef::ROLE, "Semantic text role (§7.5).");
-impl_enum_prop!(RichText, RichTextBuilder, Importance, importance, importance_of, get_importance, set_importance, set_importance_for, op_set_importance, op_set_importance_for, clear_importance, clear_importance_for, op_clear_importance, op_clear_importance_for, PropertyRef::ROLE, "Semantic emphasis level (§7.5).");
-impl_string_prop!(RichText, RichTextBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Accessibility label (§7.4).");
-impl_string_prop!(RichText, RichTextBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
-impl_bool_prop!(RichText, RichTextBuilder, read_only, read_only_of, get_read_only, is_read_only, is_read_only_of, is_read_only_for, set_read_only, set_read_only_for, op_set_read_only, op_set_read_only_for, clear_read_only, clear_read_only_for, op_clear_read_only, op_clear_read_only_for, PropertyRef::READ_ONLY, "Whether the text is read-only (§7.4).");
+impl_string_prop!(
+    RichText,
+    RichTextBuilder,
+    text,
+    text_of,
+    get_text,
+    set_text,
+    set_text_for,
+    op_set_text,
+    op_set_text_for,
+    clear_text,
+    clear_text_for,
+    op_clear_text,
+    op_clear_text_for,
+    PropertyRef::TEXT,
+    "Primary structured text content (§7.4, §9)."
+);
+impl_enum_prop!(
+    RichText,
+    RichTextBuilder,
+    TextRole,
+    role,
+    role_of,
+    get_role,
+    set_role,
+    set_role_for,
+    op_set_role,
+    op_set_role_for,
+    clear_role,
+    clear_role_for,
+    op_clear_role,
+    op_clear_role_for,
+    PropertyRef::ROLE,
+    "Semantic text role (§7.5)."
+);
+impl_enum_prop!(
+    RichText,
+    RichTextBuilder,
+    Importance,
+    importance,
+    importance_of,
+    get_importance,
+    set_importance,
+    set_importance_for,
+    op_set_importance,
+    op_set_importance_for,
+    clear_importance,
+    clear_importance_for,
+    op_clear_importance,
+    op_clear_importance_for,
+    PropertyRef::ROLE,
+    "Semantic emphasis level (§7.5)."
+);
+impl_string_prop!(
+    RichText,
+    RichTextBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Accessibility label (§7.4)."
+);
+impl_string_prop!(
+    RichText,
+    RichTextBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
+impl_bool_prop!(
+    RichText,
+    RichTextBuilder,
+    read_only,
+    read_only_of,
+    get_read_only,
+    is_read_only,
+    is_read_only_of,
+    is_read_only_for,
+    set_read_only,
+    set_read_only_for,
+    op_set_read_only,
+    op_set_read_only_for,
+    clear_read_only,
+    clear_read_only_for,
+    op_clear_read_only,
+    op_clear_read_only_for,
+    PropertyRef::READ_ONLY,
+    "Whether the text is read-only (§7.4)."
+);
 impl_common_state_props!(RichText, RichTextBuilder);
 impl_common_layout_props!(RichText, RichTextBuilder);
 
@@ -981,13 +1507,130 @@ impl_widget_boilerplate!(
     TypeRef::BUTTON,
     "Momentary action trigger (§7.2, §7.3 Required Tier)."
 );
-impl_string_prop!(Button, ButtonBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Button label text (§7.4).");
-impl_enum_prop!(Button, ButtonBuilder, ActionRole, role, role_of, get_role, set_role, set_role_for, op_set_role, op_set_role_for, clear_role, clear_role_for, op_clear_role, op_clear_role_for, PropertyRef::ROLE, "Semantic action role (§7.5).");
-impl_enum_prop!(Button, ButtonBuilder, Importance, importance, importance_of, get_importance, set_importance, set_importance_for, op_set_importance, op_set_importance_for, clear_importance, clear_importance_for, op_clear_importance, op_clear_importance_for, PropertyRef::ROLE, "Semantic emphasis level (§7.5).");
-impl_string_prop!(Button, ButtonBuilder, action_key, action_key_of, get_action_key, set_action_key, set_action_key_for, op_set_action_key, op_set_action_key_for, clear_action_key, clear_action_key_for, op_clear_action_key, op_clear_action_key_for, PropertyRef::ACTION_KEY, "Opaque semantic action key (§7.7).");
-impl_list_prop!(Button, ButtonBuilder, actions, actions_of, get_actions, set_actions, set_actions_for, op_set_actions, op_set_actions_for, clear_actions, clear_actions_for, op_clear_actions, op_clear_actions_for, PropertyRef::ACTIONS, "List of supported semantic actions (§7.4).");
-impl_string_prop!(Button, ButtonBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
-impl_bool_prop!(Button, ButtonBuilder, selected, selected_of, get_selected, is_selected, is_selected_of, is_selected_for, set_selected, set_selected_for, op_set_selected, op_set_selected_for, clear_selected, clear_selected_for, op_clear_selected, op_clear_selected_for, PropertyRef::SELECTED, "Selected state (§7.4).");
+impl_string_prop!(
+    Button,
+    ButtonBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Button label text (§7.4)."
+);
+impl_enum_prop!(
+    Button,
+    ButtonBuilder,
+    ActionRole,
+    role,
+    role_of,
+    get_role,
+    set_role,
+    set_role_for,
+    op_set_role,
+    op_set_role_for,
+    clear_role,
+    clear_role_for,
+    op_clear_role,
+    op_clear_role_for,
+    PropertyRef::ROLE,
+    "Semantic action role (§7.5)."
+);
+impl_enum_prop!(
+    Button,
+    ButtonBuilder,
+    Importance,
+    importance,
+    importance_of,
+    get_importance,
+    set_importance,
+    set_importance_for,
+    op_set_importance,
+    op_set_importance_for,
+    clear_importance,
+    clear_importance_for,
+    op_clear_importance,
+    op_clear_importance_for,
+    PropertyRef::ROLE,
+    "Semantic emphasis level (§7.5)."
+);
+impl_string_prop!(
+    Button,
+    ButtonBuilder,
+    action_key,
+    action_key_of,
+    get_action_key,
+    set_action_key,
+    set_action_key_for,
+    op_set_action_key,
+    op_set_action_key_for,
+    clear_action_key,
+    clear_action_key_for,
+    op_clear_action_key,
+    op_clear_action_key_for,
+    PropertyRef::ACTION_KEY,
+    "Opaque semantic action key (§7.7)."
+);
+impl_list_prop!(
+    Button,
+    ButtonBuilder,
+    actions,
+    actions_of,
+    get_actions,
+    set_actions,
+    set_actions_for,
+    op_set_actions,
+    op_set_actions_for,
+    clear_actions,
+    clear_actions_for,
+    op_clear_actions,
+    op_clear_actions_for,
+    PropertyRef::ACTIONS,
+    "List of supported semantic actions (§7.4)."
+);
+impl_string_prop!(
+    Button,
+    ButtonBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
+impl_bool_prop!(
+    Button,
+    ButtonBuilder,
+    selected,
+    selected_of,
+    get_selected,
+    is_selected,
+    is_selected_of,
+    is_selected_for,
+    set_selected,
+    set_selected_for,
+    op_set_selected,
+    op_set_selected_for,
+    clear_selected,
+    clear_selected_for,
+    op_clear_selected,
+    op_clear_selected_for,
+    PropertyRef::SELECTED,
+    "Selected state (§7.4)."
+);
 impl_common_state_props!(Button, ButtonBuilder);
 impl_common_layout_props!(Button, ButtonBuilder);
 
@@ -1024,15 +1667,168 @@ impl Toggle {
     }
 }
 
-impl_bool_prop!(Toggle, ToggleBuilder, value, value_of, get_value, is_value_set, is_value_set_of, is_value_set_for, set_value, set_value_for, op_set_value, op_set_value_for, clear_value, clear_value_for, op_clear_value, op_clear_value_for, PropertyRef::VALUE, "Boolean toggle value (§7.2, §7.4).");
-impl_enum_prop!(Toggle, ToggleBuilder, TogglePresentationHint, presentation_hint, presentation_hint_of, get_presentation_hint, set_presentation_hint, set_presentation_hint_for, op_set_presentation_hint, op_set_presentation_hint_for, clear_presentation_hint, clear_presentation_hint_for, op_clear_presentation_hint, op_clear_presentation_hint_for, PropertyRef::PRESENTATION_HINT, "Advisory presentation hint (checkbox | switch | automatic) (§7.2).");
-impl_string_prop!(Toggle, ToggleBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Toggle label text (§7.4).");
-impl_enum_prop!(Toggle, ToggleBuilder, Importance, importance, importance_of, get_importance, set_importance, set_importance_for, op_set_importance, op_set_importance_for, clear_importance, clear_importance_for, op_clear_importance, op_clear_importance_for, PropertyRef::ROLE, "Semantic emphasis level (§7.5).");
-impl_string_prop!(Toggle, ToggleBuilder, action_key, action_key_of, get_action_key, set_action_key, set_action_key_for, op_set_action_key, op_set_action_key_for, clear_action_key, clear_action_key_for, op_clear_action_key, op_clear_action_key_for, PropertyRef::ACTION_KEY, "Opaque action key (§7.7).");
-impl_string_prop!(Toggle, ToggleBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
-impl_string_prop!(Toggle, ToggleBuilder, value_description, value_description_of, get_value_description, set_value_description, set_value_description_for, op_set_value_description, op_set_value_description_for, clear_value_description, clear_value_description_for, op_clear_value_description, op_clear_value_description_for, PropertyRef::VALUE_DESCRIPTION, "Human-readable value description (§7.4).");
-impl_enum_prop!(Toggle, ToggleBuilder, ValidationState, validation_state, validation_state_of, get_validation_state, set_validation_state, set_validation_state_for, op_set_validation_state, op_set_validation_state_for, clear_validation_state, clear_validation_state_for, op_clear_validation_state, op_clear_validation_state_for, PropertyRef::VALIDATION_STATE, "Validation state (§7.4).");
-impl_bool_prop!(Toggle, ToggleBuilder, read_only, read_only_of, get_read_only, is_read_only, is_read_only_of, is_read_only_for, set_read_only, set_read_only_for, op_set_read_only, op_set_read_only_for, clear_read_only, clear_read_only_for, op_clear_read_only, op_clear_read_only_for, PropertyRef::READ_ONLY, "Whether the toggle is read-only (§7.4).");
+impl_bool_prop!(
+    Toggle,
+    ToggleBuilder,
+    value,
+    value_of,
+    get_value,
+    is_value_set,
+    is_value_set_of,
+    is_value_set_for,
+    set_value,
+    set_value_for,
+    op_set_value,
+    op_set_value_for,
+    clear_value,
+    clear_value_for,
+    op_clear_value,
+    op_clear_value_for,
+    PropertyRef::VALUE,
+    "Boolean toggle value (§7.2, §7.4)."
+);
+impl_enum_prop!(
+    Toggle,
+    ToggleBuilder,
+    TogglePresentationHint,
+    presentation_hint,
+    presentation_hint_of,
+    get_presentation_hint,
+    set_presentation_hint,
+    set_presentation_hint_for,
+    op_set_presentation_hint,
+    op_set_presentation_hint_for,
+    clear_presentation_hint,
+    clear_presentation_hint_for,
+    op_clear_presentation_hint,
+    op_clear_presentation_hint_for,
+    PropertyRef::PRESENTATION_HINT,
+    "Advisory presentation hint (checkbox | switch | automatic) (§7.2)."
+);
+impl_string_prop!(
+    Toggle,
+    ToggleBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Toggle label text (§7.4)."
+);
+impl_enum_prop!(
+    Toggle,
+    ToggleBuilder,
+    Importance,
+    importance,
+    importance_of,
+    get_importance,
+    set_importance,
+    set_importance_for,
+    op_set_importance,
+    op_set_importance_for,
+    clear_importance,
+    clear_importance_for,
+    op_clear_importance,
+    op_clear_importance_for,
+    PropertyRef::ROLE,
+    "Semantic emphasis level (§7.5)."
+);
+impl_string_prop!(
+    Toggle,
+    ToggleBuilder,
+    action_key,
+    action_key_of,
+    get_action_key,
+    set_action_key,
+    set_action_key_for,
+    op_set_action_key,
+    op_set_action_key_for,
+    clear_action_key,
+    clear_action_key_for,
+    op_clear_action_key,
+    op_clear_action_key_for,
+    PropertyRef::ACTION_KEY,
+    "Opaque action key (§7.7)."
+);
+impl_string_prop!(
+    Toggle,
+    ToggleBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
+impl_string_prop!(
+    Toggle,
+    ToggleBuilder,
+    value_description,
+    value_description_of,
+    get_value_description,
+    set_value_description,
+    set_value_description_for,
+    op_set_value_description,
+    op_set_value_description_for,
+    clear_value_description,
+    clear_value_description_for,
+    op_clear_value_description,
+    op_clear_value_description_for,
+    PropertyRef::VALUE_DESCRIPTION,
+    "Human-readable value description (§7.4)."
+);
+impl_enum_prop!(
+    Toggle,
+    ToggleBuilder,
+    ValidationState,
+    validation_state,
+    validation_state_of,
+    get_validation_state,
+    set_validation_state,
+    set_validation_state_for,
+    op_set_validation_state,
+    op_set_validation_state_for,
+    clear_validation_state,
+    clear_validation_state_for,
+    op_clear_validation_state,
+    op_clear_validation_state_for,
+    PropertyRef::VALIDATION_STATE,
+    "Validation state (§7.4)."
+);
+impl_bool_prop!(
+    Toggle,
+    ToggleBuilder,
+    read_only,
+    read_only_of,
+    get_read_only,
+    is_read_only,
+    is_read_only_of,
+    is_read_only_for,
+    set_read_only,
+    set_read_only_for,
+    op_set_read_only,
+    op_set_read_only_for,
+    clear_read_only,
+    clear_read_only_for,
+    op_clear_read_only,
+    op_clear_read_only_for,
+    PropertyRef::READ_ONLY,
+    "Whether the toggle is read-only (§7.4)."
+);
 impl_common_state_props!(Toggle, ToggleBuilder);
 impl_common_layout_props!(Toggle, ToggleBuilder);
 
@@ -1046,17 +1842,199 @@ impl_widget_boilerplate!(
     TypeRef::TEXT_INPUT,
     "Single-line text editing field (§7.2, §7.3 Required Tier, §22.6)."
 );
-impl_string_prop!(TextInput, TextInputBuilder, value, value_of, get_value, set_value, set_value_for, op_set_value, op_set_value_for, clear_value, clear_value_for, op_clear_value, op_clear_value_for, PropertyRef::VALUE, "Current text input value (§7.4).");
-impl_string_prop!(TextInput, TextInputBuilder, text, text_of, get_text, set_text, set_text_for, op_set_text, op_set_text_for, clear_text, clear_text_for, op_clear_text, op_clear_text_for, PropertyRef::TEXT, "Text content alias (§7.4).");
-impl_string_prop!(TextInput, TextInputBuilder, placeholder, placeholder_of, get_placeholder, set_placeholder, set_placeholder_for, op_set_placeholder, op_set_placeholder_for, clear_placeholder, clear_placeholder_for, op_clear_placeholder, op_clear_placeholder_for, PropertyRef::PLACEHOLDER, "Placeholder text (§7.4).");
-impl_enum_prop!(TextInput, TextInputBuilder, InputRole, role, role_of, get_role, set_role, set_role_for, op_set_role, op_set_role_for, clear_role, clear_role_for, op_clear_role, op_clear_role_for, PropertyRef::ROLE, "Semantic input role (plain | search | secure | command) (§7.5).");
-impl_enum_prop!(TextInput, TextInputBuilder, Importance, importance, importance_of, get_importance, set_importance, set_importance_for, op_set_importance, op_set_importance_for, clear_importance, clear_importance_for, op_clear_importance, op_clear_importance_for, PropertyRef::ROLE, "Semantic emphasis level (§7.5).");
-impl_string_prop!(TextInput, TextInputBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Input field label (§7.4).");
-impl_string_prop!(TextInput, TextInputBuilder, action_key, action_key_of, get_action_key, set_action_key, set_action_key_for, op_set_action_key, op_set_action_key_for, clear_action_key, clear_action_key_for, op_clear_action_key, op_clear_action_key_for, PropertyRef::ACTION_KEY, "Opaque action key (§7.7).");
-impl_string_prop!(TextInput, TextInputBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
-impl_string_prop!(TextInput, TextInputBuilder, value_description, value_description_of, get_value_description, set_value_description, set_value_description_for, op_set_value_description, op_set_value_description_for, clear_value_description, clear_value_description_for, op_clear_value_description, op_clear_value_description_for, PropertyRef::VALUE_DESCRIPTION, "Human-readable value description (§7.4).");
-impl_enum_prop!(TextInput, TextInputBuilder, ValidationState, validation_state, validation_state_of, get_validation_state, set_validation_state, set_validation_state_for, op_set_validation_state, op_set_validation_state_for, clear_validation_state, clear_validation_state_for, op_clear_validation_state, op_clear_validation_state_for, PropertyRef::VALIDATION_STATE, "Validation state (§7.4).");
-impl_bool_prop!(TextInput, TextInputBuilder, read_only, read_only_of, get_read_only, is_read_only, is_read_only_of, is_read_only_for, set_read_only, set_read_only_for, op_set_read_only, op_set_read_only_for, clear_read_only, clear_read_only_for, op_clear_read_only, op_clear_read_only_for, PropertyRef::READ_ONLY, "Whether the input is read-only (§7.4).");
+impl_string_prop!(
+    TextInput,
+    TextInputBuilder,
+    value,
+    value_of,
+    get_value,
+    set_value,
+    set_value_for,
+    op_set_value,
+    op_set_value_for,
+    clear_value,
+    clear_value_for,
+    op_clear_value,
+    op_clear_value_for,
+    PropertyRef::VALUE,
+    "Current text input value (§7.4)."
+);
+impl_string_prop!(
+    TextInput,
+    TextInputBuilder,
+    text,
+    text_of,
+    get_text,
+    set_text,
+    set_text_for,
+    op_set_text,
+    op_set_text_for,
+    clear_text,
+    clear_text_for,
+    op_clear_text,
+    op_clear_text_for,
+    PropertyRef::TEXT,
+    "Text content alias (§7.4)."
+);
+impl_string_prop!(
+    TextInput,
+    TextInputBuilder,
+    placeholder,
+    placeholder_of,
+    get_placeholder,
+    set_placeholder,
+    set_placeholder_for,
+    op_set_placeholder,
+    op_set_placeholder_for,
+    clear_placeholder,
+    clear_placeholder_for,
+    op_clear_placeholder,
+    op_clear_placeholder_for,
+    PropertyRef::PLACEHOLDER,
+    "Placeholder text (§7.4)."
+);
+impl_enum_prop!(
+    TextInput,
+    TextInputBuilder,
+    InputRole,
+    role,
+    role_of,
+    get_role,
+    set_role,
+    set_role_for,
+    op_set_role,
+    op_set_role_for,
+    clear_role,
+    clear_role_for,
+    op_clear_role,
+    op_clear_role_for,
+    PropertyRef::ROLE,
+    "Semantic input role (plain | search | secure | command) (§7.5)."
+);
+impl_enum_prop!(
+    TextInput,
+    TextInputBuilder,
+    Importance,
+    importance,
+    importance_of,
+    get_importance,
+    set_importance,
+    set_importance_for,
+    op_set_importance,
+    op_set_importance_for,
+    clear_importance,
+    clear_importance_for,
+    op_clear_importance,
+    op_clear_importance_for,
+    PropertyRef::ROLE,
+    "Semantic emphasis level (§7.5)."
+);
+impl_string_prop!(
+    TextInput,
+    TextInputBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Input field label (§7.4)."
+);
+impl_string_prop!(
+    TextInput,
+    TextInputBuilder,
+    action_key,
+    action_key_of,
+    get_action_key,
+    set_action_key,
+    set_action_key_for,
+    op_set_action_key,
+    op_set_action_key_for,
+    clear_action_key,
+    clear_action_key_for,
+    op_clear_action_key,
+    op_clear_action_key_for,
+    PropertyRef::ACTION_KEY,
+    "Opaque action key (§7.7)."
+);
+impl_string_prop!(
+    TextInput,
+    TextInputBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
+impl_string_prop!(
+    TextInput,
+    TextInputBuilder,
+    value_description,
+    value_description_of,
+    get_value_description,
+    set_value_description,
+    set_value_description_for,
+    op_set_value_description,
+    op_set_value_description_for,
+    clear_value_description,
+    clear_value_description_for,
+    op_clear_value_description,
+    op_clear_value_description_for,
+    PropertyRef::VALUE_DESCRIPTION,
+    "Human-readable value description (§7.4)."
+);
+impl_enum_prop!(
+    TextInput,
+    TextInputBuilder,
+    ValidationState,
+    validation_state,
+    validation_state_of,
+    get_validation_state,
+    set_validation_state,
+    set_validation_state_for,
+    op_set_validation_state,
+    op_set_validation_state_for,
+    clear_validation_state,
+    clear_validation_state_for,
+    op_clear_validation_state,
+    op_clear_validation_state_for,
+    PropertyRef::VALIDATION_STATE,
+    "Validation state (§7.4)."
+);
+impl_bool_prop!(
+    TextInput,
+    TextInputBuilder,
+    read_only,
+    read_only_of,
+    get_read_only,
+    is_read_only,
+    is_read_only_of,
+    is_read_only_for,
+    set_read_only,
+    set_read_only_for,
+    op_set_read_only,
+    op_set_read_only_for,
+    clear_read_only,
+    clear_read_only_for,
+    op_clear_read_only,
+    op_clear_read_only_for,
+    PropertyRef::READ_ONLY,
+    "Whether the input is read-only (§7.4)."
+);
 impl_common_state_props!(TextInput, TextInputBuilder);
 impl_common_layout_props!(TextInput, TextInputBuilder);
 
@@ -1070,17 +2048,199 @@ impl_widget_boilerplate!(
     TypeRef::TEXT_AREA,
     "Multi-line text editing view (§7.2, §7.3 Required Tier, §22.6)."
 );
-impl_string_prop!(TextArea, TextAreaBuilder, value, value_of, get_value, set_value, set_value_for, op_set_value, op_set_value_for, clear_value, clear_value_for, op_clear_value, op_clear_value_for, PropertyRef::VALUE, "Current text area value (§7.4).");
-impl_string_prop!(TextArea, TextAreaBuilder, text, text_of, get_text, set_text, set_text_for, op_set_text, op_set_text_for, clear_text, clear_text_for, op_clear_text, op_clear_text_for, PropertyRef::TEXT, "Text content alias (§7.4).");
-impl_string_prop!(TextArea, TextAreaBuilder, placeholder, placeholder_of, get_placeholder, set_placeholder, set_placeholder_for, op_set_placeholder, op_set_placeholder_for, clear_placeholder, clear_placeholder_for, op_clear_placeholder, op_clear_placeholder_for, PropertyRef::PLACEHOLDER, "Placeholder text (§7.4).");
-impl_enum_prop!(TextArea, TextAreaBuilder, InputRole, role, role_of, get_role, set_role, set_role_for, op_set_role, op_set_role_for, clear_role, clear_role_for, op_clear_role, op_clear_role_for, PropertyRef::ROLE, "Semantic input role (§7.5).");
-impl_enum_prop!(TextArea, TextAreaBuilder, Importance, importance, importance_of, get_importance, set_importance, set_importance_for, op_set_importance, op_set_importance_for, clear_importance, clear_importance_for, op_clear_importance, op_clear_importance_for, PropertyRef::ROLE, "Semantic emphasis level (§7.5).");
-impl_string_prop!(TextArea, TextAreaBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Text area label (§7.4).");
-impl_string_prop!(TextArea, TextAreaBuilder, action_key, action_key_of, get_action_key, set_action_key, set_action_key_for, op_set_action_key, op_set_action_key_for, clear_action_key, clear_action_key_for, op_clear_action_key, op_clear_action_key_for, PropertyRef::ACTION_KEY, "Opaque action key (§7.7).");
-impl_string_prop!(TextArea, TextAreaBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
-impl_string_prop!(TextArea, TextAreaBuilder, value_description, value_description_of, get_value_description, set_value_description, set_value_description_for, op_set_value_description, op_set_value_description_for, clear_value_description, clear_value_description_for, op_clear_value_description, op_clear_value_description_for, PropertyRef::VALUE_DESCRIPTION, "Human-readable value description (§7.4).");
-impl_enum_prop!(TextArea, TextAreaBuilder, ValidationState, validation_state, validation_state_of, get_validation_state, set_validation_state, set_validation_state_for, op_set_validation_state, op_set_validation_state_for, clear_validation_state, clear_validation_state_for, op_clear_validation_state, op_clear_validation_state_for, PropertyRef::VALIDATION_STATE, "Validation state (§7.4).");
-impl_bool_prop!(TextArea, TextAreaBuilder, read_only, read_only_of, get_read_only, is_read_only, is_read_only_of, is_read_only_for, set_read_only, set_read_only_for, op_set_read_only, op_set_read_only_for, clear_read_only, clear_read_only_for, op_clear_read_only, op_clear_read_only_for, PropertyRef::READ_ONLY, "Whether the text area is read-only (§7.4).");
+impl_string_prop!(
+    TextArea,
+    TextAreaBuilder,
+    value,
+    value_of,
+    get_value,
+    set_value,
+    set_value_for,
+    op_set_value,
+    op_set_value_for,
+    clear_value,
+    clear_value_for,
+    op_clear_value,
+    op_clear_value_for,
+    PropertyRef::VALUE,
+    "Current text area value (§7.4)."
+);
+impl_string_prop!(
+    TextArea,
+    TextAreaBuilder,
+    text,
+    text_of,
+    get_text,
+    set_text,
+    set_text_for,
+    op_set_text,
+    op_set_text_for,
+    clear_text,
+    clear_text_for,
+    op_clear_text,
+    op_clear_text_for,
+    PropertyRef::TEXT,
+    "Text content alias (§7.4)."
+);
+impl_string_prop!(
+    TextArea,
+    TextAreaBuilder,
+    placeholder,
+    placeholder_of,
+    get_placeholder,
+    set_placeholder,
+    set_placeholder_for,
+    op_set_placeholder,
+    op_set_placeholder_for,
+    clear_placeholder,
+    clear_placeholder_for,
+    op_clear_placeholder,
+    op_clear_placeholder_for,
+    PropertyRef::PLACEHOLDER,
+    "Placeholder text (§7.4)."
+);
+impl_enum_prop!(
+    TextArea,
+    TextAreaBuilder,
+    InputRole,
+    role,
+    role_of,
+    get_role,
+    set_role,
+    set_role_for,
+    op_set_role,
+    op_set_role_for,
+    clear_role,
+    clear_role_for,
+    op_clear_role,
+    op_clear_role_for,
+    PropertyRef::ROLE,
+    "Semantic input role (§7.5)."
+);
+impl_enum_prop!(
+    TextArea,
+    TextAreaBuilder,
+    Importance,
+    importance,
+    importance_of,
+    get_importance,
+    set_importance,
+    set_importance_for,
+    op_set_importance,
+    op_set_importance_for,
+    clear_importance,
+    clear_importance_for,
+    op_clear_importance,
+    op_clear_importance_for,
+    PropertyRef::ROLE,
+    "Semantic emphasis level (§7.5)."
+);
+impl_string_prop!(
+    TextArea,
+    TextAreaBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Text area label (§7.4)."
+);
+impl_string_prop!(
+    TextArea,
+    TextAreaBuilder,
+    action_key,
+    action_key_of,
+    get_action_key,
+    set_action_key,
+    set_action_key_for,
+    op_set_action_key,
+    op_set_action_key_for,
+    clear_action_key,
+    clear_action_key_for,
+    op_clear_action_key,
+    op_clear_action_key_for,
+    PropertyRef::ACTION_KEY,
+    "Opaque action key (§7.7)."
+);
+impl_string_prop!(
+    TextArea,
+    TextAreaBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
+impl_string_prop!(
+    TextArea,
+    TextAreaBuilder,
+    value_description,
+    value_description_of,
+    get_value_description,
+    set_value_description,
+    set_value_description_for,
+    op_set_value_description,
+    op_set_value_description_for,
+    clear_value_description,
+    clear_value_description_for,
+    op_clear_value_description,
+    op_clear_value_description_for,
+    PropertyRef::VALUE_DESCRIPTION,
+    "Human-readable value description (§7.4)."
+);
+impl_enum_prop!(
+    TextArea,
+    TextAreaBuilder,
+    ValidationState,
+    validation_state,
+    validation_state_of,
+    get_validation_state,
+    set_validation_state,
+    set_validation_state_for,
+    op_set_validation_state,
+    op_set_validation_state_for,
+    clear_validation_state,
+    clear_validation_state_for,
+    op_clear_validation_state,
+    op_clear_validation_state_for,
+    PropertyRef::VALIDATION_STATE,
+    "Validation state (§7.4)."
+);
+impl_bool_prop!(
+    TextArea,
+    TextAreaBuilder,
+    read_only,
+    read_only_of,
+    get_read_only,
+    is_read_only,
+    is_read_only_of,
+    is_read_only_for,
+    set_read_only,
+    set_read_only_for,
+    op_set_read_only,
+    op_set_read_only_for,
+    clear_read_only,
+    clear_read_only_for,
+    op_clear_read_only,
+    op_clear_read_only_for,
+    PropertyRef::READ_ONLY,
+    "Whether the text area is read-only (§7.4)."
+);
 impl_common_state_props!(TextArea, TextAreaBuilder);
 impl_common_layout_props!(TextArea, TextAreaBuilder);
 
@@ -1094,10 +2254,74 @@ impl_widget_boilerplate!(
     TypeRef::PROGRESS,
     "Determinate or indeterminate progress indicator (§7.2, §7.3 Required Tier)."
 );
-impl_f64_prop!(Progress, ProgressBuilder, value, value_of, get_value, set_value, set_value_for, op_set_value, op_set_value_for, clear_value, clear_value_for, op_clear_value, op_clear_value_for, PropertyRef::VALUE, "Determinate progress value in [0.0, 1.0] (§7.4).");
-impl_string_prop!(Progress, ProgressBuilder, value_description, value_description_of, get_value_description, set_value_description, set_value_description_for, op_set_value_description, op_set_value_description_for, clear_value_description, clear_value_description_for, op_clear_value_description, op_clear_value_description_for, PropertyRef::VALUE_DESCRIPTION, "Human-readable progress description (e.g. '62%') (§7.4).");
-impl_string_prop!(Progress, ProgressBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Progress label text (§7.4).");
-impl_string_prop!(Progress, ProgressBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
+impl_f64_prop!(
+    Progress,
+    ProgressBuilder,
+    value,
+    value_of,
+    get_value,
+    set_value,
+    set_value_for,
+    op_set_value,
+    op_set_value_for,
+    clear_value,
+    clear_value_for,
+    op_clear_value,
+    op_clear_value_for,
+    PropertyRef::VALUE,
+    "Determinate progress value in [0.0, 1.0] (§7.4)."
+);
+impl_string_prop!(
+    Progress,
+    ProgressBuilder,
+    value_description,
+    value_description_of,
+    get_value_description,
+    set_value_description,
+    set_value_description_for,
+    op_set_value_description,
+    op_set_value_description_for,
+    clear_value_description,
+    clear_value_description_for,
+    op_clear_value_description,
+    op_clear_value_description_for,
+    PropertyRef::VALUE_DESCRIPTION,
+    "Human-readable progress description (e.g. '62%') (§7.4)."
+);
+impl_string_prop!(
+    Progress,
+    ProgressBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Progress label text (§7.4)."
+);
+impl_string_prop!(
+    Progress,
+    ProgressBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
 impl_common_state_props!(Progress, ProgressBuilder);
 impl_common_layout_props!(Progress, ProgressBuilder);
 
@@ -1122,7 +2346,8 @@ impl Image {
     #[doc = "Returns the content-addressed [`ResourceHash`] from a [`Node`] (§14)."]
     #[inline]
     pub fn resource_of(node: &Node) -> Option<ResourceHash> {
-        node.get_property(PropertyRef::RESOURCE).and_then(Value::as_resource_hash)
+        node.get_property(PropertyRef::RESOURCE)
+            .and_then(Value::as_resource_hash)
     }
 
     #[doc = "Returns the content-addressed [`ResourceHash`] for node `id` from `store` (§14)."]
@@ -1133,13 +2358,21 @@ impl Image {
 
     #[doc = "Sets the `resource` property on this widget in `store` (§13 SET_PROPERTY, §14)."]
     #[inline]
-    pub fn set_resource(&self, store: &mut impl StoreMut, hash: impl Into<ResourceHash>) -> Result<Option<Value>, StoreError> {
+    pub fn set_resource(
+        &self,
+        store: &mut impl StoreMut,
+        hash: impl Into<ResourceHash>,
+    ) -> Result<Option<Value>, StoreError> {
         Self::set_resource_for(store, self.id, hash)
     }
 
     #[doc = "Sets the `resource` property on the given node in `store` (§13 SET_PROPERTY, §14)."]
     #[inline]
-    pub fn set_resource_for(store: &mut impl StoreMut, id: NodeId, hash: impl Into<ResourceHash>) -> Result<Option<Value>, StoreError> {
+    pub fn set_resource_for(
+        store: &mut impl StoreMut,
+        id: NodeId,
+        hash: impl Into<ResourceHash>,
+    ) -> Result<Option<Value>, StoreError> {
         store.set_property(id, PropertyRef::RESOURCE, Value::ResourceHash(hash.into()))
     }
 
@@ -1163,7 +2396,10 @@ impl Image {
 
     #[doc = "Clears the `resource` property on the given node in `store` (§13 CLEAR_PROPERTY)."]
     #[inline]
-    pub fn clear_resource_for(store: &mut impl StoreMut, id: NodeId) -> Result<Option<Value>, StoreError> {
+    pub fn clear_resource_for(
+        store: &mut impl StoreMut,
+        id: NodeId,
+    ) -> Result<Option<Value>, StoreError> {
         store.clear_property(id, PropertyRef::RESOURCE)
     }
 
@@ -1185,13 +2421,46 @@ impl ImageBuilder {
     #[inline]
     #[must_use]
     pub fn resource(mut self, hash: impl Into<ResourceHash>) -> Self {
-        self.properties.push((PropertyRef::RESOURCE, Value::ResourceHash(hash.into())));
+        self.properties
+            .push((PropertyRef::RESOURCE, Value::ResourceHash(hash.into())));
         self
     }
 }
 
-impl_string_prop!(Image, ImageBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Image alt text or accessibility label (§7.4).");
-impl_string_prop!(Image, ImageBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
+impl_string_prop!(
+    Image,
+    ImageBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Image alt text or accessibility label (§7.4)."
+);
+impl_string_prop!(
+    Image,
+    ImageBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
 impl_common_state_props!(Image, ImageBuilder);
 impl_common_layout_props!(Image, ImageBuilder);
 
@@ -1208,7 +2477,23 @@ impl_widget_boilerplate!(
 impl_container_spacing_props!(Scroll, ScrollBuilder);
 impl_common_state_props!(Scroll, ScrollBuilder);
 impl_common_layout_props!(Scroll, ScrollBuilder);
-impl_string_prop!(Scroll, ScrollBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
+impl_string_prop!(
+    Scroll,
+    ScrollBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
 
 // =============================================================================
 // 16. List (§7.2, §7.3 Required Tier, TypeRef::LIST / id 17)
@@ -1221,11 +2506,95 @@ impl_widget_boilerplate!(
     "Virtualized one-dimensional collection of items (§7.2, §7.3 Required Tier, §8)."
 );
 impl_model_ref_prop!(List, ListBuilder);
-impl_list_prop!(List, ListBuilder, items, items_of, get_items, set_items, set_items_for, op_set_items, op_set_items_for, clear_items, clear_items_for, op_clear_items, op_clear_items_for, PropertyRef::ITEMS, "Inline item list for small un-virtualized collections (§7.4).");
-impl_enum_prop!(List, ListBuilder, SelectionMode, selection_mode, selection_mode_of, get_selection_mode, set_selection_mode, set_selection_mode_for, op_set_selection_mode, op_set_selection_mode_for, clear_selection_mode, clear_selection_mode_for, op_clear_selection_mode, op_clear_selection_mode_for, PropertyRef::SELECTION_MODE, "Selection mode (none | single | multiple) (§8).");
-impl_bool_prop!(List, ListBuilder, selected, selected_of, get_selected, is_selected, is_selected_of, is_selected_for, set_selected, set_selected_for, op_set_selected, op_set_selected_for, clear_selected, clear_selected_for, op_clear_selected, op_clear_selected_for, PropertyRef::SELECTED, "Selection state (§7.4).");
-impl_string_prop!(List, ListBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Collection label or title (§7.4).");
-impl_string_prop!(List, ListBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
+impl_list_prop!(
+    List,
+    ListBuilder,
+    items,
+    items_of,
+    get_items,
+    set_items,
+    set_items_for,
+    op_set_items,
+    op_set_items_for,
+    clear_items,
+    clear_items_for,
+    op_clear_items,
+    op_clear_items_for,
+    PropertyRef::ITEMS,
+    "Inline item list for small un-virtualized collections (§7.4)."
+);
+impl_enum_prop!(
+    List,
+    ListBuilder,
+    SelectionMode,
+    selection_mode,
+    selection_mode_of,
+    get_selection_mode,
+    set_selection_mode,
+    set_selection_mode_for,
+    op_set_selection_mode,
+    op_set_selection_mode_for,
+    clear_selection_mode,
+    clear_selection_mode_for,
+    op_clear_selection_mode,
+    op_clear_selection_mode_for,
+    PropertyRef::SELECTION_MODE,
+    "Selection mode (none | single | multiple) (§8)."
+);
+impl_bool_prop!(
+    List,
+    ListBuilder,
+    selected,
+    selected_of,
+    get_selected,
+    is_selected,
+    is_selected_of,
+    is_selected_for,
+    set_selected,
+    set_selected_for,
+    op_set_selected,
+    op_set_selected_for,
+    clear_selected,
+    clear_selected_for,
+    op_clear_selected,
+    op_clear_selected_for,
+    PropertyRef::SELECTED,
+    "Selection state (§7.4)."
+);
+impl_string_prop!(
+    List,
+    ListBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Collection label or title (§7.4)."
+);
+impl_string_prop!(
+    List,
+    ListBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
 impl_common_state_props!(List, ListBuilder);
 impl_common_layout_props!(List, ListBuilder);
 
@@ -1240,11 +2609,95 @@ impl_widget_boilerplate!(
     "Multi-column row-based collection view (§7.2, §7.3 Required Tier, §8)."
 );
 impl_model_ref_prop!(Table, TableBuilder);
-impl_list_prop!(Table, TableBuilder, columns, columns_of, get_columns, set_columns, set_columns_for, op_set_columns, op_set_columns_for, clear_columns, clear_columns_for, op_clear_columns, op_clear_columns_for, PropertyRef::COLUMNS, "Column definitions list (§7.4, §8).");
-impl_enum_prop!(Table, TableBuilder, SelectionMode, selection_mode, selection_mode_of, get_selection_mode, set_selection_mode, set_selection_mode_for, op_set_selection_mode, op_set_selection_mode_for, clear_selection_mode, clear_selection_mode_for, op_clear_selection_mode, op_clear_selection_mode_for, PropertyRef::SELECTION_MODE, "Selection mode (§8).");
-impl_bool_prop!(Table, TableBuilder, selected, selected_of, get_selected, is_selected, is_selected_of, is_selected_for, set_selected, set_selected_for, op_set_selected, op_set_selected_for, clear_selected, clear_selected_for, op_clear_selected, op_clear_selected_for, PropertyRef::SELECTED, "Selection state (§7.4).");
-impl_string_prop!(Table, TableBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Table accessibility label (§7.4).");
-impl_string_prop!(Table, TableBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
+impl_list_prop!(
+    Table,
+    TableBuilder,
+    columns,
+    columns_of,
+    get_columns,
+    set_columns,
+    set_columns_for,
+    op_set_columns,
+    op_set_columns_for,
+    clear_columns,
+    clear_columns_for,
+    op_clear_columns,
+    op_clear_columns_for,
+    PropertyRef::COLUMNS,
+    "Column definitions list (§7.4, §8)."
+);
+impl_enum_prop!(
+    Table,
+    TableBuilder,
+    SelectionMode,
+    selection_mode,
+    selection_mode_of,
+    get_selection_mode,
+    set_selection_mode,
+    set_selection_mode_for,
+    op_set_selection_mode,
+    op_set_selection_mode_for,
+    clear_selection_mode,
+    clear_selection_mode_for,
+    op_clear_selection_mode,
+    op_clear_selection_mode_for,
+    PropertyRef::SELECTION_MODE,
+    "Selection mode (§8)."
+);
+impl_bool_prop!(
+    Table,
+    TableBuilder,
+    selected,
+    selected_of,
+    get_selected,
+    is_selected,
+    is_selected_of,
+    is_selected_for,
+    set_selected,
+    set_selected_for,
+    op_set_selected,
+    op_set_selected_for,
+    clear_selected,
+    clear_selected_for,
+    op_clear_selected,
+    op_clear_selected_for,
+    PropertyRef::SELECTED,
+    "Selection state (§7.4)."
+);
+impl_string_prop!(
+    Table,
+    TableBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Table accessibility label (§7.4)."
+);
+impl_string_prop!(
+    Table,
+    TableBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
 impl_common_state_props!(Table, TableBuilder);
 impl_common_layout_props!(Table, TableBuilder);
 
@@ -1259,9 +2712,77 @@ impl_widget_boilerplate!(
     "Hierarchical outline collection view with expandable nodes (§7.2, §7.3 Required Tier, §8)."
 );
 impl_model_ref_prop!(Tree, TreeBuilder);
-impl_enum_prop!(Tree, TreeBuilder, SelectionMode, selection_mode, selection_mode_of, get_selection_mode, set_selection_mode, set_selection_mode_for, op_set_selection_mode, op_set_selection_mode_for, clear_selection_mode, clear_selection_mode_for, op_clear_selection_mode, op_clear_selection_mode_for, PropertyRef::SELECTION_MODE, "Selection mode (§8).");
-impl_bool_prop!(Tree, TreeBuilder, selected, selected_of, get_selected, is_selected, is_selected_of, is_selected_for, set_selected, set_selected_for, op_set_selected, op_set_selected_for, clear_selected, clear_selected_for, op_clear_selected, op_clear_selected_for, PropertyRef::SELECTED, "Selection state (§7.4).");
-impl_string_prop!(Tree, TreeBuilder, label, label_of, get_label, set_label, set_label_for, op_set_label, op_set_label_for, clear_label, clear_label_for, op_clear_label, op_clear_label_for, PropertyRef::LABEL, "Tree accessibility label (§7.4).");
-impl_string_prop!(Tree, TreeBuilder, accessible_description, accessible_description_of, get_accessible_description, set_accessible_description, set_accessible_description_for, op_set_accessible_description, op_set_accessible_description_for, clear_accessible_description, clear_accessible_description_for, op_clear_accessible_description, op_clear_accessible_description_for, PropertyRef::ACCESSIBLE_DESCRIPTION, "Secondary accessibility description (§7.4).");
+impl_enum_prop!(
+    Tree,
+    TreeBuilder,
+    SelectionMode,
+    selection_mode,
+    selection_mode_of,
+    get_selection_mode,
+    set_selection_mode,
+    set_selection_mode_for,
+    op_set_selection_mode,
+    op_set_selection_mode_for,
+    clear_selection_mode,
+    clear_selection_mode_for,
+    op_clear_selection_mode,
+    op_clear_selection_mode_for,
+    PropertyRef::SELECTION_MODE,
+    "Selection mode (§8)."
+);
+impl_bool_prop!(
+    Tree,
+    TreeBuilder,
+    selected,
+    selected_of,
+    get_selected,
+    is_selected,
+    is_selected_of,
+    is_selected_for,
+    set_selected,
+    set_selected_for,
+    op_set_selected,
+    op_set_selected_for,
+    clear_selected,
+    clear_selected_for,
+    op_clear_selected,
+    op_clear_selected_for,
+    PropertyRef::SELECTED,
+    "Selection state (§7.4)."
+);
+impl_string_prop!(
+    Tree,
+    TreeBuilder,
+    label,
+    label_of,
+    get_label,
+    set_label,
+    set_label_for,
+    op_set_label,
+    op_set_label_for,
+    clear_label,
+    clear_label_for,
+    op_clear_label,
+    op_clear_label_for,
+    PropertyRef::LABEL,
+    "Tree accessibility label (§7.4)."
+);
+impl_string_prop!(
+    Tree,
+    TreeBuilder,
+    accessible_description,
+    accessible_description_of,
+    get_accessible_description,
+    set_accessible_description,
+    set_accessible_description_for,
+    op_set_accessible_description,
+    op_set_accessible_description_for,
+    clear_accessible_description,
+    clear_accessible_description_for,
+    op_clear_accessible_description,
+    op_clear_accessible_description_for,
+    PropertyRef::ACCESSIBLE_DESCRIPTION,
+    "Secondary accessibility description (§7.4)."
+);
 impl_common_state_props!(Tree, TreeBuilder);
 impl_common_layout_props!(Tree, TreeBuilder);

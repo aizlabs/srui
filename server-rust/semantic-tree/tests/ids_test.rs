@@ -75,16 +75,31 @@ fn test_wire_proto_conversion() {
 
 #[test]
 fn test_resolve_known_registry_node_types() {
-    assert_eq!(resolve_standard_node_type("Surface").unwrap(), TypeRef::SURFACE);
-    assert_eq!(resolve_standard_node_type("Button").unwrap(), TypeRef::BUTTON);
+    assert_eq!(
+        resolve_standard_node_type("Surface").unwrap(),
+        TypeRef::SURFACE
+    );
+    assert_eq!(
+        resolve_standard_node_type("Button").unwrap(),
+        TypeRef::BUTTON
+    );
     assert_eq!(resolve_standard_node_type("Text").unwrap(), TypeRef::TEXT);
 }
 
 #[test]
 fn test_resolve_known_registry_properties() {
-    assert_eq!(resolve_standard_property("label").unwrap(), PropertyRef::LABEL);
-    assert_eq!(resolve_standard_property("enabled").unwrap(), PropertyRef::ENABLED);
-    assert_eq!(resolve_standard_property("text").unwrap(), PropertyRef::TEXT);
+    assert_eq!(
+        resolve_standard_property("label").unwrap(),
+        PropertyRef::LABEL
+    );
+    assert_eq!(
+        resolve_standard_property("enabled").unwrap(),
+        PropertyRef::ENABLED
+    );
+    assert_eq!(
+        resolve_standard_property("text").unwrap(),
+        PropertyRef::TEXT
+    );
 }
 
 #[test]
@@ -105,7 +120,10 @@ fn test_resource_hash() {
     let hash = ResourceHash::new(bytes);
     assert_eq!(hash.as_bytes(), &bytes);
     let hex = hash.to_hex();
-    assert_eq!(hex, "0707070707070707070707070707070707070707070707070707070707070707");
+    assert_eq!(
+        hex,
+        "0707070707070707070707070707070707070707070707070707070707070707"
+    );
 
     let parsed = ResourceHash::from_hex(&hex).unwrap();
     assert_eq!(hash, parsed);
@@ -129,20 +147,11 @@ fn test_resolve_standard_enum_values() {
         resolve_standard_enum_value("Visibility", "collapsed"),
         Some(EnumToken::VISIBILITY_COLLAPSED)
     );
-    assert_eq!(
-        lookup_standard_enum_value(2, "destructive"),
-        Some(3)
-    );
-    assert_eq!(
-        standard_enum_value_name(2, 3),
-        Some("destructive")
-    );
+    assert_eq!(lookup_standard_enum_value(2, "destructive"), Some(3));
+    assert_eq!(standard_enum_value_name(2, 3), Some("destructive"));
     assert_eq!(
         resolve_standard_enum_value("ActionRole", "non_existent"),
         None
     );
-    assert_eq!(
-        resolve_standard_enum_value("NonExistentEnum", "val"),
-        None
-    );
+    assert_eq!(resolve_standard_enum_value("NonExistentEnum", "val"), None);
 }

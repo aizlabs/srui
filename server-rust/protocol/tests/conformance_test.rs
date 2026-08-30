@@ -6,7 +6,8 @@ use std::path::Path;
 
 fn load_expected_spec() -> (std::path::PathBuf, JsonValue) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let spec_path = Path::new(manifest_dir).join("../../protocol/conformance-vectors/expected.json");
+    let spec_path =
+        Path::new(manifest_dir).join("../../protocol/conformance-vectors/expected.json");
     let text = fs::read_to_string(&spec_path)
         .unwrap_or_else(|e| panic!("Failed to read expected.json from {:?}: {}", spec_path, e));
     let json: JsonValue = serde_json::from_str(&text).expect("valid JSON in expected.json");
@@ -83,7 +84,9 @@ fn create_authored_transaction() -> Transaction {
                                 local_id: StandardProperty::PropertyText as u32,
                             }),
                             value: Some(Value {
-                                value: Some(value::Value::StringValue("27 tests passed".to_string())),
+                                value: Some(value::Value::StringValue(
+                                    "27 tests passed".to_string(),
+                                )),
                             }),
                         }],
                     }),
@@ -137,7 +140,11 @@ fn test_decode_golden_node_record_against_expected_json() {
         .unwrap_or_else(|e| panic!("Failed to read fixture from {:?}: {}", fixture_path, e));
 
     // 1. Assert raw bytes match canonical specification
-    assert_eq!(bytes.len(), expected_byte_len, "Fixture byte length mismatch");
+    assert_eq!(
+        bytes.len(),
+        expected_byte_len,
+        "Fixture byte length mismatch"
+    );
     assert_eq!(to_hex(&bytes), expected_hex, "Fixture hex mismatch");
 
     // 2. Decode and assert against JSON oracle
@@ -145,11 +152,20 @@ fn test_decode_golden_node_record_against_expected_json() {
 
     assert_eq!(node.node_id, expected["node_id"].as_u64().unwrap());
     assert_eq!(node.parent_id, expected["parent_id"].as_u64().unwrap());
-    assert_eq!(node.child_index, expected["child_index"].as_u64().unwrap() as u32);
+    assert_eq!(
+        node.child_index,
+        expected["child_index"].as_u64().unwrap() as u32
+    );
 
     let type_ref = node.r#type.expect("type_ref");
-    assert_eq!(type_ref.namespace_id, expected["type"]["namespace_id"].as_u64().unwrap() as u32);
-    assert_eq!(type_ref.local_id, expected["type"]["local_id"].as_u64().unwrap() as u32);
+    assert_eq!(
+        type_ref.namespace_id,
+        expected["type"]["namespace_id"].as_u64().unwrap() as u32
+    );
+    assert_eq!(
+        type_ref.local_id,
+        expected["type"]["local_id"].as_u64().unwrap() as u32
+    );
 
     let expected_props = expected["properties"].as_array().expect("properties array");
     assert_eq!(node.properties.len(), expected_props.len());
@@ -157,10 +173,16 @@ fn test_decode_golden_node_record_against_expected_json() {
     // Property 0: label
     let p0 = &node.properties[0];
     let p0_ref = p0.property.as_ref().unwrap();
-    assert_eq!(p0_ref.local_id, expected_props[0]["property"]["local_id"].as_u64().unwrap() as u32);
+    assert_eq!(
+        p0_ref.local_id,
+        expected_props[0]["property"]["local_id"].as_u64().unwrap() as u32
+    );
     match &p0.value.as_ref().unwrap().value {
         Some(value::Value::StringValue(s)) => {
-            assert_eq!(s, expected_props[0]["value"]["string_value"].as_str().unwrap());
+            assert_eq!(
+                s,
+                expected_props[0]["value"]["string_value"].as_str().unwrap()
+            );
         }
         other => panic!("Expected StringValue, got {:?}", other),
     }
@@ -168,7 +190,10 @@ fn test_decode_golden_node_record_against_expected_json() {
     // Property 1: role
     let p1 = &node.properties[1];
     let p1_ref = p1.property.as_ref().unwrap();
-    assert_eq!(p1_ref.local_id, expected_props[1]["property"]["local_id"].as_u64().unwrap() as u32);
+    assert_eq!(
+        p1_ref.local_id,
+        expected_props[1]["property"]["local_id"].as_u64().unwrap() as u32
+    );
     match &p1.value.as_ref().unwrap().value {
         Some(value::Value::EnumValue(ev)) => {
             let ev_spec = &expected_props[1]["value"]["enum_value"];
@@ -181,10 +206,16 @@ fn test_decode_golden_node_record_against_expected_json() {
     // Property 2: enabled
     let p2 = &node.properties[2];
     let p2_ref = p2.property.as_ref().unwrap();
-    assert_eq!(p2_ref.local_id, expected_props[2]["property"]["local_id"].as_u64().unwrap() as u32);
+    assert_eq!(
+        p2_ref.local_id,
+        expected_props[2]["property"]["local_id"].as_u64().unwrap() as u32
+    );
     match &p2.value.as_ref().unwrap().value {
         Some(value::Value::BoolValue(b)) => {
-            assert_eq!(*b, expected_props[2]["value"]["bool_value"].as_bool().unwrap());
+            assert_eq!(
+                *b,
+                expected_props[2]["value"]["bool_value"].as_bool().unwrap()
+            );
         }
         other => panic!("Expected BoolValue, got {:?}", other),
     }
@@ -210,13 +241,20 @@ fn test_decode_golden_transaction_against_expected_json() {
         .unwrap_or_else(|e| panic!("Failed to read fixture from {:?}: {}", fixture_path, e));
 
     // 1. Assert raw bytes match canonical specification
-    assert_eq!(bytes.len(), expected_byte_len, "Fixture byte length mismatch");
+    assert_eq!(
+        bytes.len(),
+        expected_byte_len,
+        "Fixture byte length mismatch"
+    );
     assert_eq!(to_hex(&bytes), expected_hex, "Fixture hex mismatch");
 
     // 2. Decode and assert against JSON oracle
     let tx = Transaction::decode(&bytes[..]).expect("Decode Transaction");
 
-    assert_eq!(tx.base_revision, expected["base_revision"].as_u64().unwrap());
+    assert_eq!(
+        tx.base_revision,
+        expected["base_revision"].as_u64().unwrap()
+    );
     assert_eq!(tx.new_revision, expected["new_revision"].as_u64().unwrap());
     assert_eq!(tx.priority, expected["priority"].as_u64().unwrap() as u32);
 
@@ -230,12 +268,21 @@ fn test_decode_golden_transaction_against_expected_json() {
             let node = create_op.node.as_ref().unwrap();
             assert_eq!(node.node_id, exp_create["node_id"].as_u64().unwrap());
             assert_eq!(node.parent_id, exp_create["parent_id"].as_u64().unwrap());
-            assert_eq!(node.child_index, exp_create["child_index"].as_u64().unwrap() as u32);
-            assert_eq!(node.r#type.as_ref().unwrap().local_id, exp_create["type"]["local_id"].as_u64().unwrap() as u32);
+            assert_eq!(
+                node.child_index,
+                exp_create["child_index"].as_u64().unwrap() as u32
+            );
+            assert_eq!(
+                node.r#type.as_ref().unwrap().local_id,
+                exp_create["type"]["local_id"].as_u64().unwrap() as u32
+            );
 
             let exp_prop = &exp_create["properties"][0];
             let p0 = &node.properties[0];
-            assert_eq!(p0.property.as_ref().unwrap().local_id, exp_prop["property"]["local_id"].as_u64().unwrap() as u32);
+            assert_eq!(
+                p0.property.as_ref().unwrap().local_id,
+                exp_prop["property"]["local_id"].as_u64().unwrap() as u32
+            );
             match &p0.value.as_ref().unwrap().value {
                 Some(value::Value::StringValue(s)) => {
                     assert_eq!(s, exp_prop["value"]["string_value"].as_str().unwrap());
@@ -251,7 +298,10 @@ fn test_decode_golden_transaction_against_expected_json() {
         Some(operation::Op::SetProperty(set_op)) => {
             let exp_set = &expected_ops[1]["set_property"];
             assert_eq!(set_op.node_id, exp_set["node_id"].as_u64().unwrap());
-            assert_eq!(set_op.property.as_ref().unwrap().local_id, exp_set["property"]["local_id"].as_u64().unwrap() as u32);
+            assert_eq!(
+                set_op.property.as_ref().unwrap().local_id,
+                exp_set["property"]["local_id"].as_u64().unwrap() as u32
+            );
             match &set_op.value.as_ref().unwrap().value {
                 Some(value::Value::FloatValue(f)) => {
                     let expected_f = exp_set["value"]["float_value"].as_f64().unwrap();
@@ -270,7 +320,10 @@ fn test_decode_golden_transaction_against_expected_json() {
             assert_eq!(batch_op.node_id, exp_batch["node_id"].as_u64().unwrap());
             let exp_prop = &exp_batch["properties"][0];
             let p0 = &batch_op.properties[0];
-            assert_eq!(p0.property.as_ref().unwrap().local_id, exp_prop["property"]["local_id"].as_u64().unwrap() as u32);
+            assert_eq!(
+                p0.property.as_ref().unwrap().local_id,
+                exp_prop["property"]["local_id"].as_u64().unwrap() as u32
+            );
             match &p0.value.as_ref().unwrap().value {
                 Some(value::Value::SizeValue(size)) => {
                     let exp_size = &exp_prop["value"]["size_value"];
@@ -380,17 +433,27 @@ fn test_decode_golden_framed_message_against_expected_json() {
         .unwrap_or_else(|e| panic!("Failed to read fixture from {:?}: {}", fixture_path, e));
 
     // 1. Assert raw bytes match canonical specification
-    assert_eq!(bytes.len(), expected_byte_len, "Fixture byte length mismatch");
+    assert_eq!(
+        bytes.len(),
+        expected_byte_len,
+        "Fixture byte length mismatch"
+    );
     assert_eq!(to_hex(&bytes), expected_hex, "Fixture hex mismatch");
 
     // 2. Decode framed message and assert against expected JSON spec
     let decoded: SruiMessage = decode_framed(&bytes[..]).expect("Decode framed SruiMessage");
     match decoded.msg {
         Some(srui_message::Msg::Transaction(ref tx)) => {
-            assert_eq!(tx.base_revision, expected["base_revision"].as_u64().unwrap());
+            assert_eq!(
+                tx.base_revision,
+                expected["base_revision"].as_u64().unwrap()
+            );
             assert_eq!(tx.new_revision, expected["new_revision"].as_u64().unwrap());
             assert_eq!(tx.priority, expected["priority"].as_u64().unwrap() as u32);
-            assert_eq!(tx.operations.len(), expected["operation_count"].as_u64().unwrap() as usize);
+            assert_eq!(
+                tx.operations.len(),
+                expected["operation_count"].as_u64().unwrap() as usize
+            );
         }
         other => panic!("Expected Transaction in framed message, got {:?}", other),
     }
@@ -446,7 +509,11 @@ fn test_decode_golden_event_ack_against_expected_json() {
     let bytes = fs::read(&fixture_path)
         .unwrap_or_else(|e| panic!("Failed to read fixture from {:?}: {}", fixture_path, e));
 
-    assert_eq!(bytes.len(), expected_byte_len, "Fixture byte length mismatch");
+    assert_eq!(
+        bytes.len(),
+        expected_byte_len,
+        "Fixture byte length mismatch"
+    );
     assert_eq!(to_hex(&bytes), expected_hex, "Fixture hex mismatch");
 
     let decoded: SruiMessage = decode_framed(&bytes[..]).expect("Decode framed ServerEventAck");
@@ -456,7 +523,10 @@ fn test_decode_golden_event_ack_against_expected_json() {
                 ack.client_instance_id,
                 expected["client_instance_id"].as_str().unwrap().as_bytes()
             );
-            assert_eq!(ack.event_id, expected["event_id"].as_str().unwrap().as_bytes());
+            assert_eq!(
+                ack.event_id,
+                expected["event_id"].as_str().unwrap().as_bytes()
+            );
             assert_eq!(
                 ack.last_processed_event_seq,
                 expected["last_processed_event_seq"].as_u64().unwrap()
@@ -472,7 +542,10 @@ fn test_decode_golden_event_ack_against_expected_json() {
                 ack.revision_after_effect,
                 expected["revision_after_effect"].as_u64().unwrap()
             );
-            assert_eq!(ack.reject_reason, expected["reject_reason"].as_str().unwrap());
+            assert_eq!(
+                ack.reject_reason,
+                expected["reject_reason"].as_str().unwrap()
+            );
         }
         other => panic!("Expected ServerEventAck in framed message, got {:?}", other),
     }
@@ -524,15 +597,26 @@ fn test_malformed_framing_fixtures_rejected_cleanly() {
     let overlong_spec = &malformed["malformed_overlong_varint"];
     let overlong_file = overlong_spec["file"].as_str().unwrap();
     let overlong_bytes = fs::read(vectors_dir.join(overlong_file)).unwrap();
-    assert_eq!(to_hex(&overlong_bytes), overlong_spec["hex"].as_str().unwrap());
-    let overlong_err = decode_framed::<SruiMessage>(&overlong_bytes).expect_err("overlong varint must fail");
-    assert!(matches!(overlong_err, FramingError::DecodeError(_) | FramingError::FrameSizeLimitExceeded { .. }));
+    assert_eq!(
+        to_hex(&overlong_bytes),
+        overlong_spec["hex"].as_str().unwrap()
+    );
+    let overlong_err =
+        decode_framed::<SruiMessage>(&overlong_bytes).expect_err("overlong varint must fail");
+    assert!(matches!(
+        overlong_err,
+        FramingError::DecodeError(_) | FramingError::FrameSizeLimitExceeded { .. }
+    ));
 
     // 2. Truncated frame
     let truncated_spec = &malformed["malformed_truncated_frame"];
     let truncated_file = truncated_spec["file"].as_str().unwrap();
     let truncated_bytes = fs::read(vectors_dir.join(truncated_file)).unwrap();
-    assert_eq!(to_hex(&truncated_bytes), truncated_spec["hex"].as_str().unwrap());
-    let truncated_err = decode_framed::<SruiMessage>(&truncated_bytes).expect_err("truncated frame must fail");
+    assert_eq!(
+        to_hex(&truncated_bytes),
+        truncated_spec["hex"].as_str().unwrap()
+    );
+    let truncated_err =
+        decode_framed::<SruiMessage>(&truncated_bytes).expect_err("truncated frame must fail");
     assert!(matches!(truncated_err, FramingError::DecodeError(_)));
 }

@@ -1,5 +1,5 @@
-use futures::{SinkExt, StreamExt};
 use bytes::BytesMut;
+use futures::{SinkExt, StreamExt};
 use prost::Message;
 use srui_protocol::{
     srui_message, ClientHello, ClientLimits, FramingError, SruiCodec, SruiMessage, Transaction,
@@ -47,7 +47,8 @@ fn test_decode_chunked_large_frame_without_upfront_allocation() {
     };
 
     let mut full_frame = BytesMut::new();
-    msg.encode_length_delimited(&mut full_frame).expect("encode frame");
+    msg.encode_length_delimited(&mut full_frame)
+        .expect("encode frame");
 
     let mut codec = SruiCodec::new();
     let mut buf = BytesMut::new();
@@ -106,7 +107,11 @@ async fn test_async_codec_roundtrip() {
     };
 
     writer.send(msg.clone()).await.expect("send frame");
-    let received = reader.next().await.expect("received frame").expect("decoded ok");
+    let received = reader
+        .next()
+        .await
+        .expect("received frame")
+        .expect("decoded ok");
     assert_eq!(msg, received);
 }
 
@@ -125,8 +130,14 @@ async fn test_async_codec_max_frame_size_enforced() {
     };
 
     // Encoding should fail since encoded size > 5 bytes
-    let err = writer.send(msg).await.expect_err("should reject large frame on send");
-    assert!(matches!(err, FramingError::FrameSizeLimitExceeded { limit: 5, .. }));
+    let err = writer
+        .send(msg)
+        .await
+        .expect_err("should reject large frame on send");
+    assert!(matches!(
+        err,
+        FramingError::FrameSizeLimitExceeded { limit: 5, .. }
+    ));
 
     // Now test decode rejecting oversized frame
     let (mut client_raw, server_raw) = duplex(1024);
@@ -142,13 +153,19 @@ async fn test_async_codec_max_frame_size_enforced() {
     })
     .expect("encode normal frame");
 
-    client_raw.write_all(&valid_frame).await.expect("write frame");
+    client_raw
+        .write_all(&valid_frame)
+        .await
+        .expect("write frame");
     let decode_err = small_reader
         .next()
         .await
         .expect("read frame")
         .expect_err("should reject on decode");
-    assert!(matches!(decode_err, FramingError::FrameSizeLimitExceeded { limit: 5, .. }));
+    assert!(matches!(
+        decode_err,
+        FramingError::FrameSizeLimitExceeded { limit: 5, .. }
+    ));
 }
 
 #[tokio::test]
@@ -175,7 +192,10 @@ async fn test_async_codec_cancel_safety_in_select() {
     let second_half = &encoded_bytes[split_point..];
 
     // Write only the first half
-    client_raw.write_all(first_half).await.expect("write first half");
+    client_raw
+        .write_all(first_half)
+        .await
+        .expect("write first half");
 
     // Race reader against a timeout: reader will be cancelled mid-frame!
     let timeout_result = tokio::select! {
@@ -186,7 +206,10 @@ async fn test_async_codec_cancel_safety_in_select() {
     assert!(timeout_result.is_none());
 
     // Write the remaining half of the frame
-    client_raw.write_all(second_half).await.expect("write second half");
+    client_raw
+        .write_all(second_half)
+        .await
+        .expect("write second half");
 
     // Next read MUST succeed with the complete message because FramedRead preserved the buffer!
     let received = reader

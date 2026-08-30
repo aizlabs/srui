@@ -12,15 +12,110 @@ use tracing::{error, info, warn};
 
 use srui_sessiond::{handle_connection, Session};
 
+/// Ignores `SIGHUP` so SSH session detach / controlling-terminal loss does not terminate
+/// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
+/// the process and defeats persistent session state.
+#[cfg(unix)]
+fn ignore_sighup() {
+    // SAFETY: called synchronously at process start, before threads or other handlers exist.
+    let rc = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    if rc == libc::SIG_ERR {
+        eprintln!("srui-sessiond: failed to ignore SIGHUP");
+    }
+}
+
 fn default_socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("srui-sessiond.sock")
 }
+fn parse_args() -> (PathBuf, Option<String>) {
+    let args: Vec<String> = std::env::args().collect();
+    let mut socket_path = None;
+    let mut app_name = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--socket" && i + 1 < args.len() {
+            socket_path = Some(PathBuf::from(&args[i + 1]));
+            i += 2;
+        } else if args[i] == "--app" && i + 1 < args.len() {
+            app_name = Some(args[i + 1].clone());
+            i += 2;
+        } else if !args[i].starts_with('-') && socket_path.is_none() {
+            socket_path = Some(PathBuf::from(&args[i]));
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    (socket_path.unwrap_or_else(default_socket_path), app_name)
+}
+
+fn initialize_counter_app(session: &Arc<Session>) {
+    use srui_sdk::*;
+    let surface_id = NodeId::new(1);
+    let text_id = NodeId::new(2);
+    let progress_id = NodeId::new(3);
+    let button_id = NodeId::new(4);
+
+    session
+        .transaction(|ui| {
+            Surface::builder(surface_id)
+                .label("SRUI Counter Application")
+                .create(ui)?;
+
+            Text::builder(text_id)
+                .parent(surface_id)
+                .text("Count: 0")
+                .role(TextRole::Heading)
+                .create(ui)?;
+
+            Progress::builder(progress_id)
+                .parent(surface_id)
+                .value(0.0)
+                .value_description("0 / 100")
+                .create(ui)?;
+
+            Button::builder(button_id)
+                .parent(surface_id)
+                .label("Increment")
+                .role(ActionRole::Primary)
+                .create(ui)?;
+
+            Ok(())
+        })
+        .expect("initialize counter UI transaction");
+
+    let text = text_id;
+    let prog = progress_id;
+    session.on(button_id, ACTIVATE, move |ctx, _event| {
+        ctx.transaction(|ui| {
+            let current: u64 = ui
+                .get_node(text)
+                .and_then(|n| n.get_property(TEXT))
+                .and_then(|v| v.as_string())
+                .and_then(|s| s.strip_prefix("Count: "))
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            let next_val = current + 1;
+            ui.set(text, TEXT, format!("Count: {}", next_val))?;
+            ui.set(prog, VALUE, (next_val as f64) / 100.0)?;
+            ui.set(prog, VALUE_DESCRIPTION, format!("{} / 100", next_val))?;
+            info!("Counter incremented to {}", next_val);
+            Ok(())
+        })
+        .expect("counter increment transaction failed");
+    });
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    ignore_sighup();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -31,10 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting srui-sessiond daemon (§20.2)...");
 
-    let socket_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_socket_path);
+    let (socket_path, app_name) = parse_args();
 
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -47,15 +139,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket_path)?;
     info!("Listening on Unix domain socket: {:?}", socket_path);
 
-    let session = Arc::new(Session::new("default"));
+    // Mint a fresh, globally unique session incarnation token (§17)
+    let session = Arc::new(Session::mint());
+    info!(
+        "Minted session incarnation token {} (initial state: {:?})",
+        session.session_id(),
+        session.state()
+    );
+
+    if let Some(app) = app_name.as_deref() {
+        match app {
+            "counter" => {
+                info!("Initializing built-in counter application adapter (§20.2, §29)...");
+                initialize_counter_app(&session);
+            }
+            other => {
+                warn!("Unknown application adapter: {}", other);
+            }
+        }
+    }
+
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
-    // Listen for shutdown signals (SIGINT, SIGTERM, SIGHUP on Unix)
+    // Listen for process shutdown signals (SIGINT, SIGTERM). SIGHUP is ignored via SIG_IGN
+    // at startup so SSH detachments do NOT terminate the session daemon (§17, §20.2).
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
-        info!("Received shutdown signal; draining connections...");
+        info!("Received termination signal; draining connections...");
         shutdown_signal.cancel();
     });
 
@@ -73,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let shutdown_child = shutdown.child_token();
                         tasks.spawn(async move {
                             if let Err(e) = handle_connection(stream, session_clone, shutdown_child).await {
-                                warn!("Connection ended with error: {}", e);
+                                warn!("Connection ended: {}", e);
                             }
                         });
                     }
@@ -108,12 +220,10 @@ async fn wait_for_shutdown_signal() {
 
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-    let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
 
     tokio::select! {
         _ = sigint.recv() => { info!("Received SIGINT (Ctrl+C)"); }
         _ = sigterm.recv() => { info!("Received SIGTERM"); }
-        _ = sighup.recv() => { info!("Received SIGHUP (SSH session detach)"); }
     }
 }
 

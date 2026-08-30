@@ -17,6 +17,10 @@ srui-semantic-tree = { path = "../semantic-tree" }
 srui-sdk = { path = "../sdk" }
 srui-journal = { path = "../journal" }
 srui-event-dedupe = { path = "../event-dedupe" }
+getrandom = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

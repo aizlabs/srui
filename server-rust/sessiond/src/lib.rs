@@ -7,6 +7,6 @@ pub mod session;
 
 pub use connection::{handle_connection, ConnectionError, HANDSHAKE_TIMEOUT};
 pub use session::{
-    EventOutcome, FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, Session,
-    SessionError, TRANSACTION_BROADCAST_CAPACITY,
+    mint_session_id, AttachmentGuard, EventOutcome, FreshClientBootstrap, ResumeClientBootstrap,
+    ResumeOutcome, Session, SessionError, SessionState, TRANSACTION_BROADCAST_CAPACITY,
 };

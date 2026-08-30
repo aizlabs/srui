@@ -257,13 +257,13 @@ struct EventOutboxTests {
 
         // Reconnect on a fresh transport pair and complete same-session resume
         let (client2, server2) = await PipeTransport.createPair()
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let serverStream2 = server2.receiveStream()
 
         let accepted = try await outbox.completeSameSessionResume(
             id: "session-123",
             lastProcessedEventSeq: 1,
-            attemptId: attemptId,
+            generation: generation,
             via: client2,
             enableNewEventsAfterReplay: true
         )
@@ -308,11 +308,11 @@ struct EventOutboxTests {
         _ = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(false), via: client)
         #expect(await outbox.pendingCount == 2)
 
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let accepted = await outbox.prepareReplacedSession(
             id: "new-incarnation",
             lastProcessedEventSeq: 0,
-            attemptId: attemptId
+            generation: generation
         )
         #expect(accepted)
         #expect(await outbox.pendingCount == 0)

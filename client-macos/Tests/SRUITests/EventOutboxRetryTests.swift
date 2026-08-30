@@ -201,7 +201,7 @@ struct EventOutboxRetryTests {
             via: seedClient
         )
 
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let failing = FailingTransport()
 
         var replayFailed = false
@@ -209,7 +209,7 @@ struct EventOutboxRetryTests {
             _ = try await outbox.completeSameSessionResume(
                 id: "session-a",
                 lastProcessedEventSeq: 0,
-                attemptId: attemptId,
+                generation: generation,
                 via: failing,
                 enableNewEventsAfterReplay: true
             )

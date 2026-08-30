@@ -30,7 +30,10 @@ public actor EventOutbox {
     public nonisolated let clientInstanceId: ClientInstanceId
     private let maxPendingEvents: Int
     private var activeSessionId: String?
-    private var activeResumeAttemptId: UUID?
+    /// Generation of the newest resume attempt, or nil when no attempt is outstanding (§18).
+    private var activeResumeGeneration: UInt64?
+    /// Strictly increasing source of resume generations; never reused within this outbox (§18).
+    private var lastIssuedResumeGeneration: UInt64 = 0
     private var acceptsNewEvents = true
     private var currentEventSeq: UInt64 = 0
     private var pendingEvents: [EventId: Event] = [:]
@@ -187,33 +190,36 @@ public actor EventOutbox {
 
     /// Starts a reconnect generation and prevents every controller sharing this outbox from
     /// allocating new events until that generation receives an authoritative decision.
-    func beginResumeAttempt() -> UUID {
-        let attemptId = UUID()
-        activeResumeAttemptId = attemptId
+    ///
+    /// Generations are local and strictly increasing: issuing one immediately supersedes every
+    /// older attempt, so a delayed response from an abandoned connection is discarded (§18).
+    func beginResumeAttempt() -> UInt64 {
+        lastIssuedResumeGeneration += 1
+        activeResumeGeneration = lastIssuedResumeGeneration
         acceptsNewEvents = false
-        return attemptId
+        return lastIssuedResumeGeneration
     }
 
     /// Completes a same-session decision only if no newer controller superseded this attempt.
     func completeSameSessionResume(
         id: String,
         lastProcessedEventSeq: UInt64,
-        attemptId: UUID,
+        generation: UInt64,
         via transport: any Transport,
         enableNewEventsAfterReplay: Bool
     ) async throws -> Bool {
-        guard activeResumeAttemptId == attemptId else { return false }
+        guard activeResumeGeneration == generation else { return false }
         activeSessionId = id
         acknowledgeEvents(throughSeq: lastProcessedEventSeq)
         try await resendPendingEvents(via: transport)
-        guard activeResumeAttemptId == attemptId else { return false }
+        guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
         return true
     }
 
     /// Binds a fresh HELLO handshake that did not carry an old retry set.
     func confirmFreshSession(id: String) -> Bool {
-        guard activeResumeAttemptId == nil else { return false }
+        guard activeResumeGeneration == nil else { return false }
         activeSessionId = id
         acceptsNewEvents = true
         return true
@@ -276,9 +282,9 @@ public actor EventOutbox {
     func prepareReplacedSession(
         id: String,
         lastProcessedEventSeq: UInt64,
-        attemptId: UUID
+        generation: UInt64
     ) -> Bool {
-        guard activeResumeAttemptId == attemptId else { return false }
+        guard activeResumeGeneration == generation else { return false }
         applyReplacementFrontier(id: id, lastProcessedEventSeq: lastProcessedEventSeq)
         return true
     }
@@ -289,8 +295,8 @@ public actor EventOutbox {
     }
 
     /// Enables new events only after the snapshot for the current reconnect generation commits.
-    func finishResync(attemptId: UUID) -> Bool {
-        guard activeResumeAttemptId == attemptId else { return false }
+    func finishResync(generation: UInt64) -> Bool {
+        guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = true
         return true
     }

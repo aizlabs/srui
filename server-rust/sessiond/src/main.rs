@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use srui_sessiond::{handle_connection, Session};
+use srui_sessiond::{handle_connection, Session, SessionConfig};
 
 /// Ignores `SIGHUP` so SSH session detach / controlling-terminal loss does not terminate
 /// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
@@ -30,10 +30,19 @@ fn default_socket_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("srui-sessiond.sock")
 }
-fn parse_args() -> (PathBuf, Option<String>) {
+/// Parsed command line: socket path, optional built-in app adapter, and the §18.1 journal
+/// retention window (maximum retained transaction count).
+struct Args {
+    socket_path: PathBuf,
+    app_name: Option<String>,
+    journal_capacity: usize,
+}
+
+fn parse_args() -> Result<Args, String> {
     let args: Vec<String> = std::env::args().collect();
     let mut socket_path = None;
     let mut app_name = None;
+    let mut journal_capacity = SessionConfig::default().journal_capacity;
 
     let mut i = 1;
     while i < args.len() {
@@ -43,6 +52,20 @@ fn parse_args() -> (PathBuf, Option<String>) {
         } else if args[i] == "--app" && i + 1 < args.len() {
             app_name = Some(args[i + 1].clone());
             i += 2;
+        } else if args[i] == "--journal-capacity" {
+            // A zero or unparsable retention window would silently degrade every reconnect to a
+            // snapshot resync, so refuse to start instead of clamping (§18.1).
+            let raw = args
+                .get(i + 1)
+                .ok_or_else(|| "--journal-capacity requires a value".to_string())?;
+            journal_capacity = raw
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    format!("--journal-capacity must be a positive integer, got {raw}")
+                })?;
+            i += 2;
         } else if !args[i].starts_with('-') && socket_path.is_none() {
             socket_path = Some(PathBuf::from(&args[i]));
             i += 1;
@@ -51,7 +74,11 @@ fn parse_args() -> (PathBuf, Option<String>) {
         }
     }
 
-    (socket_path.unwrap_or_else(default_socket_path), app_name)
+    Ok(Args {
+        socket_path: socket_path.unwrap_or_else(default_socket_path),
+        app_name,
+        journal_capacity,
+    })
 }
 
 fn initialize_counter_app(session: &Arc<Session>) {
@@ -126,7 +153,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting srui-sessiond daemon (§20.2)...");
 
-    let (socket_path, app_name) = parse_args();
+    let Args {
+        socket_path,
+        app_name,
+        journal_capacity,
+    } = parse_args()?;
 
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -140,11 +171,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Listening on Unix domain socket: {:?}", socket_path);
 
     // Mint a fresh, globally unique session incarnation token (§17)
-    let session = Arc::new(Session::mint());
+    let session = Arc::new(Session::mint_with_config(SessionConfig {
+        journal_capacity,
+        ..SessionConfig::default()
+    }));
     info!(
-        "Minted session incarnation token {} (initial state: {:?})",
+        journal_capacity,
+        "Minted session incarnation token {} (initial state: {:?}, journal retention: {} transactions)",
         session.session_id(),
-        session.state()
+        session.state(),
+        journal_capacity
     );
 
     if let Some(app) = app_name.as_deref() {

@@ -65,3 +65,29 @@ Tests in **Rust** (`server-rust/protocol/tests/conformance_test.rs`), **Swift** 
 - **Standard Enums**: `StandardEnum` type IDs $1 \ldots 12$ match `registry.yaml` enums $1 \ldots 12$. On the wire, `EnumValue` carries `(enum_id, value_id)`.
 - **Operations & Commit**: `Operation` oneof field tags $1 \ldots 13$ map 1:1 with numeric operation IDs in `StandardOperation` and `registry.yaml`, including `CommitOp commit = 5`.
 - **Transactions**: The `Transaction` envelope (`base_revision` → `new_revision`) defines atomic commit boundaries.
+
+---
+
+## Resume Responses and Session Continuity (§18)
+
+`CLIENT RESUME` is answered by exactly one of two messages, and the client may not replay pending
+events or allocate new ones until one of them arrives.
+
+| Response | Meaning | Client obligation |
+|---|---|---|
+| `ServerResumeOk{session_id, replay_from_revision, last_processed_event_seq}` | The exact requested incarnation survived and its journal still covers the gap. | Apply the frontier, then replay remaining pending events with their original `event_id`/`event_seq` before any new event. |
+| `ServerResyncRequired{session_id, snapshot_revision, reason, continuity, last_processed_event_seq}` | A full snapshot is required. | Depends on `continuity`. |
+
+`SessionContinuity` is carried **only on `ServerResyncRequired`**: `SERVER RESUME_OK` is
+`SAME_SESSION` by construction, and its `session_id` MUST exactly equal the requested one, so a
+separate field there would be redundant state a peer could contradict. Both responses report
+`last_processed_event_seq`, the server's contiguous settled frontier for the bound client.
+
+- `SESSION_CONTINUITY_SAME_SESSION` — the incarnation survived but the journal no longer covers
+  the gap; `session_id` still equals the requested one. The client applies the frontier, may
+  replay remaining pending events, discards its replica, and applies the snapshot.
+- `SESSION_CONTINUITY_REPLACED` — the requested incarnation is gone; `session_id` is the
+  replacement token. The client abandons every unresolved event and pending text edit without
+  replaying any of them, resets its outbox to the reported frontier, and applies the snapshot.
+- `SESSION_CONTINUITY_UNSPECIFIED` (or any unrecognized value) is a required-semantics failure
+  (§4 inv. 13): the client fails the session rather than assuming either outcome.

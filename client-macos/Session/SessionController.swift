@@ -61,7 +61,7 @@ public enum SessionDispatchError: Error, Equatable, Sendable {
 private enum ProtocolPhase: Equatable {
     case idle
     case awaitingWelcome
-    case awaitingResume(sessionId: String, attemptId: UUID)
+    case awaitingResume(sessionId: String, generation: UInt64)
     case active(negotiated: CapabilitySet)
     case awaitingSnapshot(negotiated: CapabilitySet)
     case failed
@@ -89,7 +89,9 @@ public final class SessionController: @unchecked Sendable {
     private var _isDiverged = false
     private var _onFailure: (@Sendable (SessionFailure) -> Void)?
     private var requestedSessionId: String?
-    private var resumeAttemptId: UUID?
+    /// Generation of this controller's outstanding resume attempt (§18). Strictly increasing per
+    /// outbox: a response carrying an older generation is discarded outright.
+    private var resumeGeneration: UInt64?
     private var eventDispatchEnabled = false
     private var phase: ProtocolPhase = .idle
     /// Negotiated set from the last successful `SERVER WELCOME`, retained across `stop()` so a
@@ -247,7 +249,7 @@ public final class SessionController: @unchecked Sendable {
                 withStateLock {
                     self.isRunning = false
                     self.requestedSessionId = nil
-                    self.resumeAttemptId = nil
+                    self.resumeGeneration = nil
                     self.eventDispatchEnabled = false
                     self.phase = .idle
                 }
@@ -264,10 +266,10 @@ public final class SessionController: @unchecked Sendable {
         }
 
         if let requestedId {
-            let resumeAttemptId = await outbox.beginResumeAttempt()
+            let resumeGeneration = await outbox.beginResumeAttempt()
             withStateLock {
                 self.requestedSessionId = requestedId
-                self.resumeAttemptId = resumeAttemptId
+                self.resumeGeneration = resumeGeneration
             }
             var resume = SRUIClientResume()
             resume.sessionID = requestedId
@@ -280,7 +282,7 @@ public final class SessionController: @unchecked Sendable {
             guard withStateLock({ isRunning }) else { return }
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
             withStateLock {
-                self.phase = .awaitingResume(sessionId: requestedId, attemptId: resumeAttemptId)
+                self.phase = .awaitingResume(sessionId: requestedId, generation: resumeGeneration)
             }
         } else {
             var hello = SRUIClientHello()
@@ -545,7 +547,7 @@ public final class SessionController: @unchecked Sendable {
         withStateLock {
             self.currentSessionId = welcome.sessionID
             self.requestedSessionId = nil
-            self.resumeAttemptId = nil
+            self.resumeGeneration = nil
             self.retainedCapabilities = negotiated
             if welcome.initialRevision > 0 {
                 self.pendingResync = true
@@ -565,10 +567,10 @@ public final class SessionController: @unchecked Sendable {
     }
 
     private func handleResumeOk(_ resumeOk: SRUIServerResumeOk) async {
-        let (requested, attemptId) = withStateLock {
-            (requestedSessionId, resumeAttemptId)
+        let (requested, generation) = withStateLock {
+            (requestedSessionId, resumeGeneration)
         }
-        guard let requested, let attemptId else {
+        guard let requested, let generation else {
             await reportFailure(.protocolViolation(
                 "Unexpected SERVER RESUME_OK without an outstanding resume"
             ))
@@ -585,7 +587,7 @@ public final class SessionController: @unchecked Sendable {
             let accepted = try await outbox.completeSameSessionResume(
                 id: resumeOk.sessionID,
                 lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
-                attemptId: attemptId,
+                generation: generation,
                 via: transport,
                 enableNewEventsAfterReplay: true
             )
@@ -601,7 +603,7 @@ public final class SessionController: @unchecked Sendable {
             let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
             self.requestedSessionId = nil
-            self.resumeAttemptId = nil
+            self.resumeGeneration = nil
             self.retainedCapabilities = negotiated
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = self.isRunning && !self._isDiverged
@@ -622,11 +624,11 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        let (requested, attemptId) = withStateLock {
-            (requestedSessionId, resumeAttemptId)
+        let (requested, generation) = withStateLock {
+            (requestedSessionId, resumeGeneration)
         }
 
-        if let requested, let attemptId {
+        if let requested, let generation {
             switch resync.continuity {
             case .sameSession:
                 guard resync.sessionID == requested else {
@@ -639,7 +641,7 @@ public final class SessionController: @unchecked Sendable {
                     let accepted = try await outbox.completeSameSessionResume(
                         id: resync.sessionID,
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                        attemptId: attemptId,
+                        generation: generation,
                         via: transport,
                         enableNewEventsAfterReplay: false
                     )
@@ -663,7 +665,7 @@ public final class SessionController: @unchecked Sendable {
                 let accepted = await outbox.prepareReplacedSession(
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                    attemptId: attemptId
+                    generation: generation
                 )
                 guard accepted else {
                     SessionDiagnostics.log("Ignoring superseded replacement resync")
@@ -834,12 +836,12 @@ public final class SessionController: @unchecked Sendable {
     /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.
     private func completeSnapshotCatchUp() async {
         withStateLock { self.pendingResync = false }
-        let attemptId = withStateLock { self.resumeAttemptId }
-        if let attemptId {
-            let accepted = await outbox.finishResync(attemptId: attemptId)
+        let generation = withStateLock { self.resumeGeneration }
+        if let generation {
+            let accepted = await outbox.finishResync(generation: generation)
             withStateLock {
                 guard accepted else { return }
-                self.resumeAttemptId = nil
+                self.resumeGeneration = nil
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
                 if case .awaitingSnapshot(let negotiated) = self.phase {
                     self.phase = .active(negotiated: negotiated)
@@ -971,7 +973,7 @@ public final class SessionController: @unchecked Sendable {
             _isDiverged = false
             pendingResync = false
             requestedSessionId = nil
-            resumeAttemptId = nil
+            resumeGeneration = nil
             phase = .idle
         }
     }

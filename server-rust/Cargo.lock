@@ -703,6 +703,7 @@ dependencies = [
  "bytes",
  "futures",
  "getrandom",
+ "libc",
  "srui-event-dedupe",
  "srui-journal",
  "srui-protocol",

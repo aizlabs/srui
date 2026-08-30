@@ -12,6 +12,18 @@ use tracing::{error, info, warn};
 
 use srui_sessiond::{handle_connection, Session};
 
+/// Ignores `SIGHUP` so SSH session detach / controlling-terminal loss does not terminate
+/// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
+/// the process and defeats persistent session state.
+#[cfg(unix)]
+fn ignore_sighup() {
+    // SAFETY: called synchronously at process start, before threads or other handlers exist.
+    let rc = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+    if rc == libc::SIG_ERR {
+        eprintln!("srui-sessiond: failed to ignore SIGHUP");
+    }
+}
+
 fn default_socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -101,6 +113,9 @@ fn initialize_counter_app(session: &Arc<Session>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    ignore_sighup();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -147,8 +162,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
 
-    // Listen for process shutdown signals (SIGINT, SIGTERM).
-    // Note: SIGHUP is intentionally ignored so SSH detachments do NOT terminate the session daemon (§17, §20.2).
+    // Listen for process shutdown signals (SIGINT, SIGTERM). SIGHUP is ignored via SIG_IGN
+    // at startup so SSH detachments do NOT terminate the session daemon (§17, §20.2).
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;

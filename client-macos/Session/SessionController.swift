@@ -277,6 +277,7 @@ public final class SessionController: @unchecked Sendable {
 
             var envelope = SRUIMessage()
             envelope.clientResume = resume
+            guard withStateLock({ isRunning }) else { return }
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
             withStateLock {
                 self.phase = .awaitingResume(sessionId: requestedId, attemptId: resumeAttemptId)
@@ -289,11 +290,14 @@ public final class SessionController: @unchecked Sendable {
 
             var envelope = SRUIMessage()
             envelope.clientHello = hello
+            guard withStateLock({ isRunning }) else { return }
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
             withStateLock {
                 self.phase = .awaitingWelcome
             }
         }
+
+        guard withStateLock({ isRunning }) else { return }
 
         // Start receiving the handshake response before processing data.
         let task = Task.detached { [weak self] in
@@ -301,8 +305,14 @@ public final class SessionController: @unchecked Sendable {
             await self.runReceiveLoop()
         }
 
-        withStateLock {
+        let adopted = withStateLock { () -> Bool in
+            guard isRunning else { return false }
             self.receiveTask = task
+            return true
+        }
+        guard adopted else {
+            task.cancel()
+            return
         }
         didStart = true
     }
@@ -919,22 +929,35 @@ public final class SessionController: @unchecked Sendable {
 
     /// Stops the session coordinator and closes the underlying transport.
     public func stop() async {
-        let task = withStateLock { () -> Task<Void, Never>? in
-            guard isRunning else { return nil }
+        let task = withStateLock { () -> (Task<Void, Never>?, Bool) in
+            guard isRunning else { return (nil, false) }
             isRunning = false
             eventDispatchEnabled = false
-            return receiveTask
+            return (receiveTask, true)
         }
 
-        guard let task else { return }
+        guard task.1 else { return }
 
         // Close the transport first so the receive loop drains any buffered catch-up frames
         // (welcome snapshot, replay) while handshake phase is still valid. Resetting `phase` or
         // cancelling the task before that completes rejects in-flight transactions as protocol
         // violations even though the server sent them in order (§15, §18).
+        // When `stop()` races `start()` before `receiveTask` is assigned, closing the transport
+        // still tears down an in-progress handshake send (§22.2).
         await transport.close()
-        await task.value
 
+        if let receiveTask = task.0 {
+            await receiveTask.value
+        }
+
+        clearSessionStateAfterStop()
+
+        await MainActor.run {
+            self.hasMountedInitialTree = false
+        }
+    }
+
+    private func clearSessionStateAfterStop() {
         withStateLock {
             receiveTask = nil
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
@@ -950,10 +973,6 @@ public final class SessionController: @unchecked Sendable {
             requestedSessionId = nil
             resumeAttemptId = nil
             phase = .idle
-        }
-
-        await MainActor.run {
-            self.hasMountedInitialTree = false
         }
     }
 }

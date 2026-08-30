@@ -214,6 +214,9 @@ public actor EventOutbox {
         try await resendPendingEvents(via: transport)
         guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
+        if enableNewEventsAfterReplay {
+            activeResumeGeneration = nil
+        }
         return true
     }
 
@@ -298,6 +301,7 @@ public actor EventOutbox {
     func finishResync(generation: UInt64) -> Bool {
         guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = true
+        activeResumeGeneration = nil
         return true
     }
 

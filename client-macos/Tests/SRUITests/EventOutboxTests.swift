@@ -299,6 +299,39 @@ struct EventOutboxTests {
         await server2.close()
     }
 
+    @Test("Same-session RESUME_OK clears the generation latch for a later fresh HELLO")
+    func resumeOkClearsGenerationLatch() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            via: client
+        )
+
+        let generation = await outbox.beginResumeAttempt()
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-123",
+            lastProcessedEventSeq: 0,
+            generation: generation,
+            via: client,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Finish resync clears the generation latch for a later fresh HELLO")
+    func finishResyncClearsGenerationLatch() async {
+        let outbox = EventOutbox()
+        let generation = await outbox.beginResumeAttempt()
+        #expect(await outbox.finishResync(generation: generation))
+        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+    }
+
     @Test("Replaced session abandons pending events and resets sequence")
     func replacedSessionResetsSequence() async throws {
         let (client, server) = await PipeTransport.createPair()

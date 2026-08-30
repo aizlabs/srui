@@ -213,6 +213,8 @@ pub struct SessionConfig {
     /// Server-side capability set offered during negotiation (§15).
     pub capabilities: ServerCapabilities,
     /// Maximum number of committed transactions retained for reconnect replay (§18.1).
+    /// Must be positive; zero is rejected at session construction (same policy as
+    /// `srui-sessiond --journal-capacity`).
     pub journal_capacity: usize,
     /// Capacity of the bounded transaction broadcast channel (§20.2).
     pub broadcast_capacity: usize,
@@ -284,6 +286,12 @@ impl Session {
     /// Creates a session with the given session ID and an explicit [`SessionConfig`] (§15, §18.1, §20.2).
     #[must_use]
     pub fn with_config(session_id: impl Into<String>, config: SessionConfig) -> Self {
+        if config.journal_capacity == 0 {
+            panic!(
+                "SessionConfig::journal_capacity must be a positive integer (§18.1); \
+                 got 0. Use the default ({DEFAULT_MAX_JOURNAL_ENTRIES}) or pass an explicit window."
+            );
+        }
         let (tx_broadcast, _) = broadcast::channel(config.broadcast_capacity.max(1));
         Self::with_broadcast_sender(session_id, tx_broadcast, config)
     }
@@ -767,5 +775,22 @@ mod tests {
         session.poison_lock_for_test();
         assert_eq!(session.session_id(), "poison-test");
         assert_eq!(session.current_revision(), 0);
+    }
+
+    #[test]
+    fn test_session_config_rejects_zero_journal_capacity() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = Session::with_config(
+                "zero-capacity",
+                SessionConfig {
+                    journal_capacity: 0,
+                    ..SessionConfig::default()
+                },
+            );
+        });
+        assert!(
+            result.is_err(),
+            "zero journal_capacity must be rejected (§18.1)"
+        );
     }
 }

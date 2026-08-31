@@ -251,6 +251,9 @@ public final class SessionController: @unchecked Sendable {
                     self.eventDispatchEnabled = false
                     self.phase = .idle
                 }
+                Task { [transport] in
+                    await transport.close()
+                }
             }
         }
 

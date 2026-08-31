@@ -400,9 +400,21 @@ fn test_mint_session_id_produces_unique_tokens_in_process() {
 }
 
 async fn read_session_id_from_counter_sessiond(socket_path: &std::path::Path) -> String {
-    let stream = tokio::net::UnixStream::connect(socket_path)
-        .await
-        .expect("connect to sessiond unix socket");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let stream = loop {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(stream) => break stream,
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!(
+                        "failed to connect to socket {}: {err}",
+                        socket_path.display()
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
     let (read_half, write_half) = tokio::io::split(stream);
     let mut read = FramedRead::new(read_half, SruiCodec::new());
     let mut write = FramedWrite::new(write_half, SruiCodec::new());
@@ -447,14 +459,14 @@ async fn read_session_id_from_counter_sessiond(socket_path: &std::path::Path) ->
 
 #[tokio::test]
 async fn test_sessiond_process_restart_mints_unique_session_ids() {
-    let temp_dir = std::env::temp_dir().join(format!("srui-sd-{}", std::process::id()));
-    std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-
     let mut seen = HashSet::new();
     const ITERATIONS: usize = 5;
 
     for iteration in 0..ITERATIONS {
-        let socket_path = temp_dir.join(format!("sessiond-{iteration}.sock"));
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/srui-t-{}-{iteration}.sock",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&socket_path);
 
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_srui-sessiond"))
@@ -463,7 +475,7 @@ async fn test_sessiond_process_restart_mints_unique_session_ids() {
             .arg("--app")
             .arg("counter")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("spawn srui-sessiond");
 
@@ -487,10 +499,10 @@ async fn test_sessiond_process_restart_mints_unique_session_ids() {
         child.kill().await.expect("kill sessiond");
         let status = child.wait().await.expect("wait for sessiond");
         assert!(!status.success(), "sessiond should exit after kill");
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     assert_eq!(seen.len(), ITERATIONS);
-    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[tokio::test]

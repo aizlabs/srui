@@ -130,6 +130,119 @@ fn initialize_counter_app(session: &Arc<Session>) {
     });
 }
 
+/// A socket path this process created and is therefore allowed to unlink.
+struct OwnedSocket {
+    path: PathBuf,
+    /// `(device, inode)` of the endpoint created by this process.
+    identity: (u64, u64),
+}
+
+impl OwnedSocket {
+    /// Removes the socket, but only while the path still resolves to the endpoint we bound.
+    ///
+    /// If a replacement server has since taken the path over, its socket has a different inode and
+    /// is left alone.
+    fn remove(&self) {
+        match socket_identity(&self.path) {
+            Ok(Some(identity)) if identity == self.identity => {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    warn!("failed to remove {}: {error}", self.path.display());
+                }
+            }
+            Ok(Some(_)) => warn!(
+                "leaving {} in place: it now belongs to another server",
+                self.path.display()
+            ),
+            Ok(None) | Err(_) => {}
+        }
+    }
+}
+
+/// Returns the `(device, inode)` identity of `path` when it is a Unix socket.
+///
+/// `Ok(None)` means the path does not exist; a path that exists but is not a socket is an error, so
+/// an unrelated file is never a removal candidate.
+fn socket_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_socket() {
+                Ok(Some((metadata.dev(), metadata.ino())))
+            } else {
+                Err(std::io::Error::other(format!(
+                    "{} exists but is not a Unix socket",
+                    path.display()
+                )))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Binds a Unix domain socket, verifying parent directory permissions and unlinking any stale
+/// predecessor safely without disturbing a live server.
+async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
+    use tokio::net::UnixStream;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if socket_identity(path)?.is_some() {
+        match UnixStream::connect(path).await {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "{} is already served by a running process; pass a different socket path",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::ConnectionReset
+                ) || matches!(
+                    error.raw_os_error(),
+                    Some(libc::ECONNREFUSED)
+                        | Some(libc::EPERM)
+                        | Some(libc::EACCES)
+                        | Some(libc::ENOENT)
+                ) =>
+            {
+                if let Err(unlink_error) = std::fs::remove_file(path) {
+                    if unlink_error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(unlink_error);
+                    }
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let listener = UnixListener::bind(path)?;
+
+    let identity = socket_identity(path)?.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "{} vanished immediately after bind",
+            path.display()
+        ))
+    })?;
+    Ok((
+        listener,
+        OwnedSocket {
+            path: path.to_path_buf(),
+            identity,
+        },
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
@@ -147,15 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = parse_args();
 
-    if config.socket_path.exists() {
-        let _ = std::fs::remove_file(&config.socket_path);
-    }
-
-    if let Some(parent) = config.socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let listener = UnixListener::bind(&config.socket_path)?;
+    let (listener, owned_socket) = bind_owned_socket(&config.socket_path).await?;
     info!(socket_path = ?config.socket_path, "Listening on Unix domain socket");
 
     // Mint a fresh, globally unique session incarnation token (§17)
@@ -228,7 +333,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Clean up socket file
-    let _ = std::fs::remove_file(&config.socket_path);
+    drop(listener);
+    owned_socket.remove();
     info!("srui-sessiond daemon shutdown complete.");
     Ok(())
 }

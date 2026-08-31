@@ -16,30 +16,23 @@ What it demonstrates:
 - **Semantic events (§7.6, §7.7).** Table selection, toggle changes, and the destructive button are
   ordinary semantic events. `action_key` values (`process.show-all`, `process.kill-selected`) travel
   as opaque metadata; they are never parsed, dispatched, or executed.
-- **Server authority (§27).** Filtering, selection validity, and kill authorization are decided by
-  the server from its own state. Nothing about a kill target is read from client input.
+- **Server authority & Client Isolation (§27).** Filtering, selection validity, and kill authorization are decided by
+  the server from its own state. Multiple connected clients maintain isolated selections and cannot signal processes on behalf of other clients. Nothing about a kill target is read from client input.
 
-## ⚠️ Safety
+## ⚠️ Safety & Security
 
 **"Kill Selected" sends a real `SIGTERM` to a real process on the machine running the server.**
 There is no confirmation dialog and no undo — both are deliberately out of scope.
 
 Guardrails that are always in force:
 
-- **Denylist.** PID 1 and the process-monitor server's own PID (`std::process::id()`) can never be
-  signalled. A denied request performs no signal operation, leaves the server running, logs a clear
-  refusal, and returns normally.
-- **PID-reuse protection.** A selection is an `ItemId`. The server resolves it to the
-  `ProcessKey(pid, start_time)` it assigned, then re-reads the live process's start time immediately
-  before signalling. A mismatch (or a vanished PID) is refused as stale, so a recycled PID can never
-  be hit.
-- **Single-process targets only.** PID 0 is denylisted and the numeric target is validated before
-  `kill(2)` is called, so a process-group (`0`, negative) or broadcast (`-1`) target — which a
-  `u32 as i32` cast could otherwise produce — can never be signalled.
-- **No shell.** Termination goes through `kill(2)` via `nix`. The example never constructs a command
-  line and never invokes `sh`, `bash`, `zsh`, or `system()`.
-- **PID text is never trusted.** Row text, PID text, row index, labels and `action_key` sent by the
-  client are ignored when resolving the target.
+- **Denylist.** PID 0 (which would signal the caller's entire process group), PID 1 (`init` / `launchd`), and the process-monitor server's own PID (`std::process::id()`) are strictly denylisted. A denied request performs no signal operation, leaves the server running, logs a clear refusal, and returns normally.
+- **PID-reuse protection & Linux `pidfd`.** A selection is an `ItemId`. The server resolves it to the `ProcessKey(pid, start_time)` it assigned. On Linux, signalling uses `pidfd_open` and `pidfd_send_signal` for race-free process targeting. On other Unix platforms, the server re-reads the live process start time immediately before signalling via `kill(2)`. A mismatch or vanished PID is refused as stale.
+- **Single-process numeric validation.** PID targets are strictly validated within `[1, i32::MAX]` before invoking system APIs. Process group (`0`, negative) and broadcast (`-1`) targets cannot be signalled.
+- **Client-scoped actions.** Selections and activations are scoped to the activating client's `client_instance_id`. Client A cannot trigger termination of Client B's selected row.
+- **Socket protection.** The Unix domain socket is created with restrictive permissions (`0600`) and validated via connect probes before unlinking stale predecessors, preventing hijacking of running endpoints.
+- **No shell.** Termination goes directly through `kill(2)` / `pidfd`. The example never constructs shell commands and never invokes `sh`, `bash`, `zsh`, or `system()`.
+- **PID text is never trusted.** Row text, PID text, row index, labels and `action_key` sent by the client are ignored when resolving the target.
 
 ## Filtering
 
@@ -63,7 +56,7 @@ cargo build --manifest-path examples/process-monitor/Cargo.toml --release
 ## Run locally over a Unix socket
 
 ```bash
-# defaults to $XDG_RUNTIME_DIR/srui-sessiond.sock, else $TMPDIR/srui-sessiond.sock
+# defaults to $XDG_RUNTIME_DIR/srui-process-monitor.sock, else $TMPDIR/srui-process-monitor.sock
 ./examples/process-monitor/target/release/process-monitor
 
 # explicit socket path plus wire accounting
@@ -75,7 +68,7 @@ Options:
 
 | Flag | Meaning |
 | --- | --- |
-| `--socket <path>` | Unix socket to bind. Defaults to the `srui-ssh-bridge` convention. |
+| `--socket <path>` | Unix socket to bind. Defaults to `srui-process-monitor.sock`. |
 | `--wire-stats` | Log the framed byte size and operation mix of every committed transaction. |
 
 A malformed or missing option argument is rejected with a clear error. An existing socket path is

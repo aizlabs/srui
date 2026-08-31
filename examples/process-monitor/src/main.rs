@@ -16,7 +16,6 @@ use tracing::{error, info, warn};
 use srui_example_process_monitor::{
     effective_uid, measure_transaction, Monitor, SignalTerminator, SysinfoProcessSource,
 };
-use srui_sdk::ServerCapabilities;
 use srui_sessiond::{handle_connection, Session};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -30,7 +29,7 @@ fn default_socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("srui-sessiond.sock")
+        .join("srui-process-monitor.sock")
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -136,7 +135,13 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::ConnectionReset
+                ) || matches!(
+                    error.raw_os_error(),
+                    Some(libc::ECONNREFUSED) | Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOENT)
                 ) =>
             {
                 info!("removing stale socket {}", path.display());
@@ -178,10 +183,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         message
     })?;
 
-    let session = Arc::new(Session::with_capabilities(
-        "process-monitor",
-        ServerCapabilities::standard_widgets(),
-    ));
+    // Ignore SIGHUP so detached process-monitor daemons survive SSH bridge disconnects (§17, §20.2).
+    unsafe {
+        let _ = nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGHUP,
+            nix::sys::signal::SigHandler::SigIgn,
+        );
+    }
+
+    let session = Arc::new(Session::mint());
 
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();

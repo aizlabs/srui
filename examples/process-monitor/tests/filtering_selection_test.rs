@@ -223,3 +223,69 @@ fn processes_without_a_resolvable_owner_are_excluded_until_show_all() {
         .expect("event accepted");
     assert_eq!(visible_pids(&fixture.monitor), vec![11, 12]);
 }
+
+#[test]
+fn multi_client_selections_are_isolated_and_cleared_independently() {
+    let fixture = base_fixture();
+    let revision = fixture.session.current_revision();
+
+    let item_20 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+    let item_30 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 30)
+            .unwrap()
+            .item_id
+    });
+
+    // Client A selects PID 20
+    let mut event_a = selection_event(1, revision, item_20);
+    event_a.client_instance_id = b"client-a".to_vec();
+    fixture
+        .session
+        .process_event(&event_a)
+        .expect("client A selection accepted");
+
+    // Client B selects PID 30
+    let mut event_b = selection_event(2, revision, item_30);
+    event_b.client_instance_id = b"client-b".to_vec();
+    fixture
+        .session
+        .process_event(&event_b)
+        .expect("client B selection accepted");
+
+    assert_eq!(
+        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-a")),
+        Some(item_20)
+    );
+    assert_eq!(
+        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-b")),
+        Some(item_30)
+    );
+
+    // PID 20 exits
+    let remaining: Vec<ProcessRecord> = base_processes()
+        .into_iter()
+        .filter(|process| process.key.pid != 20)
+        .collect();
+    fixture.source.publish(snapshot(25.0, remaining));
+    fixture.monitor.tick().expect("tick");
+
+    // Client A's selection is cleared because PID 20 exited, but Client B's selection of PID 30 remains intact!
+    assert_eq!(
+        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-a")),
+        None
+    );
+    assert_eq!(
+        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-b")),
+        Some(item_30)
+    );
+}

@@ -34,7 +34,11 @@ public actor EventOutbox {
     private let replayRetryInitialDelay: Duration
     private let replayRetryMaximumDelay: Duration
     private var activeSessionId: String?
+    /// Resume-handshake latch used only to reject superseded server decisions. It is cleared
+    /// once RESUME_OK commits, or after a required snapshot finishes.
     private var activeResumeAttemptId: UUID?
+    /// Ownership retained between outbox completion and the controller committing its state.
+    private var pendingResumeFinalizationAttemptId: UUID?
     private var acceptsNewEvents = true
     private var currentEventSeq: UInt64 = 0
     private var pendingEvents: [EventId: Event] = [:]
@@ -47,6 +51,8 @@ public actor EventOutbox {
     /// `transport.send` is a reentrancy point; each new write task awaits this tail.
     private var sendTail: Task<Void, Never>?
     private var replayRetryTask: Task<Void, Never>?
+    /// Retry ownership is independent from the resume-handshake latch.
+    private var activeReplayRetryAttemptId: UUID?
     private var replayRetryToken: UUID?
 
     public init(
@@ -216,6 +222,7 @@ public actor EventOutbox {
     /// allocating new events until that generation receives an authoritative decision.
     func beginResumeAttempt() -> UUID {
         cancelReplayRetryLoop()
+        pendingResumeFinalizationAttemptId = nil
         let attemptId = UUID()
         activeResumeAttemptId = attemptId
         acceptsNewEvents = false
@@ -228,7 +235,8 @@ public actor EventOutbox {
         lastProcessedEventSeq: UInt64,
         attemptId: UUID,
         via transport: any Transport,
-        enableNewEventsAfterReplay: Bool
+        enableNewEventsAfterReplay: Bool,
+        onReplayFailure: (@Sendable (String) async -> Void)? = nil
     ) async throws -> Bool {
         guard activeResumeAttemptId == attemptId else { return false }
         activeSessionId = id
@@ -236,7 +244,15 @@ public actor EventOutbox {
         try await resendPendingEvents(via: transport)
         guard activeResumeAttemptId == attemptId else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
-        startReplayRetryLoop(attemptId: attemptId, via: transport)
+        startReplayRetryLoop(
+            attemptId: attemptId,
+            via: transport,
+            onFailure: onReplayFailure
+        )
+        if enableNewEventsAfterReplay {
+            activeResumeAttemptId = nil
+            pendingResumeFinalizationAttemptId = attemptId
+        }
         return true
     }
 
@@ -244,6 +260,7 @@ public actor EventOutbox {
     func confirmFreshSession(id: String) -> Bool {
         guard activeResumeAttemptId == nil else { return false }
         cancelReplayRetryLoop()
+        pendingResumeFinalizationAttemptId = nil
         activeSessionId = id
         acceptsNewEvents = true
         return true
@@ -255,6 +272,9 @@ public actor EventOutbox {
     }
 
     /// Applies the event frontier for a live-session resync without an outstanding resume attempt.
+    ///
+    /// Does not cancel the replay retry loop: unsettled events keep retrying until settlement
+    /// advances the frontier (§18.2).
     func applyLiveResyncFrontier(lastProcessedEventSeq: UInt64) {
         acceptsNewEvents = false
         acknowledgeEvents(throughSeq: lastProcessedEventSeq)
@@ -263,6 +283,7 @@ public actor EventOutbox {
     /// Abandons pending intents and binds a replacement incarnation without a resume attempt (§18).
     func applyReplacementFrontier(id: String, lastProcessedEventSeq: UInt64) {
         cancelReplayRetryLoop()
+        pendingResumeFinalizationAttemptId = nil
         activeSessionId = id
         acceptsNewEvents = false
         currentEventSeq = lastProcessedEventSeq
@@ -324,6 +345,8 @@ public actor EventOutbox {
     func finishResync(attemptId: UUID) -> Bool {
         guard activeResumeAttemptId == attemptId else { return false }
         acceptsNewEvents = true
+        activeResumeAttemptId = nil
+        pendingResumeFinalizationAttemptId = attemptId
         return true
     }
 
@@ -337,23 +360,50 @@ public actor EventOutbox {
         replayRetryTask != nil
     }
 
-    /// Stops only the retry loop owned by this resume generation.
-    func stopReplayRetries(attemptId: UUID) {
-        guard activeResumeAttemptId == attemptId else { return }
-        cancelReplayRetryLoop()
+    /// Releases the short ownership window after controller state commits.
+    func commitResumeWork(attemptId: UUID) {
+        guard pendingResumeFinalizationAttemptId == attemptId else { return }
+        pendingResumeFinalizationAttemptId = nil
     }
 
-    private func startReplayRetryLoop(attemptId: UUID, via transport: any Transport) {
+    /// Cancels only handshake/finalization/retry work owned by this resume generation.
+    func stopResumeWork(attemptId: UUID) {
+        guard ownsResumeWork(attemptId: attemptId) else { return }
+        if activeResumeAttemptId == attemptId {
+            activeResumeAttemptId = nil
+        }
+        if pendingResumeFinalizationAttemptId == attemptId {
+            pendingResumeFinalizationAttemptId = nil
+        }
+        if activeReplayRetryAttemptId == attemptId {
+            cancelReplayRetryLoop()
+        }
+        acceptsNewEvents = false
+    }
+
+    private func ownsResumeWork(attemptId: UUID) -> Bool {
+        activeResumeAttemptId == attemptId
+            || pendingResumeFinalizationAttemptId == attemptId
+            || activeReplayRetryAttemptId == attemptId
+    }
+
+    private func startReplayRetryLoop(
+        attemptId: UUID,
+        via transport: any Transport,
+        onFailure: (@Sendable (String) async -> Void)?
+    ) {
         cancelReplayRetryLoop()
         guard activeResumeAttemptId == attemptId, pendingEvents.isEmpty == false else { return }
 
         let token = UUID()
+        activeReplayRetryAttemptId = attemptId
         replayRetryToken = token
-        replayRetryTask = Task { [weak self] in
-            await self?.runReplayRetryLoop(
+        replayRetryTask = Task {
+            await runReplayRetryLoop(
                 attemptId: attemptId,
                 token: token,
-                via: transport
+                via: transport,
+                onFailure: onFailure
             )
         }
     }
@@ -361,7 +411,8 @@ public actor EventOutbox {
     private func runReplayRetryLoop(
         attemptId: UUID,
         token: UUID,
-        via transport: any Transport
+        via transport: any Transport,
+        onFailure: (@Sendable (String) async -> Void)?
     ) async {
         defer {
             if replayRetryToken == token {
@@ -395,17 +446,17 @@ public actor EventOutbox {
                       Task.isCancelled == false else {
                     return
                 }
-                await transport.close()
+                await onFailure?(String(describing: error))
                 return
             }
 
             guard isCurrentReplayRetry(attemptId: attemptId, token: token) else { return }
-            delay = Swift.min(delay + delay, replayRetryMaximumDelay)
+            delay = Swift.min(delay * 2, replayRetryMaximumDelay)
         }
     }
 
     private func isCurrentReplayRetry(attemptId: UUID, token: UUID) -> Bool {
-        activeResumeAttemptId == attemptId && replayRetryToken == token
+        activeReplayRetryAttemptId == attemptId && replayRetryToken == token
     }
 
     private func cancelReplayRetryLoopIfSettled() {
@@ -416,6 +467,7 @@ public actor EventOutbox {
     private func cancelReplayRetryLoop() {
         let task = replayRetryTask
         replayRetryTask = nil
+        activeReplayRetryAttemptId = nil
         replayRetryToken = nil
         task?.cancel()
     }

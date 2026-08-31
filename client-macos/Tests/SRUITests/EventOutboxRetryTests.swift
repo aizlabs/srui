@@ -125,6 +125,38 @@ private actor FailingTransport: Transport {
     }
 }
 
+/// Transport whose initial replay succeeds and whose background retry fails.
+private actor FailAfterFirstSendTransport: Transport {
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let streamContinuation: AsyncThrowingStream<Data, Error>.Continuation
+    private var sendCount = 0
+    private var closeCount = 0
+
+    init() {
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.streamContinuation = continuation
+    }
+
+    var closeCallCount: Int { closeCount }
+
+    func send(data: Data) async throws {
+        sendCount += 1
+        if sendCount > 1 {
+            throw TransportError.ioError("simulated background replay failure")
+        }
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        closeCount += 1
+        streamContinuation.finish()
+    }
+}
+
 @Suite("EventOutbox Retry Safety Tests")
 struct EventOutboxRetryTests {
 
@@ -297,6 +329,85 @@ struct EventOutboxRetryTests {
 
         await resumedTransport.releaseNextSend()
         await resumedTransport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
+    @Test(
+        "Background replay failure is surfaced without closing controller-owned transport",
+        .bug("https://github.com/aizlabs/srui/issues/17")
+    )
+    func backgroundReplayFailureIsSurfacedWithoutClosingTransport() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox(
+            replayRetryInitialDelay: .zero,
+            replayRetryMaximumDelay: .zero
+        )
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let resumedTransport = FailAfterFirstSendTransport()
+        let (failures, failureContinuation) = AsyncStream<String>.makeStream()
+        let attemptId = await outbox.beginResumeAttempt()
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-a",
+            lastProcessedEventSeq: 0,
+            attemptId: attemptId,
+            via: resumedTransport,
+            enableNewEventsAfterReplay: true,
+            onReplayFailure: { error in
+                failureContinuation.yield(error)
+                failureContinuation.finish()
+            }
+        )
+        #expect(accepted)
+
+        var failureIterator = failures.makeAsyncIterator()
+        let failure = await failureIterator.next()
+        #expect(failure?.contains("simulated background replay failure") == true)
+        #expect(await resumedTransport.closeCallCount == 0)
+
+        await outbox.stopResumeWork(attemptId: attemptId)
+        await resumedTransport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
+    @Test(
+        "A completed resume no longer occupies the handshake latch",
+        .bug("https://github.com/aizlabs/srui/issues/17")
+    )
+    func completedResumeReleasesHandshakeLatch() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let (resumedClient, resumedServer) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: resumedServer)
+        let attemptId = await outbox.beginResumeAttempt()
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-a",
+            lastProcessedEventSeq: 0,
+            attemptId: attemptId,
+            via: resumedClient,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+        #expect(await outbox.isRetryingPendingEvents)
+        #expect(await outbox.confirmFreshSession(id: "session-fresh"))
+        #expect(await outbox.isRetryingPendingEvents == false)
+
+        await collector.stop()
+        await resumedClient.close()
+        await resumedServer.close()
         await seedClient.close()
         await seedServer.close()
     }

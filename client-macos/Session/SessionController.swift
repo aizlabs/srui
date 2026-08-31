@@ -573,7 +573,12 @@ public final class SessionController: @unchecked Sendable {
                 lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
                 attemptId: attemptId,
                 via: transport,
-                enableNewEventsAfterReplay: true
+                enableNewEventsAfterReplay: true,
+                onReplayFailure: { [weak self] error in
+                    await self?.reportFailure(.transportEnded(
+                        "pending event replay retry failed: \(error)"
+                    ))
+                }
             )
             guard accepted else {
                 SessionDiagnostics.log("Ignoring superseded SERVER RESUME_OK")
@@ -583,20 +588,14 @@ public final class SessionController: @unchecked Sendable {
             await reportFailure(.transportEnded("pending event replay failed: \(error)"))
             return
         }
-        let shouldKeepRetrying = withStateLock { () -> Bool in
-            guard self.isRunning, !self._isDiverged else { return false }
+        await finalizeResumeAttempt(attemptId) {
             let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
             self.requestedSessionId = nil
             self.resumeAttemptId = nil
-            self.activeReplayRetryAttemptId = attemptId
             self.retainedCapabilities = negotiated
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = !self._isDiverged
-            return true
-        }
-        if !shouldKeepRetrying {
-            await outbox.stopReplayRetries(attemptId: attemptId)
         }
     }
 
@@ -633,7 +632,12 @@ public final class SessionController: @unchecked Sendable {
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
                         attemptId: attemptId,
                         via: transport,
-                        enableNewEventsAfterReplay: false
+                        enableNewEventsAfterReplay: false,
+                        onReplayFailure: { [weak self] error in
+                            await self?.reportFailure(.transportEnded(
+                                "pending event replay retry failed: \(error)"
+                            ))
+                        }
                     )
                     guard accepted else {
                         SessionDiagnostics.log("Ignoring superseded same-session resync")
@@ -823,24 +827,34 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// Commits controller state after resume replay and abandons background retries when teardown raced completion.
+    private func finalizeResumeAttempt(_ attemptId: UUID, mutate: () -> Void) async {
+        let didCommitControllerState = withStateLock { () -> Bool in
+            guard isRunning, !_isDiverged else { return false }
+            mutate()
+            activeReplayRetryAttemptId = attemptId
+            return true
+        }
+        if didCommitControllerState {
+            await outbox.commitResumeWork(attemptId: attemptId)
+        } else {
+            await outbox.stopResumeWork(attemptId: attemptId)
+        }
+    }
+
     /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.
     private func completeSnapshotCatchUp() async {
         withStateLock { self.pendingResync = false }
         let attemptId = withStateLock { self.resumeAttemptId }
         if let attemptId {
             let accepted = await outbox.finishResync(attemptId: attemptId)
-            let shouldKeepRetrying = withStateLock { () -> Bool in
-                guard accepted, self.isRunning, !self._isDiverged else { return false }
+            guard accepted else { return }
+            await finalizeResumeAttempt(attemptId) {
                 self.resumeAttemptId = nil
-                self.activeReplayRetryAttemptId = attemptId
                 self.eventDispatchEnabled = true
                 if case .awaitingSnapshot(let negotiated) = self.phase {
                     self.phase = .active(negotiated: negotiated)
                 }
-                return true
-            }
-            if !shouldKeepRetrying {
-                await outbox.stopReplayRetries(attemptId: attemptId)
             }
         } else {
             await outbox.allowNewEvents()
@@ -898,7 +912,7 @@ public final class SessionController: @unchecked Sendable {
         guard let handler = failureState.handler else { return }
 
         if let replayAttemptId = failureState.replayAttemptId {
-            await outbox.stopReplayRetries(attemptId: replayAttemptId)
+            await outbox.stopResumeWork(attemptId: replayAttemptId)
         }
         SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
         handler(failure)
@@ -966,7 +980,7 @@ public final class SessionController: @unchecked Sendable {
         }
 
         if let replayAttemptId = stoppedState.replayAttemptId {
-            await outbox.stopReplayRetries(attemptId: replayAttemptId)
+            await outbox.stopResumeWork(attemptId: replayAttemptId)
         }
         stoppedState.receiveTask?.cancel()
         await transport.close()

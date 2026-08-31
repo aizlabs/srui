@@ -202,3 +202,62 @@ fn pid_0_is_denied_because_it_would_signal_a_process_group() {
     assert_eq!(fixture.monitor.kill_selected(), KillOutcome::Denied(0));
     assert!(fixture.terminator.calls().is_empty());
 }
+
+#[test]
+fn kill_activation_is_scoped_to_the_activating_client() {
+    let fixture = common::base_fixture();
+    let revision = fixture.session.current_revision();
+
+    let item_20 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+    let item_30 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 30)
+            .unwrap()
+            .item_id
+    });
+
+    // Client A selects PID 20.
+    let mut event_a = selection_event(1, revision, item_20);
+    event_a.client_instance_id = b"client-a".to_vec();
+    fixture
+        .session
+        .process_event(&event_a)
+        .expect("client A selection accepted");
+
+    // Client B selects PID 30.
+    let mut event_b = selection_event(2, revision, item_30);
+    event_b.client_instance_id = b"client-b".to_vec();
+    fixture
+        .session
+        .process_event(&event_b)
+        .expect("client B selection accepted");
+
+    // Client A activates Kill Selected: must kill PID 20, NOT Client B's selection (PID 30).
+    let mut kill_a = activate_event(3, revision, KILL_BUTTON_ID);
+    kill_a.client_instance_id = b"client-a".to_vec();
+    fixture
+        .session
+        .process_event(&kill_a)
+        .expect("client A kill accepted");
+
+    assert_eq!(fixture.terminator.calls(), vec![20]);
+
+    // Client B activates Kill Selected: must kill PID 30.
+    let mut kill_b = activate_event(4, revision, KILL_BUTTON_ID);
+    kill_b.client_instance_id = b"client-b".to_vec();
+    fixture
+        .session
+        .process_event(&kill_b)
+        .expect("client B kill accepted");
+
+    assert_eq!(fixture.terminator.calls(), vec![20, 30]);
+}

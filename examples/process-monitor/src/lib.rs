@@ -270,10 +270,15 @@ pub fn signal_target_pid(pid: u32) -> Result<i32, TerminateError> {
     }
 }
 
-/// Sends a termination signal to a numeric PID.
+/// Sends a termination signal to a numeric PID or stable process handle.
 pub trait ProcessTerminator: Send + Sync {
     /// Sends `SIGTERM` to `pid`. Implementations must use a direct OS signal API: never a shell.
     fn terminate(&self, pid: u32) -> Result<(), TerminateError>;
+
+    /// Signals `target` through a validated identity or stable process handle (§27).
+    fn terminate_key(&self, target: ProcessKey) -> Result<(), TerminateError> {
+        self.terminate(target.pid)
+    }
 }
 
 /// Result of a "Kill Selected" activation, reported for logging and tests.
@@ -303,6 +308,7 @@ pub struct MonitorState {
     show_all: bool,
     effective_uid: u32,
     selected_item: Option<ItemId>,
+    client_selections: HashMap<Vec<u8>, ItemId>,
     next_item_id: u64,
     key_to_item: HashMap<ProcessKey, ItemId>,
     item_to_key: HashMap<ItemId, ProcessKey>,
@@ -318,6 +324,7 @@ pub struct MonitorState {
 struct PendingState {
     show_all: bool,
     selected_item: Option<ItemId>,
+    client_selections: HashMap<Vec<u8>, ItemId>,
     next_item_id: u64,
     key_to_item: HashMap<ProcessKey, ItemId>,
     item_to_key: HashMap<ItemId, ProcessKey>,
@@ -368,6 +375,7 @@ impl MonitorState {
             show_all: false,
             effective_uid,
             selected_item: None,
+            client_selections: HashMap::new(),
             next_item_id: 1,
             key_to_item: HashMap::new(),
             item_to_key: HashMap::new(),
@@ -387,6 +395,11 @@ impl MonitorState {
     /// The currently selected item, if any.
     pub fn selected_item(&self) -> Option<ItemId> {
         self.selected_item
+    }
+
+    /// The currently selected item for a specific client instance, if any.
+    pub fn selected_item_for_client(&self, client_instance_id: &[u8]) -> Option<ItemId> {
+        self.client_selections.get(client_instance_id).copied()
     }
 
     /// Rows currently published in the process model.
@@ -543,12 +556,15 @@ impl MonitorState {
         let selected_item = self
             .selected_item
             .filter(|selected| visible.iter().any(|row| row.item_id == *selected));
+        let mut client_selections = self.client_selections.clone();
+        client_selections.retain(|_, selected| visible.iter().any(|row| row.item_id == *selected));
 
         TickPlan {
             operations,
             next: PendingState {
                 show_all,
                 selected_item,
+                client_selections,
                 next_item_id,
                 key_to_item,
                 item_to_key,
@@ -565,6 +581,7 @@ impl MonitorState {
         let PendingState {
             show_all,
             selected_item,
+            client_selections,
             next_item_id,
             key_to_item,
             item_to_key,
@@ -575,6 +592,7 @@ impl MonitorState {
         } = plan.next;
         self.show_all = show_all;
         self.selected_item = selected_item;
+        self.client_selections = client_selections;
         self.next_item_id = next_item_id;
         self.key_to_item = key_to_item;
         self.item_to_key = item_to_key;
@@ -582,6 +600,18 @@ impl MonitorState {
         self.latest = latest;
         self.cpu = cpu;
         self.mem = mem;
+    }
+
+    /// Records a client selection for a specific client instance, accepting it only if visible.
+    pub fn select_for_client(&mut self, client_instance_id: &[u8], item: ItemId) -> bool {
+        if self.visible.iter().any(|row| row.item_id == item) {
+            self.client_selections
+                .insert(client_instance_id.to_vec(), item);
+            self.selected_item = Some(item);
+            true
+        } else {
+            false
+        }
     }
 
     /// Records a client selection, accepting it only if the item exists in the visible model.
@@ -908,9 +938,9 @@ impl Monitor {
             });
 
         let kill_target: Weak<Self> = Arc::downgrade(self);
-        self.session.on(KILL_BUTTON_ID, ACTIVATE, move |_, _| {
+        self.session.on(KILL_BUTTON_ID, ACTIVATE, move |_, event| {
             if let Some(monitor) = kill_target.upgrade() {
-                monitor.on_kill_activated();
+                monitor.on_kill_activated(event);
             }
         });
     }
@@ -925,7 +955,12 @@ impl Monitor {
             return;
         };
         let mut state = lock_or_recover(&self.state);
-        if state.select(item) {
+        let accepted = if !event.client_instance_id.is_empty() {
+            state.select_for_client(&event.client_instance_id, item)
+        } else {
+            state.select(item)
+        };
+        if accepted {
             debug!("selection accepted for item {}", item.get());
         } else {
             warn!(
@@ -950,8 +985,13 @@ impl Monitor {
     }
 
     /// Handles `ACTIVATE` on the "Kill Selected" button (§7.6, §27).
-    pub fn on_kill_activated(&self) {
-        match self.kill_selected() {
+    pub fn on_kill_activated(&self, event: &WireEvent) {
+        let client_id = if !event.client_instance_id.is_empty() {
+            Some(event.client_instance_id.as_slice())
+        } else {
+            None
+        };
+        match self.kill_selected_for_client(client_id) {
             KillOutcome::NoSelection => warn!("kill refused: no process is selected"),
             KillOutcome::UnknownSelection(item) => {
                 warn!("kill refused: selected item {} is stale", item.get())
@@ -971,9 +1011,18 @@ impl Monitor {
     /// [`ProcessKey`] the server assigned, then revalidated against the live process start time
     /// immediately before signalling so a reused PID cannot be hit.
     pub fn kill_selected(&self) -> KillOutcome {
+        self.kill_selected_for_client(None)
+    }
+
+    /// Resolves the selection for a specific client through server-owned state and signals it (§27).
+    pub fn kill_selected_for_client(&self, client_id: Option<&[u8]>) -> KillOutcome {
         let target = {
             let state = lock_or_recover(&self.state);
-            let Some(selected) = state.selected_item else {
+            let selected = match client_id {
+                Some(id) => state.selected_item_for_client(id).or(state.selected_item),
+                None => state.selected_item,
+            };
+            let Some(selected) = selected else {
                 return KillOutcome::NoSelection;
             };
             let Some(key) = state.key_for_item(selected) else {
@@ -991,7 +1040,7 @@ impl Monitor {
             return KillOutcome::StaleIdentity(target.pid);
         }
 
-        match self.terminator.terminate(target.pid) {
+        match self.terminator.terminate_key(target) {
             Ok(()) => KillOutcome::Terminated(target.pid),
             Err(error) => KillOutcome::Failed(target.pid, error),
         }
@@ -1162,7 +1211,7 @@ impl ProcessSource for SysinfoProcessSource {
     }
 }
 
-/// `kill(2)`-backed terminator. Sends `SIGTERM` directly: never through a shell.
+/// `kill(2)` / `pidfd`-backed terminator. Sends `SIGTERM` directly: never through a shell.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SignalTerminator;
 
@@ -1181,6 +1230,61 @@ impl ProcessTerminator for SignalTerminator {
             Err(Errno::EPERM) => Err(TerminateError::PermissionDenied),
             Err(Errno::ESRCH) => Err(TerminateError::NoSuchProcess),
             Err(errno) => Err(TerminateError::Other(errno.to_string())),
+        }
+    }
+
+    fn terminate_key(&self, target: ProcessKey) -> Result<(), TerminateError> {
+        #[cfg(target_os = "linux")]
+        {
+            linux_pidfd::terminate_pidfd(target).or_else(|err| {
+                if let TerminateError::Other(_) = err {
+                    self.terminate(target.pid)
+                } else {
+                    Err(err)
+                }
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.terminate(target.pid)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_pidfd {
+    use super::*;
+
+    pub fn terminate_pidfd(target: ProcessKey) -> Result<(), TerminateError> {
+        let pid = signal_target_pid(target.pid)?;
+        unsafe {
+            let fd = libc::syscall(libc::SYS_pidfd_open, pid, 0);
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(libc::ESRCH) => Err(TerminateError::NoSuchProcess),
+                    Some(libc::EPERM) => Err(TerminateError::PermissionDenied),
+                    _ => Err(TerminateError::Other(err.to_string())),
+                };
+            }
+
+            let ret = libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                libc::SIGTERM,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+            libc::close(fd as libc::c_int);
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                return match err.raw_os_error() {
+                    Some(libc::ESRCH) => Err(TerminateError::NoSuchProcess),
+                    Some(libc::EPERM) => Err(TerminateError::PermissionDenied),
+                    _ => Err(TerminateError::Other(err.to_string())),
+                };
+            }
+            Ok(())
         }
     }
 }

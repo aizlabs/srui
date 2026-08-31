@@ -729,6 +729,7 @@ name = "srui-example-process-monitor"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "libc",
  "nix",
  "srui-protocol",
  "srui-sdk",

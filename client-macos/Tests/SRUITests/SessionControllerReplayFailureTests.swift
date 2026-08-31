@@ -28,11 +28,57 @@ private final class ReplayTestCounter: @unchecked Sendable {
         defer { lock.unlock() }
         count += 1
     }
+}
 
-    func store(_ newValue: Int) {
+/// Lock-guarded record of the controller's terminal failure callback.
+///
+/// Every wait here is deadline-bounded: a regression that never invokes `onFailure` must fail the
+/// test, not suspend it forever and hang the suite.
+private final class ReplayFailureRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failures: [SessionFailure] = []
+    private var closeCallsAtFirstReport: Int?
+
+    var count: Int {
         lock.lock()
         defer { lock.unlock() }
-        count = newValue
+        return failures.count
+    }
+
+    var first: SessionFailure? {
+        lock.lock()
+        defer { lock.unlock() }
+        return failures.first
+    }
+
+    /// Transport close count sampled inside the first callback, before the controller's own close.
+    var closeCallsWhenFirstReported: Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return closeCallsAtFirstReport
+    }
+
+    func record(_ failure: SessionFailure, closeCalls: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        if failures.isEmpty {
+            closeCallsAtFirstReport = closeCalls
+        }
+        failures.append(failure)
+    }
+
+    func waitForFirstFailure(timeout: Duration = .seconds(2)) async throws -> SessionFailure {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            if let failure = first {
+                return failure
+            }
+            guard clock.now < deadline else {
+                throw AsyncTestTimeout(description: "terminal session failure callback")
+            }
+            await Task.yield()
+        }
     }
 }
 
@@ -147,15 +193,11 @@ struct SessionControllerReplayFailureTests {
             sessionId: "session-a"
         )
 
-        let (failures, failureContinuation) = AsyncStream<SessionFailure>.makeStream()
-        let failureCount = ReplayTestCounter()
-        let closeCallsWhenReported = ReplayTestCounter()
+        let reported = ReplayFailureRecorder()
         controller.onFailure = { failure in
-            failureCount.increment()
-            // Sampled before the controller's own `transport.close()`: proves the outbox did not
-            // close a transport it does not own.
-            closeCallsWhenReported.store(transport.closeCalls.value)
-            failureContinuation.yield(failure)
+            // The close count is sampled before the controller's own `transport.close()`: it proves
+            // the outbox did not close a transport it does not own.
+            reported.record(failure, closeCalls: transport.closeCalls.value)
         }
 
         try await controller.start()
@@ -176,20 +218,19 @@ struct SessionControllerReplayFailureTests {
         response.serverResumeOk = resumeOk
         try await transport.deliver(message: response)
 
-        var failureIterator = failures.makeAsyncIterator()
-        let failure = try #require(await failureIterator.next())
+        let failure = try await reported.waitForFirstFailure()
         guard case .transportEnded(let message) = failure else {
             Issue.record("Expected .transportEnded, got \(failure)")
             return
         }
         #expect(message.contains("pending event replay retry failed"))
         #expect(message.contains("simulated background replay failure"))
-        #expect(closeCallsWhenReported.value == 0)
+        #expect(reported.closeCallsWhenFirstReported == 0)
 
         // The controller closes the transport itself, exactly once, after reporting.
         try await transport.waitForFirstClose()
         #expect(transport.closeCalls.value == 1)
-        #expect(failureCount.value == 1)
+        #expect(reported.count == 1)
 
         // The retry loop is stopped and the data plane stays shut for this session.
         #expect(await outbox.isRetryingPendingEvents == false)
@@ -218,9 +259,8 @@ struct SessionControllerReplayFailureTests {
         #expect(await transport.sentFrameCount == 3)
 
         await controller.stop()
-        #expect(failureCount.value == 1)
+        #expect(reported.count == 1)
         #expect(await outbox.isRetryingPendingEvents == false)
-        failureContinuation.finish()
         await transport.close()
     }
 }

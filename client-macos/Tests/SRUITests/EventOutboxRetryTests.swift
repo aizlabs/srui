@@ -334,6 +334,66 @@ struct EventOutboxRetryTests {
     }
 
     @Test(
+        "A live resync frontier keeps retries active until the remaining event settles",
+        .bug("https://github.com/aizlabs/srui/issues/20")
+    )
+    func liveResyncFrontierKeepsRetryLeaseForUnsettledEvents() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox(
+            replayRetryInitialDelay: .zero,
+            replayRetryMaximumDelay: .zero
+        )
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(8),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let resumedTransport = GatedTransport()
+        let attemptId = await outbox.beginResumeAttempt()
+        let resumeTask = Task {
+            try await outbox.completeSameSessionResume(
+                id: "session-a",
+                lastProcessedEventSeq: 0,
+                attemptId: attemptId,
+                via: resumedTransport,
+                enableNewEventsAfterReplay: true
+            )
+        }
+
+        await resumedTransport.waitForSendCount(1)
+        await resumedTransport.releaseNextSend()
+        await resumedTransport.waitForSendCount(2)
+        await resumedTransport.releaseNextSend()
+        #expect(try await resumeTask.value)
+        #expect(await outbox.isRetryingPendingEvents)
+
+        await outbox.applyLiveResyncFrontier(lastProcessedEventSeq: first.eventSeq)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == first.eventSeq)
+        #expect(await outbox.isRetryingPendingEvents)
+
+        _ = await outbox.settleAcknowledgement(
+            eventId: second.eventId,
+            throughSeq: second.eventSeq,
+            sessionId: "session-a"
+        )
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.isRetryingPendingEvents == false)
+
+        await resumedTransport.releaseNextSend()
+        await resumedTransport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
+    @Test(
         "Background replay failure is surfaced without closing controller-owned transport",
         .bug("https://github.com/aizlabs/srui/issues/17")
     )

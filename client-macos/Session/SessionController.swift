@@ -575,9 +575,7 @@ public final class SessionController: @unchecked Sendable {
                 via: transport,
                 enableNewEventsAfterReplay: true,
                 onReplayFailure: { [weak self] error in
-                    await self?.reportFailure(.transportEnded(
-                        "pending event replay retry failed: \(error)"
-                    ))
+                    await self?.handlePendingEventReplayFailure(error)
                 }
             )
             guard accepted else {
@@ -634,9 +632,7 @@ public final class SessionController: @unchecked Sendable {
                         via: transport,
                         enableNewEventsAfterReplay: false,
                         onReplayFailure: { [weak self] error in
-                            await self?.reportFailure(.transportEnded(
-                                "pending event replay retry failed: \(error)"
-                            ))
+                            await self?.handlePendingEventReplayFailure(error)
                         }
                     )
                     guard accepted else {
@@ -825,6 +821,10 @@ public final class SessionController: @unchecked Sendable {
         case .failure(let err):
             await handleTransactionRejection(err, isResyncSnapshot: isResyncSnapshot)
         }
+    }
+
+    private func handlePendingEventReplayFailure(_ error: String) async {
+        await reportFailure(.transportEnded("pending event replay retry failed: \(error)"))
     }
 
     /// Commits controller state after resume replay and abandons background retries when teardown raced completion.

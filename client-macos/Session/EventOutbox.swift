@@ -426,6 +426,8 @@ public actor EventOutbox {
         return pendingEvents.isEmpty == false
     }
 
+    /// Natural completion only: cancellation clears `replayLease` in `cancelReplayRetryLoop()` first,
+    /// so a stale `onFinish` from an invalidated task exits on the guard below.
     private func finishReplayRetryLoop(_ lease: PendingEventReplayLoop.Lease) {
         guard replayLease == lease else { return }
         replayLease = nil

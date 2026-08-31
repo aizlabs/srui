@@ -21,22 +21,29 @@ struct PendingEventReplayLoop {
         fileprivate let token: UUID
     }
 
+    /// Returns `true` when another delayed replay should be scheduled; `false` stops the loop.
     typealias ReplayOperation = @Sendable (Lease) async throws -> Bool
     typealias FailureHandler = @Sendable (String) async -> Void
     typealias FinishHandler = @Sendable (Lease) async -> Void
+    typealias SleepOperation = @Sendable (Duration) async throws -> Void
 
     private let initialDelay: Duration
     private let maximumDelay: Duration
+    private let sleep: SleepOperation
     private var activeLease: Lease?
     private var task: Task<Void, Never>?
 
     init(
         initialDelay: Duration = PendingEventReplayLoop.defaultInitialDelay,
-        maximumDelay: Duration = PendingEventReplayLoop.defaultMaximumDelay
+        maximumDelay: Duration = PendingEventReplayLoop.defaultMaximumDelay,
+        sleep: @escaping SleepOperation = { delay in
+            try await Task<Never, Never>.sleep(for: delay)
+        }
     ) {
         let clampedInitialDelay = Swift.max(.zero, initialDelay)
         self.initialDelay = clampedInitialDelay
         self.maximumDelay = Swift.max(clampedInitialDelay, maximumDelay)
+        self.sleep = sleep
     }
 
     var isRunning: Bool {
@@ -59,12 +66,14 @@ struct PendingEventReplayLoop {
         let lease = Lease(resumeScope: resumeScope, token: UUID())
         let initialDelay = self.initialDelay
         let maximumDelay = self.maximumDelay
+        let sleep = self.sleep
         activeLease = lease
         task = Task {
             await Self.run(
                 lease: lease,
                 initialDelay: initialDelay,
                 maximumDelay: maximumDelay,
+                sleep: sleep,
                 replay: replay,
                 onFailure: onFailure
             )
@@ -95,6 +104,7 @@ struct PendingEventReplayLoop {
         lease: Lease,
         initialDelay: Duration,
         maximumDelay: Duration,
+        sleep: @escaping SleepOperation,
         replay: @escaping ReplayOperation,
         onFailure: FailureHandler?
     ) async {
@@ -102,7 +112,7 @@ struct PendingEventReplayLoop {
 
         while Task.isCancelled == false {
             do {
-                try await Task<Never, Never>.sleep(for: retryDelay)
+                try await sleep(retryDelay)
             } catch {
                 return
             }

@@ -295,6 +295,7 @@ struct EventOutboxTests {
         let ev4 = try await outbox.sendActivate(nodeId: NodeId(4), observedRevision: Revision(2), via: client2)
         #expect(ev4.eventSeq == 4)
 
+        await outbox.stopResumeWork(attemptId: attemptId)
         await client2.close()
         await server2.close()
     }

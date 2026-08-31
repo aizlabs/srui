@@ -39,7 +39,13 @@ fn initial_graph_has_the_required_hierarchy_and_node_types() {
 
         let actions_row = store.get_node(ACTIONS_ROW_ID).expect("actions row");
         assert_eq!(actions_row.node_type, TypeRef::ROW);
-        assert_eq!(actions_row.ordered_children, vec![KILL_BUTTON_ID]);
+        assert_eq!(
+            actions_row.ordered_children,
+            vec![KILL_BUTTON_ID, KILL_STATUS_ID]
+        );
+
+        let status = Text::from_store(store, KILL_STATUS_ID).expect("kill status");
+        assert_eq!(status.text(store), Some(KILL_STATUS_IDLE));
 
         let heading = Text::from_store(store, HEADING_ID).expect("heading");
         assert_eq!(heading.text(store), Some("System Monitor"));

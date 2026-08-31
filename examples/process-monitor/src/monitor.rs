@@ -8,7 +8,7 @@ use srui_semantic_tree::Event as SemanticEvent;
 use srui_sessiond::{Session, SessionError};
 use tracing::{debug, info, warn};
 
-use crate::domain::{KILL_BUTTON_ID, PROCESS_TABLE_ID, SHOW_ALL_ID};
+use crate::domain::{KILL_BUTTON_ID, KILL_STATUS_ID, PROCESS_TABLE_ID, SHOW_ALL_ID};
 use crate::source::ProcessSource;
 use crate::state::{MonitorState, TickPlan};
 use crate::terminator::{ProcessTerminator, TerminateError};
@@ -33,6 +33,25 @@ pub enum KillOutcome {
     Terminated(u32),
     /// The OS refused the signal.
     Failed(u32, TerminateError),
+}
+
+impl KillOutcome {
+    /// Human-readable outcome published to clients as semantic state (§7.2).
+    ///
+    /// Refusals are reported as plainly as successes: a client must be able to tell "denied" from
+    /// "signalled" without access to the server's stderr.
+    pub fn client_message(&self) -> String {
+        match self {
+            Self::NoSelection => "Select a process first".to_string(),
+            Self::UnknownSelection(_) => "Refused: that row is no longer available".to_string(),
+            Self::Denied(pid) => format!("Refused: PID {pid} is protected"),
+            Self::StaleIdentity(pid) => {
+                format!("Refused: PID {pid} no longer matches the selected process")
+            }
+            Self::Terminated(pid) => format!("SIGTERM delivered to PID {pid}"),
+            Self::Failed(pid, error) => format!("Kill of PID {pid} failed: {error}"),
+        }
+    }
 }
 
 /// Live process monitor: authoritative state plus the session it publishes into.
@@ -195,7 +214,8 @@ impl Monitor {
             warn!("kill refused: ACTIVATE carries no client instance id");
             return;
         }
-        match self.kill_selected_for_client(Some(event.client_instance_id.as_slice())) {
+        let outcome = self.kill_selected_for_client(Some(event.client_instance_id.as_slice()));
+        match &outcome {
             KillOutcome::NoSelection => warn!("kill refused: no process is selected"),
             KillOutcome::UnknownSelection(item) => {
                 warn!("kill refused: selected item {} is stale", item.get())
@@ -206,6 +226,18 @@ impl Monitor {
             }
             KillOutcome::Terminated(pid) => info!("SIGTERM delivered to pid {pid}"),
             KillOutcome::Failed(pid, error) => warn!("kill of pid {pid} failed: {error}"),
+        }
+        self.publish_kill_status(&outcome);
+    }
+
+    /// Commits the outcome of a kill activation as semantic state (§7.2, §12.1).
+    fn publish_kill_status(&self, outcome: &KillOutcome) {
+        let message = outcome.client_message();
+        if let Err(error) = self.session.transaction(move |ui| {
+            ui.set(KILL_STATUS_ID, TEXT, message.clone())?;
+            Ok(())
+        }) {
+            warn!("failed to publish kill status: {error}");
         }
     }
 

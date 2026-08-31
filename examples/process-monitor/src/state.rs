@@ -10,12 +10,32 @@ use crate::domain::{
     RowValues, VisibleRow, CPU_PROGRESS_ID, MEM_PROGRESS_ID, PROCESS_MODEL_ID, SHOW_ALL_ID,
 };
 
+/// Maximum client instances whose selection is retained at once.
+///
+/// Nothing in the event stream announces a disconnect, so without a ceiling a peer that reconnects
+/// under a fresh `client_instance_id` while holding a long-lived row would grow this map for the
+/// lifetime of the daemon.
+pub const MAX_CLIENT_SELECTIONS: usize = 64;
+
+/// Maximum accepted `client_instance_id` length in bytes.
+pub const MAX_CLIENT_INSTANCE_ID_LEN: usize = 128;
+
+/// One client's selection, tagged with the sequence number that ordered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientSelection {
+    /// The selected item.
+    pub item: ItemId,
+    /// Monotonic sequence number of the selection, used to evict the least recent one.
+    pub seq: u64,
+}
+
 /// Core mutable state payload shared between authoritative state and pending transaction plans.
 #[derive(Debug, Clone, Default)]
 pub struct StateData {
     pub show_all: bool,
     pub selected_item: Option<ItemId>,
-    pub client_selections: HashMap<Vec<u8>, ItemId>,
+    pub client_selections: HashMap<Vec<u8>, ClientSelection>,
+    pub next_selection_seq: u64,
     pub next_item_id: u64,
     pub key_to_item: HashMap<ProcessKey, ItemId>,
     pub item_to_key: HashMap<ItemId, ProcessKey>,
@@ -98,7 +118,15 @@ impl MonitorState {
 
     /// The currently selected item for a specific client instance, if any.
     pub fn selected_item_for_client(&self, client_instance_id: &[u8]) -> Option<ItemId> {
-        self.data.client_selections.get(client_instance_id).copied()
+        self.data
+            .client_selections
+            .get(client_instance_id)
+            .map(|selection| selection.item)
+    }
+
+    /// Number of client instances currently holding a selection.
+    pub fn client_selection_count(&self) -> usize {
+        self.data.client_selections.len()
     }
 
     /// Rows currently published in the process model.
@@ -277,7 +305,8 @@ impl MonitorState {
             .selected_item
             .filter(|selected| visible.iter().any(|row| row.item_id == *selected));
         let mut client_selections = self.data.client_selections.clone();
-        client_selections.retain(|_, selected| visible.iter().any(|row| row.item_id == *selected));
+        client_selections
+            .retain(|_, selected| visible.iter().any(|row| row.item_id == selected.item));
 
         TickPlan {
             operations,
@@ -286,6 +315,7 @@ impl MonitorState {
                     show_all,
                     selected_item,
                     client_selections,
+                    next_selection_seq: self.data.next_selection_seq,
                     next_item_id,
                     key_to_item,
                     item_to_key,
@@ -304,15 +334,39 @@ impl MonitorState {
     }
 
     /// Records a client selection for a specific client instance, accepting it only if visible.
+    ///
+    /// The map is bounded: an over-long identifier is rejected outright, and once
+    /// [`MAX_CLIENT_SELECTIONS`] distinct clients hold a selection, recording one for a new client
+    /// evicts the least recently selected entry instead of growing without limit.
     pub fn select_for_client(&mut self, client_instance_id: &[u8], item: ItemId) -> bool {
-        if self.data.visible.iter().any(|row| row.item_id == item) {
-            self.data
-                .client_selections
-                .insert(client_instance_id.to_vec(), item);
-            true
-        } else {
-            false
+        if client_instance_id.len() > MAX_CLIENT_INSTANCE_ID_LEN {
+            return false;
         }
+        if !self.data.visible.iter().any(|row| row.item_id == item) {
+            return false;
+        }
+
+        let seq = self.data.next_selection_seq;
+        self.data.next_selection_seq = self.data.next_selection_seq.saturating_add(1);
+
+        if !self.data.client_selections.contains_key(client_instance_id)
+            && self.data.client_selections.len() >= MAX_CLIENT_SELECTIONS
+        {
+            if let Some(oldest) = self
+                .data
+                .client_selections
+                .iter()
+                .min_by_key(|(_, selection)| selection.seq)
+                .map(|(id, _)| id.clone())
+            {
+                self.data.client_selections.remove(&oldest);
+            }
+        }
+
+        self.data
+            .client_selections
+            .insert(client_instance_id.to_vec(), ClientSelection { item, seq });
+        true
     }
 
     /// Records a client selection, accepting it only if the item exists in the visible model.

@@ -43,7 +43,13 @@ impl std::fmt::Display for TransactionWireStats {
 /// The transaction is wrapped in the same [`srui_protocol::SruiMessage`] envelope and encoded with
 /// the canonical varint length-delimited framing helper, so the reported size is the semantic SRUI
 /// frame the client would receive (§26). SSH transport encryption and compression are not included.
-pub fn measure_transaction(transaction: &srui_protocol::Transaction) -> TransactionWireStats {
+///
+/// A framing failure is returned rather than reported as a size: a transaction that cannot be
+/// encoded also cannot be sent, and silently logging `framed_bytes=0` would hide exactly the
+/// oversize-frame case these statistics exist to diagnose.
+pub fn measure_transaction(
+    transaction: &srui_protocol::Transaction,
+) -> Result<TransactionWireStats, String> {
     use srui_protocol::operation::Op;
 
     let mut stats = TransactionWireStats {
@@ -68,6 +74,11 @@ pub fn measure_transaction(transaction: &srui_protocol::Transaction) -> Transact
     };
     stats.framed_bytes = srui_protocol::encode_framed(&envelope)
         .map(|bytes| bytes.len())
-        .unwrap_or(0);
-    stats
+        .map_err(|error| {
+            format!(
+                "revision {} could not be framed: {error}",
+                transaction.new_revision
+            )
+        })?;
+    Ok(stats)
 }

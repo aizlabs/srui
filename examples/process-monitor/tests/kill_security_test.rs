@@ -7,7 +7,16 @@ use srui_example_process_monitor::testing::{
     activate_event, record, selection_event, snapshot, TEST_CLIENT_INSTANCE_ID,
 };
 use srui_example_process_monitor::*;
-use srui_sdk::ItemId;
+use srui_sdk::{ItemId, Text};
+
+/// The kill-status text the client currently sees.
+fn kill_status(fixture: &Fixture) -> Option<String> {
+    fixture.session.with_store(|store| {
+        Text::from_store(store, KILL_STATUS_ID)?
+            .text(store)
+            .map(str::to_string)
+    })
+}
 
 /// Resolves the kill through the same client instance the event builders stamp, because a
 /// selection is only ever actionable by the client that made it (§27).
@@ -175,7 +184,51 @@ fn a_malformed_activation_does_not_crash_or_terminate() {
         .expect("event accepted");
 
     assert!(fixture.terminator.calls().is_empty());
-    assert_eq!(fixture.session.current_revision(), revision);
+    // The only state change is the refusal reported back to the client.
+    assert_eq!(fixture.session.current_revision(), revision + 1);
+}
+
+#[test]
+fn every_kill_outcome_is_reported_to_the_client_as_semantic_state() {
+    let fixture = common::base_fixture();
+
+    let refusal = activate_event(1, fixture.session.current_revision(), KILL_BUTTON_ID);
+    fixture
+        .session
+        .process_event(&refusal)
+        .expect("event accepted");
+    assert_eq!(
+        kill_status(&fixture),
+        Some("Select a process first".to_string())
+    );
+
+    let item = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 30)
+            .unwrap()
+            .item_id
+    });
+    fixture
+        .session
+        .process_event(&selection_event(
+            2,
+            fixture.session.current_revision(),
+            item,
+        ))
+        .expect("selection accepted");
+
+    let success = activate_event(3, fixture.session.current_revision(), KILL_BUTTON_ID);
+    fixture
+        .session
+        .process_event(&success)
+        .expect("event accepted");
+    assert_eq!(fixture.terminator.calls(), vec![30]);
+    assert_eq!(
+        kill_status(&fixture),
+        Some("SIGTERM delivered to PID 30".to_string())
+    );
 }
 
 #[test]

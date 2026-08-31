@@ -16,12 +16,17 @@ use srui_sessiond::{handle_connection, Session};
 /// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
 /// the process and defeats persistent session state.
 #[cfg(unix)]
-fn ignore_sighup() {
-    // SAFETY: called synchronously at process start, before threads or other handlers exist.
+fn ignore_sighup() -> Result<(), std::io::Error> {
+    // SAFETY: `signal(2)` mutates process-wide disposition. This is called synchronously at process
+    // start, before any thread, task or other handler exists, so no concurrent observer can see the
+    // intermediate state, and `SIG_IGN` installs no handler that could run unsafe code.
     let rc = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
     if rc == libc::SIG_ERR {
-        eprintln!("srui-sessiond: failed to ignore SIGHUP");
+        // Failing silently would leave the daemon killable by the very disconnect this call exists
+        // to survive (§17, §20.2).
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
 fn default_socket_path() -> PathBuf {
@@ -45,32 +50,47 @@ impl Default for DaemonConfig {
     }
 }
 
-fn parse_args() -> DaemonConfig {
-    let args: Vec<String> = std::env::args().collect();
+/// Parses the daemon command line, rejecting anything it does not understand.
+///
+/// A silently swallowed flag would start the daemon on the default endpoint instead of the
+/// requested one — particularly dangerous for a background SSH subsystem, where nobody reads the
+/// startup log — so an unknown flag or a missing value is a hard error.
+fn parse_args_from(args: &[String]) -> Result<DaemonConfig, String> {
     let mut config = DaemonConfig::default();
 
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--socket" if i + 1 < args.len() => {
-                config.socket_path = PathBuf::from(&args[i + 1]);
+            "--socket" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| "--socket requires a path argument".to_string())?;
+                config.socket_path = PathBuf::from(value);
                 i += 2;
             }
-            "--app" if i + 1 < args.len() => {
-                config.app_name = Some(args[i + 1].clone());
+            "--app" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| "--app requires an application name".to_string())?;
+                config.app_name = Some(value.clone());
                 i += 2;
             }
             arg if !arg.starts_with('-') => {
                 config.socket_path = PathBuf::from(arg);
                 i += 1;
             }
-            _ => {
-                i += 1;
-            }
+            other => return Err(format!("unrecognized argument: {other}")),
         }
     }
 
-    config
+    Ok(config)
+}
+
+fn parse_args() -> Result<DaemonConfig, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_args_from(&args)
 }
 
 fn initialize_counter_app(session: &Arc<Session>) {
@@ -135,6 +155,8 @@ struct OwnedSocket {
     path: PathBuf,
     /// `(device, inode)` of the endpoint created by this process.
     identity: (u64, u64),
+    /// Exclusive advisory lock on the socket path, released when this value is dropped.
+    _lock: std::fs::File,
 }
 
 impl OwnedSocket {
@@ -181,41 +203,85 @@ fn socket_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, u64)>
     }
 }
 
-/// Probes an existing socket path to determine if a live server is listening.
+/// The advisory lock path guarding `socket_path`.
+fn socket_lock_path(socket_path: &std::path::Path) -> PathBuf {
+    let mut name = socket_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Takes the exclusive advisory lock that marks this process as the owner of the socket path.
 ///
-/// Retries connect attempts with backoff to avoid misinterpreting a Darwin listen backlog saturation
-/// as an inactive or stale socket.
-async fn probe_live_socket(path: &std::path::Path) -> std::io::Result<bool> {
+/// The lock, not the connect probe, is what decides ownership: it is held across the probe, the
+/// unlink and the bind, so two daemons can never both conclude the endpoint was free and race to
+/// replace each other's freshly bound socket. The kernel releases it when the descriptor closes,
+/// including on `SIGKILL`, so a crashed daemon never leaves the path permanently claimed.
+fn acquire_socket_lock(socket_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = socket_lock_path(socket_path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+
+    // SAFETY: `file` owns a valid open descriptor for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is already served by a running process; pass a different socket path",
+                    socket_path.display()
+                ),
+            ))
+        } else {
+            Err(error)
+        };
+    }
+    Ok(file)
+}
+
+/// What a connect probe was able to establish about an existing socket path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketLiveness {
+    /// A server answered: the endpoint is in use.
+    Live,
+    /// The endpoint is definitively gone or definitively unserved.
+    Absent,
+    /// The probe failed in a way that does not prove anything either way.
+    Ambiguous,
+}
+
+/// Classifies an existing socket path by attempting one connection.
+///
+/// Only two outcomes are treated as proof of absence: the path no longer exists, or connection is
+/// refused. `ECONNREFUSED` is conclusive *here* precisely because [`acquire_socket_lock`] already
+/// excluded every other daemon instance, so it cannot be the backlog-saturated peer of a sibling.
+/// Anything else — `EPERM`, `EACCES`, `ECONNRESET` — can equally well come from a live foreign
+/// listener, and a foreign endpoint must never be displaced.
+async fn probe_socket_liveness(path: &std::path::Path) -> std::io::Result<SocketLiveness> {
     use tokio::net::UnixStream;
     if socket_identity(path)?.is_none() {
-        return Ok(false);
+        return Ok(SocketLiveness::Absent);
     }
-    for attempt in 0..3 {
-        match UnixStream::connect(path).await {
-            Ok(_) => return Ok(true),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::PermissionDenied
-                        | std::io::ErrorKind::ConnectionReset
-                ) || matches!(
-                    error.raw_os_error(),
-                    Some(libc::ECONNREFUSED)
-                        | Some(libc::EPERM)
-                        | Some(libc::EACCES)
-                        | Some(libc::ENOENT)
-                ) =>
-            {
-                if attempt < 2 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-            Err(error) => return Err(error),
+    match UnixStream::connect(path).await {
+        Ok(_) => Ok(SocketLiveness::Live),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOENT)
+                || error.kind() == std::io::ErrorKind::ConnectionRefused
+                || error.raw_os_error() == Some(libc::ECONNREFUSED) =>
+        {
+            Ok(SocketLiveness::Absent)
         }
+        Err(_) => Ok(SocketLiveness::Ambiguous),
     }
-    Ok(false)
 }
 
 /// Binds a Unix domain socket, verifying parent directory permissions and unlinking any stale
@@ -225,25 +291,47 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
         std::fs::create_dir_all(parent)?;
     }
 
-    if probe_live_socket(path).await? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            format!(
-                "{} is already served by a running process; pass a different socket path",
-                path.display()
-            ),
-        ));
-    }
+    let lock = acquire_socket_lock(path)?;
 
-    if path.exists() {
-        if let Err(unlink_error) = std::fs::remove_file(path) {
-            if unlink_error.kind() != std::io::ErrorKind::NotFound {
-                return Err(unlink_error);
-            }
+    match probe_socket_liveness(path).await? {
+        SocketLiveness::Live => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is already served by a running process; pass a different socket path",
+                    path.display()
+                ),
+            ));
         }
+        SocketLiveness::Ambiguous => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} could not be proven unused; refusing to unlink it. Pass a different socket path",
+                    path.display()
+                ),
+            ));
+        }
+        SocketLiveness::Absent => {}
     }
 
-    let listener = UnixListener::bind(path)?;
+    // The lock is held across the unlink and the bind, so no other daemon can slip in between.
+    // `socket_identity` refuses a path that exists but is not a socket, so an unrelated file is
+    // never a removal candidate.
+    if socket_identity(path)?.is_some() {
+        info!("removing stale socket {}", path.display());
+        std::fs::remove_file(path)?;
+    }
+
+    // Create the endpoint as `0600`: a Unix socket honours the umask, and any connector can drive
+    // the session, so the endpoint must not be world-connectable.
+    //
+    // SAFETY: `umask(2)` reads and replaces a process-wide value and cannot fail. This runs during
+    // single-threaded startup, and the previous value is restored immediately after the bind.
+    let previous_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(path);
+    unsafe { libc::umask(previous_umask) };
+    let listener = bind_result?;
 
     let identity = socket_identity(path)?.ok_or_else(|| {
         std::io::Error::other(format!(
@@ -256,6 +344,7 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
         OwnedSocket {
             path: path.to_path_buf(),
             identity,
+            _lock: lock,
         },
     ))
 }
@@ -263,7 +352,7 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
-    ignore_sighup();
+    ignore_sighup()?;
 
     // Initialize tracing
     tracing_subscriber::fmt()
@@ -275,7 +364,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting srui-sessiond daemon (§20.2)...");
 
-    let config = parse_args();
+    let config = parse_args().map_err(|message| {
+        error!("{message}");
+        message
+    })?;
 
     let (listener, owned_socket) = bind_owned_socket(&config.socket_path).await?;
     info!(socket_path = ?config.socket_path, "Listening on Unix domain socket");
@@ -372,4 +464,42 @@ async fn wait_for_shutdown_signal() {
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn recognized_options_are_parsed() {
+        let config = parse_args_from(&args(&["--socket", "/tmp/a.sock", "--app", "counter"]))
+            .expect("valid arguments");
+        assert_eq!(config.socket_path, PathBuf::from("/tmp/a.sock"));
+        assert_eq!(config.app_name.as_deref(), Some("counter"));
+    }
+
+    #[test]
+    fn a_bare_path_still_selects_the_socket() {
+        let config = parse_args_from(&args(&["/tmp/b.sock"])).expect("valid arguments");
+        assert_eq!(config.socket_path, PathBuf::from("/tmp/b.sock"));
+    }
+
+    #[test]
+    fn an_unknown_flag_is_rejected_instead_of_silently_ignored() {
+        // Falling back to the default endpoint on a typo is what makes this dangerous for a
+        // background SSH subsystem: nobody reads the startup log.
+        let error = parse_args_from(&args(&["--sockets", "/tmp/c.sock"])).expect_err("rejected");
+        assert!(error.contains("--sockets"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_option_value_is_rejected() {
+        assert!(parse_args_from(&args(&["--socket"])).is_err());
+        assert!(parse_args_from(&args(&["--socket", "--app"])).is_err());
+        assert!(parse_args_from(&args(&["--app"])).is_err());
+    }
 }

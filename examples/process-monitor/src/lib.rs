@@ -37,7 +37,10 @@ pub use diff::diff_visible_rows;
 pub use domain::*;
 pub use monitor::{KillOutcome, Monitor};
 pub use source::{effective_uid, ProcessSource, SysinfoProcessSource};
-pub use state::{MonitorState, PendingState, StateData, TickPlan};
+pub use state::{
+    ClientSelection, MonitorState, PendingState, StateData, TickPlan, MAX_CLIENT_INSTANCE_ID_LEN,
+    MAX_CLIENT_SELECTIONS,
+};
 pub use terminator::{signal_target_pid, ProcessTerminator, SignalTerminator, TerminateError};
 pub use ui::build_initial_ui;
 pub use wire_stats::{measure_transaction, TransactionWireStats};

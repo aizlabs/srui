@@ -30,8 +30,8 @@ Guardrails that are always in force:
 - **Per-client selection ownership.** A selection is recorded against the `client_instance_id` that made it, and "Kill Selected" only ever resolves the activating client's own selection — never another client's, and never a shared fallback. An event that carries no `client_instance_id` cannot be attributed to an owner and is refused outright.
 - **PID-reuse protection & Linux `pidfd`.** A selection is an `ItemId`. The server resolves it to the `ProcessKey(pid, start_time)` it assigned. On Linux, signalling uses `pidfd_open` and `pidfd_send_signal` for race-free process targeting. On other Unix platforms, the server re-reads the live process start time immediately before signalling via `kill(2)`. A mismatch or vanished PID is refused as stale.
 - **Single-process numeric validation.** PID targets are strictly validated within `[1, i32::MAX]` before invoking system APIs. Process group (`0`, negative) and broadcast (`-1`) targets cannot be signalled.
-- **Client-scoped actions.** Selections and activations are scoped to the activating client's `client_instance_id`. Client A cannot trigger termination of Client B's selected row.
-- **Socket protection.** The Unix domain socket is guarded by an exclusive `flock(2)` lock file held for the process lifetime, plus a connect probe, before any stale predecessor is unlinked — a live endpoint can never be hijacked, and a crashed server's socket is still reclaimable.
+- **Socket protection.** The Unix domain socket is created `0600` (owner-only) and guarded by an exclusive `flock(2)` lock file held for the process lifetime, plus a connect probe, before any stale predecessor is unlinked — a live endpoint can never be hijacked, and a crashed server's socket is still reclaimable.
+- **The socket is the authorization boundary.** There is no per-connection authentication: anything that can connect to the endpoint can select a row and press **Kill Selected**, subject to every guardrail above. `0600` on the socket, and a private parent directory (`$XDG_RUNTIME_DIR`, or a `0700` directory you choose with `--socket`), are therefore load-bearing. Over SSH the SSH login *is* the authentication. Do not place the socket in a world-writable directory or relax its mode.
 - **No shell.** Termination goes directly through `kill(2)` / `pidfd`. The example never constructs shell commands and never invokes `sh`, `bash`, `zsh`, or `system()`.
 - **PID text is never trusted.** Row text, PID text, row index, labels and `action_key` sent by the client are ignored when resolving the target.
 
@@ -89,14 +89,16 @@ and exits without panicking.
 ## Run over SSH
 
 On the **server** host, run the monitor on the default socket path, then expose the bridge as an SSH
-subsystem in `/etc/ssh/sshd_config`:
+subsystem in `/etc/ssh/sshd_config`, pointing it at the monitor's endpoint:
 
 ```
-Subsystem srui /usr/local/bin/srui-ssh-bridge
+Subsystem srui /usr/local/bin/srui-ssh-bridge --socket /run/user/1000/srui-process-monitor.sock
 ```
 
-(`srui-ssh-bridge` is built from `server-rust/ssh-bridge`; it connects to
-`$XDG_RUNTIME_DIR/srui-sessiond.sock`, falling back to the temp directory, and forwards stdio.)
+(`srui-ssh-bridge` is built from `server-rust/ssh-bridge` and forwards stdio to the socket it is
+given. Its *default* is `$XDG_RUNTIME_DIR/srui-sessiond.sock`, falling back to the temp directory —
+that is `srui-sessiond`'s endpoint, not this example's, so the `--socket` argument above is
+required. Substitute the `$XDG_RUNTIME_DIR` of the account that runs the monitor.)
 
 On the **client** Mac:
 

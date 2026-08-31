@@ -4,10 +4,11 @@ use srui_sdk::*;
 use srui_semantic_tree::ModelItem;
 use srui_sessiond::{Session, SessionError};
 
+use crate::domain::KILL_STATUS_IDLE;
 use crate::domain::{
     VisibleRow, ACTIONS_ROW_ID, COLUMN_ID, COLUMN_TITLES, CPU_PROGRESS_ID, HEADING_ID,
-    KILL_ACTION_KEY, KILL_BUTTON_ID, MAX_ITEMS_PER_MODEL_OP, MEM_PROGRESS_ID, PROCESS_MODEL_ID,
-    PROCESS_TABLE_ID, SHOW_ALL_ACTION_KEY, SHOW_ALL_ID, STATS_ROW_ID, SURFACE_ID,
+    KILL_ACTION_KEY, KILL_BUTTON_ID, KILL_STATUS_ID, MAX_ITEMS_PER_MODEL_OP, MEM_PROGRESS_ID,
+    PROCESS_MODEL_ID, PROCESS_TABLE_ID, SHOW_ALL_ACTION_KEY, SHOW_ALL_ID, STATS_ROW_ID, SURFACE_ID,
 };
 use crate::state::MonitorState;
 
@@ -110,6 +111,15 @@ pub fn build_initial_ui(session: &Session, state: &MonitorState) -> Result<(), S
             .label("Kill Selected")
             .role(ActionRole::Destructive)
             .action_key(KILL_ACTION_KEY)
+            .create(ui)?;
+
+        // Every kill outcome — refusal or success — is reported here as semantic state, so a
+        // client can tell "denied" from "signalled" without reading the server's stderr (§7.2).
+        Text::builder(KILL_STATUS_ID)
+            .parent(ACTIONS_ROW_ID)
+            .text(KILL_STATUS_IDLE)
+            .role(TextRole::Caption)
+            .accessible_description("Outcome of the last Kill Selected activation")
             .create(ui)?;
 
         Ok(())

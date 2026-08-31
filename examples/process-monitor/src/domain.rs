@@ -27,6 +27,8 @@ pub const PROCESS_TABLE_ID: NodeId = NodeId::new(8);
 pub const ACTIONS_ROW_ID: NodeId = NodeId::new(9);
 /// "Kill Selected" button node.
 pub const KILL_BUTTON_ID: NodeId = NodeId::new(10);
+/// Status text reporting the outcome of the last "Kill Selected" activation.
+pub const KILL_STATUS_ID: NodeId = NodeId::new(11);
 
 /// Collection model backing the process table (§8).
 pub const PROCESS_MODEL_ID: ModelId = ModelId::new(1);
@@ -35,6 +37,9 @@ pub const PROCESS_MODEL_ID: ModelId = ModelId::new(1);
 pub const SHOW_ALL_ACTION_KEY: &str = "process.show-all";
 /// Opaque action key advertised on the kill button (§7.7). Never parsed or executed.
 pub const KILL_ACTION_KEY: &str = "process.kill-selected";
+
+/// Status text shown before any "Kill Selected" activation has been resolved.
+pub const KILL_STATUS_IDLE: &str = "No termination requested yet";
 
 /// Table column titles, in row-value order.
 pub const COLUMN_TITLES: [&str; 4] = ["PID", "Name", "CPU %", "Memory MiB"];

@@ -107,7 +107,7 @@ async fn fresh_hello_receives_welcome_then_the_complete_process_monitor_snapshot
 
     assert_eq!(
         kinds.iter().filter(|kind| **kind == "CREATE_NODE").count(),
-        10,
+        11,
         "snapshot carries the full node tree"
     );
     assert_eq!(
@@ -135,7 +135,7 @@ async fn wire_statistics_use_the_same_framing_path_as_the_live_connection() {
     let (snapshot_bytes, snapshot_message) = read_frame(&mut client).await;
     let snapshot_transaction = expect_transaction(snapshot_message);
 
-    let stats = measure_transaction(&snapshot_transaction);
+    let stats = measure_transaction(&snapshot_transaction).expect("snapshot frames");
     assert_eq!(
         stats.framed_bytes, snapshot_bytes,
         "wire statistics must measure the exact frame the client receives"
@@ -143,6 +143,28 @@ async fn wire_statistics_use_the_same_framing_path_as_the_live_connection() {
     assert_eq!(stats.operations, snapshot_transaction.operations.len());
 
     shutdown.cancel();
+}
+
+#[test]
+fn a_transaction_that_cannot_be_framed_reports_an_error_rather_than_zero_bytes() {
+    // Past the §26 frame ceiling: this transaction cannot reach a client, and reporting
+    // `framed_bytes=0` would hide exactly the case wire statistics exist to diagnose.
+    let oversized = srui_sdk::Operation::set_property(
+        srui_sdk::NodeId::new(1),
+        srui_sdk::TEXT,
+        srui_sdk::Value::String("x".repeat(17 * 1024 * 1024)),
+    );
+    let transaction = srui_protocol::Transaction {
+        new_revision: 7,
+        operations: vec![oversized.to_wire()],
+        ..Default::default()
+    };
+
+    let error = measure_transaction(&transaction).expect_err("oversize frame is not measurable");
+    assert!(
+        error.contains("revision 7"),
+        "error must identify the transaction: {error}"
+    );
 }
 
 #[tokio::test]
@@ -153,7 +175,8 @@ async fn a_quiet_tick_is_materially_smaller_than_the_initial_snapshot() {
 
     let (_, _welcome) = read_frame(&mut client).await;
     let (snapshot_bytes, snapshot_message) = read_frame(&mut client).await;
-    let snapshot_stats = measure_transaction(&expect_transaction(snapshot_message));
+    let snapshot_stats =
+        measure_transaction(&expect_transaction(snapshot_message)).expect("snapshot frames");
 
     // A quiet tick: global CPU moved, one process changed, nothing appeared or exited.
     let mut processes = base_processes();
@@ -167,7 +190,7 @@ async fn a_quiet_tick_is_materially_smaller_than_the_initial_snapshot() {
 
     let (tick_bytes, tick_message) = read_frame(&mut client).await;
     let tick_transaction = expect_transaction(tick_message);
-    let tick_stats = measure_transaction(&tick_transaction);
+    let tick_stats = measure_transaction(&tick_transaction).expect("tick frames");
 
     assert_eq!(tick_stats.framed_bytes, tick_bytes);
     assert!(

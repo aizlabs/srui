@@ -157,36 +157,39 @@ fn acquire_socket_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Returns `true` when some server is currently listening on `path`.
+/// What a connect probe was able to establish about an existing socket path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketLiveness {
+    /// A server answered: the endpoint is in use.
+    Live,
+    /// The endpoint is definitively gone or definitively unserved.
+    Absent,
+    /// The probe failed in a way that does not prove anything either way.
+    Ambiguous,
+}
+
+/// Classifies an existing socket path by attempting one connection.
 ///
-/// A single connect attempt is enough here because it only has to catch a foreign listener that
-/// does not take the lock: another instance of this program is already excluded by
-/// [`acquire_socket_lock`], which is what makes a `ECONNREFUSED` from a live-but-backlog-saturated
-/// Darwin listener harmless.
-async fn socket_has_live_listener(path: &Path) -> std::io::Result<bool> {
+/// Only two outcomes are treated as proof of absence: the path no longer exists, or connection is
+/// refused. `ECONNREFUSED` is conclusive *here* precisely because [`acquire_socket_lock`] already
+/// excluded every other instance of this program, so it cannot be the backlog-saturated peer of a
+/// sibling daemon. Anything else — `EPERM`, `EACCES`, `ECONNRESET` — can equally well come from a
+/// live foreign listener, and a foreign endpoint must never be displaced.
+async fn probe_socket_liveness(path: &Path) -> std::io::Result<SocketLiveness> {
     if socket_identity(path)?.is_none() {
-        return Ok(false);
+        return Ok(SocketLiveness::Absent);
     }
     match tokio::net::UnixStream::connect(path).await {
-        Ok(_) => Ok(true),
+        Ok(_) => Ok(SocketLiveness::Live),
         Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::PermissionDenied
-                    | std::io::ErrorKind::ConnectionReset
-            ) || matches!(
-                error.raw_os_error(),
-                Some(libc::ECONNREFUSED)
-                    | Some(libc::EPERM)
-                    | Some(libc::EACCES)
-                    | Some(libc::ENOENT)
-            ) =>
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOENT)
+                || error.kind() == std::io::ErrorKind::ConnectionRefused
+                || error.raw_os_error() == Some(libc::ECONNREFUSED) =>
         {
-            Ok(false)
+            Ok(SocketLiveness::Absent)
         }
-        Err(error) => Err(error),
+        Err(_) => Ok(SocketLiveness::Ambiguous),
     }
 }
 
@@ -198,14 +201,26 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
 
     let lock = acquire_socket_lock(path)?;
 
-    if socket_has_live_listener(path).await? {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AddrInUse,
-            format!(
-                "{} is already served by a running process; pass a different --socket",
-                path.display()
-            ),
-        ));
+    match probe_socket_liveness(path).await? {
+        SocketLiveness::Live => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is already served by a running process; pass a different --socket",
+                    path.display()
+                ),
+            ));
+        }
+        SocketLiveness::Ambiguous => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} could not be proven unused; refusing to unlink it. Pass a different --socket",
+                    path.display()
+                ),
+            ));
+        }
+        SocketLiveness::Absent => {}
     }
 
     // The lock is held across the unlink and the bind, so no other instance can slip in between.
@@ -216,7 +231,15 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
         std::fs::remove_file(path)?;
     }
 
-    let listener = UnixListener::bind(path)?;
+    // Create the endpoint as `0600`: a Unix socket honours the umask, and any connector can send
+    // "Kill Selected" activations, so the endpoint must not be world-connectable.
+    //
+    // SAFETY: `umask(2)` reads and replaces a process-wide value and cannot fail. This runs during
+    // single-threaded startup, and the previous value is restored immediately after the bind.
+    let previous_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(path);
+    unsafe { libc::umask(previous_umask) };
+    let listener = bind_result?;
     let identity = socket_identity(path)?.ok_or_else(|| {
         std::io::Error::other(format!(
             "{} vanished immediately after bind",
@@ -250,11 +273,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Ignore SIGHUP so detached process-monitor daemons survive SSH bridge disconnects (§17, §20.2).
+    // Failing to install it silently would leave the daemon killable by the very disconnect this
+    // call exists to survive, so the error is propagated instead of dropped.
+    //
+    // SAFETY: `signal(2)` mutates process-wide disposition. This runs during single-threaded
+    // startup, before any task is spawned and before the socket exists, so no other thread can
+    // observe or race the intermediate disposition, and `SigIgn` installs no handler that could
+    // run non-async-signal-safe code.
     unsafe {
-        let _ = nix::sys::signal::signal(
+        nix::sys::signal::signal(
             nix::sys::signal::Signal::SIGHUP,
             nix::sys::signal::SigHandler::SigIgn,
-        );
+        )
+        .map_err(|errno| format!("failed to ignore SIGHUP: {errno}"))?;
     }
 
     let session = Arc::new(Session::mint());
@@ -271,7 +302,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     received = receiver.recv() => match received {
-                        Ok(transaction) => info!(target: "srui::wire_stats", "{}", measure_transaction(&transaction)),
+                        Ok(transaction) => match measure_transaction(&transaction) {
+                            Ok(stats) => info!(target: "srui::wire_stats", "{stats}"),
+                            Err(error) => warn!(target: "srui::wire_stats", "{error}"),
+                        },
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!("wire-stats observer lagged by {skipped} transactions");
                         }

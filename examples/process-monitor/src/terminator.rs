@@ -96,36 +96,71 @@ impl ProcessTerminator for SignalTerminator {
 mod linux_pidfd {
     use super::*;
 
+    /// Owns a `pidfd` and closes it on every exit path.
+    struct PidFd(libc::c_int);
+
+    impl Drop for PidFd {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a descriptor this type opened and never handed out, so closing
+            // it exactly once here cannot close a descriptor another owner still uses.
+            unsafe { libc::close(self.0) };
+        }
+    }
+
+    fn errno_to_terminate_error(err: &std::io::Error) -> TerminateError {
+        match err.raw_os_error() {
+            Some(libc::ESRCH) => TerminateError::NoSuchProcess,
+            Some(libc::EPERM) => TerminateError::PermissionDenied,
+            _ => TerminateError::Other(err.to_string()),
+        }
+    }
+
+    /// Re-reads the start time the same way the enumeration that produced [`ProcessKey`] did.
+    fn live_start_time(pid: u32) -> Option<u64> {
+        let pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        system.process(pid).map(|process| process.start_time())
+    }
+
+    /// Signals `target` through a `pidfd`, which stays bound to one process instance for its whole
+    /// lifetime even if the PID is recycled.
+    ///
+    /// The identity check the caller performed happens *before* the handle exists, so it cannot
+    /// rule out a PID reuse between that check and `pidfd_open`. The start time is therefore
+    /// re-read here while the descriptor is already held: from that point the fd, not the number,
+    /// designates the target, so a process that passes this check is the one that gets the signal.
     pub fn terminate_pidfd(target: ProcessKey) -> Result<(), TerminateError> {
         let pid = signal_target_pid(target.pid)?;
-        unsafe {
-            let fd = libc::syscall(libc::SYS_pidfd_open, pid, 0);
-            if fd < 0 {
-                let err = std::io::Error::last_os_error();
-                return match err.raw_os_error() {
-                    Some(libc::ESRCH) => Err(TerminateError::NoSuchProcess),
-                    Some(libc::EPERM) => Err(TerminateError::PermissionDenied),
-                    _ => Err(TerminateError::Other(err.to_string())),
-                };
-            }
 
-            let ret = libc::syscall(
+        // SAFETY: `pidfd_open` only reads `pid` by value and returns a new descriptor or -1; no
+        // pointers are passed and no memory is shared with the kernel.
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if raw < 0 {
+            return Err(errno_to_terminate_error(&std::io::Error::last_os_error()));
+        }
+        let fd = PidFd(raw as libc::c_int);
+
+        // The handle is open, so this comparison can no longer be invalidated by PID reuse.
+        match live_start_time(target.pid) {
+            Some(start_time) if start_time == target.start_time => {}
+            _ => return Err(TerminateError::NoSuchProcess),
+        }
+
+        // SAFETY: `fd.0` is a live descriptor owned by `fd`, and the `siginfo_t` argument is the
+        // documented null pointer meaning "synthesize the default signal info".
+        let sent = unsafe {
+            libc::syscall(
                 libc::SYS_pidfd_send_signal,
-                fd,
+                fd.0,
                 libc::SIGTERM,
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
-            );
-            libc::close(fd as libc::c_int);
-            if ret < 0 {
-                let err = std::io::Error::last_os_error();
-                return match err.raw_os_error() {
-                    Some(libc::ESRCH) => Err(TerminateError::NoSuchProcess),
-                    Some(libc::EPERM) => Err(TerminateError::PermissionDenied),
-                    _ => Err(TerminateError::Other(err.to_string())),
-                };
-            }
-            Ok(())
+            )
+        };
+        if sent < 0 {
+            return Err(errno_to_terminate_error(&std::io::Error::last_os_error()));
         }
+        Ok(())
     }
 }

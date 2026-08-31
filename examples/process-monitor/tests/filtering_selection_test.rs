@@ -286,6 +286,66 @@ fn multi_client_selections_are_isolated_and_cleared_independently() {
 }
 
 #[test]
+fn client_selection_state_is_bounded_and_rejects_oversized_identifiers() {
+    let fixture = base_fixture();
+    let revision = fixture.session.current_revision();
+    let item = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+
+    // An identifier past the accepted length is refused rather than stored.
+    let mut oversized = selection_event(1, revision, item);
+    oversized.client_instance_id = vec![b'x'; MAX_CLIENT_INSTANCE_ID_LEN + 1];
+    fixture
+        .session
+        .process_event(&oversized)
+        .expect("event processed");
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(MonitorState::client_selection_count),
+        0
+    );
+
+    // A peer reconnecting under fresh ids while holding a long-lived row cannot grow the map:
+    // the least recently selected client is evicted once the cap is reached.
+    let overflow = MAX_CLIENT_SELECTIONS + 20;
+    for index in 0..overflow {
+        let mut event = selection_event(2 + index as u64, revision, item);
+        event.client_instance_id = format!("client-{index}").into_bytes();
+        fixture
+            .session
+            .process_event(&event)
+            .expect("event processed");
+    }
+
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(MonitorState::client_selection_count),
+        MAX_CLIENT_SELECTIONS
+    );
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|state| state.selected_item_for_client(b"client-0")),
+        None
+    );
+    let newest = format!("client-{}", overflow - 1).into_bytes();
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|state| state.selected_item_for_client(&newest)),
+        Some(item)
+    );
+}
+
+#[test]
 fn show_all_toggle_reaffirms_state_when_commit_fails() {
     // A foreign-user process whose name exceeds the §26 maximum string length: invisible while
     // `show_all` is false, and impossible to publish once the toggle flips, so the whole

@@ -239,6 +239,68 @@ struct EventOutboxRetryTests {
         await failing.close()
     }
 
+    @Test(
+        "A resumed pending event retries until the server settles it",
+        .bug("https://github.com/aizlabs/srui/issues/17")
+    )
+    func resumedPendingEventRetriesUntilAcknowledged() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox(
+            replayRetryInitialDelay: .zero,
+            replayRetryMaximumDelay: .zero
+        )
+        let pending = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let resumedTransport = GatedTransport()
+        let attemptId = await outbox.beginResumeAttempt()
+        let resumeTask = Task {
+            try await outbox.completeSameSessionResume(
+                id: "session-a",
+                lastProcessedEventSeq: 0,
+                attemptId: attemptId,
+                via: resumedTransport,
+                enableNewEventsAfterReplay: true
+            )
+        }
+
+        await resumedTransport.waitForSendCount(1)
+        await resumedTransport.releaseNextSend()
+        #expect(try await resumeTask.value)
+
+        // The first replay overlapped the server's original in-flight delivery, so no ack arrived.
+        // The retry loop must send the same semantic event again on the resumed connection.
+        await resumedTransport.waitForSendCount(2)
+        let initialReplayFrame = try #require(await resumedTransport.frame(at: 0))
+        let retryFrame = try #require(await resumedTransport.frame(at: 1))
+        let initialReplay = try #require(
+            try events(in: [decodeFramedMessage(from: initialReplayFrame)]).first
+        )
+        let retry = try #require(
+            try events(in: [decodeFramedMessage(from: retryFrame)]).first
+        )
+        #expect(initialReplay.eventId == pending.eventId)
+        #expect(retry.eventId == pending.eventId)
+        #expect(retry.eventSeq == pending.eventSeq)
+        #expect(await outbox.isRetryingPendingEvents)
+
+        _ = await outbox.settleAcknowledgement(
+            eventId: pending.eventId,
+            throughSeq: pending.eventSeq,
+            sessionId: "session-a"
+        )
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.isRetryingPendingEvents == false)
+
+        await resumedTransport.releaseNextSend()
+        await resumedTransport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
     @Test("A SERVER EVENT_ACK settles the event and raises last_acked_event_seq (§18.2)")
     func serverEventAckDrainsPendingEvent() async throws {
         let (client, server) = await PipeTransport.createPair()
@@ -493,10 +555,11 @@ struct EventOutboxRetryTests {
         let replayed = try #require(try events(in: afterDecision).last)
         #expect(replayed.eventId == pending.eventId)
         #expect(replayed.eventSeq == pending.eventSeq)
+        #expect(await outbox.isRetryingPendingEvents)
 
         await controller.stop()
+        #expect(await outbox.isRetryingPendingEvents == false)
         await collector.stop()
-        await seedClient.close()
         await seedServer.close()
         await server.close()
     }
@@ -546,10 +609,12 @@ struct EventOutboxRetryTests {
         let secondMessages = await secondCollector.wait(forAtLeast: 2)
         let replayed = try #require(try events(in: secondMessages).last)
         #expect(replayed.eventId == pending.eventId)
+        #expect(await outbox.isRetryingPendingEvents)
 
         await firstController.stop()
+        #expect(await outbox.isRetryingPendingEvents)
         await secondController.stop()
-        await firstCollector.stop()
+        #expect(await outbox.isRetryingPendingEvents == false)
         await secondCollector.stop()
         await seedClient.close()
         await seedServer.close()

@@ -296,7 +296,8 @@ struct EventOutboxTests {
         #expect(ev4.eventSeq == 4)
 
         await client2.close()
-        await server2.close()
+        await outbox.stopReplayRetries(attemptId: attemptId)
+        await client2.close()
     }
 
     @Test("Replaced session abandons pending events and resets sequence")

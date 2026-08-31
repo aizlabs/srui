@@ -934,6 +934,9 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// How long `stop()` lets the receive loop drain closed-transport frames before cancelling it.
+    private static let receiveDrainGraceNanoseconds: UInt64 = 2_000_000_000
+
     /// Stops the session coordinator and closes the underlying transport.
     public func stop() async {
         let task = withStateLock { () -> (Task<Void, Never>?, Bool) in
@@ -954,6 +957,19 @@ public final class SessionController: @unchecked Sendable {
         await transport.close()
 
         if let receiveTask = task.0 {
+            // Bound the drain. `Transport` is a public protocol: a conformer whose `close()` never
+            // finishes its stream continuation would otherwise hang `stop()` forever, with no
+            // cancellation to break it. Wait for the drain, but cancel it once the grace period
+            // elapses so teardown always completes (§22.2).
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await receiveTask.value }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: Self.receiveDrainGraceNanoseconds)
+                    receiveTask.cancel()
+                }
+                await group.next()
+                group.cancelAll()
+            }
             receiveTask.cancel()
             await receiveTask.value
         }

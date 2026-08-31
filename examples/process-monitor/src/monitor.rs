@@ -143,16 +143,19 @@ impl Monitor {
     /// Only the item id is trusted, and only if it currently exists in authoritative state. Row
     /// text, PID text, index, label, and `action_key` from the client are never consulted.
     pub fn on_selection_changed(&self, event: &WireEvent) {
+        // A selection belongs to the client instance that made it. An event with no client
+        // instance id cannot be attributed to an owner, so it is refused rather than recorded in a
+        // shared bucket that another client's "Kill Selected" could then resolve (§27).
+        if event.client_instance_id.is_empty() {
+            warn!("rejecting SELECTION_CHANGED without a client instance id");
+            return;
+        }
         let Some(item) = decode_item_id(event) else {
             warn!("rejecting SELECTION_CHANGED without a usable item id argument");
             return;
         };
         let mut state = lock_or_recover(&self.state);
-        let accepted = if !event.client_instance_id.is_empty() {
-            state.select_for_client(&event.client_instance_id, item)
-        } else {
-            state.select(item)
-        };
+        let accepted = state.select_for_client(&event.client_instance_id, item);
         if accepted {
             debug!("selection accepted for item {}", item.get());
         } else {
@@ -186,12 +189,13 @@ impl Monitor {
 
     /// Handles `ACTIVATE` on the "Kill Selected" button (§7.6, §27).
     pub fn on_kill_activated(&self, event: &WireEvent) {
-        let client_id = if !event.client_instance_id.is_empty() {
-            Some(event.client_instance_id.as_slice())
-        } else {
-            None
-        };
-        match self.kill_selected_for_client(client_id) {
+        // Only the activating client's own selection may be signalled, so an activation that
+        // carries no client instance id has no resolvable target (§27).
+        if event.client_instance_id.is_empty() {
+            warn!("kill refused: ACTIVATE carries no client instance id");
+            return;
+        }
+        match self.kill_selected_for_client(Some(event.client_instance_id.as_slice())) {
             KillOutcome::NoSelection => warn!("kill refused: no process is selected"),
             KillOutcome::UnknownSelection(item) => {
                 warn!("kill refused: selected item {} is stale", item.get())
@@ -210,6 +214,8 @@ impl Monitor {
     /// The PID is never read from client input: the selection is an [`ItemId`], resolved to a
     /// [`ProcessKey`] the server assigned, then revalidated against the live process start time
     /// immediately before signalling so a reused PID cannot be hit.
+    /// Resolves the process-local selection, i.e. the one recorded by [`MonitorState::select`]
+    /// rather than by a connected client instance.
     pub fn kill_selected(&self) -> KillOutcome {
         self.kill_selected_for_client(None)
     }
@@ -218,15 +224,11 @@ impl Monitor {
     pub fn kill_selected_for_client(&self, client_id: Option<&[u8]>) -> KillOutcome {
         let target = {
             let state = lock_or_recover(&self.state);
+            // No fallback across clients: a client that has selected nothing has nothing to kill,
+            // however many other clients hold selections (§27).
             let selected = match client_id {
                 Some(id) => state.selected_item_for_client(id),
-                None => state.selected_item().or_else(|| {
-                    if state.client_selections().len() == 1 {
-                        state.client_selections().values().next().copied()
-                    } else {
-                        None
-                    }
-                }),
+                None => state.selected_item(),
             };
             let Some(selected) = selected else {
                 return KillOutcome::NoSelection;

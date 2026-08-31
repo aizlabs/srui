@@ -27,10 +27,11 @@ There is no confirmation dialog and no undo — both are deliberately out of sco
 Guardrails that are always in force:
 
 - **Denylist.** PID 0 (which would signal the caller's entire process group), PID 1 (`init` / `launchd`), and the process-monitor server's own PID (`std::process::id()`) are strictly denylisted. A denied request performs no signal operation, leaves the server running, logs a clear refusal, and returns normally.
+- **Per-client selection ownership.** A selection is recorded against the `client_instance_id` that made it, and "Kill Selected" only ever resolves the activating client's own selection — never another client's, and never a shared fallback. An event that carries no `client_instance_id` cannot be attributed to an owner and is refused outright.
 - **PID-reuse protection & Linux `pidfd`.** A selection is an `ItemId`. The server resolves it to the `ProcessKey(pid, start_time)` it assigned. On Linux, signalling uses `pidfd_open` and `pidfd_send_signal` for race-free process targeting. On other Unix platforms, the server re-reads the live process start time immediately before signalling via `kill(2)`. A mismatch or vanished PID is refused as stale.
 - **Single-process numeric validation.** PID targets are strictly validated within `[1, i32::MAX]` before invoking system APIs. Process group (`0`, negative) and broadcast (`-1`) targets cannot be signalled.
 - **Client-scoped actions.** Selections and activations are scoped to the activating client's `client_instance_id`. Client A cannot trigger termination of Client B's selected row.
-- **Socket protection.** The Unix domain socket is created with restrictive permissions (`0600`) and validated via connect probes before unlinking stale predecessors, preventing hijacking of running endpoints.
+- **Socket protection.** The Unix domain socket is guarded by an exclusive `flock(2)` lock file held for the process lifetime, plus a connect probe, before any stale predecessor is unlinked — a live endpoint can never be hijacked, and a crashed server's socket is still reclaimable.
 - **No shell.** Termination goes directly through `kill(2)` / `pidfd`. The example never constructs shell commands and never invokes `sh`, `bash`, `zsh`, or `system()`.
 - **PID text is never trusted.** Row text, PID text, row index, labels and `action_key` sent by the client are ignored when resolving the target.
 
@@ -71,11 +72,16 @@ Options:
 | `--socket <path>` | Unix socket to bind. Defaults to `srui-process-monitor.sock`. |
 | `--wire-stats` | Log the framed byte size and operation mix of every committed transaction. |
 
-A malformed or missing option argument is rejected with a clear error. An existing socket path is
-only unlinked after verifying that it is a Unix socket *and* that nothing answers a connection on
-it: if another server is live there, this instance refuses to start instead of stealing the
-endpoint. On clean shutdown the socket is removed only while the path still resolves to the
-endpoint this process bound, so a replacement server's socket is left alone.
+A malformed or missing option argument is rejected with a clear error. Ownership of the endpoint is
+decided by an exclusive `flock(2)` on a `<socket>.lock` file, taken before the socket is touched and
+held for the process lifetime: a second instance refuses to start instead of stealing the endpoint,
+and because the kernel releases the lock when the process dies — `SIGKILL` included — a crashed
+server never leaves the path permanently claimed. A connect probe additionally refuses to displace a
+*foreign* listener that does not participate in the lock. The lock is held across the unlink and the
+bind, so two instances can never both conclude the existing socket was stale, and a path that exists
+but is not a socket is an error rather than a removal candidate. On clean shutdown the socket is
+removed only while the path still resolves to the endpoint this process bound, so a replacement
+server's socket is left alone.
 All diagnostics go to stderr, so a bridged stdout stays a pure binary protocol stream (§19.1).
 `Ctrl-C` stops accepting connections, cancels connection and polling tasks, cleans up the socket,
 and exits without panicking.

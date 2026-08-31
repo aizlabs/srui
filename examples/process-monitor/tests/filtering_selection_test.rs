@@ -4,7 +4,7 @@ mod common;
 
 use common::{base_fixture, base_processes, model_rows, MIB, OTHER_UID, UID};
 use srui_example_process_monitor::testing::{
-    argumentless_event, record, selection_event, snapshot, toggle_event,
+    argumentless_event, record, selection_event, snapshot, toggle_event, TEST_CLIENT_INSTANCE_ID,
 };
 use srui_example_process_monitor::*;
 use srui_sdk::{ItemId, Toggle, Value, SELECTION_CHANGED, VALUE, VALUE_CHANGED};
@@ -14,7 +14,7 @@ fn visible_pids(monitor: &Monitor) -> Vec<u64> {
 }
 
 fn test_client_selection(monitor: &Monitor) -> Option<ItemId> {
-    monitor.with_state(|state| state.selected_item_for_client(b"process-monitor-test"))
+    monitor.with_state(|state| state.selected_item_for_client(TEST_CLIENT_INSTANCE_ID.as_bytes()))
 }
 
 #[test]
@@ -97,10 +97,7 @@ fn a_known_selection_records_only_the_item_id() {
         .process_event(&event)
         .expect("event accepted");
 
-    assert_eq!(
-        test_client_selection(&fixture.monitor),
-        Some(item)
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), Some(item));
 }
 
 #[test]
@@ -114,10 +111,7 @@ fn an_unknown_selection_is_ignored() {
         .process_event(&event)
         .expect("event accepted");
 
-    assert_eq!(
-        test_client_selection(&fixture.monitor),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
     assert_eq!(fixture.session.current_revision(), revision);
 }
 
@@ -132,10 +126,7 @@ fn a_malformed_selection_argument_is_ignored() {
         .process_event(&bare)
         .expect("event accepted");
 
-    assert_eq!(
-        test_client_selection(&fixture.monitor),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
 }
 
 #[test]
@@ -157,10 +148,7 @@ fn selection_is_cleared_when_the_selected_process_exits() {
     fixture.source.publish(snapshot(25.0, remaining));
     fixture.monitor.tick().expect("tick");
 
-    assert_eq!(
-        test_client_selection(&fixture.monitor),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
 }
 
 #[test]
@@ -185,10 +173,7 @@ fn selection_is_cleared_when_the_selected_process_is_filtered_out() {
         .session
         .process_event(&selection_event(2, revision, foreign))
         .expect("event accepted");
-    assert_eq!(
-        test_client_selection(&fixture.monitor),
-        Some(foreign)
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), Some(foreign));
 
     let revision = fixture.session.current_revision();
     fixture
@@ -196,10 +181,7 @@ fn selection_is_cleared_when_the_selected_process_is_filtered_out() {
         .process_event(&toggle_event(3, revision, Value::Bool(false)))
         .expect("event accepted");
 
-    assert_eq!(
-        test_client_selection(&fixture.monitor),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
     fixture.session.with_store(|store| {
         assert_eq!(
             Toggle::new(SHOW_ALL_ID).value(store),
@@ -305,22 +287,31 @@ fn multi_client_selections_are_isolated_and_cleared_independently() {
 
 #[test]
 fn show_all_toggle_reaffirms_state_when_commit_fails() {
-    let fixture = base_fixture();
-    let initial_show_all = fixture.monitor.with_state(MonitorState::show_all);
-    assert!(!initial_show_all);
+    // A foreign-user process whose name exceeds the §26 maximum string length: invisible while
+    // `show_all` is false, and impossible to publish once the toggle flips, so the whole
+    // visibility transaction is rejected.
+    let oversized_name = "x".repeat(2 * 1024 * 1024);
+    let fixture = common::fixture(snapshot(
+        25.0,
+        vec![
+            record(20, 1_000, "beta", 2.0, 2 * MIB, Some(UID)),
+            record(40, 1_000, &oversized_name, 4.0, 4 * MIB, Some(OTHER_UID)),
+        ],
+    ));
+    assert!(!fixture.monitor.with_state(MonitorState::show_all));
+    let revision = fixture.session.current_revision();
 
-    // If an invalid toggle event with non-boolean payload arrives, the toggle value remains false.
-    let bogus_event = toggle_event(
-        1,
-        fixture.session.current_revision(),
-        Value::String("invalid".into()),
-    );
     fixture
         .session
-        .process_event(&bogus_event)
-        .expect("processed");
+        .process_event(&toggle_event(1, revision, Value::Bool(true)))
+        .expect("event accepted");
 
+    // Authoritative state stays on the value that is actually published ...
     assert!(!fixture.monitor.with_state(MonitorState::show_all));
+    assert_eq!(visible_pids(&fixture.monitor), vec![20]);
+    // ... and exactly one reaffirming transaction re-sends it, so the client switch that already
+    // flipped optimistically snaps back instead of staying desynced (§27).
+    assert_eq!(fixture.session.current_revision(), revision + 1);
     fixture.session.with_store(|store| {
         assert_eq!(
             store.get_node(SHOW_ALL_ID).unwrap().get_property(VALUE),

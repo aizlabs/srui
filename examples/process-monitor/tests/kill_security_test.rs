@@ -3,9 +3,19 @@
 mod common;
 
 use common::{base_processes, fixture, Fixture, MIB, UID};
-use srui_example_process_monitor::testing::{activate_event, record, selection_event, snapshot};
+use srui_example_process_monitor::testing::{
+    activate_event, record, selection_event, snapshot, TEST_CLIENT_INSTANCE_ID,
+};
 use srui_example_process_monitor::*;
 use srui_sdk::ItemId;
+
+/// Resolves the kill through the same client instance the event builders stamp, because a
+/// selection is only ever actionable by the client that made it (§27).
+fn kill(fixture: &Fixture) -> KillOutcome {
+    fixture
+        .monitor
+        .kill_selected_for_client(Some(TEST_CLIENT_INSTANCE_ID.as_bytes()))
+}
 
 fn select(fixture: &Fixture, pid: u32) -> ItemId {
     let item = fixture.monitor.with_state(|state| {
@@ -27,7 +37,7 @@ fn select(fixture: &Fixture, pid: u32) -> ItemId {
 #[test]
 fn no_selection_performs_no_termination() {
     let fixture = common::base_fixture();
-    assert_eq!(fixture.monitor.kill_selected(), KillOutcome::NoSelection);
+    assert_eq!(kill(&fixture), KillOutcome::NoSelection);
     assert!(fixture.terminator.calls().is_empty());
 }
 
@@ -44,7 +54,7 @@ fn a_stale_selection_performs_no_termination() {
     fixture.source.publish(snapshot(25.0, remaining));
     fixture.monitor.tick().expect("tick");
 
-    assert_eq!(fixture.monitor.kill_selected(), KillOutcome::NoSelection);
+    assert_eq!(kill(&fixture), KillOutcome::NoSelection);
     assert!(fixture.terminator.calls().is_empty());
 }
 
@@ -59,7 +69,7 @@ fn pid_1_is_denied() {
     ));
     select(&fixture, 1);
 
-    assert_eq!(fixture.monitor.kill_selected(), KillOutcome::Denied(1));
+    assert_eq!(kill(&fixture), KillOutcome::Denied(1));
     assert!(fixture.terminator.calls().is_empty());
 }
 
@@ -72,7 +82,7 @@ fn the_monitors_own_pid_is_denied() {
     ));
     select(&fixture, own);
 
-    assert_eq!(fixture.monitor.kill_selected(), KillOutcome::Denied(own));
+    assert_eq!(kill(&fixture), KillOutcome::Denied(own));
     assert!(fixture.terminator.calls().is_empty());
 }
 
@@ -84,10 +94,7 @@ fn a_start_time_mismatch_is_refused_as_stale() {
     // The PID was recycled between the sample and the activation.
     fixture.source.set_live_start_time(20, Some(999_999));
 
-    assert_eq!(
-        fixture.monitor.kill_selected(),
-        KillOutcome::StaleIdentity(20)
-    );
+    assert_eq!(kill(&fixture), KillOutcome::StaleIdentity(20));
     assert!(fixture.terminator.calls().is_empty());
 }
 
@@ -97,10 +104,7 @@ fn a_vanished_pid_is_refused_as_stale() {
     select(&fixture, 20);
     fixture.source.set_live_start_time(20, None);
 
-    assert_eq!(
-        fixture.monitor.kill_selected(),
-        KillOutcome::StaleIdentity(20)
-    );
+    assert_eq!(kill(&fixture), KillOutcome::StaleIdentity(20));
     assert!(fixture.terminator.calls().is_empty());
 }
 
@@ -109,7 +113,7 @@ fn a_valid_selection_signals_the_authoritative_numeric_pid_exactly_once() {
     let fixture = common::base_fixture();
     select(&fixture, 30);
 
-    assert_eq!(fixture.monitor.kill_selected(), KillOutcome::Terminated(30));
+    assert_eq!(kill(&fixture), KillOutcome::Terminated(30));
     assert_eq!(fixture.terminator.calls(), vec![30]);
 }
 
@@ -127,10 +131,7 @@ fn client_visible_row_text_is_never_used_to_resolve_the_target() {
 
     // The item id is not the pid either: identity resolves through server-owned state only.
     assert_ne!(item.get(), 4_242);
-    assert_eq!(
-        fixture.monitor.kill_selected(),
-        KillOutcome::Terminated(4_242)
-    );
+    assert_eq!(kill(&fixture), KillOutcome::Terminated(4_242));
     assert_eq!(fixture.terminator.calls(), vec![4_242]);
 }
 
@@ -155,7 +156,7 @@ fn an_os_refusal_is_reported_without_crashing() {
     session.process_event(&event).expect("selection accepted");
 
     assert_eq!(
-        monitor.kill_selected(),
+        monitor.kill_selected_for_client(Some(TEST_CLIENT_INSTANCE_ID.as_bytes())),
         KillOutcome::Failed(20, TerminateError::PermissionDenied)
     );
     assert_eq!(terminator.calls(), vec![20]);
@@ -199,7 +200,7 @@ fn pid_0_is_denied_because_it_would_signal_a_process_group() {
     ));
     select(&fixture, 0);
 
-    assert_eq!(fixture.monitor.kill_selected(), KillOutcome::Denied(0));
+    assert_eq!(kill(&fixture), KillOutcome::Denied(0));
     assert!(fixture.terminator.calls().is_empty());
 }
 
@@ -298,4 +299,73 @@ fn client_b_without_selection_cannot_kill_client_a_selection() {
         fixture.monitor.kill_selected_for_client(Some(b"client-b")),
         KillOutcome::NoSelection
     );
+}
+
+#[test]
+fn an_unidentified_client_cannot_kill_another_clients_selection() {
+    let fixture = common::base_fixture();
+    let revision = fixture.session.current_revision();
+
+    let item_20 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+
+    // Client A selects PID 20, and is the only client in the session holding a selection.
+    let mut event_a = selection_event(1, revision, item_20);
+    event_a.client_instance_id = b"client-a".to_vec();
+    fixture
+        .session
+        .process_event(&event_a)
+        .expect("client A selection accepted");
+
+    // A client that handshook without a client instance id activates "Kill Selected". Nothing
+    // identifies it as the owner of A's selection, so nothing is signalled.
+    let mut kill_anonymous = activate_event(2, revision, KILL_BUTTON_ID);
+    kill_anonymous.client_instance_id = Vec::new();
+    fixture
+        .session
+        .process_event(&kill_anonymous)
+        .expect("anonymous kill event processed");
+
+    assert!(fixture.terminator.calls().is_empty());
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|state| state.selected_item_for_client(b"client-a")),
+        Some(item_20)
+    );
+}
+
+#[test]
+fn an_unidentified_client_cannot_record_a_selection() {
+    let fixture = common::base_fixture();
+    let revision = fixture.session.current_revision();
+
+    let item_20 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+
+    let mut event = selection_event(1, revision, item_20);
+    event.client_instance_id = Vec::new();
+    fixture
+        .session
+        .process_event(&event)
+        .expect("anonymous selection event processed");
+
+    // Refused outright rather than parked in a bucket a later activation could resolve.
+    assert_eq!(
+        fixture.monitor.with_state(MonitorState::selected_item),
+        None
+    );
+    assert_eq!(kill(&fixture), KillOutcome::NoSelection);
 }

@@ -56,7 +56,7 @@ jobs:
             ~/.cargo/registry/cache
           key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('server-rust/fuzz/Cargo.lock') }}
           restore-keys: cargo-fuzz-${{ runner.os }}-
-        name: Install cargo-fuzz
+      - name: Install cargo-fuzz
         if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
         run: cargo install cargo-fuzz --locked
       - name: Seed fuzz corpora from conformance vectors
@@ -93,6 +93,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build server-rust binaries for integration tests
         run: cargo build --manifest-path server-rust/Cargo.toml
+      - name: Build example servers for integration tests
+        run: cargo build --manifest-path examples/counter/Cargo.toml
       - name: Verify SemanticModel does not import AppKit or Cocoa (§1)
         run: |
           if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then

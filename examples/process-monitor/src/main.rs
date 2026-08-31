@@ -68,6 +68,8 @@ struct OwnedSocket {
     path: PathBuf,
     /// `(device, inode)` of the endpoint created by this process.
     identity: (u64, u64),
+    /// Exclusive advisory lock on the socket path, released when this value is dropped.
+    _lock: std::fs::File,
 }
 
 impl OwnedSocket {
@@ -111,40 +113,81 @@ fn socket_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
     }
 }
 
-/// Probes an existing socket path to determine if a live server is listening.
+/// The advisory lock path guarding `socket_path`.
+fn socket_lock_path(socket_path: &Path) -> PathBuf {
+    let mut name = socket_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Takes the exclusive advisory lock that marks this process as the owner of the socket path.
 ///
-/// Retries connect attempts with backoff to avoid misinterpreting a Darwin listen backlog saturation
-/// as an inactive or stale socket.
-async fn probe_live_socket(path: &Path) -> std::io::Result<bool> {
+/// `flock(2)` is the authority on ownership, not a connect probe: the kernel releases it when the
+/// descriptor closes, including on `SIGKILL`, so a crashed server never leaves the endpoint
+/// permanently claimed, and holding it across the unlink-then-bind sequence closes the window in
+/// which two instances could both conclude the existing socket was stale.
+fn acquire_socket_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = socket_lock_path(socket_path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+
+    // SAFETY: `file` owns a valid open descriptor for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is already served by a running process; pass a different --socket",
+                    socket_path.display()
+                ),
+            ))
+        } else {
+            Err(error)
+        };
+    }
+    Ok(file)
+}
+
+/// Returns `true` when some server is currently listening on `path`.
+///
+/// A single connect attempt is enough here because it only has to catch a foreign listener that
+/// does not take the lock: another instance of this program is already excluded by
+/// [`acquire_socket_lock`], which is what makes a `ECONNREFUSED` from a live-but-backlog-saturated
+/// Darwin listener harmless.
+async fn socket_has_live_listener(path: &Path) -> std::io::Result<bool> {
     if socket_identity(path)?.is_none() {
         return Ok(false);
     }
-    for attempt in 0..3 {
-        match tokio::net::UnixStream::connect(path).await {
-            Ok(_) => return Ok(true),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::PermissionDenied
-                        | std::io::ErrorKind::ConnectionReset
-                ) || matches!(
-                    error.raw_os_error(),
-                    Some(libc::ECONNREFUSED)
-                        | Some(libc::EPERM)
-                        | Some(libc::EACCES)
-                        | Some(libc::ENOENT)
-                ) =>
-            {
-                if attempt < 2 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-            Err(error) => return Err(error),
+    match tokio::net::UnixStream::connect(path).await {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::ConnectionReset
+            ) || matches!(
+                error.raw_os_error(),
+                Some(libc::ECONNREFUSED)
+                    | Some(libc::EPERM)
+                    | Some(libc::EACCES)
+                    | Some(libc::ENOENT)
+            ) =>
+        {
+            Ok(false)
         }
+        Err(error) => Err(error),
     }
-    Ok(false)
 }
 
 /// Binds `path`, refusing to displace a socket another server is still listening on.
@@ -153,7 +196,9 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
         std::fs::create_dir_all(parent)?;
     }
 
-    if probe_live_socket(path).await? {
+    let lock = acquire_socket_lock(path)?;
+
+    if socket_has_live_listener(path).await? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!(
@@ -163,12 +208,12 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
         ));
     }
 
-    if path.exists() {
-        if let Err(unlink_error) = std::fs::remove_file(path) {
-            if unlink_error.kind() != std::io::ErrorKind::NotFound {
-                return Err(unlink_error);
-            }
-        }
+    // The lock is held across the unlink and the bind, so no other instance can slip in between.
+    // `socket_identity` refuses a path that exists but is not a socket, so an unrelated file is
+    // never a removal candidate.
+    if socket_identity(path)?.is_some() {
+        info!("removing stale socket {}", path.display());
+        std::fs::remove_file(path)?;
     }
 
     let listener = UnixListener::bind(path)?;
@@ -183,6 +228,7 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
         OwnedSocket {
             path: path.to_path_buf(),
             identity,
+            _lock: lock,
         },
     ))
 }

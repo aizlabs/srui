@@ -15,6 +15,12 @@ use crate::monitor::lock_or_recover;
 use crate::source::ProcessSource;
 use crate::terminator::{ProcessTerminator, TerminateError};
 
+/// Client instance id stamped on every wire event built by this module.
+///
+/// Selections are owned by the client instance that made them (§27), so a test that drives the
+/// monitor through these builders must resolve the selection under this id.
+pub const TEST_CLIENT_INSTANCE_ID: &str = "process-monitor-test";
+
 #[derive(Debug, Default)]
 struct FakeSourceInner {
     snapshot: ProcessSnapshot,
@@ -218,5 +224,5 @@ pub fn argumentless_event(
 }
 
 fn wire(event: SemanticEvent) -> WireEvent {
-    WireEvent::from(&event.with_client_instance_id("process-monitor-test"))
+    WireEvent::from(&event.with_client_instance_id(TEST_CLIENT_INSTANCE_ID))
 }

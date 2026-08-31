@@ -253,6 +253,8 @@ public actor EventOutbox {
     /// Binds a fresh HELLO handshake that did not carry an old retry set.
     func confirmFreshSession(id: String) -> Bool {
         guard activeResumeAttemptId == nil else { return false }
+        // The current HELLO generation owns this decision: retire the prior transport lease while
+        // retaining unsettled intents for explicit acknowledgement or a later resume.
         cancelReplayRetryLoop()
         pendingResumeFinalizationAttemptId = nil
         activeSessionId = id
@@ -349,7 +351,8 @@ public actor EventOutbox {
         pendingEvents.count
     }
 
-    /// Whether a same-session connection is scheduling retries for unsettled events.
+    /// Whether retry scheduling is active for unsettled events. This becomes false as soon
+    /// as the lease is invalidated, while an in-flight send may still be unwinding cancellation.
     var isRetryingPendingEvents: Bool {
         pendingEventReplayLoop.isRunning
     }
@@ -389,6 +392,8 @@ public actor EventOutbox {
         cancelReplayRetryLoop()
         guard activeResumeAttemptId == attemptId, pendingEvents.isEmpty == false else { return }
 
+        // The transport is valid for this lease's lifetime. SessionController invalidates resume
+        // work before replacing or closing the transport; the replay loop never owns teardown.
         replayLease = pendingEventReplayLoop.start(
             resumeScope: attemptId,
             replay: { [weak self] lease in

@@ -789,6 +789,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "getrandom",
+ "libc",
  "srui-event-dedupe",
  "srui-journal",
  "srui-protocol",

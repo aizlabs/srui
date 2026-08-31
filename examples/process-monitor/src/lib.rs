@@ -718,8 +718,15 @@ pub fn build_initial_ui(session: &Session, state: &MonitorState) -> Result<(), S
             TypeRef::TABLE,
             0,
         ))?;
-        if !items.is_empty() {
-            ui.apply_op(&Operation::model_insert(PROCESS_MODEL_ID, 0, items.clone()))?;
+        let mut offset: u64 = 0;
+        for chunk in items.chunks(MAX_ITEMS_PER_MODEL_OP) {
+            let chunk_len = chunk.len() as u64;
+            ui.apply_op(&Operation::model_insert(
+                PROCESS_MODEL_ID,
+                offset,
+                chunk.to_vec(),
+            ))?;
+            offset += chunk_len;
         }
 
         Surface::builder(SURFACE_ID)

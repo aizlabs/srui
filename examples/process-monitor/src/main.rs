@@ -111,27 +111,17 @@ fn socket_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
     }
 }
 
-/// Binds `path`, refusing to displace a socket another server is still listening on.
+/// Probes an existing socket path to determine if a live server is listening.
 ///
-/// An existing socket is probed by connecting to it: a successful connection means a live server
-/// owns the endpoint and this process must not start. Only a socket that refuses connections is
-/// treated as stale and unlinked.
-async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Retries connect attempts with backoff to avoid misinterpreting a Darwin listen backlog saturation
+/// as an inactive or stale socket.
+async fn probe_live_socket(path: &Path) -> std::io::Result<bool> {
+    if socket_identity(path)?.is_none() {
+        return Ok(false);
     }
-
-    if socket_identity(path)?.is_some() {
+    for attempt in 0..3 {
         match tokio::net::UnixStream::connect(path).await {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "{} is already served by a running process; pass a different --socket",
-                        path.display()
-                    ),
-                ));
-            }
+            Ok(_) => return Ok(true),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -147,10 +137,37 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
                         | Some(libc::ENOENT)
                 ) =>
             {
-                info!("removing stale socket {}", path.display());
-                std::fs::remove_file(path)?;
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
             }
             Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+/// Binds `path`, refusing to displace a socket another server is still listening on.
+async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if probe_live_socket(path).await? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "{} is already served by a running process; pass a different --socket",
+                path.display()
+            ),
+        ));
+    }
+
+    if path.exists() {
+        if let Err(unlink_error) = std::fs::remove_file(path) {
+            if unlink_error.kind() != std::io::ErrorKind::NotFound {
+                return Err(unlink_error);
+            }
         }
     }
 

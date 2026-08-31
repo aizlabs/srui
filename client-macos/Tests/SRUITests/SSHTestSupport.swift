@@ -40,6 +40,31 @@ enum SSHTestSupport {
         return UInt16.random(in: 23000...28000)
     }
 
+    static func waitForPort(port: UInt16, timeoutSeconds: TimeInterval = 5.0) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+            if fd >= 0 {
+                var addr = sockaddr_in()
+                addr.sin_family = sa_family_t(AF_INET)
+                addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+                addr.sin_port = port.bigEndian
+                let len = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let res = withUnsafePointer(to: &addr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        Darwin.connect(fd, sa, len)
+                    }
+                }
+                Darwin.close(fd)
+                if res == 0 {
+                    return
+                }
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw SSHTestSupportError.portTimeout(port)
+    }
+
     static func generateEd25519Key(at path: String) throws {
         let gen = Process()
         gen.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
@@ -63,11 +88,14 @@ enum SSHTestSupport {
 
 enum SSHTestSupportError: Error, CustomStringConvertible {
     case keyGenerationFailed(String)
+    case portTimeout(UInt16)
 
     var description: String {
         switch self {
         case .keyGenerationFailed(let path):
             return "ssh-keygen failed for \(path)"
+        case .portTimeout(let port):
+            return "timed out waiting for port \(port) to open"
         }
     }
 }

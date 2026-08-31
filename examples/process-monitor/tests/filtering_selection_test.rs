@@ -13,6 +13,10 @@ fn visible_pids(monitor: &Monitor) -> Vec<u64> {
     monitor.with_state(|state| state.visible().iter().map(|row| row.values.pid).collect())
 }
 
+fn test_client_selection(monitor: &Monitor) -> Option<ItemId> {
+    monitor.with_state(|state| state.selected_item_for_client(b"process-monitor-test"))
+}
+
 #[test]
 fn show_all_false_includes_only_the_effective_users_processes() {
     let fixture = base_fixture();
@@ -94,7 +98,7 @@ fn a_known_selection_records_only_the_item_id() {
         .expect("event accepted");
 
     assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
+        test_client_selection(&fixture.monitor),
         Some(item)
     );
 }
@@ -111,7 +115,7 @@ fn an_unknown_selection_is_ignored() {
         .expect("event accepted");
 
     assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
+        test_client_selection(&fixture.monitor),
         None
     );
     assert_eq!(fixture.session.current_revision(), revision);
@@ -129,7 +133,7 @@ fn a_malformed_selection_argument_is_ignored() {
         .expect("event accepted");
 
     assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
+        test_client_selection(&fixture.monitor),
         None
     );
 }
@@ -154,7 +158,7 @@ fn selection_is_cleared_when_the_selected_process_exits() {
     fixture.monitor.tick().expect("tick");
 
     assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
+        test_client_selection(&fixture.monitor),
         None
     );
 }
@@ -182,7 +186,7 @@ fn selection_is_cleared_when_the_selected_process_is_filtered_out() {
         .process_event(&selection_event(2, revision, foreign))
         .expect("event accepted");
     assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
+        test_client_selection(&fixture.monitor),
         Some(foreign)
     );
 
@@ -193,13 +197,14 @@ fn selection_is_cleared_when_the_selected_process_is_filtered_out() {
         .expect("event accepted");
 
     assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
+        test_client_selection(&fixture.monitor),
         None
     );
     fixture.session.with_store(|store| {
         assert_eq!(
-            store.get_node(SHOW_ALL_ID).unwrap().get_property(VALUE),
-            Some(&Value::Bool(false))
+            Toggle::new(SHOW_ALL_ID).value(store),
+            Some(false),
+            "show_all toggle property must update to false on the client"
         );
     });
 }
@@ -296,4 +301,30 @@ fn multi_client_selections_are_isolated_and_cleared_independently() {
             .with_state(|s| s.selected_item_for_client(b"client-b")),
         Some(item_30)
     );
+}
+
+#[test]
+fn show_all_toggle_reaffirms_state_when_commit_fails() {
+    let fixture = base_fixture();
+    let initial_show_all = fixture.monitor.with_state(MonitorState::show_all);
+    assert!(!initial_show_all);
+
+    // If an invalid toggle event with non-boolean payload arrives, the toggle value remains false.
+    let bogus_event = toggle_event(
+        1,
+        fixture.session.current_revision(),
+        Value::String("invalid".into()),
+    );
+    fixture
+        .session
+        .process_event(&bogus_event)
+        .expect("processed");
+
+    assert!(!fixture.monitor.with_state(MonitorState::show_all));
+    fixture.session.with_store(|store| {
+        assert_eq!(
+            store.get_node(SHOW_ALL_ID).unwrap().get_property(VALUE),
+            Some(&Value::Bool(false))
+        );
+    });
 }

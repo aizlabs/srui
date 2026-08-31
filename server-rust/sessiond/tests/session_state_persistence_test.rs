@@ -311,3 +311,18 @@ async fn test_process_restart_replaced_continuity_on_old_session_id_resume() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_terminal_session_state_rejects_attachment() {
+    let session = Arc::new(Session::mint());
+    assert_eq!(session.state(), SessionState::Detached);
+
+    session.terminate();
+    assert_eq!(session.state(), SessionState::Terminating);
+    assert!(session.attach().is_none());
+
+    let session_expired = Arc::new(Session::mint());
+    session_expired.expire();
+    assert_eq!(session_expired.state(), SessionState::Expired);
+    assert!(session_expired.attach().is_none());
+}

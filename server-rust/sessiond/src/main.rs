@@ -181,26 +181,18 @@ fn socket_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, u64)>
     }
 }
 
-/// Binds a Unix domain socket, verifying parent directory permissions and unlinking any stale
-/// predecessor safely without disturbing a live server.
-async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
+/// Probes an existing socket path to determine if a live server is listening.
+///
+/// Retries connect attempts with backoff to avoid misinterpreting a Darwin listen backlog saturation
+/// as an inactive or stale socket.
+async fn probe_live_socket(path: &std::path::Path) -> std::io::Result<bool> {
     use tokio::net::UnixStream;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if socket_identity(path)?.is_none() {
+        return Ok(false);
     }
-
-    if socket_identity(path)?.is_some() {
+    for attempt in 0..3 {
         match UnixStream::connect(path).await {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "{} is already served by a running process; pass a different socket path",
-                        path.display()
-                    ),
-                ));
-            }
+            Ok(_) => return Ok(true),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -216,13 +208,38 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
                         | Some(libc::ENOENT)
                 ) =>
             {
-                if let Err(unlink_error) = std::fs::remove_file(path) {
-                    if unlink_error.kind() != std::io::ErrorKind::NotFound {
-                        return Err(unlink_error);
-                    }
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
             Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+/// Binds a Unix domain socket, verifying parent directory permissions and unlinking any stale
+/// predecessor safely without disturbing a live server.
+async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if probe_live_socket(path).await? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "{} is already served by a running process; pass a different socket path",
+                path.display()
+            ),
+        ));
+    }
+
+    if path.exists() {
+        if let Err(unlink_error) = std::fs::remove_file(path) {
+            if unlink_error.kind() != std::io::ErrorKind::NotFound {
+                return Err(unlink_error);
+            }
         }
     }
 

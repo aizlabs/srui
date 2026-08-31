@@ -261,3 +261,41 @@ fn kill_activation_is_scoped_to_the_activating_client() {
 
     assert_eq!(fixture.terminator.calls(), vec![20, 30]);
 }
+
+#[test]
+fn client_b_without_selection_cannot_kill_client_a_selection() {
+    let fixture = common::base_fixture();
+    let revision = fixture.session.current_revision();
+
+    let item_20 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+
+    // Client A selects PID 20.
+    let mut event_a = selection_event(1, revision, item_20);
+    event_a.client_instance_id = b"client-a".to_vec();
+    fixture
+        .session
+        .process_event(&event_a)
+        .expect("client A selection accepted");
+
+    // Client B has never made any selection, but sends ACTIVATE on Kill Selected.
+    let mut kill_b = activate_event(2, revision, KILL_BUTTON_ID);
+    kill_b.client_instance_id = b"client-b".to_vec();
+    fixture
+        .session
+        .process_event(&kill_b)
+        .expect("client B kill event processed");
+
+    // Must NOT kill Client A's selection (PID 20) or any other process.
+    assert!(fixture.terminator.calls().is_empty());
+    assert_eq!(
+        fixture.monitor.kill_selected_for_client(Some(b"client-b")),
+        KillOutcome::NoSelection
+    );
+}

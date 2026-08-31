@@ -101,6 +101,11 @@ impl MonitorState {
         self.data.client_selections.get(client_instance_id).copied()
     }
 
+    /// Map of active client selections.
+    pub fn client_selections(&self) -> &HashMap<Vec<u8>, ItemId> {
+        &self.data.client_selections
+    }
+
     /// Rows currently published in the process model.
     pub fn visible(&self) -> &[VisibleRow] {
         &self.data.visible
@@ -309,7 +314,6 @@ impl MonitorState {
             self.data
                 .client_selections
                 .insert(client_instance_id.to_vec(), item);
-            self.data.selected_item = Some(item);
             true
         } else {
             false

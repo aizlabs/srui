@@ -173,7 +173,14 @@ impl Monitor {
         let plan = state.plan_visibility(show_all);
         match self.commit_plan(&mut state, plan) {
             Ok(count) => info!("show_all set to {show_all} ({count} operations)"),
-            Err(error) => warn!("failed to apply show_all change: {error}"),
+            Err(error) => {
+                warn!("failed to apply show_all change: {error}");
+                let current_show_all = state.show_all();
+                let _ = self.session.transaction(move |ui| {
+                    ui.set(SHOW_ALL_ID, VALUE, current_show_all)?;
+                    Ok(())
+                });
+            }
         }
     }
 
@@ -213,7 +220,13 @@ impl Monitor {
             let state = lock_or_recover(&self.state);
             let selected = match client_id {
                 Some(id) => state.selected_item_for_client(id),
-                None => state.selected_item(),
+                None => state.selected_item().or_else(|| {
+                    if state.client_selections().len() == 1 {
+                        state.client_selections().values().next().copied()
+                    } else {
+                        None
+                    }
+                }),
             };
             let Some(selected) = selected else {
                 return KillOutcome::NoSelection;

@@ -31,6 +31,14 @@ pub enum SessionState {
     Expired,
 }
 
+impl SessionState {
+    /// Returns `true` if this state is terminal (`Terminating` or `Expired`).
+    #[must_use]
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Terminating | Self::Expired)
+    }
+}
+
 impl std::fmt::Display for SessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -109,6 +117,9 @@ pub enum SessionError {
 
     #[error("transaction broadcast channel is closed")]
     BroadcastClosed,
+
+    #[error("session is in a terminal state ({0:?})")]
+    TerminalState(SessionState),
 
     #[error("transaction panicked: {0}")]
     Panicked(String),
@@ -359,25 +370,32 @@ impl Session {
     /// Attaches a transport connection to this session (§17, App. B).
     ///
     /// Increments the attached connection count and transitions `DETACHED -> ATTACHED`.
+    /// Returns `None` if the session is in a terminal state (`TERMINATING` or `EXPIRED`).
     /// Returns an [`AttachmentGuard`] that automatically decrements the count and transitions
     /// back to `DETACHED` when dropped.
     #[must_use]
-    pub fn attach(&self) -> AttachmentGuard {
-        {
-            let mut guard = lock_or_recover(&self.inner);
-            guard.attached_connections = guard.attached_connections.saturating_add(1);
-            if guard.state == SessionState::Detached {
-                guard.state = SessionState::Attached;
-                tracing::info!(
-                    session_id = %guard.session_id,
-                    active_attachments = guard.attached_connections,
-                    "Session transitioned to ATTACHED"
-                );
-            }
+    pub fn attach(&self) -> Option<AttachmentGuard> {
+        let mut guard = lock_or_recover(&self.inner);
+        if guard.state.is_terminal() {
+            tracing::warn!(
+                session_id = %guard.session_id,
+                state = ?guard.state,
+                "Refusing attachment to terminal session"
+            );
+            return None;
         }
-        AttachmentGuard {
+        guard.attached_connections = guard.attached_connections.saturating_add(1);
+        if guard.state == SessionState::Detached {
+            guard.state = SessionState::Attached;
+            tracing::info!(
+                session_id = %guard.session_id,
+                active_attachments = guard.attached_connections,
+                "Session transitioned to ATTACHED"
+            );
+        }
+        Some(AttachmentGuard {
             session: self.clone(),
-        }
+        })
     }
 
     /// Internal helper to detach a transport connection (§17, App. B).

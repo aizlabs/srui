@@ -397,19 +397,23 @@ public final class SessionController: @unchecked Sendable {
 
         do {
             for try await chunk in stream {
+                guard !Task.isCancelled else { break }
                 let messages: [SRUIMessage]
                 do {
                     messages = try streamDecoder.appendAndExtract(incoming: chunk)
                 } catch {
+                    guard !Task.isCancelled else { return }
                     await reportFailure(.decodeFailed("frame decode failed: \(error)"))
                     return
                 }
 
                 for msg in messages {
+                    guard !Task.isCancelled else { break }
                     await handleIncomingMessage(msg)
                 }
             }
         } catch {
+            guard !Task.isCancelled else { return }
             await reportFailure(.transportEnded("\(error)"))
             return
         }
@@ -899,8 +903,8 @@ public final class SessionController: @unchecked Sendable {
         guard let handler else { return }
 
         SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
-        handler(failure)
         await transport.close()
+        handler(failure)
     }
 
     /// Dispatches committed store state to AppKit on the main actor (§22.2).
@@ -950,6 +954,7 @@ public final class SessionController: @unchecked Sendable {
         await transport.close()
 
         if let receiveTask = task.0 {
+            receiveTask.cancel()
             await receiveTask.value
         }
 

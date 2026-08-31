@@ -263,11 +263,15 @@ fn multi_client_selections_are_isolated_and_cleared_independently() {
         .expect("client B selection accepted");
 
     assert_eq!(
-        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-a")),
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-a")),
         Some(item_20)
     );
     assert_eq!(
-        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-b")),
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-b")),
         Some(item_30)
     );
 
@@ -281,11 +285,15 @@ fn multi_client_selections_are_isolated_and_cleared_independently() {
 
     // Client A's selection is cleared because PID 20 exited, but Client B's selection of PID 30 remains intact!
     assert_eq!(
-        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-a")),
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-a")),
         None
     );
     assert_eq!(
-        fixture.monitor.with_state(|s| s.selected_item_for_client(b"client-b")),
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-b")),
         Some(item_30)
     );
 }

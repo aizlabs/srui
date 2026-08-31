@@ -141,7 +141,10 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
                         | std::io::ErrorKind::ConnectionReset
                 ) || matches!(
                     error.raw_os_error(),
-                    Some(libc::ECONNREFUSED) | Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENOENT)
+                    Some(libc::ECONNREFUSED)
+                        | Some(libc::EPERM)
+                        | Some(libc::EACCES)
+                        | Some(libc::ENOENT)
                 ) =>
             {
                 info!("removing stale socket {}", path.display());

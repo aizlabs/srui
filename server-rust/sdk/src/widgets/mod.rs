@@ -70,10 +70,24 @@ pub trait Widget: Copy + Clone + PartialEq + Eq + std::hash::Hash + std::fmt::De
 #[macro_use]
 pub mod macros;
 
+pub mod buttons;
 pub mod collections;
-pub mod controls;
+pub mod inputs;
+pub mod media;
 pub mod primitives;
+pub mod text;
 
+/// Compatibility module re-exporting control widgets.
+pub mod controls {
+    pub use super::buttons::*;
+    pub use super::inputs::*;
+    pub use super::media::*;
+    pub use super::text::*;
+}
+
+pub use buttons::*;
 pub use collections::*;
-pub use controls::*;
+pub use inputs::*;
+pub use media::*;
 pub use primitives::*;
+pub use text::*;

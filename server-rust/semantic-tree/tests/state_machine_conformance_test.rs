@@ -158,11 +158,15 @@ fn resolve_type_ref(val: &JsonValue) -> TypeRef {
         JsonValue::String(s) => resolve_standard_node_type(s)
             .unwrap_or_else(|e| panic!("Unknown node type {}: {}", s, e)),
         JsonValue::Object(map) => {
-            let ns = map.get("namespace_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let ns = map
+                .get("namespace_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
             let local = map
                 .get("local_id")
                 .and_then(|v| v.as_u64())
-                .expect("type_ref object missing numeric local_id field") as u32;
+                .expect("type_ref object missing numeric local_id field")
+                as u32;
             TypeRef::new(ns, local)
         }
         JsonValue::Number(n) => TypeRef::standard(
@@ -177,11 +181,15 @@ fn resolve_property_ref(val: &JsonValue) -> PropertyRef {
     match val {
         JsonValue::String(s) => resolve_property_name(s),
         JsonValue::Object(map) => {
-            let ns = map.get("namespace_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let ns = map
+                .get("namespace_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
             let local = map
                 .get("local_id")
                 .and_then(|v| v.as_u64())
-                .expect("property_ref object missing numeric local_id field") as u32;
+                .expect("property_ref object missing numeric local_id field")
+                as u32;
             PropertyRef::new(ns, local)
         }
         JsonValue::Number(n) => PropertyRef::standard(
@@ -193,8 +201,7 @@ fn resolve_property_ref(val: &JsonValue) -> PropertyRef {
 }
 
 fn resolve_property_name(name: &str) -> PropertyRef {
-    resolve_standard_property(name)
-        .unwrap_or_else(|e| panic!("Unknown property {}: {}", name, e))
+    resolve_standard_property(name).unwrap_or_else(|e| panic!("Unknown property {}: {}", name, e))
 }
 
 fn resolve_enum_token(enum_name: &str, val_name: &str) -> EnumToken {
@@ -227,14 +234,18 @@ fn convert_value(val: JsonValue) -> Value {
                 let enum_name = enum_val.as_str().expect("enum name string");
                 let val_name = val_val.as_str().expect("value name string");
                 Value::EnumToken(resolve_enum_token(enum_name, val_name))
-            } else if let (Some(enum_id), Some(val_id)) = (map.remove("enum_id"), map.remove("value_id")) {
+            } else if let (Some(enum_id), Some(val_id)) =
+                (map.remove("enum_id"), map.remove("value_id"))
+            {
                 Value::EnumToken(EnumToken::new(
                     enum_id
                         .as_u64()
-                        .expect("enum_id must be a non-negative integer") as u32,
+                        .expect("enum_id must be a non-negative integer")
+                        as u32,
                     val_id
                         .as_u64()
-                        .expect("value_id must be a non-negative integer") as u32,
+                        .expect("value_id must be a non-negative integer")
+                        as u32,
                 ))
             } else if let Some(node_id) = map.remove("node_id") {
                 Value::NodeId(NodeId::new(
@@ -295,7 +306,9 @@ fn convert_value(val: JsonValue) -> Value {
                     b.as_f64().expect("bottom must be a number"),
                     tr.as_f64().expect("trailing must be a number"),
                 ))
-            } else if let (Some(rec_type), Some(props)) = (map.remove("record_type"), map.remove("properties")) {
+            } else if let (Some(rec_type), Some(props)) =
+                (map.remove("record_type"), map.remove("properties"))
+            {
                 let type_ref = resolve_type_ref(&rec_type);
                 match props {
                     JsonValue::Object(prop_map) => {
@@ -373,7 +386,8 @@ fn convert_operation(op: FixtureOperation) -> Operation {
     match op.op_type.as_str() {
         "CREATE_NODE" => {
             let id = NodeId::new(op.node_id.expect("node_id for CREATE_NODE"));
-            let node_type = resolve_type_ref(op.node_type.as_ref().expect("node_type for CREATE_NODE"));
+            let node_type =
+                resolve_type_ref(op.node_type.as_ref().expect("node_type for CREATE_NODE"));
             let parent_id = op.parent_id.flatten().map(NodeId::new);
             let child_index = op.child_index.flatten();
             let properties = convert_properties(op.properties);
@@ -385,13 +399,15 @@ fn convert_operation(op: FixtureOperation) -> Operation {
         }
         "SET_PROPERTY" => {
             let id = NodeId::new(op.node_id.expect("node_id for SET_PROPERTY"));
-            let property = resolve_property_ref(op.property.as_ref().expect("property for SET_PROPERTY"));
+            let property =
+                resolve_property_ref(op.property.as_ref().expect("property for SET_PROPERTY"));
             let value = convert_value(op.value.expect("value for SET_PROPERTY"));
             Operation::set_property(id, property, value)
         }
         "CLEAR_PROPERTY" => {
             let id = NodeId::new(op.node_id.expect("node_id for CLEAR_PROPERTY"));
-            let property = resolve_property_ref(op.property.as_ref().expect("property for CLEAR_PROPERTY"));
+            let property =
+                resolve_property_ref(op.property.as_ref().expect("property for CLEAR_PROPERTY"));
             Operation::clear_property(id, property)
         }
         "BATCH_PROPERTY_SET" => {
@@ -406,7 +422,11 @@ fn convert_operation(op: FixtureOperation) -> Operation {
             Operation::move_node(id, new_parent_id, new_child_index)
         }
         "REORDER_CHILDREN" => {
-            let parent_id = NodeId::new(op.node_id.or(op.parent_id.flatten()).expect("parent_id for REORDER_CHILDREN"));
+            let parent_id = NodeId::new(
+                op.node_id
+                    .or(op.parent_id.flatten())
+                    .expect("parent_id for REORDER_CHILDREN"),
+            );
             let new_order = op
                 .new_order
                 .as_ref()
@@ -418,7 +438,8 @@ fn convert_operation(op: FixtureOperation) -> Operation {
         }
         "CREATE_MODEL" => {
             let id = ModelId::new(op.model_id.expect("model_id for CREATE_MODEL"));
-            let model_type = resolve_type_ref(op.model_type.as_ref().expect("model_type for CREATE_MODEL"));
+            let model_type =
+                resolve_type_ref(op.model_type.as_ref().expect("model_type for CREATE_MODEL"));
             let item_count = op.item_count.expect("item_count for CREATE_MODEL");
             Operation::create_model(id, model_type, item_count)
         }
@@ -513,8 +534,11 @@ fn get_fixture_files() -> Vec<PathBuf> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dir = Path::new(manifest_dir).join("../../protocol/conformance-vectors/state-machine");
     let mut files = Vec::new();
-    for entry in fs::read_dir(&dir).unwrap_or_else(|e| panic!("Failed to read dir {:?}: {}", dir, e)) {
-        let entry = entry.unwrap_or_else(|e| panic!("Failed to read directory entry in {:?}: {}", dir, e));
+    for entry in
+        fs::read_dir(&dir).unwrap_or_else(|e| panic!("Failed to read dir {:?}: {}", dir, e))
+    {
+        let entry =
+            entry.unwrap_or_else(|e| panic!("Failed to read directory entry in {:?}: {}", dir, e));
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("json") {
             files.push(path);
@@ -534,7 +558,12 @@ fn get_fixture_files() -> Vec<PathBuf> {
 // State Snapshot for Rollback Verification
 // ==============================================================================
 
-type NodeSnapshot = (TypeRef, Option<NodeId>, Vec<NodeId>, HashMap<PropertyRef, Value>);
+type NodeSnapshot = (
+    TypeRef,
+    Option<NodeId>,
+    Vec<NodeId>,
+    HashMap<PropertyRef, Value>,
+);
 
 #[derive(Clone, Debug, PartialEq)]
 struct StoreSnapshot {
@@ -557,7 +586,11 @@ fn take_snapshot(store: &SemanticStore) -> StoreSnapshot {
         if let Some(model) = store.get_model(model_id) {
             models.insert(
                 model_id,
-                (model.model_type, model.item_count, model.cached_item_count()),
+                (
+                    model.model_type,
+                    model.item_count,
+                    model.cached_item_count(),
+                ),
             );
         }
     }
@@ -662,7 +695,10 @@ fn replay_fixture(path: &Path) {
                 result.err()
             );
             let committed_rev = result.unwrap();
-            let exp_rev = fixture.expected_outcome.committed_revision.expect("committed_revision");
+            let exp_rev = fixture
+                .expected_outcome
+                .committed_revision
+                .expect("committed_revision");
             assert_eq!(
                 committed_rev.get(),
                 exp_rev,
@@ -684,7 +720,8 @@ fn replay_fixture(path: &Path) {
                     "Store node_count mismatch in {}",
                     file_name
                 );
-                let exp_roots: Vec<NodeId> = state.roots.iter().map(|id| NodeId::new(*id)).collect();
+                let exp_roots: Vec<NodeId> =
+                    state.roots.iter().map(|id| NodeId::new(*id)).collect();
                 assert_eq!(
                     store.root_ids(),
                     exp_roots.as_slice(),
@@ -694,9 +731,9 @@ fn replay_fixture(path: &Path) {
 
                 for (id_str, exp_node) in &state.nodes {
                     let node_id = NodeId::new(id_str.parse::<u64>().expect("numeric node_id key"));
-                    let node = store
-                        .get_node(node_id)
-                        .unwrap_or_else(|| panic!("Expected node {} missing in {:?}", node_id, path));
+                    let node = store.get_node(node_id).unwrap_or_else(|| {
+                        panic!("Expected node {} missing in {:?}", node_id, path)
+                    });
 
                     let exp_type = resolve_type_ref(&exp_node.node_type);
                     assert_eq!(
@@ -711,8 +748,11 @@ fn replay_fixture(path: &Path) {
                         node_id,
                         path
                     );
-                    let exp_children: Vec<NodeId> =
-                        exp_node.ordered_children.iter().map(|c| NodeId::new(*c)).collect();
+                    let exp_children: Vec<NodeId> = exp_node
+                        .ordered_children
+                        .iter()
+                        .map(|c| NodeId::new(*c))
+                        .collect();
                     assert_eq!(
                         node.ordered_children, exp_children,
                         "Ordered children mismatch for node {} in {:?}",
@@ -723,7 +763,10 @@ fn replay_fixture(path: &Path) {
                         let prop_ref = resolve_property_name(k);
                         let exp_val = convert_value(v.clone());
                         let actual_val = node.properties.get(&prop_ref).unwrap_or_else(|| {
-                            panic!("Property {} missing on node {} in {}", k, node_id, file_name)
+                            panic!(
+                                "Property {} missing on node {} in {}",
+                                k, node_id, file_name
+                            )
                         });
                         assert_eq!(
                             actual_val, &exp_val,
@@ -741,10 +784,11 @@ fn replay_fixture(path: &Path) {
                     file_name
                 );
                 for (id_str, exp_model) in &state.models {
-                    let model_id = ModelId::new(id_str.parse::<u64>().expect("numeric model_id key"));
-                    let model = store
-                        .get_model(model_id)
-                        .unwrap_or_else(|| panic!("Expected model {} missing in {:?}", model_id, path));
+                    let model_id =
+                        ModelId::new(id_str.parse::<u64>().expect("numeric model_id key"));
+                    let model = store.get_model(model_id).unwrap_or_else(|| {
+                        panic!("Expected model {} missing in {:?}", model_id, path)
+                    });
 
                     assert_eq!(
                         model.item_count, exp_model.item_count,
@@ -774,9 +818,12 @@ fn replay_fixture(path: &Path) {
 
                     for (idx_str, exp_item) in &exp_model.items {
                         let idx = idx_str.parse::<u64>().expect("numeric item index key");
-                        let item = model
-                            .get_item_by_index(idx)
-                            .unwrap_or_else(|| panic!("Item at index {} missing in model {} in {:?}", idx, model_id, path));
+                        let item = model.get_item_by_index(idx).unwrap_or_else(|| {
+                            panic!(
+                                "Item at index {} missing in model {} in {:?}",
+                                idx, model_id, path
+                            )
+                        });
 
                         assert_eq!(
                             item.item_id.get(),
@@ -915,7 +962,9 @@ fn test_semantic_not_paint_architectural_invariants() {
             name
         );
         assert!(
-            !name.contains("color_hex") && !name.contains("background_color") && !name.contains("brush"),
+            !name.contains("color_hex")
+                && !name.contains("background_color")
+                && !name.contains("brush"),
             "Standard property {} ({}) must not prescribe direct painting brushes (§4.7)",
             id,
             name
@@ -938,7 +987,9 @@ fn test_semantic_not_paint_architectural_invariants() {
             name
         );
         assert!(
-            !name_lower.contains("paint") && !name_lower.contains("draw") && !name_lower.contains("render"),
+            !name_lower.contains("paint")
+                && !name_lower.contains("draw")
+                && !name_lower.contains("render"),
             "Operation {} ({}) must not be a paint or drawing command (§4.7, §7.1)",
             id,
             name

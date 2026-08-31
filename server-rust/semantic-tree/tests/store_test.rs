@@ -105,7 +105,10 @@ fn test_property_mutations_set_clear_batch() {
         .expect("set property");
     assert_eq!(prev, None);
     assert_eq!(
-        store.get_node(root_id).unwrap().get_property(PropertyRef::LABEL),
+        store
+            .get_node(root_id)
+            .unwrap()
+            .get_property(PropertyRef::LABEL),
         Some(&Value::from("Initial Title"))
     );
 
@@ -115,7 +118,10 @@ fn test_property_mutations_set_clear_batch() {
         .expect("update property");
     assert_eq!(prev, Some(Value::from("Initial Title")));
     assert_eq!(
-        store.get_node(root_id).unwrap().get_property(PropertyRef::LABEL),
+        store
+            .get_node(root_id)
+            .unwrap()
+            .get_property(PropertyRef::LABEL),
         Some(&Value::from("Updated Title"))
     );
 
@@ -130,15 +136,27 @@ fn test_property_mutations_set_clear_batch() {
         )
         .expect("batch set");
     let node = store.get_node(root_id).unwrap();
-    assert_eq!(node.get_property(PropertyRef::ENABLED), Some(&Value::from(false)));
-    assert_eq!(node.get_property(PropertyRef::BUSY), Some(&Value::from(true)));
+    assert_eq!(
+        node.get_property(PropertyRef::ENABLED),
+        Some(&Value::from(false))
+    );
+    assert_eq!(
+        node.get_property(PropertyRef::BUSY),
+        Some(&Value::from(true))
+    );
 
     // Clear property
     let removed = store
         .clear_property(root_id, PropertyRef::BUSY)
         .expect("clear property");
     assert_eq!(removed, Some(Value::from(true)));
-    assert_eq!(store.get_node(root_id).unwrap().get_property(PropertyRef::BUSY), None);
+    assert_eq!(
+        store
+            .get_node(root_id)
+            .unwrap()
+            .get_property(PropertyRef::BUSY),
+        None
+    );
 }
 
 #[test]
@@ -150,11 +168,21 @@ fn test_reorder_children() {
     let c2 = NodeId::new(20);
     let c3 = NodeId::new(30);
 
-    store.create_node(root_id, TypeRef::SURFACE, None, None, []).unwrap();
-    store.create_node(col_id, TypeRef::COLUMN, Some(root_id), None, []).unwrap();
-    store.create_node(c1, TypeRef::TEXT, Some(col_id), None, []).unwrap();
-    store.create_node(c2, TypeRef::TEXT, Some(col_id), None, []).unwrap();
-    store.create_node(c3, TypeRef::TEXT, Some(col_id), None, []).unwrap();
+    store
+        .create_node(root_id, TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(col_id, TypeRef::COLUMN, Some(root_id), None, [])
+        .unwrap();
+    store
+        .create_node(c1, TypeRef::TEXT, Some(col_id), None, [])
+        .unwrap();
+    store
+        .create_node(c2, TypeRef::TEXT, Some(col_id), None, [])
+        .unwrap();
+    store
+        .create_node(c3, TypeRef::TEXT, Some(col_id), None, [])
+        .unwrap();
 
     assert_eq!(store.children_of(col_id), Some(&[c1, c2, c3][..]));
 
@@ -196,11 +224,21 @@ fn test_move_node() {
     let item_id = NodeId::new(4);
     let item_child_id = NodeId::new(5);
 
-    store.create_node(root_id, TypeRef::SURFACE, None, None, []).unwrap();
-    store.create_node(col1_id, TypeRef::COLUMN, Some(root_id), None, []).unwrap();
-    store.create_node(col2_id, TypeRef::COLUMN, Some(root_id), None, []).unwrap();
-    store.create_node(item_id, TypeRef::ROW, Some(col1_id), None, []).unwrap();
-    store.create_node(item_child_id, TypeRef::TEXT, Some(item_id), None, []).unwrap();
+    store
+        .create_node(root_id, TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(col1_id, TypeRef::COLUMN, Some(root_id), None, [])
+        .unwrap();
+    store
+        .create_node(col2_id, TypeRef::COLUMN, Some(root_id), None, [])
+        .unwrap();
+    store
+        .create_node(item_id, TypeRef::ROW, Some(col1_id), None, [])
+        .unwrap();
+    store
+        .create_node(item_child_id, TypeRef::TEXT, Some(item_id), None, [])
+        .unwrap();
 
     assert_eq!(store.children_of(col1_id), Some(&[item_id][..]));
     assert_eq!(store.children_of(col2_id), Some(&[][..]));
@@ -235,11 +273,21 @@ fn test_move_node_same_parent_append_index() {
     let c2 = NodeId::new(4);
     let c3 = NodeId::new(5);
 
-    store.create_node(root_id, TypeRef::SURFACE, None, None, []).unwrap();
-    store.create_node(col_id, TypeRef::COLUMN, Some(root_id), None, []).unwrap();
-    store.create_node(c1, TypeRef::TEXT, Some(col_id), Some(0), []).unwrap();
-    store.create_node(c2, TypeRef::TEXT, Some(col_id), Some(1), []).unwrap();
-    store.create_node(c3, TypeRef::TEXT, Some(col_id), Some(2), []).unwrap();
+    store
+        .create_node(root_id, TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(col_id, TypeRef::COLUMN, Some(root_id), None, [])
+        .unwrap();
+    store
+        .create_node(c1, TypeRef::TEXT, Some(col_id), Some(0), [])
+        .unwrap();
+    store
+        .create_node(c2, TypeRef::TEXT, Some(col_id), Some(1), [])
+        .unwrap();
+    store
+        .create_node(c3, TypeRef::TEXT, Some(col_id), Some(2), [])
+        .unwrap();
 
     assert_eq!(store.children_of(col_id), Some(&[c1, c2, c3][..]));
 
@@ -259,10 +307,18 @@ fn test_move_node_cycle_prevention() {
     let child_id = NodeId::new(3);
     let grandchild_id = NodeId::new(4);
 
-    store.create_node(root_id, TypeRef::SURFACE, None, None, []).unwrap();
-    store.create_node(parent_id, TypeRef::COLUMN, Some(root_id), None, []).unwrap();
-    store.create_node(child_id, TypeRef::ROW, Some(parent_id), None, []).unwrap();
-    store.create_node(grandchild_id, TypeRef::TEXT, Some(child_id), None, []).unwrap();
+    store
+        .create_node(root_id, TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(parent_id, TypeRef::COLUMN, Some(root_id), None, [])
+        .unwrap();
+    store
+        .create_node(child_id, TypeRef::ROW, Some(parent_id), None, [])
+        .unwrap();
+    store
+        .create_node(grandchild_id, TypeRef::TEXT, Some(child_id), None, [])
+        .unwrap();
 
     // Moving parent under itself -> Cycle
     let err = store
@@ -302,11 +358,21 @@ fn test_delete_node_recursive_subtree_cleanup() {
     let c2 = NodeId::new(4);
     let gc1 = NodeId::new(5);
 
-    store.create_node(root_id, TypeRef::SURFACE, None, None, []).unwrap();
-    store.create_node(col_id, TypeRef::COLUMN, Some(root_id), None, []).unwrap();
-    store.create_node(c1, TypeRef::ROW, Some(col_id), None, []).unwrap();
-    store.create_node(gc1, TypeRef::TEXT, Some(c1), None, []).unwrap();
-    store.create_node(c2, TypeRef::BUTTON, Some(col_id), None, []).unwrap();
+    store
+        .create_node(root_id, TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(col_id, TypeRef::COLUMN, Some(root_id), None, [])
+        .unwrap();
+    store
+        .create_node(c1, TypeRef::ROW, Some(col_id), None, [])
+        .unwrap();
+    store
+        .create_node(gc1, TypeRef::TEXT, Some(c1), None, [])
+        .unwrap();
+    store
+        .create_node(c2, TypeRef::BUTTON, Some(col_id), None, [])
+        .unwrap();
 
     assert_eq!(store.node_count(), 5);
 
@@ -330,7 +396,9 @@ fn test_node_id_cannot_be_reused_even_after_deletion() {
     let root_id = NodeId::new(1);
     let item_id = NodeId::new(42);
 
-    store.create_node(root_id, TypeRef::SURFACE, None, None, []).unwrap();
+    store
+        .create_node(root_id, TypeRef::SURFACE, None, None, [])
+        .unwrap();
     store
         .create_node(item_id, TypeRef::BUTTON, Some(root_id), None, [])
         .unwrap();
@@ -380,9 +448,15 @@ fn test_max_tree_depth_enforced_and_store_unchanged() {
     let n3 = NodeId::new(3); // depth 3
     let n4 = NodeId::new(4); // depth 4 -> should fail
 
-    store.create_node(n1, TypeRef::SURFACE, None, None, []).unwrap();
-    store.create_node(n2, TypeRef::COLUMN, Some(n1), None, []).unwrap();
-    store.create_node(n3, TypeRef::ROW, Some(n2), None, []).unwrap();
+    store
+        .create_node(n1, TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(n2, TypeRef::COLUMN, Some(n1), None, [])
+        .unwrap();
+    store
+        .create_node(n3, TypeRef::ROW, Some(n2), None, [])
+        .unwrap();
 
     assert_eq!(store.node_depth(n3), Some(3));
     assert_eq!(store.node_count(), 3);
@@ -434,8 +508,12 @@ fn test_max_node_count_enforced_and_store_unchanged() {
     let n2 = NodeId::new(2);
     let n3 = NodeId::new(3);
 
-    store.create_node(n1, TypeRef::SURFACE, None, None, []).unwrap();
-    store.create_node(n2, TypeRef::BUTTON, Some(n1), None, []).unwrap();
+    store
+        .create_node(n1, TypeRef::SURFACE, None, None, [])
+        .unwrap();
+    store
+        .create_node(n2, TypeRef::BUTTON, Some(n1), None, [])
+        .unwrap();
 
     assert_eq!(store.node_count(), 2);
 
@@ -554,7 +632,10 @@ fn test_apply_protobuf_wire_operations() {
     };
     store.apply_operation(&set_op).expect("apply set_op");
     assert_eq!(
-        store.get_node(NodeId::new(100)).unwrap().get_property(PropertyRef::ENABLED),
+        store
+            .get_node(NodeId::new(100))
+            .unwrap()
+            .get_property(PropertyRef::ENABLED),
         Some(&Value::from(true))
     );
 
@@ -569,7 +650,10 @@ fn test_apply_protobuf_wire_operations() {
     };
     store.apply_operation(&clear_op).expect("apply clear_op");
     assert_eq!(
-        store.get_node(NodeId::new(100)).unwrap().get_property(PropertyRef::ENABLED),
+        store
+            .get_node(NodeId::new(100))
+            .unwrap()
+            .get_property(PropertyRef::ENABLED),
         None
     );
 
@@ -629,7 +713,9 @@ fn test_apply_protobuf_wire_operations() {
             },
         )),
     };
-    store.apply_operation(&child2).expect("create child2 with append sentinel");
+    store
+        .apply_operation(&child2)
+        .expect("create child2 with append sentinel");
     assert_eq!(
         store.children_of(NodeId::new(1)),
         Some(&[NodeId::new(2), NodeId::new(3)][..])
@@ -665,7 +751,9 @@ fn test_apply_protobuf_wire_operations() {
             },
         )),
     };
-    store.apply_operation(&move_op).expect("move child 2 to end");
+    store
+        .apply_operation(&move_op)
+        .expect("move child 2 to end");
     assert_eq!(
         store.children_of(NodeId::new(1)),
         Some(&[NodeId::new(4), NodeId::new(3), NodeId::new(2)][..])
@@ -690,7 +778,9 @@ fn test_wire_create_root_nodes_preserve_explicit_child_index() {
             },
         )),
     };
-    store.apply_operation(&root_b).expect("create root B at index 0");
+    store
+        .apply_operation(&root_b)
+        .expect("create root B at index 0");
 
     // First root appended at index 1
     let root_a = srui_protocol::Operation {
@@ -706,7 +796,9 @@ fn test_wire_create_root_nodes_preserve_explicit_child_index() {
             },
         )),
     };
-    store.apply_operation(&root_a).expect("create root A at index 1");
+    store
+        .apply_operation(&root_a)
+        .expect("create root A at index 1");
 
     assert_eq!(
         store.root_ids(),
@@ -733,9 +825,9 @@ fn test_nested_value_depth_limit_enforced() {
         .expect("depth 1 list ok");
 
     // Depth 3: List -> List -> List -> scalar (depth 4 when inspecting inner)
-    let nested_val = Value::List(vec![Value::List(vec![Value::List(vec![Value::List(vec![
-        Value::from(1i64),
-    ])])])]);
+    let nested_val = Value::List(vec![Value::List(vec![Value::List(vec![Value::List(
+        vec![Value::from(1i64)],
+    )])])]);
 
     let err = store
         .set_property(NodeId::new(1), PropertyRef::VALUE, nested_val)
@@ -743,7 +835,10 @@ fn test_nested_value_depth_limit_enforced() {
 
     assert!(matches!(
         err,
-        StoreError::MaxValueDepthExceeded { limit: 3, actual: 4 }
+        StoreError::MaxValueDepthExceeded {
+            limit: 3,
+            actual: 4
+        }
     ));
 }
 
@@ -752,7 +847,11 @@ fn test_max_list_elements_limit_enforced() {
     let limits = StoreLimits::with_tree_and_value_limits(64, 1000, 1024, 10, 3, 100);
     let mut store = SemanticStore::with_limits(limits);
 
-    let list_ok = Value::List(vec![Value::from(1i64), Value::from(2i64), Value::from(3i64)]);
+    let list_ok = Value::List(vec![
+        Value::from(1i64),
+        Value::from(2i64),
+        Value::from(3i64),
+    ]);
     store
         .create_node(
             NodeId::new(1),
@@ -775,7 +874,10 @@ fn test_max_list_elements_limit_enforced() {
 
     assert_eq!(
         err,
-        StoreError::MaxListLengthExceeded { limit: 3, actual: 4 }
+        StoreError::MaxListLengthExceeded {
+            limit: 3,
+            actual: 4
+        }
     );
 }
 
@@ -805,6 +907,9 @@ fn test_max_record_properties_limit_enforced() {
 
     assert_eq!(
         err,
-        StoreError::MaxRecordPropertiesExceeded { limit: 2, actual: 3 }
+        StoreError::MaxRecordPropertiesExceeded {
+            limit: 2,
+            actual: 3
+        }
     );
 }

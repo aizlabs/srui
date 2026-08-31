@@ -102,7 +102,6 @@ impl From<ModelId> for u64 {
     }
 }
 
-
 /// 256-bit SHA-256 binary digest identifying content-addressed resources (§7.4, §8, §18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResourceHash(pub [u8; 32]);

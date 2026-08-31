@@ -1,0 +1,29 @@
+[package]
+name = "srui-example-process-monitor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.39"
+nix = { version = "0.31", features = ["signal", "user"] }
+libc = "0.2"
+srui-sdk = { path = "../../server-rust/sdk" }
+srui-sessiond = { path = "../../server-rust/sessiond" }
+srui-protocol = { path = "../../server-rust/protocol" }
+srui-semantic-tree = { path = "../../server-rust/semantic-tree" }
+
+[dev-dependencies]
+futures = "0.3"
+
+[lib]
+name = "srui_example_process_monitor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "process-monitor"
+path = "src/main.rs"

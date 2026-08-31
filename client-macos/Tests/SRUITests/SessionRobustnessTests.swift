@@ -484,6 +484,31 @@ struct SessionRobustnessTests {
         await controller.stop()
     }
 
+    @Test("stop() during handshake send tears down transport and allows restart")
+    @MainActor
+    func stopDuringHandshakeSendDoesNotLeaveOrphanTask() async throws {
+        let transport = BlockingTransport()
+        let controller = SessionController(transport: transport)
+
+        let startTask = Task {
+            try await controller.start()
+        }
+
+        #expect(await Self.waitUntil { await transport.isSendBlocked })
+
+        await controller.stop()
+        _ = try? await startTask.value
+
+        #expect(await transport.isClosed)
+
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let restartController = SessionController(transport: clientTransport)
+        try await restartController.start()
+        try await serverTransport.send(data: try Self.framedWelcome())
+        await restartController.stop()
+        await serverTransport.close()
+    }
+
     @Test("stop() does not report a failure when the stream finishes")
     @MainActor
     func intentionalStopReportsNoFailure() async throws {
@@ -656,6 +681,49 @@ private actor EndedFlag {
     private var ended = false
     func markEnded() { ended = true }
     var isEnded: Bool { ended }
+}
+
+/// Transport whose `send` blocks until `releaseSend()` or `close()` so tests can race `stop()` with startup.
+private actor BlockingTransport: Transport {
+    private var sendBlocked = false
+    private var closed = false
+    private var sendWaiters: [CheckedContinuation<Void, Never>] = []
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let continuation: AsyncThrowingStream<Data, Error>.Continuation
+
+    init() {
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.continuation = continuation
+    }
+
+    var isSendBlocked: Bool { sendBlocked }
+    var isClosed: Bool { closed }
+
+    func send(data: Data) async throws {
+        guard !closed else { throw TransportError.closed }
+        sendBlocked = true
+        await withCheckedContinuation { sendWaiters.append($0) }
+        sendBlocked = false
+        guard !closed else { throw TransportError.closed }
+    }
+
+    func releaseSend() {
+        guard !sendWaiters.isEmpty else { return }
+        sendWaiters.removeFirst().resume()
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        closed = true
+        while !sendWaiters.isEmpty {
+            sendWaiters.removeFirst().resume()
+        }
+        continuation.finish()
+    }
 }
 
 /// Transport whose first `send` fails, modelling a handshake that never reaches the server.

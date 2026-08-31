@@ -4,8 +4,8 @@
 //! Used to replay state mutations upon client reconnect without resending full snapshots,
 //! while bounding memory usage according to [`async-bounded-channel`](rules/async-bounded-channel.md) principles.
 
-use std::collections::VecDeque;
 use srui_protocol::Transaction;
+use std::collections::VecDeque;
 use thiserror::Error;
 
 /// Default maximum number of historical transactions retained in the journal ring buffer (1024 revisions).
@@ -237,7 +237,13 @@ mod tests {
 
         // Non-contiguous (expected base 1, got 5)
         let err = journal.record(make_tx(5)).unwrap_err();
-        assert!(matches!(err, JournalError::NonContiguousRevision { expected: 1, actual: 5 }));
+        assert!(matches!(
+            err,
+            JournalError::NonContiguousRevision {
+                expected: 1,
+                actual: 5
+            }
+        ));
 
         // Invalid span (base 1, new 3)
         let bad_tx = Transaction {
@@ -247,6 +253,9 @@ mod tests {
             operations: vec![],
         };
         let err2 = journal.record(bad_tx).unwrap_err();
-        assert!(matches!(err2, JournalError::InvalidRevisionRange { base: 1, new: 3 }));
+        assert!(matches!(
+            err2,
+            JournalError::InvalidRevisionRange { base: 1, new: 3 }
+        ));
     }
 }

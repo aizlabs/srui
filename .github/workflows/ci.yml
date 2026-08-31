@@ -33,6 +33,31 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo check --workspace --all-targets
         working-directory: server-rust
+      - name: Build and test examples
+        run: |
+          cargo test --manifest-path ../examples/process-monitor/Cargo.toml
+          cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+        working-directory: server-rust
+
+  rust-linux:
+    name: Rust Build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build and test server-rust workspace
+        run: |
+          cargo test --workspace --all-targets
+          cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: server-rust
+      # The pidfd termination path is cfg(target_os = "linux") and is the safety-critical remote
+      # kill path on the expected server platform, so it must be compiled, linted and tested here.
+      - name: Build and test examples
+        run: |
+          cargo test --manifest-path ../examples/process-monitor/Cargo.toml
+          cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+        working-directory: server-rust
 
   fuzz:
     name: Decoder Fuzz Regression
@@ -84,6 +109,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build server-rust binaries for integration tests
+        run: cargo build --manifest-path server-rust/Cargo.toml
+      - name: Build example servers for integration tests
+        run: cargo build --manifest-path examples/counter/Cargo.toml
       - name: Verify SemanticModel does not import AppKit or Cocoa (§1)
         run: |
           if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then

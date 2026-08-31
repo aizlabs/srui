@@ -68,6 +68,12 @@ pub async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Attach at transport connect (§17, App. B). The guard drops on every exit path—including
+    // handshake failure, cancellation, and EOF—transitioning ATTACHED -> DETACHED.
+    let _attachment = session
+        .attach()
+        .ok_or_else(|| ConnectionError::Session(SessionError::TerminalState(session.state())))?;
+
     let (read_half, write_half) = tokio::io::split(stream);
     let mut framed_read = FramedRead::new(read_half, SruiCodec::new());
     let mut framed_write = FramedWrite::new(write_half, SruiCodec::new());
@@ -92,8 +98,8 @@ where
     let (client_instance_id, mut tx_rx) = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
-                "Received ClientHello from client instance {:?}",
-                hello.client_instance_id
+                client_instance_id = ?hello.client_instance_id,
+                "Received ClientHello"
             );
             let bootstrap = session.bootstrap_fresh_client(&hello)?;
             let welcome_envelope = SruiMessage {
@@ -110,8 +116,9 @@ where
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
             info!(
-                "Received ClientResume for session {} from revision {}",
-                resume.session_id, resume.last_applied_revision
+                session_id = %resume.session_id,
+                last_applied_revision = resume.last_applied_revision,
+                "Received ClientResume"
             );
             let bootstrap = session.bootstrap_resume(&resume)?;
             match bootstrap.outcome {
@@ -172,7 +179,7 @@ where
                         }
                     }
                     Some(Err(e)) => {
-                        error!("Framing error on client stream: {}", e);
+                        error!(error = %e, "Framing error on client stream");
                         return Err(ConnectionError::Framing(e));
                     }
                     None => {

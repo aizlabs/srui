@@ -161,6 +161,11 @@ public final class SessionController: @unchecked Sendable {
         withStateLock { _isDiverged }
     }
 
+    /// Current active session ID assigned by the server or requested during resume (§15, §18).
+    public var sessionId: String? {
+        withStateLock { currentSessionId }
+    }
+
     /// Invoked when the session stops tracking the authoritative stream. Always also reported to
     /// stderr, so a session can never fail completely silently (§4 inv. 13).
     public var onFailure: (@Sendable (SessionFailure) -> Void)? {
@@ -247,6 +252,9 @@ public final class SessionController: @unchecked Sendable {
                     self.eventDispatchEnabled = false
                     self.phase = .idle
                 }
+                Task { [transport] in
+                    await transport.close()
+                }
             }
         }
 
@@ -273,6 +281,7 @@ public final class SessionController: @unchecked Sendable {
 
             var envelope = SRUIMessage()
             envelope.clientResume = resume
+            guard withStateLock({ isRunning }) else { return }
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
             withStateLock {
                 self.phase = .awaitingResume(sessionId: requestedId, attemptId: resumeAttemptId)
@@ -285,11 +294,14 @@ public final class SessionController: @unchecked Sendable {
 
             var envelope = SRUIMessage()
             envelope.clientHello = hello
+            guard withStateLock({ isRunning }) else { return }
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
             withStateLock {
                 self.phase = .awaitingWelcome
             }
         }
+
+        guard withStateLock({ isRunning }) else { return }
 
         // Start receiving the handshake response before processing data.
         let task = Task.detached { [weak self] in
@@ -297,8 +309,14 @@ public final class SessionController: @unchecked Sendable {
             await self.runReceiveLoop()
         }
 
-        withStateLock {
+        let adopted = withStateLock { () -> Bool in
+            guard isRunning else { return false }
             self.receiveTask = task
+            return true
+        }
+        guard adopted else {
+            task.cancel()
+            return
         }
         didStart = true
     }
@@ -380,19 +398,23 @@ public final class SessionController: @unchecked Sendable {
 
         do {
             for try await chunk in stream {
+                guard !Task.isCancelled else { break }
                 let messages: [SRUIMessage]
                 do {
                     messages = try streamDecoder.appendAndExtract(incoming: chunk)
                 } catch {
+                    guard !Task.isCancelled else { return }
                     await reportFailure(.decodeFailed("frame decode failed: \(error)"))
                     return
                 }
 
                 for msg in messages {
+                    guard !Task.isCancelled else { break }
                     await handleIncomingMessage(msg)
                 }
             }
         } catch {
+            guard !Task.isCancelled else { return }
             await reportFailure(.transportEnded("\(error)"))
             return
         }
@@ -946,16 +968,67 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// How long `stop()` lets the receive loop drain closed-transport frames before cancelling it.
+    private static let receiveDrainGraceNanoseconds: UInt64 = 2_000_000_000
+
     /// Stops the session coordinator and closes the underlying transport.
     public func stop() async {
         let stoppedState: (
             receiveTask: Task<Void, Never>?,
-            replayAttemptId: UUID?
+            replayAttemptId: UUID?,
+            shouldStop: Bool
         ) = withStateLock {
-            guard isRunning else { return (nil, nil) }
+            guard isRunning else { return (nil, nil, false) }
             isRunning = false
-            let task = receiveTask
-            let replayAttemptId = resumeAttemptId ?? activeReplayRetryAttemptId
+            eventDispatchEnabled = false
+            return (
+                receiveTask,
+                resumeAttemptId ?? activeReplayRetryAttemptId,
+                true
+            )
+        }
+
+        guard stoppedState.shouldStop else { return }
+
+        if let replayAttemptId = stoppedState.replayAttemptId {
+            await outbox.stopResumeWork(attemptId: replayAttemptId)
+        }
+
+        // Close the transport first so the receive loop drains any buffered catch-up frames
+        // (welcome snapshot, replay) while handshake phase is still valid. Resetting `phase` or
+        // cancelling the task before that completes rejects in-flight transactions as protocol
+        // violations even though the server sent them in order (§15, §18).
+        // When `stop()` races `start()` before `receiveTask` is assigned, closing the transport
+        // still tears down an in-progress handshake send (§22.2).
+        await transport.close()
+
+        if let receiveTask = stoppedState.receiveTask {
+            // Bound the drain. `Transport` is a public protocol: a conformer whose `close()` never
+            // finishes its stream continuation would otherwise hang `stop()` forever, with no
+            // cancellation to break it. Wait for the drain, but cancel it once the grace period
+            // elapses so teardown always completes (§22.2).
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await receiveTask.value }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: Self.receiveDrainGraceNanoseconds)
+                    receiveTask.cancel()
+                }
+                await group.next()
+                group.cancelAll()
+            }
+            receiveTask.cancel()
+            await receiveTask.value
+        }
+
+        clearSessionStateAfterStop()
+
+        await MainActor.run {
+            self.hasMountedInitialTree = false
+        }
+    }
+
+    private func clearSessionStateAfterStop() {
+        withStateLock {
             receiveTask = nil
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
             // mount state may survive.
@@ -972,17 +1045,6 @@ public final class SessionController: @unchecked Sendable {
             activeReplayRetryAttemptId = nil
             eventDispatchEnabled = false
             phase = .idle
-            return (task, replayAttemptId)
         }
-
-        await MainActor.run {
-            self.hasMountedInitialTree = false
-        }
-
-        if let replayAttemptId = stoppedState.replayAttemptId {
-            await outbox.stopResumeWork(attemptId: replayAttemptId)
-        }
-        stoppedState.receiveTask?.cancel()
-        await transport.close()
     }
 }

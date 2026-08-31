@@ -77,17 +77,13 @@ fn test_capability_set_basic_operations() {
 
 #[test]
 fn test_capability_set_algebra() {
-    let set_a = CapabilitySet::from_str_slice(&[
-        "org.srui.standard-widgets/1",
-        "org.srui.terminal/1",
-    ])
-    .unwrap();
+    let set_a =
+        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1", "org.srui.terminal/1"])
+            .unwrap();
 
-    let set_b = CapabilitySet::from_str_slice(&[
-        "org.srui.standard-widgets/1",
-        "org.srui.richtext/1",
-    ])
-    .unwrap();
+    let set_b =
+        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1", "org.srui.richtext/1"])
+            .unwrap();
 
     // Union: A + B
     let union_set = set_a.union(&set_b);
@@ -121,14 +117,11 @@ fn test_capability_negotiation_matching_sets_succeed() {
     ])
     .unwrap();
 
-    let server_required =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
-    let server_optional =
-        CapabilitySet::from_str_slice(&["org.srui.terminal/1"]).unwrap();
+    let server_required = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
+    let server_optional = CapabilitySet::from_str_slice(&["org.srui.terminal/1"]).unwrap();
 
     let negotiated =
-        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional)
-            .unwrap();
+        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional).unwrap();
 
     assert_eq!(negotiated.len(), 2);
     assert!(negotiated.contains_str("org.srui.standard-widgets/1"));
@@ -139,19 +132,13 @@ fn test_capability_negotiation_matching_sets_succeed() {
 #[test]
 fn test_capability_negotiation_missing_required_profile_fails_hard() {
     // Client offers terminal and richtext, but NOT standard-widgets
-    let client_offered = CapabilitySet::from_str_slice(&[
-        "org.srui.terminal/1",
-        "org.srui.richtext/1",
-    ])
-    .unwrap();
+    let client_offered =
+        CapabilitySet::from_str_slice(&["org.srui.terminal/1", "org.srui.richtext/1"]).unwrap();
 
-    let server_required =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
-    let server_optional =
-        CapabilitySet::from_str_slice(&["org.srui.terminal/1"]).unwrap();
+    let server_required = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
+    let server_optional = CapabilitySet::from_str_slice(&["org.srui.terminal/1"]).unwrap();
 
-    let result =
-        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional);
+    let result = CapabilitySet::negotiate(&client_offered, &server_required, &server_optional);
 
     // §4 Invariant 13: Must fail explicitly with a hard error
     assert_eq!(
@@ -168,20 +155,14 @@ fn test_capability_negotiation_missing_required_profile_fails_hard() {
 #[test]
 fn test_capability_negotiation_missing_optional_profile_is_omitted_without_error() {
     // Client offers only required profile, not optional ones
-    let client_offered =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
+    let client_offered = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
 
-    let server_required =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
-    let server_optional = CapabilitySet::from_str_slice(&[
-        "org.srui.terminal/1",
-        "org.srui.richtext/1",
-    ])
-    .unwrap();
+    let server_required = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
+    let server_optional =
+        CapabilitySet::from_str_slice(&["org.srui.terminal/1", "org.srui.richtext/1"]).unwrap();
 
     let negotiated =
-        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional)
-            .unwrap();
+        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional).unwrap();
 
     // Succeeded, and negotiated set contains ONLY the required profile
     assert_eq!(negotiated.len(), 1);
@@ -199,13 +180,11 @@ fn test_capability_negotiation_unknown_client_profiles_ignored() {
     ])
     .unwrap();
 
-    let server_required =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
+    let server_required = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
     let server_optional = CapabilitySet::new();
 
     let negotiated =
-        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional)
-            .unwrap();
+        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional).unwrap();
 
     assert_eq!(negotiated.len(), 1);
     assert!(negotiated.contains_str("org.srui.standard-widgets/1"));
@@ -216,15 +195,12 @@ fn test_capability_negotiation_unknown_client_profiles_ignored() {
 #[test]
 fn test_capability_negotiation_version_mismatch_fails_required() {
     // Client offers standard-widgets version 2, but server requires version 1
-    let client_offered =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/2"]).unwrap();
+    let client_offered = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/2"]).unwrap();
 
-    let server_required =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
+    let server_required = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
     let server_optional = CapabilitySet::new();
 
-    let result =
-        CapabilitySet::negotiate(&client_offered, &server_required, &server_optional);
+    let result = CapabilitySet::negotiate(&client_offered, &server_required, &server_optional);
 
     assert_eq!(
         result,
@@ -241,21 +217,17 @@ fn test_server_capabilities_wrapper() {
         CapabilitySet::from_str_slice(&["org.srui.terminal/1"]).unwrap(),
     );
 
-    let client_matching = CapabilitySet::from_str_slice(&[
-        "org.srui.standard-widgets/1",
-        "org.srui.terminal/1",
-    ])
-    .unwrap();
+    let client_matching =
+        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1", "org.srui.terminal/1"])
+            .unwrap();
     let negotiated = server_caps.negotiate(&client_matching).unwrap();
     assert_eq!(negotiated.len(), 2);
 
-    let client_minimal =
-        CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
+    let client_minimal = CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap();
     let negotiated_min = server_caps.negotiate(&client_minimal).unwrap();
     assert_eq!(negotiated_min.len(), 1);
 
-    let client_incompatible =
-        CapabilitySet::from_str_slice(&["org.srui.terminal/1"]).unwrap();
+    let client_incompatible = CapabilitySet::from_str_slice(&["org.srui.terminal/1"]).unwrap();
     assert!(server_caps.negotiate(&client_incompatible).is_err());
 }
 

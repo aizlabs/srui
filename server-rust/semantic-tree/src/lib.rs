@@ -40,11 +40,11 @@ pub use ids::{
     resolve_standard_enum_value, resolve_standard_event, resolve_standard_node_type,
     resolve_standard_property, standard_enum_name, standard_enum_value_name, standard_event_name,
     standard_node_type_name, standard_operation_name, standard_property_name, ItemId, ModelId,
-    NodeId, ParseResourceHashError, PropertyRef, RegistryLookupError, ResourceHash, TypeRef,
+    NodeId, ParseResourceHashError, PropertyRef, RegistryLookupError, ResourceHash,
     StandardActionRole, StandardHorizontalAlignment, StandardImportance, StandardInputRole,
     StandardPaddingRole, StandardSelectionMode, StandardSpacingRole, StandardTextRole,
     StandardTogglePresentationHint, StandardValidationState, StandardVerticalAlignment,
-    StandardVisibility, STANDARD_ENUMS, STANDARD_EVENTS, STANDARD_NAMESPACE_ID,
+    StandardVisibility, TypeRef, STANDARD_ENUMS, STANDARD_EVENTS, STANDARD_NAMESPACE_ID,
     STANDARD_NODE_TYPES, STANDARD_OPERATIONS, STANDARD_PROPERTIES,
 };
 
@@ -69,4 +69,3 @@ pub use wire::{
     encode_node_record_ref, encode_operation, encode_operation_ref, encode_transaction,
     encode_transaction_ref, encode_value, encode_value_ref, NodeRecord, WireError,
 };
-

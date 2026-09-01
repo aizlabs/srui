@@ -217,6 +217,7 @@ pub struct SessionConfig {
     /// `srui-sessiond --journal-capacity`).
     pub journal_capacity: usize,
     /// Capacity of the bounded transaction broadcast channel (§20.2).
+    /// Must be positive; zero is rejected at session construction, like `journal_capacity`.
     pub broadcast_capacity: usize,
 }
 
@@ -284,15 +285,25 @@ impl Session {
     }
 
     /// Creates a session with the given session ID and an explicit [`SessionConfig`] (§15, §18.1, §20.2).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `journal_capacity` or `broadcast_capacity` is zero. Both are refused rather
+    /// than clamped: a zero journal window silently degrades every reconnect to a snapshot resync
+    /// (§18.1), and a zero broadcast capacity cannot deliver a single transaction (§20.2).
     #[must_use]
     pub fn with_config(session_id: impl Into<String>, config: SessionConfig) -> Self {
-        if config.journal_capacity == 0 {
-            panic!(
-                "SessionConfig::journal_capacity must be a positive integer (§18.1); \
-                 got 0. Use the default ({DEFAULT_MAX_JOURNAL_ENTRIES}) or pass an explicit window."
-            );
-        }
-        let (tx_broadcast, _) = broadcast::channel(config.broadcast_capacity.max(1));
+        assert!(
+            config.journal_capacity > 0,
+            "SessionConfig::journal_capacity must be a positive integer (§18.1); \
+             got 0. Use the default ({DEFAULT_MAX_JOURNAL_ENTRIES}) or pass an explicit window."
+        );
+        assert!(
+            config.broadcast_capacity > 0,
+            "SessionConfig::broadcast_capacity must be a positive integer (§20.2); \
+             got 0. Use the default ({TRANSACTION_BROADCAST_CAPACITY}) or pass an explicit capacity."
+        );
+        let (tx_broadcast, _) = broadcast::channel(config.broadcast_capacity);
         Self::with_broadcast_sender(session_id, tx_broadcast, config)
     }
 
@@ -791,6 +802,25 @@ mod tests {
         assert!(
             result.is_err(),
             "zero journal_capacity must be rejected (§18.1)"
+        );
+    }
+
+    /// A zero broadcast capacity is refused on the same terms as a zero journal window, instead
+    /// of being silently clamped to a capacity that cannot hold a transaction (§20.2).
+    #[test]
+    fn test_session_config_rejects_zero_broadcast_capacity() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = Session::with_config(
+                "zero-broadcast",
+                SessionConfig {
+                    broadcast_capacity: 0,
+                    ..SessionConfig::default()
+                },
+            );
+        });
+        assert!(
+            result.is_err(),
+            "zero broadcast_capacity must be rejected (§20.2)"
         );
     }
 }

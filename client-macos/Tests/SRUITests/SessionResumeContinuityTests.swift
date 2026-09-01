@@ -452,6 +452,10 @@ struct SessionResumeContinuityTests {
             outbox: outbox,
             sessionId: "session-old"
         )
+        let failures = FailureRecorder()
+        firstController.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
         try await firstController.start()
 
         await firstController.handleIncomingMessage(
@@ -470,8 +474,60 @@ struct SessionResumeContinuityTests {
 
         #expect(applier.lastAppliedRevision == .initial)
 
+        // A superseded controller can never finish its handshake, so it reports instead of
+        // holding an open transport that silently drops every frame (§18).
+        let failure = try #require(await failures.wait())
+        guard case .superseded = failure else {
+            Issue.record("Expected a superseded failure, got \(failure)")
+            return
+        }
+
         await firstController.stop()
         await secondController.stop()
+        await firstServer.close()
+        await secondServer.close()
+    }
+
+    @Test("An older controller's stop() cannot strand a newer resume attempt")
+    func stoppingSupersededControllerLeavesNewerAttemptUsable() async throws {
+        let outbox = EventOutbox()
+
+        let (firstClient, firstServer) = await PipeTransport.createPair()
+        let firstController = SessionController(
+            transport: firstClient,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await firstController.start()
+
+        let (secondClient, secondServer) = await PipeTransport.createPair()
+        let secondCollector = ResumeWireCollector()
+        await secondCollector.start(draining: secondServer)
+        let secondController = SessionController(
+            transport: secondClient,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await secondController.start()
+        _ = await secondCollector.wait(forAtLeast: 1)
+
+        // Generation 1 is already superseded: releasing it on stop() must leave generation 2's
+        // latch intact, or the newer attempt could never be answered at all (§18).
+        await firstController.stop()
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "session-old"
+        resumeOk.replayFromRevision = 1
+        resumeOk.lastProcessedEventSeq = 0
+        var response = SRUIMessage()
+        response.serverResumeOk = resumeOk
+        await secondController.handleIncomingMessage(response)
+
+        #expect(secondController.sessionId == "session-old")
+        #expect(secondController.isEventDispatchEnabled)
+
+        await secondController.stop()
+        await secondCollector.stop()
         await firstServer.close()
         await secondServer.close()
     }

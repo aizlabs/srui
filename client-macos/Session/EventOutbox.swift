@@ -43,8 +43,10 @@ public actor EventOutbox {
     /// Selectively acknowledged sequences above the cumulative frontier.
     private var acknowledgedOutOfOrder: Set<UInt64> = []
     /// Tail of the FIFO transport-write chain. Actor isolation alone is insufficient because
-    /// `transport.send` is a reentrancy point; each new write task awaits this tail.
-    private var sendTail: Task<Void, Never>?
+    /// `transport.send` is a reentrancy point; each new write task awaits this tail. Retained as
+    /// the writer itself (not a result-swallowing wrapper) so an abandoned generation can cancel
+    /// it instead of merely dropping the reference (§18).
+    private var sendTail: Task<Void, any Error>?
 
     public init(
         clientInstanceId: ClientInstanceId = ClientInstanceId(string: UUID().uuidString),
@@ -202,7 +204,7 @@ public actor EventOutbox {
     /// Generations are local and strictly increasing: issuing one immediately supersedes every
     /// older attempt, so a delayed response from an abandoned connection is discarded (§18).
     func beginResumeAttempt() -> UInt64 {
-        sendTail = nil
+        cancelPendingWrites()
         lastIssuedResumeGeneration += 1
         activeResumeGeneration = lastIssuedResumeGeneration
         acceptsNewEvents = false
@@ -233,14 +235,30 @@ public actor EventOutbox {
     ///
     /// Called when the owning controller stops intentionally so a later fresh HELLO on the same
     /// outbox is not blocked by an abandoned resume/resync handshake.
-    func abandonResumeHandshake() {
+    ///
+    /// Only the generation that still owns the latch may release it: a controller that was
+    /// already superseded must not unlatch the newer attempt, which would leave that attempt with
+    /// every decision rejected and no way to finish (§18).
+    func abandonResumeHandshake(generation: UInt64) {
+        guard activeResumeGeneration == generation else { return }
         activeResumeGeneration = nil
-        sendTail = nil
+        cancelPendingWrites()
     }
 
-    /// Returns whether `generation` is still the authoritative reconnect attempt (§18).
-    func matchesActiveResumeGeneration(_ generation: UInt64) -> Bool {
-        activeResumeGeneration == generation
+    /// Runs `body` only while `generation` still owns the reconnect decision (§18).
+    ///
+    /// The check and `body` share this single actor-isolated critical section, so a concurrent
+    /// `beginResumeAttempt()` cannot slip between them. A caller that checked first and applied
+    /// after a suspension would still let a superseded snapshot reach the shared replica.
+    ///
+    /// A `nil` generation means "this controller has no attempt outstanding", which is the
+    /// live-resync case: it matches only while no other controller holds the latch either.
+    func withUnsupersededResume<T: Sendable>(
+        _ generation: UInt64?,
+        _ body: @Sendable () -> T
+    ) -> T? {
+        guard activeResumeGeneration == generation else { return nil }
+        return body()
     }
 
     /// Binds a fresh HELLO handshake that did not carry an old retry set.
@@ -271,7 +289,7 @@ public actor EventOutbox {
         pendingEvents.removeAll(keepingCapacity: true)
         pendingOrder.removeAll(keepingCapacity: true)
         acknowledgedOutOfOrder.removeAll(keepingCapacity: true)
-        sendTail = nil
+        cancelPendingWrites()
     }
 
     /// Applies one selective acknowledgement plus the server's contiguous cumulative frontier.
@@ -316,8 +334,15 @@ public actor EventOutbox {
     }
 
     /// Re-enables allocation after a HELLO catch-up snapshot with no resume attempt (§15, §18).
-    func allowNewEvents() {
+    ///
+    /// Refuses while any controller holds an outstanding reconnect generation: that latch exists
+    /// precisely to keep new events from being allocated before the continuity decision arrives,
+    /// and re-opening it from an unrelated catch-up would bypass it (§18).
+    @discardableResult
+    func allowNewEvents() -> Bool {
+        guard activeResumeGeneration == nil else { return false }
         acceptsNewEvents = true
+        return true
     }
 
     /// Enables new events only after the snapshot for the current reconnect generation commits.
@@ -360,13 +385,24 @@ public actor EventOutbox {
     ) -> Task<Void, any Error> {
         let predecessor = sendTail
         let task = Task {
-            await predecessor?.value
+            // A failed or cancelled predecessor must not abort this write: ordering is the
+            // invariant here, not shared success.
+            _ = try? await predecessor?.value
             try await operation()
         }
-        sendTail = Task {
-            _ = try? await task.value
-        }
+        sendTail = task
         return task
+    }
+
+    /// Cancels the outstanding transport-write chain and drops it (§18).
+    ///
+    /// A write already committed to a dead transport can never complete, so a new reconnect
+    /// generation must not chain its replay behind it. Cancellation is cooperative: the replay
+    /// loop checks it between frames, but a `transport.send` already in flight still runs to
+    /// completion, so this bounds the overlap rather than eliminating it.
+    private func cancelPendingWrites() {
+        sendTail?.cancel()
+        sendTail = nil
     }
 
     /// Retains a new event without evicting an earlier unacknowledged sequence.

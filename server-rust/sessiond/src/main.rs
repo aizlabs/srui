@@ -177,10 +177,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     info!(
         journal_capacity,
-        "Minted session incarnation token {} (initial state: {:?}, journal retention: {} transactions)",
+        "Minted session incarnation token {} (initial state: {:?})",
         session.session_id(),
-        session.state(),
-        journal_capacity
+        session.state()
     );
 
     if let Some(app) = app_name.as_deref() {

@@ -38,6 +38,9 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
     case protocolViolation(String)
     /// The transport stream ended or errored.
     case transportEnded(String)
+    /// A newer reconnect attempt on the same outbox superseded this controller. Its handshake can
+    /// never complete, so the owner discards this controller instead of reconnecting it (§18).
+    case superseded(String)
 
     public var description: String {
         switch self {
@@ -45,6 +48,7 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
         case .decodeFailed(let msg): return "decode failed: \(msg)"
         case .protocolViolation(let msg): return "protocol violation: \(msg)"
         case .transportEnded(let msg): return "transport ended: \(msg)"
+        case .superseded(let msg): return "superseded by a newer reconnect attempt: \(msg)"
         }
     }
 }
@@ -592,7 +596,7 @@ public final class SessionController: @unchecked Sendable {
                 enableNewEventsAfterReplay: true
             )
             guard accepted else {
-                SessionDiagnostics.log("Ignoring superseded SERVER RESUME_OK")
+                await failSuperseded("SERVER RESUME_OK answered a superseded resume attempt")
                 return
             }
         } catch {
@@ -646,7 +650,9 @@ public final class SessionController: @unchecked Sendable {
                         enableNewEventsAfterReplay: false
                     )
                     guard accepted else {
-                        SessionDiagnostics.log("Ignoring superseded same-session resync")
+                        await failSuperseded(
+                            "same-session resync answered a superseded resume attempt"
+                        )
                         return
                     }
                 } catch {
@@ -668,7 +674,9 @@ public final class SessionController: @unchecked Sendable {
                     generation: generation
                 )
                 guard accepted else {
-                    SessionDiagnostics.log("Ignoring superseded replacement resync")
+                    await failSuperseded(
+                        "replacement resync answered a superseded resume attempt"
+                    )
                     return
                 }
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
@@ -810,20 +818,25 @@ public final class SessionController: @unchecked Sendable {
             (pendingResync, resumeGeneration)
         }
 
-        if isResyncSnapshot, let outstandingGeneration {
-            guard await outbox.matchesActiveResumeGeneration(outstandingGeneration) else {
-                SessionDiagnostics.log(
-                    "Ignoring resync snapshot for superseded resume generation"
-                )
-                return
-            }
-        }
-
         // Apply and capture the committed snapshot in a single critical section so the renderer is
         // handed exactly the store produced by this transaction (§22.2).
-        let applyResult: Result<TransactionSnapshot, TxnError> = isResyncSnapshot
-            ? applier.applyResyncSnapshot(record: domainTx)
-            : applier.applyCommitted(record: domainTx)
+        let applyResult: Result<TransactionSnapshot, TxnError>
+        if isResyncSnapshot {
+            // A snapshot replaces the entire replica, so the supersession check and the apply run
+            // inside one outbox critical section: checking here and applying after a suspension
+            // would let a newer attempt open in between and the stale snapshot still land on the
+            // shared applier (§18). `outstandingGeneration == nil` (a live resync) is checked the
+            // same way — another controller's outstanding attempt must block it too.
+            guard let claimed = await outbox.withUnsupersededResume(outstandingGeneration, {
+                self.applier.applyResyncSnapshot(record: domainTx)
+            }) else {
+                await failSuperseded("resync snapshot arrived after a newer reconnect attempt")
+                return
+            }
+            applyResult = claimed
+        } else {
+            applyResult = applier.applyCommitted(record: domainTx)
+        }
 
         switch applyResult {
         case .success(let snapshot):
@@ -848,9 +861,13 @@ public final class SessionController: @unchecked Sendable {
     private func completeSnapshotCatchUp() async {
         let generation = withStateLock { self.resumeGeneration }
         if let generation {
-            let accepted = await outbox.finishResync(generation: generation)
+            guard await outbox.finishResync(generation: generation) else {
+                // The latch belongs to a newer attempt, so this controller can never leave
+                // `.awaitingSnapshot`. Report it instead of holding a mute transport (§18).
+                await failSuperseded("resync completed after a newer reconnect attempt")
+                return
+            }
             withStateLock {
-                guard accepted else { return }
                 self.pendingResync = false
                 self.resumeGeneration = nil
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
@@ -859,9 +876,16 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
         } else {
-            withStateLock { self.pendingResync = false }
-            await outbox.allowNewEvents()
+            guard await outbox.allowNewEvents() else {
+                // Another controller opened a reconnect generation while this catch-up was in
+                // flight; re-enabling allocation here would break the latch it is waiting on.
+                await failSuperseded(
+                    "catch-up completed while another reconnect attempt was outstanding"
+                )
+                return
+            }
             withStateLock {
+                self.pendingResync = false
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
                 if case .awaitingSnapshot(let negotiated) = self.phase {
                     self.phase = .active(negotiated: negotiated)
@@ -895,6 +919,15 @@ public final class SessionController: @unchecked Sendable {
         // Anything else means the next transaction will fail for the same reason forever: we have
         // missed committed state and cannot resynchronize by continuing to listen (§4 inv. 13).
         await reportFailure(.replicaDiverged(error))
+    }
+
+    /// Terminates a controller whose reconnect generation lost to a newer attempt (§18).
+    ///
+    /// Every outbox decision for a superseded generation is rejected, so such a controller can
+    /// never leave `.awaitingResume` / `.awaitingSnapshot`. Without this it would keep an open
+    /// transport, silently drop every frame, and give the owner no signal that it is dead.
+    private func failSuperseded(_ context: String) async {
+        await reportFailure(.superseded(context))
     }
 
     /// Reports a terminal session failure exactly once and tears the transport down so the caller
@@ -964,7 +997,11 @@ public final class SessionController: @unchecked Sendable {
             await receiveTask.value
         }
 
-        await outbox.abandonResumeHandshake()
+        // Only this controller's own generation is released: a newer controller may already own
+        // the latch on a shared outbox, and clearing that one would strand it (§18).
+        if let generation = withStateLock({ resumeGeneration }) {
+            await outbox.abandonResumeHandshake(generation: generation)
+        }
         clearSessionStateAfterStop()
 
         await MainActor.run {

@@ -404,6 +404,77 @@ struct SessionResumeContinuityTests {
         await firstServer.close()
         await secondServer.close()
     }
+
+    @Test("stop() during resync clears the outbox latch so a shared outbox can fresh HELLO")
+    func stopDuringResyncAllowsFreshHelloWithSharedOutbox() async throws {
+        let outbox = EventOutbox()
+        let (client, server) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: client,
+            outbox: outbox,
+            sessionId: "session-live"
+        )
+        try await controller.start()
+
+        await controller.handleIncomingMessage(
+            resyncMessage(sessionId: "session-live", continuity: .sameSession)
+        )
+        #expect(controller.isEventDispatchEnabled == false)
+
+        await controller.stop()
+
+        let (freshClient, freshServer) = await PipeTransport.createPair()
+        let freshController = SessionController(transport: freshClient, outbox: outbox)
+        try await freshController.start()
+
+        var welcome = HandshakeFixtures.welcomeMessage(sessionId: "fresh-session")
+        welcome.serverWelcome.initialRevision = 0
+        try await freshServer.send(data: SRUIFraming.encodeFramed(welcome))
+
+        try await AsyncTestSupport.eventually(description: "fresh HELLO handshake") {
+            freshController.sessionId == "fresh-session"
+        }
+
+        await freshController.stop()
+        await freshServer.close()
+        await server.close()
+    }
+
+    @Test("A superseded controller ignores a late resync snapshot")
+    func supersededControllerIgnoresLateSnapshot() async throws {
+        let outbox = EventOutbox()
+        let applier = TransactionApplier()
+
+        let (firstClient, firstServer) = await PipeTransport.createPair()
+        let firstController = SessionController(
+            transport: firstClient,
+            applier: applier,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await firstController.start()
+
+        await firstController.handleIncomingMessage(
+            resyncMessage(sessionId: "session-old", continuity: .sameSession)
+        )
+
+        let (secondClient, secondServer) = await PipeTransport.createPair()
+        let secondController = SessionController(
+            transport: secondClient,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await secondController.start()
+
+        await firstController.handleIncomingMessage(snapshot(revision: 5, text: "stale"))
+
+        #expect(applier.lastAppliedRevision == .initial)
+
+        await firstController.stop()
+        await secondController.stop()
+        await firstServer.close()
+        await secondServer.close()
+    }
 }
 
 /// Collects reported session failures for assertions.

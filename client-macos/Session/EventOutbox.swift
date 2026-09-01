@@ -169,13 +169,21 @@ public actor EventOutbox {
     ///
     /// Failures propagate to the caller so resume cannot enable new events until every retained
     /// write succeeds (§18.2).
-    public func resendPendingEvents(via transport: any Transport) async throws {
-        let replay = pendingOrder.compactMap { pendingEvents[$0] }
+    public func resendPendingEvents(
+        via transport: any Transport,
+        generation: UInt64? = nil
+    ) async throws {
+        if let generation, activeResumeGeneration != generation { return }
+        let payloads = try pendingOrder.compactMap { eventId -> Data? in
+            guard let event = pendingEvents[eventId] else { return nil }
+            var msg = SRUIMessage()
+            msg.event = event.toWire()
+            return try SRUIFraming.encodeFramed(msg)
+        }
         let send = enqueueSend {
-            for event in replay {
-                var msg = SRUIMessage()
-                msg.event = event.toWire()
-                try await transport.send(data: try SRUIFraming.encodeFramed(msg))
+            for payload in payloads {
+                try Task.checkCancellation()
+                try await transport.send(data: payload)
             }
         }
         try await send.value
@@ -194,6 +202,7 @@ public actor EventOutbox {
     /// Generations are local and strictly increasing: issuing one immediately supersedes every
     /// older attempt, so a delayed response from an abandoned connection is discarded (§18).
     func beginResumeAttempt() -> UInt64 {
+        sendTail = nil
         lastIssuedResumeGeneration += 1
         activeResumeGeneration = lastIssuedResumeGeneration
         acceptsNewEvents = false
@@ -211,13 +220,27 @@ public actor EventOutbox {
         guard activeResumeGeneration == generation else { return false }
         activeSessionId = id
         acknowledgeEvents(throughSeq: lastProcessedEventSeq)
-        try await resendPendingEvents(via: transport)
+        try await resendPendingEvents(via: transport, generation: generation)
         guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
         if enableNewEventsAfterReplay {
             activeResumeGeneration = nil
         }
         return true
+    }
+
+    /// Drops an outstanding reconnect generation without settling pending events (§18).
+    ///
+    /// Called when the owning controller stops intentionally so a later fresh HELLO on the same
+    /// outbox is not blocked by an abandoned resume/resync handshake.
+    func abandonResumeHandshake() {
+        activeResumeGeneration = nil
+        sendTail = nil
+    }
+
+    /// Returns whether `generation` is still the authoritative reconnect attempt (§18).
+    func matchesActiveResumeGeneration(_ generation: UInt64) -> Bool {
+        activeResumeGeneration == generation
     }
 
     /// Binds a fresh HELLO handshake that did not carry an old retry set.

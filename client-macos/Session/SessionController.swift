@@ -806,7 +806,18 @@ public final class SessionController: @unchecked Sendable {
         // `base_revision == 0` is not by itself evidence of a snapshot: a stale copy of the
         // initial transaction carries it too, and treating that as a snapshot would wipe a live
         // replica (§12.1).
-        let isResyncSnapshot = withStateLock { pendingResync }
+        let (isResyncSnapshot, outstandingGeneration) = withStateLock {
+            (pendingResync, resumeGeneration)
+        }
+
+        if isResyncSnapshot, let outstandingGeneration {
+            guard await outbox.matchesActiveResumeGeneration(outstandingGeneration) else {
+                SessionDiagnostics.log(
+                    "Ignoring resync snapshot for superseded resume generation"
+                )
+                return
+            }
+        }
 
         // Apply and capture the committed snapshot in a single critical section so the renderer is
         // handed exactly the store produced by this transaction (§22.2).
@@ -835,12 +846,12 @@ public final class SessionController: @unchecked Sendable {
 
     /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.
     private func completeSnapshotCatchUp() async {
-        withStateLock { self.pendingResync = false }
         let generation = withStateLock { self.resumeGeneration }
         if let generation {
             let accepted = await outbox.finishResync(generation: generation)
             withStateLock {
                 guard accepted else { return }
+                self.pendingResync = false
                 self.resumeGeneration = nil
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
                 if case .awaitingSnapshot(let negotiated) = self.phase {
@@ -848,6 +859,7 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
         } else {
+            withStateLock { self.pendingResync = false }
             await outbox.allowNewEvents()
             withStateLock {
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
@@ -952,6 +964,7 @@ public final class SessionController: @unchecked Sendable {
             await receiveTask.value
         }
 
+        await outbox.abandonResumeHandshake()
         clearSessionStateAfterStop()
 
         await MainActor.run {

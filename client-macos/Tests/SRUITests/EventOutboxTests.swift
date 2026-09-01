@@ -332,6 +332,14 @@ struct EventOutboxTests {
         #expect(await outbox.confirmFreshSession(id: "fresh-session"))
     }
 
+    @Test("Abandoning resume handshake clears the generation latch for a later fresh HELLO")
+    func abandonResumeHandshakeClearsGenerationLatch() async {
+        let outbox = EventOutbox()
+        _ = await outbox.beginResumeAttempt()
+        await outbox.abandonResumeHandshake()
+        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+    }
+
     @Test("Replaced session abandons pending events and resets sequence")
     func replacedSessionResetsSequence() async throws {
         let (client, server) = await PipeTransport.createPair()

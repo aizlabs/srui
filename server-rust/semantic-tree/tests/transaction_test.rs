@@ -247,9 +247,27 @@ fn test_max_operations_limit_enforced_as_precheck() {
     // Submit transaction with 4 operations (exceeds limit of 3)
     let oversized_ops = vec![
         Operation::create_node(NodeId::new(1), TypeRef::SURFACE, None, None, []),
-        Operation::create_node(NodeId::new(2), TypeRef::COLUMN, Some(NodeId::new(1)), None, []),
-        Operation::create_node(NodeId::new(3), TypeRef::BUTTON, Some(NodeId::new(2)), None, []),
-        Operation::create_node(NodeId::new(4), TypeRef::TEXT, Some(NodeId::new(2)), None, []),
+        Operation::create_node(
+            NodeId::new(2),
+            TypeRef::COLUMN,
+            Some(NodeId::new(1)),
+            None,
+            [],
+        ),
+        Operation::create_node(
+            NodeId::new(3),
+            TypeRef::BUTTON,
+            Some(NodeId::new(2)),
+            None,
+            [],
+        ),
+        Operation::create_node(
+            NodeId::new(4),
+            TypeRef::TEXT,
+            Some(NodeId::new(2)),
+            None,
+            [],
+        ),
     ];
 
     let err = store
@@ -276,7 +294,13 @@ fn test_transaction_record_with_invalid_new_revision_rejected() {
     let mut store = SemanticStore::new();
 
     let root_id = NodeId::new(1);
-    let ops = vec![Operation::create_node(root_id, TypeRef::SURFACE, None, None, [])];
+    let ops = vec![Operation::create_node(
+        root_id,
+        TypeRef::SURFACE,
+        None,
+        None,
+        [],
+    )];
 
     // Transaction specifies new_revision = 5 instead of expected 1
     let invalid_txn = Transaction::with_revisions(Revision::new(0), Revision::new(5), ops, 0);
@@ -364,8 +388,20 @@ fn test_intermediate_failure_rolls_back_entire_transaction() {
             Revision::INITIAL,
             vec![
                 Operation::create_node(NodeId::new(1), TypeRef::SURFACE, None, None, []),
-                Operation::create_node(NodeId::new(2), TypeRef::COLUMN, Some(NodeId::new(1)), None, []),
-                Operation::create_node(NodeId::new(3), TypeRef::ROW, Some(NodeId::new(2)), None, []),
+                Operation::create_node(
+                    NodeId::new(2),
+                    TypeRef::COLUMN,
+                    Some(NodeId::new(1)),
+                    None,
+                    [],
+                ),
+                Operation::create_node(
+                    NodeId::new(3),
+                    TypeRef::ROW,
+                    Some(NodeId::new(2)),
+                    None,
+                    [],
+                ),
             ],
         )
         .expect("setup tree");
@@ -379,10 +415,22 @@ fn test_intermediate_failure_rolls_back_entire_transaction() {
     // Op 2: move #2 under #3 -> CycleDetected error!
     // Op 3: create #5 (valid)
     let cycle_ops = vec![
-        Operation::create_node(NodeId::new(4), TypeRef::TEXT, Some(NodeId::new(3)), None, []),
+        Operation::create_node(
+            NodeId::new(4),
+            TypeRef::TEXT,
+            Some(NodeId::new(3)),
+            None,
+            [],
+        ),
         Operation::set_property(NodeId::new(1), PropertyRef::LABEL, "Will Rollback"),
         Operation::move_node(NodeId::new(2), Some(NodeId::new(3)), None),
-        Operation::create_node(NodeId::new(5), TypeRef::BUTTON, Some(NodeId::new(3)), None, []),
+        Operation::create_node(
+            NodeId::new(5),
+            TypeRef::BUTTON,
+            Some(NodeId::new(3)),
+            None,
+            [],
+        ),
     ];
 
     let err = store
@@ -408,7 +456,13 @@ fn test_intermediate_failure_rolls_back_entire_transaction() {
     assert!(!store.is_id_used(NodeId::new(4)));
     assert!(!store.is_id_used(NodeId::new(5)));
     assert_eq!(store.parent_of(NodeId::new(2)), Some(Some(NodeId::new(1))));
-    assert_eq!(store.get_node(NodeId::new(1)).unwrap().get_property(PropertyRef::LABEL), None);
+    assert_eq!(
+        store
+            .get_node(NodeId::new(1))
+            .unwrap()
+            .get_property(PropertyRef::LABEL),
+        None
+    );
 }
 
 #[test]

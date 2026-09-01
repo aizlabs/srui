@@ -339,7 +339,10 @@ impl Event {
     }
 
     /// Sets the client instance identifier on this event.
-    pub fn with_client_instance_id(mut self, client_instance_id: impl Into<ClientInstanceId>) -> Self {
+    pub fn with_client_instance_id(
+        mut self,
+        client_instance_id: impl Into<ClientInstanceId>,
+    ) -> Self {
         self.client_instance_id = Some(client_instance_id.into());
         self
     }
@@ -367,17 +370,20 @@ impl Event {
 
     /// Returns the text string argument (from [`PropertyRef::TEXT`]) if present.
     pub fn text_arg(&self) -> Option<&str> {
-        self.get_argument(PropertyRef::TEXT).and_then(|v| v.as_string())
+        self.get_argument(PropertyRef::TEXT)
+            .and_then(|v| v.as_string())
     }
 
     /// Returns the boolean argument (from [`PropertyRef::VALUE`]) if present.
     pub fn bool_arg(&self) -> Option<bool> {
-        self.get_argument(PropertyRef::VALUE).and_then(|v| v.as_bool())
+        self.get_argument(PropertyRef::VALUE)
+            .and_then(|v| v.as_bool())
     }
 
     /// Returns the item ID argument (from [`PropertyRef::VALUE`]) if present.
     pub fn item_id_arg(&self) -> Option<ItemId> {
-        self.get_argument(PropertyRef::VALUE).and_then(|v| v.as_item_id())
+        self.get_argument(PropertyRef::VALUE)
+            .and_then(|v| v.as_item_id())
     }
 
     /// Returns the standard event name if this event's type belongs to standard namespace 0 (§7.6).
@@ -386,14 +392,20 @@ impl Event {
     }
 
     /// Validates that the event's target `node_id` exists in the provided [`SemanticStore`].
-    pub fn validate_node_exists<'a>(&self, store: &'a SemanticStore) -> Result<&'a Node, EventValidationError> {
+    pub fn validate_node_exists<'a>(
+        &self,
+        store: &'a SemanticStore,
+    ) -> Result<&'a Node, EventValidationError> {
         store
             .get_node(self.node_id)
             .ok_or(EventValidationError::NodeNotFound(self.node_id))
     }
 
     /// Validates that the event's target `node_id` exists and is interactive (`enabled != false`) in the store (§7.4, §7.7, §27).
-    pub fn validate_node_interactive<'a>(&self, store: &'a SemanticStore) -> Result<&'a Node, EventValidationError> {
+    pub fn validate_node_interactive<'a>(
+        &self,
+        store: &'a SemanticStore,
+    ) -> Result<&'a Node, EventValidationError> {
         let node = self.validate_node_exists(store)?;
         if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
             return Err(EventValidationError::NodeDisabled(self.node_id));
@@ -402,7 +414,10 @@ impl Event {
     }
 
     /// Validates that the event's `observed_revision` is not from an unseen future revision (§7.7, §12.1).
-    pub fn validate_observed_revision(&self, store_revision: Revision) -> Result<(), EventValidationError> {
+    pub fn validate_observed_revision(
+        &self,
+        store_revision: Revision,
+    ) -> Result<(), EventValidationError> {
         if self.observed_revision > store_revision {
             return Err(EventValidationError::FutureRevision {
                 observed: self.observed_revision,
@@ -464,7 +479,9 @@ impl fmt::Display for EventValidationError {
                 "event observed revision {} is in the future relative to store revision {}",
                 observed, current
             ),
-            Self::MissingArgument(prop) => write!(f, "event is missing required argument property {}", prop),
+            Self::MissingArgument(prop) => {
+                write!(f, "event is missing required argument property {}", prop)
+            }
         }
     }
 }

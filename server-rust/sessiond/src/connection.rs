@@ -70,7 +70,9 @@ where
 {
     // Attach at transport connect (§17, App. B). The guard drops on every exit path—including
     // handshake failure, cancellation, and EOF—transitioning ATTACHED -> DETACHED.
-    let _attachment = session.attach();
+    let _attachment = session
+        .attach()
+        .ok_or_else(|| ConnectionError::Session(SessionError::TerminalState(session.state())))?;
 
     let (read_half, write_half) = tokio::io::split(stream);
     let mut framed_read = FramedRead::new(read_half, SruiCodec::new());

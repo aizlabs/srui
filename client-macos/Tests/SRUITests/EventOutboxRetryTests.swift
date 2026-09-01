@@ -125,6 +125,38 @@ private actor FailingTransport: Transport {
     }
 }
 
+/// Transport whose initial replay succeeds and whose background retry fails.
+private actor FailAfterFirstSendTransport: Transport {
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let streamContinuation: AsyncThrowingStream<Data, Error>.Continuation
+    private var sendCount = 0
+    private var closeCount = 0
+
+    init() {
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.streamContinuation = continuation
+    }
+
+    var closeCallCount: Int { closeCount }
+
+    func send(data: Data) async throws {
+        sendCount += 1
+        if sendCount > 1 {
+            throw TransportError.ioError("simulated background replay failure")
+        }
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        closeCount += 1
+        streamContinuation.finish()
+    }
+}
+
 @Suite("EventOutbox Retry Safety Tests")
 struct EventOutboxRetryTests {
 
@@ -237,6 +269,207 @@ struct EventOutboxRetryTests {
         await seedClient.close()
         await seedServer.close()
         await failing.close()
+    }
+
+    @Test(
+        "A resumed pending event retries until the server settles it",
+        .bug("https://github.com/aizlabs/srui/issues/17")
+    )
+    func resumedPendingEventRetriesUntilAcknowledged() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox(
+            replayRetryInitialDelay: .zero,
+            replayRetryMaximumDelay: .zero
+        )
+        let pending = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let resumedTransport = GatedTransport()
+        let generation = await outbox.beginResumeAttempt()
+        let resumeTask = Task {
+            try await outbox.completeSameSessionResume(
+                id: "session-a",
+                lastProcessedEventSeq: 0,
+                generation: generation,
+                via: resumedTransport,
+                enableNewEventsAfterReplay: true
+            )
+        }
+
+        await resumedTransport.waitForSendCount(1)
+        await resumedTransport.releaseNextSend()
+        #expect(try await resumeTask.value)
+
+        // The first replay overlapped the server's original in-flight delivery, so no ack arrived.
+        // The retry loop must send the same semantic event again on the resumed connection.
+        await resumedTransport.waitForSendCount(2)
+        let initialReplayFrame = try #require(await resumedTransport.frame(at: 0))
+        let retryFrame = try #require(await resumedTransport.frame(at: 1))
+        let initialReplay = try #require(
+            try events(in: [decodeFramedMessage(from: initialReplayFrame)]).first
+        )
+        let retry = try #require(
+            try events(in: [decodeFramedMessage(from: retryFrame)]).first
+        )
+        #expect(initialReplay.eventId == pending.eventId)
+        #expect(retry.eventId == pending.eventId)
+        #expect(retry.eventSeq == pending.eventSeq)
+        #expect(await outbox.isRetryingPendingEvents)
+
+        _ = await outbox.settleAcknowledgement(
+            eventId: pending.eventId,
+            throughSeq: pending.eventSeq,
+            sessionId: "session-a"
+        )
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.isRetryingPendingEvents == false)
+
+        await resumedTransport.releaseNextSend()
+        await resumedTransport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
+    @Test(
+        "A live resync frontier keeps retries active until the remaining event settles",
+        .bug("https://github.com/aizlabs/srui/issues/20")
+    )
+    func liveResyncFrontierKeepsRetryLeaseForUnsettledEvents() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox(
+            replayRetryInitialDelay: .zero,
+            replayRetryMaximumDelay: .zero
+        )
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(8),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let resumedTransport = GatedTransport()
+        let generation = await outbox.beginResumeAttempt()
+        let resumeTask = Task {
+            try await outbox.completeSameSessionResume(
+                id: "session-a",
+                lastProcessedEventSeq: 0,
+                generation: generation,
+                via: resumedTransport,
+                enableNewEventsAfterReplay: true
+            )
+        }
+
+        await resumedTransport.waitForSendCount(1)
+        await resumedTransport.releaseNextSend()
+        await resumedTransport.waitForSendCount(2)
+        await resumedTransport.releaseNextSend()
+        #expect(try await resumeTask.value)
+        #expect(await outbox.isRetryingPendingEvents)
+
+        await outbox.applyLiveResyncFrontier(lastProcessedEventSeq: first.eventSeq)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == first.eventSeq)
+        #expect(await outbox.isRetryingPendingEvents)
+
+        _ = await outbox.settleAcknowledgement(
+            eventId: second.eventId,
+            throughSeq: second.eventSeq,
+            sessionId: "session-a"
+        )
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.isRetryingPendingEvents == false)
+
+        await resumedTransport.releaseNextSend()
+        await resumedTransport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
+    @Test(
+        "Background replay failure is surfaced without closing controller-owned transport",
+        .bug("https://github.com/aizlabs/srui/issues/17")
+    )
+    func backgroundReplayFailureIsSurfacedWithoutClosingTransport() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox(
+            replayRetryInitialDelay: .zero,
+            replayRetryMaximumDelay: .zero
+        )
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let resumedTransport = FailAfterFirstSendTransport()
+        let (failures, failureContinuation) = AsyncStream<String>.makeStream()
+        let generation = await outbox.beginResumeAttempt()
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-a",
+            lastProcessedEventSeq: 0,
+            generation: generation,
+            via: resumedTransport,
+            enableNewEventsAfterReplay: true,
+            onReplayFailure: { error in
+                failureContinuation.yield(error)
+                failureContinuation.finish()
+            }
+        )
+        #expect(accepted)
+
+        var failureIterator = failures.makeAsyncIterator()
+        let failure = await failureIterator.next()
+        #expect(failure?.contains("simulated background replay failure") == true)
+        #expect(await resumedTransport.closeCallCount == 0)
+
+        await outbox.stopResumeWork(generation: generation)
+        await resumedTransport.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
+
+    @Test(
+        "A completed resume no longer occupies the handshake latch",
+        .bug("https://github.com/aizlabs/srui/issues/17")
+    )
+    func completedResumeReleasesHandshakeLatch() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let (resumedClient, resumedServer) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: resumedServer)
+        let generation = await outbox.beginResumeAttempt()
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-a",
+            lastProcessedEventSeq: 0,
+            generation: generation,
+            via: resumedClient,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+        #expect(await outbox.isRetryingPendingEvents)
+        #expect(await outbox.confirmFreshSession(id: "session-fresh"))
+        #expect(await outbox.isRetryingPendingEvents == false)
+
+        await collector.stop()
+        await resumedClient.close()
+        await resumedServer.close()
+        await seedClient.close()
+        await seedServer.close()
     }
 
     @Test("A SERVER EVENT_ACK settles the event and raises last_acked_event_seq (§18.2)")
@@ -493,10 +726,11 @@ struct EventOutboxRetryTests {
         let replayed = try #require(try events(in: afterDecision).last)
         #expect(replayed.eventId == pending.eventId)
         #expect(replayed.eventSeq == pending.eventSeq)
+        #expect(await outbox.isRetryingPendingEvents)
 
         await controller.stop()
+        #expect(await outbox.isRetryingPendingEvents == false)
         await collector.stop()
-        await seedClient.close()
         await seedServer.close()
         await server.close()
     }
@@ -546,10 +780,12 @@ struct EventOutboxRetryTests {
         let secondMessages = await secondCollector.wait(forAtLeast: 2)
         let replayed = try #require(try events(in: secondMessages).last)
         #expect(replayed.eventId == pending.eventId)
+        #expect(await outbox.isRetryingPendingEvents)
 
         await firstController.stop()
+        #expect(await outbox.isRetryingPendingEvents)
         await secondController.stop()
-        await firstCollector.stop()
+        #expect(await outbox.isRetryingPendingEvents == false)
         await secondCollector.stop()
         await seedClient.close()
         await seedServer.close()

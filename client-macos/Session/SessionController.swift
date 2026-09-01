@@ -94,8 +94,9 @@ public final class SessionController: @unchecked Sendable {
     private var _onFailure: (@Sendable (SessionFailure) -> Void)?
     private var requestedSessionId: String?
     /// Generation of this controller's outstanding resume attempt (§18). Strictly increasing per
-    /// outbox: a response carrying an older generation is discarded outright.
+    /// outbox: a decision carrying an older generation is discarded outright.
     private var resumeGeneration: UInt64?
+    private var activeReplayRetryGeneration: UInt64?
     private var eventDispatchEnabled = false
     private var phase: ProtocolPhase = .idle
     /// Negotiated set from the last successful `SERVER WELCOME`, retained across `stop()` so a
@@ -257,6 +258,9 @@ public final class SessionController: @unchecked Sendable {
                     self.eventDispatchEnabled = false
                     self.phase = .idle
                 }
+                Task { [transport] in
+                    await transport.close()
+                }
             }
         }
 
@@ -400,19 +404,23 @@ public final class SessionController: @unchecked Sendable {
 
         do {
             for try await chunk in stream {
+                guard !Task.isCancelled else { break }
                 let messages: [SRUIMessage]
                 do {
                     messages = try streamDecoder.appendAndExtract(incoming: chunk)
                 } catch {
+                    guard !Task.isCancelled else { return }
                     await reportFailure(.decodeFailed("frame decode failed: \(error)"))
                     return
                 }
 
                 for msg in messages {
+                    guard !Task.isCancelled else { break }
                     await handleIncomingMessage(msg)
                 }
             }
         } catch {
+            guard !Task.isCancelled else { return }
             await reportFailure(.transportEnded("\(error)"))
             return
         }
@@ -593,24 +601,30 @@ public final class SessionController: @unchecked Sendable {
                 lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
                 generation: generation,
                 via: transport,
-                enableNewEventsAfterReplay: true
+                enableNewEventsAfterReplay: true,
+                onReplayFailure: { [weak self] error in
+                    await self?.handlePendingEventReplayFailure(error)
+                }
             )
             guard accepted else {
-                await failSuperseded("SERVER RESUME_OK answered a superseded resume attempt")
+                await failRefusedResumeDecision(
+                    generation,
+                    "SERVER RESUME_OK answered a superseded resume attempt"
+                )
                 return
             }
         } catch {
             await reportFailure(.transportEnded("pending event replay failed: \(error)"))
             return
         }
-        withStateLock {
+        await finalizeResumeAttempt(generation) {
             let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
             self.requestedSessionId = nil
             self.resumeGeneration = nil
             self.retainedCapabilities = negotiated
             self.phase = .active(negotiated: negotiated)
-            self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+            self.eventDispatchEnabled = !self._isDiverged
         }
     }
 
@@ -647,10 +661,14 @@ public final class SessionController: @unchecked Sendable {
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
                         generation: generation,
                         via: transport,
-                        enableNewEventsAfterReplay: false
+                        enableNewEventsAfterReplay: false,
+                        onReplayFailure: { [weak self] error in
+                            await self?.handlePendingEventReplayFailure(error)
+                        }
                     )
                     guard accepted else {
-                        await failSuperseded(
+                        await failRefusedResumeDecision(
+                            generation,
                             "same-session resync answered a superseded resume attempt"
                         )
                         return
@@ -674,7 +692,8 @@ public final class SessionController: @unchecked Sendable {
                     generation: generation
                 )
                 guard accepted else {
-                    await failSuperseded(
+                    await failRefusedResumeDecision(
+                        generation,
                         "replacement resync answered a superseded resume attempt"
                     )
                     return
@@ -825,12 +844,17 @@ public final class SessionController: @unchecked Sendable {
             // A snapshot replaces the entire replica, so the supersession check and the apply run
             // inside one outbox critical section: checking here and applying after a suspension
             // would let a newer attempt open in between and the stale snapshot still land on the
-            // shared applier (§18). `outstandingGeneration == nil` (a live resync) is checked the
-            // same way — another controller's outstanding attempt must block it too.
+            // shared applier (§18). A live resync carries no generation and is checked the same
+            // way — another controller's outstanding attempt must block it too.
             guard let claimed = await outbox.withUnsupersededResume(outstandingGeneration, {
                 self.applier.applyResyncSnapshot(record: domainTx)
             }) else {
-                await failSuperseded("resync snapshot arrived after a newer reconnect attempt")
+                let context = "resync snapshot arrived after a newer reconnect attempt"
+                if let outstandingGeneration {
+                    await failRefusedResumeDecision(outstandingGeneration, context)
+                } else {
+                    await reportFailure(.superseded(context))
+                }
                 return
             }
             applyResult = claimed
@@ -857,20 +881,57 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    private func handlePendingEventReplayFailure(_ error: String) async {
+        await reportFailure(.transportEnded("pending event replay retry failed: \(error)"))
+    }
+
+    /// Commits controller state after resume replay and abandons background retries when teardown raced completion.
+    private func finalizeResumeAttempt(_ generation: UInt64, mutate: () -> Void) async {
+        let didCommitControllerState = withStateLock { () -> Bool in
+            guard isRunning, !_isDiverged else { return false }
+            mutate()
+            activeReplayRetryGeneration = generation
+            return true
+        }
+        if didCommitControllerState {
+            await outbox.commitResumeWork(generation: generation)
+        } else {
+            await outbox.stopResumeWork(generation: generation)
+        }
+    }
+
+    /// Reports the terminal failure for a resume decision the outbox refused (§18).
+    ///
+    /// A generation the outbox never issued cannot be explained by a lost race: it means this
+    /// controller is bound to a different outbox than the one that minted it, which is a
+    /// required-semantics failure rather than a benign supersession (§4 inv. 13).
+    private func failRefusedResumeDecision(_ generation: UInt64, _ context: String) async {
+        if await outbox.hasIssuedResumeGeneration(generation) {
+            await reportFailure(.superseded(context))
+        } else {
+            await reportFailure(.protocolViolation(
+                "\(context): resume generation \(generation) was never issued by this outbox"
+            ))
+        }
+    }
+
     /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.
     private func completeSnapshotCatchUp() async {
+        withStateLock { self.pendingResync = false }
         let generation = withStateLock { self.resumeGeneration }
         if let generation {
             guard await outbox.finishResync(generation: generation) else {
                 // The latch belongs to a newer attempt, so this controller can never leave
                 // `.awaitingSnapshot`. Report it instead of holding a mute transport (§18).
-                await failSuperseded("resync completed after a newer reconnect attempt")
+                await failRefusedResumeDecision(
+                    generation,
+                    "resync completed after a newer reconnect attempt"
+                )
                 return
             }
-            withStateLock {
-                self.pendingResync = false
+            await finalizeResumeAttempt(generation) {
                 self.resumeGeneration = nil
-                self.eventDispatchEnabled = self.isRunning && !self._isDiverged
+                self.eventDispatchEnabled = true
                 if case .awaitingSnapshot(let negotiated) = self.phase {
                     self.phase = .active(negotiated: negotiated)
                 }
@@ -879,13 +940,12 @@ public final class SessionController: @unchecked Sendable {
             guard await outbox.allowNewEvents() else {
                 // Another controller opened a reconnect generation while this catch-up was in
                 // flight; re-enabling allocation here would break the latch it is waiting on.
-                await failSuperseded(
+                await reportFailure(.superseded(
                     "catch-up completed while another reconnect attempt was outstanding"
-                )
+                ))
                 return
             }
             withStateLock {
-                self.pendingResync = false
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
                 if case .awaitingSnapshot(let negotiated) = self.phase {
                     self.phase = .active(negotiated: negotiated)
@@ -921,27 +981,26 @@ public final class SessionController: @unchecked Sendable {
         await reportFailure(.replicaDiverged(error))
     }
 
-    /// Terminates a controller whose reconnect generation lost to a newer attempt (§18).
-    ///
-    /// Every outbox decision for a superseded generation is rejected, so such a controller can
-    /// never leave `.awaitingResume` / `.awaitingSnapshot`. Without this it would keep an open
-    /// transport, silently drop every frame, and give the owner no signal that it is dead.
-    private func failSuperseded(_ context: String) async {
-        await reportFailure(.superseded(context))
-    }
-
     /// Reports a terminal session failure exactly once and tears the transport down so the caller
     /// can reconnect and resume (§18, §4 inv. 13).
     private func reportFailure(_ failure: SessionFailure) async {
-        let handler: (@Sendable (SessionFailure) -> Void)? = withStateLock {
-            if _isDiverged { return nil }
+        let failureState: (
+            handler: (@Sendable (SessionFailure) -> Void)?,
+            replayGeneration: UInt64?
+        ) = withStateLock {
+            if _isDiverged { return (nil, nil) }
             _isDiverged = true
             eventDispatchEnabled = false
             phase = .failed
-            return _onFailure ?? { _ in }
+            let replayGeneration = resumeGeneration ?? activeReplayRetryGeneration
+            activeReplayRetryGeneration = nil
+            return (_onFailure ?? { _ in }, replayGeneration)
         }
-        guard let handler else { return }
+        guard let handler = failureState.handler else { return }
 
+        if let replayGeneration = failureState.replayGeneration {
+            await outbox.stopResumeWork(generation: replayGeneration)
+        }
         SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
         handler(failure)
         await transport.close()
@@ -974,16 +1033,31 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// How long `stop()` lets the receive loop drain closed-transport frames before cancelling it.
+    private static let receiveDrainGraceNanoseconds: UInt64 = 2_000_000_000
+
     /// Stops the session coordinator and closes the underlying transport.
     public func stop() async {
-        let task = withStateLock { () -> (Task<Void, Never>?, Bool) in
-            guard isRunning else { return (nil, false) }
+        let stoppedState: (
+            receiveTask: Task<Void, Never>?,
+            replayGeneration: UInt64?,
+            shouldStop: Bool
+        ) = withStateLock {
+            guard isRunning else { return (nil, nil, false) }
             isRunning = false
             eventDispatchEnabled = false
-            return (receiveTask, true)
+            return (
+                receiveTask,
+                resumeGeneration ?? activeReplayRetryGeneration,
+                true
+            )
         }
 
-        guard task.1 else { return }
+        guard stoppedState.shouldStop else { return }
+
+        if let replayGeneration = stoppedState.replayGeneration {
+            await outbox.stopResumeWork(generation: replayGeneration)
+        }
 
         // Close the transport first so the receive loop drains any buffered catch-up frames
         // (welcome snapshot, replay) while handshake phase is still valid. Resetting `phase` or
@@ -993,15 +1067,24 @@ public final class SessionController: @unchecked Sendable {
         // still tears down an in-progress handshake send (§22.2).
         await transport.close()
 
-        if let receiveTask = task.0 {
+        if let receiveTask = stoppedState.receiveTask {
+            // Bound the drain. `Transport` is a public protocol: a conformer whose `close()` never
+            // finishes its stream continuation would otherwise hang `stop()` forever, with no
+            // cancellation to break it. Wait for the drain, but cancel it once the grace period
+            // elapses so teardown always completes (§22.2).
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await receiveTask.value }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: Self.receiveDrainGraceNanoseconds)
+                    receiveTask.cancel()
+                }
+                await group.next()
+                group.cancelAll()
+            }
+            receiveTask.cancel()
             await receiveTask.value
         }
 
-        // Only this controller's own generation is released: a newer controller may already own
-        // the latch on a shared outbox, and clearing that one would strand it (§18).
-        if let generation = withStateLock({ resumeGeneration }) {
-            await outbox.abandonResumeHandshake(generation: generation)
-        }
         clearSessionStateAfterStop()
 
         await MainActor.run {
@@ -1024,6 +1107,8 @@ public final class SessionController: @unchecked Sendable {
             pendingResync = false
             requestedSessionId = nil
             resumeGeneration = nil
+            activeReplayRetryGeneration = nil
+            eventDispatchEnabled = false
             phase = .idle
         }
     }

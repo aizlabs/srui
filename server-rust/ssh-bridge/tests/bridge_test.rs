@@ -37,7 +37,10 @@ async fn test_ssh_bridge_forwarding() {
             client_metadata: Default::default(),
         })),
     };
-    ssh_framed_write.send(hello.clone()).await.expect("send hello from ssh");
+    ssh_framed_write
+        .send(hello.clone())
+        .await
+        .expect("send hello from ssh");
 
     let received_by_session = session_framed_read
         .next()
@@ -55,7 +58,10 @@ async fn test_ssh_bridge_forwarding() {
             operations: vec![],
         })),
     };
-    session_framed_write.send(tx.clone()).await.expect("send tx from sessiond");
+    session_framed_write
+        .send(tx.clone())
+        .await
+        .expect("send tx from sessiond");
 
     let received_by_ssh = ssh_framed_read
         .next()

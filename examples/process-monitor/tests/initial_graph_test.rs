@@ -39,7 +39,13 @@ fn initial_graph_has_the_required_hierarchy_and_node_types() {
 
         let actions_row = store.get_node(ACTIONS_ROW_ID).expect("actions row");
         assert_eq!(actions_row.node_type, TypeRef::ROW);
-        assert_eq!(actions_row.ordered_children, vec![KILL_BUTTON_ID]);
+        assert_eq!(
+            actions_row.ordered_children,
+            vec![KILL_BUTTON_ID, KILL_STATUS_ID]
+        );
+
+        let status = Text::from_store(store, KILL_STATUS_ID).expect("kill status");
+        assert_eq!(status.text(store), Some(KILL_STATUS_IDLE));
 
         let heading = Text::from_store(store, HEADING_ID).expect("heading");
         assert_eq!(heading.text(store), Some("System Monitor"));
@@ -172,5 +178,42 @@ fn fixture_with_single_process() -> common::Fixture {
 #[test]
 fn initial_transaction_is_a_single_atomic_commit() {
     let fixture = base_fixture();
+    assert_eq!(fixture.session.current_revision(), 1);
+}
+
+#[test]
+fn initial_model_population_chunks_large_process_lists() {
+    // 2 500 processes exceeds MAX_ITEMS_PER_MODEL_OP (1 000) and exercises chunking.
+    const LARGE_COUNT: usize = 2_500;
+    let records: Vec<ProcessRecord> = (0..LARGE_COUNT)
+        .map(|i| {
+            record(
+                i as u32 + 100,
+                1_000,
+                &format!("proc-{i}"),
+                0.5,
+                10 * MIB,
+                Some(UID),
+            )
+        })
+        .collect();
+
+    let fixture = common::fixture(snapshot(50.0, records));
+    let visible = fixture.monitor.with_state(|state| state.visible().to_vec());
+    assert_eq!(visible.len(), LARGE_COUNT);
+
+    fixture.session.with_store(|store| {
+        let model = store.get_model(PROCESS_MODEL_ID).expect("process model");
+        assert_eq!(model.item_count(), LARGE_COUNT as u64);
+        assert_eq!(model.cached_item_count(), LARGE_COUNT);
+
+        for (index, row) in visible.iter().enumerate() {
+            let item = model
+                .get_item_by_index(index as u64)
+                .expect("cached item at index");
+            assert_eq!(item.item_id, row.item_id);
+            assert_eq!(item.value, row.values.to_value());
+        }
+    });
     assert_eq!(fixture.session.current_revision(), 1);
 }

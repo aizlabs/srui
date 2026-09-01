@@ -93,14 +93,17 @@ pub fn replay_model(
     store
         .create_model(PROCESS_MODEL_ID, TypeRef::TABLE, 0)
         .expect("create model");
-    if !prev.is_empty() {
+    let mut offset: u64 = 0;
+    for chunk in prev.chunks(srui_example_process_monitor::MAX_ITEMS_PER_MODEL_OP) {
+        let chunk_len = chunk.len() as u64;
         Operation::model_insert(
             PROCESS_MODEL_ID,
-            0,
-            prev.iter().map(|row| row.to_model_item()),
+            offset,
+            chunk.iter().map(|row| row.to_model_item()),
         )
         .apply(&mut store)
         .expect("seed model");
+        offset += chunk_len;
     }
     for operation in operations {
         operation.apply(&mut store).expect("apply operation");

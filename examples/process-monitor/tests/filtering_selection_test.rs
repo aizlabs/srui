@@ -4,13 +4,17 @@ mod common;
 
 use common::{base_fixture, base_processes, model_rows, MIB, OTHER_UID, UID};
 use srui_example_process_monitor::testing::{
-    argumentless_event, record, selection_event, snapshot, toggle_event,
+    argumentless_event, record, selection_event, snapshot, toggle_event, TEST_CLIENT_INSTANCE_ID,
 };
 use srui_example_process_monitor::*;
 use srui_sdk::{ItemId, Toggle, Value, SELECTION_CHANGED, VALUE, VALUE_CHANGED};
 
 fn visible_pids(monitor: &Monitor) -> Vec<u64> {
     monitor.with_state(|state| state.visible().iter().map(|row| row.values.pid).collect())
+}
+
+fn test_client_selection(monitor: &Monitor) -> Option<ItemId> {
+    monitor.with_state(|state| state.selected_item_for_client(TEST_CLIENT_INSTANCE_ID.as_bytes()))
 }
 
 #[test]
@@ -93,10 +97,7 @@ fn a_known_selection_records_only_the_item_id() {
         .process_event(&event)
         .expect("event accepted");
 
-    assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
-        Some(item)
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), Some(item));
 }
 
 #[test]
@@ -110,10 +111,7 @@ fn an_unknown_selection_is_ignored() {
         .process_event(&event)
         .expect("event accepted");
 
-    assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
     assert_eq!(fixture.session.current_revision(), revision);
 }
 
@@ -128,10 +126,7 @@ fn a_malformed_selection_argument_is_ignored() {
         .process_event(&bare)
         .expect("event accepted");
 
-    assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
 }
 
 #[test]
@@ -153,10 +148,7 @@ fn selection_is_cleared_when_the_selected_process_exits() {
     fixture.source.publish(snapshot(25.0, remaining));
     fixture.monitor.tick().expect("tick");
 
-    assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
 }
 
 #[test]
@@ -181,10 +173,7 @@ fn selection_is_cleared_when_the_selected_process_is_filtered_out() {
         .session
         .process_event(&selection_event(2, revision, foreign))
         .expect("event accepted");
-    assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
-        Some(foreign)
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), Some(foreign));
 
     let revision = fixture.session.current_revision();
     fixture
@@ -192,14 +181,12 @@ fn selection_is_cleared_when_the_selected_process_is_filtered_out() {
         .process_event(&toggle_event(3, revision, Value::Bool(false)))
         .expect("event accepted");
 
-    assert_eq!(
-        fixture.monitor.with_state(MonitorState::selected_item),
-        None
-    );
+    assert_eq!(test_client_selection(&fixture.monitor), None);
     fixture.session.with_store(|store| {
         assert_eq!(
-            store.get_node(SHOW_ALL_ID).unwrap().get_property(VALUE),
-            Some(&Value::Bool(false))
+            Toggle::new(SHOW_ALL_ID).value(store),
+            Some(false),
+            "show_all toggle property must update to false on the client"
         );
     });
 }
@@ -222,4 +209,173 @@ fn processes_without_a_resolvable_owner_are_excluded_until_show_all() {
         .process_event(&event)
         .expect("event accepted");
     assert_eq!(visible_pids(&fixture.monitor), vec![11, 12]);
+}
+
+#[test]
+fn multi_client_selections_are_isolated_and_cleared_independently() {
+    let fixture = base_fixture();
+    let revision = fixture.session.current_revision();
+
+    let item_20 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+    let item_30 = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 30)
+            .unwrap()
+            .item_id
+    });
+
+    // Client A selects PID 20
+    let mut event_a = selection_event(1, revision, item_20);
+    event_a.client_instance_id = b"client-a".to_vec();
+    fixture
+        .session
+        .process_event(&event_a)
+        .expect("client A selection accepted");
+
+    // Client B selects PID 30
+    let mut event_b = selection_event(2, revision, item_30);
+    event_b.client_instance_id = b"client-b".to_vec();
+    fixture
+        .session
+        .process_event(&event_b)
+        .expect("client B selection accepted");
+
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-a")),
+        Some(item_20)
+    );
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-b")),
+        Some(item_30)
+    );
+
+    // PID 20 exits
+    let remaining: Vec<ProcessRecord> = base_processes()
+        .into_iter()
+        .filter(|process| process.key.pid != 20)
+        .collect();
+    fixture.source.publish(snapshot(25.0, remaining));
+    fixture.monitor.tick().expect("tick");
+
+    // Client A's selection is cleared because PID 20 exited, but Client B's selection of PID 30 remains intact!
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-a")),
+        None
+    );
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|s| s.selected_item_for_client(b"client-b")),
+        Some(item_30)
+    );
+}
+
+#[test]
+fn client_selection_state_is_bounded_and_rejects_oversized_identifiers() {
+    let fixture = base_fixture();
+    let revision = fixture.session.current_revision();
+    let item = fixture.monitor.with_state(|state| {
+        state
+            .visible()
+            .iter()
+            .find(|row| row.values.pid == 20)
+            .unwrap()
+            .item_id
+    });
+
+    // An identifier past the accepted length is refused rather than stored.
+    let mut oversized = selection_event(1, revision, item);
+    oversized.client_instance_id = vec![b'x'; MAX_CLIENT_INSTANCE_ID_LEN + 1];
+    fixture
+        .session
+        .process_event(&oversized)
+        .expect("event processed");
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(MonitorState::client_selection_count),
+        0
+    );
+
+    // A peer reconnecting under fresh ids while holding a long-lived row cannot grow the map:
+    // the least recently selected client is evicted once the cap is reached.
+    let overflow = MAX_CLIENT_SELECTIONS + 20;
+    for index in 0..overflow {
+        let mut event = selection_event(2 + index as u64, revision, item);
+        event.client_instance_id = format!("client-{index}").into_bytes();
+        fixture
+            .session
+            .process_event(&event)
+            .expect("event processed");
+    }
+
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(MonitorState::client_selection_count),
+        MAX_CLIENT_SELECTIONS
+    );
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|state| state.selected_item_for_client(b"client-0")),
+        None
+    );
+    let newest = format!("client-{}", overflow - 1).into_bytes();
+    assert_eq!(
+        fixture
+            .monitor
+            .with_state(|state| state.selected_item_for_client(&newest)),
+        Some(item)
+    );
+}
+
+#[test]
+fn show_all_toggle_reaffirms_state_when_commit_fails() {
+    // A foreign-user process whose name exceeds the §26 maximum string length: invisible while
+    // `show_all` is false, and impossible to publish once the toggle flips, so the whole
+    // visibility transaction is rejected.
+    let oversized_name = "x".repeat(2 * 1024 * 1024);
+    let fixture = common::fixture(snapshot(
+        25.0,
+        vec![
+            record(20, 1_000, "beta", 2.0, 2 * MIB, Some(UID)),
+            record(40, 1_000, &oversized_name, 4.0, 4 * MIB, Some(OTHER_UID)),
+        ],
+    ));
+    assert!(!fixture.monitor.with_state(MonitorState::show_all));
+    let revision = fixture.session.current_revision();
+
+    fixture
+        .session
+        .process_event(&toggle_event(1, revision, Value::Bool(true)))
+        .expect("event accepted");
+
+    // Authoritative state stays on the value that is actually published ...
+    assert!(!fixture.monitor.with_state(MonitorState::show_all));
+    assert_eq!(visible_pids(&fixture.monitor), vec![20]);
+    // ... and exactly one reaffirming transaction re-sends it, so the client switch that already
+    // flipped optimistically snaps back instead of staying desynced (§27).
+    assert_eq!(fixture.session.current_revision(), revision + 1);
+    fixture.session.with_store(|store| {
+        assert_eq!(
+            store.get_node(SHOW_ALL_ID).unwrap().get_property(VALUE),
+            Some(&Value::Bool(false))
+        );
+    });
 }

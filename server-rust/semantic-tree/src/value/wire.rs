@@ -14,7 +14,9 @@ pub enum ValueConversionError {
 impl fmt::Display for ValueConversionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingField(field) => write!(f, "missing expected protobuf wire field: {}", field),
+            Self::MissingField(field) => {
+                write!(f, "missing expected protobuf wire field: {}", field)
+            }
             Self::InvalidResourceHashLength(len) => {
                 write!(f, "expected 32-byte resource hash, got {} bytes", len)
             }
@@ -47,10 +49,7 @@ impl From<&Value> for srui_protocol::Value {
                 width: s.width,
                 height: s.height,
             }),
-            Value::Point(p) => WireVal::PointValue(srui_protocol::PointVal {
-                x: p.x,
-                y: p.y,
-            }),
+            Value::Point(p) => WireVal::PointValue(srui_protocol::PointVal { x: p.x, y: p.y }),
             Value::Range(r) => WireVal::RangeValue(srui_protocol::RangeVal {
                 location: r.start,
                 length: r.length,
@@ -128,10 +127,7 @@ impl TryFrom<srui_protocol::Value> for Value {
             WireVal::RangeValue(r) => Ok(Self::Range(Range::new(r.location, r.length))),
             WireVal::RectValue(r) => Ok(Self::Rect(Rect::new(r.x, r.y, r.width, r.height))),
             WireVal::InsetsValue(i) => Ok(Self::EdgeInsets(EdgeInsets::new(
-                i.top,
-                i.leading,
-                i.bottom,
-                i.trailing,
+                i.top, i.leading, i.bottom, i.trailing,
             ))),
             WireVal::ListValue(l) => {
                 let mut list = Vec::with_capacity(l.values.len());

@@ -1,7 +1,7 @@
 use srui_semantic_tree::{
     resolve_standard_node_type, resolve_standard_property, ItemId, ModelId, ModelItem, NodeId,
-    Operation, PropertyRef, Revision, SemanticStore, StoreError, StoreLimits, Transaction, TxnError,
-    Value, DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_TRANSACTION_OPERATIONS,
+    Operation, PropertyRef, Revision, SemanticStore, StoreError, StoreLimits, Transaction,
+    TxnError, Value, DEFAULT_MAX_MODEL_COUNT, DEFAULT_MAX_TRANSACTION_OPERATIONS,
 };
 
 #[test]
@@ -30,17 +30,26 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
     let item1 = ModelItem::new(
         ItemId::new(101),
         "nginx",
-        vec![(col_name, Value::from("nginx")), (col_cpu, Value::from(0.05))],
+        vec![
+            (col_name, Value::from("nginx")),
+            (col_cpu, Value::from(0.05)),
+        ],
     );
     let item2 = ModelItem::new(
         ItemId::new(202),
         "postgres",
-        vec![(col_name, Value::from("postgres")), (col_cpu, Value::from(0.35))],
+        vec![
+            (col_name, Value::from("postgres")),
+            (col_cpu, Value::from(0.35)),
+        ],
     );
     let item3 = ModelItem::new(
         ItemId::new(303),
         "redis",
-        vec![(col_name, Value::from("redis")), (col_cpu, Value::from(0.02))],
+        vec![
+            (col_name, Value::from("redis")),
+            (col_cpu, Value::from(0.02)),
+        ],
     );
 
     // Reset range at index 10 for item1 and item2
@@ -57,15 +66,27 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
     assert_eq!(model.item_count(), large_count);
     assert_eq!(model.cached_item_count(), 3);
     assert_eq!(model.cached_ranges().len(), 2);
-    assert_eq!(model.get_item_by_id(ItemId::new(101)).unwrap().value, Value::from("nginx"));
-    assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().value, Value::from("postgres"));
-    assert_eq!(model.get_item_by_id(ItemId::new(303)).unwrap().value, Value::from("redis"));
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(101)).unwrap().value,
+        Value::from("nginx")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(202)).unwrap().value,
+        Value::from("postgres")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(303)).unwrap().value,
+        Value::from("redis")
+    );
 
     // 3. Insert a new item into the sparse collection using MODEL_INSERT (§13)
     let item_inserted = ModelItem::new(
         ItemId::new(150),
         "memcached",
-        vec![(col_name, Value::from("memcached")), (col_cpu, Value::from(0.01))],
+        vec![
+            (col_name, Value::from("memcached")),
+            (col_cpu, Value::from(0.01)),
+        ],
     );
     store
         .model_insert(model_id, 11, vec![item_inserted])
@@ -84,7 +105,10 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
     let updated_postgres = ModelItem::new(
         ItemId::new(202),
         "postgres-master",
-        vec![(col_name, Value::from("postgres-master")), (col_cpu, Value::from(0.50))],
+        vec![
+            (col_name, Value::from("postgres-master")),
+            (col_cpu, Value::from(0.50)),
+        ],
     );
     store
         .model_update(model_id, None, vec![updated_postgres])
@@ -92,11 +116,29 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
 
     // Confirm only the addressed item changes; other items remain untouched
     let model = store.get_model(model_id).unwrap();
-    assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().value, Value::from("postgres-master"));
-    assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().get_property(col_cpu), Some(&Value::from(0.50)));
-    assert_eq!(model.get_item_by_id(ItemId::new(101)).unwrap().value, Value::from("nginx"));
-    assert_eq!(model.get_item_by_id(ItemId::new(150)).unwrap().value, Value::from("memcached"));
-    assert_eq!(model.get_item_by_id(ItemId::new(303)).unwrap().value, Value::from("redis"));
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(202)).unwrap().value,
+        Value::from("postgres-master")
+    );
+    assert_eq!(
+        model
+            .get_item_by_id(ItemId::new(202))
+            .unwrap()
+            .get_property(col_cpu),
+        Some(&Value::from(0.50))
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(101)).unwrap().value,
+        Value::from("nginx")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(150)).unwrap().value,
+        Value::from("memcached")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(303)).unwrap().value,
+        Value::from("redis")
+    );
     assert_eq!(model.cached_item_count(), 4);
 
     // 5. Delete an item by item_id (delete nginx ItemId(101))
@@ -108,9 +150,18 @@ fn test_create_sparse_model_and_item_mutations_by_identity() {
     let model = store.get_model(model_id).unwrap();
     assert_eq!(model.cached_item_count(), 3);
     assert!(!model.contains_item(ItemId::new(101)));
-    assert_eq!(model.get_item_by_id(ItemId::new(150)).unwrap().value, Value::from("memcached"));
-    assert_eq!(model.get_item_by_id(ItemId::new(202)).unwrap().value, Value::from("postgres-master"));
-    assert_eq!(model.get_item_by_id(ItemId::new(303)).unwrap().value, Value::from("redis"));
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(150)).unwrap().value,
+        Value::from("memcached")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(202)).unwrap().value,
+        Value::from("postgres-master")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(303)).unwrap().value,
+        Value::from("redis")
+    );
 }
 
 #[test]
@@ -121,7 +172,9 @@ fn test_model_reset_range_replaces_range_without_touching_count_or_other_ranges(
     let model_id = ModelId::new(42);
     let total_count = 100_000u64;
 
-    store.create_model(model_id, list_type, total_count).unwrap();
+    store
+        .create_model(model_id, list_type, total_count)
+        .unwrap();
 
     // Populate Range A at index 100..103
     let range_a = vec![
@@ -129,14 +182,18 @@ fn test_model_reset_range_replaces_range_without_touching_count_or_other_ranges(
         ModelItem::with_value(ItemId::new(2), "A1"),
         ModelItem::with_value(ItemId::new(3), "A2"),
     ];
-    store.model_reset_range(model_id, 100, range_a, None).unwrap();
+    store
+        .model_reset_range(model_id, 100, range_a, None)
+        .unwrap();
 
     // Populate Range B at index 500..502
     let range_b = vec![
         ModelItem::with_value(ItemId::new(10), "B0"),
         ModelItem::with_value(ItemId::new(11), "B1"),
     ];
-    store.model_reset_range(model_id, 500, range_b, None).unwrap();
+    store
+        .model_reset_range(model_id, 500, range_b, None)
+        .unwrap();
 
     let model = store.get_model(model_id).unwrap();
     assert_eq!(model.item_count(), 100_000);
@@ -149,7 +206,9 @@ fn test_model_reset_range_replaces_range_without_touching_count_or_other_ranges(
         ModelItem::with_value(ItemId::new(1002), "X1"),
         ModelItem::with_value(ItemId::new(1003), "X2"),
     ];
-    store.model_reset_range(model_id, 100, new_range_a, None).unwrap();
+    store
+        .model_reset_range(model_id, 100, new_range_a, None)
+        .unwrap();
 
     let model = store.get_model(model_id).unwrap();
     // 1. Total item_count must NOT change
@@ -159,13 +218,28 @@ fn test_model_reset_range_replaces_range_without_touching_count_or_other_ranges(
     assert!(!model.contains_item(ItemId::new(1)));
     assert!(!model.contains_item(ItemId::new(2)));
     assert!(!model.contains_item(ItemId::new(3)));
-    assert_eq!(model.get_item_by_id(ItemId::new(1001)).unwrap().value, Value::from("X0"));
-    assert_eq!(model.get_item_by_id(ItemId::new(1002)).unwrap().value, Value::from("X1"));
-    assert_eq!(model.get_item_by_id(ItemId::new(1003)).unwrap().value, Value::from("X2"));
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(1001)).unwrap().value,
+        Value::from("X0")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(1002)).unwrap().value,
+        Value::from("X1")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(1003)).unwrap().value,
+        Value::from("X2")
+    );
 
     // 3. Range B items are completely unchanged
-    assert_eq!(model.get_item_by_id(ItemId::new(10)).unwrap().value, Value::from("B0"));
-    assert_eq!(model.get_item_by_id(ItemId::new(11)).unwrap().value, Value::from("B1"));
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(10)).unwrap().value,
+        Value::from("B0")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(11)).unwrap().value,
+        Value::from("B1")
+    );
     assert_eq!(model.index_of(ItemId::new(10)), Some(500));
     assert_eq!(model.index_of(ItemId::new(11)), Some(501));
     assert_eq!(model.cached_item_count(), 5);
@@ -191,7 +265,13 @@ fn test_transaction_atomicity_spans_node_ops_and_model_ops() {
     assert_eq!(rev1, Revision::new(1));
     assert_eq!(store.node_count(), 1);
     assert_eq!(store.model_count(), 1);
-    assert_eq!(store.get_model(ModelId::new(10)).unwrap().cached_item_count(), 0);
+    assert_eq!(
+        store
+            .get_model(ModelId::new(10))
+            .unwrap()
+            .cached_item_count(),
+        0
+    );
 
     // Build a transaction combining:
     // 1. A valid MODEL_INSERT on model 10
@@ -349,7 +429,9 @@ fn test_model_limits_enforcement() {
     let oversized_str = "x".repeat(max_str_len + 1);
     let invalid_item = ModelItem::with_value(ItemId::new(1), oversized_str);
 
-    let err = store.model_insert(model_id, 0, vec![invalid_item]).unwrap_err();
+    let err = store
+        .model_insert(model_id, 0, vec![invalid_item])
+        .unwrap_err();
     assert_eq!(
         err,
         StoreError::MaxStringLengthExceeded {
@@ -390,7 +472,9 @@ fn test_successful_mixed_transaction_commits_atomically() {
         ],
     );
 
-    let new_rev = store.apply_transaction_record(&txn).expect("apply mixed txn");
+    let new_rev = store
+        .apply_transaction_record(&txn)
+        .expect("apply mixed txn");
     assert_eq!(new_rev, Revision::new(1));
     assert_eq!(store.revision(), Revision::new(1));
     assert_eq!(store.node_count(), 1);
@@ -398,7 +482,10 @@ fn test_successful_mixed_transaction_commits_atomically() {
 
     let model = store.get_model(ModelId::new(1)).unwrap();
     assert_eq!(model.cached_item_count(), 2);
-    assert_eq!(model.get_item_by_id(ItemId::new(10)).unwrap().value, Value::from("root_node"));
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(10)).unwrap().value,
+        Value::from("root_node")
+    );
 }
 
 #[test]
@@ -509,7 +596,10 @@ fn test_model_items_per_operation_limit_enforced() {
 
     assert_eq!(
         err,
-        StoreError::MaxItemsPerModelOperationExceeded { limit: 2, actual: 3 }
+        StoreError::MaxItemsPerModelOperationExceeded {
+            limit: 2,
+            actual: 3
+        }
     );
 }
 
@@ -528,7 +618,10 @@ fn test_max_model_count_limit_enforced() {
 
     assert_eq!(
         err,
-        StoreError::MaxModelCountExceeded { limit: 2, current: 2 }
+        StoreError::MaxModelCountExceeded {
+            limit: 2,
+            current: 2
+        }
     );
     assert_eq!(store.model_count(), 2);
 }
@@ -621,12 +714,7 @@ fn test_model_delete_combined_identity_and_range_preserves_item_count() {
 
     // Attempt invalid combined delete
     let err = store
-        .model_delete(
-            model_id,
-            Some(5),
-            Some(2),
-            &[ItemId::new(50)],
-        )
+        .model_delete(model_id, Some(5), Some(2), &[ItemId::new(50)])
         .unwrap_err();
 
     assert!(matches!(err, StoreError::InvalidModelDelete(_)));
@@ -646,7 +734,9 @@ fn test_model_delete_sparse_range_large_count() {
     let model_id = ModelId::new(1);
     let total_count = 1_000_000u64;
 
-    store.create_model(model_id, list_type, total_count).unwrap();
+    store
+        .create_model(model_id, list_type, total_count)
+        .unwrap();
 
     // Place sparse items at index 10, 50, 100, 200
     store
@@ -723,7 +813,10 @@ fn test_model_batch_limits_enforced_across_all_ops() {
         .unwrap_err();
     assert_eq!(
         update_err,
-        StoreError::MaxItemsPerModelOperationExceeded { limit: 2, actual: 3 }
+        StoreError::MaxItemsPerModelOperationExceeded {
+            limit: 2,
+            actual: 3
+        }
     );
 
     // 2. model_reset_range batch limit
@@ -741,7 +834,10 @@ fn test_model_batch_limits_enforced_across_all_ops() {
         .unwrap_err();
     assert_eq!(
         reset_err,
-        StoreError::MaxItemsPerModelOperationExceeded { limit: 2, actual: 3 }
+        StoreError::MaxItemsPerModelOperationExceeded {
+            limit: 2,
+            actual: 3
+        }
     );
 
     // 3. model_delete batch limit (item_ids)
@@ -755,7 +851,10 @@ fn test_model_batch_limits_enforced_across_all_ops() {
         .unwrap_err();
     assert_eq!(
         delete_err,
-        StoreError::MaxItemsPerModelOperationExceeded { limit: 2, actual: 3 }
+        StoreError::MaxItemsPerModelOperationExceeded {
+            limit: 2,
+            actual: 3
+        }
     );
 }
 
@@ -788,8 +887,14 @@ fn test_model_update_by_identity_and_by_index() {
         .unwrap();
 
     let model = store.get_model(model_id).unwrap();
-    assert_eq!(model.get_item_by_index(1).unwrap().value, Value::from("updated_20_by_id"));
-    assert_eq!(model.get_item_by_id(ItemId::new(20)).unwrap().value, Value::from("updated_20_by_id"));
+    assert_eq!(
+        model.get_item_by_index(1).unwrap().value,
+        Value::from("updated_20_by_id")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(20)).unwrap().value,
+        Value::from("updated_20_by_id")
+    );
 
     // 2. Update by index (index: Some(0))
     store
@@ -801,8 +906,14 @@ fn test_model_update_by_identity_and_by_index() {
         .unwrap();
 
     let model = store.get_model(model_id).unwrap();
-    assert_eq!(model.get_item_by_index(0).unwrap().value, Value::from("updated_10_by_idx"));
-    assert_eq!(model.get_item_by_id(ItemId::new(10)).unwrap().value, Value::from("updated_10_by_idx"));
+    assert_eq!(
+        model.get_item_by_index(0).unwrap().value,
+        Value::from("updated_10_by_idx")
+    );
+    assert_eq!(
+        model.get_item_by_id(ItemId::new(10)).unwrap().value,
+        Value::from("updated_10_by_idx")
+    );
 }
 
 #[test]
@@ -837,7 +948,10 @@ fn test_model_update_positional_conflict_reindexes_cleanly() {
     let model = store.get_model(model_id).unwrap();
     // Index 0 has ItemId(3)
     assert_eq!(model.get_item_by_index(0).unwrap().item_id, ItemId::new(3));
-    assert_eq!(model.get_item_by_index(0).unwrap().value, Value::from("item_3_moved_to_0"));
+    assert_eq!(
+        model.get_item_by_index(0).unwrap().value,
+        Value::from("item_3_moved_to_0")
+    );
     assert_eq!(model.index_of(ItemId::new(3)), Some(0));
 
     // Old index 2 is now vacant
@@ -884,7 +998,10 @@ fn test_store_limits_granular_builder_methods() {
     assert_eq!(tree_val_limits.max_value_depth, 3);
     assert_eq!(tree_val_limits.max_list_elements, 20);
     assert_eq!(tree_val_limits.max_record_properties, 15);
-    assert_eq!(tree_val_limits.max_transaction_operations, DEFAULT_MAX_TRANSACTION_OPERATIONS);
+    assert_eq!(
+        tree_val_limits.max_transaction_operations,
+        DEFAULT_MAX_TRANSACTION_OPERATIONS
+    );
     assert_eq!(tree_val_limits.max_model_count, DEFAULT_MAX_MODEL_COUNT);
 
     // Test true 10-parameter with_all_limits
@@ -946,7 +1063,9 @@ fn test_dangling_model_ref_rejected_across_all_property_mutation_methods() {
     assert_eq!(batch_err, StoreError::ModelNotFound(non_existent_model));
 
     // 4. Create model and verify setting model_ref now succeeds
-    store.create_model(non_existent_model, table_type, 100).unwrap();
+    store
+        .create_model(non_existent_model, table_type, 100)
+        .unwrap();
     store
         .set_property(
             NodeId::new(1),

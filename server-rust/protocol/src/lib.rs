@@ -19,5 +19,3 @@ pub use codec::SruiCodec;
 
 /// Namespace 0 is the permanently reserved SRUI standard registry namespace.
 pub const STANDARD_NAMESPACE_ID: u32 = 0;
-
-

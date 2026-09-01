@@ -22,8 +22,8 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use srui_semantic_tree::{
-    Event, EventValidationError, Node, NodeId, Operation, PropertyRef, Revision,
-    SemanticStore, StoreError, TxnError, TypeRef, Value,
+    Event, EventValidationError, Node, NodeId, Operation, PropertyRef, Revision, SemanticStore,
+    StoreError, TxnError, TypeRef, Value,
 };
 use thiserror::Error;
 
@@ -255,8 +255,11 @@ impl UiTransaction {
     ) -> Result<(), StoreError> {
         let node_id = node.into();
         self.record_op()?;
-        self.operations
-            .push(Operation::move_node(node_id, new_parent_id, new_child_index));
+        self.operations.push(Operation::move_node(
+            node_id,
+            new_parent_id,
+            new_child_index,
+        ));
         self.staged
             .move_node(node_id, new_parent_id, new_child_index)
     }
@@ -269,8 +272,10 @@ impl UiTransaction {
     ) -> Result<(), StoreError> {
         let parent_id = parent.into();
         self.record_op()?;
-        self.operations
-            .push(Operation::reorder_children(parent_id, new_order.iter().copied()));
+        self.operations.push(Operation::reorder_children(
+            parent_id,
+            new_order.iter().copied(),
+        ));
         self.staged.reorder_children(parent_id, new_order)
     }
 

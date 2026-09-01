@@ -13,7 +13,10 @@ pub enum StoreError {
     /// Reordering children received an invalid list of child IDs (must be an exact permutation).
     InvalidChildrenReorder { parent_id: NodeId, reason: String },
     /// Moving a node would create a parent-child cycle in the graph.
-    CycleDetected { node_id: NodeId, target_parent: NodeId },
+    CycleDetected {
+        node_id: NodeId,
+        target_parent: NodeId,
+    },
     /// Operation exceeds the configured maximum tree depth limit (§26).
     MaxTreeDepthExceeded { limit: usize, actual: usize },
     /// Operation exceeds the configured maximum node count limit (§26).
@@ -29,7 +32,11 @@ pub enum StoreError {
     /// Operation exceeds the configured maximum model count limit (§26).
     MaxModelCountExceeded { limit: usize, current: usize },
     /// Collection model exceeds the configured maximum cached items limit (§26).
-    MaxCachedItemsPerModelExceeded { limit: usize, current: usize, attempted: usize },
+    MaxCachedItemsPerModelExceeded {
+        limit: usize,
+        current: usize,
+        attempted: usize,
+    },
     /// Model mutation operation exceeds the configured maximum items limit (§26).
     MaxItemsPerModelOperationExceeded { limit: usize, actual: usize },
     /// Invalid model delete parameters (e.g. combined identity and range selectors, §8, §13).
@@ -171,7 +178,9 @@ impl StoreError {
             Self::MaxRecordPropertiesExceeded { .. } => "max_record_properties_exceeded",
             Self::MaxModelCountExceeded { .. } => "max_model_count_exceeded",
             Self::MaxCachedItemsPerModelExceeded { .. } => "max_cached_items_per_model_exceeded",
-            Self::MaxItemsPerModelOperationExceeded { .. } => "max_items_per_model_operation_exceeded",
+            Self::MaxItemsPerModelOperationExceeded { .. } => {
+                "max_items_per_model_operation_exceeded"
+            }
             Self::InvalidModelDelete(_) => "invalid_model_delete",
             Self::ChildIndexOutOfBounds { .. } => "child_index_out_of_bounds",
             Self::ModelIdAlreadyUsed(_) => "model_id_already_used",

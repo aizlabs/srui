@@ -16,7 +16,6 @@ use tracing::{error, info, warn};
 use srui_example_process_monitor::{
     effective_uid, measure_transaction, Monitor, SignalTerminator, SysinfoProcessSource,
 };
-use srui_sdk::ServerCapabilities;
 use srui_sessiond::{handle_connection, Session};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -30,7 +29,7 @@ fn default_socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("srui-sessiond.sock")
+        .join("srui-process-monitor.sock")
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -69,6 +68,8 @@ struct OwnedSocket {
     path: PathBuf,
     /// `(device, inode)` of the endpoint created by this process.
     identity: (u64, u64),
+    /// Exclusive advisory lock on the socket path, released when this value is dropped.
+    _lock: std::fs::File,
 }
 
 impl OwnedSocket {
@@ -112,41 +113,133 @@ fn socket_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
     }
 }
 
-/// Binds `path`, refusing to displace a socket another server is still listening on.
+/// The advisory lock path guarding `socket_path`.
+fn socket_lock_path(socket_path: &Path) -> PathBuf {
+    let mut name = socket_path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Takes the exclusive advisory lock that marks this process as the owner of the socket path.
 ///
-/// An existing socket is probed by connecting to it: a successful connection means a live server
-/// owns the endpoint and this process must not start. Only a socket that refuses connections is
-/// treated as stale and unlinked.
+/// `flock(2)` is the authority on ownership, not a connect probe: the kernel releases it when the
+/// descriptor closes, including on `SIGKILL`, so a crashed server never leaves the endpoint
+/// permanently claimed, and holding it across the unlink-then-bind sequence closes the window in
+/// which two instances could both conclude the existing socket was stale.
+fn acquire_socket_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = socket_lock_path(socket_path);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+
+    // SAFETY: `file` owns a valid open descriptor for the duration of the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is already served by a running process; pass a different --socket",
+                    socket_path.display()
+                ),
+            ))
+        } else {
+            Err(error)
+        };
+    }
+    Ok(file)
+}
+
+/// What a connect probe was able to establish about an existing socket path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketLiveness {
+    /// A server answered: the endpoint is in use.
+    Live,
+    /// The endpoint is definitively gone or definitively unserved.
+    Absent,
+    /// The probe failed in a way that does not prove anything either way.
+    Ambiguous,
+}
+
+/// Classifies an existing socket path by attempting one connection.
+///
+/// Only two outcomes are treated as proof of absence: the path no longer exists, or connection is
+/// refused. `ECONNREFUSED` is conclusive *here* precisely because [`acquire_socket_lock`] already
+/// excluded every other instance of this program, so it cannot be the backlog-saturated peer of a
+/// sibling daemon. Anything else — `EPERM`, `EACCES`, `ECONNRESET` — can equally well come from a
+/// live foreign listener, and a foreign endpoint must never be displaced.
+async fn probe_socket_liveness(path: &Path) -> std::io::Result<SocketLiveness> {
+    if socket_identity(path)?.is_none() {
+        return Ok(SocketLiveness::Absent);
+    }
+    match tokio::net::UnixStream::connect(path).await {
+        Ok(_) => Ok(SocketLiveness::Live),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOENT)
+                || error.kind() == std::io::ErrorKind::ConnectionRefused
+                || error.raw_os_error() == Some(libc::ECONNREFUSED) =>
+        {
+            Ok(SocketLiveness::Absent)
+        }
+        Err(_) => Ok(SocketLiveness::Ambiguous),
+    }
+}
+
+/// Binds `path`, refusing to displace a socket another server is still listening on.
 async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    if socket_identity(path)?.is_some() {
-        match tokio::net::UnixStream::connect(path).await {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!(
-                        "{} is already served by a running process; pass a different --socket",
-                        path.display()
-                    ),
-                ));
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                ) =>
-            {
-                info!("removing stale socket {}", path.display());
-                std::fs::remove_file(path)?;
-            }
-            Err(error) => return Err(error),
+    let lock = acquire_socket_lock(path)?;
+
+    match probe_socket_liveness(path).await? {
+        SocketLiveness::Live => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is already served by a running process; pass a different --socket",
+                    path.display()
+                ),
+            ));
         }
+        SocketLiveness::Ambiguous => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} could not be proven unused; refusing to unlink it. Pass a different --socket",
+                    path.display()
+                ),
+            ));
+        }
+        SocketLiveness::Absent => {}
     }
 
-    let listener = UnixListener::bind(path)?;
+    // The lock is held across the unlink and the bind, so no other instance can slip in between.
+    // `socket_identity` refuses a path that exists but is not a socket, so an unrelated file is
+    // never a removal candidate.
+    if socket_identity(path)?.is_some() {
+        info!("removing stale socket {}", path.display());
+        std::fs::remove_file(path)?;
+    }
+
+    // Create the endpoint as `0600`: a Unix socket honours the umask, and any connector can send
+    // "Kill Selected" activations, so the endpoint must not be world-connectable.
+    //
+    // SAFETY: `umask(2)` reads and replaces a process-wide value and cannot fail. This runs during
+    // single-threaded startup, and the previous value is restored immediately after the bind.
+    let previous_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(path);
+    unsafe { libc::umask(previous_umask) };
+    let listener = bind_result?;
     let identity = socket_identity(path)?.ok_or_else(|| {
         std::io::Error::other(format!(
             "{} vanished immediately after bind",
@@ -158,6 +251,7 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
         OwnedSocket {
             path: path.to_path_buf(),
             identity,
+            _lock: lock,
         },
     ))
 }
@@ -178,10 +272,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         message
     })?;
 
-    let session = Arc::new(Session::with_capabilities(
-        "process-monitor",
-        ServerCapabilities::standard_widgets(),
-    ));
+    // Ignore SIGHUP so detached process-monitor daemons survive SSH bridge disconnects (§17, §20.2).
+    // Failing to install it silently would leave the daemon killable by the very disconnect this
+    // call exists to survive, so the error is propagated instead of dropped.
+    //
+    // SAFETY: `signal(2)` mutates process-wide disposition. This runs during single-threaded
+    // startup, before any task is spawned and before the socket exists, so no other thread can
+    // observe or race the intermediate disposition, and `SigIgn` installs no handler that could
+    // run non-async-signal-safe code.
+    unsafe {
+        nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGHUP,
+            nix::sys::signal::SigHandler::SigIgn,
+        )
+        .map_err(|errno| format!("failed to ignore SIGHUP: {errno}"))?;
+    }
+
+    let session = Arc::new(Session::mint());
 
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -195,7 +302,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     received = receiver.recv() => match received {
-                        Ok(transaction) => info!(target: "srui::wire_stats", "{}", measure_transaction(&transaction)),
+                        Ok(transaction) => match measure_transaction(&transaction) {
+                            Ok(stats) => info!(target: "srui::wire_stats", "{stats}"),
+                            Err(error) => warn!(target: "srui::wire_stats", "{error}"),
+                        },
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             warn!("wire-stats observer lagged by {skipped} transactions");
                         }

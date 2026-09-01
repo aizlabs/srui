@@ -47,7 +47,6 @@ impl std::error::Error for FramingError {
     }
 }
 
-
 /// Encodes a message with a varint length prefix, enforcing `DEFAULT_MAX_FRAME_SIZE` (§16, §26).
 pub fn encode_framed<M: Message>(msg: &M) -> Result<Vec<u8>, FramingError> {
     encode_framed_with_limit(msg, DEFAULT_MAX_FRAME_SIZE)
@@ -90,8 +89,7 @@ pub fn decode_framed_with_limit<M: Message + Default>(
             });
         }
     }
-    M::decode_length_delimited(&mut buf)
-        .map_err(|e| FramingError::DecodeError(e.to_string()))
+    M::decode_length_delimited(&mut buf).map_err(|e| FramingError::DecodeError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -129,13 +127,18 @@ mod tests {
 
         // Encoding with tiny limit should fail
         let err = encode_framed_with_limit(&msg, 2).expect_err("encode exceeding frame size");
-        assert!(matches!(err, FramingError::FrameSizeLimitExceeded { limit: 2, actual } if actual > 2));
+        assert!(
+            matches!(err, FramingError::FrameSizeLimitExceeded { limit: 2, actual } if actual > 2)
+        );
 
         // Decoding with tiny limit should fail
         let valid_bytes = encode_framed(&msg).unwrap();
         let decode_err = decode_framed_with_limit::<SruiMessage>(&valid_bytes, 2)
             .expect_err("decode exceeding frame size");
-        assert!(matches!(decode_err, FramingError::FrameSizeLimitExceeded { limit: 2, .. }));
+        assert!(matches!(
+            decode_err,
+            FramingError::FrameSizeLimitExceeded { limit: 2, .. }
+        ));
     }
 
     #[test]

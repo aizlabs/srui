@@ -96,7 +96,7 @@ fn exited_process_produces_a_model_delete() {
 
     assert_eq!(kinds(plan.operations()), vec!["MODEL_DELETE"]);
     match &plan.operations()[0] {
-        Operation::ModelDelete { item_ids, .. } => assert_eq!(item_ids, &vec![gone]),
+        Operation::ModelDelete { item_ids, .. } => assert_eq!(item_ids.as_slice(), &[gone]),
         other => panic!("expected MODEL_DELETE, got {other:?}"),
     }
 }
@@ -146,7 +146,7 @@ fn one_new_process_emits_only_a_model_insert() {
     match &plan.operations()[0] {
         Operation::ModelInsert { index, items, .. } => {
             // pid 25 sorts between 20 and 30.
-            assert_eq!(*index, 2);
+            assert_eq!(index, &2);
             assert_eq!(items.len(), 1);
         }
         other => panic!("expected MODEL_INSERT, got {other:?}"),
@@ -166,7 +166,7 @@ fn a_changed_row_emits_only_a_model_update_for_that_row() {
     assert_eq!(kinds(plan.operations()), vec!["MODEL_UPDATE"]);
     match &plan.operations()[0] {
         Operation::ModelUpdate { index, items, .. } => {
-            assert_eq!(*index, None, "updates address items by stable identity");
+            assert_eq!(index, &None, "updates address items by stable identity");
             assert_eq!(items.len(), 1, "unchanged retained rows are not resent");
             assert_eq!(items[0].item_id, changed_item);
             assert_eq!(
@@ -364,7 +364,7 @@ fn progress_properties_are_only_resent_when_their_value_changed() {
     );
     for operation in plan.operations() {
         match operation {
-            Operation::SetProperty { id, .. } => assert_eq!(*id, CPU_PROGRESS_ID),
+            Operation::SetProperty { id, .. } => assert_eq!(id, &CPU_PROGRESS_ID),
             other => panic!("expected SET_PROPERTY, got {other:?}"),
         }
     }

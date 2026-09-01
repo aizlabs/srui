@@ -295,6 +295,7 @@ struct EventOutboxTests {
         let ev4 = try await outbox.sendActivate(nodeId: NodeId(4), observedRevision: Revision(2), via: client2)
         #expect(ev4.eventSeq == 4)
 
+        await outbox.stopResumeWork(generation: generation)
         await client2.close()
         await server2.close()
     }
@@ -332,21 +333,21 @@ struct EventOutboxTests {
         #expect(await outbox.confirmFreshSession(id: "fresh-session"))
     }
 
-    @Test("Abandoning resume handshake clears the generation latch for a later fresh HELLO")
-    func abandonResumeHandshakeClearsGenerationLatch() async {
+    @Test("Stopping resume work clears the generation latch for a later fresh HELLO")
+    func stopResumeWorkClearsGenerationLatch() async {
         let outbox = EventOutbox()
         let generation = await outbox.beginResumeAttempt()
-        await outbox.abandonResumeHandshake(generation: generation)
+        await outbox.stopResumeWork(generation: generation)
         #expect(await outbox.confirmFreshSession(id: "fresh-session"))
     }
 
-    @Test("A superseded generation cannot abandon the latch held by a newer attempt")
-    func supersededGenerationCannotAbandonNewerLatch() async {
+    @Test("A superseded generation cannot release the latch held by a newer attempt")
+    func supersededGenerationCannotReleaseNewerLatch() async {
         let outbox = EventOutbox()
         let superseded = await outbox.beginResumeAttempt()
         let newest = await outbox.beginResumeAttempt()
 
-        await outbox.abandonResumeHandshake(generation: superseded)
+        await outbox.stopResumeWork(generation: superseded)
 
         // The newest attempt still owns the latch, so its own decision is still the only one
         // that can settle the outbox (§18).

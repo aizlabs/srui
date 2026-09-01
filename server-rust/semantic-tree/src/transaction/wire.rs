@@ -23,10 +23,9 @@ impl TryFrom<srui_protocol::Operation> for Operation {
                     TxnError::WireError("missing NodeRecord in CreateNodeOp".to_string())
                 })?;
                 let id = NodeId::new(rec.node_id);
-                let node_type = rec
-                    .r#type
-                    .map(TypeRef::from)
-                    .ok_or_else(|| TxnError::WireError("missing TypeRef in CreateNodeOp".to_string()))?;
+                let node_type = rec.r#type.map(TypeRef::from).ok_or_else(|| {
+                    TxnError::WireError("missing TypeRef in CreateNodeOp".to_string())
+                })?;
                 let parent_id = if rec.parent_id == 0 {
                     None
                 } else {
@@ -58,12 +57,13 @@ impl TryFrom<srui_protocol::Operation> for Operation {
             }),
             Op::SetProperty(set_op) => {
                 let id = NodeId::new(set_op.node_id);
-                let property = set_op
-                    .property
-                    .map(PropertyRef::from)
-                    .ok_or_else(|| TxnError::WireError("missing PropertyRef in SetPropertyOp".to_string()))?;
+                let property = set_op.property.map(PropertyRef::from).ok_or_else(|| {
+                    TxnError::WireError("missing PropertyRef in SetPropertyOp".to_string())
+                })?;
                 let value = match set_op.value {
-                    Some(v) => Value::try_from(v).map_err(|e| TxnError::WireError(e.to_string()))?,
+                    Some(v) => {
+                        Value::try_from(v).map_err(|e| TxnError::WireError(e.to_string()))?
+                    }
                     None => Value::Null,
                 };
                 Ok(Self::SetProperty {
@@ -74,10 +74,9 @@ impl TryFrom<srui_protocol::Operation> for Operation {
             }
             Op::ClearProperty(clear_op) => {
                 let id = NodeId::new(clear_op.node_id);
-                let property = clear_op
-                    .property
-                    .map(PropertyRef::from)
-                    .ok_or_else(|| TxnError::WireError("missing PropertyRef in ClearPropertyOp".to_string()))?;
+                let property = clear_op.property.map(PropertyRef::from).ok_or_else(|| {
+                    TxnError::WireError("missing PropertyRef in ClearPropertyOp".to_string())
+                })?;
                 Ok(Self::ClearProperty { id, property })
             }
             Op::MoveNode(move_op) => {
@@ -122,10 +121,9 @@ impl TryFrom<srui_protocol::Operation> for Operation {
             }
             Op::CreateModel(create_op) => {
                 let id = ModelId::new(create_op.model_id);
-                let model_type = create_op
-                    .model_type
-                    .map(TypeRef::from)
-                    .ok_or_else(|| TxnError::WireError("missing TypeRef in CreateModelOp".to_string()))?;
+                let model_type = create_op.model_type.map(TypeRef::from).ok_or_else(|| {
+                    TxnError::WireError("missing TypeRef in CreateModelOp".to_string())
+                })?;
                 Ok(Self::CreateModel {
                     id,
                     model_type,
@@ -148,8 +146,16 @@ impl TryFrom<srui_protocol::Operation> for Operation {
             }
             Op::ModelDelete(del_op) => {
                 let id = ModelId::new(del_op.model_id);
-                let index = if del_op.count > 0 { Some(del_op.index) } else { None };
-                let count = if del_op.count > 0 { Some(del_op.count) } else { None };
+                let index = if del_op.count > 0 {
+                    Some(del_op.index)
+                } else {
+                    None
+                };
+                let count = if del_op.count > 0 {
+                    Some(del_op.count)
+                } else {
+                    None
+                };
                 let item_ids = del_op.item_ids.into_iter().map(ItemId::new).collect();
                 Ok(Self::ModelDelete {
                     id,
@@ -160,7 +166,11 @@ impl TryFrom<srui_protocol::Operation> for Operation {
             }
             Op::ModelUpdate(update_op) => {
                 let id = ModelId::new(update_op.model_id);
-                let index = if update_op.index == u64::MAX { None } else { Some(update_op.index) };
+                let index = if update_op.index == u64::MAX {
+                    None
+                } else {
+                    Some(update_op.index)
+                };
                 let mut items = Vec::with_capacity(update_op.items.len());
                 for wire_item in update_op.items {
                     let item = ModelItem::try_from(wire_item)
@@ -171,7 +181,11 @@ impl TryFrom<srui_protocol::Operation> for Operation {
             }
             Op::ModelResetRange(reset_op) => {
                 let id = ModelId::new(reset_op.model_id);
-                let total_count = if reset_op.total_count > 0 { Some(reset_op.total_count) } else { None };
+                let total_count = if reset_op.total_count > 0 {
+                    Some(reset_op.total_count)
+                } else {
+                    None
+                };
                 let mut items = Vec::with_capacity(reset_op.items.len());
                 for wire_item in reset_op.items {
                     let item = ModelItem::try_from(wire_item)

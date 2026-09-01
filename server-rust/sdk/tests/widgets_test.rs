@@ -76,8 +76,14 @@ fn test_all_18_required_tier_node_types_and_constants() {
 fn test_no_separate_checkbox_or_switch_node_types_exist() {
     // Confirm across standard registry table that only Toggle (id: 12) exists
     for &(id, name) in STANDARD_NODE_TYPES {
-        assert_ne!(name, "Checkbox", "Invariant violated: Checkbox node type found in standard registry");
-        assert_ne!(name, "Switch", "Invariant violated: Switch node type found in standard registry");
+        assert_ne!(
+            name, "Checkbox",
+            "Invariant violated: Checkbox node type found in standard registry"
+        );
+        assert_ne!(
+            name, "Switch",
+            "Invariant violated: Switch node type found in standard registry"
+        );
         if id == 12 {
             assert_eq!(name, "Toggle");
         }
@@ -112,7 +118,10 @@ fn test_surface_widget_roundtrip() {
 
     // Typed accessors
     assert_eq!(surface.label(&store), Some("Main Window"));
-    assert_eq!(surface.accessible_description(&store), Some("Primary application window"));
+    assert_eq!(
+        surface.accessible_description(&store),
+        Some("Primary application window")
+    );
     assert_eq!(surface.visibility(&store), Some(Visibility::Visible));
     assert_eq!(surface.enabled(&store), Some(true));
     assert!(surface.is_enabled(&store));
@@ -120,11 +129,23 @@ fn test_surface_widget_roundtrip() {
     assert!(!surface.is_busy(&store));
     assert_eq!(surface.spacing_role(&store), Some(SpacingRole::Normal));
     assert_eq!(surface.padding_role(&store), Some(PaddingRole::Relaxed));
-    assert_eq!(surface.preferred_size(&store), Some(Size::new(800.0, 600.0)));
+    assert_eq!(
+        surface.preferred_size(&store),
+        Some(Size::new(800.0, 600.0))
+    );
     assert_eq!(surface.minimum_size(&store), Some(Size::new(400.0, 300.0)));
-    assert_eq!(surface.maximum_size(&store), Some(Size::new(1920.0, 1080.0)));
-    assert_eq!(surface.horizontal_alignment(&store), Some(HorizontalAlignment::Fill));
-    assert_eq!(surface.vertical_alignment(&store), Some(VerticalAlignment::Fill));
+    assert_eq!(
+        surface.maximum_size(&store),
+        Some(Size::new(1920.0, 1080.0))
+    );
+    assert_eq!(
+        surface.horizontal_alignment(&store),
+        Some(HorizontalAlignment::Fill)
+    );
+    assert_eq!(
+        surface.vertical_alignment(&store),
+        Some(VerticalAlignment::Fill)
+    );
     assert_eq!(surface.grow(&store), Some(1.0));
     assert_eq!(surface.shrink(&store), Some(1.0));
 
@@ -132,24 +153,51 @@ fn test_surface_widget_roundtrip() {
     {
         let node = store.get_node(id).expect("Node not found in store");
         assert_eq!(node.node_type, TypeRef::SURFACE);
-        assert_eq!(node.get_property(PropertyRef::LABEL), Some(&Value::String("Main Window".into())));
-        assert_eq!(node.get_property(PropertyRef::ACCESSIBLE_DESCRIPTION), Some(&Value::String("Primary application window".into())));
-        assert_eq!(node.get_property(PropertyRef::VISIBILITY), Some(&Value::EnumToken(EnumToken::new(6, 1))));
-        assert_eq!(node.get_property(PropertyRef::ENABLED), Some(&Value::Bool(true)));
-        assert_eq!(node.get_property(PropertyRef::SPACING_ROLE), Some(&Value::EnumToken(EnumToken::new(7, 3))));
-        assert_eq!(node.get_property(PropertyRef::PADDING_ROLE), Some(&Value::EnumToken(EnumToken::new(8, 4))));
-        assert_eq!(node.get_property(PropertyRef::PREFERRED_SIZE), Some(&Value::Size(Size::new(800.0, 600.0))));
+        assert_eq!(
+            node.get_property(PropertyRef::LABEL),
+            Some(&Value::String("Main Window".into()))
+        );
+        assert_eq!(
+            node.get_property(PropertyRef::ACCESSIBLE_DESCRIPTION),
+            Some(&Value::String("Primary application window".into()))
+        );
+        assert_eq!(
+            node.get_property(PropertyRef::VISIBILITY),
+            Some(&Value::EnumToken(EnumToken::new(6, 1)))
+        );
+        assert_eq!(
+            node.get_property(PropertyRef::ENABLED),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            node.get_property(PropertyRef::SPACING_ROLE),
+            Some(&Value::EnumToken(EnumToken::new(7, 3)))
+        );
+        assert_eq!(
+            node.get_property(PropertyRef::PADDING_ROLE),
+            Some(&Value::EnumToken(EnumToken::new(8, 4)))
+        );
+        assert_eq!(
+            node.get_property(PropertyRef::PREFERRED_SIZE),
+            Some(&Value::Size(Size::new(800.0, 600.0)))
+        );
     }
 
     // Test setters
     surface.set_label(&mut store, "Updated Window").unwrap();
     assert_eq!(surface.label(&store), Some("Updated Window"));
-    assert_eq!(store.get_node(id).unwrap().get_property(PropertyRef::LABEL), Some(&Value::String("Updated Window".into())));
+    assert_eq!(
+        store.get_node(id).unwrap().get_property(PropertyRef::LABEL),
+        Some(&Value::String("Updated Window".into()))
+    );
 
     // Test clear
     surface.clear_label(&mut store).unwrap();
     assert_eq!(surface.label(&store), None);
-    assert_eq!(store.get_node(id).unwrap().get_property(PropertyRef::LABEL), None);
+    assert_eq!(
+        store.get_node(id).unwrap().get_property(PropertyRef::LABEL),
+        None
+    );
 }
 
 #[test]
@@ -199,7 +247,11 @@ fn test_grid_widget() {
     let mut store = SemanticStore::new();
 
     let grid = Grid::builder(301)
-        .columns(vec![Value::String("200px".into()), Value::String("1fr".into()), Value::String("auto".into())])
+        .columns(vec![
+            Value::String("200px".into()),
+            Value::String("1fr".into()),
+            Value::String("auto".into()),
+        ])
         .spacing_role(SpacingRole::Normal)
         .padding_role(PaddingRole::Normal)
         .create(&mut store)
@@ -237,7 +289,10 @@ fn test_spacer_and_separator_widgets() {
         .expect("Failed to create Separator");
 
     assert_eq!(spacer.grow(&store), Some(1.0));
-    assert_eq!(separator.accessible_description(&store), Some("Section divider"));
+    assert_eq!(
+        separator.accessible_description(&store),
+        Some("Section divider")
+    );
 
     let spacer_node = store.get_node(spacer.id()).unwrap();
     assert_eq!(spacer_node.node_type, TypeRef::SPACER);
@@ -272,7 +327,8 @@ fn test_text_and_richtext_widgets_and_text_roles() {
     assert!(rich_text.is_read_only(&store));
 
     // Test importance on Text
-    text.set_importance(&mut store, Importance::Emphasized).unwrap();
+    text.set_importance(&mut store, Importance::Emphasized)
+        .unwrap();
     assert_eq!(text.importance(&store), Some(Importance::Emphasized));
     assert_eq!(text.role(&store), None);
 
@@ -290,12 +346,18 @@ fn test_text_and_richtext_widgets_and_text_roles() {
         text.set_role(&mut store, role).unwrap();
         assert_eq!(text.role(&store), Some(role));
         let node = store.get_node(text.id()).unwrap();
-        assert_eq!(node.get_property(PropertyRef::ROLE), Some(&Value::EnumToken(EnumToken::from(role))));
+        assert_eq!(
+            node.get_property(PropertyRef::ROLE),
+            Some(&Value::EnumToken(EnumToken::from(role)))
+        );
     }
 
     let node_text = store.get_node(text.id()).unwrap();
     assert_eq!(node_text.node_type, TypeRef::TEXT);
-    assert_eq!(node_text.get_property(PropertyRef::TEXT), Some(&Value::String("System Online".into())));
+    assert_eq!(
+        node_text.get_property(PropertyRef::TEXT),
+        Some(&Value::String("System Online".into()))
+    );
 
     let node_rich = store.get_node(rich_text.id()).unwrap();
     assert_eq!(node_rich.node_type, TypeRef::RICHTEXT);
@@ -309,7 +371,10 @@ fn test_button_widget_and_action_roles() {
         .label("Delete Service")
         .role(ActionRole::Destructive)
         .action_key("delete_service")
-        .actions(vec![Value::String("primary".into()), Value::String("context_menu".into())])
+        .actions(vec![
+            Value::String("primary".into()),
+            Value::String("context_menu".into()),
+        ])
         .enabled(true)
         .busy(false)
         .selected(false)
@@ -325,7 +390,8 @@ fn test_button_widget_and_action_roles() {
     assert!(!btn.is_busy(&store));
 
     // Test importance on Button
-    btn.set_importance(&mut store, Importance::Emphasized).unwrap();
+    btn.set_importance(&mut store, Importance::Emphasized)
+        .unwrap();
     assert_eq!(btn.importance(&store), Some(Importance::Emphasized));
     assert_eq!(btn.role(&store), None);
 
@@ -339,13 +405,22 @@ fn test_button_widget_and_action_roles() {
         btn.set_role(&mut store, role).unwrap();
         assert_eq!(btn.role(&store), Some(role));
         let node = store.get_node(btn.id()).unwrap();
-        assert_eq!(node.get_property(PropertyRef::ROLE), Some(&Value::EnumToken(EnumToken::from(role))));
+        assert_eq!(
+            node.get_property(PropertyRef::ROLE),
+            Some(&Value::EnumToken(EnumToken::from(role)))
+        );
     }
 
     let node = store.get_node(btn.id()).unwrap();
     assert_eq!(node.node_type, TypeRef::BUTTON);
-    assert_eq!(node.get_property(PropertyRef::LABEL), Some(&Value::String("Delete Service".into())));
-    assert_eq!(node.get_property(PropertyRef::ACTION_KEY), Some(&Value::String("delete_service".into())));
+    assert_eq!(
+        node.get_property(PropertyRef::LABEL),
+        Some(&Value::String("Delete Service".into()))
+    );
+    assert_eq!(
+        node.get_property(PropertyRef::ACTION_KEY),
+        Some(&Value::String("delete_service".into()))
+    );
 }
 
 #[test]
@@ -362,14 +437,23 @@ fn test_toggle_roundtrip_presentation_hints_and_values() {
 
     assert_eq!(t1.value(&store), Some(true));
     assert!(t1.is_value_set(&store));
-    assert_eq!(t1.presentation_hint(&store), Some(TogglePresentationHint::Automatic));
+    assert_eq!(
+        t1.presentation_hint(&store),
+        Some(TogglePresentationHint::Automatic)
+    );
     assert_eq!(t1.label(&store), Some("Enable Notifications"));
 
     let node1 = store.get_node(t1.id()).unwrap();
     assert_eq!(node1.node_type, TypeRef::TOGGLE);
     assert_eq!(node1.node_type, TypeRef::standard(12));
-    assert_eq!(node1.get_property(PropertyRef::VALUE), Some(&Value::Bool(true)));
-    assert_eq!(node1.get_property(PropertyRef::PRESENTATION_HINT), Some(&Value::EnumToken(EnumToken::new(5, 1))));
+    assert_eq!(
+        node1.get_property(PropertyRef::VALUE),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        node1.get_property(PropertyRef::PRESENTATION_HINT),
+        Some(&Value::EnumToken(EnumToken::new(5, 1)))
+    );
 
     // 2. Construct via convenience constructors
     let t_checkbox = Toggle::checkbox(702)
@@ -390,31 +474,66 @@ fn test_toggle_roundtrip_presentation_hints_and_values() {
         .create(&mut store)
         .expect("Failed to create auto Toggle");
 
-    assert_eq!(t_checkbox.presentation_hint(&store), Some(TogglePresentationHint::Checkbox));
-    assert_eq!(t_switch.presentation_hint(&store), Some(TogglePresentationHint::Switch));
-    assert_eq!(t_auto.presentation_hint(&store), Some(TogglePresentationHint::Automatic));
+    assert_eq!(
+        t_checkbox.presentation_hint(&store),
+        Some(TogglePresentationHint::Checkbox)
+    );
+    assert_eq!(
+        t_switch.presentation_hint(&store),
+        Some(TogglePresentationHint::Switch)
+    );
+    assert_eq!(
+        t_auto.presentation_hint(&store),
+        Some(TogglePresentationHint::Automatic)
+    );
 
     // Confirm that all 4 toggles have node_type == TypeRef::TOGGLE (no separate Checkbox/Switch node type)
     for id in [701, 702, 703, 704] {
         let node = store.get_node(NodeId::new(id)).unwrap();
-        assert_eq!(node.node_type, TypeRef::TOGGLE, "Node {} must have TypeRef::TOGGLE", id);
+        assert_eq!(
+            node.node_type,
+            TypeRef::TOGGLE,
+            "Node {} must have TypeRef::TOGGLE",
+            id
+        );
         assert_eq!(node.node_type, TypeRef::standard(12));
     }
 
     // 3. Test round-tripping both presentation_hint values dynamically
-    t_checkbox.set_presentation_hint(&mut store, TogglePresentationHint::Switch).unwrap();
-    assert_eq!(t_checkbox.presentation_hint(&store), Some(TogglePresentationHint::Switch));
+    t_checkbox
+        .set_presentation_hint(&mut store, TogglePresentationHint::Switch)
+        .unwrap();
+    assert_eq!(
+        t_checkbox.presentation_hint(&store),
+        Some(TogglePresentationHint::Switch)
+    );
     let n = store.get_node(t_checkbox.id()).unwrap();
-    assert_eq!(n.get_property(PropertyRef::PRESENTATION_HINT), Some(&Value::EnumToken(EnumToken::new(5, 3))));
+    assert_eq!(
+        n.get_property(PropertyRef::PRESENTATION_HINT),
+        Some(&Value::EnumToken(EnumToken::new(5, 3)))
+    );
 
-    t_checkbox.set_presentation_hint(&mut store, TogglePresentationHint::Checkbox).unwrap();
-    assert_eq!(t_checkbox.presentation_hint(&store), Some(TogglePresentationHint::Checkbox));
+    t_checkbox
+        .set_presentation_hint(&mut store, TogglePresentationHint::Checkbox)
+        .unwrap();
+    assert_eq!(
+        t_checkbox.presentation_hint(&store),
+        Some(TogglePresentationHint::Checkbox)
+    );
     let n = store.get_node(t_checkbox.id()).unwrap();
-    assert_eq!(n.get_property(PropertyRef::PRESENTATION_HINT), Some(&Value::EnumToken(EnumToken::new(5, 2))));
+    assert_eq!(
+        n.get_property(PropertyRef::PRESENTATION_HINT),
+        Some(&Value::EnumToken(EnumToken::new(5, 2)))
+    );
 
     // 4. Test validation_state and read_only
-    t_switch.set_validation_state(&mut store, ValidationState::Warning).unwrap();
-    assert_eq!(t_switch.validation_state(&store), Some(ValidationState::Warning));
+    t_switch
+        .set_validation_state(&mut store, ValidationState::Warning)
+        .unwrap();
+    assert_eq!(
+        t_switch.validation_state(&store),
+        Some(ValidationState::Warning)
+    );
 
     t_switch.set_read_only(&mut store, true).unwrap();
     assert_eq!(t_switch.read_only(&store), Some(true));
@@ -446,7 +565,10 @@ fn test_text_input_and_text_area_and_input_roles() {
     assert_eq!(input.placeholder(&store), Some("Enter API token..."));
     assert_eq!(input.role(&store), Some(InputRole::Secure));
 
-    assert_eq!(area.value(&store), Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5..."));
+    assert_eq!(
+        area.value(&store),
+        Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5...")
+    );
     assert_eq!(area.role(&store), Some(InputRole::Plain));
 
     // Test all InputRole variants
@@ -459,7 +581,10 @@ fn test_text_input_and_text_area_and_input_roles() {
         input.set_role(&mut store, role).unwrap();
         assert_eq!(input.role(&store), Some(role));
         let node = store.get_node(input.id()).unwrap();
-        assert_eq!(node.get_property(PropertyRef::ROLE), Some(&Value::EnumToken(EnumToken::from(role))));
+        assert_eq!(
+            node.get_property(PropertyRef::ROLE),
+            Some(&Value::EnumToken(EnumToken::from(role)))
+        );
     }
 
     let input_node = store.get_node(input.id()).unwrap();
@@ -488,14 +613,26 @@ fn test_progress_widget() {
     {
         let node = store.get_node(progress.id()).unwrap();
         assert_eq!(node.node_type, TypeRef::PROGRESS);
-        assert_eq!(node.get_property(PropertyRef::VALUE), Some(&Value::Float64(0.72)));
-        assert_eq!(node.get_property(PropertyRef::VALUE_DESCRIPTION), Some(&Value::String("72% complete".into())));
+        assert_eq!(
+            node.get_property(PropertyRef::VALUE),
+            Some(&Value::Float64(0.72))
+        );
+        assert_eq!(
+            node.get_property(PropertyRef::VALUE_DESCRIPTION),
+            Some(&Value::String("72% complete".into()))
+        );
     }
 
     // Update progress scalar
     progress.set_value(&mut store, 0.73).unwrap();
     assert_eq!(progress.value(&store), Some(0.73));
-    assert_eq!(store.get_node(progress.id()).unwrap().get_property(PropertyRef::VALUE), Some(&Value::Float64(0.73)));
+    assert_eq!(
+        store
+            .get_node(progress.id())
+            .unwrap()
+            .get_property(PropertyRef::VALUE),
+        Some(&Value::Float64(0.73))
+    );
 }
 
 #[test]
@@ -518,7 +655,10 @@ fn test_image_widget_and_resource_hash() {
 
     let node = store.get_node(image.id()).unwrap();
     assert_eq!(node.node_type, TypeRef::IMAGE);
-    assert_eq!(node.get_property(PropertyRef::RESOURCE), Some(&Value::ResourceHash(res_hash)));
+    assert_eq!(
+        node.get_property(PropertyRef::RESOURCE),
+        Some(&Value::ResourceHash(res_hash))
+    );
 }
 
 #[test]
@@ -593,24 +733,31 @@ fn test_list_table_tree_collection_widgets() {
 
     let list_node = store.get_node(list.id()).unwrap();
     assert_eq!(list_node.node_type, TypeRef::LIST);
-    assert_eq!(list_node.get_property(PropertyRef::MODEL_REF), Some(&Value::UnsignedInt(1)));
+    assert_eq!(
+        list_node.get_property(PropertyRef::MODEL_REF),
+        Some(&Value::UnsignedInt(1))
+    );
 
     let table_node = store.get_node(table.id()).unwrap();
     assert_eq!(table_node.node_type, TypeRef::TABLE);
-    assert_eq!(table_node.get_property(PropertyRef::MODEL_REF), Some(&Value::UnsignedInt(2)));
+    assert_eq!(
+        table_node.get_property(PropertyRef::MODEL_REF),
+        Some(&Value::UnsignedInt(2))
+    );
 
     let tree_node = store.get_node(tree.id()).unwrap();
     assert_eq!(tree_node.node_type, TypeRef::TREE);
-    assert_eq!(tree_node.get_property(PropertyRef::MODEL_REF), Some(&Value::UnsignedInt(3)));
+    assert_eq!(
+        tree_node.get_property(PropertyRef::MODEL_REF),
+        Some(&Value::UnsignedInt(3))
+    );
 }
 
 #[test]
 fn test_builder_into_operation_and_atomic_transactions() {
     let mut store = SemanticStore::new();
 
-    let root_op = Surface::builder(1)
-        .label("Dashboard")
-        .into_operation();
+    let root_op = Surface::builder(1).label("Dashboard").into_operation();
 
     let row_op = Row::builder(2)
         .parent(1)
@@ -642,7 +789,10 @@ fn test_builder_into_operation_and_atomic_transactions() {
 
     let tgl = Toggle::from_store(&store, NodeId::new(4)).expect("Toggle not found");
     assert_eq!(tgl.value(&store), Some(true));
-    assert_eq!(tgl.presentation_hint(&store), Some(TogglePresentationHint::Switch));
+    assert_eq!(
+        tgl.presentation_hint(&store),
+        Some(TogglePresentationHint::Switch)
+    );
 }
 
 #[test]
@@ -651,7 +801,11 @@ fn test_widget_trait_and_generic_delete() {
 
     let surface = Surface::builder(1).create(&mut store).unwrap();
     let row = Row::builder(2).parent(1).create(&mut store).unwrap();
-    let btn = Button::builder(3).parent(2).label("Click").create(&mut store).unwrap();
+    let btn = Button::builder(3)
+        .parent(2)
+        .label("Click")
+        .create(&mut store)
+        .unwrap();
 
     assert_eq!(store.node_count(), 3);
     assert_eq!(btn.id(), NodeId::new(3));

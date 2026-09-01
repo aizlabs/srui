@@ -10,8 +10,8 @@
 //! - **In-Memory Serialization**: High-performance encode/decode functions operate on byte slices
 //!   and `Vec<u8>` buffers without socket I/O dependencies.
 
-use prost::Message;
 use bytes::BufMut;
+use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -52,7 +52,9 @@ impl fmt::Display for WireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ProtobufDecode(msg) => write!(f, "protobuf decode error: {}", msg),
-            Self::MissingField(field) => write!(f, "missing expected protobuf wire field: {}", field),
+            Self::MissingField(field) => {
+                write!(f, "missing expected protobuf wire field: {}", field)
+            }
             Self::ValueConversion(err) => write!(f, "value conversion error: {}", err),
             Self::InvalidResourceHashLength(len) => {
                 write!(f, "expected 32-byte resource hash, got {} bytes", len)
@@ -513,10 +515,7 @@ pub fn encode_event(event: &Event) -> Vec<u8> {
 }
 
 /// Encodes an [`Event`] into an existing buffer without cloning the domain event.
-pub fn encode_event_ref(
-    event: &Event,
-    buf: &mut impl BufMut,
-) -> Result<(), prost::EncodeError> {
+pub fn encode_event_ref(event: &Event, buf: &mut impl BufMut) -> Result<(), prost::EncodeError> {
     let wire_event: srui_protocol::Event = event.into();
     wire_event.encode(buf)
 }
@@ -538,10 +537,7 @@ pub fn encode_value(value: &Value) -> Vec<u8> {
 }
 
 /// Encodes a [`Value`] into an existing buffer without cloning the domain value.
-pub fn encode_value_ref(
-    value: &Value,
-    buf: &mut impl BufMut,
-) -> Result<(), prost::EncodeError> {
+pub fn encode_value_ref(value: &Value, buf: &mut impl BufMut) -> Result<(), prost::EncodeError> {
     let wire_value: srui_protocol::Value = value.into();
     wire_value.encode(buf)
 }

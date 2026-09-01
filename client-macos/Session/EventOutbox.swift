@@ -234,6 +234,11 @@ public actor EventOutbox {
         return lastIssuedResumeGeneration
     }
 
+    /// Whether `generation` still owns the reconnect decision (§18).
+    func isActiveResumeGeneration(_ generation: UInt64) -> Bool {
+        activeResumeGeneration == generation
+    }
+
     /// Whether this outbox ever minted `generation` (§18).
     ///
     /// Generations are strictly increasing, so a value above the last issued one cannot be a

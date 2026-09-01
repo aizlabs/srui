@@ -614,7 +614,7 @@ public final class SessionController: @unchecked Sendable {
                 return
             }
         } catch {
-            await reportFailure(.transportEnded("pending event replay failed: \(error)"))
+            await failReplayError(generation, error)
             return
         }
         await finalizeResumeAttempt(generation) {
@@ -674,7 +674,7 @@ public final class SessionController: @unchecked Sendable {
                         return
                     }
                 } catch {
-                    await reportFailure(.transportEnded("pending event replay failed: \(error)"))
+                    await failReplayError(generation, error)
                     return
                 }
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
@@ -913,6 +913,24 @@ public final class SessionController: @unchecked Sendable {
                 "\(context): resume generation \(generation) was never issued by this outbox"
             ))
         }
+    }
+
+    /// Classifies a throw out of pending-event replay (§18).
+    ///
+    /// A newer `beginResumeAttempt()` cancels the write chain of the attempt it supersedes, so a
+    /// superseded replay throws `CancellationError` from mid-loop instead of returning `false`
+    /// from the decision guard. Reporting that as a transport failure would tell the owner to
+    /// reconnect a controller that merely lost the race, so classify by latch ownership rather
+    /// than by the error that surfaced.
+    private func failReplayError(_ generation: UInt64, _ error: any Error) async {
+        guard await outbox.isActiveResumeGeneration(generation) else {
+            await failRefusedResumeDecision(
+                generation,
+                "pending event replay was cancelled by a newer reconnect attempt"
+            )
+            return
+        }
+        await reportFailure(.transportEnded("pending event replay failed: \(error)"))
     }
 
     /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.

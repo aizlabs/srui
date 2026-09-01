@@ -488,6 +488,80 @@ struct SessionResumeContinuityTests {
         await secondServer.close()
     }
 
+    @Test("A replay cancelled by a newer attempt reports supersession, not a transport failure")
+    func supersededReplayReportsSupersessionNotTransportFailure() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        // Two pending events: the cancellation the newer attempt raises is observed between
+        // frames, so a single-frame replay would finish before it is ever checked.
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(8),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let gated = GatedSendTransport()
+        let failures = FailureRecorder()
+        let firstController = SessionController(
+            transport: gated,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        firstController.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+
+        // `start()` blocks on the gated CLIENT RESUME write until it is released.
+        let startTask = Task { try await firstController.start() }
+        await gated.waitForSendCount(1)
+        await gated.releaseNextSend()
+        try await startTask.value
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "session-old"
+        resumeOk.replayFromRevision = 1
+        resumeOk.lastProcessedEventSeq = 0
+        var response = SRUIMessage()
+        response.serverResumeOk = resumeOk
+
+        // Hold the first replay frame in flight.
+        let deliverTask = Task { await firstController.handleIncomingMessage(response) }
+        await gated.waitForSendCount(2)
+
+        // A newer attempt cancels the superseded write chain mid-replay (§18).
+        let (secondClient, secondServer) = await PipeTransport.createPair()
+        let secondController = SessionController(
+            transport: secondClient,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await secondController.start()
+
+        await gated.releaseNextSend()
+        await deliverTask.value
+
+        // The cancellation surfaces as `CancellationError`, but this controller did not lose its
+        // transport — it lost the race, and the owner must not reconnect it (§18).
+        let failure = try #require(await failures.wait())
+        guard case .superseded = failure else {
+            Issue.record("Expected a superseded failure, got \(failure)")
+            return
+        }
+        #expect(firstController.isEventDispatchEnabled == false)
+
+        await firstController.stop()
+        await secondController.stop()
+        await gated.close()
+        await seedClient.close()
+        await seedServer.close()
+        await secondServer.close()
+    }
+
     @Test("An older controller's stop() cannot strand a newer resume attempt")
     func stoppingSupersededControllerLeavesNewerAttemptUsable() async throws {
         let outbox = EventOutbox()
@@ -530,6 +604,51 @@ struct SessionResumeContinuityTests {
         await secondCollector.stop()
         await firstServer.close()
         await secondServer.close()
+    }
+}
+
+/// Transport whose `send` records the frame and then suspends until the test releases it, so a
+/// replay can be held mid-flight while another controller supersedes it.
+private actor GatedSendTransport: Transport {
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let streamContinuation: AsyncThrowingStream<Data, Error>.Continuation
+    private let releaseStream: AsyncStream<Void>
+    private let releaseContinuation: AsyncStream<Void>.Continuation
+    private var sentFrameCount = 0
+
+    init() {
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.streamContinuation = continuation
+        let (releaseStream, releaseContinuation) = AsyncStream<Void>.makeStream()
+        self.releaseStream = releaseStream
+        self.releaseContinuation = releaseContinuation
+    }
+
+    func waitForSendCount(_ count: Int, timeout: Double = 2.0) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while sentFrameCount < count && Date() < deadline {
+            await Task.yield()
+        }
+    }
+
+    func releaseNextSend() {
+        releaseContinuation.yield()
+    }
+
+    func send(data: Data) async throws {
+        sentFrameCount += 1
+        var releases = releaseStream.makeAsyncIterator()
+        _ = await releases.next()
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        releaseContinuation.finish()
+        streamContinuation.finish()
     }
 }
 

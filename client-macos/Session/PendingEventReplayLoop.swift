@@ -17,7 +17,8 @@ struct PendingEventReplayLoop {
     static let defaultMaximumDelay: Duration = .seconds(30)
 
     struct Lease: Equatable, Sendable {
-        let resumeScope: UUID
+        /// Resume generation that owns this lease; strictly increasing per outbox (§18).
+        let resumeScope: UInt64
         fileprivate let token: UUID
     }
 
@@ -56,7 +57,7 @@ struct PendingEventReplayLoop {
 
     @discardableResult
     mutating func start(
-        resumeScope: UUID,
+        resumeScope: UInt64,
         replay: @escaping ReplayOperation,
         onFailure: FailureHandler?,
         onFinish: @escaping FinishHandler

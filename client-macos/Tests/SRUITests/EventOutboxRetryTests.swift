@@ -233,7 +233,7 @@ struct EventOutboxRetryTests {
             via: seedClient
         )
 
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let failing = FailingTransport()
 
         var replayFailed = false
@@ -241,7 +241,7 @@ struct EventOutboxRetryTests {
             _ = try await outbox.completeSameSessionResume(
                 id: "session-a",
                 lastProcessedEventSeq: 0,
-                attemptId: attemptId,
+                generation: generation,
                 via: failing,
                 enableNewEventsAfterReplay: true
             )
@@ -288,12 +288,12 @@ struct EventOutboxRetryTests {
         )
 
         let resumedTransport = GatedTransport()
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let resumeTask = Task {
             try await outbox.completeSameSessionResume(
                 id: "session-a",
                 lastProcessedEventSeq: 0,
-                attemptId: attemptId,
+                generation: generation,
                 via: resumedTransport,
                 enableNewEventsAfterReplay: true
             )
@@ -355,12 +355,12 @@ struct EventOutboxRetryTests {
         )
 
         let resumedTransport = GatedTransport()
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let resumeTask = Task {
             try await outbox.completeSameSessionResume(
                 id: "session-a",
                 lastProcessedEventSeq: 0,
-                attemptId: attemptId,
+                generation: generation,
                 via: resumedTransport,
                 enableNewEventsAfterReplay: true
             )
@@ -411,11 +411,11 @@ struct EventOutboxRetryTests {
 
         let resumedTransport = FailAfterFirstSendTransport()
         let (failures, failureContinuation) = AsyncStream<String>.makeStream()
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let accepted = try await outbox.completeSameSessionResume(
             id: "session-a",
             lastProcessedEventSeq: 0,
-            attemptId: attemptId,
+            generation: generation,
             via: resumedTransport,
             enableNewEventsAfterReplay: true,
             onReplayFailure: { error in
@@ -430,7 +430,7 @@ struct EventOutboxRetryTests {
         #expect(failure?.contains("simulated background replay failure") == true)
         #expect(await resumedTransport.closeCallCount == 0)
 
-        await outbox.stopResumeWork(attemptId: attemptId)
+        await outbox.stopResumeWork(generation: generation)
         await resumedTransport.close()
         await seedClient.close()
         await seedServer.close()
@@ -452,11 +452,11 @@ struct EventOutboxRetryTests {
         let (resumedClient, resumedServer) = await PipeTransport.createPair()
         let collector = OutboxWireCollector()
         await collector.start(draining: resumedServer)
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let accepted = try await outbox.completeSameSessionResume(
             id: "session-a",
             lastProcessedEventSeq: 0,
-            attemptId: attemptId,
+            generation: generation,
             via: resumedClient,
             enableNewEventsAfterReplay: true
         )

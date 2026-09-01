@@ -257,13 +257,13 @@ struct EventOutboxTests {
 
         // Reconnect on a fresh transport pair and complete same-session resume
         let (client2, server2) = await PipeTransport.createPair()
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let serverStream2 = server2.receiveStream()
 
         let accepted = try await outbox.completeSameSessionResume(
             id: "session-123",
             lastProcessedEventSeq: 1,
-            attemptId: attemptId,
+            generation: generation,
             via: client2,
             enableNewEventsAfterReplay: true
         )
@@ -295,9 +295,82 @@ struct EventOutboxTests {
         let ev4 = try await outbox.sendActivate(nodeId: NodeId(4), observedRevision: Revision(2), via: client2)
         #expect(ev4.eventSeq == 4)
 
-        await outbox.stopResumeWork(attemptId: attemptId)
+        await outbox.stopResumeWork(generation: generation)
         await client2.close()
         await server2.close()
+    }
+
+    @Test("Same-session RESUME_OK clears the generation latch for a later fresh HELLO")
+    func resumeOkClearsGenerationLatch() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            via: client
+        )
+
+        let generation = await outbox.beginResumeAttempt()
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-123",
+            lastProcessedEventSeq: 0,
+            generation: generation,
+            via: client,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Finish resync clears the generation latch for a later fresh HELLO")
+    func finishResyncClearsGenerationLatch() async {
+        let outbox = EventOutbox()
+        let generation = await outbox.beginResumeAttempt()
+        #expect(await outbox.finishResync(generation: generation))
+        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+    }
+
+    @Test("Stopping resume work clears the generation latch for a later fresh HELLO")
+    func stopResumeWorkClearsGenerationLatch() async {
+        let outbox = EventOutbox()
+        let generation = await outbox.beginResumeAttempt()
+        await outbox.stopResumeWork(generation: generation)
+        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+    }
+
+    @Test("A superseded generation cannot release the latch held by a newer attempt")
+    func supersededGenerationCannotReleaseNewerLatch() async {
+        let outbox = EventOutbox()
+        let superseded = await outbox.beginResumeAttempt()
+        let newest = await outbox.beginResumeAttempt()
+
+        await outbox.stopResumeWork(generation: superseded)
+
+        // The newest attempt still owns the latch, so its own decision is still the only one
+        // that can settle the outbox (§18).
+        let freshAccepted = await outbox.confirmFreshSession(id: "fresh-session")
+        #expect(freshAccepted == false)
+        let newestAccepted = await outbox.finishResync(generation: newest)
+        #expect(newestAccepted == true)
+    }
+
+    @Test("Catch-up cannot re-enable allocation while a reconnect generation is outstanding")
+    func allowNewEventsRefusesDuringOutstandingResume() async {
+        let outbox = EventOutbox()
+        let idleAllowed = await outbox.allowNewEvents()
+        #expect(idleAllowed == true)
+
+        let generation = await outbox.beginResumeAttempt()
+        let latchedAllowed = await outbox.allowNewEvents()
+        #expect(latchedAllowed == false)
+
+        let finished = await outbox.finishResync(generation: generation)
+        #expect(finished == true)
+        let releasedAllowed = await outbox.allowNewEvents()
+        #expect(releasedAllowed == true)
     }
 
     @Test("Replaced session abandons pending events and resets sequence")
@@ -309,16 +382,20 @@ struct EventOutboxTests {
         _ = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(false), via: client)
         #expect(await outbox.pendingCount == 2)
 
-        let attemptId = await outbox.beginResumeAttempt()
+        let generation = await outbox.beginResumeAttempt()
         let accepted = await outbox.prepareReplacedSession(
             id: "new-incarnation",
             lastProcessedEventSeq: 0,
-            attemptId: attemptId
+            generation: generation
         )
         #expect(accepted)
         #expect(await outbox.pendingCount == 0)
 
-        await outbox.allowNewEvents()
+        // The replacement's snapshot commits under the same reconnect generation, so allocation
+        // reopens through `finishResync`; `allowNewEvents` covers only a catch-up with no
+        // outstanding attempt and refuses while this generation still holds the latch (§18).
+        let reopened = await outbox.finishResync(generation: generation)
+        #expect(reopened == true)
 
         let freshEvent = try await outbox.sendActivate(nodeId: NodeId(10), observedRevision: Revision(1), via: client)
         #expect(freshEvent.eventSeq == 1)

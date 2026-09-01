@@ -38,6 +38,9 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
     case protocolViolation(String)
     /// The transport stream ended or errored.
     case transportEnded(String)
+    /// A newer reconnect attempt on the same outbox superseded this controller. Its handshake can
+    /// never complete, so the owner discards this controller instead of reconnecting it (§18).
+    case superseded(String)
 
     public var description: String {
         switch self {
@@ -45,6 +48,7 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
         case .decodeFailed(let msg): return "decode failed: \(msg)"
         case .protocolViolation(let msg): return "protocol violation: \(msg)"
         case .transportEnded(let msg): return "transport ended: \(msg)"
+        case .superseded(let msg): return "superseded by a newer reconnect attempt: \(msg)"
         }
     }
 }
@@ -61,7 +65,7 @@ public enum SessionDispatchError: Error, Equatable, Sendable {
 private enum ProtocolPhase: Equatable {
     case idle
     case awaitingWelcome
-    case awaitingResume(sessionId: String, attemptId: UUID)
+    case awaitingResume(sessionId: String, generation: UInt64)
     case active(negotiated: CapabilitySet)
     case awaitingSnapshot(negotiated: CapabilitySet)
     case failed
@@ -89,8 +93,10 @@ public final class SessionController: @unchecked Sendable {
     private var _isDiverged = false
     private var _onFailure: (@Sendable (SessionFailure) -> Void)?
     private var requestedSessionId: String?
-    private var resumeAttemptId: UUID?
-    private var activeReplayRetryAttemptId: UUID?
+    /// Generation of this controller's outstanding resume attempt (§18). Strictly increasing per
+    /// outbox: a decision carrying an older generation is discarded outright.
+    private var resumeGeneration: UInt64?
+    private var activeReplayRetryGeneration: UInt64?
     private var eventDispatchEnabled = false
     private var phase: ProtocolPhase = .idle
     /// Negotiated set from the last successful `SERVER WELCOME`, retained across `stop()` so a
@@ -248,7 +254,7 @@ public final class SessionController: @unchecked Sendable {
                 withStateLock {
                     self.isRunning = false
                     self.requestedSessionId = nil
-                    self.resumeAttemptId = nil
+                    self.resumeGeneration = nil
                     self.eventDispatchEnabled = false
                     self.phase = .idle
                 }
@@ -268,10 +274,10 @@ public final class SessionController: @unchecked Sendable {
         }
 
         if let requestedId {
-            let resumeAttemptId = await outbox.beginResumeAttempt()
+            let resumeGeneration = await outbox.beginResumeAttempt()
             withStateLock {
                 self.requestedSessionId = requestedId
-                self.resumeAttemptId = resumeAttemptId
+                self.resumeGeneration = resumeGeneration
             }
             var resume = SRUIClientResume()
             resume.sessionID = requestedId
@@ -284,7 +290,7 @@ public final class SessionController: @unchecked Sendable {
             guard withStateLock({ isRunning }) else { return }
             try await transport.send(data: SRUIFraming.encodeFramed(envelope))
             withStateLock {
-                self.phase = .awaitingResume(sessionId: requestedId, attemptId: resumeAttemptId)
+                self.phase = .awaitingResume(sessionId: requestedId, generation: resumeGeneration)
             }
         } else {
             var hello = SRUIClientHello()
@@ -553,7 +559,7 @@ public final class SessionController: @unchecked Sendable {
         withStateLock {
             self.currentSessionId = welcome.sessionID
             self.requestedSessionId = nil
-            self.resumeAttemptId = nil
+            self.resumeGeneration = nil
             self.retainedCapabilities = negotiated
             if welcome.initialRevision > 0 {
                 self.pendingResync = true
@@ -573,10 +579,10 @@ public final class SessionController: @unchecked Sendable {
     }
 
     private func handleResumeOk(_ resumeOk: SRUIServerResumeOk) async {
-        let (requested, attemptId) = withStateLock {
-            (requestedSessionId, resumeAttemptId)
+        let (requested, generation) = withStateLock {
+            (requestedSessionId, resumeGeneration)
         }
-        guard let requested, let attemptId else {
+        guard let requested, let generation else {
             await reportFailure(.protocolViolation(
                 "Unexpected SERVER RESUME_OK without an outstanding resume"
             ))
@@ -593,7 +599,7 @@ public final class SessionController: @unchecked Sendable {
             let accepted = try await outbox.completeSameSessionResume(
                 id: resumeOk.sessionID,
                 lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
-                attemptId: attemptId,
+                generation: generation,
                 via: transport,
                 enableNewEventsAfterReplay: true,
                 onReplayFailure: { [weak self] error in
@@ -601,18 +607,21 @@ public final class SessionController: @unchecked Sendable {
                 }
             )
             guard accepted else {
-                SessionDiagnostics.log("Ignoring superseded SERVER RESUME_OK")
+                await failRefusedResumeDecision(
+                    generation,
+                    "SERVER RESUME_OK answered a superseded resume attempt"
+                )
                 return
             }
         } catch {
-            await reportFailure(.transportEnded("pending event replay failed: \(error)"))
+            await failReplayError(generation, error)
             return
         }
-        await finalizeResumeAttempt(attemptId) {
+        await finalizeResumeAttempt(generation) {
             let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
             self.requestedSessionId = nil
-            self.resumeAttemptId = nil
+            self.resumeGeneration = nil
             self.retainedCapabilities = negotiated
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = !self._isDiverged
@@ -633,11 +642,11 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        let (requested, attemptId) = withStateLock {
-            (requestedSessionId, resumeAttemptId)
+        let (requested, generation) = withStateLock {
+            (requestedSessionId, resumeGeneration)
         }
 
-        if let requested, let attemptId {
+        if let requested, let generation {
             switch resync.continuity {
             case .sameSession:
                 guard resync.sessionID == requested else {
@@ -650,7 +659,7 @@ public final class SessionController: @unchecked Sendable {
                     let accepted = try await outbox.completeSameSessionResume(
                         id: resync.sessionID,
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                        attemptId: attemptId,
+                        generation: generation,
                         via: transport,
                         enableNewEventsAfterReplay: false,
                         onReplayFailure: { [weak self] error in
@@ -658,11 +667,14 @@ public final class SessionController: @unchecked Sendable {
                         }
                     )
                     guard accepted else {
-                        SessionDiagnostics.log("Ignoring superseded same-session resync")
+                        await failRefusedResumeDecision(
+                            generation,
+                            "same-session resync answered a superseded resume attempt"
+                        )
                         return
                     }
                 } catch {
-                    await reportFailure(.transportEnded("pending event replay failed: \(error)"))
+                    await failReplayError(generation, error)
                     return
                 }
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
@@ -677,10 +689,13 @@ public final class SessionController: @unchecked Sendable {
                 let accepted = await outbox.prepareReplacedSession(
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                    attemptId: attemptId
+                    generation: generation
                 )
                 guard accepted else {
-                    SessionDiagnostics.log("Ignoring superseded replacement resync")
+                    await failRefusedResumeDecision(
+                        generation,
+                        "replacement resync answered a superseded resume attempt"
+                    )
                     return
                 }
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
@@ -818,13 +833,34 @@ public final class SessionController: @unchecked Sendable {
         // `base_revision == 0` is not by itself evidence of a snapshot: a stale copy of the
         // initial transaction carries it too, and treating that as a snapshot would wipe a live
         // replica (§12.1).
-        let isResyncSnapshot = withStateLock { pendingResync }
+        let (isResyncSnapshot, outstandingGeneration) = withStateLock {
+            (pendingResync, resumeGeneration)
+        }
 
         // Apply and capture the committed snapshot in a single critical section so the renderer is
         // handed exactly the store produced by this transaction (§22.2).
-        let applyResult: Result<TransactionSnapshot, TxnError> = isResyncSnapshot
-            ? applier.applyResyncSnapshot(record: domainTx)
-            : applier.applyCommitted(record: domainTx)
+        let applyResult: Result<TransactionSnapshot, TxnError>
+        if isResyncSnapshot {
+            // A snapshot replaces the entire replica, so the supersession check and the apply run
+            // inside one outbox critical section: checking here and applying after a suspension
+            // would let a newer attempt open in between and the stale snapshot still land on the
+            // shared applier (§18). A live resync carries no generation and is checked the same
+            // way — another controller's outstanding attempt must block it too.
+            guard let claimed = await outbox.withUnsupersededResume(outstandingGeneration, {
+                self.applier.applyResyncSnapshot(record: domainTx)
+            }) else {
+                let context = "resync snapshot arrived after a newer reconnect attempt"
+                if let outstandingGeneration {
+                    await failRefusedResumeDecision(outstandingGeneration, context)
+                } else {
+                    await reportFailure(.superseded(context))
+                }
+                return
+            }
+            applyResult = claimed
+        } else {
+            applyResult = applier.applyCommitted(record: domainTx)
+        }
 
         switch applyResult {
         case .success(let snapshot):
@@ -850,36 +886,83 @@ public final class SessionController: @unchecked Sendable {
     }
 
     /// Commits controller state after resume replay and abandons background retries when teardown raced completion.
-    private func finalizeResumeAttempt(_ attemptId: UUID, mutate: () -> Void) async {
+    private func finalizeResumeAttempt(_ generation: UInt64, mutate: () -> Void) async {
         let didCommitControllerState = withStateLock { () -> Bool in
             guard isRunning, !_isDiverged else { return false }
             mutate()
-            activeReplayRetryAttemptId = attemptId
+            activeReplayRetryGeneration = generation
             return true
         }
         if didCommitControllerState {
-            await outbox.commitResumeWork(attemptId: attemptId)
+            await outbox.commitResumeWork(generation: generation)
         } else {
-            await outbox.stopResumeWork(attemptId: attemptId)
+            await outbox.stopResumeWork(generation: generation)
         }
+    }
+
+    /// Reports the terminal failure for a resume decision the outbox refused (§18).
+    ///
+    /// A generation the outbox never issued cannot be explained by a lost race: it means this
+    /// controller is bound to a different outbox than the one that minted it, which is a
+    /// required-semantics failure rather than a benign supersession (§4 inv. 13).
+    private func failRefusedResumeDecision(_ generation: UInt64, _ context: String) async {
+        if await outbox.hasIssuedResumeGeneration(generation) {
+            await reportFailure(.superseded(context))
+        } else {
+            await reportFailure(.protocolViolation(
+                "\(context): resume generation \(generation) was never issued by this outbox"
+            ))
+        }
+    }
+
+    /// Classifies a throw out of pending-event replay (§18).
+    ///
+    /// A newer `beginResumeAttempt()` cancels the write chain of the attempt it supersedes, so a
+    /// superseded replay throws `CancellationError` from mid-loop instead of returning `false`
+    /// from the decision guard. Reporting that as a transport failure would tell the owner to
+    /// reconnect a controller that merely lost the race, so classify by latch ownership rather
+    /// than by the error that surfaced.
+    private func failReplayError(_ generation: UInt64, _ error: any Error) async {
+        guard await outbox.isActiveResumeGeneration(generation) else {
+            await failRefusedResumeDecision(
+                generation,
+                "pending event replay was cancelled by a newer reconnect attempt"
+            )
+            return
+        }
+        await reportFailure(.transportEnded("pending event replay failed: \(error)"))
     }
 
     /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.
     private func completeSnapshotCatchUp() async {
         withStateLock { self.pendingResync = false }
-        let attemptId = withStateLock { self.resumeAttemptId }
-        if let attemptId {
-            let accepted = await outbox.finishResync(attemptId: attemptId)
-            guard accepted else { return }
-            await finalizeResumeAttempt(attemptId) {
-                self.resumeAttemptId = nil
+        let generation = withStateLock { self.resumeGeneration }
+        if let generation {
+            guard await outbox.finishResync(generation: generation) else {
+                // The latch belongs to a newer attempt, so this controller can never leave
+                // `.awaitingSnapshot`. Report it instead of holding a mute transport (§18).
+                await failRefusedResumeDecision(
+                    generation,
+                    "resync completed after a newer reconnect attempt"
+                )
+                return
+            }
+            await finalizeResumeAttempt(generation) {
+                self.resumeGeneration = nil
                 self.eventDispatchEnabled = true
                 if case .awaitingSnapshot(let negotiated) = self.phase {
                     self.phase = .active(negotiated: negotiated)
                 }
             }
         } else {
-            await outbox.allowNewEvents()
+            guard await outbox.allowNewEvents() else {
+                // Another controller opened a reconnect generation while this catch-up was in
+                // flight; re-enabling allocation here would break the latch it is waiting on.
+                await reportFailure(.superseded(
+                    "catch-up completed while another reconnect attempt was outstanding"
+                ))
+                return
+            }
             withStateLock {
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
                 if case .awaitingSnapshot(let negotiated) = self.phase {
@@ -921,20 +1004,20 @@ public final class SessionController: @unchecked Sendable {
     private func reportFailure(_ failure: SessionFailure) async {
         let failureState: (
             handler: (@Sendable (SessionFailure) -> Void)?,
-            replayAttemptId: UUID?
+            replayGeneration: UInt64?
         ) = withStateLock {
             if _isDiverged { return (nil, nil) }
             _isDiverged = true
             eventDispatchEnabled = false
             phase = .failed
-            let replayAttemptId = resumeAttemptId ?? activeReplayRetryAttemptId
-            activeReplayRetryAttemptId = nil
-            return (_onFailure ?? { _ in }, replayAttemptId)
+            let replayGeneration = resumeGeneration ?? activeReplayRetryGeneration
+            activeReplayRetryGeneration = nil
+            return (_onFailure ?? { _ in }, replayGeneration)
         }
         guard let handler = failureState.handler else { return }
 
-        if let replayAttemptId = failureState.replayAttemptId {
-            await outbox.stopResumeWork(attemptId: replayAttemptId)
+        if let replayGeneration = failureState.replayGeneration {
+            await outbox.stopResumeWork(generation: replayGeneration)
         }
         SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
         handler(failure)
@@ -975,7 +1058,7 @@ public final class SessionController: @unchecked Sendable {
     public func stop() async {
         let stoppedState: (
             receiveTask: Task<Void, Never>?,
-            replayAttemptId: UUID?,
+            replayGeneration: UInt64?,
             shouldStop: Bool
         ) = withStateLock {
             guard isRunning else { return (nil, nil, false) }
@@ -983,15 +1066,15 @@ public final class SessionController: @unchecked Sendable {
             eventDispatchEnabled = false
             return (
                 receiveTask,
-                resumeAttemptId ?? activeReplayRetryAttemptId,
+                resumeGeneration ?? activeReplayRetryGeneration,
                 true
             )
         }
 
         guard stoppedState.shouldStop else { return }
 
-        if let replayAttemptId = stoppedState.replayAttemptId {
-            await outbox.stopResumeWork(attemptId: replayAttemptId)
+        if let replayGeneration = stoppedState.replayGeneration {
+            await outbox.stopResumeWork(generation: replayGeneration)
         }
 
         // Close the transport first so the receive loop drains any buffered catch-up frames
@@ -1041,8 +1124,8 @@ public final class SessionController: @unchecked Sendable {
             _isDiverged = false
             pendingResync = false
             requestedSessionId = nil
-            resumeAttemptId = nil
-            activeReplayRetryAttemptId = nil
+            resumeGeneration = nil
+            activeReplayRetryGeneration = nil
             eventDispatchEnabled = false
             phase = .idle
         }

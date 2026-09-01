@@ -118,7 +118,7 @@ private actor ReplayLoopHarness {
     }
 
     func start(
-        resumeScope: UUID,
+        resumeScope: UInt64,
         replay: @escaping PendingEventReplayLoop.ReplayOperation,
         onFailure: PendingEventReplayLoop.FailureHandler? = nil,
         onFinish: @escaping PendingEventReplayLoop.FinishHandler = { _ in }
@@ -164,13 +164,13 @@ struct PendingEventReplayLoopTests {
             maximumDelay: .seconds(3_600)
         )
         let firstLease = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 1,
             replay: { _ in true }
         )
         #expect(await harness.isActive(firstLease))
 
         let secondLease = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 2,
             replay: { _ in false }
         )
 
@@ -188,11 +188,11 @@ struct PendingEventReplayLoopTests {
             maximumDelay: .seconds(3_600)
         )
         let firstLease = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 1,
             replay: { _ in true }
         )
         let activeLease = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 2,
             replay: { _ in true }
         )
 
@@ -211,7 +211,7 @@ struct PendingEventReplayLoopTests {
         let harness = ReplayLoopHarness(initialDelay: .zero, maximumDelay: .zero)
 
         _ = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 1,
             replay: { _ in
                 await counters.recordReplay()
                 return false
@@ -241,7 +241,7 @@ struct PendingEventReplayLoopTests {
             maximumDelay: .seconds(3_600)
         )
         let lease = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 1,
             replay: { _ in true },
             onFinish: { _ in
                 await counters.recordFinish()
@@ -265,7 +265,7 @@ struct PendingEventReplayLoopTests {
         let harness = ReplayLoopHarness(initialDelay: .zero, maximumDelay: .zero)
 
         _ = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 1,
             replay: { _ in throw ReplayFailure() },
             onFailure: { message in
                 await counters.recordFailure(message)
@@ -297,7 +297,7 @@ struct PendingEventReplayLoopTests {
         )
 
         _ = await harness.start(
-            resumeScope: UUID(),
+            resumeScope: 1,
             replay: { _ in
                 let replayCount = await counters.recordReplay()
                 return replayCount < 3

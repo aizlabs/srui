@@ -1,8 +1,24 @@
 //! # SRUI Transaction Journal
 //!
-//! Maintains a bounded in-memory log of committed transactions (§12, §18, §20.2, §21, §32.5).
+//! Maintains a bounded in-memory log of committed transactions (§12, §18, §18.1, §20.2, §21, §32.5).
 //! Used to replay state mutations upon client reconnect without resending full snapshots,
 //! while bounding memory usage according to [`async-bounded-channel`](rules/async-bounded-channel.md) principles.
+//!
+//! # Retention policy (§18.1)
+//!
+//! §18.1 permits several retention policies. The implemented policy is **maximum retained
+//! transaction count**: the ring buffer holds at most `max_entries` committed transactions and
+//! evicts the oldest on overflow. The bound is configurable per session
+//! (`srui_sessiond::SessionConfig::journal_capacity`, `srui-sessiond --journal-capacity`) and
+//! defaults to [`DEFAULT_MAX_JOURNAL_ENTRIES`]. The other §18.1 policies — all-client
+//! acknowledgement, maximum bytes, revision age, and wall-clock time — are not implemented.
+//!
+//! A reconnect whose `last_applied_revision` falls outside the retained window cannot be
+//! replayed; the server answers `RESYNC_REQUIRED{continuity = SAME_SESSION}` and sends a
+//! snapshot instead (§18).
+//!
+//! Only fully committed transactions are recorded, so replay never emits a partially applied
+//! transaction (§12.1).
 
 use srui_protocol::Transaction;
 use std::collections::VecDeque;

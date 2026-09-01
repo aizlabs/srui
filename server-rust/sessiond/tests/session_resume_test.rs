@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use srui_protocol::{
     srui_message, ClientResume, SessionContinuity, SruiCodec, SruiMessage, Transaction,
 };
-use srui_sessiond::{handle_connection, ConnectionError, Session};
+use srui_sdk::{NodeId, Surface, Text, TEXT};
+use srui_sessiond::{handle_connection, ConnectionError, Session, SessionConfig};
 
 fn make_tx(base: u64) -> Transaction {
     Transaction {
@@ -86,6 +87,53 @@ impl ResumeConnection {
                 assert_eq!(ok.last_processed_event_seq, 0);
             }
             other => panic!("expected ServerResumeOk, got {:?}", other),
+        }
+    }
+
+    /// Reads one `ServerResyncRequired` and asserts its continuity decision (§18).
+    async fn expect_resync(
+        &mut self,
+        expected_session_id: &str,
+        expected_continuity: SessionContinuity,
+        expected_snapshot_revision: u64,
+    ) {
+        let msg = self
+            .read
+            .next()
+            .await
+            .expect("resync-required frame")
+            .expect("decode");
+        match msg.msg {
+            Some(srui_message::Msg::ServerResyncRequired(resync)) => {
+                assert_eq!(resync.session_id, expected_session_id);
+                assert_eq!(resync.snapshot_revision, expected_snapshot_revision);
+                assert_eq!(
+                    SessionContinuity::try_from(resync.continuity),
+                    Ok(expected_continuity),
+                    "the server always states a recognized continuity (§18, §4 inv. 13)"
+                );
+                assert_ne!(
+                    SessionContinuity::try_from(resync.continuity),
+                    Ok(SessionContinuity::Unspecified)
+                );
+            }
+            other => panic!("expected ServerResyncRequired, got {:?}", other),
+        }
+    }
+
+    async fn expect_transaction(&mut self, base_revision: u64, new_revision: u64) {
+        let msg = self
+            .read
+            .next()
+            .await
+            .expect("transaction frame")
+            .expect("decode");
+        match msg.msg {
+            Some(srui_message::Msg::Transaction(tx)) => {
+                assert_eq!(tx.base_revision, base_revision);
+                assert_eq!(tx.new_revision, new_revision);
+            }
+            other => panic!("expected transaction, got {:?}", other),
         }
     }
 
@@ -165,6 +213,86 @@ async fn test_resume_at_earliest_retained_revision_replays_full_range() {
     conn.close().await;
 }
 
+/// §18.1: the retention window is a configurable maximum transaction count. A reconnect inside
+/// the window replays; the same live incarnation answers a reconnect outside it with
+/// `RESYNC_REQUIRED{continuity = SAME_SESSION}` and a snapshot.
+#[tokio::test]
+async fn test_resume_beyond_configured_retention_is_same_session_resync() {
+    let session = Arc::new(Session::with_config(
+        "resume-retention",
+        SessionConfig {
+            journal_capacity: 4,
+            ..SessionConfig::default()
+        },
+    ));
+    for base in 0..6 {
+        session.commit_transaction(make_tx(base)).unwrap();
+    }
+    assert_eq!(session.current_revision(), 6);
+
+    // Revision 2 is the earliest retained base after four evictions: still replayable.
+    let mut inside = ResumeConnection::open(session.clone()).await;
+    inside.send_resume("resume-retention", 2).await;
+    inside.expect_resume_ok("resume-retention", 2).await;
+    for base in 2..6 {
+        inside.expect_transaction(base, base + 1).await;
+    }
+    inside.expect_no_message(Duration::from_millis(100)).await;
+    inside.close().await;
+
+    // Revision 0 fell out of the configured window: same incarnation, snapshot resync.
+    let mut outside = ResumeConnection::open(session).await;
+    outside.send_resume("resume-retention", 0).await;
+    outside
+        .expect_resync("resume-retention", SessionContinuity::SameSession, 6)
+        .await;
+    outside.expect_transaction(0, 6).await;
+    outside.close().await;
+}
+
+/// §12.1: a transaction that fails partway is never committed, journaled, broadcast, or replayed.
+#[tokio::test]
+async fn test_partially_applied_transaction_is_never_journaled_or_replayed() {
+    let session = Arc::new(Session::new("resume-atomicity"));
+    session.commit_transaction(make_tx(0)).unwrap();
+
+    let mut attached = ResumeConnection::open(session.clone()).await;
+    attached.send_resume("resume-atomicity", 1).await;
+    attached.expect_resume_ok("resume-atomicity", 1).await;
+
+    let surface = NodeId::new(1);
+    let text = NodeId::new(2);
+    let missing = NodeId::new(4242);
+    let failed = session.transaction(|ui| {
+        Surface::builder(surface).create(ui)?;
+        Text::builder(text)
+            .parent(surface)
+            .text("half-applied")
+            .create(ui)?;
+        // Fails after the mutations above are staged: the whole transaction is discarded.
+        ui.set(missing, TEXT, "no such node")?;
+        Ok(())
+    });
+    assert!(failed.is_err(), "the failing transaction must not commit");
+
+    // No revision advance, nothing broadcast to the attached connection.
+    assert_eq!(session.current_revision(), 1);
+    attached.expect_no_message(Duration::from_millis(100)).await;
+    attached.close().await;
+
+    // A later reconnect replays only whole committed transactions.
+    session.commit_transaction(make_tx(1)).unwrap();
+    let mut reconnect = ResumeConnection::open(session).await;
+    reconnect.send_resume("resume-atomicity", 0).await;
+    reconnect.expect_resume_ok("resume-atomicity", 0).await;
+    reconnect.expect_transaction(0, 1).await;
+    reconnect.expect_transaction(1, 2).await;
+    reconnect
+        .expect_no_message(Duration::from_millis(100))
+        .await;
+    reconnect.close().await;
+}
+
 #[tokio::test]
 async fn test_wrong_session_id_requires_replacement_resync() {
     let session = Arc::new(Session::new("resume-authoritative"));
@@ -181,7 +309,9 @@ async fn test_wrong_session_id_requires_replacement_resync() {
         .expect("decode");
     match msg.msg {
         Some(srui_message::Msg::ServerResyncRequired(resync)) => {
+            // A replacement is announced under a different incarnation token (§17, §18).
             assert_eq!(resync.session_id, "resume-authoritative");
+            assert_ne!(resync.session_id, "expired-session-id");
             assert_eq!(resync.snapshot_revision, 1);
             assert_eq!(
                 SessionContinuity::try_from(resync.continuity),

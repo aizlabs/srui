@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use srui_sessiond::{handle_connection, Session};
+use srui_sessiond::{handle_connection, Session, SessionConfig};
 
 /// Ignores `SIGHUP` so SSH session detach / controlling-terminal loss does not terminate
 /// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
@@ -35,10 +35,13 @@ fn default_socket_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("srui-sessiond.sock")
 }
+/// Parsed command line: socket path, optional built-in app adapter, and the §18.1 journal
+/// retention window (maximum retained transaction count).
 #[derive(Debug, Clone)]
 struct DaemonConfig {
     socket_path: PathBuf,
     app_name: Option<String>,
+    journal_capacity: usize,
 }
 
 impl Default for DaemonConfig {
@@ -46,6 +49,7 @@ impl Default for DaemonConfig {
         Self {
             socket_path: default_socket_path(),
             app_name: None,
+            journal_capacity: SessionConfig::default().journal_capacity,
         }
     }
 }
@@ -75,6 +79,22 @@ fn parse_args_from(args: &[String]) -> Result<DaemonConfig, String> {
                     .filter(|value| !value.starts_with('-'))
                     .ok_or_else(|| "--app requires an application name".to_string())?;
                 config.app_name = Some(value.clone());
+                i += 2;
+            }
+            "--journal-capacity" => {
+                // A zero or unparsable retention window would silently degrade every reconnect
+                // to a snapshot resync, so refuse to start instead of clamping (§18.1).
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| "--journal-capacity requires a value".to_string())?;
+                config.journal_capacity = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        format!("--journal-capacity must be a positive integer, got {value}")
+                    })?;
                 i += 2;
             }
             arg if !arg.starts_with('-') => {
@@ -373,10 +393,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(socket_path = ?config.socket_path, "Listening on Unix domain socket");
 
     // Mint a fresh, globally unique session incarnation token (§17)
-    let session = Arc::new(Session::mint());
+    let session = Arc::new(Session::mint_with_config(SessionConfig {
+        journal_capacity: config.journal_capacity,
+        ..SessionConfig::default()
+    }));
     info!(
         session_id = %session.session_id(),
         state = %session.state(),
+        journal_capacity = config.journal_capacity,
         "Minted session incarnation token"
     );
 
@@ -501,5 +525,29 @@ mod tests {
         assert!(parse_args_from(&args(&["--socket"])).is_err());
         assert!(parse_args_from(&args(&["--socket", "--app"])).is_err());
         assert!(parse_args_from(&args(&["--app"])).is_err());
+        assert!(parse_args_from(&args(&["--journal-capacity"])).is_err());
+    }
+
+    /// §18.1: the retention window is configurable, and a window that cannot retain anything is
+    /// refused at startup rather than silently degrading every reconnect to a snapshot resync.
+    #[test]
+    fn journal_capacity_is_parsed_and_defaults_to_the_session_default() {
+        let config = parse_args_from(&args(&["--journal-capacity", "64"])).expect("valid window");
+        assert_eq!(config.journal_capacity, 64);
+
+        let default = parse_args_from(&args(&[])).expect("valid arguments");
+        assert_eq!(
+            default.journal_capacity,
+            SessionConfig::default().journal_capacity
+        );
+    }
+
+    #[test]
+    fn a_non_positive_or_unparsable_journal_capacity_is_rejected() {
+        for value in ["0", "-1", "many"] {
+            let error = parse_args_from(&args(&["--journal-capacity", value]))
+                .expect_err("rejected retention window");
+            assert!(error.contains("--journal-capacity"), "{error}");
+        }
     }
 }

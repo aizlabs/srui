@@ -69,7 +69,7 @@ pub fn mint_session_id() -> String {
 }
 
 use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, EventSequenceError, RecordOutcome};
-use srui_journal::{JournalError, TransactionJournal};
+use srui_journal::{JournalError, TransactionJournal, DEFAULT_MAX_JOURNAL_ENTRIES};
 use srui_protocol::{Event, ServerLimits, Transaction};
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
@@ -236,6 +236,35 @@ impl Drop for AttachmentGuard {
     }
 }
 
+/// Construction parameters for a [`Session`] (§15, §18.1, §20.2).
+///
+/// # Journal Retention (§18.1)
+/// `journal_capacity` is the **maximum retained transaction count**, the §18.1 retention policy
+/// this implementation uses. A resume whose `last_applied_revision` falls outside that window
+/// is answered `RESYNC_REQUIRED{continuity = SAME_SESSION}` instead of a journal replay (§18).
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// Server-side capability set offered during negotiation (§15).
+    pub capabilities: ServerCapabilities,
+    /// Maximum number of committed transactions retained for reconnect replay (§18.1).
+    /// Must be positive; zero is rejected at session construction (same policy as
+    /// `srui-sessiond --journal-capacity`).
+    pub journal_capacity: usize,
+    /// Capacity of the bounded transaction broadcast channel (§20.2).
+    /// Must be positive; zero is rejected at session construction, like `journal_capacity`.
+    pub broadcast_capacity: usize,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            capabilities: ServerCapabilities::standard_widgets(),
+            journal_capacity: DEFAULT_MAX_JOURNAL_ENTRIES,
+            broadcast_capacity: TRANSACTION_BROADCAST_CAPACITY,
+        }
+    }
+}
+
 /// Authoritative session controller managing the distributed UI graph.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -263,6 +292,13 @@ impl Session {
         Self::with_capabilities(mint_session_id(), capabilities)
     }
 
+    /// Creates a new `Session` with a freshly minted incarnation token and an explicit
+    /// configuration, including the §18.1 journal retention window (§17, §18.1).
+    #[must_use]
+    pub fn mint_with_config(config: SessionConfig) -> Self {
+        Self::with_config(mint_session_id(), config)
+    }
+
     /// Creates a new `Session` with the given session ID and default standard capabilities.
     pub fn new(session_id: impl Into<String>) -> Self {
         Self::with_capabilities(session_id, ServerCapabilities::standard_widgets())
@@ -273,11 +309,12 @@ impl Session {
     /// Intended for integration tests that exercise lag/resync behavior (§20.2).
     #[doc(hidden)]
     pub fn with_broadcast_capacity(session_id: impl Into<String>, capacity: usize) -> Self {
-        let (tx_broadcast, _) = broadcast::channel(capacity);
-        Self::with_broadcast_sender(
+        Self::with_config(
             session_id,
-            tx_broadcast,
-            ServerCapabilities::standard_widgets(),
+            SessionConfig {
+                broadcast_capacity: capacity,
+                ..SessionConfig::default()
+            },
         )
     }
 
@@ -288,10 +325,33 @@ impl Session {
         lock_or_recover(&self.tx_broadcast).take();
     }
 
+    /// Creates a session with the given session ID and an explicit [`SessionConfig`] (§15, §18.1, §20.2).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `journal_capacity` or `broadcast_capacity` is zero. Both are refused rather
+    /// than clamped: a zero journal window silently degrades every reconnect to a snapshot resync
+    /// (§18.1), and a zero broadcast capacity cannot deliver a single transaction (§20.2).
+    #[must_use]
+    pub fn with_config(session_id: impl Into<String>, config: SessionConfig) -> Self {
+        assert!(
+            config.journal_capacity > 0,
+            "SessionConfig::journal_capacity must be a positive integer (§18.1); \
+             got 0. Use the default ({DEFAULT_MAX_JOURNAL_ENTRIES}) or pass an explicit window."
+        );
+        assert!(
+            config.broadcast_capacity > 0,
+            "SessionConfig::broadcast_capacity must be a positive integer (§20.2); \
+             got 0. Use the default ({TRANSACTION_BROADCAST_CAPACITY}) or pass an explicit capacity."
+        );
+        let (tx_broadcast, _) = broadcast::channel(config.broadcast_capacity);
+        Self::with_broadcast_sender(session_id, tx_broadcast, config)
+    }
+
     fn with_broadcast_sender(
         session_id: impl Into<String>,
         tx_broadcast: broadcast::Sender<Transaction>,
-        capabilities: ServerCapabilities,
+        config: SessionConfig,
     ) -> Self {
         let limits = ServerLimits {
             max_frame_size: 16 * 1024 * 1024,
@@ -307,9 +367,9 @@ impl Session {
             state: SessionState::Detached,
             attached_connections: 0,
             store: SemanticStore::new(),
-            journal: TransactionJournal::new(1024),
+            journal: TransactionJournal::new(config.journal_capacity),
             dedupe: EventDeduplicator::default(),
-            capabilities,
+            capabilities: config.capabilities,
             limits,
             handlers: HashMap::new(),
         };
@@ -330,8 +390,13 @@ impl Session {
         session_id: impl Into<String>,
         capabilities: ServerCapabilities,
     ) -> Self {
-        let (tx_broadcast, _) = broadcast::channel(TRANSACTION_BROADCAST_CAPACITY);
-        Self::with_broadcast_sender(session_id, tx_broadcast, capabilities)
+        Self::with_config(
+            session_id,
+            SessionConfig {
+                capabilities,
+                ..SessionConfig::default()
+            },
+        )
     }
 
     /// Returns the session ID.
@@ -774,5 +839,41 @@ mod tests {
         session.poison_lock_for_test();
         assert_eq!(session.session_id(), "poison-test");
         assert_eq!(session.current_revision(), 0);
+    }
+
+    #[test]
+    fn test_session_config_rejects_zero_journal_capacity() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = Session::with_config(
+                "zero-capacity",
+                SessionConfig {
+                    journal_capacity: 0,
+                    ..SessionConfig::default()
+                },
+            );
+        });
+        assert!(
+            result.is_err(),
+            "zero journal_capacity must be rejected (§18.1)"
+        );
+    }
+
+    /// A zero broadcast capacity is refused on the same terms as a zero journal window, instead
+    /// of being silently clamped to a capacity that cannot hold a transaction (§20.2).
+    #[test]
+    fn test_session_config_rejects_zero_broadcast_capacity() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = Session::with_config(
+                "zero-broadcast",
+                SessionConfig {
+                    broadcast_capacity: 0,
+                    ..SessionConfig::default()
+                },
+            );
+        });
+        assert!(
+            result.is_err(),
+            "zero broadcast_capacity must be rejected (§20.2)"
+        );
     }
 }

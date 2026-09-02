@@ -203,6 +203,7 @@ struct EventOutboxRetryTests {
     func acknowledgementAdvancesResumeState() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-ack"))
 
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
@@ -211,7 +212,12 @@ struct EventOutboxRetryTests {
         )
         #expect(await outbox.pendingCount == 1)
 
-        await outbox.acknowledgeEvent(id: event.eventId)
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: event.eventId,
+            throughSeq: 0,
+            sessionId: "session-ack"
+        ))
 
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == event.eventSeq)
@@ -320,6 +326,7 @@ struct EventOutboxRetryTests {
         #expect(await outbox.isRetryingPendingEvents)
 
         _ = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
             eventId: pending.eventId,
             throughSeq: pending.eventSeq,
             sessionId: "session-a"
@@ -380,6 +387,7 @@ struct EventOutboxRetryTests {
         #expect(await outbox.isRetryingPendingEvents)
 
         _ = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
             eventId: second.eventId,
             throughSeq: second.eventSeq,
             sessionId: "session-a"
@@ -494,6 +502,7 @@ struct EventOutboxRetryTests {
         ack.lastProcessedEventSeq = event.eventSeq
         ack.status = .processed
         ack.revisionAfterEffect = 4
+        ack.sessionID = "test-session"
 
         var message = SRUIMessage()
         message.serverEventAck = ack
@@ -535,6 +544,7 @@ struct EventOutboxRetryTests {
         ack.eventID = second.eventId.bytes
         ack.lastProcessedEventSeq = second.eventSeq
         ack.status = .processed
+        ack.sessionID = "test-session"
 
         var message = SRUIMessage()
         message.serverEventAck = ack
@@ -579,6 +589,7 @@ struct EventOutboxRetryTests {
         secondAck.eventID = second.eventId.bytes
         secondAck.lastProcessedEventSeq = 0
         secondAck.status = .processed
+        secondAck.sessionID = "test-session"
         var secondMessage = SRUIMessage()
         secondMessage.serverEventAck = secondAck
         await controller.handleIncomingMessage(secondMessage)
@@ -596,6 +607,7 @@ struct EventOutboxRetryTests {
         firstAck.eventID = first.eventId.bytes
         firstAck.lastProcessedEventSeq = 2
         firstAck.status = .processed
+        firstAck.sessionID = "test-session"
         var firstMessage = SRUIMessage()
         firstMessage.serverEventAck = firstAck
         await controller.handleIncomingMessage(firstMessage)
@@ -631,6 +643,7 @@ struct EventOutboxRetryTests {
         ack.lastProcessedEventSeq = event.eventSeq
         ack.status = .rejected
         ack.rejectReason = "node 7 is disabled"
+        ack.sessionID = "test-session"
 
         var message = SRUIMessage()
         message.serverEventAck = ack
@@ -657,6 +670,7 @@ struct EventOutboxRetryTests {
 
         let outbox = EventOutbox()
         let controller = SessionController(transport: client, outbox: outbox, sessionId: "session-9")
+        #expect(await outbox.confirmFreshSession(id: "session-9"))
 
         for node in 1...3 {
             let event = try await outbox.sendActivate(
@@ -665,8 +679,10 @@ struct EventOutboxRetryTests {
                 via: client
             )
             _ = await outbox.settleAcknowledgement(
+                clientInstanceId: outbox.clientInstanceId,
                 eventId: event.eventId,
-                throughSeq: event.eventSeq
+                throughSeq: event.eventSeq,
+                sessionId: "session-9"
             )
         }
         #expect(await outbox.pendingCount == 0)
@@ -835,6 +851,7 @@ struct EventOutboxRetryTests {
     func staleHighWaterMarkDoesNotRetireUnackedEvents() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-stale"))
 
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
@@ -846,7 +863,14 @@ struct EventOutboxRetryTests {
         // The server tracks `last_processed_event_seq` per client_instance_id and it outlives the
         // connection, while a fresh outbox restarts its own counter at zero. Honoring a mark the
         // outbox never issued would retire an event that was never acknowledged.
-        await outbox.acknowledgeEvents(throughSeq: 5_000)
+        // The identity binds — this is the live session and this client instance — so the refusal
+        // below is about the content of the acknowledgement, not about who sent it.
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: EventId(string: "event-from-a-prior-incarnation"),
+            throughSeq: 5_000,
+            sessionId: "session-stale"
+        ))
 
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
@@ -881,6 +905,7 @@ struct EventOutboxRetryTests {
         ack.eventID = event.eventId.bytes
         ack.lastProcessedEventSeq = event.eventSeq
         ack.status = .processed
+        ack.sessionID = "test-session"
         var ackMessage = SRUIMessage()
         ackMessage.serverEventAck = ack
         await controller.handleIncomingMessage(ackMessage)
@@ -972,6 +997,7 @@ struct EventOutboxRetryTests {
         ack.eventID = event.eventId.bytes
         ack.lastProcessedEventSeq = event.eventSeq
         ack.status = .processed
+        ack.sessionID = "test-session"
         var message = SRUIMessage()
         message.serverEventAck = ack
         await controller.handleIncomingMessage(message)
@@ -990,12 +1016,18 @@ struct EventOutboxRetryTests {
         await collector.start(draining: server)
 
         let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-7"))
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
             via: client
         )
-        await outbox.acknowledgeEvent(id: event.eventId)
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: event.eventId,
+            throughSeq: 0,
+            sessionId: "session-7"
+        ))
 
         let controller = SessionController(
             transport: client,
@@ -1015,6 +1047,106 @@ struct EventOutboxRetryTests {
 
         await controller.stop()
         await collector.stop()
+        await server.close()
+    }
+
+    @Test("Stale, empty, and foreign-client acknowledgements mutate nothing (§18.2)")
+    func acknowledgementIdentityMustBindBeforeAnyMutation() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox(clientInstanceId: ClientInstanceId(string: "client-a"))
+        #expect(await outbox.confirmFreshSession(id: "session-live"))
+
+        let event = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: client
+        )
+
+        // An expired incarnation draining its socket must not retire an intent the live session
+        // still owns.
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: event.eventId,
+            throughSeq: event.eventSeq,
+            sessionId: "session-expired"
+        ) == false)
+        // An empty session_id proves nothing about which incarnation settled the event.
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: event.eventId,
+            throughSeq: event.eventSeq,
+            sessionId: ""
+        ) == false)
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: ClientInstanceId(string: "client-b"),
+            eventId: event.eventId,
+            throughSeq: event.eventSeq,
+            sessionId: "session-live"
+        ) == false)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: event.eventId,
+            throughSeq: event.eventSeq,
+            sessionId: "session-live"
+        ))
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == event.eventSeq)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("A retained event_id cannot be rebound to a different sequence or payload (§18.2)")
+    func pendingEventIdCannotBeReplaced() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let original = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: client
+        )
+
+        // Reusing the id for a different intent would hand the second action the first one's
+        // idempotency key: the server would answer it from the result cache, never running it.
+        let resequenced = Event.activate(
+            eventSeq: original.eventSeq + 1,
+            eventId: original.eventId,
+            observedRevision: original.observedRevision,
+            nodeId: original.nodeId
+        ).withClientInstanceId(outbox.clientInstanceId)
+        await #expect(throws: EventOutboxError.pendingEventIdentityConflict(eventId: original.eventId)) {
+            try await outbox.sendEvent(resequenced, via: client)
+        }
+
+        let repayloaded = Event.activate(
+            eventSeq: original.eventSeq,
+            eventId: original.eventId,
+            observedRevision: original.observedRevision,
+            nodeId: NodeId(8)
+        ).withClientInstanceId(outbox.clientInstanceId)
+        await #expect(throws: EventOutboxError.pendingEventIdentityConflict(eventId: original.eventId)) {
+            try await outbox.sendEvent(repayloaded, via: client)
+        }
+
+        #expect(await outbox.pendingCount == 1)
+
+        // The retained intent is still the original, byte for byte.
+        try await outbox.resendPendingEvents(via: client)
+        let messages = await collector.wait(forAtLeast: 2)
+        let decoded = try events(in: messages)
+        #expect(decoded.count == 2)
+        let replayed = try #require(decoded.last)
+        #expect(replayed == original)
+
+        await collector.stop()
+        await client.close()
         await server.close()
     }
 }

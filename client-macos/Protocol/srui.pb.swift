@@ -2109,7 +2109,7 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
   /// Diagnostic only, bounded by max_string_length (§26)
   public var rejectReason: String = String()
 
-  /// Incarnation that produced this acknowledgement (§18)
+  /// Non-empty; incarnation that produced this acknowledgement (§18, §18.2)
   public var sessionID: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()

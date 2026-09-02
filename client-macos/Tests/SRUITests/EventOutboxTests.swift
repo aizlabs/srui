@@ -17,38 +17,51 @@ struct EventOutboxTests {
 
     @Test("EventOutbox allocates monotonically increasing sequence numbers")
     func monotonicSequenceNumbers() async throws {
+        let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
 
-        let seq1 = await outbox.nextEventSeq()
-        let seq2 = await outbox.nextEventSeq()
-        let seq3 = await outbox.nextEventSeq()
+        // Sending is the whole allocation surface: no caller can mint a sequence without also
+        // retaining and transmitting it, so allocation and retention cannot diverge (§18.2).
+        let seq1 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client).eventSeq
+        let seq2 = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client).eventSeq
+        let seq3 = try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client).eventSeq
 
         #expect(seq1 == 1)
         #expect(seq2 == 2)
         #expect(seq3 == 3)
+        #expect(await outbox.eventSeq == 3)
+        #expect(await outbox.pendingCount == 3)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox generates unique retry-safe event IDs")
     func uniqueEventIds() async throws {
+        let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
 
-        let id1 = await outbox.generateEventId()
-        let id2 = await outbox.generateEventId()
+        let id1 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client).eventId
+        let id2 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client).eventId
 
         #expect(!id1.isEmpty)
         #expect(!id2.isEmpty)
         #expect(id1 != id2)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox creates and serializes ACTIVATE event")
     func activateEventSerialization() async throws {
         let clientInstanceId = ClientInstanceId(string: "client-test-42")
         let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
 
         let nodeId = NodeId(183)
         let observedRevision = Revision(104)
 
-        let event = await outbox.makeActivateEvent(nodeId: nodeId, observedRevision: observedRevision)
+        let event = try await outbox.sendActivate(nodeId: nodeId, observedRevision: observedRevision, via: client)
 
         #expect(event.eventSeq == 1)
         #expect(event.nodeId == nodeId)
@@ -73,18 +86,22 @@ struct EventOutboxTests {
         #expect(decodedEvent.observedRevision == observedRevision)
         #expect(decodedEvent.eventType == .EVENT_ACTIVATE)
         #expect(decodedEvent.clientInstanceId == clientInstanceId)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox creates and serializes VALUE_CHANGED event")
     func valueChangedEventSerialization() async throws {
         let clientInstanceId = ClientInstanceId(string: "client-test-val")
         let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
 
         let nodeId = NodeId(200)
         let observedRevision = Revision(50)
         let value = Value.bool(true)
 
-        let event = await outbox.makeValueChangedEvent(nodeId: nodeId, observedRevision: observedRevision, value: value)
+        let event = try await outbox.sendValueChanged(nodeId: nodeId, observedRevision: observedRevision, value: value, via: client)
 
         #expect(event.eventSeq == 1)
         #expect(event.nodeId == nodeId)
@@ -109,18 +126,22 @@ struct EventOutboxTests {
         #expect(decodedEvent.nodeId == nodeId)
         #expect(decodedEvent.eventType == .EVENT_VALUE_CHANGED)
         #expect(decodedEvent.boolArg == true)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox creates and serializes SELECTION_CHANGED event")
     func selectionChangedEventSerialization() async throws {
         let clientInstanceId = ClientInstanceId(string: "client-test-sel")
         let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
 
         let nodeId = NodeId(300)
         let observedRevision = Revision(75)
         let itemId = ItemId(999)
 
-        let event = await outbox.makeSelectionChangedEvent(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId)
+        let event = try await outbox.sendSelectionChanged(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId, via: client)
 
         #expect(event.eventSeq == 1)
         #expect(event.nodeId == nodeId)
@@ -145,6 +166,9 @@ struct EventOutboxTests {
         #expect(decodedEvent.nodeId == nodeId)
         #expect(decodedEvent.eventType == .EVENT_SELECTION_CHANGED)
         #expect(decodedEvent.itemIdArg == itemId)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("Mixed event types share contiguous monotonic sequences and are retained")
@@ -249,7 +273,13 @@ struct EventOutboxTests {
         #expect(await outbox.pendingCount == 3)
 
         // Settle ack through seq 1
-        _ = await outbox.settleAcknowledgement(eventId: ev1.eventId, throughSeq: 1, sessionId: nil)
+        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        _ = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: ev1.eventId,
+            throughSeq: 1,
+            sessionId: "session-live"
+        )
         #expect(await outbox.pendingCount == 2)
 
         await client.close()
@@ -399,6 +429,88 @@ struct EventOutboxTests {
 
         let freshEvent = try await outbox.sendActivate(nodeId: NodeId(10), observedRevision: Revision(1), via: client)
         #expect(freshEvent.eventSeq == 1)
+        #expect(await outbox.pendingCount == 1)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Window exhaustion is refused before a sequence or id is minted (§18.2)")
+    func exhaustionLeavesSequenceAndRetentionUntouched() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox(maxPendingEvents: 2)
+        #expect(await outbox.confirmFreshSession(id: "session-window"))
+
+        let first = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        let second = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client)
+
+        await #expect(throws: EventOutboxError.sequenceWindowExhausted(limit: 2)) {
+            try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client)
+        }
+
+        // A sequence burned by a refused send would be a permanent hole the server never settles
+        // past, so backpressure must precede allocation (§18.2).
+        #expect(await outbox.eventSeq == 2)
+        #expect(await outbox.pendingCount == 2)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        // The two retained identities are still exactly the originals: acking them by id drains
+        // the outbox and advances the contiguous frontier to the newest allocated sequence.
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: 0,
+            sessionId: "session-window"
+        ))
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: second.eventId,
+            throughSeq: 0,
+            sessionId: "session-window"
+        ))
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == 2)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("A selective ack across a gap neither reopens the window nor skips a sequence (§18.2)")
+    func selectiveAckAcrossGapKeepsWindowClosed() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox(maxPendingEvents: 2)
+        #expect(await outbox.confirmFreshSession(id: "session-gap"))
+
+        let first = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        let second = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client)
+
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: second.eventId,
+            throughSeq: 0,
+            sessionId: "session-gap"
+        ))
+        #expect(await outbox.pendingCount == 1)
+        // Sequence 1 is still unsettled, so the cumulative frontier cannot cross it.
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        // The window is measured from that frontier, not from the selective set, so the slot the
+        // later ack settled is not reusable while the gap remains.
+        await #expect(throws: EventOutboxError.sequenceWindowExhausted(limit: 2)) {
+            try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client)
+        }
+        #expect(await outbox.eventSeq == 2)
+
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: 0,
+            sessionId: "session-gap"
+        ))
+        #expect(await outbox.lastAckedEventSeq == 2)
+
+        let third = try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client)
+        #expect(third.eventSeq == 3)
         #expect(await outbox.pendingCount == 1)
 
         await client.close()

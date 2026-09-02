@@ -15,6 +15,8 @@ public enum EventOutboxError: Error, Equatable, Sendable {
     case sequenceWindowExhausted(limit: Int)
     case eventSequenceAlreadyAcknowledged(eventSeq: UInt64)
     case resumeNotConfirmed
+    /// A retained `event_id` was reused for a different sequence or payload (§18.2).
+    case pendingEventIdentityConflict(eventId: EventId)
 }
 
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
@@ -89,58 +91,37 @@ public actor EventOutbox {
         _lastAckedEventSeq
     }
 
-    /// Allocates the next sequence. Callers must send or retain the resulting event without
-    /// abandoning it; the combined send APIs enforce the bounded window before allocation.
-    public func nextEventSeq() -> UInt64 {
-        currentEventSeq += 1
-        return currentEventSeq
-    }
-
     /// Generates a globally unique, retry-safe event identifier (§7.7, §18.2).
-    public func generateEventId() -> EventId {
+    private func generateEventId() -> EventId {
         EventId(string: UUID().uuidString)
     }
 
-    /// Constructs a client-originated momentary activation event (§7.6, §7.7).
-    public func makeActivateEvent(nodeId: NodeId, observedRevision: Revision) -> Event {
-        let seq = nextEventSeq()
-        let id = generateEventId()
-        return Event.activate(
-            eventSeq: seq,
-            eventId: id,
-            observedRevision: observedRevision,
-            nodeId: nodeId
-        ).withClientInstanceId(clientInstanceId)
-    }
-
-    /// Constructs a client-originated value-changed event (§7.6).
-    public func makeValueChangedEvent(nodeId: NodeId, observedRevision: Revision, value: Value) -> Event {
-        let seq = nextEventSeq()
-        let id = generateEventId()
-        return Event.valueChanged(
-            eventSeq: seq,
-            eventId: id,
-            observedRevision: observedRevision,
-            nodeId: nodeId,
-            value: value
-        ).withClientInstanceId(clientInstanceId)
-    }
-
-    /// Constructs a client-originated selection-changed event (§7.6).
-    public func makeSelectionChangedEvent(nodeId: NodeId, observedRevision: Revision, itemId: ItemId) -> Event {
-        let seq = nextEventSeq()
-        let id = generateEventId()
-        return Event.selectionChanged(
-            eventSeq: seq,
-            eventId: id,
-            observedRevision: observedRevision,
-            nodeId: nodeId,
-            itemId: itemId
-        ).withClientInstanceId(clientInstanceId)
+    /// Admits, allocates, retains, and transmits one client-originated event (§7.6, §7.7, §18.2).
+    ///
+    /// The only path that mints a sequence, and private so it stays that way. Admission and
+    /// backpressure run *before* allocation, and retention happens before the first suspension, so
+    /// neither a refused send nor a failed write can leave a permanent hole in the contiguous send
+    /// window that the server would then refuse to settle past.
+    private func allocateAndSend(
+        via transport: any Transport,
+        _ makeEvent: (UInt64, EventId) -> Event
+    ) async throws -> Event {
+        guard acceptsNewEvents else {
+            throw EventOutboxError.resumeNotConfirmed
+        }
+        try ensureSequenceWindowCapacity()
+        currentEventSeq += 1
+        let event = makeEvent(currentEventSeq, generateEventId())
+            .withClientInstanceId(clientInstanceId)
+        try await sendEvent(event, via: transport)
+        return event
     }
 
     /// Serializes and sends an event over the given transport (§16, §22).
-    public func sendEvent(_ event: Event, via transport: any Transport) async throws {
+    ///
+    /// Internal because it accepts an already-allocated identity: only `allocateAndSend` may mint
+    /// one, so allocation, retention, and transmission stay a single actor-isolated step.
+    func sendEvent(_ event: Event, via transport: any Transport) async throws {
         var msg = SRUIMessage()
         msg.event = event.toWire()
         let framedBytes = try SRUIFraming.encodeFramed(msg)
@@ -157,37 +138,42 @@ public actor EventOutbox {
     /// Constructs and sends an `ACTIVATE` event without creating a sequence beyond the window.
     @discardableResult
     public func sendActivate(nodeId: NodeId, observedRevision: Revision, via transport: any Transport) async throws -> Event {
-        guard acceptsNewEvents else {
-            throw EventOutboxError.resumeNotConfirmed
+        try await allocateAndSend(via: transport) { eventSeq, eventId in
+            Event.activate(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId
+            )
         }
-        try ensureSequenceWindowCapacity()
-        let event = makeActivateEvent(nodeId: nodeId, observedRevision: observedRevision)
-        try await sendEvent(event, via: transport)
-        return event
     }
 
     /// Constructs and sends a `VALUE_CHANGED` event without creating a sequence beyond the window.
     @discardableResult
     public func sendValueChanged(nodeId: NodeId, observedRevision: Revision, value: Value, via transport: any Transport) async throws -> Event {
-        guard acceptsNewEvents else {
-            throw EventOutboxError.resumeNotConfirmed
+        try await allocateAndSend(via: transport) { eventSeq, eventId in
+            Event.valueChanged(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId,
+                value: value
+            )
         }
-        try ensureSequenceWindowCapacity()
-        let event = makeValueChangedEvent(nodeId: nodeId, observedRevision: observedRevision, value: value)
-        try await sendEvent(event, via: transport)
-        return event
     }
 
     /// Constructs and sends a `SELECTION_CHANGED` event without creating a sequence beyond the window.
     @discardableResult
     public func sendSelectionChanged(nodeId: NodeId, observedRevision: Revision, itemId: ItemId, via transport: any Transport) async throws -> Event {
-        guard acceptsNewEvents else {
-            throw EventOutboxError.resumeNotConfirmed
+        try await allocateAndSend(via: transport) { eventSeq, eventId in
+            Event.selectionChanged(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId,
+                itemId: itemId
+            )
         }
-        try ensureSequenceWindowCapacity()
-        let event = makeSelectionChangedEvent(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId)
-        try await sendEvent(event, via: transport)
-        return event
     }
 
     /// Replays every unacknowledged event in original send order with its original identity.
@@ -212,7 +198,10 @@ public actor EventOutbox {
     }
 
     /// Selectively acknowledges one event ID. A later sequence does not cross an earlier gap.
-    public func acknowledgeEvent(id: EventId) {
+    ///
+    /// Private: settling an intent mutates state whose ownership depends on wire identity, so
+    /// `settleAcknowledgement` is the only way in from the wire (§18.2).
+    private func acknowledgeEvent(id: EventId) {
         guard let event = pendingEvents.removeValue(forKey: id) else { return }
         pendingOrder.removeAll { $0 == id }
         recordSelectiveAcknowledgement(event.eventSeq)
@@ -248,20 +237,36 @@ public actor EventOutbox {
         generation >= 1 && generation <= lastIssuedResumeGeneration
     }
 
-    /// Runs `body` only while `generation` still owns the reconnect decision (§18).
+    /// Publishes a resync snapshot under the reconnect latch and releases it in the same step (§18).
     ///
-    /// The check and `body` share this single actor-isolated critical section, so a concurrent
-    /// `beginResumeAttempt()` cannot slip between them. A caller that checked first and applied
-    /// after a suspension would still let a superseded snapshot reach the shared replica.
+    /// The supersession check, `publish`, and the latch release share this single actor-isolated
+    /// critical section, so a concurrent `beginResumeAttempt()` cannot slip between them: a caller
+    /// that published first and released the latch after a suspension would leave the shared
+    /// replica advanced while its own resync decision was refused (§18, §22.2).
+    ///
+    /// `publish` must be the swap alone — build the snapshot with
+    /// `TransactionApplier.prepareResyncSnapshot(record:)` before calling, so the rebuild never
+    /// occupies this actor while acknowledgements and sends wait behind it.
     ///
     /// A `nil` generation means "this controller has no attempt outstanding", which is the
     /// live-resync case: it matches only while no other controller holds the latch either.
-    func withUnsupersededResume<T: Sendable>(
-        _ generation: UInt64?,
-        _ body: @Sendable () -> T
+    /// Returns `nil` when a newer attempt owns the latch and nothing was published.
+    func commitResyncSnapshot<T: Sendable>(
+        generation: UInt64?,
+        publish: @Sendable () -> T,
+        committed: @Sendable (T) -> Bool
     ) -> T? {
         guard activeResumeGeneration == generation else { return nil }
-        return body()
+        let result = publish()
+        // A rejected snapshot keeps the latch: the server can still send another one, and
+        // re-enabling allocation here would let events race a replica that was never rebuilt (§18).
+        guard committed(result) else { return result }
+        if let generation {
+            _ = finishResync(generation: generation)
+        } else {
+            allowNewEvents()
+        }
+        return result
     }
 
     /// Completes a same-session decision only if no newer controller superseded this attempt.
@@ -332,14 +337,24 @@ public actor EventOutbox {
     }
 
     /// Applies one selective acknowledgement plus the server's contiguous cumulative frontier.
-    /// Returns false when a draining connection delivers an ack from an expired incarnation.
+    ///
+    /// Both wire identities are checked here rather than by the caller: the ack settles state this
+    /// actor owns, so a draining connection, an expired incarnation, or another client instance
+    /// must be refused inside the same isolated step that would otherwise mutate it (§18, §18.2).
+    /// Returns false without any mutation when the identity does not bind.
     @discardableResult
     public func settleAcknowledgement(
+        clientInstanceId ackClientInstanceId: ClientInstanceId,
         eventId: EventId,
         throughSeq seq: UInt64,
-        sessionId: String? = nil
+        sessionId: String
     ) -> Bool {
-        if let sessionId, let activeSessionId, sessionId != activeSessionId {
+        guard ackClientInstanceId == clientInstanceId else { return false }
+        // `session_id` is required on every ack (§18.2): an empty one proves nothing about which
+        // incarnation settled the event, so it can never retire an intent.
+        guard !sessionId.isEmpty,
+              let activeSessionId,
+              sessionId == activeSessionId else {
             return false
         }
         acknowledgeEvents(throughSeq: seq)
@@ -348,7 +363,11 @@ public actor EventOutbox {
     }
 
     /// Acknowledges every event through the server's highest contiguous settled sequence.
-    public func acknowledgeEvents(throughSeq seq: UInt64) {
+    ///
+    /// Private for the same reason as `acknowledgeEvent(id:)`: reachable from the wire only
+    /// through the identity-checked `settleAcknowledgement`, and internally only from a resume or
+    /// resync decision the generation latch already bound to this outbox (§18, §18.2).
+    private func acknowledgeEvents(throughSeq seq: UInt64) {
         guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return }
 
         _lastAckedEventSeq = seq
@@ -462,6 +481,11 @@ public actor EventOutbox {
         for lease: PendingEventReplayLoop.Lease,
         via transport: any Transport
     ) async throws -> Bool {
+        // Lease identity *is* resume ownership here: `beginResumeAttempt()` and
+        // `stopResumeWork(generation:)` cancel the lease of the generation they supersede, which
+        // clears `replayLease` before any newer attempt can run. Re-deriving ownership from the
+        // latch instead would stop the loop after `commitResumeWork(generation:)` releases it,
+        // stranding events that are still unsettled (§18, §18.2).
         guard replayLease == lease,
               pendingEventReplayLoop.isActive(lease),
               pendingEvents.isEmpty == false else {
@@ -469,6 +493,10 @@ public actor EventOutbox {
         }
         try Task.checkCancellation()
         try await resendPendingEvents(via: transport)
+        // Re-checked after the suspension: a reconnect that superseded this generation while the
+        // replay was in flight owns the retry set now, and this lease must not touch it (§18).
+        // `Lease` equality covers `resumeScope`, so still being the current lease is itself proof
+        // that this generation still owns the retry set.
         guard replayLease == lease,
               pendingEventReplayLoop.isActive(lease),
               Task.isCancelled == false else {
@@ -549,8 +577,13 @@ public actor EventOutbox {
 
     /// Retains a new event without evicting an earlier unacknowledged sequence.
     private func retainPending(_ event: Event) throws {
-        if pendingEvents[event.eventId] != nil {
-            pendingEvents[event.eventId] = event
+        if let retained = pendingEvents[event.eventId] {
+            // A retry is byte-identical by definition (§18.2). Overwriting the entry instead would
+            // let a second, semantically different intent inherit the first one's idempotency key,
+            // and the server would answer it from the result cache without ever running it.
+            guard retained == event else {
+                throw EventOutboxError.pendingEventIdentityConflict(eventId: event.eventId)
+            }
             return
         }
         guard event.eventSeq > _lastAckedEventSeq else {

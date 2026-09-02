@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use srui_protocol::Transaction;
 use srui_semantic_tree::Transaction as DomainTxn;
@@ -86,6 +87,7 @@ impl SubscriberState {
 pub struct OutboundReceiver {
     notify_rx: mpsc::Receiver<()>,
     state: Arc<Mutex<SubscriberState>>,
+    disconnect: CancellationToken,
 }
 
 impl OutboundReceiver {
@@ -137,6 +139,28 @@ impl OutboundReceiver {
         Ok(None)
     }
 
+    /// Token cancelled when this subscriber overflows or the hub closes.
+    ///
+    /// Connection writes must race this against `framed_write.send` so a blocked
+    /// socket does not delay `LaggedResyncRequired` (§20.2).
+    #[must_use]
+    pub fn disconnect_token(&self) -> &CancellationToken {
+        &self.disconnect
+    }
+
+    /// Current terminal state, if the queue has overflowed or closed.
+    #[must_use]
+    pub fn termination(&self) -> Option<OutboundRecvError> {
+        let guard = self.state.lock().unwrap();
+        if let Some(reason) = &guard.stale_reason {
+            Some(OutboundRecvError::Lagged(reason.clone()))
+        } else if guard.is_closed {
+            Some(OutboundRecvError::Closed)
+        } else {
+            None
+        }
+    }
+
     /// Returns `true` if the underlying queue has closed.
     pub fn is_closed(&self) -> bool {
         self.state.lock().unwrap().is_closed
@@ -148,6 +172,7 @@ struct Subscriber {
     client_instance_id: Vec<u8>,
     notify_tx: mpsc::Sender<()>,
     state: Arc<Mutex<SubscriberState>>,
+    disconnect: CancellationToken,
 }
 
 /// Central distribution hub for outbound transaction queues.
@@ -191,6 +216,7 @@ impl OutboundHub {
         }
 
         let (notify_tx, notify_rx) = mpsc::channel(capacity);
+        let disconnect = CancellationToken::new();
         let state = Arc::new(Mutex::new(SubscriberState {
             capacity,
             max_ops,
@@ -205,11 +231,16 @@ impl OutboundHub {
             client_instance_id,
             notify_tx,
             state: Arc::clone(&state),
+            disconnect: disconnect.clone(),
         };
 
         self.subscribers.lock().unwrap().push(sub);
 
-        Ok(OutboundReceiver { notify_rx, state })
+        Ok(OutboundReceiver {
+            notify_rx,
+            state,
+            disconnect,
+        })
     }
 
     pub fn publish(&self, tx: &Transaction) {
@@ -233,10 +264,14 @@ impl OutboundHub {
                 }
                 Ok(false) => true,
                 Err(OutboundRecvError::Lagged(_)) => {
+                    sub.disconnect.cancel();
                     stale_marked.push((sub.client_instance_id.clone(), guard.peak_depth));
                     false
                 }
-                Err(OutboundRecvError::Closed) => false,
+                Err(OutboundRecvError::Closed) => {
+                    sub.disconnect.cancel();
+                    false
+                }
             }
         });
 
@@ -313,6 +348,7 @@ impl OutboundHub {
         self.is_closed.store(true, Ordering::Relaxed);
         let mut subs = self.subscribers.lock().unwrap();
         for sub in subs.drain(..) {
+            sub.disconnect.cancel();
             let mut guard = sub.state.lock().unwrap();
             guard.is_closed = true;
         }
@@ -323,8 +359,9 @@ impl OutboundHub {
 mod tests {
     use super::*;
     use srui_protocol::{
-        operation::Op, value::Value as WireValInner, CreateNodeOp, NodeRecord, Operation as WireOp,
-        PropertyRef as WirePropRef, SetPropertyOp, Value as WireValue,
+        operation::Op, srui_message, value::Value as WireValInner, CreateNodeOp, NodeRecord,
+        Operation as WireOp, PropertyRef as WirePropRef, SetPropertyOp, SruiMessage,
+        Value as WireValue,
     };
 
     fn make_set_prop_op(node_id: u64, prop_id: u32, val: &str) -> WireOp {
@@ -441,6 +478,57 @@ mod tests {
     }
 
     #[test]
+    fn test_coalescing_accounts_for_enclosing_message_frame_size() {
+        let tx1 = make_scalar_tx(0, 1, 10, 1, "first-value");
+        let tx2 = make_scalar_tx(1, 2, 10, 2, "second-value");
+        let merged = Transaction {
+            base_revision: 0,
+            new_revision: 2,
+            priority: 1,
+            operations: vec![tx1.operations[0].clone(), tx2.operations[0].clone()],
+        };
+        let merged_envelope = SruiMessage {
+            msg: Some(srui_message::Msg::Transaction(merged.clone())),
+        };
+        let framed =
+            srui_protocol::encode_framed(&merged_envelope).expect("encode merged envelope fixture");
+        let merged_envelope_size = (0..=framed.len())
+            .find(|&limit| srui_protocol::encode_framed_with_limit(&merged_envelope, limit).is_ok())
+            .expect("find encoded envelope size");
+        let max_frame_size = merged_envelope_size - 1;
+
+        assert!(
+            srui_protocol::encode_framed_with_limit(&merged, max_frame_size).is_ok(),
+            "fixture must fit the bare transaction under the limit"
+        );
+        for tx in [&tx1, &tx2] {
+            let envelope = SruiMessage {
+                msg: Some(srui_message::Msg::Transaction(tx.clone())),
+            };
+            assert!(
+                srui_protocol::encode_framed_with_limit(&envelope, max_frame_size).is_ok(),
+                "each unmerged transaction must remain independently sendable"
+            );
+        }
+
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![8, 8], 4, 10, max_frame_size)
+            .expect("subscribe");
+
+        hub.publish(&tx1);
+        hub.publish(&tx2);
+
+        assert_eq!(
+            hub.peak_depth_for_client(&[8, 8]),
+            2,
+            "coalescing must not create an SruiMessage larger than the frame limit"
+        );
+        assert_eq!(rx.try_recv().unwrap().unwrap(), tx1);
+        assert_eq!(rx.try_recv().unwrap().unwrap(), tx2);
+    }
+
+    #[test]
     fn test_overflow_discards_backlog_and_marks_stale() {
         let hub = OutboundHub::new();
         let mut rx = hub
@@ -458,7 +546,15 @@ mod tests {
 
         hub.publish(&b3);
         assert!(hub.is_client_stale(&[7, 7]));
+        assert!(
+            rx.disconnect_token().is_cancelled(),
+            "overflow must wake a connection blocked in framed_write.send"
+        );
 
         assert!(matches!(rx.try_recv(), Err(OutboundRecvError::Lagged(_))));
+        assert!(matches!(
+            rx.termination(),
+            Some(OutboundRecvError::Lagged(_))
+        ));
     }
 }

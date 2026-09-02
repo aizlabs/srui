@@ -89,35 +89,30 @@ impl Transaction {
         use std::collections::HashMap;
 
         let mut key_map: HashMap<(NodeId, PropertyRef), usize> =
-            HashMap::with_capacity(self.operations.len());
+            HashMap::with_capacity(self.operations.len() + incoming.operations.len());
         for (idx, op) in self.operations.iter().enumerate() {
             if let Operation::SetProperty { id, property, .. } = op {
                 key_map.insert((*id, *property), idx);
             }
         }
 
-        let mut new_keys_count = 0;
-        for op in &incoming.operations {
-            if let Operation::SetProperty { id, property, .. } = op {
-                key_map.entry((*id, *property)).or_insert_with(|| {
-                    new_keys_count += 1;
-                    usize::MAX
-                });
-            }
-        }
+        let new_keys_count = incoming
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Operation::SetProperty { id, property, .. }
+                        if !key_map.contains_key(&(*id, *property))
+                )
+            })
+            .count();
 
         if self.operations.len() + new_keys_count > max_ops {
             return false;
         }
 
         let mut merged_ops = self.operations.clone();
-        key_map.clear();
-        for (idx, op) in merged_ops.iter().enumerate() {
-            if let Operation::SetProperty { id, property, .. } = op {
-                key_map.insert((*id, *property), idx);
-            }
-        }
-
         for op in &incoming.operations {
             if let Operation::SetProperty {
                 id,
@@ -151,7 +146,10 @@ impl Transaction {
             priority: self.priority,
         };
         let wire: srui_protocol::Transaction = (&test_txn).into();
-        if wire.encoded_len() > max_frame_size {
+        let envelope = srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(wire)),
+        };
+        if envelope.encoded_len() > max_frame_size {
             return false;
         }
 

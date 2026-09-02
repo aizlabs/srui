@@ -95,6 +95,24 @@ impl SemanticStore {
         self.apply_staged_owned(ops, base_rev.next())
     }
 
+    fn validate_live_span(txn: &Transaction, current_rev: Revision) -> Result<(), TxnError> {
+        if txn.base_revision != current_rev {
+            return Err(TxnError::StaleBaseRevision {
+                expected: current_rev,
+                actual: txn.base_revision,
+            });
+        }
+        if txn.new_revision <= txn.base_revision
+            || (txn.new_revision > txn.base_revision.next() && !txn.is_coalesceable())
+        {
+            return Err(TxnError::InvalidNewRevision {
+                expected: txn.base_revision.next(),
+                actual: txn.new_revision,
+            });
+        }
+        Ok(())
+    }
+
     /// Applies a structured [`Transaction`] record, validating base revision, forward revision advancement,
     /// and operational limits (§12.1, §20.2).
     ///
@@ -102,28 +120,7 @@ impl SemanticStore {
     /// Multi-revision forward spans (`new_revision > base_revision + 1`) are legal exclusively for
     /// coalesced scalar updates (`txn.is_coalesceable()`).
     pub fn apply_transaction_record(&mut self, txn: &Transaction) -> Result<Revision, TxnError> {
-        let current_rev = self.revision();
-        if txn.base_revision != current_rev {
-            return Err(TxnError::StaleBaseRevision {
-                expected: current_rev,
-                actual: txn.base_revision,
-            });
-        }
-
-        if txn.new_revision <= txn.base_revision {
-            return Err(TxnError::InvalidNewRevision {
-                expected: txn.base_revision.next(),
-                actual: txn.new_revision,
-            });
-        }
-
-        if txn.new_revision > txn.base_revision.next() && !txn.is_coalesceable() {
-            return Err(TxnError::InvalidNewRevision {
-                expected: txn.base_revision.next(),
-                actual: txn.new_revision,
-            });
-        }
-
+        Self::validate_live_span(txn, self.revision())?;
         self.apply_staged(&txn.operations, txn.new_revision)
     }
 
@@ -133,28 +130,7 @@ impl SemanticStore {
         wire_txn: srui_protocol::Transaction,
     ) -> Result<Revision, TxnError> {
         let txn = Transaction::try_from(wire_txn)?;
-        let current_rev = self.revision();
-        if txn.base_revision != current_rev {
-            return Err(TxnError::StaleBaseRevision {
-                expected: current_rev,
-                actual: txn.base_revision,
-            });
-        }
-
-        if txn.new_revision <= txn.base_revision {
-            return Err(TxnError::InvalidNewRevision {
-                expected: txn.base_revision.next(),
-                actual: txn.new_revision,
-            });
-        }
-
-        if txn.new_revision > txn.base_revision.next() && !txn.is_coalesceable() {
-            return Err(TxnError::InvalidNewRevision {
-                expected: txn.base_revision.next(),
-                actual: txn.new_revision,
-            });
-        }
-
+        Self::validate_live_span(&txn, self.revision())?;
         self.apply_staged_owned(txn.operations, txn.new_revision)
     }
 }

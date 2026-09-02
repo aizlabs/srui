@@ -235,10 +235,11 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
             .expect("commit structural transaction");
     }
 
-    // The connection handler must detach with LaggedResyncRequired
-    let server_result = timeout(Duration::from_secs(3), server_task)
+    // The connection handler must detach with LaggedResyncRequired even if
+    // framed_write.send is blocked on a client that has stopped reading.
+    let server_result = timeout(Duration::from_secs(1), server_task)
         .await
-        .expect("server task should exit promptly on overflow")
+        .expect("server task should exit promptly on overflow even when send is blocked")
         .expect("server task join");
 
     assert!(

@@ -145,9 +145,6 @@ impl Session {
 
         before_subscribe();
 
-        self.outbound_hub
-            .clear_stale_client(&hello.client_instance_id);
-
         let max_ops = inner_guard.limits.max_transaction_operations as usize;
         let max_frame_size = inner_guard.limits.max_frame_size as usize;
         let transactions = self.outbound_hub.subscribe(
@@ -224,11 +221,6 @@ impl Session {
         } else {
             None
         };
-
-        if resync_cause.is_some() {
-            self.outbound_hub
-                .clear_stale_client(&resume.client_instance_id);
-        }
 
         let plan = if let Some(cause) = resync_cause {
             ResumePlan::Resync {
@@ -314,6 +306,95 @@ mod tests {
             client_instance_id: vec![1, 2],
             client_metadata: Default::default(),
         }
+    }
+
+    fn empty_tx(base: u64, new_rev: u64) -> Transaction {
+        Transaction {
+            base_revision: base,
+            new_revision: new_rev,
+            priority: 1,
+            operations: vec![],
+        }
+    }
+
+    #[test]
+    fn test_replaced_incarnation_precedes_outbound_overflow_stale() {
+        let session = Session::with_outbound_queue_capacity("live-incarnation", 1);
+        let client = vec![9, 9];
+        let _rx = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe");
+
+        session
+            .commit_transaction(empty_tx(0, 1))
+            .expect("fill queue");
+        session
+            .commit_transaction(empty_tx(1, 2))
+            .expect("overflow");
+        assert!(session.outbound_hub().is_client_stale(&client));
+
+        let resume = ClientResume {
+            session_id: "old-incarnation".to_string(),
+            client_instance_id: client,
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+        };
+        let bootstrap = session.bootstrap_resume(&resume).expect("resume");
+        match bootstrap.outcome {
+            ResumeOutcome::Resync { resync_msg, .. } => {
+                assert_eq!(
+                    SessionContinuity::try_from(resync_msg.continuity),
+                    Ok(SessionContinuity::Replaced)
+                );
+                assert!(resync_msg.reason.contains("incarnation"));
+            }
+            other => panic!("expected Replaced resync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_overflow_stale_survives_resume_bootstrap_until_snapshot_ack() {
+        let session = Session::with_outbound_queue_capacity("overflow-session", 1);
+        let client = vec![4, 2];
+        let _rx = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe");
+
+        session
+            .commit_transaction(empty_tx(0, 1))
+            .expect("fill queue");
+        session
+            .commit_transaction(empty_tx(1, 2))
+            .expect("overflow");
+        assert!(session.outbound_hub().is_client_stale(&client));
+
+        let resume = ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: client.clone(),
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+        };
+        let bootstrap = session.bootstrap_resume(&resume).expect("resume");
+        match bootstrap.outcome {
+            ResumeOutcome::Resync { resync_msg, .. } => {
+                assert_eq!(
+                    SessionContinuity::try_from(resync_msg.continuity),
+                    Ok(SessionContinuity::SameSession)
+                );
+                assert!(resync_msg
+                    .reason
+                    .contains("outbound transaction queue overflowed"));
+            }
+            other => panic!("expected overflow resync, got {other:?}"),
+        }
+        assert!(
+            session.outbound_hub().is_client_stale(&client),
+            "stale must remain until the snapshot write completes"
+        );
+        session.clear_stale_client(&client);
+        assert!(!session.outbound_hub().is_client_stale(&client));
     }
 
     #[test]

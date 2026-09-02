@@ -6,7 +6,7 @@
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
 //! Conforms to [`async-bounded-channel`](rules/async-bounded-channel.md):
-//! transaction broadcast channels are strictly bounded.
+//! per-connection outbound transaction queues are strictly bounded.
 
 mod handshake;
 mod snapshot;
@@ -107,7 +107,7 @@ pub enum SessionError {
     #[error("lock poisoned")]
     LockPoisoned,
 
-    #[error("client lagged behind transaction broadcast; resync required")]
+    #[error("client outbound queue overflowed; resync required")]
     LaggedResyncRequired,
 
     #[error("replay unavailable for requested revision")]
@@ -485,6 +485,11 @@ impl Session {
         drop(guard);
         self.outbound_hub
             .subscribe(client_instance_id, capacity, max_ops, max_frame_size)
+    }
+
+    /// Clears the overflow stale marker after a catch-up snapshot has been written (§20.2).
+    pub(crate) fn clear_stale_client(&self, client_instance_id: &[u8]) {
+        self.outbound_hub.clear_stale_client(client_instance_id);
     }
 
     /// Returns a reference to the session's outbound transaction hub.

@@ -21,7 +21,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::outbound::OutboundRecvError;
+use crate::outbound::{OutboundReceiver, OutboundRecvError};
 use crate::session::{EventOutcome, ResumeOutcome, Session, SessionError};
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
@@ -57,6 +57,39 @@ pub enum ConnectionError {
 
     #[error("event client_instance_id does not match the connection handshake")]
     ClientInstanceMismatch,
+}
+
+/// Sends `envelope` unless shutdown or outbound overflow/close fires first.
+///
+/// Returns `Ok(true)` if the frame was written, `Ok(false)` if the connection should
+/// unwind cleanly (shutdown or hub close). A lagged queue is a hard resync error.
+async fn send_message<W>(
+    framed_write: &mut FramedWrite<W, SruiCodec>,
+    envelope: SruiMessage,
+    shutdown: &CancellationToken,
+    outbound: &OutboundReceiver,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    tokio::select! {
+        res = framed_write.send(envelope) => {
+            res?;
+            Ok(true)
+        }
+        _ = shutdown.cancelled() => Ok(false),
+        _ = outbound.disconnect_token().cancelled() => match outbound.termination() {
+            Some(OutboundRecvError::Closed) => Ok(false),
+            Some(OutboundRecvError::Lagged(reason)) => {
+                warn!(%reason, "Client outbound queue overflowed during send; closing connection to force resync");
+                Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
+            }
+            None => {
+                warn!("Client outbound subscriber disconnected during send; closing connection to force resync");
+                Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
+            }
+        },
+    }
 }
 
 /// Handles an active client connection stream through handshake and event processing.
@@ -105,13 +138,32 @@ where
             let welcome_envelope = SruiMessage {
                 msg: Some(srui_message::Msg::ServerWelcome(bootstrap.welcome)),
             };
-            framed_write.send(welcome_envelope).await?;
+            if !send_message(
+                &mut framed_write,
+                welcome_envelope,
+                &shutdown,
+                &bootstrap.transactions,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             if let Some(snapshot) = bootstrap.snapshot {
                 let snapshot_envelope = SruiMessage {
                     msg: Some(srui_message::Msg::Transaction(snapshot)),
                 };
-                framed_write.send(snapshot_envelope).await?;
+                if !send_message(
+                    &mut framed_write,
+                    snapshot_envelope,
+                    &shutdown,
+                    &bootstrap.transactions,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
             }
+            session.clear_stale_client(&hello.client_instance_id);
             (hello.client_instance_id, bootstrap.transactions)
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
@@ -129,12 +181,30 @@ where
                     let envelope = SruiMessage {
                         msg: Some(srui_message::Msg::ServerResumeOk(welcome_msg)),
                     };
-                    framed_write.send(envelope).await?;
+                    if !send_message(
+                        &mut framed_write,
+                        envelope,
+                        &shutdown,
+                        &bootstrap.transactions,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                     for tx in replayed {
                         let tx_env = SruiMessage {
                             msg: Some(srui_message::Msg::Transaction(tx)),
                         };
-                        framed_write.send(tx_env).await?;
+                        if !send_message(
+                            &mut framed_write,
+                            tx_env,
+                            &shutdown,
+                            &bootstrap.transactions,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
                 }
                 ResumeOutcome::Resync {
@@ -144,11 +214,30 @@ where
                     let envelope = SruiMessage {
                         msg: Some(srui_message::Msg::ServerResyncRequired(resync_msg)),
                     };
-                    framed_write.send(envelope).await?;
+                    if !send_message(
+                        &mut framed_write,
+                        envelope,
+                        &shutdown,
+                        &bootstrap.transactions,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                     let snapshot_env = SruiMessage {
                         msg: Some(srui_message::Msg::Transaction(snapshot_transaction)),
                     };
-                    framed_write.send(snapshot_env).await?;
+                    if !send_message(
+                        &mut framed_write,
+                        snapshot_env,
+                        &shutdown,
+                        &bootstrap.transactions,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    session.clear_stale_client(&resume.client_instance_id);
                 }
             }
             (resume.client_instance_id, bootstrap.transactions)
@@ -175,13 +264,15 @@ where
                         if let Some(response) =
                             handle_incoming_message(msg, &session, &client_instance_id).await?
                         {
-                            tokio::select! {
-                                res = framed_write.send(response) => {
-                                    res?;
-                                }
-                                _ = shutdown.cancelled() => {
-                                    break;
-                                }
+                            if !send_message(
+                                &mut framed_write,
+                                response,
+                                &shutdown,
+                                &tx_rx,
+                            )
+                            .await?
+                            {
+                                break;
                             }
                         }
                     }
@@ -203,13 +294,15 @@ where
                         let envelope = SruiMessage {
                             msg: Some(srui_message::Msg::Transaction(tx)),
                         };
-                        tokio::select! {
-                            res = framed_write.send(envelope) => {
-                                res?;
-                            }
-                            _ = shutdown.cancelled() => {
-                                break;
-                            }
+                        if !send_message(
+                            &mut framed_write,
+                            envelope,
+                            &shutdown,
+                            &tx_rx,
+                        )
+                        .await?
+                        {
+                            break;
                         }
                     }
                     Err(OutboundRecvError::Lagged(reason)) => {

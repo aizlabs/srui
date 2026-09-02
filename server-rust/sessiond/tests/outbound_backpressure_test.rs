@@ -16,31 +16,11 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientHello, ClientResume, SessionContinuity, SruiCodec, SruiMessage, Transaction,
+    srui_message, ClientHello, ClientResume, SessionContinuity, SruiCodec, SruiMessage,
 };
 use srui_sdk::{NodeId, Row, Surface, Text, LABEL};
 use srui_semantic_tree::{PropertyRef, SemanticStore};
 use srui_sessiond::{handle_connection, ConnectionError, Session, SessionConfig, SessionError};
-
-fn apply_client_delta(store: &mut SemanticStore, wire_tx: Transaction) {
-    let domain_tx = srui_semantic_tree::Transaction::try_from(wire_tx).expect("valid wire txn");
-    assert_eq!(
-        domain_tx.base_revision,
-        store.revision(),
-        "client delta base revision must match current committed replica revision"
-    );
-    assert!(
-        domain_tx.new_revision > domain_tx.base_revision,
-        "client delta new revision must advance forward"
-    );
-
-    let mut staged = store.clone_staging();
-    for op in domain_tx.operations {
-        op.apply(&mut staged)
-            .expect("apply operation to staged replica");
-    }
-    store.commit_staging(staged, domain_tx.new_revision);
-}
 
 #[tokio::test]
 async fn test_throttled_1000_updates_coalesce_with_structural_barrier() {
@@ -155,7 +135,9 @@ async fn test_throttled_1000_updates_coalesce_with_structural_barrier() {
                 if tx.base_revision != client_store.revision().get() {
                     continuous_ranges = false;
                 }
-                apply_client_delta(&mut client_store, tx);
+                client_store
+                    .apply_wire_transaction(tx)
+                    .expect("apply wire transaction to client replica");
             }
             other => panic!("expected Transaction message, got {:?}", other),
         }
@@ -186,15 +168,6 @@ async fn test_throttled_1000_updates_coalesce_with_structural_barrier() {
         received_tx_count <= 10,
         "expected materially fewer messages than 1000 due to coalescing, got {received_tx_count}"
     );
-
-    // Assert queue diagnostics: peak depth remained within configured capacity
-    let peak = session.peak_depth_for_client(&[1, 2, 3, 4]).unwrap_or(0);
-    assert!(
-        peak <= QUEUE_CAPACITY,
-        "peak depth {peak} must not exceed configured capacity {QUEUE_CAPACITY}"
-    );
-    let hub = session.outbound_hub();
-    assert!(!hub.is_closed());
 
     // Clean shutdown
     shutdown.cancel();
@@ -277,12 +250,6 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
         server_result
     );
 
-    // Assert client instance was marked stale in the session hub
-    assert!(
-        session.is_client_stale(&client_instance),
-        "overflowed client must be marked stale for Task 23 resync"
-    );
-
     drop(framed_write);
     drop(framed_read);
 
@@ -336,6 +303,13 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
                 SessionContinuity::try_from(resync.continuity),
                 Ok(SessionContinuity::SameSession)
             );
+            assert!(
+                resync
+                    .reason
+                    .contains("outbound transaction queue overflowed"),
+                "expected outbound overflow reason, got {:?}",
+                resync.reason
+            );
         }
         other => panic!(
             "expected ServerResyncRequired for stale client, got {:?}",
@@ -357,12 +331,6 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
         }
         other => panic!("expected snapshot Transaction, got {:?}", other),
     }
-
-    // Once the snapshot transaction has been sent, the stale marker must be cleared
-    assert!(
-        !session.is_client_stale(&client_instance),
-        "stale marker must be cleared after resync snapshot is written"
-    );
 
     reconnect_shutdown.cancel();
     drop(r_framed_write);

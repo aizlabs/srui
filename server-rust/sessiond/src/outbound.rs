@@ -1,571 +1,320 @@
 //! # Bounded Outbound Transaction Queues & Coalescing (§20.2)
 //!
-//! Provides [`OutboundHub`], [`OutboundQueue`], and [`OutboundReceiver`] for bounded,
-//! per-connection transaction streaming with scalar property coalescing and lossless
-//! structural barriers.
+//! Provides bounded, per-connection transaction streaming with scalar property coalescing
+//! and lossless structural barriers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
-use srui_protocol::{
-    operation::Op, value::Value as WireValInner, Operation as WireOp, Transaction,
-    Value as WireValue,
-};
+use srui_protocol::Transaction;
+use srui_semantic_tree::Transaction as DomainTxn;
 
 use crate::session::SessionError;
 
 /// Default capacity for per-connection outbound transaction queues (§20.2).
 pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 
-/// Diagnostic queue metrics for tracking buffer depth and peak pressure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutboundMetrics {
-    /// Current count of pending transactions in the client queue.
-    pub current_depth: usize,
-    /// Maximum count of pending transactions observed in this queue.
-    pub peak_depth: usize,
-    /// Configured maximum queue capacity.
-    pub capacity: usize,
-}
-
 /// Errors occurring when receiving transactions from an [`OutboundReceiver`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OutboundRecvError {
-    /// The client queue overflowed its configured capacity; connection must detach for resync.
+    /// The client queue overflowed its configured capacity; connection must detach for resync (§20.2).
+    #[error("outbound queue overflow: {0}")]
     Lagged(String),
     /// The outbound transaction queue or session has closed cleanly.
+    #[error("outbound queue closed")]
     Closed,
-}
-
-impl std::fmt::Display for OutboundRecvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Lagged(reason) => write!(f, "outbound queue overflow: {reason}"),
-            Self::Closed => write!(f, "outbound queue closed"),
-        }
-    }
-}
-
-impl std::error::Error for OutboundRecvError {}
-
-/// Non-blocking receive errors for [`OutboundReceiver::try_recv`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutboundTryRecvError {
-    /// No transaction is currently queued.
-    Empty,
-    /// The client queue overflowed its configured capacity; connection must detach for resync.
-    Lagged(String),
-    /// The outbound transaction queue or session has closed cleanly.
-    Closed,
-}
-
-impl std::fmt::Display for OutboundTryRecvError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "queue is empty"),
-            Self::Lagged(reason) => write!(f, "outbound queue overflow: {reason}"),
-            Self::Closed => write!(f, "outbound queue closed"),
-        }
-    }
-}
-
-impl std::error::Error for OutboundTryRecvError {}
-
-/// Result of an enqueue operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnqueueOutcome {
-    /// Enqueued as a new discrete transaction in the queue.
-    Enqueued,
-    /// Coalesced into the existing tail transaction without increasing queue length.
-    Coalesced,
-}
-
-/// Error returned when an unmergeable transaction cannot fit into a full queue.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnqueueError {
-    /// The client queue reached capacity; queue backlog was discarded and marked stale.
-    Overflow {
-        /// Client instance identity to mark for Task 23 snapshot resync.
-        client_instance_id: Vec<u8>,
-    },
-    /// The queue has already been closed.
-    Closed,
-}
-
-/// Returns `true` if the wire value is scalar (§7.6).
-///
-/// Composite types (`ListValue` and `RecordValue`) are non-scalar and serve as barriers.
-fn is_scalar_value(val: &WireValue) -> bool {
-    !matches!(
-        &val.value,
-        Some(WireValInner::ListValue(_)) | Some(WireValInner::RecordValue(_)) | None
-    )
-}
-
-/// Returns `true` if this operation is a scalar `Operation::SetProperty`.
-fn is_scalar_set_property(op: &WireOp) -> bool {
-    match &op.op {
-        Some(Op::SetProperty(sp)) => sp.value.as_ref().is_some_and(is_scalar_value),
-        _ => false,
-    }
-}
-
-/// Returns `true` if this transaction is composed entirely of scalar `SetProperty` operations.
-///
-/// Mixed, structural, model, clear, batch, and non-scalar transactions return `false`
-/// and act as FIFO barriers.
-pub fn is_coalesceable_tx(tx: &Transaction) -> bool {
-    !tx.operations.is_empty() && tx.operations.iter().all(is_scalar_set_property)
-}
-
-type PropKey = (u64, (u32, u32));
-
-fn get_prop_key(op: &WireOp) -> Option<PropKey> {
-    match &op.op {
-        Some(Op::SetProperty(sp)) => {
-            let prop = sp.property.as_ref()?;
-            Some((sp.node_id, (prop.namespace_id, prop.local_id)))
-        }
-        _ => None,
-    }
-}
-
-/// Attempts to coalesce `incoming` into `tail` if contiguous, same priority, and within `max_ops`.
-fn try_coalesce(tail: &mut Transaction, incoming: &Transaction, max_ops: usize) -> bool {
-    let mut key_map: HashMap<PropKey, usize> = HashMap::with_capacity(tail.operations.len());
-    for (idx, op) in tail.operations.iter().enumerate() {
-        if let Some(key) = get_prop_key(op) {
-            key_map.insert(key, idx);
-        }
-    }
-
-    let mut new_keys_count = 0;
-    for op in &incoming.operations {
-        if let Some(key) = get_prop_key(op) {
-            key_map.entry(key).or_insert_with(|| {
-                new_keys_count += 1;
-                usize::MAX
-            });
-        }
-    }
-
-    if tail.operations.len() + new_keys_count > max_ops {
-        return false;
-    }
-
-    key_map.clear();
-    for (idx, op) in tail.operations.iter().enumerate() {
-        if let Some(key) = get_prop_key(op) {
-            key_map.insert(key, idx);
-        }
-    }
-
-    for op in &incoming.operations {
-        if let Some(key) = get_prop_key(op) {
-            if let Some(&idx) = key_map.get(&key) {
-                tail.operations[idx] = op.clone();
-            } else {
-                let new_idx = tail.operations.len();
-                tail.operations.push(op.clone());
-                key_map.insert(key, new_idx);
-            }
-        }
-    }
-
-    tail.new_revision = incoming.new_revision;
-    true
 }
 
 #[derive(Debug)]
-struct QueueInner {
-    client_instance_id: Vec<u8>,
+struct SubscriberState {
     capacity: usize,
     max_ops: usize,
+    max_frame_size: usize,
     items: VecDeque<Transaction>,
-    current_depth: usize,
     peak_depth: usize,
-    is_closed: bool,
     stale_reason: Option<String>,
+    is_closed: bool,
 }
 
-/// A bounded, per-connection queue for outbound transaction deltas.
-#[derive(Debug)]
-pub struct OutboundQueue {
-    inner: Mutex<QueueInner>,
-    notify: Arc<Notify>,
-}
-
-impl OutboundQueue {
-    /// Creates a new `OutboundQueue` for a client connection.
-    pub fn new(client_instance_id: Vec<u8>, capacity: usize, max_ops: usize) -> Self {
-        assert!(capacity > 0, "outbound queue capacity must be positive");
-        assert!(max_ops > 0, "max_transaction_operations must be positive");
-
-        Self {
-            inner: Mutex::new(QueueInner {
-                client_instance_id,
-                capacity,
-                max_ops,
-                items: VecDeque::with_capacity(capacity),
-                current_depth: 0,
-                peak_depth: 0,
-                is_closed: false,
-                stale_reason: None,
-            }),
-            notify: Arc::new(Notify::new()),
-        }
-    }
-
-    /// Enqueues a committed transaction synchronously.
-    ///
-    /// If `tx` is contiguous, same-priority, and composed entirely of scalar `SetProperty`
-    /// operations, it coalesces into the tail item. Otherwise, it is pushed as a distinct item.
-    /// When capacity is exceeded, the queue backlog is purged, closed with a stale marker,
-    /// and wakes blocked receivers immediately.
-    pub fn enqueue(&self, tx: &Transaction) -> Result<EnqueueOutcome, EnqueueError> {
-        let mut guard = self.inner.lock().unwrap();
-        if guard.is_closed {
-            return Err(EnqueueError::Closed);
+impl SubscriberState {
+    fn try_push_or_absorb(&mut self, tx: &Transaction) -> Result<bool, OutboundRecvError> {
+        if self.is_closed {
+            if let Some(reason) = &self.stale_reason {
+                return Err(OutboundRecvError::Lagged(reason.clone()));
+            }
+            return Err(OutboundRecvError::Closed);
         }
 
-        let max_ops = guard.max_ops;
-        if let Some(tail) = guard.items.back_mut() {
-            if tail.priority == tx.priority
-                && tail.new_revision == tx.base_revision
-                && is_coalesceable_tx(tail)
-                && is_coalesceable_tx(tx)
-                && try_coalesce(tail, tx, max_ops)
-            {
-                self.notify.notify_one();
-                return Ok(EnqueueOutcome::Coalesced);
+        // Try absorbing into the unsent tail item if present
+        if let Some(tail) = self.items.back_mut() {
+            // Convert to domain transactions to leverage canonical domain absorption logic
+            if let (Ok(mut domain_tail), Ok(domain_incoming)) = (
+                DomainTxn::try_from(tail.clone()),
+                DomainTxn::try_from(tx.clone()),
+            ) {
+                if domain_tail.try_absorb(&domain_incoming, self.max_ops, self.max_frame_size) {
+                    *tail = (&domain_tail).into();
+                    return Ok(false); // Absorbed in-place, queue length did not increase
+                }
             }
         }
 
-        if guard.items.len() < guard.capacity {
-            guard.items.push_back(tx.clone());
-            guard.current_depth = guard.items.len();
-            guard.peak_depth = guard.peak_depth.max(guard.current_depth);
-            self.notify.notify_one();
-            Ok(EnqueueOutcome::Enqueued)
-        } else {
+        // Cannot absorb: check bounded capacity
+        if self.items.len() >= self.capacity {
             let reason = format!(
-                "outbound queue capacity ({}) exceeded; resync required",
-                guard.capacity
+                "client queue exceeded bounded capacity of {} transactions without absorption",
+                self.capacity
             );
-            guard.is_closed = true;
-            guard.stale_reason = Some(reason);
-            guard.items.clear();
-            guard.current_depth = 0;
-            self.notify.notify_waiters();
-            Err(EnqueueError::Overflow {
-                client_instance_id: guard.client_instance_id.clone(),
-            })
+            self.stale_reason = Some(reason.clone());
+            self.is_closed = true;
+            self.items.clear();
+            return Err(OutboundRecvError::Lagged(reason));
         }
-    }
 
-    /// Closes the queue cleanly without dropping already queued transactions.
-    pub fn close(&self) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.is_closed = true;
-        self.notify.notify_waiters();
-    }
-
-    /// Returns `true` if this queue has overflowed and is marked stale.
-    pub fn is_stale(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        guard.stale_reason.is_some()
-    }
-
-    /// Returns `true` if this queue has been closed.
-    pub fn is_closed(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        guard.is_closed
-    }
-
-    /// Current queue depth.
-    pub fn current_depth(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
-        guard.current_depth
-    }
-
-    /// Peak queue depth observed over the lifetime of this queue.
-    pub fn peak_depth(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
-        guard.peak_depth
-    }
-
-    /// Configured queue capacity.
-    pub fn capacity(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
-        guard.capacity
-    }
-
-    /// Returns queue diagnostics.
-    pub fn metrics(&self) -> OutboundMetrics {
-        let guard = self.inner.lock().unwrap();
-        OutboundMetrics {
-            current_depth: guard.current_depth,
-            peak_depth: guard.peak_depth,
-            capacity: guard.capacity,
+        self.items.push_back(tx.clone());
+        if self.items.len() > self.peak_depth {
+            self.peak_depth = self.items.len();
         }
+        Ok(true) // Enqueued as new item
     }
 }
 
-/// The consumer handle for an outbound transaction queue.
+/// A handle for receiving outbound transactions streamed to a connection.
 #[derive(Debug)]
 pub struct OutboundReceiver {
-    subscription_id: u64,
-    queue: Arc<OutboundQueue>,
-    hub: Option<Arc<OutboundHub>>,
+    notify_rx: mpsc::Receiver<()>,
+    state: Arc<Mutex<SubscriberState>>,
 }
 
 impl OutboundReceiver {
-    /// Creates an unlinked receiver for standalone unit tests.
-    #[must_use]
-    pub fn new_unlinked(queue: Arc<OutboundQueue>) -> Self {
-        Self {
-            subscription_id: 0,
-            queue,
-            hub: None,
-        }
-    }
-
-    /// Asynchronously waits for and removes the next transaction from the queue.
+    /// Asynchronously waits for the next committed transaction.
     ///
-    /// Conforms to `async-cancel-safety`: if cancelled at an `.await` point, no item is lost.
+    /// This is the single, authoritative signal for queue lag: on overflow, it returns
+    /// [`OutboundRecvError::Lagged`].
     pub async fn recv(&mut self) -> Result<Transaction, OutboundRecvError> {
         loop {
-            let notified = self.queue.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
             {
-                let mut guard = self.queue.inner.lock().unwrap();
+                let mut guard = self.state.lock().unwrap();
                 if let Some(reason) = &guard.stale_reason {
                     return Err(OutboundRecvError::Lagged(reason.clone()));
                 }
-                if let Some(tx) = guard.items.pop_front() {
-                    guard.current_depth = guard.items.len();
-                    return Ok(tx);
+                if let Some(item) = guard.items.pop_front() {
+                    return Ok(item);
                 }
                 if guard.is_closed {
                     return Err(OutboundRecvError::Closed);
                 }
             }
 
-            notified.await;
-        }
-    }
-
-    /// Non-blocking check for the next transaction in the queue.
-    pub fn try_recv(&mut self) -> Result<Transaction, OutboundTryRecvError> {
-        let mut guard = self.queue.inner.lock().unwrap();
-        if let Some(reason) = &guard.stale_reason {
-            return Err(OutboundTryRecvError::Lagged(reason.clone()));
-        }
-        if let Some(tx) = guard.items.pop_front() {
-            guard.current_depth = guard.items.len();
-            return Ok(tx);
-        }
-        if guard.is_closed {
-            return Err(OutboundTryRecvError::Closed);
-        }
-        Err(OutboundTryRecvError::Empty)
-    }
-
-    /// Current queue depth.
-    pub fn current_depth(&self) -> usize {
-        self.queue.current_depth()
-    }
-
-    /// Peak queue depth observed over the lifetime of this queue.
-    pub fn peak_depth(&self) -> usize {
-        self.queue.peak_depth()
-    }
-
-    /// Configured queue capacity.
-    pub fn capacity(&self) -> usize {
-        self.queue.capacity()
-    }
-
-    /// Diagnostic metrics for this receiver's queue.
-    pub fn metrics(&self) -> OutboundMetrics {
-        self.queue.metrics()
-    }
-
-    /// Returns `true` if this queue has overflowed and is marked stale.
-    pub fn is_stale(&self) -> bool {
-        self.queue.is_stale()
-    }
-
-    /// Returns `true` if this queue has been closed.
-    pub fn is_closed(&self) -> bool {
-        self.queue.is_closed()
-    }
-}
-
-impl Drop for OutboundReceiver {
-    fn drop(&mut self) {
-        if let Some(hub) = &self.hub {
-            hub.unsubscribe(self.subscription_id);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct HubInner {
-    next_sub_id: u64,
-    subscriptions: HashMap<u64, Arc<OutboundQueue>>,
-    stale_clients: HashSet<Vec<u8>>,
-    is_closed: bool,
-}
-
-/// The session-level outbound transaction distribution hub.
-///
-/// Distributes committed transactions to active client connections while enforcing
-/// per-connection queue capacities and tracking stale client identities for Task 23 resync.
-#[derive(Debug)]
-pub struct OutboundHub {
-    inner: Mutex<HubInner>,
-}
-
-impl Default for OutboundHub {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OutboundHub {
-    /// Creates a new `OutboundHub`.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(HubInner {
-                next_sub_id: 1,
-                subscriptions: HashMap::new(),
-                stale_clients: HashSet::new(),
-                is_closed: false,
-            }),
-        }
-    }
-
-    /// Subscribes a client connection to the hub, returning an [`OutboundReceiver`].
-    pub fn subscribe(
-        self: &Arc<Self>,
-        client_instance_id: Vec<u8>,
-        capacity: usize,
-        max_ops: usize,
-    ) -> Result<OutboundReceiver, SessionError> {
-        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-        if guard.is_closed {
-            return Err(SessionError::BroadcastClosed);
-        }
-
-        let sub_id = guard.next_sub_id;
-        guard.next_sub_id = guard.next_sub_id.wrapping_add(1);
-
-        let queue = Arc::new(OutboundQueue::new(client_instance_id, capacity, max_ops));
-        guard.subscriptions.insert(sub_id, Arc::clone(&queue));
-
-        Ok(OutboundReceiver {
-            subscription_id: sub_id,
-            queue,
-            hub: Some(Arc::clone(self)),
-        })
-    }
-
-    /// Publishes a committed transaction synchronously to all attached client queues.
-    ///
-    /// Never blocks on client I/O. Any client whose queue cannot accommodate the transaction
-    /// is closed with a stale marker, its backlog purged, and its `client_instance_id` recorded
-    /// for mandatory snapshot resync on reconnect.
-    pub fn publish(&self, tx: &Transaction) -> Vec<Vec<u8>> {
-        let mut guard = self.inner.lock().unwrap();
-        if guard.is_closed {
-            return Vec::new();
-        }
-
-        let mut overflowed = Vec::new();
-        for queue in guard.subscriptions.values() {
-            if let Err(EnqueueError::Overflow { client_instance_id }) = queue.enqueue(tx) {
-                if !client_instance_id.is_empty() {
-                    overflowed.push(client_instance_id);
+            match self.notify_rx.recv().await {
+                Some(()) => {}
+                None => {
+                    let guard = self.state.lock().unwrap();
+                    if let Some(reason) = &guard.stale_reason {
+                        return Err(OutboundRecvError::Lagged(reason.clone()));
+                    }
+                    return Err(OutboundRecvError::Closed);
                 }
             }
         }
-        for client_id in &overflowed {
-            guard.stale_clients.insert(client_id.clone());
+    }
+
+    /// Non-blocking synchronous poll for the next transaction.
+    pub fn try_recv(&mut self) -> Result<Option<Transaction>, OutboundRecvError> {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(reason) = &guard.stale_reason {
+            return Err(OutboundRecvError::Lagged(reason.clone()));
         }
-        overflowed
-    }
-
-    /// Returns `true` if `client_instance_id` was marked stale due to queue overflow.
-    pub fn is_client_stale(&self, client_instance_id: &[u8]) -> bool {
-        let guard = self.inner.lock().unwrap();
-        guard.stale_clients.contains(client_instance_id)
-    }
-
-    /// Explicitly marks a client instance as stale (forcing Task 23 resync).
-    pub fn mark_client_stale(&self, client_instance_id: Vec<u8>) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.stale_clients.insert(client_instance_id);
-    }
-
-    /// Clears the stale marker for `client_instance_id` after a snapshot is sent.
-    pub fn clear_stale_client(&self, client_instance_id: &[u8]) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.stale_clients.remove(client_instance_id);
-    }
-
-    /// Closes all active outbound queues and marks the hub as closed.
-    pub fn close(&self) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.is_closed = true;
-        for queue in guard.subscriptions.values() {
-            queue.close();
+        if let Some(item) = guard.items.pop_front() {
+            let _ = self.notify_rx.try_recv();
+            return Ok(Some(item));
         }
-        guard.subscriptions.clear();
+        if guard.is_closed {
+            return Err(OutboundRecvError::Closed);
+        }
+        Ok(None)
     }
 
-    /// Returns the peak depth observed for a client instance queue, if currently attached.
-    pub fn peak_depth_for_client(&self, client_instance_id: &[u8]) -> Option<usize> {
-        let guard = self.inner.lock().unwrap();
-        for q in guard.subscriptions.values() {
-            let inner = q.inner.lock().unwrap();
-            if inner.client_instance_id.as_slice() == client_instance_id {
-                return Some(inner.peak_depth);
+    /// Returns `true` if the underlying queue has closed.
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().is_closed
+    }
+}
+
+#[derive(Debug)]
+struct Subscriber {
+    client_instance_id: Vec<u8>,
+    notify_tx: mpsc::Sender<()>,
+    state: Arc<Mutex<SubscriberState>>,
+}
+
+/// Central distribution hub for outbound transaction queues.
+#[derive(Debug)]
+pub(crate) struct OutboundHub {
+    subscribers: Mutex<Vec<Subscriber>>,
+    stale_clients: Mutex<HashSet<Vec<u8>>>,
+    historical_peak_depths: Mutex<HashMap<Vec<u8>, usize>>,
+    is_closed: AtomicBool,
+}
+
+impl OutboundHub {
+    pub fn new() -> Self {
+        Self {
+            subscribers: Mutex::new(Vec::new()),
+            stale_clients: Mutex::new(HashSet::new()),
+            historical_peak_depths: Mutex::new(HashMap::new()),
+            is_closed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn subscribe(
+        &self,
+        client_instance_id: Vec<u8>,
+        capacity: usize,
+        max_ops: usize,
+        max_frame_size: usize,
+    ) -> Result<OutboundReceiver, SessionError> {
+        if client_instance_id.is_empty() {
+            return Err(SessionError::InvalidInput(
+                "client_instance_id must not be empty for outbound subscription".to_string(),
+            ));
+        }
+        if capacity == 0 {
+            return Err(SessionError::InvalidConfiguration(
+                "outbound queue capacity must be positive".to_string(),
+            ));
+        }
+        if self.is_closed.load(Ordering::Relaxed) {
+            return Err(SessionError::OutboundClosed);
+        }
+
+        let (notify_tx, notify_rx) = mpsc::channel(capacity);
+        let state = Arc::new(Mutex::new(SubscriberState {
+            capacity,
+            max_ops,
+            max_frame_size,
+            items: VecDeque::with_capacity(capacity),
+            peak_depth: 0,
+            stale_reason: None,
+            is_closed: false,
+        }));
+
+        let sub = Subscriber {
+            client_instance_id,
+            notify_tx,
+            state: Arc::clone(&state),
+        };
+
+        self.subscribers.lock().unwrap().push(sub);
+
+        Ok(OutboundReceiver { notify_rx, state })
+    }
+
+    pub fn publish(&self, tx: &Transaction) {
+        if self.is_closed.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut subs = self.subscribers.lock().unwrap();
+        let mut stale_marked = Vec::new();
+
+        subs.retain(|sub| {
+            if sub.notify_tx.is_closed() {
+                return false;
+            }
+
+            let mut guard = sub.state.lock().unwrap();
+            match guard.try_push_or_absorb(tx) {
+                Ok(true) => {
+                    let _ = sub.notify_tx.try_send(());
+                    true
+                }
+                Ok(false) => true,
+                Err(OutboundRecvError::Lagged(_)) => {
+                    stale_marked.push((sub.client_instance_id.clone(), guard.peak_depth));
+                    false
+                }
+                Err(OutboundRecvError::Closed) => false,
+            }
+        });
+
+        if !stale_marked.is_empty() {
+            let mut stale_guard = self.stale_clients.lock().unwrap();
+            let mut peaks = self.historical_peak_depths.lock().unwrap();
+            for (id, peak) in stale_marked {
+                stale_guard.insert(id.clone());
+                peaks
+                    .entry(id)
+                    .and_modify(|p| *p = (*p).max(peak))
+                    .or_insert(peak);
             }
         }
-        None
     }
 
-    /// Returns the maximum peak depth observed across all active client queues.
+    pub fn is_client_stale(&self, client_instance_id: &[u8]) -> bool {
+        self.stale_clients
+            .lock()
+            .unwrap()
+            .contains(client_instance_id)
+    }
+
+    pub fn clear_stale_client(&self, client_instance_id: &[u8]) {
+        self.stale_clients
+            .lock()
+            .unwrap()
+            .remove(client_instance_id);
+    }
+
+    #[cfg(test)]
+    pub fn peak_depth_for_client(&self, client_instance_id: &[u8]) -> usize {
+        let subs = self.subscribers.lock().unwrap();
+        let mut peak = self
+            .historical_peak_depths
+            .lock()
+            .unwrap()
+            .get(client_instance_id)
+            .copied()
+            .unwrap_or(0);
+        for sub in subs.iter() {
+            if sub.client_instance_id == client_instance_id {
+                let guard = sub.state.lock().unwrap();
+                peak = peak.max(guard.peak_depth);
+            }
+        }
+        peak
+    }
+
+    #[cfg(test)]
     pub fn max_peak_depth(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
-        guard
-            .subscriptions
+        let subs = self.subscribers.lock().unwrap();
+        let mut max = self
+            .historical_peak_depths
+            .lock()
+            .unwrap()
             .values()
-            .map(|q| q.peak_depth())
+            .copied()
             .max()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        for sub in subs.iter() {
+            let guard = sub.state.lock().unwrap();
+            max = max.max(guard.peak_depth);
+        }
+        max
     }
 
-    /// Returns `true` if the hub is closed.
+    #[cfg(test)]
     pub fn is_closed(&self) -> bool {
-        let guard = self.inner.lock().unwrap();
-        guard.is_closed
+        self.is_closed.load(Ordering::Relaxed)
     }
 
-    /// Returns the number of currently active subscriptions.
-    pub fn active_subscriptions(&self) -> usize {
-        let guard = self.inner.lock().unwrap();
-        guard.subscriptions.len()
-    }
-
-    pub(crate) fn unsubscribe(&self, sub_id: u64) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.subscriptions.remove(&sub_id);
+    pub fn close(&self) {
+        self.is_closed.store(true, Ordering::Relaxed);
+        let mut subs = self.subscribers.lock().unwrap();
+        for sub in subs.drain(..) {
+            let mut guard = sub.state.lock().unwrap();
+            guard.is_closed = true;
         }
     }
 }
@@ -573,14 +322,17 @@ impl OutboundHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use srui_protocol::{CreateNodeOp, NodeRecord, PropertyRef as WirePropRef, SetPropertyOp};
+    use srui_protocol::{
+        operation::Op, value::Value as WireValInner, CreateNodeOp, NodeRecord, Operation as WireOp,
+        PropertyRef as WirePropRef, SetPropertyOp, Value as WireValue,
+    };
 
     fn make_set_prop_op(node_id: u64, prop_id: u32, val: &str) -> WireOp {
         WireOp {
             op: Some(Op::SetProperty(SetPropertyOp {
                 node_id,
                 property: Some(WirePropRef {
-                    namespace_id: 0,
+                    namespace_id: 1,
                     local_id: prop_id,
                 }),
                 value: Some(WireValue {
@@ -626,23 +378,24 @@ mod tests {
 
     #[test]
     fn test_scalar_coalescing_retains_latest_value_and_revision_span() {
-        let queue = OutboundQueue::new(vec![1], 4, 10);
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![1], 4, 10, 1024 * 1024)
+            .expect("subscribe");
 
         let tx1 = make_scalar_tx(0, 1, 10, 1, "v1");
-        assert_eq!(queue.enqueue(&tx1), Ok(EnqueueOutcome::Enqueued));
-        assert_eq!(queue.current_depth(), 1);
+        hub.publish(&tx1);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 1);
 
         let tx2 = make_scalar_tx(1, 2, 10, 1, "v2");
-        assert_eq!(queue.enqueue(&tx2), Ok(EnqueueOutcome::Coalesced));
-        assert_eq!(queue.current_depth(), 1);
+        hub.publish(&tx2);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 1);
 
         let tx3 = make_scalar_tx(2, 5, 10, 1, "v5");
-        assert_eq!(queue.enqueue(&tx3), Ok(EnqueueOutcome::Coalesced));
-        assert_eq!(queue.current_depth(), 1);
-        assert_eq!(queue.peak_depth(), 1);
+        hub.publish(&tx3);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 1);
 
-        let mut rx = OutboundReceiver::new_unlinked(Arc::new(queue));
-        let merged = rx.try_recv().expect("merged tx");
+        let merged = rx.try_recv().expect("poll").expect("merged tx");
         assert_eq!(merged.base_revision, 0);
         assert_eq!(merged.new_revision, 5);
         assert_eq!(merged.operations.len(), 1);
@@ -659,53 +412,53 @@ mod tests {
 
     #[test]
     fn test_structural_transaction_acts_as_barrier() {
-        let queue = OutboundQueue::new(vec![1], 4, 10);
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![1], 4, 10, 1024 * 1024)
+            .expect("subscribe");
 
         let tx1 = make_scalar_tx(0, 1, 10, 1, "v1");
-        assert_eq!(queue.enqueue(&tx1), Ok(EnqueueOutcome::Enqueued));
+        hub.publish(&tx1);
 
         let tx_barrier = make_create_node_tx(1, 2, 20);
-        assert_eq!(queue.enqueue(&tx_barrier), Ok(EnqueueOutcome::Enqueued));
-        assert_eq!(queue.current_depth(), 2);
+        hub.publish(&tx_barrier);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 2);
 
         let tx3 = make_scalar_tx(2, 3, 10, 1, "v3");
-        assert_eq!(queue.enqueue(&tx3), Ok(EnqueueOutcome::Enqueued));
-        assert_eq!(queue.current_depth(), 3);
+        hub.publish(&tx3);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 3);
 
         let tx4 = make_scalar_tx(3, 4, 10, 1, "v4");
-        assert_eq!(queue.enqueue(&tx4), Ok(EnqueueOutcome::Coalesced));
-        assert_eq!(queue.current_depth(), 3);
-        assert_eq!(queue.peak_depth(), 3);
+        hub.publish(&tx4);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 3);
+
+        let p1 = rx.try_recv().unwrap().unwrap();
+        assert_eq!(p1.new_revision, 1);
+        let p2 = rx.try_recv().unwrap().unwrap();
+        assert_eq!(p2.new_revision, 2);
+        let p3 = rx.try_recv().unwrap().unwrap();
+        assert_eq!(p3.new_revision, 4);
     }
 
     #[test]
     fn test_overflow_discards_backlog_and_marks_stale() {
-        let queue = OutboundQueue::new(vec![7, 7], 2, 10);
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![7, 7], 2, 10, 1024 * 1024)
+            .expect("subscribe");
 
         let b1 = make_create_node_tx(0, 1, 1);
         let b2 = make_create_node_tx(1, 2, 2);
         let b3 = make_create_node_tx(2, 3, 3);
 
-        assert_eq!(queue.enqueue(&b1), Ok(EnqueueOutcome::Enqueued));
-        assert_eq!(queue.enqueue(&b2), Ok(EnqueueOutcome::Enqueued));
-        assert_eq!(queue.current_depth(), 2);
+        hub.publish(&b1);
+        hub.publish(&b2);
+        assert_eq!(hub.peak_depth_for_client(&[7, 7]), 2);
+        assert_eq!(hub.max_peak_depth(), 2);
 
-        let overflow_err = queue.enqueue(&b3);
-        assert_eq!(
-            overflow_err,
-            Err(EnqueueError::Overflow {
-                client_instance_id: vec![7, 7]
-            })
-        );
-        assert!(queue.is_stale());
-        assert!(queue.is_closed());
-        assert_eq!(queue.current_depth(), 0);
-        assert_eq!(queue.peak_depth(), 2);
+        hub.publish(&b3);
+        assert!(hub.is_client_stale(&[7, 7]));
 
-        let mut rx = OutboundReceiver::new_unlinked(Arc::new(queue));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(OutboundTryRecvError::Lagged(_))
-        ));
+        assert!(matches!(rx.try_recv(), Err(OutboundRecvError::Lagged(_))));
     }
 }

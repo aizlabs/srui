@@ -221,7 +221,9 @@ fn test_failed_and_panicking_transactions_do_not_clobber_committed_state() {
 #[tokio::test]
 async fn test_broadcast_reflects_committed_state() {
     let session = Arc::new(Session::new("concurrent-broadcast"));
-    let mut broadcast_rx = session.subscribe_transactions().expect("broadcast open");
+    let mut broadcast_rx = session
+        .subscribe_transactions(vec![1, 2, 3])
+        .expect("broadcast open");
     let barrier = Arc::new(Barrier::new(CONCURRENT_WORKERS));
 
     let commit_task = tokio::task::spawn_blocking({

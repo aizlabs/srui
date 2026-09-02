@@ -322,6 +322,112 @@ fn test_transaction_record_with_invalid_new_revision_rejected() {
 }
 
 #[test]
+fn test_coalesceable_forward_span_applies_and_advances_revision() {
+    let mut store = SemanticStore::new();
+    let root_id = NodeId::new(1);
+
+    // Rev 0 -> 1: Create node
+    store
+        .apply_transaction(
+            Revision::INITIAL,
+            vec![Operation::create_node(
+                root_id,
+                TypeRef::SURFACE,
+                None,
+                None,
+                [(PropertyRef::LABEL, Value::from("v0"))],
+            )],
+        )
+        .expect("initial setup");
+    assert_eq!(store.revision(), Revision::new(1));
+
+    // Rev 1 -> 5: Multi-revision forward span with scalar SetProperty (§12.1, §20.2)
+    let span_txn = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(5),
+        vec![Operation::SetProperty {
+            id: root_id,
+            property: PropertyRef::LABEL,
+            value: Value::from("v5"),
+        }],
+        0,
+    );
+    let committed = store
+        .apply_transaction_record(&span_txn)
+        .expect("coalesced span must apply");
+    assert_eq!(committed, Revision::new(5));
+    assert_eq!(store.revision(), Revision::new(5));
+    assert_eq!(
+        store
+            .get_node(root_id)
+            .unwrap()
+            .get_property(PropertyRef::LABEL),
+        Some(&Value::from("v5"))
+    );
+}
+
+#[test]
+fn test_transaction_try_absorb_semantics_and_limits() {
+    let node_id = NodeId::new(10);
+    let mut t1 = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(2),
+        vec![Operation::SetProperty {
+            id: node_id,
+            property: PropertyRef::LABEL,
+            value: Value::from("first"),
+        }],
+        0,
+    );
+
+    let t2 = Transaction::with_revisions(
+        Revision::new(2),
+        Revision::new(3),
+        vec![Operation::SetProperty {
+            id: node_id,
+            property: PropertyRef::LABEL,
+            value: Value::from("second"),
+        }],
+        0,
+    );
+
+    // Contiguous scalar absorption succeeds and updates target revision
+    assert!(t1.try_absorb(&t2, 100, 1024 * 1024));
+    assert_eq!(t1.base_revision, Revision::new(1));
+    assert_eq!(t1.new_revision, Revision::new(3));
+    assert_eq!(t1.operations.len(), 1);
+    match &t1.operations[0] {
+        Operation::SetProperty { value, .. } => assert_eq!(value, &Value::from("second")),
+        _ => panic!("expected SetProperty"),
+    }
+
+    // Structural transaction cannot be absorbed
+    let t_structural = Transaction::with_revisions(
+        Revision::new(3),
+        Revision::new(4),
+        vec![Operation::DeleteNode { id: node_id }],
+        0,
+    );
+    assert!(!t1.try_absorb(&t_structural, 100, 1024 * 1024));
+
+    // Exceeding max_ops is rejected
+    let t3 = Transaction::with_revisions(
+        Revision::new(3),
+        Revision::new(4),
+        vec![Operation::SetProperty {
+            id: node_id,
+            property: PropertyRef::VALUE,
+            value: Value::from(42.0),
+        }],
+        0,
+    );
+    assert!(!t1.try_absorb(&t3, 1, 1024 * 1024));
+
+    // Exceeding max_frame_size is rejected
+    assert!(!t1.try_absorb(&t3, 100, 5));
+}
+
+#[test]
 fn test_wire_transaction_conversion_and_application() {
     let mut store = SemanticStore::new();
 

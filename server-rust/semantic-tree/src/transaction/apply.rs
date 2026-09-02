@@ -95,7 +95,12 @@ impl SemanticStore {
         self.apply_staged_owned(ops, base_rev.next())
     }
 
-    /// Applies a structured [`Transaction`] record, validating base revision, new revision (`base_revision + 1`), and operational limits (§12.1).
+    /// Applies a structured [`Transaction`] record, validating base revision, forward revision advancement,
+    /// and operational limits (§12.1, §20.2).
+    ///
+    /// Single-step increments (`new_revision == base_revision + 1`) accept arbitrary operations.
+    /// Multi-revision forward spans (`new_revision > base_revision + 1`) are legal exclusively for
+    /// coalesced scalar updates (`txn.is_coalesceable()`).
     pub fn apply_transaction_record(&mut self, txn: &Transaction) -> Result<Revision, TxnError> {
         let current_rev = self.revision();
         if txn.base_revision != current_rev {
@@ -105,10 +110,16 @@ impl SemanticStore {
             });
         }
 
-        let expected_new_rev = txn.base_revision.next();
-        if txn.new_revision != expected_new_rev {
+        if txn.new_revision <= txn.base_revision {
             return Err(TxnError::InvalidNewRevision {
-                expected: expected_new_rev,
+                expected: txn.base_revision.next(),
+                actual: txn.new_revision,
+            });
+        }
+
+        if txn.new_revision > txn.base_revision.next() && !txn.is_coalesceable() {
+            return Err(TxnError::InvalidNewRevision {
+                expected: txn.base_revision.next(),
                 actual: txn.new_revision,
             });
         }
@@ -116,24 +127,30 @@ impl SemanticStore {
         self.apply_staged(&txn.operations, txn.new_revision)
     }
 
-    /// Decodes and applies a protobuf wire `srui_protocol::Transaction` atomically (§12.1, §16).
+    /// Decodes and applies a protobuf wire `srui_protocol::Transaction` atomically (§12.1, §16, §20.2).
     pub fn apply_wire_transaction(
         &mut self,
         wire_txn: srui_protocol::Transaction,
     ) -> Result<Revision, TxnError> {
         let txn = Transaction::try_from(wire_txn)?;
-        let base_rev = self.revision();
-        if txn.base_revision != base_rev {
+        let current_rev = self.revision();
+        if txn.base_revision != current_rev {
             return Err(TxnError::StaleBaseRevision {
-                expected: base_rev,
+                expected: current_rev,
                 actual: txn.base_revision,
             });
         }
 
-        let expected_new_rev = txn.base_revision.next();
-        if txn.new_revision != expected_new_rev {
+        if txn.new_revision <= txn.base_revision {
             return Err(TxnError::InvalidNewRevision {
-                expected: expected_new_rev,
+                expected: txn.base_revision.next(),
+                actual: txn.new_revision,
+            });
+        }
+
+        if txn.new_revision > txn.base_revision.next() && !txn.is_coalesceable() {
+            return Err(TxnError::InvalidNewRevision {
+                expected: txn.base_revision.next(),
                 actual: txn.new_revision,
             });
         }

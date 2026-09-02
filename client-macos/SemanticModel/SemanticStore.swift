@@ -594,6 +594,14 @@ public enum StoreOperation: Equatable, Sendable {
             try store.modelResetRange(id: id, startIndex: startIndex, items: items, totalCount: totalCount)
         }
     }
+
+    /// Returns `true` if this operation is a scalar `setProperty` mutation (§7.6, §20.2).
+    public var isScalarSetProperty: Bool {
+        if case .setProperty(_, _, let value) = self {
+            return value.isScalar
+        }
+        return false
+    }
 }
 
 /// Convenience alias matching protocol terminology (§13).

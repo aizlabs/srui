@@ -197,7 +197,7 @@ async fn test_disconnecting_one_client_does_not_affect_the_other() {
 
 #[tokio::test]
 async fn test_lagged_broadcast_closes_connection_for_resync() {
-    let session = Arc::new(Session::with_broadcast_capacity(
+    let session = Arc::new(Session::with_outbound_queue_capacity(
         "multi-client-lagged",
         TEST_BROADCAST_CAPACITY,
     ));
@@ -266,7 +266,7 @@ async fn test_transaction_broadcast_closed_exits_connection_cleanly() {
     let session = Arc::new(Session::new("multi-client-broadcast-closed"));
     let client = ClientConnection::connect(session.clone(), 1024 * 1024).await;
 
-    session.close_transaction_broadcast();
+    session.close_outbound();
 
     let server_result = timeout(Duration::from_secs(2), client.await_server())
         .await
@@ -283,19 +283,21 @@ async fn test_transaction_broadcast_closed_exits_connection_cleanly() {
 #[tokio::test]
 async fn test_subscribe_after_broadcast_closed_reports_error() {
     let session = Session::new("broadcast-closed-subscribe");
-    session.close_transaction_broadcast();
+    session.close_outbound();
 
     assert!(matches!(
-        session.subscribe_transactions(),
-        Err(SessionError::BroadcastClosed)
+        session.subscribe_transactions(vec![1, 2, 3]),
+        Err(SessionError::OutboundClosed)
     ));
 }
 
 #[tokio::test]
 async fn test_transaction_broadcast_closed_notifies_subscribers() {
     let session = Session::new("broadcast-closed-subscriber");
-    let mut rx = session.subscribe_transactions().expect("broadcast open");
-    session.close_transaction_broadcast();
+    let mut rx = session
+        .subscribe_transactions(vec![1, 2, 3])
+        .expect("broadcast open");
+    session.close_outbound();
 
     assert!(matches!(rx.recv().await, Err(OutboundRecvError::Closed)));
 }

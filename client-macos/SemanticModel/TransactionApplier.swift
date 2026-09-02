@@ -134,6 +134,11 @@ public struct Transaction: Equatable, Sendable {
         self.operations = operations
         self.priority = priority
     }
+
+    /// Returns `true` if all operations in this transaction are scalar `setProperty` mutations (§7.6, §20.2).
+    public var isCoalesceable: Bool {
+        !operations.isEmpty && operations.allSatisfy(\.isScalarSetProperty)
+    }
 }
 
 // MARK: - Transaction Applier (§12.1, §18, §22)
@@ -268,19 +273,11 @@ public final class TransactionApplier: @unchecked Sendable {
 
     /// Applies a structured `Transaction` record, validating its base and target revisions.
     ///
-    /// Non-coalesced or locally evaluated transactions must advance by exactly one revision
-    /// (`baseRevision.next`, §12.1). Coalesced live deltas from the server use `applyCommitted(record:)` (§20.2).
+    /// Single-step increments (`newRevision == baseRevision.next`) accept arbitrary operations.
+    /// Multi-revision forward spans (`newRevision > baseRevision.next`) are legal exclusively for
+    /// coalesced scalar updates (`record.isCoalesceable`).
     public func apply(record: Transaction) -> Result<Revision, TxnError> {
-        let expectedNewRevision = record.baseRevision.next
-        guard record.newRevision == expectedNewRevision else {
-            return .failure(
-                .invalidNewRevision(
-                    expected: expectedNewRevision,
-                    actual: record.newRevision
-                )
-            )
-        }
-        return applyCommitted(record: record).map(\.revision)
+        applyCommitted(record: record).map(\.revision)
     }
 
     /// Applies a structured `Transaction` record and atomically returns the committed snapshot.
@@ -303,7 +300,16 @@ public final class TransactionApplier: @unchecked Sendable {
             )
         }
 
-        guard record.newRevision > record.baseRevision else {
+        guard record.newRevision >= record.baseRevision.next else {
+            return .failure(
+                .invalidNewRevision(
+                    expected: record.baseRevision.next,
+                    actual: record.newRevision
+                )
+            )
+        }
+
+        if record.newRevision > record.baseRevision.next && !record.isCoalesceable {
             return .failure(
                 .invalidNewRevision(
                     expected: record.baseRevision.next,

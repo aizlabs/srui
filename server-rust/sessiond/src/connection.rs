@@ -112,7 +112,6 @@ where
                 };
                 framed_write.send(snapshot_envelope).await?;
             }
-            session.clear_stale_client(&hello.client_instance_id);
             (hello.client_instance_id, bootstrap.transactions)
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
@@ -150,7 +149,6 @@ where
                         msg: Some(srui_message::Msg::Transaction(snapshot_transaction)),
                     };
                     framed_write.send(snapshot_env).await?;
-                    session.clear_stale_client(&resume.client_instance_id);
                 }
             }
             (resume.client_instance_id, bootstrap.transactions)
@@ -167,11 +165,6 @@ where
     // -------------------------------------------------------------------------
 
     loop {
-        if tx_rx.is_stale() {
-            warn!("Client outbound queue marked stale; closing connection to force resync");
-            return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
-        }
-
         tokio::select! {
             // Cancel-safe incoming message receiver (async-cancel-safety)
             incoming = framed_read.next() => {

@@ -223,10 +223,13 @@ final class TransactionTests: XCTestCase {
         let applier = TransactionApplier()
 
         let rootID = NodeId(1)
-        let ops: [StoreOperation] = [.createNode(id: rootID, nodeType: .surface)]
+        let setupRes = applier.apply(baseRevision: Revision(0), operations: [.createNode(id: rootID, nodeType: .surface)])
+        XCTAssertEqual(setupRes, .success(Revision(1)))
 
-        // Coalesced delta specifies forward range base 0 -> new 5 via applyCommitted (§12.1, §20.2)
-        let forwardTxn = Transaction(baseRevision: Revision(0), newRevision: Revision(5), operations: ops, priority: 0)
+        let scalarOps: [StoreOperation] = [.setProperty(id: rootID, property: .label, value: .string("v5"))]
+
+        // Coalesced delta specifies forward range base 1 -> new 5 via applyCommitted (§12.1, §20.2)
+        let forwardTxn = Transaction(baseRevision: Revision(1), newRevision: Revision(5), operations: scalarOps, priority: 0)
 
         let res = applier.applyCommitted(record: forwardTxn)
         guard case .success(let snapshot) = res else {
@@ -237,6 +240,18 @@ final class TransactionTests: XCTestCase {
         XCTAssertEqual(applier.store.revision, Revision(5))
         XCTAssertEqual(applier.lastAppliedRevision, Revision(5))
         XCTAssertEqual(applier.store.nodeCount, 1)
+
+        // Forward range with structural mutation (non-coalesceable) is rejected (§12.1, §20.2)
+        let structuralSpanTxn = Transaction(
+            baseRevision: Revision(5),
+            newRevision: Revision(10),
+            operations: [.deleteNode(id: rootID)],
+            priority: 0
+        )
+        XCTAssertEqual(
+            applier.applyCommitted(record: structuralSpanTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(10)))
+        )
 
         // Equal revision is rejected by applyCommitted
         let equalTxn = Transaction(baseRevision: Revision(5), newRevision: Revision(5), operations: [], priority: 0)

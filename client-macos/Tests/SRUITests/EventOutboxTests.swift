@@ -17,38 +17,51 @@ struct EventOutboxTests {
 
     @Test("EventOutbox allocates monotonically increasing sequence numbers")
     func monotonicSequenceNumbers() async throws {
+        let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
 
-        let seq1 = await outbox.nextEventSeq()
-        let seq2 = await outbox.nextEventSeq()
-        let seq3 = await outbox.nextEventSeq()
+        // Sending is the whole allocation surface: no caller can mint a sequence without also
+        // retaining and transmitting it, so allocation and retention cannot diverge (§18.2).
+        let seq1 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client).eventSeq
+        let seq2 = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client).eventSeq
+        let seq3 = try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client).eventSeq
 
         #expect(seq1 == 1)
         #expect(seq2 == 2)
         #expect(seq3 == 3)
+        #expect(await outbox.eventSeq == 3)
+        #expect(await outbox.pendingCount == 3)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox generates unique retry-safe event IDs")
     func uniqueEventIds() async throws {
+        let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
 
-        let id1 = await outbox.generateEventId()
-        let id2 = await outbox.generateEventId()
+        let id1 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client).eventId
+        let id2 = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client).eventId
 
         #expect(!id1.isEmpty)
         #expect(!id2.isEmpty)
         #expect(id1 != id2)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox creates and serializes ACTIVATE event")
     func activateEventSerialization() async throws {
         let clientInstanceId = ClientInstanceId(string: "client-test-42")
         let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
 
         let nodeId = NodeId(183)
         let observedRevision = Revision(104)
 
-        let event = await outbox.makeActivateEvent(nodeId: nodeId, observedRevision: observedRevision)
+        let event = try await outbox.sendActivate(nodeId: nodeId, observedRevision: observedRevision, via: client)
 
         #expect(event.eventSeq == 1)
         #expect(event.nodeId == nodeId)
@@ -73,18 +86,22 @@ struct EventOutboxTests {
         #expect(decodedEvent.observedRevision == observedRevision)
         #expect(decodedEvent.eventType == .EVENT_ACTIVATE)
         #expect(decodedEvent.clientInstanceId == clientInstanceId)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox creates and serializes VALUE_CHANGED event")
     func valueChangedEventSerialization() async throws {
         let clientInstanceId = ClientInstanceId(string: "client-test-val")
         let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
 
         let nodeId = NodeId(200)
         let observedRevision = Revision(50)
         let value = Value.bool(true)
 
-        let event = await outbox.makeValueChangedEvent(nodeId: nodeId, observedRevision: observedRevision, value: value)
+        let event = try await outbox.sendValueChanged(nodeId: nodeId, observedRevision: observedRevision, value: value, via: client)
 
         #expect(event.eventSeq == 1)
         #expect(event.nodeId == nodeId)
@@ -109,18 +126,22 @@ struct EventOutboxTests {
         #expect(decodedEvent.nodeId == nodeId)
         #expect(decodedEvent.eventType == .EVENT_VALUE_CHANGED)
         #expect(decodedEvent.boolArg == true)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("EventOutbox creates and serializes SELECTION_CHANGED event")
     func selectionChangedEventSerialization() async throws {
         let clientInstanceId = ClientInstanceId(string: "client-test-sel")
         let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
 
         let nodeId = NodeId(300)
         let observedRevision = Revision(75)
         let itemId = ItemId(999)
 
-        let event = await outbox.makeSelectionChangedEvent(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId)
+        let event = try await outbox.sendSelectionChanged(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId, via: client)
 
         #expect(event.eventSeq == 1)
         #expect(event.nodeId == nodeId)
@@ -145,6 +166,9 @@ struct EventOutboxTests {
         #expect(decodedEvent.nodeId == nodeId)
         #expect(decodedEvent.eventType == .EVENT_SELECTION_CHANGED)
         #expect(decodedEvent.itemIdArg == itemId)
+
+        await client.close()
+        await server.close()
     }
 
     @Test("Mixed event types share contiguous monotonic sequences and are retained")

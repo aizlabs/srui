@@ -91,63 +91,36 @@ public actor EventOutbox {
         _lastAckedEventSeq
     }
 
-    /// Allocates the next sequence.
-    ///
-    /// Deliberately not public: a raw allocation that is never retained leaves a permanent hole
-    /// in the contiguous send window, which the server would then refuse to settle past. Every
-    /// public entry point allocates, retains, and sends inside one actor-isolated step (§18.2).
-    func nextEventSeq() -> UInt64 {
-        currentEventSeq += 1
-        return currentEventSeq
-    }
-
     /// Generates a globally unique, retry-safe event identifier (§7.7, §18.2).
-    func generateEventId() -> EventId {
+    private func generateEventId() -> EventId {
         EventId(string: UUID().uuidString)
     }
 
-    /// Constructs a client-originated momentary activation event (§7.6, §7.7).
-    func makeActivateEvent(nodeId: NodeId, observedRevision: Revision) -> Event {
-        let seq = nextEventSeq()
-        let id = generateEventId()
-        return Event.activate(
-            eventSeq: seq,
-            eventId: id,
-            observedRevision: observedRevision,
-            nodeId: nodeId
-        ).withClientInstanceId(clientInstanceId)
-    }
-
-    /// Constructs a client-originated value-changed event (§7.6).
-    func makeValueChangedEvent(nodeId: NodeId, observedRevision: Revision, value: Value) -> Event {
-        let seq = nextEventSeq()
-        let id = generateEventId()
-        return Event.valueChanged(
-            eventSeq: seq,
-            eventId: id,
-            observedRevision: observedRevision,
-            nodeId: nodeId,
-            value: value
-        ).withClientInstanceId(clientInstanceId)
-    }
-
-    /// Constructs a client-originated selection-changed event (§7.6).
-    func makeSelectionChangedEvent(nodeId: NodeId, observedRevision: Revision, itemId: ItemId) -> Event {
-        let seq = nextEventSeq()
-        let id = generateEventId()
-        return Event.selectionChanged(
-            eventSeq: seq,
-            eventId: id,
-            observedRevision: observedRevision,
-            nodeId: nodeId,
-            itemId: itemId
-        ).withClientInstanceId(clientInstanceId)
+    /// Admits, allocates, retains, and transmits one client-originated event (§7.6, §7.7, §18.2).
+    ///
+    /// The only path that mints a sequence, and private so it stays that way. Admission and
+    /// backpressure run *before* allocation, and retention happens before the first suspension, so
+    /// neither a refused send nor a failed write can leave a permanent hole in the contiguous send
+    /// window that the server would then refuse to settle past.
+    private func allocateAndSend(
+        via transport: any Transport,
+        _ makeEvent: (UInt64, EventId) -> Event
+    ) async throws -> Event {
+        guard acceptsNewEvents else {
+            throw EventOutboxError.resumeNotConfirmed
+        }
+        try ensureSequenceWindowCapacity()
+        currentEventSeq += 1
+        let event = makeEvent(currentEventSeq, generateEventId())
+            .withClientInstanceId(clientInstanceId)
+        try await sendEvent(event, via: transport)
+        return event
     }
 
     /// Serializes and sends an event over the given transport (§16, §22).
     ///
-    /// Internal because it accepts an already-allocated identity: only the `send*` entry points
-    /// above may mint one, so allocation, retention, and transmission stay a single step.
+    /// Internal because it accepts an already-allocated identity: only `allocateAndSend` may mint
+    /// one, so allocation, retention, and transmission stay a single actor-isolated step.
     func sendEvent(_ event: Event, via transport: any Transport) async throws {
         var msg = SRUIMessage()
         msg.event = event.toWire()
@@ -165,37 +138,42 @@ public actor EventOutbox {
     /// Constructs and sends an `ACTIVATE` event without creating a sequence beyond the window.
     @discardableResult
     public func sendActivate(nodeId: NodeId, observedRevision: Revision, via transport: any Transport) async throws -> Event {
-        guard acceptsNewEvents else {
-            throw EventOutboxError.resumeNotConfirmed
+        try await allocateAndSend(via: transport) { eventSeq, eventId in
+            Event.activate(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId
+            )
         }
-        try ensureSequenceWindowCapacity()
-        let event = makeActivateEvent(nodeId: nodeId, observedRevision: observedRevision)
-        try await sendEvent(event, via: transport)
-        return event
     }
 
     /// Constructs and sends a `VALUE_CHANGED` event without creating a sequence beyond the window.
     @discardableResult
     public func sendValueChanged(nodeId: NodeId, observedRevision: Revision, value: Value, via transport: any Transport) async throws -> Event {
-        guard acceptsNewEvents else {
-            throw EventOutboxError.resumeNotConfirmed
+        try await allocateAndSend(via: transport) { eventSeq, eventId in
+            Event.valueChanged(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId,
+                value: value
+            )
         }
-        try ensureSequenceWindowCapacity()
-        let event = makeValueChangedEvent(nodeId: nodeId, observedRevision: observedRevision, value: value)
-        try await sendEvent(event, via: transport)
-        return event
     }
 
     /// Constructs and sends a `SELECTION_CHANGED` event without creating a sequence beyond the window.
     @discardableResult
     public func sendSelectionChanged(nodeId: NodeId, observedRevision: Revision, itemId: ItemId, via transport: any Transport) async throws -> Event {
-        guard acceptsNewEvents else {
-            throw EventOutboxError.resumeNotConfirmed
+        try await allocateAndSend(via: transport) { eventSeq, eventId in
+            Event.selectionChanged(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: observedRevision,
+                nodeId: nodeId,
+                itemId: itemId
+            )
         }
-        try ensureSequenceWindowCapacity()
-        let event = makeSelectionChangedEvent(nodeId: nodeId, observedRevision: observedRevision, itemId: itemId)
-        try await sendEvent(event, via: transport)
-        return event
     }
 
     /// Replays every unacknowledged event in original send order with its original identity.
@@ -220,7 +198,10 @@ public actor EventOutbox {
     }
 
     /// Selectively acknowledges one event ID. A later sequence does not cross an earlier gap.
-    public func acknowledgeEvent(id: EventId) {
+    ///
+    /// Private: settling an intent mutates state whose ownership depends on wire identity, so
+    /// `settleAcknowledgement` is the only way in from the wire (§18.2).
+    private func acknowledgeEvent(id: EventId) {
         guard let event = pendingEvents.removeValue(forKey: id) else { return }
         pendingOrder.removeAll { $0 == id }
         recordSelectiveAcknowledgement(event.eventSeq)
@@ -366,7 +347,11 @@ public actor EventOutbox {
     }
 
     /// Acknowledges every event through the server's highest contiguous settled sequence.
-    public func acknowledgeEvents(throughSeq seq: UInt64) {
+    ///
+    /// Private for the same reason as `acknowledgeEvent(id:)`: reachable from the wire only
+    /// through the identity-checked `settleAcknowledgement`, and internally only from a resume or
+    /// resync decision the generation latch already bound to this outbox (§18, §18.2).
+    private func acknowledgeEvents(throughSeq seq: UInt64) {
         guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return }
 
         _lastAckedEventSeq = seq
@@ -482,7 +467,6 @@ public actor EventOutbox {
     ) async throws -> Bool {
         guard replayLease == lease,
               pendingEventReplayLoop.isActive(lease),
-              ownsResumeWork(generation: lease.resumeScope),
               pendingEvents.isEmpty == false else {
             return false
         }
@@ -490,9 +474,10 @@ public actor EventOutbox {
         try await resendPendingEvents(via: transport)
         // Re-checked after the suspension: a reconnect that superseded this generation while the
         // replay was in flight owns the retry set now, and this lease must not touch it (§18).
+        // `Lease` equality covers `resumeScope`, so still being the current lease is itself proof
+        // that this generation still owns the retry set.
         guard replayLease == lease,
               pendingEventReplayLoop.isActive(lease),
-              ownsResumeWork(generation: lease.resumeScope),
               Task.isCancelled == false else {
             return false
         }

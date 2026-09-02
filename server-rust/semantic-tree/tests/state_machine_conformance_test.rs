@@ -30,7 +30,23 @@ struct Fixture {
     #[serde(default)]
     setup_transactions: Vec<FixtureTransaction>,
     transaction: FixtureTransaction,
+    /// Which application path the fixture exercises (§12.1 delivery forms).
+    #[serde(default)]
+    applier: FixtureApplier,
     expected_outcome: FixtureExpectedOutcome,
+}
+
+/// The entry point a fixture's transaction is applied through (§12.1).
+///
+/// Setup transactions always use the authoritative path: they establish committed state.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum FixtureApplier {
+    /// A session applying its own commit: `new_revision == base_revision + 1` only.
+    #[default]
+    Authoritative,
+    /// A replica applying a live-stream frame: also accepts a coalesced scalar delta (§20.4).
+    Delivered,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -633,6 +649,7 @@ fn collect_nodes_snapshot(
 fn apply_fixture_transaction(
     store: &mut SemanticStore,
     tx: FixtureTransaction,
+    applier: FixtureApplier,
 ) -> Result<Revision, TxnError> {
     let ops: Vec<Operation> = tx.operations.into_iter().map(convert_operation).collect();
     let record = Transaction::with_revisions(
@@ -641,7 +658,13 @@ fn apply_fixture_transaction(
         ops,
         0,
     );
-    store.apply_transaction_record(&record)
+    match applier {
+        FixtureApplier::Authoritative => store.apply_transaction_record(&record),
+        FixtureApplier::Delivered => {
+            let wire: srui_protocol::Transaction = (&record).into();
+            store.apply_delivered_transaction(wire)
+        }
+    }
 }
 
 fn replay_fixture(path: &Path) {
@@ -662,7 +685,7 @@ fn replay_fixture(path: &Path) {
     // 1. Replay setup transactions
     for (idx, setup_tx) in fixture.setup_transactions.into_iter().enumerate() {
         let expected_revision = setup_tx.new_revision;
-        let res = apply_fixture_transaction(&mut store, setup_tx);
+        let res = apply_fixture_transaction(&mut store, setup_tx, FixtureApplier::Authoritative);
         assert!(
             res.is_ok(),
             "Setup transaction #{} in {} failed unexpectedly: {:?}",
@@ -683,7 +706,7 @@ fn replay_fixture(path: &Path) {
     let pre_snapshot = take_snapshot(&store);
 
     // 3. Replay target transaction under test
-    let result = apply_fixture_transaction(&mut store, fixture.transaction);
+    let result = apply_fixture_transaction(&mut store, fixture.transaction, fixture.applier);
 
     // 4. Assert outcome
     match fixture.expected_outcome.status.as_str() {

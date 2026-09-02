@@ -15,6 +15,7 @@ bytes = "1.9"
 tokio-util = { version = "0.7", features = ["codec"] }
 srui-protocol = { path = "../protocol", features = ["async-codec"] }
 srui-semantic-tree = { path = "../semantic-tree" }
+srui-journal = { path = "../journal" }
 
 [[bin]]
 name = "decode_framed"

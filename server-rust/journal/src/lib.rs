@@ -207,6 +207,9 @@ impl TransactionJournal {
     }
 
     /// Returns the latest committed revision in the journal.
+    ///
+    /// After a successful commit this equals the store's committed revision: the two advancing
+    /// apart is exactly the divergence [`Self::prepare`] exists to prevent (§12.1, §18.1).
     #[must_use]
     pub const fn latest_revision(&self) -> u64 {
         self.latest_revision

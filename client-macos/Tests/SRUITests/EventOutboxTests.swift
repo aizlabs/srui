@@ -249,7 +249,13 @@ struct EventOutboxTests {
         #expect(await outbox.pendingCount == 3)
 
         // Settle ack through seq 1
-        _ = await outbox.settleAcknowledgement(eventId: ev1.eventId, throughSeq: 1, sessionId: nil)
+        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        _ = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: ev1.eventId,
+            throughSeq: 1,
+            sessionId: "session-live"
+        )
         #expect(await outbox.pendingCount == 2)
 
         await client.close()
@@ -399,6 +405,88 @@ struct EventOutboxTests {
 
         let freshEvent = try await outbox.sendActivate(nodeId: NodeId(10), observedRevision: Revision(1), via: client)
         #expect(freshEvent.eventSeq == 1)
+        #expect(await outbox.pendingCount == 1)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Window exhaustion is refused before a sequence or id is minted (§18.2)")
+    func exhaustionLeavesSequenceAndRetentionUntouched() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox(maxPendingEvents: 2)
+        #expect(await outbox.confirmFreshSession(id: "session-window"))
+
+        let first = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        let second = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client)
+
+        await #expect(throws: EventOutboxError.sequenceWindowExhausted(limit: 2)) {
+            try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client)
+        }
+
+        // A sequence burned by a refused send would be a permanent hole the server never settles
+        // past, so backpressure must precede allocation (§18.2).
+        #expect(await outbox.eventSeq == 2)
+        #expect(await outbox.pendingCount == 2)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        // The two retained identities are still exactly the originals: acking them by id drains
+        // the outbox and advances the contiguous frontier to the newest allocated sequence.
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: 0,
+            sessionId: "session-window"
+        ))
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: second.eventId,
+            throughSeq: 0,
+            sessionId: "session-window"
+        ))
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == 2)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("A selective ack across a gap neither reopens the window nor skips a sequence (§18.2)")
+    func selectiveAckAcrossGapKeepsWindowClosed() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox(maxPendingEvents: 2)
+        #expect(await outbox.confirmFreshSession(id: "session-gap"))
+
+        let first = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
+        let second = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client)
+
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: second.eventId,
+            throughSeq: 0,
+            sessionId: "session-gap"
+        ))
+        #expect(await outbox.pendingCount == 1)
+        // Sequence 1 is still unsettled, so the cumulative frontier cannot cross it.
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        // The window is measured from that frontier, not from the selective set, so the slot the
+        // later ack settled is not reusable while the gap remains.
+        await #expect(throws: EventOutboxError.sequenceWindowExhausted(limit: 2)) {
+            try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client)
+        }
+        #expect(await outbox.eventSeq == 2)
+
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: 0,
+            sessionId: "session-gap"
+        ))
+        #expect(await outbox.lastAckedEventSeq == 2)
+
+        let third = try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client)
+        #expect(third.eventSeq == 3)
         #expect(await outbox.pendingCount == 1)
 
         await client.close()

@@ -15,7 +15,8 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{
-    srui_message, ClientHello, EventAckStatus, ServerEventAck, SruiCodec, SruiMessage,
+    srui_message, ClientHello, ClientResume, EventAckStatus, ServerEventAck, ServerResumeOk,
+    SruiCodec, SruiMessage,
 };
 use srui_sdk::{Button, NodeId, ACTIVATE, LABEL};
 use srui_semantic_tree::Event;
@@ -87,6 +88,64 @@ async fn connect_client(
     }
 
     (client_framed_write, client_framed_read, server_task)
+}
+
+/// Reconnects an existing `client_instance_id` through `CLIENT RESUME` (§18, §18.2).
+///
+/// `last_acked_event_seq` is only a client retention hint; the server answers with its own
+/// contiguous settled frontier.
+async fn resume_client(
+    session: Arc<Session>,
+    shutdown: CancellationToken,
+    client_instance_id: &[u8],
+    last_applied_revision: u64,
+    last_acked_event_seq: u64,
+) -> (
+    ClientWrite,
+    ClientRead,
+    tokio::task::JoinHandle<Result<(), ConnectionError>>,
+    ServerResumeOk,
+) {
+    let (client_io, server_io) = duplex(1024 * 1024);
+
+    let session_clone = session.clone();
+    let shutdown_clone = shutdown.clone();
+    let server_task =
+        tokio::spawn(
+            async move { handle_connection(server_io, session_clone, shutdown_clone).await },
+        );
+
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let mut client_framed_read = FramedRead::new(client_read, SruiCodec::new());
+    let mut client_framed_write = FramedWrite::new(client_write, SruiCodec::new());
+
+    let resume = SruiMessage {
+        msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: client_instance_id.to_vec(),
+            last_applied_revision,
+            last_acked_event_seq,
+            terminal_stream_offsets: Default::default(),
+        })),
+    };
+    client_framed_write.send(resume).await.expect("send resume");
+
+    let resume_msg = timeout(Duration::from_secs(2), client_framed_read.next())
+        .await
+        .expect("timed out waiting for resume response")
+        .expect("receive resume response")
+        .expect("decode resume response");
+    let resume_ok = match resume_msg.msg {
+        Some(srui_message::Msg::ServerResumeOk(ok)) => ok,
+        other => panic!("expected ServerResumeOk, got {other:?}"),
+    };
+
+    (
+        client_framed_write,
+        client_framed_read,
+        server_task,
+        resume_ok,
+    )
 }
 
 fn wire_activate_event(
@@ -278,6 +337,106 @@ async fn test_duplicate_event_id_same_client_no_repeat_side_effects() {
         let b = Button::from_store(store, btn).unwrap();
         assert_eq!(b.label(store), Some("Clicked"));
     });
+}
+
+#[tokio::test]
+async fn test_lost_ack_is_answered_from_the_result_cache_after_reconnect() {
+    let session = Arc::new(Session::new("lost-ack-reconnect"));
+    let btn = NodeId::new(1);
+    seed_button(&session, btn);
+
+    let invocations = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(btn, ACTIVATE, move |ctx, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        ctx.transaction(|ui| {
+            ui.set(btn, LABEL, "Clicked")?;
+            Ok(())
+        })
+        .expect("handler transaction");
+    });
+
+    let shutdown = CancellationToken::new();
+    let (mut write_1, read_1, task_1) =
+        connect_client(session.clone(), shutdown.clone(), CLIENT_A).await;
+
+    send_activate(&mut write_1, CLIENT_A, 1, "evt-lost-ack", 1, btn).await;
+    wait_until(Duration::from_secs(2), || {
+        invocations.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // The connection dies before the client can read the acknowledgement: from the client's point
+    // of view the event is still unsettled, so its retry set keeps it (§18.2).
+    drop(write_1);
+    drop(read_1);
+    let _ = timeout(Duration::from_secs(2), task_1)
+        .await
+        .expect("first connection did not finish");
+
+    let (mut write_2, mut read_2, task_2, resume_ok) = resume_client(
+        session.clone(),
+        shutdown.clone(),
+        CLIENT_A,
+        1,
+        // The client never saw the ack, so its own retention hint is still 0. The server's
+        // frontier is authoritative and reports the settlement it actually performed.
+        0,
+    )
+    .await;
+    assert_eq!(resume_ok.session_id, session.session_id());
+    assert_eq!(resume_ok.last_processed_event_seq, 1);
+    drain_one_transaction(&mut read_2).await;
+
+    // The retry carries byte-identical identity, so it is answered from the result cache rather
+    // than clicking the button a second time.
+    send_activate(&mut write_2, CLIENT_A, 1, "evt-lost-ack", 1, btn).await;
+    let replay_ack = recv_event_ack(&mut read_2).await;
+    assert_eq!(replay_ack.status(), EventAckStatus::Duplicate);
+    assert_eq!(replay_ack.event_id, b"evt-lost-ack");
+    assert_eq!(replay_ack.client_instance_id, CLIENT_A);
+    assert_eq!(replay_ack.revision_after_effect, 2);
+    assert_eq!(replay_ack.last_processed_event_seq, 1);
+    assert_no_pending_frame(&mut read_2).await;
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(session.current_revision(), 2);
+
+    shutdown.cancel();
+    assert!(task_2.await.expect("server task join").is_ok());
+}
+
+#[tokio::test]
+async fn test_two_event_ids_for_the_same_handler_both_execute() {
+    let session = Arc::new(Session::new("distinct-event-ids"));
+    let btn = NodeId::new(1);
+    seed_button(&session, btn);
+
+    let invocations = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(btn, ACTIVATE, move |_, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let shutdown = CancellationToken::new();
+    let (mut client_write, mut client_read, _server_task) =
+        connect_client(session.clone(), shutdown, CLIENT_A).await;
+
+    // Deduplication is keyed on `event_id`, not on the target node: two distinct presses of the
+    // same button are two distinct actions (§18.2).
+    send_activate(&mut client_write, CLIENT_A, 1, "evt-press-1", 1, btn).await;
+    let first_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(first_ack.status(), EventAckStatus::Processed);
+    assert_eq!(first_ack.event_id, b"evt-press-1");
+    assert_eq!(first_ack.last_processed_event_seq, 1);
+
+    send_activate(&mut client_write, CLIENT_A, 2, "evt-press-2", 1, btn).await;
+    let second_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(second_ack.status(), EventAckStatus::Processed);
+    assert_eq!(second_ack.event_id, b"evt-press-2");
+    assert_eq!(second_ack.last_processed_event_seq, 2);
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -15,6 +15,8 @@ public enum EventOutboxError: Error, Equatable, Sendable {
     case sequenceWindowExhausted(limit: Int)
     case eventSequenceAlreadyAcknowledged(eventSeq: UInt64)
     case resumeNotConfirmed
+    /// A retained `event_id` was reused for a different sequence or payload (§18.2).
+    case pendingEventIdentityConflict(eventId: EventId)
 }
 
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
@@ -89,20 +91,23 @@ public actor EventOutbox {
         _lastAckedEventSeq
     }
 
-    /// Allocates the next sequence. Callers must send or retain the resulting event without
-    /// abandoning it; the combined send APIs enforce the bounded window before allocation.
-    public func nextEventSeq() -> UInt64 {
+    /// Allocates the next sequence.
+    ///
+    /// Deliberately not public: a raw allocation that is never retained leaves a permanent hole
+    /// in the contiguous send window, which the server would then refuse to settle past. Every
+    /// public entry point allocates, retains, and sends inside one actor-isolated step (§18.2).
+    func nextEventSeq() -> UInt64 {
         currentEventSeq += 1
         return currentEventSeq
     }
 
     /// Generates a globally unique, retry-safe event identifier (§7.7, §18.2).
-    public func generateEventId() -> EventId {
+    func generateEventId() -> EventId {
         EventId(string: UUID().uuidString)
     }
 
     /// Constructs a client-originated momentary activation event (§7.6, §7.7).
-    public func makeActivateEvent(nodeId: NodeId, observedRevision: Revision) -> Event {
+    func makeActivateEvent(nodeId: NodeId, observedRevision: Revision) -> Event {
         let seq = nextEventSeq()
         let id = generateEventId()
         return Event.activate(
@@ -114,7 +119,7 @@ public actor EventOutbox {
     }
 
     /// Constructs a client-originated value-changed event (§7.6).
-    public func makeValueChangedEvent(nodeId: NodeId, observedRevision: Revision, value: Value) -> Event {
+    func makeValueChangedEvent(nodeId: NodeId, observedRevision: Revision, value: Value) -> Event {
         let seq = nextEventSeq()
         let id = generateEventId()
         return Event.valueChanged(
@@ -127,7 +132,7 @@ public actor EventOutbox {
     }
 
     /// Constructs a client-originated selection-changed event (§7.6).
-    public func makeSelectionChangedEvent(nodeId: NodeId, observedRevision: Revision, itemId: ItemId) -> Event {
+    func makeSelectionChangedEvent(nodeId: NodeId, observedRevision: Revision, itemId: ItemId) -> Event {
         let seq = nextEventSeq()
         let id = generateEventId()
         return Event.selectionChanged(
@@ -140,7 +145,10 @@ public actor EventOutbox {
     }
 
     /// Serializes and sends an event over the given transport (§16, §22).
-    public func sendEvent(_ event: Event, via transport: any Transport) async throws {
+    ///
+    /// Internal because it accepts an already-allocated identity: only the `send*` entry points
+    /// above may mint one, so allocation, retention, and transmission stay a single step.
+    func sendEvent(_ event: Event, via transport: any Transport) async throws {
         var msg = SRUIMessage()
         msg.event = event.toWire()
         let framedBytes = try SRUIFraming.encodeFramed(msg)
@@ -332,14 +340,24 @@ public actor EventOutbox {
     }
 
     /// Applies one selective acknowledgement plus the server's contiguous cumulative frontier.
-    /// Returns false when a draining connection delivers an ack from an expired incarnation.
+    ///
+    /// Both wire identities are checked here rather than by the caller: the ack settles state this
+    /// actor owns, so a draining connection, an expired incarnation, or another client instance
+    /// must be refused inside the same isolated step that would otherwise mutate it (§18, §18.2).
+    /// Returns false without any mutation when the identity does not bind.
     @discardableResult
     public func settleAcknowledgement(
+        clientInstanceId ackClientInstanceId: ClientInstanceId,
         eventId: EventId,
         throughSeq seq: UInt64,
-        sessionId: String? = nil
+        sessionId: String
     ) -> Bool {
-        if let sessionId, let activeSessionId, sessionId != activeSessionId {
+        guard ackClientInstanceId == clientInstanceId else { return false }
+        // An empty session_id proves nothing about which incarnation settled the event, so it can
+        // never retire an intent.
+        guard !sessionId.isEmpty,
+              let activeSessionId,
+              sessionId == activeSessionId else {
             return false
         }
         acknowledgeEvents(throughSeq: seq)
@@ -464,13 +482,17 @@ public actor EventOutbox {
     ) async throws -> Bool {
         guard replayLease == lease,
               pendingEventReplayLoop.isActive(lease),
+              ownsResumeWork(generation: lease.resumeScope),
               pendingEvents.isEmpty == false else {
             return false
         }
         try Task.checkCancellation()
         try await resendPendingEvents(via: transport)
+        // Re-checked after the suspension: a reconnect that superseded this generation while the
+        // replay was in flight owns the retry set now, and this lease must not touch it (§18).
         guard replayLease == lease,
               pendingEventReplayLoop.isActive(lease),
+              ownsResumeWork(generation: lease.resumeScope),
               Task.isCancelled == false else {
             return false
         }
@@ -549,8 +571,13 @@ public actor EventOutbox {
 
     /// Retains a new event without evicting an earlier unacknowledged sequence.
     private func retainPending(_ event: Event) throws {
-        if pendingEvents[event.eventId] != nil {
-            pendingEvents[event.eventId] = event
+        if let retained = pendingEvents[event.eventId] {
+            // A retry is byte-identical by definition (§18.2). Overwriting the entry instead would
+            // let a second, semantically different intent inherit the first one's idempotency key,
+            // and the server would answer it from the result cache without ever running it.
+            guard retained == event else {
+                throw EventOutboxError.pendingEventIdentityConflict(eventId: event.eventId)
+            }
             return
         }
         guard event.eventSeq > _lastAckedEventSeq else {

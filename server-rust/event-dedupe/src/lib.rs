@@ -78,9 +78,14 @@ pub struct EventDeduplicator {
     clients: HashMap<Bytes, ClientDedupeWindow>,
 }
 
+/// State of one admitted `event_id` inside a client's receive window (§18.2).
+///
+/// `InFlight` means the sequence slot is owned but no terminal outcome exists yet, so the entry
+/// can neither be acknowledged nor evicted. Only `Settled` carries the wire-visible outcome a
+/// replay is answered from.
 #[derive(Debug, Clone)]
 enum EventRecord {
-    Pending {
+    InFlight {
         event_seq: u64,
     },
     Settled {
@@ -92,7 +97,7 @@ enum EventRecord {
 impl EventRecord {
     fn event_seq(&self) -> u64 {
         match self {
-            Self::Pending { event_seq } | Self::Settled { event_seq, .. } => *event_seq,
+            Self::InFlight { event_seq } | Self::Settled { event_seq, .. } => *event_seq,
         }
     }
 
@@ -144,7 +149,7 @@ impl ClientDedupeWindow {
                 });
             }
             return Ok(match record {
-                EventRecord::Pending { .. } => RecordOutcome::Pending {
+                EventRecord::InFlight { .. } => RecordOutcome::Pending {
                     last_processed_event_seq: self.last_contiguous_processed_seq,
                 },
                 EventRecord::Settled { outcome, .. } => RecordOutcome::Duplicate {
@@ -154,22 +159,33 @@ impl ClientDedupeWindow {
             });
         }
 
+        // A sequence still owned by another `event_id` is a client bug, not a window overflow:
+        // reporting it as such keeps the two protocol violations distinguishable.
+        if self.ids_by_seq.contains_key(&event_seq) {
+            return Err(EventSequenceError::SequenceAlreadyAssigned { event_seq });
+        }
+
+        // Sequence 0 is never allocated, so the frontier doubles as "nothing settled yet".
+        // Saturating arithmetic keeps a frontier near `u64::MAX` from wrapping the window back
+        // around onto an already-settled sequence.
         let first_acceptable_seq = self.last_contiguous_processed_seq.saturating_add(1);
         let window_width = u64::try_from(max_entries).unwrap_or(u64::MAX);
         let last_acceptable_seq = self
             .last_contiguous_processed_seq
             .saturating_add(window_width);
-        if event_seq <= self.last_contiguous_processed_seq || event_seq > last_acceptable_seq {
+        if event_seq == 0
+            || event_seq <= self.last_contiguous_processed_seq
+            || event_seq > last_acceptable_seq
+        {
             return Err(EventSequenceError::OutsideReceiveWindow {
                 event_seq,
                 first_acceptable_seq,
                 last_acceptable_seq,
             });
         }
-        if self.ids_by_seq.contains_key(&event_seq) {
-            return Err(EventSequenceError::SequenceAlreadyAssigned { event_seq });
-        }
 
+        // Only settled results at or below the contiguous frontier are evictable, and only in
+        // FIFO order: an in-flight admission or an out-of-order settlement is still load-bearing.
         while self.seen_ids.len() >= max_entries {
             if !self.evict_oldest_settled() {
                 return Err(EventSequenceError::ReceiveWindowFull);
@@ -179,7 +195,8 @@ impl ClientDedupeWindow {
         let id = Bytes::copy_from_slice(event_id);
         self.order.push_back(id.clone());
         self.ids_by_seq.insert(event_seq, id.clone());
-        self.seen_ids.insert(id, EventRecord::Pending { event_seq });
+        self.seen_ids
+            .insert(id, EventRecord::InFlight { event_seq });
 
         Ok(RecordOutcome::Fresh {
             last_processed_event_seq: self.last_contiguous_processed_seq,
@@ -240,7 +257,7 @@ impl ClientDedupeWindow {
                 return self.last_contiguous_processed_seq;
             };
             match slot {
-                EventRecord::Pending { event_seq } => {
+                EventRecord::InFlight { event_seq } => {
                     let event_seq = *event_seq;
                     *slot = EventRecord::Settled { event_seq, outcome };
                     event_seq
@@ -273,7 +290,7 @@ impl ClientDedupeWindow {
 
     fn abandon(&mut self, event_id: &[u8]) {
         let event_seq = self.seen_ids.get(event_id).and_then(|record| match record {
-            EventRecord::Pending { event_seq } => Some(*event_seq),
+            EventRecord::InFlight { event_seq } => Some(*event_seq),
             EventRecord::Settled { .. } => None,
         });
         let Some(event_seq) = event_seq else {
@@ -420,6 +437,14 @@ mod tests {
     }
 
     fn settle_accepted(dedupe: &mut EventDeduplicator, event: &Event) -> u64 {
+        settle_accepted_at_revision(dedupe, event, 0)
+    }
+
+    fn settle_accepted_at_revision(
+        dedupe: &mut EventDeduplicator,
+        event: &Event,
+        revision_after_effect: u64,
+    ) -> u64 {
         assert!(matches!(
             dedupe.admit_event(event).expect("admit event"),
             RecordOutcome::Fresh { .. }
@@ -428,7 +453,7 @@ mod tests {
             event,
             EventOutcomeRecord {
                 accepted: true,
-                revision_after_effect: 0,
+                revision_after_effect,
                 reject_reason: String::new(),
             },
         )
@@ -603,6 +628,171 @@ mod tests {
         );
         assert_eq!(dedupe.last_contiguous_processed_seq(b"client-1"), 0);
         assert!(dedupe.clients.is_empty());
+    }
+
+    #[test]
+    fn test_full_receive_window_admits_every_slot_then_refuses_the_next() {
+        let mut dedupe = EventDeduplicator::new(4);
+        let events: Vec<Event> = (1..=4)
+            .map(|seq| wire_event(b"client-a", format!("evt-{seq}").as_bytes(), seq))
+            .collect();
+
+        for event in &events {
+            assert_eq!(
+                dedupe.admit_event(event).expect("admit inside window"),
+                RecordOutcome::Fresh {
+                    last_processed_event_seq: 0
+                }
+            );
+        }
+
+        let beyond = wire_event(b"client-a", b"evt-5", 5);
+        assert_eq!(
+            dedupe.admit_event(&beyond),
+            Err(EventSequenceError::OutsideReceiveWindow {
+                event_seq: 5,
+                first_acceptable_seq: 1,
+                last_acceptable_seq: 4,
+            })
+        );
+
+        // Refusing the overflow must not have disturbed a single admitted slot.
+        for event in &events {
+            assert_eq!(
+                dedupe.admit_event(event).expect("in-flight replay"),
+                RecordOutcome::Pending {
+                    last_processed_event_seq: 0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_eviction_spares_in_flight_and_out_of_order_settled_entries() {
+        let mut dedupe = EventDeduplicator::new(3);
+        let first = wire_event(b"client-a", b"a1", 1);
+        let second = wire_event(b"client-a", b"a2", 2);
+        let third = wire_event(b"client-a", b"a3", 3);
+        let fourth = wire_event(b"client-a", b"a4", 4);
+
+        for event in [&first, &second, &third] {
+            assert!(matches!(
+                dedupe.admit_event(event).expect("admit event"),
+                RecordOutcome::Fresh { .. }
+            ));
+        }
+        assert_eq!(
+            dedupe.settle_event(
+                &first,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 11,
+                    reject_reason: String::new(),
+                },
+            ),
+            1
+        );
+        assert_eq!(
+            dedupe.settle_event(
+                &third,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 33,
+                    reject_reason: String::new(),
+                },
+            ),
+            1
+        );
+
+        // Admitting a fourth event needs a slot: only the settled entry behind the frontier is
+        // evictable, in FIFO order.
+        assert!(matches!(
+            dedupe.admit_event(&fourth).expect("admit after eviction"),
+            RecordOutcome::Fresh {
+                last_processed_event_seq: 1
+            }
+        ));
+
+        assert_eq!(
+            dedupe.admit_event(&second).expect("in-flight survives"),
+            RecordOutcome::Pending {
+                last_processed_event_seq: 1
+            }
+        );
+        match dedupe
+            .admit_event(&third)
+            .expect("out-of-order settlement survives")
+        {
+            RecordOutcome::Duplicate { prior, .. } => {
+                assert!(prior.accepted);
+                assert_eq!(prior.revision_after_effect, 33);
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+        // The evicted result is behind the cumulative frontier, so its replay is refused rather
+        // than re-executed.
+        assert_eq!(
+            dedupe.admit_event(&first),
+            Err(EventSequenceError::OutsideReceiveWindow {
+                event_seq: 1,
+                first_acceptable_seq: 2,
+                last_acceptable_seq: 4,
+            })
+        );
+
+        assert_eq!(
+            dedupe.settle_event(
+                &second,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 22,
+                    reject_reason: String::new(),
+                },
+            ),
+            3
+        );
+        assert_eq!(dedupe.last_contiguous_processed_seq(b"client-a"), 3);
+    }
+
+    #[test]
+    fn test_zero_and_overflow_sequences_allocate_nothing() {
+        let mut dedupe = EventDeduplicator::new(4);
+
+        let zero = wire_event(b"client-a", b"a0", 0);
+        assert_eq!(
+            dedupe.admit_event(&zero),
+            Err(EventSequenceError::OutsideReceiveWindow {
+                event_seq: 0,
+                first_acceptable_seq: 1,
+                last_acceptable_seq: 4,
+            })
+        );
+
+        let overflow = wire_event(b"client-a", b"a-max", u64::MAX);
+        assert_eq!(
+            dedupe.admit_event(&overflow),
+            Err(EventSequenceError::OutsideReceiveWindow {
+                event_seq: u64::MAX,
+                first_acceptable_seq: 1,
+                last_acceptable_seq: 4,
+            })
+        );
+
+        assert!(dedupe.clients.is_empty());
+        assert_eq!(dedupe.last_contiguous_processed_seq(b"client-a"), 0);
+
+        // A conflicting sequence is refused without disturbing the entry that owns the slot.
+        assert_eq!(
+            settle_accepted_at_revision(&mut dedupe, &wire_event(b"client-a", b"a1", 1), 7),
+            1
+        );
+        let conflict = wire_event(b"client-a", b"a1-again", 1);
+        assert_eq!(
+            dedupe.admit_event(&conflict),
+            Err(EventSequenceError::SequenceAlreadyAssigned { event_seq: 1 })
+        );
+        assert!(!dedupe.is_duplicate(b"client-a", b"a1-again"));
+        assert_eq!(dedupe.last_contiguous_processed_seq(b"client-a"), 1);
     }
 
     #[test]

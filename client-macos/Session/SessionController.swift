@@ -775,23 +775,18 @@ public final class SessionController: @unchecked Sendable {
     /// refuses must be dropped here: leaving it pending would replay it on the next resume, which
     /// the server would refuse again, forever.
     private func handleEventAck(_ ack: SRUIServerEventAck) async {
-        guard ClientInstanceId(ack.clientInstanceID) == outbox.clientInstanceId else {
-            SessionDiagnostics.error(
-                "Ignoring event acknowledgement for a different client instance"
-            )
-            return
-        }
-
         let eventId = EventId(ack.eventID)
-        let ackSessionId = ack.sessionID.isEmpty ? nil : ack.sessionID
-        let belongsToActiveSession = await outbox.settleAcknowledgement(
+        // The full wire identity is handed to the outbox so the identity check and the mutation it
+        // guards share one actor-isolated step (§18.2).
+        let settled = await outbox.settleAcknowledgement(
+            clientInstanceId: ClientInstanceId(ack.clientInstanceID),
             eventId: eventId,
             throughSeq: ack.lastProcessedEventSeq,
-            sessionId: ackSessionId
+            sessionId: ack.sessionID
         )
-        guard belongsToActiveSession else {
+        guard settled else {
             SessionDiagnostics.error(
-                "Ignoring event acknowledgement from expired session \(ack.sessionID)"
+                "Ignoring event acknowledgement with unbound identity (session \(ack.sessionID))"
             )
             return
         }

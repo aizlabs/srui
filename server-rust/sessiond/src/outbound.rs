@@ -1,0 +1,874 @@
+//! # Bounded Outbound Transaction Queues & Coalescing (§20.2)
+//!
+//! Provides bounded, per-connection transaction streaming with scalar property coalescing
+//! and lossless structural barriers.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use srui_protocol::Transaction;
+use srui_semantic_tree::Transaction as DomainTxn;
+
+use crate::session::{lock_or_recover, SessionError};
+
+/// Default capacity for per-connection outbound transaction queues (§20.2).
+pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
+
+/// Maximum number of overflowed `client_instance_id`s tracked for forced resync (§20.2).
+///
+/// `client_instance_id` is client-supplied, so the marker table is bounded on the same terms as
+/// the journal retention window (§18.1): the oldest marker is evicted once the bound is reached.
+/// An evicted client that later resumes falls back to journal-gap evaluation.
+pub(crate) const MAX_TRACKED_STALE_CLIENTS: usize = 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of wire -> domain transaction conversions, asserted by the publish-cost tests.
+    static WIRE_TO_DOMAIN_CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Single funnel for wire -> domain transaction conversion so its per-publish cost is measurable.
+fn to_domain(tx: &Transaction) -> Option<DomainTxn> {
+    #[cfg(test)]
+    WIRE_TO_DOMAIN_CONVERSIONS.with(|count| count.set(count.get() + 1));
+    DomainTxn::try_from(tx.clone()).ok()
+}
+
+/// Errors occurring when receiving transactions from an [`OutboundReceiver`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OutboundRecvError {
+    /// The client queue overflowed its configured capacity; connection must detach for resync (§20.2).
+    #[error("outbound queue overflow: {0}")]
+    Lagged(String),
+    /// The outbound transaction queue or session has closed cleanly.
+    #[error("outbound queue closed")]
+    Closed,
+}
+
+#[derive(Debug)]
+struct SubscriberState {
+    capacity: usize,
+    max_ops: usize,
+    max_frame_size: usize,
+    items: VecDeque<Transaction>,
+    /// Domain form of `items.back()`, the only item absorption can still merge into.
+    ///
+    /// Cached so a publish never re-decodes an already-queued transaction: the wire -> domain
+    /// conversion and the merge both run under the subscriber lock (§20.2).
+    tail_domain: Option<DomainTxn>,
+    peak_depth: usize,
+    stale_reason: Option<String>,
+    is_closed: bool,
+}
+
+impl SubscriberState {
+    /// Returns `true` if an unsent tail exists that absorption could still merge into.
+    fn has_unsent_tail(&self) -> bool {
+        !self.is_closed && !self.items.is_empty()
+    }
+
+    /// Pops the next queued transaction, keeping the cached tail consistent with the queue.
+    fn pop(&mut self) -> Option<Transaction> {
+        let item = self.items.pop_front()?;
+        if self.items.is_empty() {
+            self.tail_domain = None;
+        }
+        Some(item)
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.tail_domain = None;
+    }
+
+    /// Enqueues `tx`, or merges it into the unsent tail when `incoming_domain` allows coalescing.
+    ///
+    /// `incoming_domain` is the caller's single decode of `tx`, shared across all subscribers.
+    fn try_push_or_absorb(
+        &mut self,
+        tx: &Transaction,
+        incoming_domain: Option<&DomainTxn>,
+    ) -> Result<bool, OutboundRecvError> {
+        if self.is_closed {
+            if let Some(reason) = &self.stale_reason {
+                return Err(OutboundRecvError::Lagged(reason.clone()));
+            }
+            return Err(OutboundRecvError::Closed);
+        }
+
+        // Try absorbing into the unsent tail item if present, using the canonical domain
+        // absorption logic against the cached domain form of that tail.
+        if let Some(incoming) = incoming_domain {
+            if self.tail_domain.is_none() {
+                // The tail was queued while no decode was in hand (empty -> non-empty queue);
+                // decode it once and keep it for every later publish.
+                if let Some(tail) = self.items.back() {
+                    self.tail_domain = to_domain(tail);
+                }
+            }
+            if let (Some(tail), Some(tail_domain)) =
+                (self.items.back_mut(), self.tail_domain.as_mut())
+            {
+                if tail_domain.try_absorb(incoming, self.max_ops, self.max_frame_size) {
+                    *tail = (&*tail_domain).into();
+                    return Ok(false); // Absorbed in-place, queue length did not increase
+                }
+            }
+        }
+
+        // Cannot absorb: check bounded capacity
+        if self.items.len() >= self.capacity {
+            let reason = format!(
+                "client queue exceeded bounded capacity of {} transactions without absorption",
+                self.capacity
+            );
+            self.stale_reason = Some(reason.clone());
+            self.is_closed = true;
+            self.clear();
+            return Err(OutboundRecvError::Lagged(reason));
+        }
+
+        self.items.push_back(tx.clone());
+        self.tail_domain = incoming_domain.cloned();
+        if self.items.len() > self.peak_depth {
+            self.peak_depth = self.items.len();
+        }
+        Ok(true) // Enqueued as new item
+    }
+}
+
+/// Bounded record of `client_instance_id`s whose queue overflowed and that must resync (§20.2).
+///
+/// Bounded because `client_instance_id` is client-supplied: a reconnect loop minting a fresh id per
+/// attempt would otherwise grow this table for the lifetime of the daemon. Eviction is oldest-first,
+/// matching the journal's bounded retention policy (§18.1).
+#[derive(Debug, Default)]
+struct StaleClientRegistry {
+    /// Insertion order of `entries` keys, used for oldest-first eviction.
+    order: VecDeque<Vec<u8>>,
+    /// `client_instance_id` -> highest queue depth observed before overflow.
+    entries: HashMap<Vec<u8>, usize>,
+}
+
+impl StaleClientRegistry {
+    fn mark(&mut self, client_instance_id: Vec<u8>, peak_depth: usize) {
+        if let Some(peak) = self.entries.get_mut(&client_instance_id) {
+            *peak = (*peak).max(peak_depth);
+            return;
+        }
+
+        self.entries.insert(client_instance_id.clone(), peak_depth);
+        self.order.push_back(client_instance_id);
+        while self.order.len() > MAX_TRACKED_STALE_CLIENTS {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+    }
+
+    fn contains(&self, client_instance_id: &[u8]) -> bool {
+        self.entries.contains_key(client_instance_id)
+    }
+
+    fn clear_client(&mut self, client_instance_id: &[u8]) {
+        if self.entries.remove(client_instance_id).is_some() {
+            // Bounded by MAX_TRACKED_STALE_CLIENTS, so the linear scan is bounded too.
+            self.order.retain(|id| id != client_instance_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn peak_depth(&self, client_instance_id: &[u8]) -> usize {
+        self.entries.get(client_instance_id).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn max_peak_depth(&self) -> usize {
+        self.entries.values().copied().max().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// A handle for receiving outbound transactions streamed to a connection.
+#[derive(Debug)]
+pub struct OutboundReceiver {
+    notify_rx: mpsc::Receiver<()>,
+    state: Arc<Mutex<SubscriberState>>,
+    disconnect: CancellationToken,
+}
+
+impl OutboundReceiver {
+    /// Asynchronously waits for the next committed transaction.
+    ///
+    /// This is the single, authoritative signal for queue lag: on overflow, it returns
+    /// [`OutboundRecvError::Lagged`].
+    pub async fn recv(&mut self) -> Result<Transaction, OutboundRecvError> {
+        loop {
+            {
+                let mut guard = lock_or_recover(&self.state);
+                if let Some(reason) = &guard.stale_reason {
+                    return Err(OutboundRecvError::Lagged(reason.clone()));
+                }
+                if let Some(item) = guard.pop() {
+                    return Ok(item);
+                }
+                if guard.is_closed {
+                    return Err(OutboundRecvError::Closed);
+                }
+            }
+
+            match self.notify_rx.recv().await {
+                Some(()) => {}
+                None => {
+                    let guard = lock_or_recover(&self.state);
+                    if let Some(reason) = &guard.stale_reason {
+                        return Err(OutboundRecvError::Lagged(reason.clone()));
+                    }
+                    return Err(OutboundRecvError::Closed);
+                }
+            }
+        }
+    }
+
+    /// Non-blocking synchronous poll for the next transaction.
+    pub fn try_recv(&mut self) -> Result<Option<Transaction>, OutboundRecvError> {
+        let mut guard = lock_or_recover(&self.state);
+        if let Some(reason) = &guard.stale_reason {
+            return Err(OutboundRecvError::Lagged(reason.clone()));
+        }
+        if let Some(item) = guard.pop() {
+            let _ = self.notify_rx.try_recv();
+            return Ok(Some(item));
+        }
+        if guard.is_closed {
+            return Err(OutboundRecvError::Closed);
+        }
+        Ok(None)
+    }
+
+    /// Token cancelled when this subscriber overflows or the hub closes.
+    ///
+    /// Connection writes must race this against `framed_write.send` so a blocked
+    /// socket does not delay `LaggedResyncRequired` (§20.2).
+    #[must_use]
+    pub fn disconnect_token(&self) -> &CancellationToken {
+        &self.disconnect
+    }
+
+    /// Current terminal state, if the queue has overflowed or closed.
+    #[must_use]
+    pub fn termination(&self) -> Option<OutboundRecvError> {
+        let guard = lock_or_recover(&self.state);
+        if let Some(reason) = &guard.stale_reason {
+            Some(OutboundRecvError::Lagged(reason.clone()))
+        } else if guard.is_closed {
+            Some(OutboundRecvError::Closed)
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` if the underlying queue has closed.
+    pub fn is_closed(&self) -> bool {
+        lock_or_recover(&self.state).is_closed
+    }
+}
+
+/// Releases the queue as soon as the connection ends, rather than at the next publish (§20.2).
+///
+/// The hub reaps the matching subscriber entry on the next [`OutboundHub::publish`] or
+/// [`OutboundHub::subscribe`]; marking the state closed here frees the queued transactions
+/// immediately so an idle session does not hold them until then.
+impl Drop for OutboundReceiver {
+    fn drop(&mut self) {
+        let mut guard = lock_or_recover(&self.state);
+        guard.is_closed = true;
+        guard.clear();
+    }
+}
+
+#[derive(Debug)]
+struct Subscriber {
+    client_instance_id: Vec<u8>,
+    notify_tx: mpsc::Sender<()>,
+    state: Arc<Mutex<SubscriberState>>,
+    disconnect: CancellationToken,
+}
+
+/// Central distribution hub for outbound transaction queues.
+///
+/// # Lock Order
+///
+/// `subscribers -> SubscriberState -> stale_clients`. Handshake bootstrap enters this hub while
+/// holding the session lock, so the full order is `SessionInner -> subscribers -> SubscriberState
+/// -> stale_clients`; nothing may acquire them in the opposite direction. A subscriber's
+/// [`CancellationToken`] is cancelled only after its `SubscriberState` guard is released, both to
+/// publish the terminal state before waking a connection and to keep an inline waker from
+/// re-entering that lock.
+#[derive(Debug)]
+pub(crate) struct OutboundHub {
+    subscribers: Mutex<Vec<Subscriber>>,
+    stale_clients: Mutex<StaleClientRegistry>,
+    is_closed: AtomicBool,
+}
+
+impl OutboundHub {
+    pub fn new() -> Self {
+        Self {
+            subscribers: Mutex::new(Vec::new()),
+            stale_clients: Mutex::new(StaleClientRegistry::default()),
+            is_closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Registers a bounded outbound queue for one connection (§20.2).
+    ///
+    /// `client_instance_id` may be empty: it is a proto3 `bytes` field with no non-empty
+    /// requirement, and an omitted id must not cost the client its connection.
+    pub fn subscribe(
+        &self,
+        client_instance_id: Vec<u8>,
+        capacity: usize,
+        max_ops: usize,
+        max_frame_size: usize,
+    ) -> Result<OutboundReceiver, SessionError> {
+        if capacity == 0 {
+            return Err(SessionError::InvalidConfiguration(
+                "outbound queue capacity must be positive".to_string(),
+            ));
+        }
+        if self.is_closed.load(Ordering::Relaxed) {
+            return Err(SessionError::OutboundClosed);
+        }
+
+        let (notify_tx, notify_rx) = mpsc::channel(capacity);
+        let disconnect = CancellationToken::new();
+        let state = Arc::new(Mutex::new(SubscriberState {
+            capacity,
+            max_ops,
+            max_frame_size,
+            items: VecDeque::with_capacity(capacity),
+            tail_domain: None,
+            peak_depth: 0,
+            stale_reason: None,
+            is_closed: false,
+        }));
+
+        let sub = Subscriber {
+            client_instance_id,
+            notify_tx,
+            state: Arc::clone(&state),
+            disconnect: disconnect.clone(),
+        };
+
+        let mut subs = lock_or_recover(&self.subscribers);
+        // Reap connections that ended since the last publish, so an idle session does not retain a
+        // subscriber entry per connect/disconnect cycle (§20.2).
+        subs.retain(|sub| !sub.notify_tx.is_closed() && !lock_or_recover(&sub.state).is_closed);
+        subs.push(sub);
+        drop(subs);
+
+        Ok(OutboundReceiver {
+            notify_rx,
+            state,
+            disconnect,
+        })
+    }
+
+    pub fn publish(&self, tx: &Transaction) {
+        if self.is_closed.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut subs = lock_or_recover(&self.subscribers);
+        let mut stale_marked = Vec::new();
+        // Decoded at most once per commit and shared by every subscriber: this conversion runs
+        // under the subscriber locks, so doing it per subscriber would stall a runtime worker on
+        // behalf of one slow client (§20.2).
+        let mut incoming_domain: Option<Option<DomainTxn>> = None;
+
+        subs.retain(|sub| {
+            if sub.notify_tx.is_closed() {
+                return false;
+            }
+
+            let (outcome, peak_depth) = {
+                let mut guard = lock_or_recover(&sub.state);
+                let incoming = if guard.has_unsent_tail() {
+                    incoming_domain
+                        .get_or_insert_with(|| to_domain(tx))
+                        .as_ref()
+                } else {
+                    None
+                };
+                let outcome = guard.try_push_or_absorb(tx, incoming);
+                (outcome, guard.peak_depth)
+            };
+
+            match outcome {
+                Ok(true) => {
+                    let _ = sub.notify_tx.try_send(());
+                    true
+                }
+                Ok(false) => true,
+                Err(OutboundRecvError::Lagged(_)) => {
+                    // Cancelled after the state guard is released: the terminal state must be
+                    // readable by the woken connection, and an inline waker must not re-enter
+                    // the subscriber lock.
+                    stale_marked.push((sub.client_instance_id.clone(), peak_depth));
+                    sub.disconnect.cancel();
+                    false
+                }
+                Err(OutboundRecvError::Closed) => {
+                    sub.disconnect.cancel();
+                    false
+                }
+            }
+        });
+        drop(subs);
+
+        if !stale_marked.is_empty() {
+            let mut stale_guard = lock_or_recover(&self.stale_clients);
+            for (id, peak) in stale_marked {
+                stale_guard.mark(id, peak);
+            }
+        }
+    }
+
+    pub fn is_client_stale(&self, client_instance_id: &[u8]) -> bool {
+        lock_or_recover(&self.stale_clients).contains(client_instance_id)
+    }
+
+    pub fn clear_stale_client(&self, client_instance_id: &[u8]) {
+        lock_or_recover(&self.stale_clients).clear_client(client_instance_id);
+    }
+
+    #[cfg(test)]
+    pub fn peak_depth_for_client(&self, client_instance_id: &[u8]) -> usize {
+        let subs = lock_or_recover(&self.subscribers);
+        let mut peak = lock_or_recover(&self.stale_clients).peak_depth(client_instance_id);
+        for sub in subs.iter() {
+            if sub.client_instance_id == client_instance_id {
+                let guard = lock_or_recover(&sub.state);
+                peak = peak.max(guard.peak_depth);
+            }
+        }
+        peak
+    }
+
+    #[cfg(test)]
+    pub fn subscriber_count(&self) -> usize {
+        lock_or_recover(&self.subscribers).len()
+    }
+
+    #[cfg(test)]
+    pub fn tracked_stale_client_count(&self) -> usize {
+        lock_or_recover(&self.stale_clients).len()
+    }
+
+    #[cfg(test)]
+    pub fn max_peak_depth(&self) -> usize {
+        let subs = lock_or_recover(&self.subscribers);
+        let mut max = lock_or_recover(&self.stale_clients).max_peak_depth();
+        for sub in subs.iter() {
+            let guard = lock_or_recover(&sub.state);
+            max = max.max(guard.peak_depth);
+        }
+        max
+    }
+
+    #[cfg(test)]
+    pub fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Relaxed)
+    }
+
+    pub fn close(&self) {
+        self.is_closed.store(true, Ordering::Relaxed);
+        let mut subs = lock_or_recover(&self.subscribers);
+        for sub in subs.drain(..) {
+            // Publish the terminal state *before* waking the connection: a connection woken by the
+            // token reads `termination()`, and an unmarked subscriber reads as a lagged queue, so
+            // a clean shutdown would be reported as LaggedResyncRequired (§20.2). Already-queued
+            // transactions stay drainable; only the receiver's own drop discards them.
+            lock_or_recover(&sub.state).is_closed = true;
+            sub.disconnect.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use srui_protocol::{
+        operation::Op, srui_message, value::Value as WireValInner, CreateNodeOp, NodeRecord,
+        Operation as WireOp, PropertyRef as WirePropRef, SetPropertyOp, SruiMessage,
+        Value as WireValue,
+    };
+
+    fn make_set_prop_op(node_id: u64, prop_id: u32, val: &str) -> WireOp {
+        WireOp {
+            op: Some(Op::SetProperty(SetPropertyOp {
+                node_id,
+                property: Some(WirePropRef {
+                    namespace_id: 1,
+                    local_id: prop_id,
+                }),
+                value: Some(WireValue {
+                    value: Some(WireValInner::StringValue(val.to_string())),
+                }),
+            })),
+        }
+    }
+
+    fn make_scalar_tx(
+        base: u64,
+        new_rev: u64,
+        node_id: u64,
+        prop_id: u32,
+        val: &str,
+    ) -> Transaction {
+        Transaction {
+            base_revision: base,
+            new_revision: new_rev,
+            priority: 1,
+            operations: vec![make_set_prop_op(node_id, prop_id, val)],
+        }
+    }
+
+    fn make_create_node_tx(base: u64, new_rev: u64, node_id: u64) -> Transaction {
+        Transaction {
+            base_revision: base,
+            new_revision: new_rev,
+            priority: 1,
+            operations: vec![WireOp {
+                op: Some(Op::CreateNode(CreateNodeOp {
+                    node: Some(NodeRecord {
+                        node_id,
+                        r#type: None,
+                        parent_id: 0,
+                        child_index: 0,
+                        properties: vec![],
+                    }),
+                })),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_scalar_coalescing_retains_latest_value_and_revision_span() {
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![1], 4, 10, 1024 * 1024)
+            .expect("subscribe");
+
+        let tx1 = make_scalar_tx(0, 1, 10, 1, "v1");
+        hub.publish(&tx1);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 1);
+
+        let tx2 = make_scalar_tx(1, 2, 10, 1, "v2");
+        hub.publish(&tx2);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 1);
+
+        let tx3 = make_scalar_tx(2, 5, 10, 1, "v5");
+        hub.publish(&tx3);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 1);
+
+        let merged = rx.try_recv().expect("poll").expect("merged tx");
+        assert_eq!(merged.base_revision, 0);
+        assert_eq!(merged.new_revision, 5);
+        assert_eq!(merged.operations.len(), 1);
+        match &merged.operations[0].op {
+            Some(Op::SetProperty(sp)) => {
+                assert_eq!(
+                    sp.value.as_ref().unwrap().value,
+                    Some(WireValInner::StringValue("v5".to_string()))
+                );
+            }
+            other => panic!("expected SetProperty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_structural_transaction_acts_as_barrier() {
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![1], 4, 10, 1024 * 1024)
+            .expect("subscribe");
+
+        let tx1 = make_scalar_tx(0, 1, 10, 1, "v1");
+        hub.publish(&tx1);
+
+        let tx_barrier = make_create_node_tx(1, 2, 20);
+        hub.publish(&tx_barrier);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 2);
+
+        let tx3 = make_scalar_tx(2, 3, 10, 1, "v3");
+        hub.publish(&tx3);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 3);
+
+        let tx4 = make_scalar_tx(3, 4, 10, 1, "v4");
+        hub.publish(&tx4);
+        assert_eq!(hub.peak_depth_for_client(&[1]), 3);
+
+        let p1 = rx.try_recv().unwrap().unwrap();
+        assert_eq!(p1.new_revision, 1);
+        let p2 = rx.try_recv().unwrap().unwrap();
+        assert_eq!(p2.new_revision, 2);
+        let p3 = rx.try_recv().unwrap().unwrap();
+        assert_eq!(p3.new_revision, 4);
+    }
+
+    #[test]
+    fn test_coalescing_accounts_for_enclosing_message_frame_size() {
+        let tx1 = make_scalar_tx(0, 1, 10, 1, "first-value");
+        let tx2 = make_scalar_tx(1, 2, 10, 2, "second-value");
+        let merged = Transaction {
+            base_revision: 0,
+            new_revision: 2,
+            priority: 1,
+            operations: vec![tx1.operations[0].clone(), tx2.operations[0].clone()],
+        };
+        let merged_envelope = SruiMessage {
+            msg: Some(srui_message::Msg::Transaction(merged.clone())),
+        };
+        let framed =
+            srui_protocol::encode_framed(&merged_envelope).expect("encode merged envelope fixture");
+        let merged_envelope_size = (0..=framed.len())
+            .find(|&limit| srui_protocol::encode_framed_with_limit(&merged_envelope, limit).is_ok())
+            .expect("find encoded envelope size");
+        let max_frame_size = merged_envelope_size - 1;
+
+        assert!(
+            srui_protocol::encode_framed_with_limit(&merged, max_frame_size).is_ok(),
+            "fixture must fit the bare transaction under the limit"
+        );
+        for tx in [&tx1, &tx2] {
+            let envelope = SruiMessage {
+                msg: Some(srui_message::Msg::Transaction(tx.clone())),
+            };
+            assert!(
+                srui_protocol::encode_framed_with_limit(&envelope, max_frame_size).is_ok(),
+                "each unmerged transaction must remain independently sendable"
+            );
+        }
+
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![8, 8], 4, 10, max_frame_size)
+            .expect("subscribe");
+
+        hub.publish(&tx1);
+        hub.publish(&tx2);
+
+        assert_eq!(
+            hub.peak_depth_for_client(&[8, 8]),
+            2,
+            "coalescing must not create an SruiMessage larger than the frame limit"
+        );
+        assert_eq!(rx.try_recv().unwrap().unwrap(), tx1);
+        assert_eq!(rx.try_recv().unwrap().unwrap(), tx2);
+    }
+
+    #[test]
+    fn test_overflow_discards_backlog_and_marks_stale() {
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![7, 7], 2, 10, 1024 * 1024)
+            .expect("subscribe");
+
+        let b1 = make_create_node_tx(0, 1, 1);
+        let b2 = make_create_node_tx(1, 2, 2);
+        let b3 = make_create_node_tx(2, 3, 3);
+
+        hub.publish(&b1);
+        hub.publish(&b2);
+        assert_eq!(hub.peak_depth_for_client(&[7, 7]), 2);
+        assert_eq!(hub.max_peak_depth(), 2);
+
+        hub.publish(&b3);
+        assert!(hub.is_client_stale(&[7, 7]));
+        assert!(
+            rx.disconnect_token().is_cancelled(),
+            "overflow must wake a connection blocked in framed_write.send"
+        );
+
+        assert!(matches!(rx.try_recv(), Err(OutboundRecvError::Lagged(_))));
+        assert!(matches!(
+            rx.termination(),
+            Some(OutboundRecvError::Lagged(_))
+        ));
+    }
+
+    /// A connection woken by the disconnect token reads [`OutboundReceiver::termination`] to decide
+    /// between a clean unwind and `LaggedResyncRequired`, so the terminal state must be published
+    /// *before* the token fires (§20.2).
+    #[test]
+    fn test_close_marks_subscriber_closed_before_cancelling_disconnect_token() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ObservingWaker {
+            state: Arc<Mutex<SubscriberState>>,
+            observed_closed: Mutex<Option<bool>>,
+        }
+
+        impl Wake for ObservingWaker {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                let closed = self.state.lock().unwrap().is_closed;
+                *self.observed_closed.lock().unwrap() = Some(closed);
+            }
+        }
+
+        let hub = OutboundHub::new();
+        let rx = hub
+            .subscribe(vec![3], 4, 10, 1024 * 1024)
+            .expect("subscribe");
+
+        let observer = Arc::new(ObservingWaker {
+            state: Arc::clone(&rx.state),
+            observed_closed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&observer));
+        let mut cx = Context::from_waker(&waker);
+        let token = rx.disconnect_token().clone();
+        let mut cancelled = Box::pin(token.cancelled());
+        assert!(matches!(cancelled.as_mut().poll(&mut cx), Poll::Pending));
+
+        hub.close();
+
+        assert_eq!(
+            *observer.observed_closed.lock().unwrap(),
+            Some(true),
+            "disconnect token fired before the subscriber was marked closed; \
+             a clean shutdown would be reported as LaggedResyncRequired"
+        );
+    }
+
+    /// `client_instance_id` is client-supplied, so overflow bookkeeping must not grow without bound
+    /// across reconnect loops that mint a fresh id every attempt (§20.2).
+    #[test]
+    fn test_stale_client_tracking_is_bounded() {
+        let hub = OutboundHub::new();
+        let client_count = MAX_TRACKED_STALE_CLIENTS + 16;
+        let mut receivers = Vec::with_capacity(client_count);
+        for i in 0..client_count {
+            receivers.push(
+                hub.subscribe(i.to_be_bytes().to_vec(), 1, 10, 1024 * 1024)
+                    .expect("subscribe"),
+            );
+        }
+
+        hub.publish(&make_create_node_tx(0, 1, 1));
+        hub.publish(&make_create_node_tx(1, 2, 2));
+
+        assert!(
+            hub.tracked_stale_client_count() <= MAX_TRACKED_STALE_CLIENTS,
+            "stale-client bookkeeping must stay bounded, tracked {} entries for {} clients",
+            hub.tracked_stale_client_count(),
+            client_count
+        );
+    }
+
+    /// Publishing must convert the incoming wire transaction to its domain form once per commit,
+    /// not once per backed-up subscriber while holding the subscriber and state locks (§20.2).
+    #[test]
+    fn test_publish_converts_incoming_transaction_once() {
+        let hub = OutboundHub::new();
+        let mut receivers = Vec::new();
+        for i in 0..8u8 {
+            receivers.push(
+                hub.subscribe(vec![i], 4, 10, 1024 * 1024)
+                    .expect("subscribe"),
+            );
+        }
+
+        // Every subscriber now holds an unsent tail whose domain form is cached, so the absorb
+        // path runs for each of them on the publish under measurement.
+        hub.publish(&make_create_node_tx(0, 1, 1));
+        hub.publish(&make_scalar_tx(1, 2, 10, 1, "v2"));
+
+        WIRE_TO_DOMAIN_CONVERSIONS.with(|count| count.set(0));
+        hub.publish(&make_scalar_tx(2, 3, 10, 1, "v3"));
+        let conversions = WIRE_TO_DOMAIN_CONVERSIONS.with(std::cell::Cell::get);
+
+        assert_eq!(
+            conversions, 1,
+            "one publish must decode the incoming transaction once, not once per subscriber"
+        );
+    }
+
+    /// A poisoned lock must fail the connection that panicked, not every later publish and
+    /// subscribe on the daemon (same policy as `session::lock_or_recover`).
+    #[test]
+    fn test_hub_survives_poisoned_locks() {
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(vec![5], 4, 10, 1024 * 1024)
+            .expect("subscribe");
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = hub.subscribers.lock().unwrap();
+            panic!("deliberate poison of the subscribers lock");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = hub.stale_clients.lock().unwrap();
+            panic!("deliberate poison of the stale-client lock");
+        }));
+
+        let tx = make_create_node_tx(0, 1, 1);
+        hub.publish(&tx);
+        assert_eq!(rx.try_recv().expect("poll").expect("queued tx"), tx);
+        assert!(!hub.is_client_stale(&[5]));
+        let _second = hub
+            .subscribe(vec![6], 4, 10, 1024 * 1024)
+            .expect("subscribe must still work after a poisoned lock");
+    }
+
+    /// Disconnected subscribers must not accumulate on a session that goes idle between
+    /// connect/disconnect cycles (§20.2).
+    #[test]
+    fn test_dropped_receivers_do_not_accumulate() {
+        let hub = OutboundHub::new();
+        for _ in 0..5 {
+            let rx = hub
+                .subscribe(vec![1], 4, 10, 1024 * 1024)
+                .expect("subscribe");
+            drop(rx);
+        }
+
+        let _live = hub
+            .subscribe(vec![2], 4, 10, 1024 * 1024)
+            .expect("subscribe");
+
+        assert_eq!(
+            hub.subscriber_count(),
+            1,
+            "dropped receivers must be reaped rather than retained until the next publish"
+        );
+    }
+
+    /// `ClientHello.client_instance_id` is a proto3 `bytes` field with no non-empty requirement,
+    /// so an omitted id must still receive transactions rather than lose the connection.
+    #[test]
+    fn test_subscribe_accepts_empty_client_instance_id() {
+        let hub = OutboundHub::new();
+        let mut rx = hub
+            .subscribe(Vec::new(), 4, 10, 1024 * 1024)
+            .expect("empty client_instance_id is the proto3 default, not a handshake failure");
+
+        let tx = make_create_node_tx(0, 1, 1);
+        hub.publish(&tx);
+        assert_eq!(rx.try_recv().expect("poll").expect("queued tx"), tx);
+    }
+}

@@ -6,7 +6,7 @@
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
 //! Conforms to [`async-bounded-channel`](rules/async-bounded-channel.md):
-//! transaction broadcast channels are strictly bounded.
+//! per-connection outbound transaction queues are strictly bounded.
 
 mod handshake;
 mod snapshot;
@@ -15,7 +15,8 @@ pub use handshake::{FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::broadcast;
+
+use crate::outbound::{OutboundHub, OutboundReceiver, DEFAULT_OUTBOUND_QUEUE_CAPACITY};
 
 /// Lifecycle states of an authoritative semantic session (§17, App. B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -79,9 +80,6 @@ use srui_semantic_tree::{
 };
 use thiserror::Error;
 
-/// Capacity of the transaction broadcast channel (§20.2).
-pub const TRANSACTION_BROADCAST_CAPACITY: usize = 128;
-
 /// Type alias for event handler callbacks in `sessiond` (§29).
 pub type HandlerFn = Arc<dyn Fn(&Session, &Event) + Send + Sync + 'static>;
 
@@ -109,14 +107,20 @@ pub enum SessionError {
     #[error("lock poisoned")]
     LockPoisoned,
 
-    #[error("client lagged behind transaction broadcast; resync required")]
+    #[error("client outbound queue overflowed; resync required")]
     LaggedResyncRequired,
 
     #[error("replay unavailable for requested revision")]
     ReplayUnavailable,
 
-    #[error("transaction broadcast channel is closed")]
-    BroadcastClosed,
+    #[error("outbound transaction queue or hub is closed")]
+    OutboundClosed,
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
+    #[error("invalid configuration: {0}")]
+    InvalidConfiguration(String),
 
     #[error("session is in a terminal state ({0:?})")]
     TerminalState(SessionState),
@@ -125,19 +129,12 @@ pub enum SessionError {
     Panicked(String),
 }
 
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+/// Takes `mutex`, recovering from poisoning instead of propagating the panic.
+///
+/// A panic while a lock is held must fail the connection that panicked, not every later use of the
+/// daemon's shared state.
+pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-pub(crate) fn subscribe_tx_broadcast(
-    tx_broadcast: &Mutex<Option<broadcast::Sender<Transaction>>>,
-) -> Result<broadcast::Receiver<Transaction>, SessionError> {
-    tx_broadcast
-        .lock()
-        .map_err(|_| SessionError::LockPoisoned)?
-        .as_ref()
-        .map(|sender| sender.subscribe())
-        .ok_or(SessionError::BroadcastClosed)
 }
 
 /// Truncates a diagnostic string to the negotiated §26 `max_string_length` (UTF-8 safe).
@@ -250,9 +247,9 @@ pub struct SessionConfig {
     /// Must be positive; zero is rejected at session construction (same policy as
     /// `srui-sessiond --journal-capacity`).
     pub journal_capacity: usize,
-    /// Capacity of the bounded transaction broadcast channel (§20.2).
+    /// Capacity of the bounded per-connection outbound transaction queue (§20.2).
     /// Must be positive; zero is rejected at session construction, like `journal_capacity`.
-    pub broadcast_capacity: usize,
+    pub outbound_queue_capacity: usize,
 }
 
 impl Default for SessionConfig {
@@ -260,7 +257,7 @@ impl Default for SessionConfig {
         Self {
             capabilities: ServerCapabilities::standard_widgets(),
             journal_capacity: DEFAULT_MAX_JOURNAL_ENTRIES,
-            broadcast_capacity: TRANSACTION_BROADCAST_CAPACITY,
+            outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
         }
     }
 }
@@ -269,7 +266,8 @@ impl Default for SessionConfig {
 #[derive(Debug, Clone)]
 pub struct Session {
     pub(crate) inner: Arc<Mutex<SessionInner>>,
-    pub(crate) tx_broadcast: Arc<Mutex<Option<broadcast::Sender<Transaction>>>>,
+    pub(crate) outbound_hub: Arc<OutboundHub>,
+    pub(crate) outbound_queue_capacity: usize,
 }
 
 impl Default for Session {
@@ -304,34 +302,33 @@ impl Session {
         Self::with_capabilities(session_id, ServerCapabilities::standard_widgets())
     }
 
-    /// Creates a session with a custom transaction broadcast channel capacity.
+    /// Creates a session with a custom per-connection outbound transaction queue capacity.
     ///
     /// Intended for integration tests that exercise lag/resync behavior (§20.2).
-    #[doc(hidden)]
-    pub fn with_broadcast_capacity(session_id: impl Into<String>, capacity: usize) -> Self {
+    #[must_use]
+    pub fn with_outbound_queue_capacity(session_id: impl Into<String>, capacity: usize) -> Self {
         Self::with_config(
             session_id,
             SessionConfig {
-                broadcast_capacity: capacity,
+                outbound_queue_capacity: capacity,
                 ..SessionConfig::default()
             },
         )
     }
 
-    /// Drops the transaction broadcast sender so attached subscribers observe
-    /// [`broadcast::error::RecvError::Closed`] (§20.2).
-    #[doc(hidden)]
-    pub fn close_transaction_broadcast(&self) {
-        lock_or_recover(&self.tx_broadcast).take();
+    /// Drops all active outbound queues so attached subscribers observe
+    /// [`OutboundRecvError::Closed`] (§20.2).
+    pub fn close_outbound(&self) {
+        self.outbound_hub.close();
     }
 
     /// Creates a session with the given session ID and an explicit [`SessionConfig`] (§15, §18.1, §20.2).
     ///
     /// # Panics
     ///
-    /// Panics when `journal_capacity` or `broadcast_capacity` is zero. Both are refused rather
+    /// Panics when `journal_capacity` or `outbound_queue_capacity` is zero. Both are refused rather
     /// than clamped: a zero journal window silently degrades every reconnect to a snapshot resync
-    /// (§18.1), and a zero broadcast capacity cannot deliver a single transaction (§20.2).
+    /// (§18.1), and a zero outbound capacity cannot deliver a single transaction (§20.2).
     #[must_use]
     pub fn with_config(session_id: impl Into<String>, config: SessionConfig) -> Self {
         assert!(
@@ -340,19 +337,10 @@ impl Session {
              got 0. Use the default ({DEFAULT_MAX_JOURNAL_ENTRIES}) or pass an explicit window."
         );
         assert!(
-            config.broadcast_capacity > 0,
-            "SessionConfig::broadcast_capacity must be a positive integer (§20.2); \
-             got 0. Use the default ({TRANSACTION_BROADCAST_CAPACITY}) or pass an explicit capacity."
+            config.outbound_queue_capacity > 0,
+            "SessionConfig::outbound_queue_capacity must be a positive integer (§20.2); \
+             got 0. Use the default ({DEFAULT_OUTBOUND_QUEUE_CAPACITY}) or pass an explicit capacity."
         );
-        let (tx_broadcast, _) = broadcast::channel(config.broadcast_capacity);
-        Self::with_broadcast_sender(session_id, tx_broadcast, config)
-    }
-
-    fn with_broadcast_sender(
-        session_id: impl Into<String>,
-        tx_broadcast: broadcast::Sender<Transaction>,
-        config: SessionConfig,
-    ) -> Self {
         let limits = ServerLimits {
             max_frame_size: 16 * 1024 * 1024,
             max_transaction_operations: DEFAULT_MAX_TRANSACTION_OPERATIONS as u32,
@@ -376,12 +364,9 @@ impl Session {
 
         Self {
             inner: Arc::new(Mutex::new(inner)),
-            tx_broadcast: Arc::new(Mutex::new(Some(tx_broadcast))),
+            outbound_hub: Arc::new(OutboundHub::new()),
+            outbound_queue_capacity: config.outbound_queue_capacity,
         }
-    }
-
-    fn broadcast_sender(&self) -> Option<broadcast::Sender<Transaction>> {
-        lock_or_recover(&self.tx_broadcast).clone()
     }
 
     /// Creates a new `Session` with the given session ID and custom server capabilities (§15).
@@ -490,13 +475,37 @@ impl Session {
         tracing::info!(session_id = %guard.session_id, "Session marked as EXPIRED");
     }
 
-    /// Subscribes to committed transaction broadcasts (§20.2).
+    /// Subscribes to committed transactions for the specified `client_instance_id` (§20.2).
     ///
-    /// Returns [`SessionError::BroadcastClosed`] once [`Session::close_transaction_broadcast`] has
-    /// dropped the sender. That hook is test-only, but it is reachable from a live session, and a
-    /// panic here would take down the connection-accept task rather than failing one connection.
-    pub fn subscribe_transactions(&self) -> Result<broadcast::Receiver<Transaction>, SessionError> {
-        subscribe_tx_broadcast(&self.tx_broadcast)
+    /// Returns [`SessionError::OutboundClosed`] once [`Session::close_outbound`] has closed the hub.
+    pub fn subscribe_transactions(
+        &self,
+        client_instance_id: Vec<u8>,
+    ) -> Result<OutboundReceiver, SessionError> {
+        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let max_ops = guard.limits.max_transaction_operations as usize;
+        let max_frame_size = guard.limits.max_frame_size as usize;
+        let capacity = self.outbound_queue_capacity;
+        drop(guard);
+        self.outbound_hub
+            .subscribe(client_instance_id, capacity, max_ops, max_frame_size)
+    }
+
+    /// Clears the overflow stale marker after a catch-up snapshot has been written (§20.2).
+    pub(crate) fn clear_stale_client(&self, client_instance_id: &[u8]) {
+        self.outbound_hub.clear_stale_client(client_instance_id);
+    }
+
+    /// Returns a reference to the session's outbound transaction hub.
+    #[cfg(test)]
+    pub(crate) fn outbound_hub(&self) -> &Arc<OutboundHub> {
+        &self.outbound_hub
+    }
+
+    /// Returns the configured outbound transaction queue capacity.
+    #[must_use]
+    pub fn outbound_queue_capacity(&self) -> usize {
+        self.outbound_queue_capacity
     }
 
     /// Collects transactions to replay starting at `from_revision` using a borrowed journal iterator.
@@ -583,27 +592,29 @@ impl Session {
             }
         };
 
-        // Broadcast to attached bridges outside of the mutex lock (§20.2, async-no-lock-await)
-        if let Some(tx_broadcast) = self.broadcast_sender() {
-            let _ = tx_broadcast.send(tx);
-        }
+        // Publish to attached client queues outside of the mutex lock (§20.2, async-no-lock-await)
+        self.outbound_hub.publish(&tx);
         Ok(val)
     }
 
     /// Applies a wire transaction to the store, logs it to the journal,
-    /// and broadcasts it to attached client streams without holding locks across await.
+    /// and publishes it to attached client streams without holding locks across await.
     pub fn commit_transaction(&self, tx: Transaction) -> Result<Transaction, SessionError> {
         // Fast in-memory critical section (async-no-lock-await)
         {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            // Refuse anything the journal cannot record *before* the store mutates. The store owns
+            // committed revisions and cannot roll one back, so a transaction that passes
+            // `apply_wire_transaction` but fails `record` (a coalesced multi-revision span, for
+            // instance) would leave the journal behind the store and wedge every later commit on
+            // this session with `NonContiguousRevision` (§12.1, §18.1, §20.2).
+            guard.journal.check_admissible(&tx)?;
             guard.store.apply_wire_transaction(tx.clone())?;
             guard.journal.record(tx.clone())?;
         }
 
-        // Broadcast to attached bridges outside of the mutex lock
-        if let Some(tx_broadcast) = self.broadcast_sender() {
-            let _ = tx_broadcast.send(tx.clone());
-        }
+        // Publish to attached client queues outside of the mutex lock
+        self.outbound_hub.publish(&tx);
         Ok(tx)
     }
 
@@ -858,22 +869,102 @@ mod tests {
         );
     }
 
-    /// A zero broadcast capacity is refused on the same terms as a zero journal window, instead
+    /// A zero outbound queue capacity is refused on the same terms as a zero journal window, instead
     /// of being silently clamped to a capacity that cannot hold a transaction (§20.2).
     #[test]
-    fn test_session_config_rejects_zero_broadcast_capacity() {
+    fn test_session_config_rejects_zero_outbound_queue_capacity() {
         let result = std::panic::catch_unwind(|| {
             let _ = Session::with_config(
-                "zero-broadcast",
+                "zero-outbound",
                 SessionConfig {
-                    broadcast_capacity: 0,
+                    outbound_queue_capacity: 0,
                     ..SessionConfig::default()
                 },
             );
         });
         assert!(
             result.is_err(),
-            "zero broadcast_capacity must be rejected (§20.2)"
+            "zero outbound_queue_capacity must be rejected (§20.2)"
         );
+    }
+
+    /// The journal only accepts single-step spans, so a transaction it will refuse must be rejected
+    /// *before* the store mutates. Otherwise the store advances, the journal does not, and every
+    /// later commit on the session fails with `NonContiguousRevision` forever (§12.1, §18.1, §20.2).
+    #[test]
+    fn test_commit_transaction_rejects_inadmissible_span_without_advancing_store() {
+        use srui_sdk::Surface;
+        use srui_semantic_tree::{Operation, Revision, Transaction as DomainTransaction};
+
+        let session = Session::new("span-guard");
+        session
+            .transaction(|ui| {
+                Surface::builder(NodeId::new(1)).create(ui)?;
+                Ok(())
+            })
+            .expect("initial surface");
+        assert_eq!(session.current_revision(), 1);
+
+        let coalesced = DomainTransaction::with_revisions(
+            Revision::new(1),
+            Revision::new(5),
+            [Operation::SetProperty {
+                id: NodeId::new(1),
+                property: PropertyRef::LABEL,
+                value: Value::String("coalesced".to_string()),
+            }],
+            0,
+        );
+        let wire: Transaction = (&coalesced).into();
+
+        let err = session
+            .commit_transaction(wire)
+            .expect_err("a multi-revision span is not journal-admissible");
+        assert!(
+            matches!(
+                err,
+                SessionError::Journal(JournalError::InvalidRevisionRange { base: 1, new: 5 })
+            ),
+            "expected a journal rejection, got {err:?}"
+        );
+        assert_eq!(
+            session.current_revision(),
+            1,
+            "a refused transaction must leave the store on its committed revision"
+        );
+
+        session
+            .transaction(|ui| {
+                ui.set(NodeId::new(1), PropertyRef::LABEL, "after")?;
+                Ok(())
+            })
+            .expect("session must remain committable after a refused transaction");
+        assert_eq!(session.current_revision(), 2);
+    }
+
+    /// `ClientHello.client_instance_id` is a proto3 `bytes` field with no documented non-empty
+    /// requirement; omitting it must not drop the socket without a diagnostic (§15, §18).
+    #[test]
+    fn test_bootstrap_fresh_client_accepts_empty_client_instance_id() {
+        let session = Session::new("empty-instance-id");
+        let hello = srui_protocol::ClientHello {
+            core_version: "0.4.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: Vec::new(),
+            client_metadata: Default::default(),
+        };
+
+        let bootstrap = session
+            .bootstrap_fresh_client(&hello)
+            .expect("empty client_instance_id must complete the handshake");
+        assert_eq!(bootstrap.welcome.session_id, "empty-instance-id");
+        assert!(bootstrap.transactions.termination().is_none());
+    }
+
+    #[test]
+    fn test_outbound_hub_accessible() {
+        let session = Session::new("test-outbound-hub");
+        assert!(!session.outbound_hub().is_closed());
     }
 }

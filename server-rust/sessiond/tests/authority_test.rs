@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::duplex;
-use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
@@ -132,7 +131,9 @@ async fn test_client_transaction_rejected_without_mutating_authority() {
     let session = Arc::new(Session::new("authority-test"));
     let shutdown = CancellationToken::new();
     let surface_id = NodeId::new(1);
-    let mut broadcast_rx = session.subscribe_transactions().expect("broadcast open");
+    let mut broadcast_rx = session
+        .subscribe_transactions(vec![1, 2, 3])
+        .expect("broadcast open");
     session
         .transaction(|ui| {
             Surface::builder(surface_id)
@@ -197,7 +198,7 @@ async fn test_client_transaction_rejected_without_mutating_authority() {
             .expect("journal replay still available"),
         baseline_journal
     );
-    assert!(matches!(broadcast_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(broadcast_rx.try_recv().unwrap(), None);
 }
 
 #[tokio::test]
@@ -210,7 +211,9 @@ async fn test_client_transaction_on_pristine_session_rejected() {
         .collect_replayed_transactions(0)
         .expect("empty journal replay");
     assert!(baseline_journal.is_empty());
-    let mut broadcast_rx = session.subscribe_transactions().expect("broadcast open");
+    let mut broadcast_rx = session
+        .subscribe_transactions(vec![1, 2, 3])
+        .expect("broadcast open");
 
     let (mut client_write, _client_read, server_task) =
         connect_client(session.clone(), shutdown).await;
@@ -242,7 +245,7 @@ async fn test_client_transaction_on_pristine_session_rejected() {
             .expect("journal replay still available"),
         baseline_journal
     );
-    assert!(matches!(broadcast_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(broadcast_rx.try_recv().unwrap(), None);
 }
 
 #[tokio::test]

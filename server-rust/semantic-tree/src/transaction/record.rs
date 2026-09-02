@@ -53,4 +53,108 @@ impl Transaction {
             priority,
         }
     }
+
+    /// Returns `true` if all operations in this transaction are scalar `SetProperty` operations (§7.6, §20.2).
+    pub fn is_coalesceable(&self) -> bool {
+        !self.operations.is_empty()
+            && self.operations.iter().all(|op| match op {
+                Operation::SetProperty { value, .. } => value.is_scalar(),
+                _ => false,
+            })
+    }
+
+    /// Attempts to absorb an adjacent transaction into `self` if both are contiguous,
+    /// have matching priority, consist entirely of scalar `SetProperty` mutations,
+    /// and the merged result stays within `max_ops` and `max_frame_size` (§20.2, §26).
+    ///
+    /// Retains the latest value per `(NodeId, PropertyRef)`.
+    pub fn try_absorb(
+        &mut self,
+        incoming: &Transaction,
+        max_ops: usize,
+        max_frame_size: usize,
+    ) -> bool {
+        if self.priority != incoming.priority {
+            return false;
+        }
+        if self.new_revision != incoming.base_revision {
+            return false;
+        }
+        if !self.is_coalesceable() || !incoming.is_coalesceable() {
+            return false;
+        }
+
+        use crate::ids::{NodeId, PropertyRef};
+        use prost::Message;
+        use std::collections::HashMap;
+
+        let mut key_map: HashMap<(NodeId, PropertyRef), usize> =
+            HashMap::with_capacity(self.operations.len() + incoming.operations.len());
+        for (idx, op) in self.operations.iter().enumerate() {
+            if let Operation::SetProperty { id, property, .. } = op {
+                key_map.insert((*id, *property), idx);
+            }
+        }
+
+        let new_keys_count = incoming
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    Operation::SetProperty { id, property, .. }
+                        if !key_map.contains_key(&(*id, *property))
+                )
+            })
+            .count();
+
+        if self.operations.len() + new_keys_count > max_ops {
+            return false;
+        }
+
+        let mut merged_ops = self.operations.clone();
+        for op in &incoming.operations {
+            if let Operation::SetProperty {
+                id,
+                property,
+                value,
+            } = op
+            {
+                let key = (*id, *property);
+                if let Some(&idx) = key_map.get(&key) {
+                    merged_ops[idx] = Operation::SetProperty {
+                        id: *id,
+                        property: *property,
+                        value: value.clone(),
+                    };
+                } else {
+                    let idx = merged_ops.len();
+                    merged_ops.push(Operation::SetProperty {
+                        id: *id,
+                        property: *property,
+                        value: value.clone(),
+                    });
+                    key_map.insert(key, idx);
+                }
+            }
+        }
+
+        let test_txn = Transaction {
+            base_revision: self.base_revision,
+            new_revision: incoming.new_revision,
+            operations: merged_ops,
+            priority: self.priority,
+        };
+        let wire: srui_protocol::Transaction = (&test_txn).into();
+        let envelope = srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(wire)),
+        };
+        if envelope.encoded_len() > max_frame_size {
+            return false;
+        }
+
+        self.operations = test_txn.operations;
+        self.new_revision = incoming.new_revision;
+        true
+    }
 }

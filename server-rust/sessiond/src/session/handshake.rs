@@ -1,7 +1,15 @@
-//! Atomic client attach: catch-up plus broadcast subscribe under one lock section (§15, §18, §20.2, §21).
+//! Atomic client attach: catch-up plus bounded outbound subscribe under one lock section
+//! (§15, §18, §18.1, §20.2, §21).
+//!
+//! # Lock Order
+//!
+//! Bootstrap holds the [`SessionInner`](super::SessionInner) lock across
+//! [`OutboundHub::subscribe`](crate::outbound::OutboundHub::subscribe) and
+//! `OutboundHub::is_client_stale`, so the session lock is always the outermost of the two; the hub
+//! itself nests `subscribers -> SubscriberState -> stale_clients`. Nothing may take a hub lock
+//! before the session lock, or the two orders deadlock.
 
-use tokio::sync::broadcast;
-
+use crate::outbound::OutboundReceiver;
 use srui_protocol::{
     ClientHello, ClientResume, ExtensionNamespaceMapping, ServerResumeOk, ServerResyncRequired,
     ServerWelcome, SessionContinuity, Transaction,
@@ -9,7 +17,7 @@ use srui_protocol::{
 use srui_semantic_tree::{CapabilitySet, Profile, SemanticStore};
 
 use super::snapshot::export_snapshot_transaction;
-use super::{subscribe_tx_broadcast, Session, SessionError};
+use super::{Session, SessionError};
 
 /// Result of an atomic fresh-client handshake bootstrap (§15, §18, §20.2).
 #[derive(Debug)]
@@ -18,8 +26,8 @@ pub struct FreshClientBootstrap {
     pub welcome: ServerWelcome,
     /// Catch-up snapshot transaction for populated sessions, or `None` if revision is 0 (§18).
     pub snapshot: Option<Transaction>,
-    /// Bounded broadcast receiver capturing every subsequent transaction committed to the session (§20.2).
-    pub transactions: broadcast::Receiver<Transaction>,
+    /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
+    pub transactions: OutboundReceiver,
 }
 
 /// Result of an atomic resume handshake bootstrap (§20.2, §21, §32.5).
@@ -27,8 +35,8 @@ pub struct FreshClientBootstrap {
 pub struct ResumeClientBootstrap {
     /// Replay or resync catch-up collected under the same lock as [`Self::transactions`].
     pub outcome: ResumeOutcome,
-    /// Bounded broadcast receiver capturing every subsequent transaction committed to the session (§20.2).
-    pub transactions: broadcast::Receiver<Transaction>,
+    /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
+    pub transactions: OutboundReceiver,
 }
 
 /// Outcome of a [`ClientResume`] handshake request.
@@ -82,11 +90,29 @@ fn negotiate_hello(
     Ok((welcome, store_clone))
 }
 
-fn resync_reason(continuity: SessionContinuity) -> &'static str {
-    match continuity {
-        SessionContinuity::SameSession => "client revision outside retained journal window",
-        SessionContinuity::Replaced => "requested session incarnation is no longer available",
-        SessionContinuity::Unspecified => unreachable!("server always sets continuity"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResyncCause {
+    ReplacedIncarnation,
+    OutboundQueueOverflow,
+    JournalGap,
+}
+
+impl ResyncCause {
+    fn continuity(self) -> SessionContinuity {
+        match self {
+            Self::ReplacedIncarnation => SessionContinuity::Replaced,
+            Self::OutboundQueueOverflow | Self::JournalGap => SessionContinuity::SameSession,
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::ReplacedIncarnation => "requested session incarnation is no longer available",
+            Self::OutboundQueueOverflow => {
+                "outbound transaction queue overflowed; full state resynchronization required (§20.2)"
+            }
+            Self::JournalGap => "client revision outside retained journal window",
+        }
     }
 }
 
@@ -94,13 +120,9 @@ impl Session {
     /// Atomically prepares a fresh client handshake and subscribes it to transactions (§15, §18, §20.2).
     ///
     /// Evaluates `ClientHello`, negotiates capabilities, constructs `ServerWelcome`, clones
-    /// authoritative state when `initial_revision > 0`, and subscribes to `tx_broadcast` while
+    /// authoritative state when `initial_revision > 0`, and subscribes to outbound hub while
     /// holding the session lock so no concurrent transaction commit can be missed between catch-up
-    /// capture and subscription. Snapshot encoding happens after both locks are dropped.
-    ///
-    /// # Lock Order
-    /// Acquires `inner -> tx_broadcast`. All other session operations acquire at most one of these mutexes,
-    /// preserving strict deadlock freedom.
+    /// clone and live distribution.
     ///
     /// # Revision-Zero Omission
     /// When `initial_revision == 0`, `snapshot` is `None` because an empty `0 -> 0` snapshot violates normal
@@ -109,7 +131,7 @@ impl Session {
     /// # Errors
     /// Returns [`SessionError::Negotiation`] if capability negotiation fails against client profiles.
     /// Returns [`SessionError::LockPoisoned`] if an internal mutex is poisoned.
-    /// Returns [`SessionError::BroadcastClosed`] if the transaction broadcast sender has been closed.
+    /// Returns [`SessionError::OutboundClosed`] if the outbound hub has been closed.
     pub fn bootstrap_fresh_client(
         &self,
         hello: &ClientHello,
@@ -117,6 +139,8 @@ impl Session {
         self.bootstrap_fresh_client_with(hello, || {})
     }
 
+    /// [`Self::bootstrap_fresh_client`] with a callback run immediately before subscription while
+    /// the session lock is held, used by tests to interleave a commit with the catch-up clone.
     pub(crate) fn bootstrap_fresh_client_with<F>(
         &self,
         hello: &ClientHello,
@@ -130,7 +154,14 @@ impl Session {
 
         before_subscribe();
 
-        let transactions = subscribe_tx_broadcast(&self.tx_broadcast)?;
+        let max_ops = inner_guard.limits.max_transaction_operations as usize;
+        let max_frame_size = inner_guard.limits.max_frame_size as usize;
+        let transactions = self.outbound_hub.subscribe(
+            hello.client_instance_id.clone(),
+            self.outbound_queue_capacity,
+            max_ops,
+            max_frame_size,
+        )?;
         drop(inner_guard);
 
         Ok(FreshClientBootstrap {
@@ -140,19 +171,12 @@ impl Session {
         })
     }
 
-    /// Atomically prepares a resume handshake and subscribes it to transactions (§20.2, §21, §32.5).
+    /// Atomically prepares a client resume and subscribes it to transactions (§18, §18.1, §20.2).
     ///
-    /// Collects journal replay or a store clone for resync, then subscribes to `tx_broadcast` while
-    /// still holding `inner`, so a concurrent commit cannot land in the broadcast between catch-up
-    /// capture and subscription. Resync snapshot encoding happens after both locks are dropped.
-    ///
-    /// # Lock Order
-    /// Acquires `inner -> tx_broadcast`. All other session operations acquire at most one of these mutexes,
-    /// preserving strict deadlock freedom.
-    ///
-    /// # Errors
-    /// Returns [`SessionError::LockPoisoned`] if an internal mutex is poisoned.
-    /// Returns [`SessionError::BroadcastClosed`] if the transaction broadcast sender has been closed.
+    /// Replaced session incarnations are evaluated first (§18.1). If the session incarnation matches
+    /// but the client detached due to outbound queue overflow (§20.2), full state resync is forced.
+    /// If neither applies and `last_applied_revision` is within the retained journal window,
+    /// a replay is prepared; otherwise, same-session snapshot resync is returned.
     pub fn bootstrap_resume(
         &self,
         resume: &ClientResume,
@@ -160,6 +184,8 @@ impl Session {
         self.bootstrap_resume_with(resume, || {})
     }
 
+    /// [`Self::bootstrap_resume`] with a callback run immediately before subscription while the
+    /// session lock is held, used by tests to interleave a commit with the replay collection.
     pub(crate) fn bootstrap_resume_with<F>(
         &self,
         resume: &ClientResume,
@@ -179,6 +205,7 @@ impl Session {
                 snapshot_revision: u64,
                 store_snapshot: SemanticStore,
                 continuity: SessionContinuity,
+                reason: String,
                 last_processed_event_seq: u64,
             },
         }
@@ -188,18 +215,38 @@ impl Session {
             .dedupe
             .last_contiguous_processed_seq(&resume.client_instance_id);
 
-        // A session ID is an incarnation token, not a human-readable application name. A
-        // mismatch means the requested session is gone, so old client intents must not be
-        // replayed against this authoritative state.
-        let plan = if resume.session_id != inner_guard.session_id {
+        // Evaluate cause: replaced incarnation takes precedence, then outbound overflow, then journal gap
+        let resync_cause = if resume.session_id != inner_guard.session_id {
+            Some(ResyncCause::ReplacedIncarnation)
+        } else if self
+            .outbound_hub
+            .is_client_stale(&resume.client_instance_id)
+        {
+            Some(ResyncCause::OutboundQueueOverflow)
+        } else if inner_guard
+            .journal
+            .iter_from(resume.last_applied_revision)
+            .is_none()
+        {
+            Some(ResyncCause::JournalGap)
+        } else {
+            None
+        };
+
+        let plan = if let Some(cause) = resync_cause {
             ResumePlan::Resync {
                 session_id: inner_guard.session_id.clone(),
                 snapshot_revision: inner_guard.store.revision().get(),
                 store_snapshot: inner_guard.store.clone_staging(),
-                continuity: SessionContinuity::Replaced,
+                continuity: cause.continuity(),
+                reason: cause.reason().to_string(),
                 last_processed_event_seq,
             }
-        } else if let Some(iter) = inner_guard.journal.iter_from(resume.last_applied_revision) {
+        } else {
+            let iter = inner_guard
+                .journal
+                .iter_from(resume.last_applied_revision)
+                .unwrap();
             ResumePlan::Replay {
                 welcome_msg: ServerResumeOk {
                     session_id: inner_guard.session_id.clone(),
@@ -208,19 +255,18 @@ impl Session {
                 },
                 replayed: iter.cloned().collect(),
             }
-        } else {
-            ResumePlan::Resync {
-                session_id: inner_guard.session_id.clone(),
-                snapshot_revision: inner_guard.store.revision().get(),
-                store_snapshot: inner_guard.store.clone_staging(),
-                continuity: SessionContinuity::SameSession,
-                last_processed_event_seq,
-            }
         };
 
         before_subscribe();
 
-        let transactions = subscribe_tx_broadcast(&self.tx_broadcast)?;
+        let max_ops = inner_guard.limits.max_transaction_operations as usize;
+        let max_frame_size = inner_guard.limits.max_frame_size as usize;
+        let transactions = self.outbound_hub.subscribe(
+            resume.client_instance_id.clone(),
+            self.outbound_queue_capacity,
+            max_ops,
+            max_frame_size,
+        )?;
         drop(inner_guard);
 
         let outcome = match plan {
@@ -236,12 +282,13 @@ impl Session {
                 snapshot_revision,
                 store_snapshot,
                 continuity,
+                reason,
                 last_processed_event_seq,
             } => ResumeOutcome::Resync {
                 resync_msg: ServerResyncRequired {
                     session_id,
                     snapshot_revision,
-                    reason: resync_reason(continuity).to_string(),
+                    reason,
                     continuity: continuity as i32,
                     last_processed_event_seq,
                 },
@@ -270,6 +317,95 @@ mod tests {
             client_instance_id: vec![1, 2],
             client_metadata: Default::default(),
         }
+    }
+
+    fn empty_tx(base: u64, new_rev: u64) -> Transaction {
+        Transaction {
+            base_revision: base,
+            new_revision: new_rev,
+            priority: 1,
+            operations: vec![],
+        }
+    }
+
+    #[test]
+    fn test_replaced_incarnation_precedes_outbound_overflow_stale() {
+        let session = Session::with_outbound_queue_capacity("live-incarnation", 1);
+        let client = vec![9, 9];
+        let _rx = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe");
+
+        session
+            .commit_transaction(empty_tx(0, 1))
+            .expect("fill queue");
+        session
+            .commit_transaction(empty_tx(1, 2))
+            .expect("overflow");
+        assert!(session.outbound_hub().is_client_stale(&client));
+
+        let resume = ClientResume {
+            session_id: "old-incarnation".to_string(),
+            client_instance_id: client,
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+        };
+        let bootstrap = session.bootstrap_resume(&resume).expect("resume");
+        match bootstrap.outcome {
+            ResumeOutcome::Resync { resync_msg, .. } => {
+                assert_eq!(
+                    SessionContinuity::try_from(resync_msg.continuity),
+                    Ok(SessionContinuity::Replaced)
+                );
+                assert!(resync_msg.reason.contains("incarnation"));
+            }
+            other => panic!("expected Replaced resync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_overflow_stale_survives_resume_bootstrap_until_snapshot_ack() {
+        let session = Session::with_outbound_queue_capacity("overflow-session", 1);
+        let client = vec![4, 2];
+        let _rx = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe");
+
+        session
+            .commit_transaction(empty_tx(0, 1))
+            .expect("fill queue");
+        session
+            .commit_transaction(empty_tx(1, 2))
+            .expect("overflow");
+        assert!(session.outbound_hub().is_client_stale(&client));
+
+        let resume = ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: client.clone(),
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+        };
+        let bootstrap = session.bootstrap_resume(&resume).expect("resume");
+        match bootstrap.outcome {
+            ResumeOutcome::Resync { resync_msg, .. } => {
+                assert_eq!(
+                    SessionContinuity::try_from(resync_msg.continuity),
+                    Ok(SessionContinuity::SameSession)
+                );
+                assert!(resync_msg
+                    .reason
+                    .contains("outbound transaction queue overflowed"));
+            }
+            other => panic!("expected overflow resync, got {other:?}"),
+        }
+        assert!(
+            session.outbound_hub().is_client_stale(&client),
+            "stale must remain until the snapshot write completes"
+        );
+        session.clear_stale_client(&client);
+        assert!(!session.outbound_hub().is_client_stale(&client));
     }
 
     #[test]
@@ -399,7 +535,8 @@ mod tests {
         let rec_tx = bootstrap0
             .transactions
             .try_recv()
-            .expect("receive broadcast");
+            .expect("receive broadcast")
+            .unwrap();
         assert_eq!(rec_tx.new_revision, 1);
 
         let bootstrap1 = session
@@ -492,7 +629,8 @@ mod tests {
         let streamed = bootstrap
             .transactions
             .try_recv()
-            .expect("post-snapshot transaction");
+            .expect("post-snapshot transaction")
+            .unwrap();
         assert_eq!(streamed.base_revision, snapshot.new_revision);
         assert_eq!(streamed.new_revision, snapshot.new_revision + 1);
     }
@@ -572,7 +710,8 @@ mod tests {
         let streamed = bootstrap
             .transactions
             .try_recv()
-            .expect("post-replay transaction");
+            .expect("post-replay transaction")
+            .unwrap();
         assert_eq!(streamed.base_revision, 1);
         assert_eq!(streamed.new_revision, 2);
     }

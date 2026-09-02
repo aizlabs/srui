@@ -134,6 +134,11 @@ public struct Transaction: Equatable, Sendable {
         self.operations = operations
         self.priority = priority
     }
+
+    /// Returns `true` if all operations in this transaction are scalar `setProperty` mutations (§7.6, §20.2).
+    public var isCoalesceable: Bool {
+        !operations.isEmpty && operations.allSatisfy(\.isScalarSetProperty)
+    }
 }
 
 // MARK: - Transaction Applier (§12.1, §18, §22)
@@ -267,6 +272,10 @@ public final class TransactionApplier: @unchecked Sendable {
     }
 
     /// Applies a structured `Transaction` record, validating its base and target revisions.
+    ///
+    /// Single-step increments (`newRevision == baseRevision.next`) accept arbitrary operations.
+    /// Multi-revision forward spans (`newRevision > baseRevision.next`) are legal exclusively for
+    /// coalesced scalar updates (`record.isCoalesceable`).
     public func apply(record: Transaction) -> Result<Revision, TxnError> {
         applyCommitted(record: record).map(\.revision)
     }
@@ -291,11 +300,19 @@ public final class TransactionApplier: @unchecked Sendable {
             )
         }
 
-        let expectedNewRevision = record.baseRevision.next
-        if record.newRevision != expectedNewRevision {
+        guard record.newRevision >= record.baseRevision.next else {
             return .failure(
                 .invalidNewRevision(
-                    expected: expectedNewRevision,
+                    expected: record.baseRevision.next,
+                    actual: record.newRevision
+                )
+            )
+        }
+
+        if record.newRevision > record.baseRevision.next && !record.isCoalesceable {
+            return .failure(
+                .invalidNewRevision(
+                    expected: record.baseRevision.next,
                     actual: record.newRevision
                 )
             )

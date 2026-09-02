@@ -296,7 +296,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Subscribe before the initial transaction so the very first line reports the full snapshot
     // every later tick is compared against.
     if options.wire_stats {
-        let mut receiver = session.subscribe_transactions()?;
+        let mut receiver =
+            session.subscribe_transactions(b"process-monitor-wire-stats".to_vec())?;
         let stats_shutdown = shutdown.clone();
         tasks.spawn(async move {
             loop {
@@ -306,10 +307,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(stats) => info!(target: "srui::wire_stats", "{stats}"),
                             Err(error) => warn!(target: "srui::wire_stats", "{error}"),
                         },
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            warn!("wire-stats observer lagged by {skipped} transactions");
+                        Err(srui_sessiond::OutboundRecvError::Lagged(reason)) => {
+                            warn!("wire-stats observer lagged: {reason}; closing");
+                            break;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(srui_sessiond::OutboundRecvError::Closed) => break,
                     },
                     _ = stats_shutdown.cancelled() => break,
                 }

@@ -776,6 +776,17 @@ public final class SessionController: @unchecked Sendable {
     /// the server would refuse again, forever.
     private func handleEventAck(_ ack: SRUIServerEventAck) async {
         let eventId = EventId(ack.eventID)
+        // `session_id` is required on every ack (§18.2): it is the only proof of which incarnation
+        // settled the event. Accepting an ack without it and logging would leave the event pending
+        // forever — replayed on every retry, answered `duplicate`, never settled — until the
+        // sequence window is exhausted, so a missing required semantic fails here (§4 inv. 13).
+        guard !ack.sessionID.isEmpty else {
+            await reportFailure(.protocolViolation(
+                "SERVER EVENT_ACK for event \(eventId) omitted the required session_id"
+            ))
+            return
+        }
+
         // The full wire identity is handed to the outbox so the identity check and the mutation it
         // guards share one actor-isolated step (§18.2).
         let settled = await outbox.settleAcknowledgement(
@@ -836,14 +847,29 @@ public final class SessionController: @unchecked Sendable {
         // handed exactly the store produced by this transaction (§22.2).
         let applyResult: Result<TransactionSnapshot, TxnError>
         if isResyncSnapshot {
-            // A snapshot replaces the entire replica, so the supersession check and the apply run
-            // inside one outbox critical section: checking here and applying after a suspension
-            // would let a newer attempt open in between and the stale snapshot still land on the
-            // shared applier (§18). A live resync carries no generation and is checked the same
-            // way — another controller's outstanding attempt must block it too.
-            guard let claimed = await outbox.withUnsupersededResume(outstandingGeneration, {
-                self.applier.applyResyncSnapshot(record: domainTx)
-            }) else {
+            // A snapshot replaces the entire replica, so the supersession check, the publish, and
+            // the latch release run inside one outbox critical section: checking here and
+            // publishing after a suspension would let a newer attempt open in between and the
+            // stale snapshot still land on the shared applier (§18). The rebuild happens before
+            // that section so it never occupies the outbox actor while acknowledgements wait
+            // (§22.2). A live resync carries no generation and is checked the same way — another
+            // controller's outstanding attempt must block it too.
+            let prepared: PreparedResyncSnapshot
+            switch applier.prepareResyncSnapshot(record: domainTx) {
+            case .success(let snapshot):
+                prepared = snapshot
+            case .failure(let error):
+                await handleTransactionRejection(error, isResyncSnapshot: true)
+                return
+            }
+            guard let published = await outbox.commitResyncSnapshot(
+                generation: outstandingGeneration,
+                publish: { self.applier.publishResyncSnapshot(prepared) },
+                committed: { result in
+                    guard case .success = result else { return false }
+                    return true
+                }
+            ) else {
                 let context = "resync snapshot arrived after a newer reconnect attempt"
                 if let outstandingGeneration {
                     await failRefusedResumeDecision(outstandingGeneration, context)
@@ -852,7 +878,7 @@ public final class SessionController: @unchecked Sendable {
                 }
                 return
             }
-            applyResult = claimed
+            applyResult = published
         } else {
             applyResult = applier.applyCommitted(record: domainTx)
         }
@@ -928,20 +954,16 @@ public final class SessionController: @unchecked Sendable {
         await reportFailure(.transportEnded("pending event replay failed: \(error)"))
     }
 
-    /// Re-enables the outbox and data-plane after a committed catch-up or resync snapshot.
+    /// Commits controller state after a catch-up or resync snapshot committed under the latch.
+    ///
+    /// The outbox latch was already released inside the critical section that published the
+    /// snapshot (`commitResyncSnapshot`), so there is no second supersession decision to lose
+    /// here: an attempt that opens now supersedes this controller the ordinary way, and
+    /// `finalizeResumeAttempt` hands the generation back if teardown or divergence raced it.
     private func completeSnapshotCatchUp() async {
         withStateLock { self.pendingResync = false }
         let generation = withStateLock { self.resumeGeneration }
         if let generation {
-            guard await outbox.finishResync(generation: generation) else {
-                // The latch belongs to a newer attempt, so this controller can never leave
-                // `.awaitingSnapshot`. Report it instead of holding a mute transport (§18).
-                await failRefusedResumeDecision(
-                    generation,
-                    "resync completed after a newer reconnect attempt"
-                )
-                return
-            }
             await finalizeResumeAttempt(generation) {
                 self.resumeGeneration = nil
                 self.eventDispatchEnabled = true
@@ -950,14 +972,6 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
         } else {
-            guard await outbox.allowNewEvents() else {
-                // Another controller opened a reconnect generation while this catch-up was in
-                // flight; re-enabling allocation here would break the latch it is waiting on.
-                await reportFailure(.superseded(
-                    "catch-up completed while another reconnect attempt was outstanding"
-                ))
-                return
-            }
             withStateLock {
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
                 if case .awaitingSnapshot(let negotiated) = self.phase {
@@ -1053,24 +1067,15 @@ public final class SessionController: @unchecked Sendable {
     public func stop() async {
         let stoppedState: (
             receiveTask: Task<Void, Never>?,
-            replayGeneration: UInt64?,
             shouldStop: Bool
         ) = withStateLock {
-            guard isRunning else { return (nil, nil, false) }
+            guard isRunning else { return (nil, false) }
             isRunning = false
             eventDispatchEnabled = false
-            return (
-                receiveTask,
-                resumeGeneration ?? activeReplayRetryGeneration,
-                true
-            )
+            return (receiveTask, true)
         }
 
         guard stoppedState.shouldStop else { return }
-
-        if let replayGeneration = stoppedState.replayGeneration {
-            await outbox.stopResumeWork(generation: replayGeneration)
-        }
 
         // Close the transport first so the receive loop drains any buffered catch-up frames
         // (welcome snapshot, replay) while handshake phase is still valid. Resetting `phase` or
@@ -1096,6 +1101,17 @@ public final class SessionController: @unchecked Sendable {
             }
             receiveTask.cancel()
             await receiveTask.value
+        }
+
+        // Release the resume latch only after the drain: the frames the drain exists to consume
+        // are exactly the ones the latch guards — a buffered `SERVER RESUME_OK` would be refused
+        // and reported as supersession on a deliberate stop, and a buffered catch-up snapshot
+        // would be dropped instead of applied (§18). Allocation of new events is already blocked
+        // by `eventDispatchEnabled == false` above, so holding the latch across the drain admits
+        // nothing.
+        let replayGeneration = withStateLock { resumeGeneration ?? activeReplayRetryGeneration }
+        if let replayGeneration {
+            await outbox.stopResumeWork(generation: replayGeneration)
         }
 
         clearSessionStateAfterStop()

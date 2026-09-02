@@ -153,6 +153,17 @@ public struct TransactionSnapshot: Equatable, Sendable {
     }
 }
 
+/// A resync snapshot rebuilt off-lock and ready to publish (§18, §20.2, §22.2).
+public struct PreparedResyncSnapshot: Sendable {
+    fileprivate let store: SemanticStore
+    fileprivate let revision: Revision
+
+    fileprivate init(store: SemanticStore, revision: Revision) {
+        self.store = store
+        self.revision = revision
+    }
+}
+
 /// Synchronous transaction gateway whose mutable state is protected by `lock`.
 ///
 /// The `@unchecked Sendable` conformance is justified by locking every read and write of
@@ -313,8 +324,23 @@ public final class TransactionApplier: @unchecked Sendable {
 
     /// Applies a resync snapshot and atomically returns the committed snapshot (§18, §20.2, §22.2).
     public func applyResyncSnapshot(record: Transaction) -> Result<TransactionSnapshot, TxnError> {
+        prepareResyncSnapshot(record: record).flatMap(publishResyncSnapshot)
+    }
+
+    /// Rebuilds a resync snapshot off-lock, ready for `publishResyncSnapshot` (§18, §20.2, §22.2).
+    ///
+    /// A snapshot replaces the whole replica, so nothing but the store limits and the monotonic
+    /// revision guard depends on current state: the rebuild — up to the §26 node limit — runs
+    /// without the lock, and only the swap in `publishResyncSnapshot` is serialized. A caller that
+    /// must decide whether the snapshot is still current therefore holds its own latch across the
+    /// swap alone instead of across the entire rebuild (§22.2).
+    public func prepareResyncSnapshot(
+        record: Transaction
+    ) -> Result<PreparedResyncSnapshot, TxnError> {
         lock.lock()
-        defer { lock.unlock() }
+        let limits = _store.limits
+        let lastAppliedRevision = _lastAppliedRevision
+        lock.unlock()
 
         guard record.baseRevision == .initial else {
             return .failure(
@@ -324,21 +350,21 @@ public final class TransactionApplier: @unchecked Sendable {
 
         // §12.1: committed revisions are monotonically increasing and never repeat downwards.
         // A snapshot may re-state the revision we already hold, but must never regress it.
-        guard record.newRevision >= _lastAppliedRevision else {
+        guard record.newRevision >= lastAppliedRevision else {
             return .failure(
                 .invalidNewRevision(
-                    expected: _lastAppliedRevision,
+                    expected: lastAppliedRevision,
                     actual: record.newRevision
                 )
             )
         }
 
-        let maxOps = _store.limits.maxTransactionOperations
+        let maxOps = limits.maxTransactionOperations
         if record.operations.count > maxOps {
             return .failure(.maxOperationsExceeded(limit: maxOps, actual: record.operations.count))
         }
 
-        var staged = SemanticStore(limits: _store.limits, revision: .initial)
+        var staged = SemanticStore(limits: limits, revision: .initial)
         for (idx, op) in record.operations.enumerated() {
             do {
                 try op.apply(to: &staged)
@@ -351,10 +377,33 @@ public final class TransactionApplier: @unchecked Sendable {
             }
         }
 
-        var committed = SemanticStore(limits: _store.limits, revision: .initial)
+        var committed = SemanticStore(limits: limits, revision: .initial)
         committed.commitStaging(staged, newRevision: record.newRevision)
-        _store = committed
-        _lastAppliedRevision = record.newRevision
+        return .success(
+            PreparedResyncSnapshot(store: committed, revision: record.newRevision)
+        )
+    }
+
+    /// Publishes a prepared snapshot as the replica and returns the committed snapshot (§18, §22.2).
+    public func publishResyncSnapshot(
+        _ prepared: PreparedResyncSnapshot
+    ) -> Result<TransactionSnapshot, TxnError> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Re-checked under the lock: another commit may have advanced the replica while this
+        // snapshot was being rebuilt, and a snapshot must never regress the committed revision.
+        guard prepared.revision >= _lastAppliedRevision else {
+            return .failure(
+                .invalidNewRevision(
+                    expected: _lastAppliedRevision,
+                    actual: prepared.revision
+                )
+            )
+        }
+
+        _store = prepared.store
+        _lastAppliedRevision = prepared.revision
         return .success(TransactionSnapshot(store: _store, revision: _lastAppliedRevision))
     }
 }

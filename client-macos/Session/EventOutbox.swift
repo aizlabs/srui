@@ -237,20 +237,36 @@ public actor EventOutbox {
         generation >= 1 && generation <= lastIssuedResumeGeneration
     }
 
-    /// Runs `body` only while `generation` still owns the reconnect decision (§18).
+    /// Publishes a resync snapshot under the reconnect latch and releases it in the same step (§18).
     ///
-    /// The check and `body` share this single actor-isolated critical section, so a concurrent
-    /// `beginResumeAttempt()` cannot slip between them. A caller that checked first and applied
-    /// after a suspension would still let a superseded snapshot reach the shared replica.
+    /// The supersession check, `publish`, and the latch release share this single actor-isolated
+    /// critical section, so a concurrent `beginResumeAttempt()` cannot slip between them: a caller
+    /// that published first and released the latch after a suspension would leave the shared
+    /// replica advanced while its own resync decision was refused (§18, §22.2).
+    ///
+    /// `publish` must be the swap alone — build the snapshot with
+    /// `TransactionApplier.prepareResyncSnapshot(record:)` before calling, so the rebuild never
+    /// occupies this actor while acknowledgements and sends wait behind it.
     ///
     /// A `nil` generation means "this controller has no attempt outstanding", which is the
     /// live-resync case: it matches only while no other controller holds the latch either.
-    func withUnsupersededResume<T: Sendable>(
-        _ generation: UInt64?,
-        _ body: @Sendable () -> T
+    /// Returns `nil` when a newer attempt owns the latch and nothing was published.
+    func commitResyncSnapshot<T: Sendable>(
+        generation: UInt64?,
+        publish: @Sendable () -> T,
+        committed: @Sendable (T) -> Bool
     ) -> T? {
         guard activeResumeGeneration == generation else { return nil }
-        return body()
+        let result = publish()
+        // A rejected snapshot keeps the latch: the server can still send another one, and
+        // re-enabling allocation here would let events race a replica that was never rebuilt (§18).
+        guard committed(result) else { return result }
+        if let generation {
+            _ = finishResync(generation: generation)
+        } else {
+            allowNewEvents()
+        }
+        return result
     }
 
     /// Completes a same-session decision only if no newer controller superseded this attempt.
@@ -334,8 +350,8 @@ public actor EventOutbox {
         sessionId: String
     ) -> Bool {
         guard ackClientInstanceId == clientInstanceId else { return false }
-        // An empty session_id proves nothing about which incarnation settled the event, so it can
-        // never retire an intent.
+        // `session_id` is required on every ack (§18.2): an empty one proves nothing about which
+        // incarnation settled the event, so it can never retire an intent.
         guard !sessionId.isEmpty,
               let activeSessionId,
               sessionId == activeSessionId else {
@@ -465,6 +481,11 @@ public actor EventOutbox {
         for lease: PendingEventReplayLoop.Lease,
         via transport: any Transport
     ) async throws -> Bool {
+        // Lease identity *is* resume ownership here: `beginResumeAttempt()` and
+        // `stopResumeWork(generation:)` cancel the lease of the generation they supersede, which
+        // clears `replayLease` before any newer attempt can run. Re-deriving ownership from the
+        // latch instead would stop the loop after `commitResumeWork(generation:)` releases it,
+        // stranding events that are still unsettled (§18, §18.2).
         guard replayLease == lease,
               pendingEventReplayLoop.isActive(lease),
               pendingEvents.isEmpty == false else {

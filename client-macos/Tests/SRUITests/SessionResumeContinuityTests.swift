@@ -605,6 +605,83 @@ struct SessionResumeContinuityTests {
         await firstServer.close()
         await secondServer.close()
     }
+
+    @Test("stop() applies a snapshot buffered on the transport instead of reporting supersession")
+    func stopAppliesSnapshotBufferedDuringDrain() async throws {
+        let transport = DrainOnCloseTransport()
+        let outbox = EventOutbox()
+        let applier = TransactionApplier()
+        let controller = SessionController(
+            transport: transport,
+            applier: applier,
+            outbox: outbox,
+            sessionId: "session-buffered"
+        )
+        let failures = FailureRecorder()
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+        try await controller.start()
+
+        // Both frames were already in the socket when the owner called `stop()`. The drain exists
+        // to consume exactly these, so the resume latch must outlive it: releasing the latch first
+        // refuses the resume decision, drops the snapshot, and reports supersession on a
+        // deliberate stop that nothing superseded (§18).
+        try await transport.buffer(
+            resyncMessage(sessionId: "session-buffered", continuity: .sameSession)
+        )
+        try await transport.buffer(snapshot(revision: 4, text: "buffered"))
+
+        await controller.stop()
+
+        #expect(applier.lastAppliedRevision == Revision(4))
+        #expect(await failures.wait(timeout: 0.2) == nil)
+    }
+
+    @Test("An EVENT_ACK without session_id fails the session instead of stranding the event")
+    func ackWithoutSessionIdFailsTheSession() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+        let failures = FailureRecorder()
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+        try await controller.start()
+        await controller.handleIncomingMessage(
+            HandshakeFixtures.welcomeMessage(sessionId: "session-ack")
+        )
+        #expect(controller.isEventDispatchEnabled)
+
+        let event = try await outbox.sendActivate(
+            nodeId: NodeId(4),
+            observedRevision: Revision(1),
+            via: client
+        )
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = event.eventId.bytes
+        ack.lastProcessedEventSeq = event.eventSeq
+        ack.status = .processed
+        ack.revisionAfterEffect = 1
+        var ackMessage = SRUIMessage()
+        ackMessage.serverEventAck = ack
+        await controller.handleIncomingMessage(ackMessage)
+
+        // Settling on an ack that names no incarnation is what the identity check forbids, so the
+        // intent stays pending — and the session fails instead of replaying it until the sequence
+        // window is exhausted (§18.2, §4 inv. 13).
+        #expect(await outbox.pendingCount == 1)
+        let failure = try #require(await failures.wait())
+        guard case .protocolViolation = failure else {
+            Issue.record("Expected a protocol violation, got \(failure)")
+            return
+        }
+
+        await controller.stop()
+        await server.close()
+    }
 }
 
 /// Transport whose `send` records the frame and then suspends until the test releases it, so a
@@ -648,6 +725,38 @@ private actor GatedSendTransport: Transport {
 
     func close() async {
         releaseContinuation.finish()
+        streamContinuation.finish()
+    }
+}
+
+/// Transport that holds queued frames until `close()`, modelling bytes already buffered in the
+/// socket when `stop()` closes it: the receive loop drains them inside the stop grace period.
+private actor DrainOnCloseTransport: Transport {
+    private let stream: AsyncThrowingStream<Data, Error>
+    private let streamContinuation: AsyncThrowingStream<Data, Error>.Continuation
+    private var buffered: [Data] = []
+
+    init() {
+        let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream()
+        self.stream = stream
+        self.streamContinuation = continuation
+    }
+
+    func buffer(_ message: SRUIMessage) throws {
+        buffered.append(try SRUIFraming.encodeFramed(message))
+    }
+
+    func send(data: Data) async throws {}
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        for frame in buffered {
+            streamContinuation.yield(frame)
+        }
+        buffered.removeAll()
         streamContinuation.finish()
     }
 }

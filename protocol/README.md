@@ -91,3 +91,14 @@ separate field there would be redundant state a peer could contradict. Both resp
   replaying any of them, resets its outbox to the reported frontier, and applies the snapshot.
 - `SESSION_CONTINUITY_UNSPECIFIED` (or any unrecognized value) is a required-semantics failure
   (§4 inv. 13): the client fails the session rather than assuming either outcome.
+
+---
+
+## Event Settlement (§18.2)
+
+`ServerEventAck.session_id` is **required and non-empty** on every acknowledgement. It names the
+incarnation that settled the event and is what lets a client refuse an ack minted by an expired
+incarnation or by a connection that is still draining. An ack that omits it can never retire an
+intent, so the event would stay pending forever — replayed on every retry, answered `DUPLICATE`,
+never settled — until the contiguous send window is exhausted. A client that receives one fails the
+session explicitly rather than degrading silently (§4 inv. 13).

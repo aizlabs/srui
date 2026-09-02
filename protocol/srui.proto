@@ -480,7 +480,7 @@ message ServerEventAck {
   EventAckStatus status = 4;
   uint64 revision_after_effect = 5; // Store revision after side effects (Appendix B)
   string reject_reason = 6; // Diagnostic only, bounded by max_string_length (§26)
-  string session_id = 7; // Incarnation that produced this acknowledgement (§18)
+  string session_id = 7; // Non-empty; incarnation that produced this acknowledgement (§18, §18.2)
 }
 
 // -----------------------------------------------------------------------------

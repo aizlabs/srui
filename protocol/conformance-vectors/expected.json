@@ -148,9 +148,9 @@
     },
     "golden_event_ack": {
       "file": "golden_event_ack.bin",
-      "sha256": "88af509836da7f88dcb106c55f33be2d974d9fcda4cdc5e39769eea0a8c70593",
-      "hex": "1542130a0363313712046531323318d104200128b30e",
-      "byte_length": 22,
+      "sha256": "4e629b391be3ba1a1b004affee366782e78301a2cf903a643cb784c179b227ae",
+      "hex": "1c421a0a0363313712046531323318d104200128b30e3a05732d393163",
+      "byte_length": 29,
       "expected": {
         "msg_type": "server_event_ack",
         "client_instance_id": "c17",
@@ -159,7 +159,8 @@
         "status": 1,
         "status_name": "PROCESSED",
         "revision_after_effect": 1843,
-        "reject_reason": ""
+        "reject_reason": "",
+        "session_id": "s-91c"
       }
     }
   },

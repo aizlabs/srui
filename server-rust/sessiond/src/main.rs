@@ -84,9 +84,12 @@ fn parse_args_from(args: &[String]) -> Result<DaemonConfig, String> {
             "--journal-capacity" => {
                 // A zero or unparsable retention window would silently degrade every reconnect
                 // to a snapshot resync, so refuse to start instead of clamping (§18.1).
+                // Only a following flag counts as a missing value: `-1` is a value this option
+                // must reject by range, and reporting it as a missing argument would point the
+                // operator at the wrong mistake.
                 let value = args
                     .get(i + 1)
-                    .filter(|value| !value.starts_with('-'))
+                    .filter(|value| !value.starts_with("--"))
                     .ok_or_else(|| "--journal-capacity requires a value".to_string())?;
                 config.journal_capacity = value
                     .parse::<usize>()
@@ -526,6 +529,11 @@ mod tests {
         assert!(parse_args_from(&args(&["--socket", "--app"])).is_err());
         assert!(parse_args_from(&args(&["--app"])).is_err());
         assert!(parse_args_from(&args(&["--journal-capacity"])).is_err());
+        assert_eq!(
+            parse_args_from(&args(&["--journal-capacity", "--app"]))
+                .expect_err("missing retention window"),
+            "--journal-capacity requires a value"
+        );
     }
 
     /// §18.1: the retention window is configurable, and a window that cannot retain anything is
@@ -547,7 +555,12 @@ mod tests {
         for value in ["0", "-1", "many"] {
             let error = parse_args_from(&args(&["--journal-capacity", value]))
                 .expect_err("rejected retention window");
-            assert!(error.contains("--journal-capacity"), "{error}");
+            // Asserted verbatim: a negative window used to be reported as a *missing* value,
+            // which points the operator at the wrong mistake (§18.1).
+            assert_eq!(
+                error,
+                format!("--journal-capacity must be a positive integer, got {value}")
+            );
         }
     }
 }

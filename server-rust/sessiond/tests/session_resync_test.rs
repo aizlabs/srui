@@ -16,8 +16,8 @@ use srui_protocol::{
 };
 use srui_sdk::*;
 use srui_semantic_tree::{
-    ItemId, ModelId, ModelItem, NodeId, Operation, Revision, SemanticStore, StoreLimits,
-    Transaction, TxnError, TypeRef, Value, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+    ItemId, ModelId, ModelItem, NodeId, Operation, ResyncSnapshot, Revision, SemanticStore,
+    StoreLimits, TxnError, TypeRef, Value, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
 };
 use srui_sessiond::{handle_connection, ResumeOutcome, Session};
 
@@ -71,26 +71,20 @@ fn evict_journal_window(session: &Session, from_revision: u64) {
     }
 }
 
+/// Applies a resync snapshot the way a replica does: from explicit protocol context, through the
+/// dedicated §18 entry point rather than the live-stream path (§12.1, §18).
 fn apply_resync_snapshot(wire_tx: WireTransaction) -> Result<SemanticStore, TxnError> {
-    let txn = Transaction::try_from(wire_tx)?;
     assert_eq!(
-        txn.base_revision,
-        Revision::INITIAL,
+        wire_tx.base_revision,
+        Revision::INITIAL.get(),
         "snapshot must start from revision 0"
     );
 
-    let limits = StoreLimits::default();
-    let mut staged = SemanticStore::with_limits_and_revision(limits.clone(), Revision::INITIAL);
-    for (idx, op) in txn.operations.iter().enumerate() {
-        op.apply(&mut staged).map_err(|source| TxnError::OpFailed {
-            op_index: idx,
-            source,
-        })?;
-    }
-
-    let mut committed = SemanticStore::with_limits_and_revision(limits, Revision::INITIAL);
-    committed.commit_staging(staged, txn.new_revision);
-    Ok(committed)
+    let snapshot = ResyncSnapshot::try_from(wire_tx)?;
+    let mut replica =
+        SemanticStore::with_limits_and_revision(StoreLimits::default(), Revision::INITIAL);
+    replica.replace_from_snapshot(&snapshot)?;
+    Ok(replica)
 }
 
 fn assert_stores_equivalent(expected: &SemanticStore, actual: &SemanticStore) {

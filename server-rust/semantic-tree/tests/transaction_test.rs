@@ -1,8 +1,8 @@
 //! Integration tests for SemanticStore transactions and atomic revisions (§12, §12.1, §12.2, §26).
 
 use srui_semantic_tree::{
-    NodeId, Operation, PropertyRef, Revision, SemanticStore, StoreError, StoreLimits, Transaction,
-    TxnError, TypeRef, Value,
+    CoalescedScalarDelta, DeliveredTransaction, NodeId, Operation, PropertyRef, Revision,
+    SemanticStore, StoreError, StoreLimits, Transaction, TxnError, TypeRef, Value,
 };
 
 #[test]
@@ -321,8 +321,10 @@ fn test_transaction_record_with_invalid_new_revision_rejected() {
     assert!(store.is_empty());
 }
 
+/// A coalesced scalar span is a *delivery* form: a replica applies it and advances several
+/// revisions at once, while the authoritative entry points refuse it (§12.1, §20.4).
 #[test]
-fn test_coalesceable_forward_span_applies_and_advances_revision() {
+fn test_coalesced_scalar_delta_applies_to_replica_but_not_authoritative_path() {
     let mut store = SemanticStore::new();
     let root_id = NodeId::new(1);
 
@@ -341,7 +343,7 @@ fn test_coalesceable_forward_span_applies_and_advances_revision() {
         .expect("initial setup");
     assert_eq!(store.revision(), Revision::new(1));
 
-    // Rev 1 -> 5: Multi-revision forward span with scalar SetProperty (§12.1, §20.2)
+    // Rev 1 -> 5: coalesced run of scalar updates (§12.1 delivery forms, §20.4)
     let span_txn = Transaction::with_revisions(
         Revision::new(1),
         Revision::new(5),
@@ -352,9 +354,27 @@ fn test_coalesceable_forward_span_applies_and_advances_revision() {
         }],
         0,
     );
-    let committed = store
+
+    let err = store
         .apply_transaction_record(&span_txn)
-        .expect("coalesced span must apply");
+        .expect_err("the authoritative path must advance exactly one revision");
+    assert_eq!(
+        err,
+        TxnError::InvalidNewRevision {
+            expected: Revision::new(2),
+            actual: Revision::new(5),
+        }
+    );
+    assert_eq!(
+        store.revision(),
+        Revision::new(1),
+        "a refused commit must leave the store on its committed revision"
+    );
+
+    let delta = CoalescedScalarDelta::try_from(span_txn).expect("scalar span is a valid delta");
+    let committed = store
+        .apply_coalesced_delta(&delta)
+        .expect("a replica must accept a coalesced scalar delta");
     assert_eq!(committed, Revision::new(5));
     assert_eq!(store.revision(), Revision::new(5));
     assert_eq!(
@@ -363,6 +383,76 @@ fn test_coalesceable_forward_span_applies_and_advances_revision() {
             .unwrap()
             .get_property(PropertyRef::LABEL),
         Some(&Value::from("v5"))
+    );
+}
+
+/// A structural operation is a coalescing barrier: it may never ride inside a multi-revision
+/// delivery span, on either the authoritative or the replica path (§20.4).
+#[test]
+fn test_structural_span_is_refused_as_a_delta() {
+    let structural_span = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(5),
+        vec![Operation::create_node(
+            NodeId::new(2),
+            TypeRef::SURFACE,
+            None,
+            None,
+            [],
+        )],
+        0,
+    );
+
+    let err = CoalescedScalarDelta::try_from(structural_span)
+        .expect_err("a structural operation must not be coalesced across revisions");
+    assert_eq!(
+        err,
+        TxnError::InvalidNewRevision {
+            expected: Revision::new(2),
+            actual: Revision::new(5),
+        }
+    );
+}
+
+/// The delivered entry point classifies by shape and refuses anything that is neither form.
+#[test]
+fn test_delivered_transaction_classifies_commit_and_delta() {
+    let root_id = NodeId::new(1);
+
+    let commit = Transaction::new(
+        Revision::INITIAL,
+        vec![Operation::create_node(
+            root_id,
+            TypeRef::SURFACE,
+            None,
+            None,
+            [(PropertyRef::LABEL, Value::from("v0"))],
+        )],
+    );
+    assert!(matches!(
+        DeliveredTransaction::try_from(commit).expect("single-step frame"),
+        DeliveredTransaction::Commit(_)
+    ));
+
+    let delta = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(5),
+        vec![Operation::SetProperty {
+            id: root_id,
+            property: PropertyRef::LABEL,
+            value: Value::from("v5"),
+        }],
+        0,
+    );
+    assert!(matches!(
+        DeliveredTransaction::try_from(delta).expect("scalar span frame"),
+        DeliveredTransaction::Delta(_)
+    ));
+
+    let backwards = Transaction::with_revisions(Revision::new(5), Revision::new(2), vec![], 0);
+    assert!(
+        DeliveredTransaction::try_from(backwards).is_err(),
+        "a span that is neither form must be rejected rather than guessed at"
     );
 }
 

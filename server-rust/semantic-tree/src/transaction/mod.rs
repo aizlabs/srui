@@ -23,10 +23,12 @@
 
 pub mod apply;
 pub mod error;
+pub mod kinds;
 pub mod operation;
 pub mod record;
 pub mod wire;
 
 pub use error::TxnError;
+pub use kinds::{AuthoritativeCommit, CoalescedScalarDelta, DeliveredTransaction, ResyncSnapshot};
 pub use operation::{Operation, Revision};
 pub use record::Transaction;

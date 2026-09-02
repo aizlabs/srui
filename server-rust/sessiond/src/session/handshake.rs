@@ -1,7 +1,4 @@
-//! Atomic client attach: catch-up plus broadcast subscribe under one lock section (§15, §18, §20.2, §21).
-
-use tokio::sync::broadcast;
-
+use crate::outbound::OutboundReceiver;
 use srui_protocol::{
     ClientHello, ClientResume, ExtensionNamespaceMapping, ServerResumeOk, ServerResyncRequired,
     ServerWelcome, SessionContinuity, Transaction,
@@ -9,7 +6,7 @@ use srui_protocol::{
 use srui_semantic_tree::{CapabilitySet, Profile, SemanticStore};
 
 use super::snapshot::export_snapshot_transaction;
-use super::{subscribe_tx_broadcast, Session, SessionError};
+use super::{Session, SessionError};
 
 /// Result of an atomic fresh-client handshake bootstrap (§15, §18, §20.2).
 #[derive(Debug)]
@@ -18,8 +15,8 @@ pub struct FreshClientBootstrap {
     pub welcome: ServerWelcome,
     /// Catch-up snapshot transaction for populated sessions, or `None` if revision is 0 (§18).
     pub snapshot: Option<Transaction>,
-    /// Bounded broadcast receiver capturing every subsequent transaction committed to the session (§20.2).
-    pub transactions: broadcast::Receiver<Transaction>,
+    /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
+    pub transactions: OutboundReceiver,
 }
 
 /// Result of an atomic resume handshake bootstrap (§20.2, §21, §32.5).
@@ -27,8 +24,8 @@ pub struct FreshClientBootstrap {
 pub struct ResumeClientBootstrap {
     /// Replay or resync catch-up collected under the same lock as [`Self::transactions`].
     pub outcome: ResumeOutcome,
-    /// Bounded broadcast receiver capturing every subsequent transaction committed to the session (§20.2).
-    pub transactions: broadcast::Receiver<Transaction>,
+    /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
+    pub transactions: OutboundReceiver,
 }
 
 /// Outcome of a [`ClientResume`] handshake request.
@@ -130,7 +127,12 @@ impl Session {
 
         before_subscribe();
 
-        let transactions = subscribe_tx_broadcast(&self.tx_broadcast)?;
+        let max_ops = inner_guard.limits.max_transaction_operations as usize;
+        let transactions = self.outbound_hub.subscribe(
+            hello.client_instance_id.clone(),
+            self.outbound_queue_capacity,
+            max_ops,
+        )?;
         drop(inner_guard);
 
         Ok(FreshClientBootstrap {
@@ -142,17 +144,13 @@ impl Session {
 
     /// Atomically prepares a resume handshake and subscribes it to transactions (§20.2, §21, §32.5).
     ///
-    /// Collects journal replay or a store clone for resync, then subscribes to `tx_broadcast` while
-    /// still holding `inner`, so a concurrent commit cannot land in the broadcast between catch-up
-    /// capture and subscription. Resync snapshot encoding happens after both locks are dropped.
-    ///
-    /// # Lock Order
-    /// Acquires `inner -> tx_broadcast`. All other session operations acquire at most one of these mutexes,
-    /// preserving strict deadlock freedom.
+    /// Collects journal replay or a store clone for resync, then subscribes to `outbound_hub` while
+    /// still holding `inner`, so a concurrent commit cannot land between catch-up capture and subscription.
+    /// Resync snapshot encoding happens after both locks are dropped.
     ///
     /// # Errors
     /// Returns [`SessionError::LockPoisoned`] if an internal mutex is poisoned.
-    /// Returns [`SessionError::BroadcastClosed`] if the transaction broadcast sender has been closed.
+    /// Returns [`SessionError::BroadcastClosed`] if the transaction hub has been closed.
     pub fn bootstrap_resume(
         &self,
         resume: &ClientResume,
@@ -188,10 +186,23 @@ impl Session {
             .dedupe
             .last_contiguous_processed_seq(&resume.client_instance_id);
 
+        let is_stale = self
+            .outbound_hub
+            .is_client_stale(&resume.client_instance_id);
+
         // A session ID is an incarnation token, not a human-readable application name. A
         // mismatch means the requested session is gone, so old client intents must not be
-        // replayed against this authoritative state.
-        let plan = if resume.session_id != inner_guard.session_id {
+        // replayed against this authoritative state. If the client detached due to outbound
+        // queue overflow, force snapshot resync even if journal replay is otherwise available.
+        let plan = if is_stale {
+            ResumePlan::Resync {
+                session_id: inner_guard.session_id.clone(),
+                snapshot_revision: inner_guard.store.revision().get(),
+                store_snapshot: inner_guard.store.clone_staging(),
+                continuity: SessionContinuity::SameSession,
+                last_processed_event_seq,
+            }
+        } else if resume.session_id != inner_guard.session_id {
             ResumePlan::Resync {
                 session_id: inner_guard.session_id.clone(),
                 snapshot_revision: inner_guard.store.revision().get(),
@@ -220,7 +231,12 @@ impl Session {
 
         before_subscribe();
 
-        let transactions = subscribe_tx_broadcast(&self.tx_broadcast)?;
+        let max_ops = inner_guard.limits.max_transaction_operations as usize;
+        let transactions = self.outbound_hub.subscribe(
+            resume.client_instance_id.clone(),
+            self.outbound_queue_capacity,
+            max_ops,
+        )?;
         drop(inner_guard);
 
         let outcome = match plan {

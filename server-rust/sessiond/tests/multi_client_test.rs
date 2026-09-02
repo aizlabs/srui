@@ -9,13 +9,12 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::duplex;
-use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{srui_message, ClientHello, SruiCodec, SruiMessage, Transaction};
-use srui_sessiond::{handle_connection, ConnectionError, Session, SessionError};
+use srui_sessiond::{handle_connection, ConnectionError, OutboundRecvError, Session, SessionError};
 
 const TEST_BROADCAST_CAPACITY: usize = 2;
 
@@ -298,5 +297,5 @@ async fn test_transaction_broadcast_closed_notifies_subscribers() {
     let mut rx = session.subscribe_transactions().expect("broadcast open");
     session.close_transaction_broadcast();
 
-    assert!(matches!(rx.recv().await, Err(RecvError::Closed)));
+    assert!(matches!(rx.recv().await, Err(OutboundRecvError::Closed)));
 }

@@ -17,11 +17,11 @@ use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::broadcast;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::outbound::OutboundRecvError;
 use crate::session::{EventOutcome, ResumeOutcome, Session, SessionError};
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
@@ -112,6 +112,7 @@ where
                 };
                 framed_write.send(snapshot_envelope).await?;
             }
+            session.clear_stale_client(&hello.client_instance_id);
             (hello.client_instance_id, bootstrap.transactions)
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
@@ -149,6 +150,7 @@ where
                         msg: Some(srui_message::Msg::Transaction(snapshot_transaction)),
                     };
                     framed_write.send(snapshot_env).await?;
+                    session.clear_stale_client(&resume.client_instance_id);
                 }
             }
             (resume.client_instance_id, bootstrap.transactions)
@@ -165,6 +167,11 @@ where
     // -------------------------------------------------------------------------
 
     loop {
+        if tx_rx.is_stale() {
+            warn!("Client outbound queue marked stale; closing connection to force resync");
+            return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
+        }
+
         tokio::select! {
             // Cancel-safe incoming message receiver (async-cancel-safety)
             incoming = framed_read.next() => {
@@ -175,7 +182,14 @@ where
                         if let Some(response) =
                             handle_incoming_message(msg, &session, &client_instance_id).await?
                         {
-                            framed_write.send(response).await?;
+                            tokio::select! {
+                                res = framed_write.send(response) => {
+                                    res?;
+                                }
+                                _ = shutdown.cancelled() => {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Some(Err(e)) => {
@@ -189,20 +203,27 @@ where
                 }
             }
 
-            // Outgoing broadcast transaction receiver (async-bounded-channel)
-            broadcast_tx = tx_rx.recv() => {
-                match broadcast_tx {
+            // Outgoing transaction queue receiver (async-bounded-channel)
+            outbound_tx = tx_rx.recv() => {
+                match outbound_tx {
                     Ok(tx) => {
                         let envelope = SruiMessage {
                             msg: Some(srui_message::Msg::Transaction(tx)),
                         };
-                        framed_write.send(envelope).await?;
+                        tokio::select! {
+                            res = framed_write.send(envelope) => {
+                                res?;
+                            }
+                            _ = shutdown.cancelled() => {
+                                break;
+                            }
+                        }
                     }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("Client lagged behind by {} transaction revisions; closing connection to force resync", skipped);
+                    Err(OutboundRecvError::Lagged(reason)) => {
+                        warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
                         return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    Err(OutboundRecvError::Closed) => {
                         break;
                     }
                 }

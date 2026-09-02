@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::duplex;
-use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
@@ -15,7 +14,7 @@ use srui_protocol::{
     ServerResyncRequired, ServerWelcome, SruiCodec, SruiMessage, Transaction, TypeRef,
 };
 use srui_sdk::{NodeId, Surface};
-use srui_sessiond::{handle_connection, ConnectionError, Session};
+use srui_sessiond::{handle_connection, ConnectionError, OutboundTryRecvError, Session};
 
 fn client_hello_message() -> SruiMessage {
     SruiMessage {
@@ -197,7 +196,10 @@ async fn test_client_transaction_rejected_without_mutating_authority() {
             .expect("journal replay still available"),
         baseline_journal
     );
-    assert!(matches!(broadcast_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(
+        broadcast_rx.try_recv(),
+        Err(OutboundTryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -242,7 +244,10 @@ async fn test_client_transaction_on_pristine_session_rejected() {
             .expect("journal replay still available"),
         baseline_journal
     );
-    assert!(matches!(broadcast_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(
+        broadcast_rx.try_recv(),
+        Err(OutboundTryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]

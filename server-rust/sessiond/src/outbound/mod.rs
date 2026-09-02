@@ -1,7 +1,14 @@
-//! # Bounded Outbound Transaction Queues & Coalescing (§20.2)
+//! # Bounded Outbound Transaction Queues & Coalescing (§12.1, §20.2, §20.4)
 //!
 //! Provides bounded, per-connection transaction streaming with scalar property coalescing
 //! and lossless structural barriers.
+//!
+//! What this queue emits is a *delivery* stream: either a committed transaction verbatim, or a
+//! coalesced scalar delta standing in for a run of them (§12.1). Neither the merge policy nor its
+//! revision spans belong to the authoritative transaction model, so the merge itself lives in
+//! [`coalesce`] rather than in `srui-semantic-tree`.
+
+mod coalesce;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,7 +119,7 @@ impl SubscriberState {
             if let (Some(tail), Some(tail_domain)) =
                 (self.items.back_mut(), self.tail_domain.as_mut())
             {
-                if tail_domain.try_absorb(incoming, self.max_ops, self.max_frame_size) {
+                if coalesce::try_absorb(tail_domain, incoming, self.max_ops, self.max_frame_size) {
                     *tail = (&*tail_domain).into();
                     return Ok(false); // Absorbed in-place, queue length did not increase
                 }

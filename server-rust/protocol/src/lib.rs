@@ -8,8 +8,8 @@ pub use proto::*;
 
 pub mod framing;
 pub use framing::{
-    decode_framed, decode_framed_with_limit, encode_framed, encode_framed_with_limit, FramingError,
-    DEFAULT_MAX_FRAME_SIZE,
+    decode_framed, decode_framed_with_limit, encode_framed, encode_framed_with_limit,
+    framed_payload_len, FramingError, DEFAULT_MAX_FRAME_SIZE,
 };
 
 #[cfg(feature = "async-codec")]

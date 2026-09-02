@@ -456,10 +456,14 @@ fn test_delivered_transaction_classifies_commit_and_delta() {
     );
 }
 
+/// Performing the merge moved to the outbound queue that owns the policy
+/// (`srui_sessiond::outbound::coalesce`, where its semantics and §26 limits are tested). The model
+/// keeps only the predicate saying which transactions are eligible (§12.1, §20.4).
 #[test]
-fn test_transaction_try_absorb_semantics_and_limits() {
+fn test_is_coalesceable_admits_only_non_empty_scalar_property_runs() {
     let node_id = NodeId::new(10);
-    let mut t1 = Transaction::with_revisions(
+
+    let scalar = Transaction::with_revisions(
         Revision::new(1),
         Revision::new(2),
         vec![Operation::SetProperty {
@@ -469,41 +473,43 @@ fn test_transaction_try_absorb_semantics_and_limits() {
         }],
         0,
     );
+    assert!(scalar.is_coalesceable());
 
-    let t2 = Transaction::with_revisions(
+    let structural = Transaction::with_revisions(
+        Revision::new(1),
         Revision::new(2),
-        Revision::new(3),
-        vec![Operation::SetProperty {
-            id: node_id,
-            property: PropertyRef::LABEL,
-            value: Value::from("second"),
-        }],
-        0,
-    );
-
-    // Contiguous scalar absorption succeeds and updates target revision
-    assert!(t1.try_absorb(&t2, 100, 1024 * 1024));
-    assert_eq!(t1.base_revision, Revision::new(1));
-    assert_eq!(t1.new_revision, Revision::new(3));
-    assert_eq!(t1.operations.len(), 1);
-    match &t1.operations[0] {
-        Operation::SetProperty { value, .. } => assert_eq!(value, &Value::from("second")),
-        _ => panic!("expected SetProperty"),
-    }
-
-    // Structural transaction cannot be absorbed
-    let t_structural = Transaction::with_revisions(
-        Revision::new(3),
-        Revision::new(4),
         vec![Operation::DeleteNode { id: node_id }],
         0,
     );
-    assert!(!t1.try_absorb(&t_structural, 100, 1024 * 1024));
+    assert!(!structural.is_coalesceable());
 
-    // Exceeding max_ops is rejected
-    let t3 = Transaction::with_revisions(
-        Revision::new(3),
-        Revision::new(4),
+    let mixed = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(2),
+        vec![
+            Operation::SetProperty {
+                id: node_id,
+                property: PropertyRef::LABEL,
+                value: Value::from("first"),
+            },
+            Operation::DeleteNode { id: node_id },
+        ],
+        0,
+    );
+    assert!(
+        !mixed.is_coalesceable(),
+        "one structural operation disqualifies the whole transaction"
+    );
+
+    let empty = Transaction::with_revisions(Revision::new(1), Revision::new(2), vec![], 0);
+    assert!(
+        !empty.is_coalesceable(),
+        "an empty transaction carries no scalar state to collapse"
+    );
+
+    let value_change = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(2),
         vec![Operation::SetProperty {
             id: node_id,
             property: PropertyRef::VALUE,
@@ -511,10 +517,7 @@ fn test_transaction_try_absorb_semantics_and_limits() {
         }],
         0,
     );
-    assert!(!t1.try_absorb(&t3, 1, 1024 * 1024));
-
-    // Exceeding max_frame_size is rejected
-    assert!(!t1.try_absorb(&t3, 100, 5));
+    assert!(value_change.is_coalesceable());
 }
 
 #[test]

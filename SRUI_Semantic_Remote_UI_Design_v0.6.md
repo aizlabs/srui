@@ -38,6 +38,7 @@ v0.6 makes the following principles normative:
 - the remote host is authoritative while the client retains a non-authoritative semantic replica and local presentation state;
 - the UI is a persistent object graph updated by atomic mutations, not a sequence of complete documents or display frames;
 - transaction `COMMIT` boundaries are state-consistency boundaries, **not render-frame boundaries**;
+- delivery to a slow client may coalesce a run of committed scalar updates into one revision span, but such a span is non-authoritative by construction: it is derived from committed transactions, accepted only by replicas, and never journalled;
 - standard input is semantic (`ACTIVATE`, `VALUE_CHANGED`, `SELECTION_CHANGED`) rather than coordinate-based;
 - ordinary layout transmits intent and relationships rather than server-computed pixel geometry;
 - text editing, IME composition, caret movement, selection, clipboard integration, and ordinary editing feedback are local;
@@ -809,6 +810,33 @@ Rules:
 - If a connection drops mid-transaction, the incomplete transaction is discarded.
 - The reconnect request references the last **committed** revision only.
 - A transaction may carry a priority class.
+- An authoritative commit advances exactly one revision: `new_revision == base_revision + 1`.
+
+#### Transaction delivery forms
+
+One envelope carries three distinct forms. The form determines which revision spans are legal, who
+may produce it, and who may accept it.
+
+| Form | Revision span | Operations | Produced by | Accepted by | Journalled |
+|---|---|---|---|---|---|
+| Authoritative commit | `base = N`, `new = N + 1` | any valid operations | the authoritative session | the authoritative store and every replica | yes |
+| Coalesced scalar delta | `base = N`, `new = M`, `M > N` | non-empty; scalar `SET_PROPERTY` only | an outbound delivery queue, from transactions the session already committed | replicas only | never |
+| Resync snapshot | `base = 0`, `new = N` | full-tree reconstruction | the authoritative session, on an explicit resync decision (§18) | replicas only | never |
+
+Rules:
+
+- Only an authoritative commit advances authoritative state. An application MUST NOT produce a
+  coalesced scalar delta, and a server MUST NOT admit one into its store or its journal (§18.1).
+- A coalesced scalar delta is **derived**: it MUST be equivalent to applying, in order, the committed
+  transactions whose revisions it spans, carrying only the latest value of each `(node, property)`
+  pair it touches (§20.4).
+- A delta MUST contain only scalar `SET_PROPERTY` operations. Any other operation ends the coalescing
+  run: a structural transaction is a barrier and is delivered on its own revision boundary.
+- A replica MUST accept both an authoritative commit and a coalesced scalar delta on the live stream,
+  and MUST reject a revision span it cannot classify as either.
+- Committed revisions stay monotonic under every form: a delta advances the replica to `new_revision`
+  exactly as if each transaction it spans had been applied individually.
+- A resync snapshot is not part of the live stream; its delivery rules are in §18.
 
 ### 12.2 Commits are not frames
 
@@ -1163,6 +1191,23 @@ superseded connection MUST NOT replay events, rebind the outbox, or enable new e
 Local presentation state such as window geometry and scroll position may be restored after resync
 only when the server declares compatible identity continuity.
 
+#### Snapshot delivery form
+
+A snapshot travels in the transaction envelope with `base_revision = 0` and
+`new_revision = snapshot_revision`, carrying the operations that reconstruct the whole tree rather
+than a difference against the client's replica (§12.1).
+
+- A snapshot replaces the replica wholesale. It is not applied on top of retained state, and the
+  client's current revision is not a precondition for accepting it.
+- A snapshot is valid only while the client holds an outstanding continuity decision that calls for
+  one: a `SERVER RESYNC_REQUIRED`, or the catch-up that follows `SERVER WELCOME` for a session
+  already past revision 0. A client MUST NOT infer "this is a snapshot" from `base_revision = 0`
+  alone — a replayed or duplicated first transaction has the same shape, and treating it as a
+  snapshot would wipe a live replica.
+- A snapshot MAY restate the revision the replica already holds, but MUST NOT regress it.
+- A snapshot never enters the transaction journal (§18.1): it is derived from committed state at the
+  revision it declares.
+
 ### 18.1 Transaction journal
 
 The server keeps a bounded journal of committed transactions.
@@ -1440,10 +1485,10 @@ Every queue is bounded.
 
 If a client is slower than the application:
 
-- scalar property updates may be coalesced when semantics allow (`progress=0.50`, `0.51`, `0.52` → latest value);
-- committed structural transactions may not be silently dropped;
+- scalar property updates may be coalesced when semantics allow (`progress=0.50`, `0.51`, `0.52` → latest value), and are delivered as a coalesced scalar delta spanning the revisions they replace (§12.1);
+- committed structural transactions may not be silently dropped, and a structural transaction ends a coalescing run rather than being merged across;
 - resources may be paused;
-- an excessively stale client may be detached and forced to resync;
+- an excessively stale client may be detached and forced to resync; a delivery queue that exceeds its bound marks that client for a full snapshot resync instead of dropping transactions out of its stream;
 - memory growth is bounded independently of remote application speed.
 
 ### 20.5 Server behavior while detached

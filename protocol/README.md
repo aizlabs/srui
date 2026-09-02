@@ -1,6 +1,6 @@
 # SRUI Protocol Wire Schema
 
-Protobuf wire encoding and code generation for the SRUI semantic protocol (Design Doc v0.4 §6.5, §13, §15, §16, §18).
+Protobuf wire encoding and code generation for the SRUI semantic protocol (Design Doc v0.6 §6.5, §13, §15, §16, §18).
 
 ---
 

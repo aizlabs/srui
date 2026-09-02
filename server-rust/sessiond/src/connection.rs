@@ -63,6 +63,15 @@ pub enum ConnectionError {
 ///
 /// Returns `Ok(true)` if the frame was written, `Ok(false)` if the connection should
 /// unwind cleanly (shutdown or hub close). A lagged queue is a hard resync error.
+///
+/// # Cancellation
+///
+/// The write is polled first (`biased`), so a frame the socket can accept immediately is always
+/// written whole even when a cancellation is already pending; only a send that would block yields
+/// to the token, which is what keeps a stalled client from delaying `LaggedResyncRequired` (§20.2).
+/// [`SinkExt::send`] is not cancel-safe, so a frame large enough to block mid-flush may still be
+/// truncated on the wire when a token wins; the connection closes immediately afterwards, and the
+/// peer resyncs (§18, §20.2).
 async fn send_message<W>(
     framed_write: &mut FramedWrite<W, SruiCodec>,
     envelope: SruiMessage,
@@ -73,6 +82,7 @@ where
     W: AsyncWrite + Unpin,
 {
     tokio::select! {
+        biased;
         res = framed_write.send(envelope) => {
             res?;
             Ok(true)
@@ -89,6 +99,22 @@ where
                 Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
             }
         },
+    }
+}
+
+/// Clears the §20.2 overflow marker once the catch-up write has been delivered.
+///
+/// The subscription is created during handshake bootstrap, before the welcome/resync message and
+/// the snapshot are written, so it can overflow *during* that write. Clearing unconditionally would
+/// erase that fresh marker and downgrade the next resume to a journal replay, defeating the forced
+/// resync the marker exists to guarantee (§20.2).
+fn clear_stale_if_settled(
+    session: &Session,
+    client_instance_id: &[u8],
+    outbound: &OutboundReceiver,
+) {
+    if outbound.termination().is_none() {
+        session.clear_stale_client(client_instance_id);
     }
 }
 
@@ -163,7 +189,7 @@ where
                     return Ok(());
                 }
             }
-            session.clear_stale_client(&hello.client_instance_id);
+            clear_stale_if_settled(&session, &hello.client_instance_id, &bootstrap.transactions);
             (hello.client_instance_id, bootstrap.transactions)
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
@@ -237,7 +263,11 @@ where
                     {
                         return Ok(());
                     }
-                    session.clear_stale_client(&resume.client_instance_id);
+                    clear_stale_if_settled(
+                        &session,
+                        &resume.client_instance_id,
+                        &bootstrap.transactions,
+                    );
                 }
             }
             (resume.client_instance_id, bootstrap.transactions)
@@ -464,4 +494,120 @@ fn build_event_ack(
         reject_reason: crate::session::bound_diagnostic_string(reject_reason, max_string_length),
         session_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use srui_sdk::{NodeId, Surface};
+    use tokio::io::duplex;
+
+    fn ack_envelope(seq: u64) -> SruiMessage {
+        SruiMessage {
+            msg: Some(srui_message::Msg::ServerEventAck(ServerEventAck {
+                last_processed_event_seq: seq,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn overflow_client_queue(session: &Session) {
+        for i in 1..=3u64 {
+            session
+                .transaction(|ui| {
+                    Surface::builder(NodeId::new(i)).create(ui)?;
+                    Ok(())
+                })
+                .expect("commit structural transaction");
+        }
+    }
+
+    /// A frame the socket can accept immediately must not be dropped or truncated just because a
+    /// cancellation is already pending; only a send that would block yields to the token (§20.2).
+    #[tokio::test]
+    async fn test_send_message_completes_writable_frame_when_shutdown_pending() {
+        const FRAMES: u64 = 20;
+
+        let session = Session::new("send-under-shutdown");
+        let outbound = session
+            .subscribe_transactions(vec![1])
+            .expect("subscribe outbound");
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let (client_io, server_io) = duplex(64 * 1024);
+        let mut framed_write = FramedWrite::new(server_io, SruiCodec::new());
+        let mut framed_read = FramedRead::new(client_io, SruiCodec::new());
+
+        for seq in 0..FRAMES {
+            let sent = send_message(&mut framed_write, ack_envelope(seq), &shutdown, &outbound)
+                .await
+                .expect("send must not fail on a writable sink");
+            assert!(
+                sent,
+                "frame {seq} was abandoned even though the sink could accept it immediately"
+            );
+        }
+
+        for seq in 0..FRAMES {
+            let frame = framed_read
+                .next()
+                .await
+                .expect("frame present")
+                .expect("frame decodes cleanly");
+            match frame.msg {
+                Some(srui_message::Msg::ServerEventAck(ack)) => {
+                    assert_eq!(ack.last_processed_event_seq, seq);
+                }
+                other => panic!("expected ServerEventAck, got {other:?}"),
+            }
+        }
+    }
+
+    /// The resume subscription exists before the resync snapshot is written, so it can overflow
+    /// during that write. Clearing the marker unconditionally would erase that fresh overflow and
+    /// downgrade the next resume to a journal replay (§20.2).
+    #[test]
+    fn test_stale_marker_survives_overflow_during_catch_up_write() {
+        let session = Session::with_outbound_queue_capacity("stale-marker-race", 1);
+        let client = vec![9u8];
+        let outbound = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe outbound");
+
+        overflow_client_queue(&session);
+        assert!(session.outbound_hub.is_client_stale(&client));
+
+        clear_stale_if_settled(&session, &client, &outbound);
+
+        assert!(
+            session.outbound_hub.is_client_stale(&client),
+            "a queue that overflowed during the catch-up write must stay marked for resync"
+        );
+    }
+
+    /// A catch-up write that completed on a healthy subscription must clear the marker, otherwise
+    /// the client resyncs forever (§20.2).
+    #[test]
+    fn test_stale_marker_cleared_after_settled_catch_up_write() {
+        let session = Session::with_outbound_queue_capacity("stale-marker-clear", 1);
+        let client = vec![9u8];
+        let stale = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe outbound");
+
+        overflow_client_queue(&session);
+        assert!(session.outbound_hub.is_client_stale(&client));
+        drop(stale);
+
+        let fresh = session
+            .subscribe_transactions(client.clone())
+            .expect("resubscribe outbound");
+        clear_stale_if_settled(&session, &client, &fresh);
+
+        assert!(
+            !session.outbound_hub.is_client_stale(&client),
+            "a settled catch-up write must clear the overflow marker"
+        );
+    }
 }

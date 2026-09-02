@@ -129,7 +129,11 @@ pub enum SessionError {
     Panicked(String),
 }
 
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+/// Takes `mutex`, recovering from poisoning instead of propagating the panic.
+///
+/// A panic while a lock is held must fail the connection that panicked, not every later use of the
+/// daemon's shared state.
+pub(crate) fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -599,6 +603,12 @@ impl Session {
         // Fast in-memory critical section (async-no-lock-await)
         {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            // Refuse anything the journal cannot record *before* the store mutates. The store owns
+            // committed revisions and cannot roll one back, so a transaction that passes
+            // `apply_wire_transaction` but fails `record` (a coalesced multi-revision span, for
+            // instance) would leave the journal behind the store and wedge every later commit on
+            // this session with `NonContiguousRevision` (§12.1, §18.1, §20.2).
+            guard.journal.check_admissible(&tx)?;
             guard.store.apply_wire_transaction(tx.clone())?;
             guard.journal.record(tx.clone())?;
         }
@@ -876,6 +886,80 @@ mod tests {
             result.is_err(),
             "zero outbound_queue_capacity must be rejected (§20.2)"
         );
+    }
+
+    /// The journal only accepts single-step spans, so a transaction it will refuse must be rejected
+    /// *before* the store mutates. Otherwise the store advances, the journal does not, and every
+    /// later commit on the session fails with `NonContiguousRevision` forever (§12.1, §18.1, §20.2).
+    #[test]
+    fn test_commit_transaction_rejects_inadmissible_span_without_advancing_store() {
+        use srui_sdk::Surface;
+        use srui_semantic_tree::{Operation, Revision, Transaction as DomainTransaction};
+
+        let session = Session::new("span-guard");
+        session
+            .transaction(|ui| {
+                Surface::builder(NodeId::new(1)).create(ui)?;
+                Ok(())
+            })
+            .expect("initial surface");
+        assert_eq!(session.current_revision(), 1);
+
+        let coalesced = DomainTransaction::with_revisions(
+            Revision::new(1),
+            Revision::new(5),
+            [Operation::SetProperty {
+                id: NodeId::new(1),
+                property: PropertyRef::LABEL,
+                value: Value::String("coalesced".to_string()),
+            }],
+            0,
+        );
+        let wire: Transaction = (&coalesced).into();
+
+        let err = session
+            .commit_transaction(wire)
+            .expect_err("a multi-revision span is not journal-admissible");
+        assert!(
+            matches!(
+                err,
+                SessionError::Journal(JournalError::InvalidRevisionRange { base: 1, new: 5 })
+            ),
+            "expected a journal rejection, got {err:?}"
+        );
+        assert_eq!(
+            session.current_revision(),
+            1,
+            "a refused transaction must leave the store on its committed revision"
+        );
+
+        session
+            .transaction(|ui| {
+                ui.set(NodeId::new(1), PropertyRef::LABEL, "after")?;
+                Ok(())
+            })
+            .expect("session must remain committable after a refused transaction");
+        assert_eq!(session.current_revision(), 2);
+    }
+
+    /// `ClientHello.client_instance_id` is a proto3 `bytes` field with no documented non-empty
+    /// requirement; omitting it must not drop the socket without a diagnostic (§15, §18).
+    #[test]
+    fn test_bootstrap_fresh_client_accepts_empty_client_instance_id() {
+        let session = Session::new("empty-instance-id");
+        let hello = srui_protocol::ClientHello {
+            core_version: "0.4.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: Vec::new(),
+            client_metadata: Default::default(),
+        };
+
+        let bootstrap = session
+            .bootstrap_fresh_client(&hello)
+            .expect("empty client_instance_id must complete the handshake");
+        assert_eq!(bootstrap.welcome.session_id, "empty-instance-id");
+        assert!(bootstrap.transactions.termination().is_none());
     }
 
     #[test]

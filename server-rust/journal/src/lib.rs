@@ -76,8 +76,13 @@ impl TransactionJournal {
         }
     }
 
-    /// Records a newly committed transaction into the journal.
-    pub fn record(&mut self, tx: Transaction) -> Result<(), JournalError> {
+    /// Reports whether [`Self::record`] would accept `tx`, without recording it.
+    ///
+    /// A caller that mutates authoritative state before recording must consult this first: the
+    /// store and the journal advance together or they diverge permanently, since the store cannot
+    /// roll back a committed revision and every later transaction then fails
+    /// [`JournalError::NonContiguousRevision`] (§12.1, §18.1).
+    pub fn check_admissible(&self, tx: &Transaction) -> Result<(), JournalError> {
         if tx.new_revision != tx.base_revision.saturating_add(1) {
             return Err(JournalError::InvalidRevisionRange {
                 base: tx.base_revision,
@@ -91,6 +96,13 @@ impl TransactionJournal {
                 actual: tx.base_revision,
             });
         }
+
+        Ok(())
+    }
+
+    /// Records a newly committed transaction into the journal.
+    pub fn record(&mut self, tx: Transaction) -> Result<(), JournalError> {
+        self.check_admissible(&tx)?;
 
         if self.entries.is_empty() {
             self.earliest_revision = tx.base_revision;

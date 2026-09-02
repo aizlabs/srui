@@ -1,3 +1,14 @@
+//! Atomic client attach: catch-up plus bounded outbound subscribe under one lock section
+//! (§15, §18, §18.1, §20.2, §21).
+//!
+//! # Lock Order
+//!
+//! Bootstrap holds the [`SessionInner`](super::SessionInner) lock across
+//! [`OutboundHub::subscribe`](crate::outbound::OutboundHub::subscribe) and
+//! `OutboundHub::is_client_stale`, so the session lock is always the outermost of the two; the hub
+//! itself nests `subscribers -> SubscriberState -> stale_clients`. Nothing may take a hub lock
+//! before the session lock, or the two orders deadlock.
+
 use crate::outbound::OutboundReceiver;
 use srui_protocol::{
     ClientHello, ClientResume, ExtensionNamespaceMapping, ServerResumeOk, ServerResyncRequired,
@@ -113,10 +124,6 @@ impl Session {
     /// holding the session lock so no concurrent transaction commit can be missed between catch-up
     /// clone and live distribution.
     ///
-    /// The caller may supply an optional callback run immediately before subscription while
-    /// holding the lock, used in tests to deterministically verify lock order and commit interleaving
-    /// preserving strict deadlock freedom.
-    ///
     /// # Revision-Zero Omission
     /// When `initial_revision == 0`, `snapshot` is `None` because an empty `0 -> 0` snapshot violates normal
     /// transaction invariants.
@@ -132,6 +139,8 @@ impl Session {
         self.bootstrap_fresh_client_with(hello, || {})
     }
 
+    /// [`Self::bootstrap_fresh_client`] with a callback run immediately before subscription while
+    /// the session lock is held, used by tests to interleave a commit with the catch-up clone.
     pub(crate) fn bootstrap_fresh_client_with<F>(
         &self,
         hello: &ClientHello,
@@ -175,6 +184,8 @@ impl Session {
         self.bootstrap_resume_with(resume, || {})
     }
 
+    /// [`Self::bootstrap_resume`] with a callback run immediately before subscription while the
+    /// session lock is held, used by tests to interleave a commit with the replay collection.
     pub(crate) fn bootstrap_resume_with<F>(
         &self,
         resume: &ClientResume,

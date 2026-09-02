@@ -271,16 +271,15 @@ public final class TransactionApplier: @unchecked Sendable {
         )
     }
 
-    /// Applies a structured `Transaction` record, validating its base and target revisions.
+    /// Applies an authoritative commit, validating its base and target revisions.
     ///
-    /// Single-step increments (`newRevision == baseRevision.next`) accept arbitrary operations.
-    /// Multi-revision forward spans (`newRevision > baseRevision.next`) are legal exclusively for
-    /// coalesced scalar updates (`record.isCoalesceable`).
+    /// Accepts only `newRevision == baseRevision.next`. A coalesced delivery span belongs to
+    /// `applyDelivered(record:)` and a resync snapshot to `applySnapshot(record:)` (§12.1).
     public func apply(record: Transaction) -> Result<Revision, TxnError> {
         applyCommitted(record: record).map(\.revision)
     }
 
-    /// Applies a structured `Transaction` record and atomically returns the committed snapshot.
+    /// Applies an authoritative commit and atomically returns the committed snapshot.
     ///
     /// Callers that must hand the renderer a store matching exactly the transaction they just
     /// applied MUST use this instead of `apply(record:)` followed by a separate `currentSnapshot`
@@ -290,30 +289,56 @@ public final class TransactionApplier: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        guard record.newRevision == record.baseRevision.next else {
+            return .failure(
+                .invalidNewRevision(
+                    expected: record.baseRevision.next,
+                    actual: record.newRevision
+                )
+            )
+        }
+
+        return applyValidated(record: record)
+    }
+
+    /// Applies one frame of the live stream, and atomically returns the committed snapshot
+    /// (§12.1, §20.4).
+    ///
+    /// This is the entry point for streamed transactions. A frame is either an authoritative commit
+    /// (`newRevision == baseRevision.next`) or a coalesced scalar delta standing in for a run of
+    /// them (`newRevision > baseRevision.next`, `record.isCoalesceable`). Both are legal for a
+    /// replica and neither is authoritative, which is why they share an entry point; a span that is
+    /// neither form is rejected rather than guessed at.
+    ///
+    /// A resync snapshot is deliberately not accepted here — its shape is indistinguishable from a
+    /// replayed first transaction, so it may only be applied from explicit protocol context via
+    /// `applySnapshot(record:)` (§18).
+    public func applyDelivered(record: Transaction) -> Result<TransactionSnapshot, TxnError> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let isCommit = record.newRevision == record.baseRevision.next
+        let isDelta = record.newRevision > record.baseRevision.next && record.isCoalesceable
+        guard isCommit || isDelta else {
+            return .failure(
+                .invalidNewRevision(
+                    expected: record.baseRevision.next,
+                    actual: record.newRevision
+                )
+            )
+        }
+
+        return applyValidated(record: record)
+    }
+
+    /// Applies a record whose delivery form has already been validated. Caller holds `lock`.
+    private func applyValidated(record: Transaction) -> Result<TransactionSnapshot, TxnError> {
         let currentRevision = _store.revision
         if record.baseRevision != currentRevision {
             return .failure(
                 .staleBaseRevision(
                     expected: currentRevision,
                     actual: record.baseRevision
-                )
-            )
-        }
-
-        guard record.newRevision >= record.baseRevision.next else {
-            return .failure(
-                .invalidNewRevision(
-                    expected: record.baseRevision.next,
-                    actual: record.newRevision
-                )
-            )
-        }
-
-        if record.newRevision > record.baseRevision.next && !record.isCoalesceable {
-            return .failure(
-                .invalidNewRevision(
-                    expected: record.baseRevision.next,
-                    actual: record.newRevision
                 )
             )
         }

@@ -228,10 +228,18 @@ final class TransactionTests: XCTestCase {
 
         let scalarOps: [StoreOperation] = [.setProperty(id: rootID, property: .label, value: .string("v5"))]
 
-        // Coalesced delta specifies forward range base 1 -> new 5 via applyCommitted (§12.1, §20.2)
+        // Coalesced delta specifies forward range base 1 -> new 5 (§12.1 delivery forms, §20.4)
         let forwardTxn = Transaction(baseRevision: Revision(1), newRevision: Revision(5), operations: scalarOps, priority: 0)
 
-        let res = applier.applyCommitted(record: forwardTxn)
+        // The authoritative path advances exactly one revision and refuses the span
+        XCTAssertEqual(
+            applier.applyCommitted(record: forwardTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(2), actual: Revision(5)))
+        )
+        XCTAssertEqual(applier.store.revision, Revision(1), "a refused commit must not advance the replica")
+
+        // The delivery path accepts it, because a replica is what a delta is addressed to
+        let res = applier.applyDelivered(record: forwardTxn)
         guard case .success(let snapshot) = res else {
             XCTFail("expected success for forward coalesced delta, got \(res)")
             return
@@ -241,7 +249,8 @@ final class TransactionTests: XCTestCase {
         XCTAssertEqual(applier.lastAppliedRevision, Revision(5))
         XCTAssertEqual(applier.store.nodeCount, 1)
 
-        // Forward range with structural mutation (non-coalesceable) is rejected (§12.1, §20.2)
+        // Forward range with structural mutation (non-coalesceable) is rejected on both paths
+        // (§12.1, §20.4)
         let structuralSpanTxn = Transaction(
             baseRevision: Revision(5),
             newRevision: Revision(10),
@@ -252,18 +261,30 @@ final class TransactionTests: XCTestCase {
             applier.applyCommitted(record: structuralSpanTxn).map(\.revision),
             .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(10)))
         )
+        XCTAssertEqual(
+            applier.applyDelivered(record: structuralSpanTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(10)))
+        )
 
-        // Equal revision is rejected by applyCommitted
+        // Equal revision is rejected by both paths
         let equalTxn = Transaction(baseRevision: Revision(5), newRevision: Revision(5), operations: [], priority: 0)
         XCTAssertEqual(
             applier.applyCommitted(record: equalTxn).map(\.revision),
             .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(5)))
         )
+        XCTAssertEqual(
+            applier.applyDelivered(record: equalTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(5)))
+        )
 
-        // Backward revision is rejected by applyCommitted
+        // Backward revision is rejected by both paths
         let backwardTxn = Transaction(baseRevision: Revision(5), newRevision: Revision(3), operations: [], priority: 0)
         XCTAssertEqual(
             applier.applyCommitted(record: backwardTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(3)))
+        )
+        XCTAssertEqual(
+            applier.applyDelivered(record: backwardTxn).map(\.revision),
             .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(3)))
         )
     }

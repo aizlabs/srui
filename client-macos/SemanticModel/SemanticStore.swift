@@ -729,6 +729,25 @@ public struct SemanticStore: Equatable, Sendable {
         nodes[id]
     }
 
+    /// Collects every resource hash referenced by node properties or cached model items (§14).
+    public func referencedResourceHashes() -> Set<ResourceHash> {
+        var hashes = Set<ResourceHash>()
+        for node in nodes.values {
+            for (_, value) in node.properties {
+                value.collectResourceHashes(into: &hashes)
+            }
+        }
+        for model in models.values {
+            for (_, item) in model.iterCachedItems() {
+                item.value.collectResourceHashes(into: &hashes)
+                for (_, value) in item.properties {
+                    value.collectResourceHashes(into: &hashes)
+                }
+            }
+        }
+        return hashes
+    }
+
     /// Returns a slice of the top-level root node IDs in insertion order.
     public var rootIDs: [NodeId] {
         roots

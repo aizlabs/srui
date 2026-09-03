@@ -261,8 +261,11 @@ public actor ResourceCache {
     }
 
     /// Looks up a committed decoded image. Partials are never visible.
+    /// Touches LRU recency so frequently resolved hashes survive eviction (§26).
     public func lookup(_ hash: ResourceHash) -> ValidatedDecodedImage? {
-        committed[hash]
+        guard committed[hash] != nil else { return nil }
+        touchCommitted(hash)
+        return committed[hash]
     }
 
     /// Number of committed CAS entries (tests / diagnostics).
@@ -280,6 +283,7 @@ public actor ResourceCache {
     @discardableResult
     public func ingestMetadata(_ input: ResourceMetadataInput) throws -> ResourceCommit? {
         if let existing = committed[input.resourceHash] {
+            touchCommitted(input.resourceHash)
             return ResourceCommit(image: existing, newlyCommitted: false)
         }
 
@@ -331,6 +335,7 @@ public actor ResourceCache {
     public func ingestChunk(_ input: ResourceChunkInput) throws -> ResourceCommit? {
         if let existing = committed[input.resourceHash] {
             // Idempotent: late/duplicate chunks for a committed hash are ignored.
+            touchCommitted(input.resourceHash)
             return ResourceCommit(image: existing, newlyCommitted: false)
         }
 
@@ -465,11 +470,7 @@ public actor ResourceCache {
     /// Inserts into the committed CAS, evicting oldest *non-live* entries to honor bounds (§26).
     private func insertCommitted(_ image: ValidatedDecodedImage) throws -> [ResourceHash] {
         if committed[image.hash] != nil {
-            // Already retained (idempotent finalize); touch order.
-            if let idx = committedOrder.firstIndex(of: image.hash) {
-                committedOrder.remove(at: idx)
-                committedOrder.append(image.hash)
-            }
+            touchCommitted(image.hash)
             return []
         }
 
@@ -510,6 +511,13 @@ public actor ResourceCache {
         committedOrder.append(image.hash)
         committedDecodedBytes += decodedBytes
         return evicted
+    }
+
+    private func touchCommitted(_ hash: ResourceHash) {
+        if let idx = committedOrder.firstIndex(of: hash) {
+            committedOrder.remove(at: idx)
+            committedOrder.append(hash)
+        }
     }
 
     private func evictOldestCommitted(excluding protected: Set<ResourceHash>) -> ResourceHash? {

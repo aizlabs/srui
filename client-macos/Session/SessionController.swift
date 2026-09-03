@@ -904,9 +904,14 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
-    /// Pins hashes currently shown by Image nodes so committed-CAS eviction cannot drop them (§26).
+    /// Pins hashes currently shown by Image nodes or referenced by the replica store so
+    /// committed-CAS eviction cannot drop still-needed content (§26).
     private func syncLiveResourceReferences() async {
-        let live = await MainActor.run { self.renderer?.liveResourceHashes() ?? [] }
+        let live = await MainActor.run { () -> Set<ResourceHash> in
+            var hashes = self.renderer?.liveResourceHashes() ?? []
+            hashes.formUnion(self.applier.currentSnapshot.store.referencedResourceHashes())
+            return hashes
+        }
         await resourceCache.setLiveReferences(live)
     }
 
@@ -1248,6 +1253,7 @@ public final class SessionController: @unchecked Sendable {
                 self.hasMountedInitialTree = false
             }
         }
+        await syncLiveResourceReferences()
     }
 
     /// How long `stop()` lets the receive loop drain closed-transport frames before cancelling it.

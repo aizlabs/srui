@@ -1,8 +1,8 @@
 //! Integration tests for SemanticStore and mutation operations (§6.2, §6.3, §13, §26).
 
 use srui_semantic_tree::{
-    NodeId, Property, PropertyRef, SemanticStore, SmallRecord, StoreError, StoreLimits, TypeRef,
-    Value,
+    ItemId, ModelId, ModelItem, NodeId, Property, PropertyRef, ResourceHash, SemanticStore,
+    SmallRecord, StoreError, StoreLimits, TypeRef, Value,
 };
 
 #[test]
@@ -912,4 +912,80 @@ fn test_max_record_properties_limit_enforced() {
             actual: 3
         }
     );
+}
+
+#[test]
+fn test_referenced_resource_hashes_include_nodes_and_model_items() {
+    let mut store = SemanticStore::new();
+    let node_hash = ResourceHash::new([1u8; 32]);
+    let nested_hash = ResourceHash::new([2u8; 32]);
+    let record_hash = ResourceHash::new([3u8; 32]);
+    let model_hash = ResourceHash::new([4u8; 32]);
+    let model_prop_hash = ResourceHash::new([5u8; 32]);
+
+    store
+        .create_node(
+            NodeId::new(1),
+            TypeRef::IMAGE,
+            None,
+            None,
+            [(PropertyRef::RESOURCE, Value::ResourceHash(node_hash))],
+        )
+        .expect("create image");
+
+    store
+        .create_node(
+            NodeId::new(2),
+            TypeRef::IMAGE,
+            None,
+            None,
+            [(
+                PropertyRef::VALUE,
+                Value::List(vec![Value::ResourceHash(nested_hash)]),
+            )],
+        )
+        .expect("create nested list image");
+
+    store
+        .create_node(
+            NodeId::new(3),
+            TypeRef::IMAGE,
+            None,
+            None,
+            [(
+                PropertyRef::VALUE,
+                Value::Record(SmallRecord::new(
+                    TypeRef::standard(1),
+                    vec![Property::new(
+                        PropertyRef::RESOURCE,
+                        Value::ResourceHash(record_hash),
+                    )],
+                )),
+            )],
+        )
+        .expect("create nested record image");
+
+    store
+        .create_model(ModelId::new(1), TypeRef::TABLE, 1)
+        .expect("create model");
+    store
+        .model_reset_range(
+            ModelId::new(1),
+            0,
+            vec![ModelItem::new(
+                ItemId::new(1),
+                Value::ResourceHash(model_hash),
+                vec![(PropertyRef::RESOURCE, Value::ResourceHash(model_prop_hash))],
+            )],
+            None,
+        )
+        .expect("cache item");
+
+    let refs = store.referenced_resource_hashes();
+    assert!(refs.contains(&node_hash));
+    assert!(refs.contains(&nested_hash));
+    assert!(refs.contains(&record_hash));
+    assert!(refs.contains(&model_hash));
+    assert!(refs.contains(&model_prop_hash));
+    assert_eq!(refs.len(), 5);
 }

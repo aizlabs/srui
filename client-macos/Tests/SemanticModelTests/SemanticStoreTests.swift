@@ -784,4 +784,54 @@ final class SemanticStoreTests: XCTestCase {
         XCTAssertTrue(store.isIDUsed(NodeId(3)))
         XCTAssertTrue(store.isIDUsed(NodeId(4)))
     }
+
+    func testReferencedResourceHashesIncludeNestedAndModelItems() throws {
+        var store = SemanticStore()
+        let nodeHash = try ResourceHash(rawBytes: Array(repeating: 0x01, count: 32))
+        let nestedHash = try ResourceHash(rawBytes: Array(repeating: 0x02, count: 32))
+        let recordHash = try ResourceHash(rawBytes: Array(repeating: 0x03, count: 32))
+        let modelHash = try ResourceHash(rawBytes: Array(repeating: 0x04, count: 32))
+        let modelPropHash = try ResourceHash(rawBytes: Array(repeating: 0x05, count: 32))
+
+        try store.createNode(
+            id: NodeId(1),
+            nodeType: .image,
+            properties: [(.resource, .resourceHash(nodeHash))]
+        )
+        try store.createNode(
+            id: NodeId(2),
+            nodeType: .image,
+            properties: [(.value, .list([.resourceHash(nestedHash)]))]
+        )
+        try store.createNode(
+            id: NodeId(3),
+            nodeType: .image,
+            properties: [(
+                .value,
+                .record(SmallRecord(
+                    typeRef: TypeRef.standard(1),
+                    properties: [Property(property: .resource, value: .resourceHash(recordHash))]
+                ))
+            )]
+        )
+        try store.createModel(id: ModelId(1), modelType: .table, itemCount: 1)
+        try store.modelResetRange(
+            id: ModelId(1),
+            startIndex: 0,
+            items: [
+                ModelItem(
+                    itemID: ItemId(1),
+                    value: .resourceHash(modelHash),
+                    properties: [(.resource, .resourceHash(modelPropHash))]
+                )
+            ],
+            totalCount: 1
+        )
+
+        let refs = store.referencedResourceHashes()
+        XCTAssertEqual(
+            refs,
+            [nodeHash, nestedHash, recordHash, modelHash, modelPropHash]
+        )
+    }
 }

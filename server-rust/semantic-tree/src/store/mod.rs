@@ -157,7 +157,8 @@ impl SemanticStore {
         self.nodes.get(&id)
     }
 
-    /// Collects every [`ResourceHash`] currently referenced by a node property (§14).
+    /// Collects every [`ResourceHash`] currently referenced by node properties or cached
+    /// model items (§14).
     ///
     /// Used by the resource CAS so eviction never drops hashes still required by authoritative
     /// state when no demand-fetch protocol exists.
@@ -166,8 +167,14 @@ impl SemanticStore {
         let mut hashes = HashSet::new();
         for node in self.nodes.values() {
             for (_, value) in node.iter_properties() {
-                if let Value::ResourceHash(hash) = value {
-                    hashes.insert(*hash);
+                value.collect_resource_hashes(&mut hashes);
+            }
+        }
+        for model in self.models.values() {
+            for (_, item) in model.iter_cached_items() {
+                item.value.collect_resource_hashes(&mut hashes);
+                for value in item.properties.values() {
+                    value.collect_resource_hashes(&mut hashes);
                 }
             }
         }

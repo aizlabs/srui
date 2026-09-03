@@ -23,12 +23,53 @@ private enum FixturePNG {
         0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ]
 
+    /// Distinct valid 1×1 green RGB PNG (different IDAT → different SHA-256).
+    static let greenBytes: [UInt8] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+        0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0xDA, 0x63, 0x60, 0xF8, 0xCF, 0x00, 0x00, 0x02, 0x02, 0x01, 0x00, 0x45, 0xF4, 0x52,
+        0xD4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ]
+
+    /// Distinct valid 1×1 blue RGB PNG.
+    static let blueBytes: [UInt8] = [
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+        0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0xDA, 0x63, 0x60, 0x60, 0xF8, 0x0F, 0x00, 0x01, 0x03, 0x01, 0x00, 0x36, 0x74, 0x11,
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ]
+
     static var data: Data { Data(bytes) }
 
     static func hash() throws -> ResourceHash {
-        let digest = SHA256.hash(data: data)
+        try hash(of: bytes)
+    }
+
+    static func hash(of bytes: [UInt8]) throws -> ResourceHash {
+        let digest = SHA256.hash(data: Data(bytes))
         return try ResourceHash(rawBytes: Array(digest))
     }
+}
+
+private func ingestPNG(_ cache: ResourceCache, bytes: [UInt8]) async throws -> ResourceCommit {
+    let hash = try FixturePNG.hash(of: bytes)
+    _ = try await cache.ingestMetadata(
+        ResourceMetadataInput(
+            resourceHash: hash,
+            mediaType: "image/png",
+            encodedLength: UInt64(bytes.count),
+            decodedWidth: 1,
+            decodedHeight: 1,
+            priority: .normal
+        )
+    )
+    return try #require(
+        try await cache.ingestChunk(
+            ResourceChunkInput(resourceHash: hash, byteOffset: 0, data: Data(bytes))
+        )
+    )
 }
 
 @Suite("ResourceCache")
@@ -309,57 +350,61 @@ struct ResourceCacheTests {
         let cache = ResourceCache(
             limits: ResourceLimits(maxCommittedEntries: 1, maxCommittedDecodedBytes: 1_048_576)
         )
-        let hash = try FixturePNG.hash()
-        let meta = ResourceMetadataInput(
-            resourceHash: hash,
-            mediaType: "image/png",
-            encodedLength: UInt64(FixturePNG.bytes.count),
-            decodedWidth: 1,
-            decodedHeight: 1,
-            priority: .normal
-        )
-        _ = try await cache.ingestMetadata(meta)
-        let first = try #require(
-            try await cache.ingestChunk(
-                ResourceChunkInput(resourceHash: hash, byteOffset: 0, data: FixturePNG.data)
-            )
-        )
+        let first = try await ingestPNG(cache, bytes: FixturePNG.bytes)
         #expect(first.newlyCommitted)
         #expect(first.evictedHashes.isEmpty)
         #expect(await cache.committedCount() == 1)
 
-        // Distinct valid 1×1 green RGB PNG (different IDAT → different SHA-256).
-        let secondBytes: [UInt8] = [
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0xDA, 0x63, 0x60, 0xF8, 0xCF, 0x00, 0x00, 0x02, 0x02, 0x01, 0x00, 0x45, 0xF4, 0x52,
-            0xD4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ]
-        let secondData = Data(secondBytes)
-        let secondDigest = SHA256.hash(data: secondData)
-        let secondHash = try ResourceHash(rawBytes: Array(secondDigest))
-        #expect(secondHash != hash)
+        let secondHash = try FixturePNG.hash(of: FixturePNG.greenBytes)
+        #expect(secondHash != first.image.hash)
 
-        _ = try await cache.ingestMetadata(
-            ResourceMetadataInput(
-                resourceHash: secondHash,
-                mediaType: "image/png",
-                encodedLength: UInt64(secondBytes.count),
-                decodedWidth: 1,
-                decodedHeight: 1,
-                priority: .normal
-            )
-        )
-        let second = try #require(
-            try await cache.ingestChunk(
-                ResourceChunkInput(resourceHash: secondHash, byteOffset: 0, data: secondData)
-            )
-        )
+        let second = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)
         #expect(second.newlyCommitted)
-        #expect(second.evictedHashes == [hash])
+        #expect(second.evictedHashes == [first.image.hash])
         #expect(await cache.contains(secondHash))
-        #expect(await cache.contains(hash) == false)
+        #expect(await cache.contains(first.image.hash) == false)
         #expect(await cache.committedCount() == 1)
+    }
+
+    @Test
+    func committedCacheEvictsLeastRecentlyUsedOnLookup() async throws {
+        let cache = ResourceCache(
+            limits: ResourceLimits(maxCommittedEntries: 2, maxCommittedDecodedBytes: 1_048_576)
+        )
+        let first = try await ingestPNG(cache, bytes: FixturePNG.bytes)
+        let second = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)
+        #expect(await cache.committedCount() == 2)
+
+        // Touch the older entry so insertion-order eviction would be wrong.
+        #expect(await cache.lookup(first.image.hash) != nil)
+
+        let third = try await ingestPNG(cache, bytes: FixturePNG.blueBytes)
+        #expect(third.newlyCommitted)
+        #expect(third.evictedHashes == [second.image.hash])
+        #expect(await cache.contains(first.image.hash))
+        #expect(await cache.contains(second.image.hash) == false)
+        #expect(await cache.contains(third.image.hash))
+        #expect(await cache.committedCount() == 2)
+    }
+
+    @Test
+    func liveReferencesAreNotEvicted() async throws {
+        let cache = ResourceCache(
+            limits: ResourceLimits(maxCommittedEntries: 1, maxCommittedDecodedBytes: 1_048_576)
+        )
+        let first = try await ingestPNG(cache, bytes: FixturePNG.bytes)
+        await cache.setLiveReferences([first.image.hash])
+
+        await #expect(throws: ResourceCacheError.self) {
+            _ = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)
+        }
+        #expect(await cache.contains(first.image.hash))
+        #expect(await cache.committedCount() == 1)
+
+        await cache.setLiveReferences([])
+        let second = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)
+        #expect(second.evictedHashes == [first.image.hash])
+        #expect(await cache.contains(first.image.hash) == false)
+        #expect(await cache.contains(second.image.hash))
     }
 }

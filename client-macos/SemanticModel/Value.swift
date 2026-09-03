@@ -288,6 +288,24 @@ public enum Value: Hashable, Equatable, Sendable, CustomStringConvertible {
         return nil
     }
 
+    /// Recursively collects nested resource hashes (§14).
+    public func collectResourceHashes(into hashes: inout Set<ResourceHash>) {
+        switch self {
+        case .resourceHash(let hash):
+            hashes.insert(hash)
+        case .list(let items):
+            for item in items {
+                item.collectResourceHashes(into: &hashes)
+            }
+        case .record(let record):
+            for prop in record.properties {
+                prop.value.collectResourceHashes(into: &hashes)
+            }
+        default:
+            break
+        }
+    }
+
     public var asRecord: SmallRecord? {
         if case .record(let r) = self { return r }
         return nil

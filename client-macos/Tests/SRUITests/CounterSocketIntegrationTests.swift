@@ -354,12 +354,13 @@ struct CounterSocketIntegrationTests {
 
     /// Soft-detects whether the counter binary advertises `--image-fixture`.
     private static func counterSupportsImageFixture(_ binary: URL) -> Bool {
+        // The counter binary has no `--help`; scan its strings for the flag name.
         let process = Process()
-        process.executableURL = binary
-        process.arguments = ["--help"]
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/strings")
+        process.arguments = [binary.path]
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardError = FileHandle.nullDevice
         do {
             try process.run()
             process.waitUntilExit()
@@ -367,7 +368,9 @@ struct CounterSocketIntegrationTests {
             let text = String(data: data, encoding: .utf8) ?? ""
             return text.contains("image-fixture")
         } catch {
-            return false
+            // If `strings` is unavailable, attempt the fixture path and let the
+            // pending-hash wait soft-skip below.
+            return true
         }
     }
 

@@ -115,15 +115,76 @@ impl ResourceTransferQueue {
             }
 
             let active = self.active.as_mut()?;
-            if let Some(frame) = active.next_frame() {
-                if active.is_complete() {
-                    self.active = None;
-                }
-                return Some(frame);
+            let Some(frame) = active.next_frame() else {
+                // `next_frame` returns `None` only when metadata is sent and no bytes remain.
+                // `is_complete()` already clears `active` after that last `Some` frame, so this
+                // branch is defensive against the two predicates drifting apart.
+                self.active = None;
+                continue;
+            };
+            if active.is_complete() {
+                self.active = None;
             }
-
-            // Empty resource: metadata already sent, no chunks.
-            self.active = None;
+            return Some(frame);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use srui_semantic_tree::ResourceHash;
+
+    fn entry(tag: u8, bytes: &[u8]) -> ResourceEntry {
+        ResourceEntry {
+            hash: ResourceHash::new([tag; 32]),
+            media_type: "application/octet-stream".into(),
+            encoded_length: bytes.len() as u64,
+            bytes: Arc::from(bytes),
+        }
+    }
+
+    #[test]
+    fn empty_resource_emits_metadata_only() {
+        let mut queue = ResourceTransferQueue::default();
+        queue.enqueue(entry(1, b""));
+        match queue.pop_frame() {
+            Some(ResourceOutboundFrame::Metadata(meta)) => {
+                assert_eq!(meta.encoded_length, 0);
+                assert_eq!(meta.resource_hash, [1u8; 32]);
+            }
+            other => panic!("expected metadata, got {other:?}"),
+        }
+        assert!(!queue.has_work());
+        assert!(queue.pop_frame().is_none());
+    }
+
+    #[test]
+    fn non_empty_resource_emits_metadata_then_chunks() {
+        let mut queue = ResourceTransferQueue::default();
+        let payload = vec![0xABu8; CHUNK_PAYLOAD_SIZE + 3];
+        queue.enqueue(entry(2, &payload));
+
+        match queue.pop_frame() {
+            Some(ResourceOutboundFrame::Metadata(meta)) => {
+                assert_eq!(meta.encoded_length, payload.len() as u64);
+            }
+            other => panic!("expected metadata, got {other:?}"),
+        }
+        match queue.pop_frame() {
+            Some(ResourceOutboundFrame::Chunk(chunk)) => {
+                assert_eq!(chunk.byte_offset, 0);
+                assert_eq!(chunk.data.len(), CHUNK_PAYLOAD_SIZE);
+            }
+            other => panic!("expected first chunk, got {other:?}"),
+        }
+        match queue.pop_frame() {
+            Some(ResourceOutboundFrame::Chunk(chunk)) => {
+                assert_eq!(chunk.byte_offset, CHUNK_PAYLOAD_SIZE as u64);
+                assert_eq!(chunk.data, vec![0xABu8; 3]);
+            }
+            other => panic!("expected tail chunk, got {other:?}"),
+        }
+        assert!(!queue.has_work());
     }
 }

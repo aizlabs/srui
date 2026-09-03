@@ -8,6 +8,3 @@ license.workspace = true
 srui-semantic-tree = { path = "../semantic-tree" }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }

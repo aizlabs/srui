@@ -17,6 +17,7 @@ let package = Package(
         .library(name: "Terminal", targets: ["Terminal"]),
         .library(name: "Resources", targets: ["Resources"]),
         .library(name: "Accessibility", targets: ["Accessibility"]),
+        .executable(name: "RendererDemoApp", targets: ["RendererDemoApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.2"),

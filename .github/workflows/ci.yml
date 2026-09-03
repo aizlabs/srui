@@ -88,9 +88,15 @@ jobs:
           set -euo pipefail
           deadline=$(( $(date +%s) + 900 ))
           while :; do
+            # `--paginate` emits one JSON document per page, so a per-page `length` yields one
+            # number per line: on a PR with enough reviews to span pages, `reviewed` becomes
+            # something like "0\n1", the numeric test below errors, and the gate times out even
+            # though the current head has been reviewed. `jq -s add` folds the pages into one
+            # integer.
             reviewed=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate \
               --jq "[.[] | select((.user.login // \"\") | startswith(\"chatgpt-codex-connector\"))
-                     | select(.commit_id == \"$HEAD_SHA\")] | length")
+                     | select(.commit_id == \"$HEAD_SHA\")] | length" \
+              | jq -s 'add // 0')
             if [ "$reviewed" -gt 0 ]; then
               echo "Codex has reviewed ${HEAD_SHA}."
               exit 0

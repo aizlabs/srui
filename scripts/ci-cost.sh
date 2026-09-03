@@ -36,7 +36,10 @@ fi
 
 while read -r run_id; do
 	[ -n "$run_id" ] || continue
-	if ! gh api "repos/$repo/actions/runs/$run_id/jobs" --jq '
+	# `filter=all` because the default, `latest`, returns only the most recent attempt — yet every
+	# earlier attempt of a re-run job was billed too, so the default silently understates spend on
+	# exactly the runs you re-ran because they failed. Paginated for runs with many jobs.
+	if ! gh api --paginate "repos/$repo/actions/runs/$run_id/jobs?filter=all&per_page=100" --jq '
 			.jobs[]
 			| select(.started_at != null and .completed_at != null)
 			| [ (.labels[0] // "unknown"), .name,

@@ -423,10 +423,10 @@ public actor ResourceCache {
             )
         }
 
-        let digest = SHA256.hash(data: bytes)
+        let digest = Array(SHA256.hash(data: bytes))
         let actualHash: ResourceHash
         do {
-            actualHash = try ResourceHash(rawBytes: Array(digest))
+            actualHash = try ResourceHash(rawBytes: digest)
         } catch {
             throw ResourceCacheError.invalidHash(digest.count)
         }

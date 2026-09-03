@@ -1241,6 +1241,47 @@ public nonisolated enum Srui_Protocol_SessionContinuity: SwiftProtobuf.Enum, Swi
 
 }
 
+/// Transfer priority for resource payloads. Resource traffic is always scheduled
+/// below UI/control traffic (§19.2); this field distinguishes resources from each
+/// other when a multi-class scheduler is introduced later.
+public nonisolated enum Srui_Protocol_ResourcePriority: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case normal // = 1
+  case low // = 2
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .normal
+    case 2: self = .low
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .normal: return 1
+    case .low: return 2
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_ResourcePriority] = [
+    .unspecified,
+    .normal,
+    .low,
+  ]
+
+}
+
 public nonisolated struct Srui_Protocol_TypeRef: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2117,44 +2158,6 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
   public init() {}
 }
 
-public nonisolated enum Srui_Protocol_ResourcePriority: SwiftProtobuf.Enum, Swift.CaseIterable {
-  public typealias RawValue = Int
-  case unspecified // = 0
-  case normal // = 1
-  case low // = 2
-  case UNRECOGNIZED(Int)
-
-  public init() {
-    self = .unspecified
-  }
-
-  public init?(rawValue: Int) {
-    switch rawValue {
-    case 0: self = .unspecified
-    case 1: self = .normal
-    case 2: self = .low
-    default: self = .UNRECOGNIZED(rawValue)
-    }
-  }
-
-  public var rawValue: Int {
-    switch self {
-    case .unspecified: return 0
-    case .normal: return 1
-    case .low: return 2
-    case .UNRECOGNIZED(let i): return i
-    }
-  }
-
-  // The compiler won't synthesize support with the UNRECOGNIZED case.
-  public static let allCases: [Srui_Protocol_ResourcePriority] = [
-    .unspecified,
-    .normal,
-    .low,
-  ]
-
-}
-
 /// Negotiated operational boundaries (§15) to prevent unbounded memory allocation
 /// on variable-length wire fields (strings, byte arrays, collections, transactions).
 public nonisolated struct Srui_Protocol_ClientLimits: Sendable {
@@ -2337,6 +2340,8 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
   public init() {}
 }
 
+/// Immutable resource announcement. Completion is defined by receiving the
+/// contiguous byte range [0, encoded_length); there is no separate terminal frame.
 public nonisolated struct Srui_Protocol_ResourceMetadata: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2362,6 +2367,8 @@ public nonisolated struct Srui_Protocol_ResourceMetadata: Sendable {
   public init() {}
 }
 
+/// One contiguous slice of a resource's encoded bytes. Every chunk carries the
+/// resource hash so concurrent transfers cannot be mixed.
 public nonisolated struct Srui_Protocol_ResourceChunk: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2565,12 +2572,12 @@ nonisolated extension Srui_Protocol_EventAckStatus: SwiftProtobuf._ProtoNameProv
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0EVENT_ACK_STATUS_UNSPECIFIED\0\u{1}EVENT_ACK_STATUS_PROCESSED\0\u{1}EVENT_ACK_STATUS_DUPLICATE\0\u{1}EVENT_ACK_STATUS_REJECTED\0")
 }
 
-nonisolated extension Srui_Protocol_ResourcePriority: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0RESOURCE_PRIORITY_UNSPECIFIED\0\u{1}RESOURCE_PRIORITY_NORMAL\0\u{1}RESOURCE_PRIORITY_LOW\0")
-}
-
 nonisolated extension Srui_Protocol_SessionContinuity: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0SESSION_CONTINUITY_UNSPECIFIED\0\u{1}SESSION_CONTINUITY_SAME_SESSION\0\u{1}SESSION_CONTINUITY_REPLACED\0")
+}
+
+nonisolated extension Srui_Protocol_ResourcePriority: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0RESOURCE_PRIORITY_UNSPECIFIED\0\u{1}RESOURCE_PRIORITY_NORMAL\0\u{1}RESOURCE_PRIORITY_LOW\0")
 }
 
 nonisolated extension Srui_Protocol_TypeRef: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {

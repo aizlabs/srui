@@ -370,8 +370,10 @@ struct CounterSocketIntegrationTests {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
-            process.waitUntilExit()
+            // Drain before waiting: `strings` on a multi-MB debug binary writes far more than the
+            // 64 KiB pipe buffer, so waiting for exit first deadlocks both processes forever.
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let text = String(data: data, encoding: .utf8) ?? ""
             return text.contains("image-fixture")
         } catch {
@@ -380,6 +382,7 @@ struct CounterSocketIntegrationTests {
         }
     }
 
+    @MainActor
     private static func waitForImagePendingHash(
         in renderer: AppKitRenderer,
         timeoutSeconds: TimeInterval

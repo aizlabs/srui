@@ -365,3 +365,46 @@ fn test_transaction_sync_and_complex_mutations() {
         assert_eq!(store.parent_of(tgl), Some(Some(NodeId::new(4))));
     });
 }
+
+#[test]
+fn test_publish_resource_returns_canonical_hash_and_dedupes() {
+    let session = Session::new("resource-api");
+    let bytes = b"sdk-resource-payload";
+    let first = session.publish_resource(bytes).expect("publish").hash;
+    let second = session.publish_resource(bytes).expect("republish");
+    assert!(!second.inserted);
+    assert_eq!(second.hash, first);
+    let entry = session.lookup_resource(&first).expect("lookup");
+    assert_eq!(entry.bytes.as_ref(), bytes);
+}
+
+#[test]
+fn test_publish_resource_rejects_oversize_before_retention() {
+    let session = Session::new("resource-limit");
+    let over = vec![0u8; DEFAULT_MAX_RESOURCE_BYTES + 1];
+    let err = session.publish_resource(&over).expect_err("oversize");
+    assert!(matches!(
+        err,
+        SdkError::Resource(ResourceError::ResourceTooLarge { .. })
+    ));
+    assert!(session
+        .lookup_resource(&ResourceHash::new([0u8; 32]))
+        .is_none());
+}
+
+#[test]
+fn test_image_widget_accepts_published_resource_hash() {
+    let session = Session::new("image-resource");
+    let hash = session.publish_resource(b"tiny-image-bytes").unwrap().hash;
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            Image::builder(2).parent(1).resource(hash).create(ui)?;
+            Ok(())
+        })
+        .unwrap();
+    session.with_store(|store| {
+        let image = Image::from_store(store, NodeId::new(2)).unwrap();
+        assert_eq!(image.resource(store), Some(hash));
+    });
+}

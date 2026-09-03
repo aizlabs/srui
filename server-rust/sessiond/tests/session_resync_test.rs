@@ -415,7 +415,9 @@ async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
         .transactions
         .recv()
         .await
-        .expect("receive transaction");
+        .expect("receive transaction")
+        .into_transaction()
+        .expect("transaction");
     assert_eq!(received.base_revision, snapshot.new_revision);
     assert_eq!(received.new_revision, snapshot.new_revision + 1);
 }
@@ -457,7 +459,9 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
         .transactions
         .recv()
         .await
-        .expect("receive first transaction");
+        .expect("receive first transaction")
+        .into_transaction()
+        .expect("transaction");
     assert_eq!(received.base_revision, 0);
     assert_eq!(received.new_revision, 1);
 }

@@ -21,9 +21,10 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use srui_resources::{PublishOutcome, ResourceEntry, ResourceError, ResourceStore};
 use srui_semantic_tree::{
-    Event, EventValidationError, Node, NodeId, Operation, PropertyRef, Revision, SemanticStore,
-    StoreError, TxnError, TypeRef, Value,
+    Event, EventValidationError, Node, NodeId, Operation, PropertyRef, ResourceHash, Revision,
+    SemanticStore, StoreError, TxnError, TypeRef, Value,
 };
 use thiserror::Error;
 
@@ -53,6 +54,10 @@ pub enum SdkError {
     /// Transaction closure panicked during execution.
     #[error("transaction panicked: {0}")]
     Panicked(String),
+
+    /// Resource CAS publication or lookup failure (§14).
+    #[error("resource error: {0}")]
+    Resource(#[from] ResourceError),
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -353,6 +358,7 @@ pub type HandlerFn = Arc<dyn Fn(&Session, &Event) + Send + Sync + 'static>;
 struct SessionInner {
     session_id: String,
     store: SemanticStore,
+    resources: ResourceStore,
     handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
 }
 
@@ -361,6 +367,7 @@ impl std::fmt::Debug for SessionInner {
         f.debug_struct("SessionInner")
             .field("session_id", &self.session_id)
             .field("store", &self.store)
+            .field("resources", &self.resources)
             .field("handler_count", &self.handlers.len())
             .finish()
     }
@@ -398,9 +405,24 @@ impl Session {
             inner: Arc::new(Mutex::new(SessionInner {
                 session_id: session_id.into(),
                 store,
+                resources: ResourceStore::new(),
                 handlers: HashMap::new(),
             })),
         }
+    }
+
+    /// Publishes immutable `bytes` into the session resource CAS (§14).
+    ///
+    /// Returns the canonical [`ResourceHash`]. Identical content is deduplicated.
+    pub fn publish_resource(&self, bytes: impl AsRef<[u8]>) -> Result<PublishOutcome, SdkError> {
+        let mut guard = self.inner.lock().map_err(|_| SdkError::LockPoisoned)?;
+        Ok(guard.resources.publish_resource(bytes)?)
+    }
+
+    /// Looks up a retained resource by hash (§14).
+    pub fn lookup_resource(&self, hash: &ResourceHash) -> Option<ResourceEntry> {
+        let guard = lock_or_recover(&self.inner);
+        guard.resources.lookup(hash).cloned()
     }
 
     /// Returns the session ID string (§6.1).

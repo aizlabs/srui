@@ -17,6 +17,7 @@ srui-semantic-tree = { path = "../semantic-tree" }
 srui-sdk = { path = "../sdk" }
 srui-journal = { path = "../journal" }
 srui-event-dedupe = { path = "../event-dedupe" }
+srui-resources = { path = "../resources" }
 getrandom = "0.4"
 
 [target.'cfg(unix)'.dependencies]

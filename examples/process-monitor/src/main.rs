@@ -303,10 +303,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     received = receiver.recv() => match received {
-                        Ok(transaction) => match measure_transaction(&transaction) {
-                            Ok(stats) => info!(target: "srui::wire_stats", "{stats}"),
-                            Err(error) => warn!(target: "srui::wire_stats", "{error}"),
-                        },
+                        Ok(srui_sessiond::OutboundItem::Transaction(transaction)) => {
+                            match measure_transaction(&transaction) {
+                                Ok(stats) => info!(target: "srui::wire_stats", "{stats}"),
+                                Err(error) => warn!(target: "srui::wire_stats", "{error}"),
+                            }
+                        }
+                        Ok(srui_sessiond::OutboundItem::ResourceMetadata(_))
+                        | Ok(srui_sessiond::OutboundItem::ResourceChunk(_)) => {
+                            // Resource frames are low-priority delivery; wire-stats here track
+                            // semantic transactions only.
+                        }
                         Err(srui_sessiond::OutboundRecvError::Lagged(reason)) => {
                             warn!("wire-stats observer lagged: {reason}; closing");
                             break;

@@ -1,7 +1,8 @@
 //! # Bounded Outbound Transaction Queues & Coalescing (§12.1, §20.2, §20.4)
 //!
 //! Provides bounded, per-connection transaction streaming with scalar property coalescing
-//! and lossless structural barriers.
+//! and lossless structural barriers, plus low-priority resource metadata/chunk delivery
+//! that never starves UI traffic (§14, §19.2).
 //!
 //! What this queue emits is a *delivery* stream: either a committed transaction verbatim, or a
 //! coalesced scalar delta standing in for a run of them (§12.1). Neither the merge policy nor its
@@ -9,6 +10,7 @@
 //! [`coalesce`] rather than in `srui-semantic-tree`.
 
 mod coalesce;
+mod resource;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,10 +18,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use srui_protocol::Transaction;
+use srui_protocol::{ResourceChunk, ResourceMetadata, Transaction};
+use srui_resources::ResourceEntry;
 use srui_semantic_tree::Transaction as DomainTxn;
 
 use crate::session::{lock_or_recover, SessionError};
+
+pub use resource::ResourceOutboundFrame;
 
 /// Default capacity for per-connection outbound transaction queues (§20.2).
 pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
@@ -30,6 +35,37 @@ pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 /// the journal retention window (§18.1): the oldest marker is evicted once the bound is reached.
 /// An evicted client that later resumes falls back to journal-gap evaluation.
 pub(crate) const MAX_TRACKED_STALE_CLIENTS: usize = 1024;
+
+/// One outbound delivery unit: UI transaction or a single resource frame (§14, §19.2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutboundItem {
+    /// Committed (or coalesced) semantic transaction.
+    Transaction(Transaction),
+    /// Resource announcement for a content-addressed payload.
+    ResourceMetadata(ResourceMetadata),
+    /// One contiguous chunk of a resource payload.
+    ResourceChunk(ResourceChunk),
+}
+
+impl OutboundItem {
+    /// Returns the enclosed transaction when this item is UI traffic.
+    #[must_use]
+    pub fn as_transaction(&self) -> Option<&Transaction> {
+        match self {
+            Self::Transaction(tx) => Some(tx),
+            _ => None,
+        }
+    }
+
+    /// Consumes the item, returning the transaction when present.
+    #[must_use]
+    pub fn into_transaction(self) -> Option<Transaction> {
+        match self {
+            Self::Transaction(tx) => Some(tx),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -66,6 +102,8 @@ struct SubscriberState {
     /// Cached so a publish never re-decodes an already-queued transaction: the wire -> domain
     /// conversion and the merge both run under the subscriber lock (§20.2).
     tail_domain: Option<DomainTxn>,
+    /// Low-priority resource transfer cursor for this connection (§14, §19.2).
+    resources: resource::ResourceTransferQueue,
     peak_depth: usize,
     stale_reason: Option<String>,
     is_closed: bool,
@@ -78,7 +116,7 @@ impl SubscriberState {
     }
 
     /// Pops the next queued transaction, keeping the cached tail consistent with the queue.
-    fn pop(&mut self) -> Option<Transaction> {
+    fn pop_transaction(&mut self) -> Option<Transaction> {
         let item = self.items.pop_front()?;
         if self.items.is_empty() {
             self.tail_domain = None;
@@ -86,9 +124,24 @@ impl SubscriberState {
         Some(item)
     }
 
+    /// Two-class selector: transactions always precede a single resource frame (§19.2).
+    fn pop_item(&mut self) -> Option<OutboundItem> {
+        if let Some(tx) = self.pop_transaction() {
+            return Some(OutboundItem::Transaction(tx));
+        }
+        match self.resources.pop_frame() {
+            Some(ResourceOutboundFrame::Metadata(meta)) => {
+                Some(OutboundItem::ResourceMetadata(meta))
+            }
+            Some(ResourceOutboundFrame::Chunk(chunk)) => Some(OutboundItem::ResourceChunk(chunk)),
+            None => None,
+        }
+    }
+
     fn clear(&mut self) {
         self.items.clear();
         self.tail_domain = None;
+        self.resources.clear();
     }
 
     /// Enqueues `tx`, or merges it into the unsent tail when `incoming_domain` allows coalescing.
@@ -212,18 +265,18 @@ pub struct OutboundReceiver {
 }
 
 impl OutboundReceiver {
-    /// Asynchronously waits for the next committed transaction.
+    /// Asynchronously waits for the next outbound item (transaction preferred over resource).
     ///
     /// This is the single, authoritative signal for queue lag: on overflow, it returns
     /// [`OutboundRecvError::Lagged`].
-    pub async fn recv(&mut self) -> Result<Transaction, OutboundRecvError> {
+    pub async fn recv(&mut self) -> Result<OutboundItem, OutboundRecvError> {
         loop {
             {
                 let mut guard = lock_or_recover(&self.state);
                 if let Some(reason) = &guard.stale_reason {
                     return Err(OutboundRecvError::Lagged(reason.clone()));
                 }
-                if let Some(item) = guard.pop() {
+                if let Some(item) = guard.pop_item() {
                     return Ok(item);
                 }
                 if guard.is_closed {
@@ -234,9 +287,12 @@ impl OutboundReceiver {
             match self.notify_rx.recv().await {
                 Some(()) => {}
                 None => {
-                    let guard = lock_or_recover(&self.state);
+                    let mut guard = lock_or_recover(&self.state);
                     if let Some(reason) = &guard.stale_reason {
                         return Err(OutboundRecvError::Lagged(reason.clone()));
+                    }
+                    if let Some(item) = guard.pop_item() {
+                        return Ok(item);
                     }
                     return Err(OutboundRecvError::Closed);
                 }
@@ -244,13 +300,13 @@ impl OutboundReceiver {
         }
     }
 
-    /// Non-blocking synchronous poll for the next transaction.
-    pub fn try_recv(&mut self) -> Result<Option<Transaction>, OutboundRecvError> {
+    /// Non-blocking synchronous poll for the next outbound item.
+    pub fn try_recv(&mut self) -> Result<Option<OutboundItem>, OutboundRecvError> {
         let mut guard = lock_or_recover(&self.state);
         if let Some(reason) = &guard.stale_reason {
             return Err(OutboundRecvError::Lagged(reason.clone()));
         }
-        if let Some(item) = guard.pop() {
+        if let Some(item) = guard.pop_item() {
             let _ = self.notify_rx.try_recv();
             return Ok(Some(item));
         }
@@ -363,6 +419,7 @@ impl OutboundHub {
             max_frame_size,
             items: VecDeque::with_capacity(capacity),
             tail_domain: None,
+            resources: resource::ResourceTransferQueue::default(),
             peak_depth: 0,
             stale_reason: None,
             is_closed: false,
@@ -445,6 +502,67 @@ impl OutboundHub {
             let mut stale_guard = lock_or_recover(&self.stale_clients);
             for (id, peak) in stale_marked {
                 stale_guard.mark(id, peak);
+            }
+        }
+    }
+
+    /// Enqueues a newly inserted resource for delivery on every live subscriber (§14, §19.2).
+    ///
+    /// Deduplicated republication should not call this: only freshly inserted CAS content needs
+    /// transfer work.
+    pub fn publish_resource(&self, entry: &ResourceEntry) {
+        if self.is_closed.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut subs = lock_or_recover(&self.subscribers);
+        subs.retain(|sub| {
+            if sub.notify_tx.is_closed() {
+                return false;
+            }
+            let closed = {
+                let mut guard = lock_or_recover(&sub.state);
+                if guard.is_closed {
+                    true
+                } else {
+                    guard.resources.enqueue(entry.clone());
+                    let _ = sub.notify_tx.try_send(());
+                    false
+                }
+            };
+            if closed {
+                sub.disconnect.cancel();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Seeds one subscriber with retained resources during handshake bootstrap (§14, §18, §20.2).
+    ///
+    /// Called while the session lock is held, immediately after [`OutboundHub::subscribe`], so a
+    /// resource published between snapshot creation and live subscription cannot be missed.
+    pub fn seed_resources(&self, receiver: &OutboundReceiver, entries: &[ResourceEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut guard = lock_or_recover(&receiver.state);
+        if guard.is_closed {
+            return;
+        }
+        for entry in entries {
+            guard.resources.enqueue(entry.clone());
+        }
+        drop(guard);
+        // Wake the connection even if it has not entered recv yet; notify capacity may be full
+        // when transactions already queued notifications, which is fine — try_recv/recv drain.
+        let _ = receiver; // state already updated; notify via matching subscriber below
+        let subs = lock_or_recover(&self.subscribers);
+        for sub in subs.iter() {
+            if Arc::ptr_eq(&sub.state, &receiver.state) {
+                let _ = sub.notify_tx.try_send(());
+                break;
             }
         }
     }
@@ -587,7 +705,12 @@ mod tests {
         hub.publish(&tx3);
         assert_eq!(hub.peak_depth_for_client(&[1]), 1);
 
-        let merged = rx.try_recv().expect("poll").expect("merged tx");
+        let merged = rx
+            .try_recv()
+            .expect("poll")
+            .expect("merged tx")
+            .into_transaction()
+            .expect("transaction item");
         assert_eq!(merged.base_revision, 0);
         assert_eq!(merged.new_revision, 5);
         assert_eq!(merged.operations.len(), 1);
@@ -624,11 +747,11 @@ mod tests {
         hub.publish(&tx4);
         assert_eq!(hub.peak_depth_for_client(&[1]), 3);
 
-        let p1 = rx.try_recv().unwrap().unwrap();
+        let p1 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
         assert_eq!(p1.new_revision, 1);
-        let p2 = rx.try_recv().unwrap().unwrap();
+        let p2 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
         assert_eq!(p2.new_revision, 2);
-        let p3 = rx.try_recv().unwrap().unwrap();
+        let p3 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
         assert_eq!(p3.new_revision, 4);
     }
 
@@ -679,8 +802,14 @@ mod tests {
             2,
             "coalescing must not create an SruiMessage larger than the frame limit"
         );
-        assert_eq!(rx.try_recv().unwrap().unwrap(), tx1);
-        assert_eq!(rx.try_recv().unwrap().unwrap(), tx2);
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap().into_transaction().unwrap(),
+            tx1
+        );
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap().into_transaction().unwrap(),
+            tx2
+        );
     }
 
     #[test]
@@ -835,7 +964,14 @@ mod tests {
 
         let tx = make_create_node_tx(0, 1, 1);
         hub.publish(&tx);
-        assert_eq!(rx.try_recv().expect("poll").expect("queued tx"), tx);
+        assert_eq!(
+            rx.try_recv()
+                .expect("poll")
+                .expect("queued tx")
+                .into_transaction()
+                .unwrap(),
+            tx
+        );
         assert!(!hub.is_client_stale(&[5]));
         let _second = hub
             .subscribe(vec![6], 4, 10, 1024 * 1024)
@@ -876,6 +1012,13 @@ mod tests {
 
         let tx = make_create_node_tx(0, 1, 1);
         hub.publish(&tx);
-        assert_eq!(rx.try_recv().expect("poll").expect("queued tx"), tx);
+        assert_eq!(
+            rx.try_recv()
+                .expect("poll")
+                .expect("queued tx")
+                .into_transaction()
+                .unwrap(),
+            tx
+        );
     }
 }

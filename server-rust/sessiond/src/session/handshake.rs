@@ -190,12 +190,17 @@ impl Session {
 
         let max_ops = inner_guard.limits.max_transaction_operations as usize;
         let max_frame_size = inner_guard.limits.max_frame_size as usize;
+        let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
             hello.client_instance_id.clone(),
             self.outbound_queue_capacity,
             max_ops,
             max_frame_size,
         )?;
+        // Seed while still holding SessionInner so a resource published between snapshot
+        // creation and live subscription cannot be missed (SessionInner -> OutboundHub order).
+        self.outbound_hub
+            .seed_resources(&transactions, &retained_resources);
         drop(inner_guard);
 
         // Fails the handshake rather than emitting a catch-up transaction the client must reject
@@ -304,12 +309,15 @@ impl Session {
 
         let max_ops = inner_guard.limits.max_transaction_operations as usize;
         let max_frame_size = inner_guard.limits.max_frame_size as usize;
+        let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
             resume.client_instance_id.clone(),
             self.outbound_queue_capacity,
             max_ops,
             max_frame_size,
         )?;
+        self.outbound_hub
+            .seed_resources(&transactions, &retained_resources);
         drop(inner_guard);
 
         let outcome = match plan {
@@ -585,7 +593,9 @@ mod tests {
             .transactions
             .try_recv()
             .expect("receive broadcast")
-            .unwrap();
+            .unwrap()
+            .into_transaction()
+            .expect("transaction");
         assert_eq!(rec_tx.new_revision, 1);
 
         let bootstrap1 = session
@@ -679,7 +689,9 @@ mod tests {
             .transactions
             .try_recv()
             .expect("post-snapshot transaction")
-            .unwrap();
+            .unwrap()
+            .into_transaction()
+            .expect("transaction");
         assert_eq!(streamed.base_revision, snapshot.new_revision);
         assert_eq!(streamed.new_revision, snapshot.new_revision + 1);
     }
@@ -760,7 +772,9 @@ mod tests {
             .transactions
             .try_recv()
             .expect("post-replay transaction")
-            .unwrap();
+            .unwrap()
+            .into_transaction()
+            .expect("transaction");
         assert_eq!(streamed.base_revision, 1);
         assert_eq!(streamed.new_revision, 2);
     }

@@ -4,6 +4,8 @@
 //! - Default: in-process simulated clicks demo.
 //! - Server: `--socket <path>` binds a Unix domain socket and hosts the counter application.
 //! - Server: `--port <port>` binds a TCP loopback socket and hosts the counter application.
+//! - Opt-in: `--image-fixture` publishes a deterministic 1×1 PNG and mounts an Image node
+//!   referencing its `ResourceHash` for cross-language resource integration tests (§14).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +16,17 @@ use tracing::{info, warn};
 use srui_example_counter::CounterApp;
 use srui_sdk::*;
 use srui_sessiond::{handle_connection, Session};
+
+/// Deterministic 1×1 PNG used by `--image-fixture` (68 bytes).
+fn fixture_png() -> Vec<u8> {
+    vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xFE, 0xD4, 0xEF, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ]
+}
 
 fn parse_server_capabilities(args: &[String]) -> ServerCapabilities {
     let mut server_caps = ServerCapabilities::standard_widgets();
@@ -26,15 +39,20 @@ fn parse_server_capabilities(args: &[String]) -> ServerCapabilities {
     server_caps
 }
 
+fn wants_image_fixture(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--image-fixture")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let capabilities = parse_server_capabilities(&args);
+    let image_fixture = wants_image_fixture(&args);
 
     if let Some(pos) = args.iter().position(|a| a == "--socket") {
         if let Some(socket_path_str) = args.get(pos + 1) {
             let socket_path = PathBuf::from(socket_path_str);
-            run_unix_server(socket_path, capabilities).await?;
+            run_unix_server(socket_path, capabilities, image_fixture).await?;
             return Ok(());
         }
     }
@@ -42,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pos) = args.iter().position(|a| a == "--port") {
         if let Some(port_str) = args.get(pos + 1) {
             let port: u16 = port_str.parse().expect("valid port number");
-            run_tcp_server(port, capabilities).await?;
+            run_tcp_server(port, capabilities, image_fixture).await?;
             return Ok(());
         }
     }
@@ -53,25 +71,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Initial UI State (Revision {}):", app.current_revision());
     println!("  Text:     {}", app.get_text().unwrap_or_default());
-    println!("  Progress: {:.2} ({})", app.get_progress().unwrap_or(0.0), app.get_progress_description().unwrap_or_default());
+    println!(
+        "  Progress: {:.2} ({})",
+        app.get_progress().unwrap_or(0.0),
+        app.get_progress_description().unwrap_or_default()
+    );
 
     // Dispatch 5 simulated button clicks
     for seq in 1..=5 {
         app.click(seq).expect("click dispatch failed");
         println!("After Click {} (Revision {}):", seq, app.current_revision());
         println!("  Text:     {}", app.get_text().unwrap_or_default());
-        println!("  Progress: {:.2} ({})", app.get_progress().unwrap_or(0.0), app.get_progress_description().unwrap_or_default());
+        println!(
+            "  Progress: {:.2} ({})",
+            app.get_progress().unwrap_or(0.0),
+            app.get_progress_description().unwrap_or_default()
+        );
     }
 
     println!("=== Counter Example completed successfully! ===");
     Ok(())
 }
 
-fn initialize_counter_session(session: &Arc<Session>) -> (NodeId, NodeId, NodeId, NodeId) {
+fn initialize_counter_session(
+    session: &Arc<Session>,
+    image_fixture: bool,
+) -> (NodeId, NodeId, NodeId, NodeId) {
     let surface_id = NodeId::new(1);
     let text_id = NodeId::new(2);
     let progress_id = NodeId::new(3);
     let button_id = NodeId::new(4);
+    let image_id = NodeId::new(5);
+
+    let image_hash = if image_fixture {
+        Some(
+            session
+                .publish_resource(fixture_png())
+                .expect("publish image fixture")
+                .hash,
+        )
+    } else {
+        None
+    };
 
     // Initial transaction (Revision 0 -> 1)
     session
@@ -97,6 +138,14 @@ fn initialize_counter_session(session: &Arc<Session>) -> (NodeId, NodeId, NodeId
                 .label("Increment")
                 .role(ActionRole::Primary)
                 .create(ui)?;
+
+            if let Some(hash) = image_hash {
+                Image::builder(image_id)
+                    .parent(surface_id)
+                    .label("Fixture Image")
+                    .resource(hash)
+                    .create(ui)?;
+            }
 
             Ok(())
         })
@@ -130,6 +179,7 @@ fn initialize_counter_session(session: &Arc<Session>) -> (NodeId, NodeId, NodeId
 async fn run_unix_server(
     socket_path: PathBuf,
     capabilities: ServerCapabilities,
+    image_fixture: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -154,7 +204,7 @@ async fn run_unix_server(
         "counter-socket-session",
         capabilities,
     ));
-    let _ = initialize_counter_session(&session);
+    let _ = initialize_counter_session(&session, image_fixture);
 
     let shutdown = CancellationToken::new();
 
@@ -190,6 +240,7 @@ async fn run_unix_server(
 async fn run_tcp_server(
     port: u16,
     capabilities: ServerCapabilities,
+    image_fixture: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -206,7 +257,7 @@ async fn run_tcp_server(
         "counter-tcp-session",
         capabilities,
     ));
-    let _ = initialize_counter_session(&session);
+    let _ = initialize_counter_session(&session, image_fixture);
 
     let shutdown = CancellationToken::new();
 

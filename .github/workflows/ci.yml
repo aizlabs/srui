@@ -1,10 +1,24 @@
 name: CI
 
+# Runs immediately before merge, not on every push.
+#
+# The check set is unchanged — the same four jobs run the same commands. What changed is how often
+# GitHub pays for them. `synchronize` (every push to an open PR) and `push` (every merge to main,
+# re-validating a tree the PR already validated) were the two high-frequency triggers, and neither
+# adds signal that `.githooks/pre-push` does not already produce locally on every push.
+#
+# Workflow:
+#   1. open the PR as a draft            -> no runner time
+#   2. push freely; `.githooks/pre-push` runs the identical checks locally
+#   3. `gh pr ready <n>`                 -> CI runs once, as the merge gate
+#
+# To re-run after a post-ready fix, without toggling draft state:
+#   gh workflow run ci.yml --ref <branch>
 on:
-  push:
-    branches: [ main, master ]
   pull_request:
+    types: [ready_for_review]
     branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   registry:
@@ -20,26 +34,12 @@ jobs:
       - name: Run registry validator tests
         run: uv run pytest protocol/tests
 
+  # The server workspace is built and tested on Linux only. It was previously also built on
+  # macOS, but that job ran an identical command set at ~10x the per-minute price, and the one
+  # platform-specific path in the workspace (`pidfd`, below) is the Linux one. macOS coverage of
+  # this code still happens: the `swift` job builds these same crates to run its integration
+  # tests against a real `sessiond`.
   rust:
-    name: Rust Build
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Build and test server-rust workspace
-        run: |
-          cargo test --workspace --all-targets
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo check --workspace --all-targets
-        working-directory: server-rust
-      - name: Build and test examples
-        run: |
-          cargo test --manifest-path ../examples/process-monitor/Cargo.toml
-          cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
-        working-directory: server-rust
-
-  rust-linux:
     name: Rust Build (Linux)
     runs-on: ubuntu-latest
     steps:
@@ -59,9 +59,11 @@ jobs:
           cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
         working-directory: server-rust
 
+  # libFuzzer and its sanitizers are best supported on Linux, and nothing in the decoders is
+  # platform-specific, so this runs where it is cheapest (§26 decode limits are host-independent).
   fuzz:
     name: Decoder Fuzz Regression
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust nightly toolchain

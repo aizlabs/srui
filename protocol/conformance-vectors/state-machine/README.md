@@ -137,6 +137,7 @@ Properties are encoded as JSON primitives or typed objects:
 |---|---|---|
 | `stale_base_revision` | `TxnError::StaleBaseRevision` | §12.1 |
 | `invalid_new_revision` | `TxnError::InvalidNewRevision` | §12.1 |
+| `revision_exhausted` | `TxnError::RevisionExhausted` | §12.1 |
 | `max_operations_exceeded` | `TxnError::MaxOperationsExceeded` | §26 |
 | `node_id_already_used` | `StoreError::NodeIdAlreadyUsed` | §6.2 |
 | `node_not_found` | `StoreError::NodeNotFound` | §13 |

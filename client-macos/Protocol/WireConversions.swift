@@ -619,17 +619,34 @@ extension Event {
 // MARK: - TransactionApplier & SemanticStore Wire Integration
 
 extension TransactionApplier {
-    /// Decodes and applies a protobuf wire `SRUITransaction` atomically (§12.1, §16).
-    public func apply(wire: SRUITransaction) -> Result<Revision, TxnError> {
+    /// Decodes a protobuf wire `SRUITransaction` under the store's §26 limits.
+    private func decode(wire: SRUITransaction) -> Result<Transaction, TxnError> {
         do {
             let data = try wire.serializedData()
-            let record = try decodeTransaction(from: data, limits: store.limits)
-            return apply(record: record)
+            return .success(try decodeTransaction(from: data, limits: store.limits))
         } catch let error as ProtocolDecodeError {
             return .failure(.wireError(error.description))
         } catch {
             return .failure(.wireError(String(describing: error)))
         }
+    }
+
+    /// Decodes and applies a protobuf wire `SRUITransaction` as an authoritative commit
+    /// (§12.1, §16).
+    ///
+    /// Accepts only `newRevision == baseRevision + 1`. A live stream also carries coalesced scalar
+    /// deltas spanning several revisions, which belong to `applyDelivered(wire:)` (§12.1, §20.4).
+    public func apply(wire: SRUITransaction) -> Result<Revision, TxnError> {
+        decode(wire: wire).flatMap { apply(record: $0) }
+    }
+
+    /// Decodes and applies one frame of the live stream to a replica (§12.1, §20.4).
+    ///
+    /// Accepts both delivery forms — an authoritative commit and a coalesced scalar delta — which
+    /// is what a client consuming a server stream needs; a resync snapshot is deliberately not
+    /// accepted here (§18).
+    public func applyDelivered(wire: SRUITransaction) -> Result<Revision, TxnError> {
+        decode(wire: wire).flatMap { applyDelivered(record: $0).map(\.revision) }
     }
 }
 
@@ -650,10 +667,27 @@ extension SemanticStore {
         try apply(ops)
     }
 
-    /// Decodes and applies a protobuf wire `SRUITransaction` atomically (§12.1, §16).
+    /// Decodes and applies a protobuf wire `SRUITransaction` as an authoritative commit
+    /// (§12.1, §16).
     public mutating func applyWireTransaction(_ wire: SRUITransaction) -> Result<Revision, TxnError> {
+        applyWire(wire) { applier in applier.apply(wire: wire) }
+    }
+
+    /// Decodes and applies one frame of the live stream, accepting either delivery form
+    /// (§12.1, §20.4).
+    public mutating func applyDeliveredWireTransaction(
+        _ wire: SRUITransaction
+    ) -> Result<Revision, TxnError> {
+        applyWire(wire) { applier in applier.applyDelivered(wire: wire) }
+    }
+
+    /// Runs one applier entry point against a temporary applier, adopting its store only on success.
+    private mutating func applyWire(
+        _ wire: SRUITransaction,
+        _ body: (TransactionApplier) -> Result<Revision, TxnError>
+    ) -> Result<Revision, TxnError> {
         let applier = TransactionApplier(store: self)
-        let res = applier.apply(wire: wire)
+        let res = body(applier)
         if case .success = res {
             self = applier.currentSnapshot.store
         }

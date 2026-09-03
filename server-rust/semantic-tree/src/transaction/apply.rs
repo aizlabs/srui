@@ -136,8 +136,13 @@ impl SemanticStore {
                 actual: base_rev,
             });
         }
+        // A replica's revision can be set from a snapshot, so the store may legitimately sit at a
+        // revision with no successor; refuse rather than wrap (§12.1).
+        let new_rev = base_rev
+            .checked_next()
+            .ok_or(TxnError::RevisionExhausted { base: base_rev })?;
 
-        self.apply_staged_owned(ops, base_rev.next())
+        self.apply_staged_owned(ops, new_rev)
     }
 
     /// Checks that `base_revision` is the store's committed revision (§12.1).

@@ -1,8 +1,9 @@
 //! Integration tests for SemanticStore transactions and atomic revisions (§12, §12.1, §12.2, §26).
 
 use srui_semantic_tree::{
-    CoalescedScalarDelta, DeliveredTransaction, NodeId, Operation, PropertyRef, Revision,
-    SemanticStore, StoreError, StoreLimits, Transaction, TxnError, TypeRef, Value,
+    AuthoritativeCommit, CoalescedScalarDelta, DeliveredTransaction, NodeId, Operation,
+    PropertyRef, Revision, SemanticStore, StoreError, StoreLimits, Transaction, TxnError, TypeRef,
+    Value,
 };
 
 #[test]
@@ -705,4 +706,56 @@ fn test_monotonic_sequential_revisions() {
 
     assert_eq!(store.revision(), Revision::new(10));
     assert_eq!(store.node_count(), 10);
+}
+
+/// A decoded frame may claim `base_revision = u64::MAX`, a revision with no successor. Every
+/// validation path computes `base + 1`, so an unguarded check panics in debug builds and wraps to
+/// `Revision(0)` in release ones — turning a malformed frame into a crash or a backwards revision.
+/// Rejection must be explicit (§12.1, §26).
+#[test]
+fn test_exhausted_base_revision_is_rejected_not_overflowed() {
+    let exhausted = Revision::new(u64::MAX);
+    let node_id = NodeId::new(1);
+    let scalar = || {
+        vec![Operation::SetProperty {
+            id: node_id,
+            property: PropertyRef::LABEL,
+            value: Value::from("v"),
+        }]
+    };
+
+    let exhausted_err = TxnError::RevisionExhausted { base: exhausted };
+
+    let as_commit = Transaction::with_revisions(exhausted, Revision::INITIAL, vec![], 0);
+    assert_eq!(
+        AuthoritativeCommit::try_from(as_commit.clone()).unwrap_err(),
+        exhausted_err,
+        "an exhausted base revision has no successor and cannot be an authoritative commit"
+    );
+
+    let as_delta = Transaction::with_revisions(exhausted, Revision::INITIAL, scalar(), 0);
+    assert_eq!(
+        CoalescedScalarDelta::try_from(as_delta.clone()).unwrap_err(),
+        exhausted_err,
+        "an exhausted base revision cannot be spanned by a delta either"
+    );
+    assert_eq!(
+        DeliveredTransaction::try_from(as_delta).unwrap_err(),
+        exhausted_err,
+        "neither delivery form admits an exhausted base revision"
+    );
+    assert_eq!(
+        DeliveredTransaction::try_from(as_commit.clone()).unwrap_err(),
+        exhausted_err,
+        "classification by shape must not overflow before it rejects"
+    );
+
+    let mut store = SemanticStore::new();
+    assert_eq!(
+        store.apply_transaction_record(&as_commit).unwrap_err(),
+        exhausted_err,
+        "the store must refuse an exhausted base revision without overflowing"
+    );
+    assert_eq!(store.revision(), Revision::INITIAL);
+    assert_eq!(exhausted_err.conformance_code(), Some("revision_exhausted"));
 }

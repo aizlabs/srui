@@ -66,7 +66,11 @@ impl AuthoritativeCommit {
     /// Shares one implementation with [`TryFrom<Transaction>`] so a store applying a borrowed
     /// record and a journal accepting an owned commit cannot drift apart.
     pub fn validate(txn: &Transaction) -> Result<(), TxnError> {
-        let expected = txn.base_revision.next();
+        let Some(expected) = txn.base_revision.checked_next() else {
+            return Err(TxnError::RevisionExhausted {
+                base: txn.base_revision,
+            });
+        };
         if txn.new_revision != expected {
             return Err(TxnError::InvalidNewRevision {
                 expected,
@@ -132,11 +136,17 @@ impl CoalescedScalarDelta {
 impl CoalescedScalarDelta {
     /// Checks the delta shape invariant without consuming or cloning the transaction.
     pub fn validate(txn: &Transaction) -> Result<(), TxnError> {
+        // An exhausted base revision has no successor at all, so no span can start from it.
+        let Some(expected) = txn.base_revision.checked_next() else {
+            return Err(TxnError::RevisionExhausted {
+                base: txn.base_revision,
+            });
+        };
         // A delta must move forward, and only scalar SetProperty operations may be collapsed:
         // any structural operation is a barrier that must keep its own revision boundary (§20.4).
         if txn.new_revision <= txn.base_revision || !txn.is_coalesceable() {
             return Err(TxnError::InvalidNewRevision {
-                expected: txn.base_revision.next(),
+                expected,
                 actual: txn.new_revision,
             });
         }
@@ -259,7 +269,15 @@ impl TryFrom<Transaction> for DeliveredTransaction {
     type Error = TxnError;
 
     fn try_from(txn: Transaction) -> Result<Self, Self::Error> {
-        if txn.new_revision == txn.base_revision.next() {
+        // Classification happens on decoded input, so it must survive an exhausted base revision:
+        // `base + 1` would panic in debug and wrap to `Revision(0)` in release, matching a frame
+        // that regresses the replica (§12.1).
+        let Some(next) = txn.base_revision.checked_next() else {
+            return Err(TxnError::RevisionExhausted {
+                base: txn.base_revision,
+            });
+        };
+        if txn.new_revision == next {
             return Ok(Self::Commit(AuthoritativeCommit(txn)));
         }
         // Anything else is only deliverable as a coalesced delta; a span this rejects is a span

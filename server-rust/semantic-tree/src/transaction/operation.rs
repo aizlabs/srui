@@ -28,8 +28,22 @@ impl Revision {
     }
 
     /// Returns the next monotonically increasing revision (`self + 1`).
+    ///
+    /// Panics on overflow in debug builds. Use [`Self::checked_next`] for any revision that came
+    /// off the wire: a decoded frame may claim `u64::MAX`, which has no successor.
     pub const fn next(self) -> Self {
         Self(self.0 + 1)
+    }
+
+    /// Returns the next revision, or `None` when this one is exhausted (`u64::MAX`).
+    ///
+    /// A revision counter never repeats, so `u64::MAX` is the end of a session's sequence rather
+    /// than a wrap point: wrapping would hand out a revision the session already used (§12.1).
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
     }
 }
 

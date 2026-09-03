@@ -1,0 +1,55 @@
+name: Codex Draft Review
+
+# Requests a Codex review on draft pull requests.
+#
+# Codex's own automatic reviews fire when a PR is opened *for review* or a draft is marked ready
+# — neither covers a draft under active development, and it does not react to pushes at all.
+# Since `ci.yml` deliberately holds the expensive checks until `ready_for_review`, drafts would
+# otherwise get no feedback at all until the merge gate. This closes that gap by posting the
+# documented `@codex review` trigger.
+#
+# Cost: one ubuntu job that makes a single API call. It does not check out the repository and
+# finishes in a few seconds, but GitHub bills whole minutes, so budget ~1 Linux minute
+# (~$0.008) per draft push. That is ~1/8 of a single macOS minute.
+#
+# Prefer the built-in setting if it covers drafts: https://chatgpt.com/codex/settings/code-review
+# (Automatic reviews -> review trigger settings). Delete this workflow if so.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One review per branch. A burst of pushes cancels the earlier requests so only the final head
+# is reviewed, rather than queueing a review per commit.
+concurrency:
+  group: codex-draft-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  request-review:
+    name: Request Codex review
+    # Drafts only. A non-draft PR is covered by Codex's own automatic review on open and on
+    # ready-for-review, so commenting here would duplicate it.
+    if: github.event.pull_request.draft == true
+    runs-on: ubuntu-latest
+    steps:
+      # Settles briefly so the review is requested against the pushed head rather than racing it.
+      - name: Wait for the pushed head to settle
+        run: sleep 10
+      - name: Comment @codex review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          note="Requested automatically for draft \`${SHA}\` by"
+          note="${note} \`.github/workflows/codex-draft-review.yml\`."
+          note="${note} Full CI runs at ready-for-review."
+          printf '@codex review\n\n<sub>%s</sub>\n' "$note" > comment.md
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file comment.md

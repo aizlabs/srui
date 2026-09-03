@@ -3,11 +3,13 @@
 // Session
 //
 // Central client session coordinator wiring Transport, ProtocolDecoder, TransactionApplier,
-// EventOutbox, and RendererAppKit (§22, §22.2).
+// EventOutbox, ResourceCache, and RendererAppKit (§22, §22.2).
 //
 // Spec sections implemented:
 // - §12.1 Revisions and transactions: transactions are applied atomically and the renderer never
 //   observes a half-committed transaction.
+// - §14 Resource model: resource metadata/chunks are assembled in ResourceCache; only verified
+//   decoded images are committed to the renderer. Failures log/drop and keep placeholders.
 // - §15 Capability negotiation: `CLIENT HELLO` / `SERVER WELCOME` establish the session; resume
 //   reuses the retained negotiated set instead of re-parsing profiles from `RESUME_OK`.
 // - §18 Reconnect and resynchronization: `CLIENT RESUME` carries `last_applied_revision` and
@@ -25,6 +27,7 @@ import SemanticModel
 import Protocol
 import TransportSSH
 import RendererAppKit
+import Resources
 
 /// Reason a session stopped tracking the authoritative semantic stream (§4 inv. 13, §18).
 public enum SessionFailure: Error, Sendable, CustomStringConvertible {
@@ -97,13 +100,14 @@ private enum ProtocolPhase: Equatable {
 }
 
 /// Central coordinator managing client session lifecycle, message decoding, store application,
-/// outbox event dispatch, and UI rendering (§22, §22.2).
+/// outbox event dispatch, resource assembly, and UI rendering (§22, §22.2).
 public final class SessionController: @unchecked Sendable {
     public let transport: any Transport
     public let applier: TransactionApplier
     public let outbox: EventOutbox
     public let decoder: ProtocolDecoder
     public let renderer: AppKitRenderer?
+    public let resourceCache: ResourceCache
     public let clientCapabilities: CapabilitySet
     public let requiredServerProfiles: CapabilitySet
 
@@ -134,6 +138,7 @@ public final class SessionController: @unchecked Sendable {
         outbox: EventOutbox = EventOutbox(),
         decoder: ProtocolDecoder = ProtocolDecoder(),
         renderer: AppKitRenderer? = nil,
+        resourceCache: ResourceCache = ResourceCache(),
         sessionId: String? = nil,
         clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1],
         requiredServerProfiles: CapabilitySet = []
@@ -143,6 +148,7 @@ public final class SessionController: @unchecked Sendable {
         self.outbox = outbox
         self.decoder = decoder
         self.renderer = renderer
+        self.resourceCache = resourceCache
         self.currentSessionId = sessionId
         self.clientCapabilities = clientCapabilities
         self.requiredServerProfiles = requiredServerProfiles
@@ -322,6 +328,16 @@ public final class SessionController: @unchecked Sendable {
             hello.coreVersion = SRUICoreVersion
             hello.profiles = clientCapabilities.toStringArray()
             hello.clientInstanceID = clientInstanceId.bytes
+            // Advertise the cache's encoded-byte ceiling so the server can clip transfers (§15, §26).
+            var limits = Srui_Protocol_ClientLimits()
+            limits.maxFrameSize = UInt32(clamping: defaultMaxFrameSize)
+            limits.maxTransactionOperations = UInt32(clamping: applier.currentSnapshot.store.limits.maxTransactionOperations)
+            limits.maxTreeDepth = UInt32(clamping: applier.currentSnapshot.store.limits.maxTreeDepth)
+            limits.maxNodeCount = UInt32(clamping: applier.currentSnapshot.store.limits.maxNodeCount)
+            limits.maxStringLength = UInt32(clamping: applier.currentSnapshot.store.limits.maxStringLength)
+            let maxResource = resourceCache.limits.maxEncodedBytes
+            limits.maxResourceSize = UInt32(clamping: maxResource)
+            hello.limits = limits
 
             var envelope = SRUIMessage()
             envelope.clientHello = hello
@@ -528,6 +544,24 @@ public final class SessionController: @unchecked Sendable {
                 return
             }
             await handleEventAck(ack)
+
+        case .resourceMetadata(let metadata):
+            guard allowsDataPlane(phase) else {
+                await reportFailure(.protocolViolation(
+                    "Received ResourceMetadata before handshake completed"
+                ))
+                return
+            }
+            await handleResourceMetadata(metadata)
+
+        case .resourceChunk(let chunk):
+            guard allowsDataPlane(phase) else {
+                await reportFailure(.protocolViolation(
+                    "Received ResourceChunk before handshake completed"
+                ))
+                return
+            }
+            await handleResourceChunk(chunk)
 
         case .clientHello, .clientResume:
             await reportFailure(.protocolViolation(
@@ -740,6 +774,8 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
+                // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
+                await resourceCache.clearPartials()
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
@@ -780,6 +816,7 @@ public final class SessionController: @unchecked Sendable {
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq
                 )
+                await resourceCache.clearPartials()
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
@@ -809,6 +846,87 @@ public final class SessionController: @unchecked Sendable {
             self.retainedCapabilities = negotiated
             self.phase = .awaitingSnapshot(negotiated: negotiated)
         }
+    }
+
+    /// Assembles resource metadata into the shared cache. Failures log/drop; the semantic store
+    /// is never corrupted by a bad resource (§14, §26).
+    private func handleResourceMetadata(_ wire: SRUIResourceMetadata) async {
+        let input: ResourceMetadataInput
+        do {
+            input = try Self.mapResourceMetadata(wire)
+        } catch {
+            SessionDiagnostics.error("Ignoring malformed ResourceMetadata: \(error)")
+            return
+        }
+
+        do {
+            if let commit = try await resourceCache.ingestMetadata(input) {
+                await dispatchResourceCommit(commit)
+            }
+        } catch {
+            SessionDiagnostics.error(
+                "Resource metadata rejected for \(input.resourceHash): \(error); keeping placeholder (§14)"
+            )
+        }
+    }
+
+    /// Assembles one resource chunk. Bad resources log/drop and leave placeholders in place (§14).
+    private func handleResourceChunk(_ wire: SRUIResourceChunk) async {
+        let input: ResourceChunkInput
+        do {
+            input = try Self.mapResourceChunk(wire)
+        } catch {
+            SessionDiagnostics.error("Ignoring malformed ResourceChunk: \(error)")
+            return
+        }
+
+        do {
+            if let commit = try await resourceCache.ingestChunk(input) {
+                await dispatchResourceCommit(commit)
+            }
+        } catch {
+            SessionDiagnostics.error(
+                "Resource chunk rejected for \(input.resourceHash): \(error); keeping placeholder (§14)"
+            )
+        }
+    }
+
+    /// Pushes a newly committed decoded image onto AppKit on the main actor (§14, §22.2).
+    private func dispatchResourceCommit(_ commit: ResourceCommit) async {
+        guard commit.newlyCommitted else { return }
+        await MainActor.run {
+            self.renderer?.commitResourceImage(commit.image)
+        }
+    }
+
+    private static func mapResourceMetadata(_ wire: SRUIResourceMetadata) throws -> ResourceMetadataInput {
+        let hash = try ResourceHash(bytes: wire.resourceHash)
+        let priority: ResourceTransferPriority
+        switch wire.priority {
+        case .unspecified, .UNRECOGNIZED:
+            priority = .unspecified
+        case .normal:
+            priority = .normal
+        case .low:
+            priority = .low
+        }
+        return ResourceMetadataInput(
+            resourceHash: hash,
+            mediaType: wire.mediaType,
+            encodedLength: wire.encodedLength,
+            decodedWidth: wire.decodedWidth,
+            decodedHeight: wire.decodedHeight,
+            priority: priority
+        )
+    }
+
+    private static func mapResourceChunk(_ wire: SRUIResourceChunk) throws -> ResourceChunkInput {
+        let hash = try ResourceHash(bytes: wire.resourceHash)
+        return ResourceChunkInput(
+            resourceHash: hash,
+            byteOffset: wire.byteOffset,
+            data: wire.data
+        )
     }
 
     /// Settles one outbound event against the server's acknowledgement (§18, §18.2).
@@ -1157,6 +1275,9 @@ public final class SessionController: @unchecked Sendable {
         if let replayGeneration {
             await outbox.stopResumeWork(generation: replayGeneration)
         }
+
+        // Disconnect drops in-flight assemblies; the committed CAS persists across reconnect (§14).
+        await resourceCache.clearPartials()
 
         clearSessionStateAfterStop()
 

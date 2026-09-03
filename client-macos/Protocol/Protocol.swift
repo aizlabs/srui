@@ -35,6 +35,10 @@ public typealias SRUIModelDeleteOp = Srui_Protocol_ModelDeleteOp
 public typealias SRUIModelUpdateOp = Srui_Protocol_ModelUpdateOp
 public typealias SRUIModelResetRangeOp = Srui_Protocol_ModelResetRangeOp
 
+public typealias SRUIResourceMetadata = Srui_Protocol_ResourceMetadata
+public typealias SRUIResourceChunk = Srui_Protocol_ResourceChunk
+public typealias SRUIResourcePriority = Srui_Protocol_ResourcePriority
+
 public struct ProtocolPlaceholder {
     public init() {}
 }

@@ -7,12 +7,14 @@
 
 import Testing
 import Foundation
+import CryptoKit
 import AppKit
 import SemanticModel
 import Protocol
 import Session
 import TransportSSH
 import RendererAppKit
+import Resources
 
 @Suite("Counter Socket Integration Tests")
 struct CounterSocketIntegrationTests {
@@ -192,12 +194,212 @@ struct CounterSocketIntegrationTests {
         await controller.stop()
     }
 
+    @Test("Image fixture delivers a committed resource that paints the Image node (§14)")
+    @MainActor
+    func imageFixtureCommitsAndPaintsImageView() async throws {
+        let socketPath = "/tmp/srui-counter-image-\(UUID().uuidString).sock"
+        let repoRoot = Self.repositoryRoot()
+        let counterBinary = repoRoot
+            .appendingPathComponent("examples/counter/target/debug/counter")
+
+        guard FileManager.default.fileExists(atPath: counterBinary.path) else {
+            return
+        }
+        guard Self.counterSupportsImageFixture(counterBinary) else {
+            return
+        }
+
+        let server = Process()
+        server.executableURL = counterBinary
+        server.arguments = ["--socket", socketPath, "--image-fixture"]
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+
+        try server.run()
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+            server.waitUntilExit()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
+
+        let transport = UnixSocketTransport(socketPath: socketPath)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let resourceCache = ResourceCache()
+        let controller = SessionController(
+            transport: transport,
+            applier: applier,
+            renderer: renderer,
+            resourceCache: resourceCache
+        )
+        controller.attachRenderer(renderer)
+
+        try await controller.start()
+        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+
+        let pendingHash = try await Self.waitForImagePendingHash(
+            in: renderer,
+            timeoutSeconds: 10
+        )
+        try await Self.waitForCommittedResource(
+            matching: pendingHash,
+            in: resourceCache,
+            timeoutSeconds: 10
+        )
+        try await AsyncTestSupport.eventually(description: "renderer retains committed image") {
+            renderer.resolveResourceImage(pendingHash) != nil
+        }
+
+        let imageHandle = try #require(
+            renderer.registry.allHandles.first {
+                $0.nodeType == .image && $0.pendingResourceHash == pendingHash
+            }
+        )
+        let imageView = try #require(imageHandle.view as? NSImageView)
+        let size = try #require(imageView.image?.size)
+        #expect(size.width > 0)
+        #expect(size.height > 0)
+        #expect(imageView.image === renderer.resolveResourceImage(pendingHash))
+
+        await controller.stop()
+    }
+
+    @Test("Corrupted resource chunk is dropped; session and placeholder survive (§14)")
+    @MainActor
+    func corruptedResourceChunkKeepsPlaceholderAndSession() async throws {
+        let socketPath = "/tmp/srui-counter-image-corrupt-\(UUID().uuidString).sock"
+        let repoRoot = Self.repositoryRoot()
+        let counterBinary = repoRoot
+            .appendingPathComponent("examples/counter/target/debug/counter")
+
+        guard FileManager.default.fileExists(atPath: counterBinary.path) else {
+            return
+        }
+        guard Self.counterSupportsImageFixture(counterBinary) else {
+            return
+        }
+
+        let server = Process()
+        server.executableURL = counterBinary
+        server.arguments = ["--socket", socketPath, "--image-fixture"]
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+
+        try server.run()
+        defer {
+            if server.isRunning {
+                server.terminate()
+            }
+            server.waitUntilExit()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
+
+        let inner = UnixSocketTransport(socketPath: socketPath)
+        let transport = ResourceChunkCorruptingTransport(inner: inner)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let resourceCache = ResourceCache()
+        let controller = SessionController(
+            transport: transport,
+            applier: applier,
+            renderer: renderer,
+            resourceCache: resourceCache
+        )
+        controller.attachRenderer(renderer)
+
+        try await controller.start()
+        try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
+
+        // Give the server time to push metadata + chunks; corruption should prevent commit.
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        #expect(controller.isDiverged == false)
+        #expect(controller.isHandshakeComplete)
+
+        // No verified image may land in the cache after a flipped chunk byte.
+        let imageHandles = renderer.registry.allHandles.filter { $0.nodeType == .image }
+        for handle in imageHandles {
+            if let hash = handle.pendingResourceHash {
+                #expect(await resourceCache.contains(hash) == false)
+            }
+            let imageView = try #require(handle.view as? NSImageView)
+            #expect(imageView.image != nil)
+        }
+
+        // Transactions must still flow: activate the increment button if present.
+        if let button = renderer.registry.allHandles.first(where: { $0.nodeType == .button }) {
+            let before = applier.lastAppliedRevision
+            _ = try await controller.sendActivate(nodeId: button.nodeID)
+            try await AsyncTestSupport.eventually(description: "post-corruption activate advances revision") {
+                applier.lastAppliedRevision > before
+            }
+        }
+
+        await controller.stop()
+    }
+
+
     private static func repositoryRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    /// Soft-detects whether the counter binary advertises `--image-fixture`.
+    private static func counterSupportsImageFixture(_ binary: URL) -> Bool {
+        let process = Process()
+        process.executableURL = binary
+        process.arguments = ["--help"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let text = String(data: data, encoding: .utf8) ?? ""
+            return text.contains("image-fixture")
+        } catch {
+            return false
+        }
+    }
+
+    private static func waitForImagePendingHash(
+        in renderer: AppKitRenderer,
+        timeoutSeconds: TimeInterval
+    ) async throws -> ResourceHash {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if let hash = renderer.registry.allHandles
+                .first(where: { $0.nodeType == .image })?
+                .pendingResourceHash {
+                return hash
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw SocketIntegrationError.resourceTimeout
+    }
+
+    private static func waitForCommittedResource(
+        matching hash: ResourceHash,
+        in cache: ResourceCache,
+        timeoutSeconds: TimeInterval
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if await cache.contains(hash) {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        throw SocketIntegrationError.resourceTimeout
     }
 
     private static func waitForSocket(at path: String, timeoutSeconds: TimeInterval) async throws {
@@ -227,9 +429,72 @@ struct CounterSocketIntegrationTests {
     }
 }
 
+/// Transport wrapper that flips the first byte of every `ResourceChunk` payload (§14 negative path).
+private final class ResourceChunkCorruptingTransport: Transport, @unchecked Sendable {
+    private let inner: any Transport
+
+    init(inner: any Transport) {
+        self.inner = inner
+    }
+
+    func send(data: Data) async throws {
+        try await inner.send(data: data)
+    }
+
+    func close() async {
+        await inner.close()
+    }
+
+    func acknowledgeReceived(byteCount: Int) async {
+        // Inner chunks are acknowledged as they are decoded below.
+    }
+
+    func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        let inner = self.inner
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                var decoder = SRUIMessageStreamDecoder()
+                do {
+                    for try await chunk in inner.receiveStream() {
+                        let messages: [SRUIMessage]
+                        do {
+                            messages = try decoder.appendAndExtract(incoming: chunk)
+                        } catch {
+                            continuation.finish(throwing: error)
+                            return
+                        }
+                        for message in messages {
+                            var outbound = message
+                            if case .resourceChunk(var resourceChunk) = outbound.msg,
+                               !resourceChunk.data.isEmpty {
+                                resourceChunk.data[0] ^= 0xFF
+                                outbound.resourceChunk = resourceChunk
+                            }
+                            do {
+                                continuation.yield(try SRUIFraming.encodeFramed(outbound))
+                            } catch {
+                                continuation.finish(throwing: error)
+                                return
+                            }
+                        }
+                        await inner.acknowledgeReceived(byteCount: chunk.count)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
+}
+
 private enum SocketIntegrationError: Error, CustomStringConvertible {
     case socketTimeout(String)
     case revisionTimeout(expected: Revision, actual: Revision)
+    case resourceTimeout
 
     var description: String {
         switch self {
@@ -237,6 +502,8 @@ private enum SocketIntegrationError: Error, CustomStringConvertible {
             return "Timed out waiting for Unix socket at \(path)"
         case .revisionTimeout(let expected, let actual):
             return "Timed out waiting for revision \(expected), still at \(actual)"
+        case .resourceTimeout:
+            return "Timed out waiting for a committed resource in the client cache"
         }
     }
 }

@@ -39,6 +39,12 @@ public final class ControlFactory {
     /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
 
+    /// Synchronous main-actor resolver from content hash to a retained `NSImage` (§14).
+    ///
+    /// Supplied by `AppKitRenderer` so a property apply that references an already-committed
+    /// resource paints immediately; a missing hash keeps the system placeholder.
+    public var resolveResourceImage: (@MainActor (ResourceHash) -> NSImage?)?
+
     public init() {}
 
     public func makeHandle(for node: Node, store: SemanticStore? = nil) throws -> RenderHandle {
@@ -163,7 +169,7 @@ public final class ControlFactory {
         case .image:
             let imageView = NSImageView(frame: .zero)
             imageView.imageScaling = .scaleProportionallyUpOrDown
-            imageView.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "Image")
+            imageView.image = Self.placeholderImage
             imageView.widthAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
             imageView.heightAnchor.constraint(greaterThanOrEqualToConstant: 48).isActive = true
             result = (imageView, nil, nil, nil)
@@ -335,16 +341,7 @@ public final class ControlFactory {
             }
 
         case .resource:
-            // lc-debt: no client resource cache exists yet (§14; the Resources target is a stub),
-            // so an arriving hash is recorded and the placeholder retained rather than resolved;
-            // resolve `pendingResourceHash` through the cache once it lands.
-            handle.pendingResourceHash = value?.asResourceHash
-            if let imageView = handle.view as? NSImageView {
-                imageView.image = NSImage(systemSymbolName: "photo", accessibilityDescription: "Image")
-            }
-            RendererDiagnostics.log(
-                "resource node=\(handle.nodeID) hash=\(handle.pendingResourceHash?.description ?? "none") unresolved (§14)"
-            )
+            applyResourceProperty(value?.asResourceHash, to: handle)
 
         case .items, .modelRef, .columns, .selectionMode:
             if let adapter = handle.modelAdapter as? TableCollectionAdapter,
@@ -497,6 +494,37 @@ public final class ControlFactory {
             adapter.update(rows: rows, outlineView: outlineView)
         }
     }
+
+    private func applyResourceProperty(_ hash: ResourceHash?, to handle: RenderHandle) {
+        let previous = handle.pendingResourceHash
+        handle.pendingResourceHash = hash
+
+        guard let imageView = handle.view as? NSImageView else { return }
+
+        // Clearing or replacing the hash must drop any previously displayed bitmap so a stale
+        // image cannot outlive the property that authorized it (§14).
+        guard let hash else {
+            imageView.image = Self.placeholderImage
+            if previous != nil {
+                RendererDiagnostics.log("resource node=\(handle.nodeID) cleared (§14)")
+            }
+            return
+        }
+
+        if let resolved = resolveResourceImage?(hash) {
+            imageView.image = resolved
+            RendererDiagnostics.log("resource node=\(handle.nodeID) hash=\(hash) resolved (§14)")
+        } else {
+            imageView.image = Self.placeholderImage
+            RendererDiagnostics.log(
+                "resource node=\(handle.nodeID) hash=\(hash) unresolved (§14)"
+            )
+        }
+    }
+
+    private static let placeholderImage: NSImage =
+        NSImage(systemSymbolName: "photo", accessibilityDescription: "Image")
+        ?? NSImage(size: NSSize(width: 48, height: 48))
 
     private func makeTable(for node: Node, store: SemanticStore?) -> (NSView, NSWindow?, AnyObject?) {
         let scrollView = NSScrollView(frame: .zero)

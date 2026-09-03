@@ -2117,6 +2117,44 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
   public init() {}
 }
 
+public nonisolated enum Srui_Protocol_ResourcePriority: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+  case normal // = 1
+  case low // = 2
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .normal
+    case 2: self = .low
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .normal: return 1
+    case .low: return 2
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_ResourcePriority] = [
+    .unspecified,
+    .normal,
+    .low,
+  ]
+
+}
+
 /// Negotiated operational boundaries (§15) to prevent unbounded memory allocation
 /// on variable-length wire fields (strings, byte arrays, collections, transactions).
 public nonisolated struct Srui_Protocol_ClientLimits: Sendable {
@@ -2299,6 +2337,48 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
   public init() {}
 }
 
+public nonisolated struct Srui_Protocol_ResourceMetadata: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Exactly 32-byte SHA-256 digest
+  public var resourceHash: Data = Data()
+
+  public var mediaType: String = String()
+
+  public var encodedLength: UInt64 = 0
+
+  /// Optional decoded dimension hints (0 = unset). Clients must still validate
+  /// decoded size independently (§14, §26).
+  public var decodedWidth: UInt32 = 0
+
+  public var decodedHeight: UInt32 = 0
+
+  public var priority: Srui_Protocol_ResourcePriority = .unspecified
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_ResourceChunk: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  /// Exactly 32-byte SHA-256 digest
+  public var resourceHash: Data = Data()
+
+  public var byteOffset: UInt64 = 0
+
+  public var data: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2370,6 +2450,22 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     set {msg = .serverEventAck(newValue)}
   }
 
+  public var resourceMetadata: Srui_Protocol_ResourceMetadata {
+    get {
+      if case .resourceMetadata(let v)? = msg {return v}
+      return Srui_Protocol_ResourceMetadata()
+    }
+    set {msg = .resourceMetadata(newValue)}
+  }
+
+  public var resourceChunk: Srui_Protocol_ResourceChunk {
+    get {
+      if case .resourceChunk(let v)? = msg {return v}
+      return Srui_Protocol_ResourceChunk()
+    }
+    set {msg = .resourceChunk(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Msg: Equatable, Sendable {
@@ -2381,6 +2477,8 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     case transaction(Srui_Protocol_Transaction)
     case event(Srui_Protocol_Event)
     case serverEventAck(Srui_Protocol_ServerEventAck)
+    case resourceMetadata(Srui_Protocol_ResourceMetadata)
+    case resourceChunk(Srui_Protocol_ResourceChunk)
 
   }
 
@@ -2465,6 +2563,10 @@ nonisolated extension Srui_Protocol_NullValue: SwiftProtobuf._ProtoNameProviding
 
 nonisolated extension Srui_Protocol_EventAckStatus: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0EVENT_ACK_STATUS_UNSPECIFIED\0\u{1}EVENT_ACK_STATUS_PROCESSED\0\u{1}EVENT_ACK_STATUS_DUPLICATE\0\u{1}EVENT_ACK_STATUS_REJECTED\0")
+}
+
+nonisolated extension Srui_Protocol_ResourcePriority: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0RESOURCE_PRIORITY_UNSPECIFIED\0\u{1}RESOURCE_PRIORITY_NORMAL\0\u{1}RESOURCE_PRIORITY_LOW\0")
 }
 
 nonisolated extension Srui_Protocol_SessionContinuity: SwiftProtobuf._ProtoNameProviding {
@@ -4581,9 +4683,104 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
   }
 }
 
+nonisolated extension Srui_Protocol_ResourceMetadata: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ResourceMetadata"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}resource_hash\0\u{3}media_type\0\u{3}encoded_length\0\u{3}decoded_width\0\u{3}decoded_height\0\u{1}priority\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.resourceHash) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.mediaType) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.encodedLength) }()
+      case 4: try { try decoder.decodeSingularUInt32Field(value: &self.decodedWidth) }()
+      case 5: try { try decoder.decodeSingularUInt32Field(value: &self.decodedHeight) }()
+      case 6: try { try decoder.decodeSingularEnumField(value: &self.priority) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.resourceHash.isEmpty {
+      try visitor.visitSingularBytesField(value: self.resourceHash, fieldNumber: 1)
+    }
+    if !self.mediaType.isEmpty {
+      try visitor.visitSingularStringField(value: self.mediaType, fieldNumber: 2)
+    }
+    if self.encodedLength != 0 {
+      try visitor.visitSingularUInt64Field(value: self.encodedLength, fieldNumber: 3)
+    }
+    if self.decodedWidth != 0 {
+      try visitor.visitSingularUInt32Field(value: self.decodedWidth, fieldNumber: 4)
+    }
+    if self.decodedHeight != 0 {
+      try visitor.visitSingularUInt32Field(value: self.decodedHeight, fieldNumber: 5)
+    }
+    if self.priority != .unspecified {
+      try visitor.visitSingularEnumField(value: self.priority, fieldNumber: 6)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ResourceMetadata, rhs: Srui_Protocol_ResourceMetadata) -> Bool {
+    if lhs.resourceHash != rhs.resourceHash {return false}
+    if lhs.mediaType != rhs.mediaType {return false}
+    if lhs.encodedLength != rhs.encodedLength {return false}
+    if lhs.decodedWidth != rhs.decodedWidth {return false}
+    if lhs.decodedHeight != rhs.decodedHeight {return false}
+    if lhs.priority != rhs.priority {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_ResourceChunk: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ResourceChunk"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}resource_hash\0\u{3}byte_offset\0\u{1}data\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.resourceHash) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.byteOffset) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.data) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.resourceHash.isEmpty {
+      try visitor.visitSingularBytesField(value: self.resourceHash, fieldNumber: 1)
+    }
+    if self.byteOffset != 0 {
+      try visitor.visitSingularUInt64Field(value: self.byteOffset, fieldNumber: 2)
+    }
+    if !self.data.isEmpty {
+      try visitor.visitSingularBytesField(value: self.data, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ResourceChunk, rhs: Srui_Protocol_ResourceChunk) -> Bool {
+    if lhs.resourceHash != rhs.resourceHash {return false}
+    if lhs.byteOffset != rhs.byteOffset {return false}
+    if lhs.data != rhs.data {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
 nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SruiMessage"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0\u{3}resource_metadata\0\u{3}resource_chunk\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4695,6 +4892,32 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
           self.msg = .serverEventAck(v)
         }
       }()
+      case 9: try {
+        var v: Srui_Protocol_ResourceMetadata?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .resourceMetadata(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .resourceMetadata(v)
+        }
+      }()
+      case 10: try {
+        var v: Srui_Protocol_ResourceChunk?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .resourceChunk(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .resourceChunk(v)
+        }
+      }()
       default: break
       }
     }
@@ -4737,6 +4960,14 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
     case .serverEventAck?: try {
       guard case .serverEventAck(let v)? = self.msg else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 8)
+    }()
+    case .resourceMetadata?: try {
+      guard case .resourceMetadata(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 9)
+    }()
+    case .resourceChunk?: try {
+      guard case .resourceChunk(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
     }()
     case nil: break
     }

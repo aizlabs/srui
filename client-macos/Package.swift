@@ -17,7 +17,6 @@ let package = Package(
         .library(name: "Terminal", targets: ["Terminal"]),
         .library(name: "Resources", targets: ["Resources"]),
         .library(name: "Accessibility", targets: ["Accessibility"]),
-        .executable(name: "RendererDemoApp", targets: ["RendererDemoApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.2"),
@@ -40,21 +39,30 @@ let package = Package(
             path: "Protocol"
         ),
         .target(
+            name: "Resources",
+            dependencies: [
+                "SemanticModel",
+            ],
+            path: "Resources"
+        ),
+        .target(
+            name: "RendererAppKit",
+            dependencies: [
+                "SemanticModel",
+                "Resources",
+            ],
+            path: "RendererAppKit"
+        ),
+        .target(
             name: "Session",
             dependencies: [
                 "TransportSSH",
                 "Protocol",
                 "SemanticModel",
                 "RendererAppKit",
+                "Resources",
             ],
             path: "Session"
-        ),
-        .target(
-            name: "RendererAppKit",
-            dependencies: [
-                "SemanticModel",
-            ],
-            path: "RendererAppKit"
         ),
         .executableTarget(
             name: "RendererDemoApp",
@@ -64,6 +72,7 @@ let package = Package(
                 "TransportSSH",
                 "Protocol",
                 "SemanticModel",
+                "Resources",
             ],
             path: "RendererDemoApp"
         ),
@@ -78,10 +87,6 @@ let package = Package(
         .target(
             name: "Terminal",
             path: "Terminal"
-        ),
-        .target(
-            name: "Resources",
-            path: "Resources"
         ),
         .target(
             name: "Accessibility",
@@ -100,8 +105,17 @@ let package = Package(
             dependencies: [
                 "RendererAppKit",
                 "SemanticModel",
+                "Resources",
             ],
             path: "Tests/RendererAppKitTests"
+        ),
+        .testTarget(
+            name: "ResourcesTests",
+            dependencies: [
+                "Resources",
+                "SemanticModel",
+            ],
+            path: "Tests/ResourcesTests"
         ),
         .testTarget(
             name: "SRUITests",

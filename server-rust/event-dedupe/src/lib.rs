@@ -17,6 +17,14 @@ use thiserror::Error;
 /// Default maximum number of recent event IDs retained per client instance (4096 events).
 pub const DEFAULT_MAX_DEDUPE_ENTRIES: usize = 4096;
 
+/// Default maximum number of distinct client instances retained per session (§26, §27).
+///
+/// App. B bounds the receive/result window *per client instance*; without a bound on the number of
+/// instances the map is still unbounded, because `client_instance_id` is peer-chosen and the
+/// reference client mints a fresh one on every launch. Windows survive detach on purpose (§18.2),
+/// so the only reclamation available is least-recently-used eviction.
+pub const DEFAULT_MAX_CLIENT_WINDOWS: usize = 256;
+
 /// Settled outcome of one client event, retained for replay answering (§18.2, App. B).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventOutcomeRecord {
@@ -54,6 +62,11 @@ pub enum EventSequenceError {
 
     #[error("event receive window is full while earlier sequences remain unsettled")]
     ReceiveWindowFull,
+
+    #[error(
+        "event dedupe capacity exhausted: all {limit} retained client instances have unsettled events"
+    )]
+    ClientWindowCapacityExhausted { limit: usize },
 }
 
 /// Result of recording an event against a client's dedupe window.
@@ -71,11 +84,23 @@ pub enum RecordOutcome {
     },
 }
 
-/// Bounded sliding-window event deduplicator per client instance.
+/// Bounded sliding-window event deduplicator, bounded both per client instance and in the number
+/// of retained client instances (§18.2, §26, §27, App. B).
 #[derive(Debug, Clone)]
 pub struct EventDeduplicator {
     max_entries_per_client: usize,
+    max_client_windows: usize,
     clients: HashMap<Bytes, ClientDedupeWindow>,
+    /// Client instances in least-recently-used order; front is the next eviction candidate.
+    client_order: VecDeque<Bytes>,
+    /// Contiguous frontiers of evicted clients, so a returning client is not restarted at zero.
+    ///
+    /// Bounded by `max_client_windows` on the same terms as `clients` (§26): the entries are one
+    /// `u64` each, and the oldest is dropped once the bound is reached. A client whose frontier
+    /// has also aged out is genuinely indistinguishable from a new one.
+    evicted_frontiers: HashMap<Bytes, u64>,
+    /// Retained frontiers in insertion order; front is the next to be dropped.
+    frontier_order: VecDeque<Bytes>,
 }
 
 /// State of one admitted `event_id` inside a client's receive window (§18.2).
@@ -132,6 +157,27 @@ impl ClientDedupeWindow {
 
     fn contains(&self, event_id: &[u8]) -> bool {
         self.seen_ids.contains_key(event_id)
+    }
+
+    /// Whether any admitted event is still awaiting a terminal outcome (§18.2, App. B).
+    ///
+    /// An `IN_FLIGHT` entry is never evictable — dropping it would let the client's retry be
+    /// admitted as fresh and re-run a side effect that is currently executing.
+    fn has_in_flight(&self) -> bool {
+        self.seen_ids
+            .values()
+            .any(|record| matches!(record, EventRecord::InFlight { .. }))
+    }
+
+    /// Whether this window holds state that its contiguous frontier alone cannot reconstruct.
+    ///
+    /// Eviction keeps only `last_contiguous_processed_seq` (see
+    /// [`EventDeduplicator::make_room_for_new_client`]). That is enough to refuse anything at or
+    /// below the frontier, but a sequence settled *above* a gap is invisible to it: the client
+    /// would retry it, the rebuilt window would admit it as fresh, and the side effect would run
+    /// twice. Both conditions therefore pin the window in place (§18.2).
+    fn is_pinned(&self) -> bool {
+        self.has_in_flight() || !self.settled_out_of_order.is_empty()
     }
 
     fn admit(
@@ -310,13 +356,129 @@ impl Default for EventDeduplicator {
 }
 
 impl EventDeduplicator {
-    /// Creates a new `EventDeduplicator` with the specified bounded capacity per client.
+    /// Creates a new `EventDeduplicator` with the specified bounded capacity per client and the
+    /// default bound on retained client instances.
     #[must_use]
     pub fn new(max_entries_per_client: usize) -> Self {
+        Self::with_limits(max_entries_per_client, DEFAULT_MAX_CLIENT_WINDOWS)
+    }
+
+    /// Creates a new `EventDeduplicator` with explicit per-client and per-session bounds (§26).
+    #[must_use]
+    pub fn with_limits(max_entries_per_client: usize, max_client_windows: usize) -> Self {
         Self {
             max_entries_per_client: max_entries_per_client.max(1),
+            max_client_windows: max_client_windows.max(1),
             clients: HashMap::new(),
+            client_order: VecDeque::new(),
+            evicted_frontiers: HashMap::new(),
+            frontier_order: VecDeque::new(),
         }
+    }
+
+    /// Number of client instances currently retained.
+    #[must_use]
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Moves an existing client instance to the most-recently-used end of the eviction order.
+    fn touch_client(&mut self, client_instance_id: &[u8]) {
+        let Some(position) = self
+            .client_order
+            .iter()
+            .position(|id| id.as_ref() == client_instance_id)
+        else {
+            return;
+        };
+        if position + 1 == self.client_order.len() {
+            return;
+        }
+        if let Some(entry) = self.client_order.remove(position) {
+            self.client_order.push_back(entry);
+        }
+    }
+
+    /// Frees a slot for a previously unseen client instance (§26, §27).
+    ///
+    /// Evicts least-recently-used windows that carry no `IN_FLIGHT` admission. If every retained
+    /// window is mid-dispatch the new instance is refused instead, because §18.2 forbids evicting
+    /// an in-flight event to admit another.
+    fn make_room_for_new_client(&mut self) -> Result<(), EventSequenceError> {
+        while self.clients.len() >= self.max_client_windows {
+            let candidate = self.client_order.iter().position(|id| {
+                self.clients
+                    .get(id)
+                    .is_some_and(|window| !window.is_pinned())
+            });
+            let Some(position) = candidate else {
+                return Err(EventSequenceError::ClientWindowCapacityExhausted {
+                    limit: self.max_client_windows,
+                });
+            };
+            let Some(evicted) = self.client_order.remove(position) else {
+                break;
+            };
+            let window = self.clients.remove(&evicted);
+            let frontier = window
+                .as_ref()
+                .map_or(0, |w| w.last_contiguous_processed_seq);
+
+            // The frontier outlives the window it came from. Dropping it too would restart the
+            // client at sequence zero, so its next event — numbered from where it actually left
+            // off — lands past `max_entries_per_client` and is refused as `OutsideReceiveWindow`.
+            // That is unrecoverable rather than merely lossy: `RESUME_OK` would report
+            // `last_processed_event_seq = 0`, the client would keep its own counter, and every
+            // reconnect would reproduce the same rejection (§18.2).
+            self.retain_frontier(evicted.clone(), frontier);
+
+            // §26 requires an eviction that can change observable behaviour to be reported rather
+            // than dropped silently: a later replay from this instance is re-run instead of being
+            // answered from the result cache.
+            tracing::warn!(
+                client_instance_id = ?evicted.as_ref(),
+                retained_entries = window.map_or(0, |w| w.seen_ids.len()),
+                retained_frontier = frontier,
+                limit = self.max_client_windows,
+                "evicted least-recently-used event dedupe window (§18.2, §26)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Records an evicted client's contiguous frontier, bounded on the same terms as the windows.
+    ///
+    /// A frontier is one `u64` plus its client id, so retaining `max_client_windows` of them costs
+    /// a fraction of the windows themselves and keeps total growth bounded (§26). A frontier of 0
+    /// carries no information and is not worth a slot.
+    fn retain_frontier(&mut self, client_instance_id: Bytes, frontier: u64) {
+        if frontier == 0 {
+            return;
+        }
+        if self
+            .evicted_frontiers
+            .insert(client_instance_id.clone(), frontier)
+            .is_none()
+        {
+            self.frontier_order.push_back(client_instance_id);
+        }
+        while self.frontier_order.len() > self.max_client_windows {
+            let Some(oldest) = self.frontier_order.pop_front() else {
+                break;
+            };
+            self.evicted_frontiers.remove(&oldest);
+        }
+    }
+
+    /// Rebuilds a window for a client whose previous one was evicted, restoring its frontier.
+    fn window_for_new_client(&mut self, client_instance_id: &[u8]) -> ClientDedupeWindow {
+        let mut window = ClientDedupeWindow::new();
+        if let Some(frontier) = self.evicted_frontiers.remove(client_instance_id) {
+            self.frontier_order
+                .retain(|id| id.as_ref() != client_instance_id);
+            window.last_contiguous_processed_seq = frontier;
+        }
+        window
     }
 
     /// Checks whether an event has already been processed without recording it.
@@ -344,14 +506,23 @@ impl EventDeduplicator {
             revision_after_effect: 0,
             reject_reason: String::new(),
         };
-        if let Some(window) = self.clients.get_mut(client_instance_id) {
+        if self.clients.contains_key(client_instance_id) {
+            self.touch_client(client_instance_id);
+            let window = self
+                .clients
+                .get_mut(client_instance_id)
+                .expect("window presence checked above");
             return window.insert_legacy_settled(event_id, outcome, max_entries);
         }
 
         let mut window = ClientDedupeWindow::new();
         let is_new = window.insert_legacy_settled(event_id, outcome, max_entries);
-        self.clients
-            .insert(Bytes::copy_from_slice(client_instance_id), window);
+        if self.make_room_for_new_client().is_err() {
+            return false;
+        }
+        let id = Bytes::copy_from_slice(client_instance_id);
+        self.clients.insert(id.clone(), window);
+        self.client_order.push_back(id);
         is_new
     }
 
@@ -371,14 +542,46 @@ impl EventDeduplicator {
         }
 
         let max_entries = self.max_entries_per_client;
-        if let Some(window) = self.clients.get_mut(event.client_instance_id.as_slice()) {
+        if self
+            .clients
+            .contains_key(event.client_instance_id.as_slice())
+        {
+            self.touch_client(&event.client_instance_id);
+            let window = self
+                .clients
+                .get_mut(event.client_instance_id.as_slice())
+                .expect("window presence checked above");
             return window.admit(&event.event_id, event.event_seq, max_entries);
         }
 
-        let mut window = ClientDedupeWindow::new();
-        let outcome = window.admit(&event.event_id, event.event_seq, max_entries)?;
-        self.clients
-            .insert(Bytes::copy_from_slice(&event.client_instance_id), window);
+        // Validated against a throwaway window first, so a refused admission never allocates
+        // persistent per-client state and never displaces a retained window (§18.2). The window is
+        // seeded from any frontier retained when this client was last evicted, so validation uses
+        // the same receive window the client is actually numbering against.
+        let mut window = self.window_for_new_client(&event.client_instance_id);
+        let restored_frontier = window.last_contiguous_processed_seq;
+        let outcome = match window.admit(&event.event_id, event.event_seq, max_entries) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Put the frontier back: a refused admission must not consume the state that a
+                // later, valid event still needs (§18.2).
+                self.retain_frontier(
+                    Bytes::copy_from_slice(&event.client_instance_id),
+                    restored_frontier,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.make_room_for_new_client() {
+            self.retain_frontier(
+                Bytes::copy_from_slice(&event.client_instance_id),
+                restored_frontier,
+            );
+            return Err(error);
+        }
+        let id = Bytes::copy_from_slice(&event.client_instance_id);
+        self.clients.insert(id.clone(), window);
+        self.client_order.push_back(id);
         Ok(outcome)
     }
 
@@ -387,6 +590,7 @@ impl EventDeduplicator {
         if event.event_id.is_empty() {
             return self.last_contiguous_processed_seq(&event.client_instance_id);
         }
+        self.touch_client(&event.client_instance_id);
         let Some(window) = self.clients.get_mut(event.client_instance_id.as_slice()) else {
             return 0;
         };
@@ -406,20 +610,38 @@ impl EventDeduplicator {
 
     /// Highest contiguous event sequence settled for a client instance (§18.2).
     #[must_use]
+    /// Falls back to the frontier retained when the client's window was evicted, so a resume
+    /// reports the sequence the client actually reached rather than restarting it at zero (§18.2).
     pub fn last_contiguous_processed_seq(&self, client_instance_id: &[u8]) -> u64 {
         self.clients
             .get(client_instance_id)
-            .map_or(0, |window| window.last_contiguous_processed_seq)
+            .map(|window| window.last_contiguous_processed_seq)
+            .or_else(|| self.evicted_frontiers.get(client_instance_id).copied())
+            .unwrap_or(0)
     }
 
     /// Clears the history for a specific client instance (e.g. when a client terminates).
+    ///
+    /// Not called on transport detach: §18.2 requires the result cache and frontier to stay valid
+    /// for the lifetime of the session incarnation, and a detached client may still resume. Bounded
+    /// growth comes from [`DEFAULT_MAX_CLIENT_WINDOWS`] LRU eviction instead.
     pub fn remove_client(&mut self, client_instance_id: &[u8]) {
         self.clients.remove(client_instance_id);
+        self.client_order
+            .retain(|id| id.as_ref() != client_instance_id);
+        // An explicit removal retires the instance outright, so its frontier must go too:
+        // retaining it would refuse the sequences a genuinely new instance starts from.
+        self.evicted_frontiers.remove(client_instance_id);
+        self.frontier_order
+            .retain(|id| id.as_ref() != client_instance_id);
     }
 
     /// Clears all deduplication history across all clients.
     pub fn clear(&mut self) {
         self.clients.clear();
+        self.client_order.clear();
+        self.evicted_frontiers.clear();
+        self.frontier_order.clear();
     }
 }
 
@@ -468,6 +690,176 @@ mod tests {
         assert!(!dedupe.record(client_a, b"event-100"));
         assert!(dedupe.record(client_a, b"event-101"));
         assert!(dedupe.is_duplicate(client_a, b"event-101"));
+    }
+
+    /// §26/§27: `client_instance_id` is peer-chosen, so an unbounded client map lets any peer
+    /// grow server memory without limit simply by reconnecting under a fresh identity.
+    #[test]
+    fn test_client_windows_are_bounded_and_evicted_least_recently_used() {
+        const MAX_CLIENTS: usize = 4;
+        let mut dedupe = EventDeduplicator::with_limits(16, MAX_CLIENTS);
+
+        for client in 0..64u8 {
+            let event = wire_event(&[client], b"evt-1", 1);
+            settle_accepted(&mut dedupe, &event);
+            assert!(
+                dedupe.client_count() <= MAX_CLIENTS,
+                "retained client instances must stay bounded"
+            );
+        }
+
+        assert_eq!(dedupe.client_count(), MAX_CLIENTS);
+        // The four most recent instances survive; everything older was evicted.
+        for client in 60..64u8 {
+            assert!(dedupe.is_duplicate(&[client], b"evt-1"));
+        }
+        assert!(!dedupe.is_duplicate(&[0], b"evt-1"));
+    }
+
+    /// §18.2: window exhaustion applies backpressure; it must never evict an `IN_FLIGHT` event.
+    #[test]
+    fn test_capacity_exhaustion_refuses_rather_than_evicting_in_flight_windows() {
+        const MAX_CLIENTS: usize = 2;
+        let mut dedupe = EventDeduplicator::with_limits(16, MAX_CLIENTS);
+
+        for client in 0..MAX_CLIENTS as u8 {
+            let event = wire_event(&[client], b"evt-1", 1);
+            assert!(matches!(
+                dedupe.admit_event(&event).expect("admit"),
+                RecordOutcome::Fresh { .. }
+            ));
+        }
+
+        let newcomer = wire_event(b"late", b"evt-1", 1);
+        assert_eq!(
+            dedupe.admit_event(&newcomer).expect_err("must be refused"),
+            EventSequenceError::ClientWindowCapacityExhausted { limit: MAX_CLIENTS }
+        );
+        assert_eq!(dedupe.client_count(), MAX_CLIENTS);
+
+        // Settling frees a window, and the newcomer is admitted without displacing in-flight work.
+        dedupe.settle_event(
+            &wire_event(&[0], b"evt-1", 1),
+            EventOutcomeRecord {
+                accepted: true,
+                revision_after_effect: 1,
+                reject_reason: String::new(),
+            },
+        );
+        assert!(matches!(
+            dedupe.admit_event(&newcomer).expect("admit after settle"),
+            RecordOutcome::Fresh { .. }
+        ));
+    }
+
+    /// §18.2: eviction may drop a client's result cache, but never its place in the sequence
+    /// space. Restarting an established client at zero makes its next event permanently invalid.
+    #[test]
+    fn test_eviction_retains_the_frontier_so_an_established_client_can_keep_sending() {
+        const MAX_CLIENTS: usize = 4;
+        const MAX_ENTRIES: usize = 16;
+        let mut dedupe = EventDeduplicator::with_limits(MAX_ENTRIES, MAX_CLIENTS);
+
+        // An established client works its way well past one window width.
+        let veteran = b"veteran";
+        for seq in 1..=40u64 {
+            let event = wire_event(veteran, format!("evt-{seq}").as_bytes(), seq);
+            settle_accepted(&mut dedupe, &event);
+        }
+        assert_eq!(dedupe.last_contiguous_processed_seq(veteran), 40);
+
+        // Churn fresh identities until the veteran is the least recently used and is evicted.
+        for client in 0..6u8 {
+            let event = wire_event(&[client], b"evt-1", 1);
+            settle_accepted(&mut dedupe, &event);
+        }
+        assert!(
+            !dedupe.is_duplicate(veteran, b"evt-40"),
+            "window was evicted"
+        );
+
+        // The frontier survives the window, so a resume reports where the client actually is
+        // rather than zero.
+        assert_eq!(dedupe.last_contiguous_processed_seq(veteran), 40);
+
+        // And its next event is admitted instead of being refused as outside a window that was
+        // silently rewound to 1..=16.
+        let next = wire_event(veteran, b"evt-41", 41);
+        assert!(matches!(
+            dedupe
+                .admit_event(&next)
+                .expect("next event must be admitted"),
+            RecordOutcome::Fresh {
+                last_processed_event_seq: 40
+            }
+        ));
+    }
+
+    /// The retained frontier is bounded on the same terms as the windows (§26), so a large enough
+    /// identity churn ages it out too. Documented rather than fixed: an unbounded frontier map is
+    /// exactly the memory exhaustion `max_client_windows` exists to prevent, and a client that has
+    /// been idle across two full rounds of the bound is not distinguishable from a new one.
+    #[test]
+    fn test_a_retained_frontier_ages_out_under_sustained_identity_churn() {
+        const MAX_CLIENTS: usize = 4;
+        let mut dedupe = EventDeduplicator::with_limits(16, MAX_CLIENTS);
+
+        let veteran = b"veteran";
+        for seq in 1..=8u64 {
+            let event = wire_event(veteran, format!("evt-{seq}").as_bytes(), seq);
+            settle_accepted(&mut dedupe, &event);
+        }
+        assert_eq!(dedupe.last_contiguous_processed_seq(veteran), 8);
+
+        for client in 0..64u8 {
+            let event = wire_event(&[client], b"evt-1", 1);
+            settle_accepted(&mut dedupe, &event);
+        }
+
+        assert_eq!(
+            dedupe.last_contiguous_processed_seq(veteran),
+            0,
+            "frontier retention is bounded; sustained churn eventually reclaims it"
+        );
+    }
+
+    /// §18.2: a sequence settled above a gap is not reconstructible from the contiguous frontier,
+    /// so its window must be pinned exactly like one holding an in-flight admission.
+    #[test]
+    fn test_windows_holding_out_of_order_settlements_are_not_evicted() {
+        const MAX_CLIENTS: usize = 2;
+        let mut dedupe = EventDeduplicator::with_limits(16, MAX_CLIENTS);
+
+        // Two clients, each with a settled sequence 2 while sequence 1 has never arrived: the
+        // frontier is still 0, so eviction would lose the only record that 2 already ran.
+        for client in 0..MAX_CLIENTS as u8 {
+            let event = wire_event(&[client], b"evt-2", 2);
+            settle_accepted(&mut dedupe, &event);
+            assert_eq!(dedupe.last_contiguous_processed_seq(&[client]), 0);
+        }
+
+        let newcomer = wire_event(b"late", b"evt-1", 1);
+        assert_eq!(
+            dedupe.admit_event(&newcomer).expect_err("must be refused"),
+            EventSequenceError::ClientWindowCapacityExhausted { limit: MAX_CLIENTS }
+        );
+
+        // The settled out-of-order result is still answerable, so a retry is not re-run.
+        assert!(matches!(
+            dedupe
+                .admit_event(&wire_event(&[0], b"evt-2", 2))
+                .expect("replay"),
+            RecordOutcome::Duplicate { .. }
+        ));
+    }
+
+    /// A refused admission must not consume a retained window slot (§18.2).
+    #[test]
+    fn test_refused_admission_does_not_allocate_a_client_window() {
+        let mut dedupe = EventDeduplicator::with_limits(16, 4);
+        let invalid = wire_event(b"client-1", b"evt-1", 0);
+        assert!(dedupe.admit_event(&invalid).is_err());
+        assert_eq!(dedupe.client_count(), 0);
     }
 
     #[test]

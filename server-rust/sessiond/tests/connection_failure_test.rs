@@ -1,7 +1,8 @@
-//! Handshake failure matrix for `handle_connection` (§15, §18.1).
+//! Handshake failure matrix for `handle_connection` (§15, §18.1, §20.4).
 //!
 //! Covers timeout, shutdown, EOF, malformed framing, unexpected first messages,
-//! capability negotiation edge cases, and `ServerWelcome` field population.
+//! capability negotiation edge cases, `ServerWelcome` field population, core-version
+//! negotiation, and unresponsive clients that stop draining the outbound stream.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,42 @@ use srui_semantic_tree::{
     CapabilitySet, NegotiationError, Profile, ServerCapabilities, DEFAULT_MAX_NODE_COUNT,
     DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
-use srui_sessiond::{handle_connection, ConnectionError, Session, SessionError, HANDSHAKE_TIMEOUT};
+use srui_sessiond::{
+    handle_connection, ConnectionError, Session, SessionError, HANDSHAKE_TIMEOUT, WRITE_TIMEOUT,
+};
+
+/// A client that completes the handshake byte-for-byte and then never reads again.
+///
+/// `duplex(64)` is smaller than a `ServerWelcome`, so the very first outbound frame pends. That is
+/// the state that used to wedge the connection task: `SinkExt::send` never completes, so the
+/// `select!` is never re-armed and neither the shutdown token nor the broadcast `Lagged` signal is
+/// ever polled again.
+/// Returns the server task plus the client halves, which the caller must keep alive: dropping
+/// them would close the socket and let the server observe EOF instead of a wedged write.
+async fn spawn_unreadable_client(
+    session: Arc<Session>,
+    shutdown: CancellationToken,
+) -> (
+    tokio::task::JoinHandle<Result<(), ConnectionError>>,
+    tokio::io::ReadHalf<tokio::io::DuplexStream>,
+    FramedWrite<tokio::io::WriteHalf<tokio::io::DuplexStream>, SruiCodec>,
+) {
+    let (client_io, server_io) = duplex(64);
+    let handle = spawn_server(server_io, session, shutdown).await;
+
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let mut write = FramedWrite::new(client_write, SruiCodec::new());
+    write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::ClientHello(sample_client_hello(&[
+                "org.srui.standard-widgets/1",
+            ]))),
+        })
+        .await
+        .expect("send ClientHello");
+
+    (handle, client_read, write)
+}
 
 fn sample_client_hello(profiles: &[&str]) -> ClientHello {
     ClientHello {
@@ -431,4 +467,137 @@ async fn handshake_negotiation_failure_is_session_error() {
         next_msg.is_none(),
         "peer must receive no envelopes when negotiation fails"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Unresponsive clients (§17, §20.4)
+// ---------------------------------------------------------------------------
+
+/// §20.4/§17: a client that stops reading must not be able to pin a connection task forever.
+///
+/// Before the fix, `framed_write.send(..).await` inside a `select!` branch body pended
+/// indefinitely, so the shutdown token was never polled again, the [`AttachmentGuard`] was never
+/// dropped, and the session stayed `ATTACHED` with a dead peer — which in turn made the daemon's
+/// `join_next()` drain in `main` hang on `SIGTERM`.
+#[tokio::test]
+async fn a_blocked_write_is_interrupted_by_the_shutdown_token() {
+    let session = Arc::new(Session::new("blocked-write-shutdown"));
+    let shutdown = CancellationToken::new();
+    let (handle, _client_read, _client_write) =
+        spawn_unreadable_client(Arc::clone(&session), shutdown.clone()).await;
+
+    // Let the server reach the wedged welcome write before asking it to stop.
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("a cancelled connection must not outlive the shutdown signal")
+        .expect("server task join");
+    assert!(
+        result.is_ok(),
+        "a write interrupted by shutdown is a clean stop, got {result:?}"
+    );
+    assert_eq!(
+        session.attached_count(),
+        0,
+        "the attachment guard must drop so the session returns to DETACHED (§17)"
+    );
+    assert!(session.is_detached());
+}
+
+/// §20.4: an excessively stale client is detached on its own, without a shutdown signal, so the
+/// daemon never accumulates connection tasks parked in an unwritable socket.
+#[tokio::test(start_paused = true)]
+async fn a_client_that_never_reads_is_detached_by_the_write_deadline() {
+    let session = Arc::new(Session::new("blocked-write-deadline"));
+    let shutdown = CancellationToken::new();
+    let (handle, _client_read, _client_write) =
+        spawn_unreadable_client(Arc::clone(&session), shutdown).await;
+
+    // Paused clock: tokio auto-advances to the write deadline once every task is idle, so this
+    // asserts the deadline rather than waiting on wall-clock time.
+    let result = handle.await.expect("server task join");
+    assert!(
+        matches!(result, Err(ConnectionError::WriteTimeout(timeout)) if timeout == WRITE_TIMEOUT),
+        "expected WriteTimeout, got {result:?}"
+    );
+    assert_eq!(session.attached_count(), 0);
+    assert!(session.is_detached());
+}
+
+// ---------------------------------------------------------------------------
+// Core version negotiation (§15, §4 inv. 13)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_incompatible_core_version_fails_the_handshake() {
+    for requested in ["", "1.0.0", "0.5.0", "garbage", "0"] {
+        let session = Arc::new(Session::new("core-version"));
+        let shutdown = CancellationToken::new();
+        let (client_io, server_io) = duplex(4096);
+        let handle = spawn_server(server_io, Arc::clone(&session), shutdown).await;
+
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let mut framed_read = FramedRead::new(client_read, SruiCodec::new());
+        let mut framed_write = FramedWrite::new(client_write, SruiCodec::new());
+
+        let mut hello = sample_client_hello(&["org.srui.standard-widgets/1"]);
+        hello.core_version = requested.to_string();
+        framed_write
+            .send(SruiMessage {
+                msg: Some(srui_message::Msg::ClientHello(hello)),
+            })
+            .await
+            .expect("send hello");
+
+        let result = handle.await.expect("server task join");
+        assert!(
+            matches!(
+                result,
+                Err(ConnectionError::Session(
+                    SessionError::UnsupportedCoreVersion { .. }
+                ))
+            ),
+            "core_version {requested:?} must be refused, got {result:?}"
+        );
+        assert!(
+            framed_read.next().await.is_none(),
+            "a refused core version must not receive a WELCOME"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_compatible_patch_level_is_accepted() {
+    let session = Arc::new(Session::new("core-version-patch"));
+    let shutdown = CancellationToken::new();
+    let (client_io, server_io) = duplex(4096);
+    let handle = spawn_server(server_io, Arc::clone(&session), shutdown.clone()).await;
+
+    let (client_read, client_write) = tokio::io::split(client_io);
+    let mut framed_read = FramedRead::new(client_read, SruiCodec::new());
+    let mut framed_write = FramedWrite::new(client_write, SruiCodec::new());
+
+    let mut hello = sample_client_hello(&["org.srui.standard-widgets/1"]);
+    hello.core_version = "0.4.99".to_string();
+    framed_write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::ClientHello(hello)),
+        })
+        .await
+        .expect("send hello");
+
+    let welcome = framed_read
+        .next()
+        .await
+        .expect("welcome frame")
+        .expect("decode welcome");
+    assert!(matches!(
+        welcome.msg,
+        Some(srui_message::Msg::ServerWelcome(_))
+    ));
+
+    shutdown.cancel();
+    let _ = handle.await.expect("server task join");
 }

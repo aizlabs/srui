@@ -3,6 +3,8 @@
 use srui_protocol::Transaction;
 use srui_semantic_tree::{SemanticStore, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION};
 
+use super::SessionError;
+
 /// Appends one `MODEL_RESET_RANGE` operation carrying `items` starting at `start_index` (§13, §26).
 fn push_model_reset_range(
     ops: &mut Vec<srui_protocol::Operation>,
@@ -22,7 +24,28 @@ fn push_model_reset_range(
     });
 }
 
-pub(crate) fn export_snapshot_transaction(store: &SemanticStore) -> Transaction {
+/// Builds the single `base_revision = 0` transaction that reconstructs `store` (§13, §18).
+///
+/// # Errors
+///
+/// Returns [`SessionError::SnapshotUnrepresentable`] when the store needs more operations than
+/// §26 `max_transaction_operations` permits in one transaction. This is a *server-side* failure on
+/// purpose. Emitting the oversized transaction anyway would put an object on the wire that every
+/// conforming replica must reject at decode — both the Swift client
+/// (`ProtocolDecoder.validateAndConvertTransaction`) and this repository's own Rust replica
+/// (`SemanticStore::apply_staged_owned`) enforce the same bound — and because a reconnect
+/// regenerates a byte-identical snapshot, the client would fail, resume, and fail again forever
+/// with no diagnosis on either side (§18, §4 inv. 13).
+///
+/// The store's own `max_node_count` (§26) is an order of magnitude above
+/// `max_transaction_operations`, so this bound is reachable by an application that is doing
+/// nothing wrong. Restoring service for such a session requires chunked snapshot delivery, which
+/// needs an explicit snapshot-framing signal on the wire; until then the session fails loudly at
+/// handshake instead of silently poisoning every client that attaches to it.
+pub(crate) fn export_snapshot_transaction(
+    store: &SemanticStore,
+) -> Result<Transaction, SessionError> {
+    let max_operations = store.limits().max_transaction_operations;
     let mut ops = Vec::new();
 
     let mut model_ids: Vec<_> = store.model_ids().collect();
@@ -123,10 +146,60 @@ pub(crate) fn export_snapshot_transaction(store: &SemanticStore) -> Transaction 
         visit_node(store, root_id, idx as u32, &mut ops);
     }
 
-    Transaction {
+    if ops.len() > max_operations {
+        return Err(SessionError::SnapshotUnrepresentable {
+            limit: max_operations,
+            actual: ops.len(),
+        });
+    }
+
+    Ok(Transaction {
         base_revision: 0,
         new_revision: store.revision().get(),
         priority: 0,
         operations: ops,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use srui_semantic_tree::{NodeId, TypeRef, DEFAULT_MAX_TRANSACTION_OPERATIONS};
+
+    /// §26: a store larger than one transaction can express must fail here, not on the client.
+    #[test]
+    fn oversized_store_is_refused_instead_of_emitting_an_unusable_transaction() {
+        let mut store = SemanticStore::new();
+        let surface = TypeRef::new(0, 1);
+        store
+            .create_node(NodeId::new(1), surface, None, None, [])
+            .expect("root");
+        for id in 2..=(DEFAULT_MAX_TRANSACTION_OPERATIONS as u64 + 1) {
+            store
+                .create_node(NodeId::new(id), surface, Some(NodeId::new(1)), None, [])
+                .expect("child");
+        }
+
+        match export_snapshot_transaction(&store) {
+            Err(SessionError::SnapshotUnrepresentable { limit, actual }) => {
+                assert_eq!(limit, DEFAULT_MAX_TRANSACTION_OPERATIONS);
+                assert_eq!(actual, DEFAULT_MAX_TRANSACTION_OPERATIONS + 1);
+            }
+            other => panic!("expected SnapshotUnrepresentable, got {other:?}"),
+        }
+    }
+
+    /// A store that fits stays expressible, and the emitted snapshot is within §26 bounds.
+    #[test]
+    fn representable_store_exports_within_the_operation_bound() {
+        let mut store = SemanticStore::new();
+        let surface = TypeRef::new(0, 1);
+        store
+            .create_node(NodeId::new(1), surface, None, None, [])
+            .expect("root");
+
+        let snapshot = export_snapshot_transaction(&store).expect("representable");
+        assert_eq!(snapshot.base_revision, 0);
+        assert!(snapshot.operations.len() <= store.limits().max_transaction_operations);
     }
 }

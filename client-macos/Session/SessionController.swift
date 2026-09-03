@@ -58,6 +58,31 @@ public enum SessionDispatchError: Error, Equatable, Sendable {
     case resumeNotConfirmed
 }
 
+/// Core protocol version this build speaks (§15).
+public let SRUICoreVersion = "0.4.0"
+
+/// Whether `advertised` names a core version this build can talk to (§15, §4 inv. 13).
+///
+/// Compatibility is decided on `major.minor`; the patch level is free. An absent field decodes to
+/// the proto3 default `""`, which is indistinguishable from "omitted" on the wire, so it is
+/// refused rather than read as "unspecified, therefore fine": a default must never be the thing
+/// that authorizes a session.
+func sruiCoreVersionIsCompatible(_ advertised: String) -> Bool {
+    func majorMinor(_ version: String) -> (Substring, Substring)? {
+        let parts = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return nil }
+        let major = parts[0]
+        let minor = parts[1]
+        guard !major.isEmpty, !minor.isEmpty,
+              major.allSatisfy(\.isNumber), minor.allSatisfy(\.isNumber) else { return nil }
+        return (major, minor)
+    }
+
+    guard let advertised = majorMinor(advertised),
+          let supported = majorMinor(SRUICoreVersion) else { return false }
+    return advertised == supported
+}
+
 /// Connection handshake / data-plane phase (§15, §18).
 ///
 /// Illegal `(phase, payload)` pairs fail in one place instead of combining `isRunning`,
@@ -294,7 +319,7 @@ public final class SessionController: @unchecked Sendable {
             }
         } else {
             var hello = SRUIClientHello()
-            hello.coreVersion = "0.4.0"
+            hello.coreVersion = SRUICoreVersion
             hello.profiles = clientCapabilities.toStringArray()
             hello.clientInstanceID = clientInstanceId.bytes
 
@@ -418,6 +443,12 @@ public final class SessionController: @unchecked Sendable {
                     guard !Task.isCancelled else { break }
                     await handleIncomingMessage(msg)
                 }
+
+                // Release half of inbound backpressure (§26): acknowledged only after the chunk
+                // has been decoded *and* applied, so a slow renderer throttles the socket instead
+                // of letting the transport buffer committed transactions without bound. Reporting
+                // it earlier would make the bound meaningless, since rendering is the slow step.
+                await transport.acknowledgeReceived(byteCount: chunk.count)
             }
         } catch {
             guard !Task.isCancelled else { return }
@@ -515,6 +546,17 @@ public final class SessionController: @unchecked Sendable {
     }
 
     private func handleWelcome(_ welcome: SRUIServerWelcome) async {
+        // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
+        // version would let two peers that disagree about required semantics reach the data plane
+        // (§4 inv. 13).
+        guard sruiCoreVersionIsCompatible(welcome.coreVersion) else {
+            await reportFailure(.protocolViolation(
+                "SERVER WELCOME core_version \(welcome.coreVersion.isEmpty ? "<absent>" : welcome.coreVersion) "
+                + "is not compatible with \(SRUICoreVersion)"
+            ))
+            return
+        }
+
         let serverRequired: CapabilitySet
         do {
             serverRequired = try CapabilitySet.fromStrings(welcome.requiredProfiles)

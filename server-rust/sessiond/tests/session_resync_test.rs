@@ -461,3 +461,78 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
     assert_eq!(received.base_revision, 0);
     assert_eq!(received.new_revision, 1);
 }
+
+/// §26: a catch-up snapshot larger than one transaction can express must fail on the server.
+///
+/// The store's `max_node_count` is an order of magnitude above `max_transaction_operations`, so an
+/// application doing nothing wrong can reach a state whose snapshot every conforming replica must
+/// reject at decode. Emitting it anyway strands the client: a reconnect regenerates the identical
+/// snapshot, so it fails, resumes, and fails again forever with no diagnosis on either side.
+#[tokio::test]
+async fn oversized_catch_up_snapshot_fails_the_handshake_instead_of_being_sent() {
+    use srui_semantic_tree::DEFAULT_MAX_TRANSACTION_OPERATIONS;
+    use srui_sessiond::SessionError;
+
+    let session = Session::new("oversized-snapshot");
+    let root = NodeId::new(1);
+    session
+        .transaction(|ui| Surface::builder(root).label("root").create(ui))
+        .expect("root");
+
+    // Built in legal chunks: every individual transaction respects §26, but the resulting store
+    // needs more operations than one transaction may carry.
+    let target = DEFAULT_MAX_TRANSACTION_OPERATIONS as u64 + 1;
+    let mut next_id = 2u64;
+    while next_id <= target {
+        let chunk_end = (next_id + 999).min(target);
+        session
+            .transaction(|ui| {
+                for id in next_id..=chunk_end {
+                    Text::builder(NodeId::new(id))
+                        .parent(root)
+                        .text("x")
+                        .create(ui)?;
+                }
+                Ok(())
+            })
+            .expect("chunked create");
+        next_id = chunk_end + 1;
+    }
+    assert!(session.node_count() > DEFAULT_MAX_TRANSACTION_OPERATIONS);
+
+    let hello = ClientHello {
+        core_version: srui_sessiond::CORE_VERSION.to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
+        limits: None,
+        client_instance_id: vec![7],
+        client_metadata: Default::default(),
+    };
+    match session.bootstrap_fresh_client(&hello) {
+        Err(SessionError::SnapshotUnrepresentable { limit, actual }) => {
+            assert_eq!(limit, DEFAULT_MAX_TRANSACTION_OPERATIONS);
+            assert!(actual > limit);
+        }
+        Ok(bootstrap) => panic!(
+            "handshake produced a snapshot with {} operations, which every conforming replica \
+             must reject (§26)",
+            bootstrap
+                .snapshot
+                .map(|tx| tx.operations.len())
+                .unwrap_or_default()
+        ),
+        Err(other) => panic!("expected SnapshotUnrepresentable, got {other:?}"),
+    }
+
+    // The same refusal must apply on the resync path, which is the one a stranded client retries.
+    let resume = ClientResume {
+        session_id: "a-different-incarnation".to_string(),
+        client_instance_id: vec![7],
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+    };
+    assert!(matches!(
+        session.bootstrap_resume(&resume),
+        Err(SessionError::SnapshotUnrepresentable { .. })
+    ));
+}

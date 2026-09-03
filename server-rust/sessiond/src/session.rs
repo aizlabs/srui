@@ -11,7 +11,7 @@
 mod handshake;
 mod snapshot;
 
-pub use handshake::{FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome};
+pub use handshake::{FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -122,6 +122,15 @@ pub enum SessionError {
 
     #[error("invalid configuration: {0}")]
     InvalidConfiguration(String),
+
+    #[error("catch-up snapshot needs {actual} operations but a transaction may carry at most {limit} (§26)")]
+    SnapshotUnrepresentable { limit: usize, actual: usize },
+
+    #[error("unsupported core protocol version {requested:?}; this server speaks {supported:?}")]
+    UnsupportedCoreVersion {
+        requested: String,
+        supported: String,
+    },
 
     #[error("session is in a terminal state ({0:?})")]
     TerminalState(SessionState),
@@ -560,7 +569,7 @@ impl Session {
     where
         F: FnOnce(&mut UiTransaction) -> Result<T, StoreError>,
     {
-        let (val, tx) = {
+        let val = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
             let base_revision = guard.store.revision();
             let max_ops = guard.store.limits().max_transaction_operations;
@@ -580,7 +589,11 @@ impl Session {
                     let tx_wire = permit.transaction().clone();
                     guard.store.commit_staging(staged, commit.new_revision());
                     guard.journal.append(permit);
-                    (val, tx_wire)
+                    // Published under `inner` so delivery order equals commit order (§12.1);
+                    // see `publish_committed` for why this is not an `async-no-lock-await`
+                    // violation.
+                    self.publish_committed(&tx_wire);
+                    val
                 }
                 Ok(Err(store_err)) => return Err(SessionError::Store(store_err)),
                 Err(panic_payload) => {
@@ -596,9 +609,25 @@ impl Session {
             }
         };
 
-        // Publish to attached client queues outside of the mutex lock (§20.2, async-no-lock-await)
-        self.outbound_hub.publish(&tx);
         Ok(val)
+    }
+
+    /// Publishes one committed transaction to every attached connection (§12.1, §20.2).
+    ///
+    /// # Locking
+    ///
+    /// The caller MUST still hold `inner`. The mutex that orders commits is the only thing that
+    /// can order publications: releasing it first lets two committers interleave as
+    /// `commit(N) | commit(N+1) | publish(N+1) | publish(N)`, which delivers a revision gap that
+    /// every conforming replica must reject as divergence even though the journal is correct.
+    /// Lock order stays `inner -> subscriber`, matching the handshake bootstrap paths, which
+    /// subscribe while holding `inner`.
+    ///
+    /// This adds no `await`: [`OutboundHub::publish`] is synchronous and never blocks — a full
+    /// queue marks the subscriber stale for forced resync rather than waiting — so holding `inner`
+    /// across it does not violate `async-no-lock-await`.
+    fn publish_committed(&self, tx: &Transaction) {
+        self.outbound_hub.publish(tx);
     }
 
     /// Applies a wire transaction to the store, logs it to the journal,
@@ -624,11 +653,11 @@ impl Session {
 
             guard.store.commit_prepared(staged);
             guard.journal.append(permit);
+            // Published under `inner` so delivery order equals commit order (§12.1).
+            self.publish_committed(&tx_wire);
             tx_wire
         };
 
-        // Publish to attached client queues outside of the mutex lock
-        self.outbound_hub.publish(&tx);
         Ok(tx)
     }
 
@@ -770,6 +799,15 @@ impl Session {
     pub fn current_revision(&self) -> u64 {
         let guard = lock_or_recover(&self.inner);
         guard.store.revision().get()
+    }
+
+    /// Highest revision admitted to the journal (§18.1).
+    ///
+    /// Equal to [`Self::current_revision`] after every commit: the prepared-permit path makes the
+    /// append infallible precisely so the two cannot drift (§12.1).
+    pub fn journal_latest_revision(&self) -> u64 {
+        let guard = lock_or_recover(&self.inner);
+        guard.journal.latest_revision()
     }
 
     /// Negotiated §26 string bound for wire diagnostics such as `reject_reason`.

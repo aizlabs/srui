@@ -31,6 +31,14 @@ use thiserror::Error;
 /// Handshake timeout in seconds (5 seconds, §18.1).
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long one outbound frame may stay unaccepted before the client is treated as unreachable.
+///
+/// The outbound queue bounds how much a slow client may buffer, but it cannot bound a client that
+/// stops reading the socket entirely: TCP backpressure then parks the write itself, and neither
+/// the queue nor the disconnect token ever fires because nothing else is trying to publish to it.
+/// The deadline turns that indefinite park into a detach, after which the client resyncs (§20.2).
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Errors occurring during connection lifecycle.
 #[derive(Debug, Error)]
 pub enum ConnectionError {
@@ -57,6 +65,9 @@ pub enum ConnectionError {
 
     #[error("event client_instance_id does not match the connection handshake")]
     ClientInstanceMismatch,
+
+    #[error("client did not accept an outbound frame within {0:?}; detaching for resync")]
+    WriteTimeout(Duration),
 }
 
 /// Sends `envelope` unless shutdown or outbound overflow/close fires first.
@@ -83,9 +94,19 @@ where
 {
     tokio::select! {
         biased;
-        res = framed_write.send(envelope) => {
-            res?;
-            Ok(true)
+        // Bounded: a client that stops reading its socket parks this write in the kernel, where
+        // neither the shutdown token nor the outbound queue can observe it (§20.2).
+        res = tokio::time::timeout(WRITE_TIMEOUT, framed_write.send(envelope)) => {
+            match res {
+                Ok(sent) => {
+                    sent?;
+                    Ok(true)
+                }
+                Err(_) => {
+                    warn!(timeout = ?WRITE_TIMEOUT, "Client did not accept an outbound frame; detaching for resync");
+                    Err(ConnectionError::WriteTimeout(WRITE_TIMEOUT))
+                }
+            }
         }
         _ = shutdown.cancelled() => Ok(false),
         _ = outbound.disconnect_token().cancelled() => match outbound.termination() {

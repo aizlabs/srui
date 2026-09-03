@@ -29,6 +29,9 @@ fn ignore_sighup() -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// How long a graceful shutdown waits for in-flight connections before aborting them (§20.4).
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn default_socket_path() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -461,11 +464,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Await all connection tasks
-    while let Some(res) = tasks.join_next().await {
-        if let Err(e) = res {
-            error!("Connection task panicked: {}", e);
+    // Await all connection tasks, but never let one unresponsive peer hold the daemon open: a
+    // connection blocked writing to a client that stopped reading only unwinds once its own write
+    // deadline elapses, and an unbounded join here would outlive any operator's patience (§20.4).
+    let drained = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+        while let Some(res) = tasks.join_next().await {
+            if let Err(e) = res {
+                error!("Connection task panicked: {}", e);
+            }
         }
+    })
+    .await;
+
+    if drained.is_err() {
+        warn!(
+            timeout = ?SHUTDOWN_DRAIN_TIMEOUT,
+            remaining = tasks.len(),
+            "Connection drain timed out; aborting remaining connections"
+        );
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
 
     // Clean up socket file

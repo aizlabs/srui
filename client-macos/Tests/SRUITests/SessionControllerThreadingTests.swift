@@ -36,6 +36,7 @@ struct SessionControllerThreadingTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "test-session"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var welcomeMsg = SRUIMessage()
@@ -177,6 +178,7 @@ struct SessionControllerThreadingTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "interaction-session"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var welcomeMessage = SRUIMessage()

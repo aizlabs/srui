@@ -24,6 +24,9 @@ printf 'Repository: %s\nSince:      %s (%s days)\n\n' "$repo" "$since" "$days"
 # "No completed jobs in this window." — and exit 0, understating spend exactly when it matters.
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT INT TERM
+# Created up front: an empty window never enters the loop below, and `awk` would then fail with
+# "cannot open file" instead of reaching its own "No completed jobs in this window." path.
+: > "$work/jobs"
 
 if ! gh api --paginate "repos/$repo/actions/runs?created=>$since" --jq '.workflow_runs[].id' \
 	> "$work/runs"; then

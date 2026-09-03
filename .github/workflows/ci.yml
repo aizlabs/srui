@@ -29,10 +29,15 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      skip_review_gate:
+        description: "Bypass the Codex review gate (recorded in the run log)"
+        type: boolean
+        default: false
 
 jobs:
   # Cheap Linux gate in front of everything else, so unresolved review findings cost one Linux
-  # minute rather than a full macOS run. Skipped for `workflow_dispatch`, which carries no PR.
+  # minute rather than a full macOS run.
   review-gate:
     name: Codex Review Resolved
     # Draft PRs iterate for free: `codex-draft-review.yml` reviews them, `.githooks/pre-push` runs
@@ -40,40 +45,104 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     steps:
-      - name: Require every Codex review thread to be resolved
-        if: github.event_name == 'pull_request'
+      # `workflow_dispatch` carries no PR context, but it is the documented way to re-run after
+      # resolving a finding — so it must be gated too, or the remediation instruction is itself
+      # the bypass. The PR is recovered from the dispatched branch.
+      - name: Identify the pull request under test
+        id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          # `isOutdated` threads are deliberately still counted: a thread going stale because the
-          # line moved is not the same as the finding being addressed. Resolve it explicitly.
-          unresolved=$(gh api graphql \
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            number='${{ github.event.pull_request.number }}'
+            head='${{ github.event.pull_request.head.sha }}'
+          else
+            number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" \
+              --state open --json number --jq '.[0].number // ""')
+            head="$GITHUB_SHA"
+          fi
+          if [ -z "$number" ]; then
+            echo "No open pull request for '${GITHUB_REF_NAME}'; review gate does not apply."
+          else
+            echo "Gating pull request #${number} at ${head}."
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Record review gate bypass
+        if: inputs.skip_review_gate
+        run: |
+          echo "::warning::Codex review gate bypassed by explicit workflow_dispatch input."
+
+      # CI and the Codex review start independently on `opened` and `ready_for_review`. Querying
+      # threads immediately would find none and pass, letting every expensive job run against code
+      # a review is about to flag. Waiting for a review of *this* head closes that race.
+      - name: Wait for a Codex review of the current head
+        if: steps.pr.outputs.number != '' && !inputs.skip_review_gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            reviewed=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate \
+              --jq "[.[] | select((.user.login // \"\") | startswith(\"chatgpt-codex-connector\"))
+                     | select(.commit_id == \"$HEAD_SHA\")] | length")
+            if [ "$reviewed" -gt 0 ]; then
+              echo "Codex has reviewed ${HEAD_SHA}."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "No Codex review of ${HEAD_SHA} after 15 minutes."
+              echo
+              echo "Fail closed rather than run the suite against unreviewed code. Either:"
+              echo "  - comment '@codex review' on the PR and re-run, or"
+              echo "  - re-run with skip_review_gate=true if Codex is unavailable."
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Require every Codex review thread to be resolved
+        if: steps.pr.outputs.number != '' && !inputs.skip_review_gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          # Paginated: a long-lived draft accumulates a thread per review, and an unresolved
+          # finding on page two must still fail the gate.
+          #
+          # `isOutdated` threads are deliberately counted too. A thread going stale because the
+          # line moved is not the same as the finding being addressed; resolve it explicitly.
+          unresolved=$(gh api graphql --paginate \
             -f query='
-              query($owner:String!,$repo:String!,$pr:Int!){
+              query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
                 repository(owner:$owner,name:$repo){
                   pullRequest(number:$pr){
-                    reviewThreads(first:100){
+                    reviewThreads(first:100, after:$endCursor){
+                      pageInfo{ hasNextPage endCursor }
                       nodes{ isResolved path
                         comments(first:1){ nodes{ author{login} } } } } } } }' \
             -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" -F pr="$PR" \
-            --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
-                   | select(.isResolved == false)
-                   | select((.comments.nodes[0].author.login // "") | startswith("chatgpt-codex-connector"))
-                   | .path]')
+            --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+                  | select(.isResolved == false)
+                  | select((.comments.nodes[0].author.login // "") | startswith("chatgpt-codex-connector"))
+                  | .path' | sort | uniq -c | sed 's/^ */  - /')
 
-          count=$(printf '%s' "$unresolved" | jq 'length')
-          if [ "$count" -eq 0 ]; then
+          if [ -z "$unresolved" ]; then
             echo "No unresolved Codex review threads."
             exit 0
           fi
 
-          echo "$count unresolved Codex review thread(s):"
-          printf '%s' "$unresolved" | jq -r '.[] | "  - \(.)"'
+          echo "Unresolved Codex review thread(s):"
+          printf '%s\n' "$unresolved"
           echo
           echo "Resolve each thread on the PR, then re-run:"
-          echo "  gh workflow run ci.yml --ref ${GITHUB_HEAD_REF:-<branch>}"
+          echo "  gh workflow run ci.yml --ref ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
           exit 1
 
   registry:

@@ -1,0 +1,4 @@
+{
+  "name": "SRUI",
+  "install": "bash .cursor/install.sh"
+}

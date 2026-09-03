@@ -1,0 +1,72 @@
+#!/bin/sh
+# Pre-push gate: runs the same checks as .github/workflows/ci.yml, in CI's order.
+#
+# Enable with:
+#     git config core.hooksPath .githooks
+#
+# Bypass a single push with `git push --no-verify` — appropriate for a WIP branch, not for a
+# branch you intend to open a PR from.
+#
+# Deliberately NOT a full CI replacement. Two things this cannot check on a Mac:
+#   * the `pidfd` termination path in examples/process-monitor is cfg(target_os = "linux") and is
+#     only ever compiled by the Linux CI job;
+#   * a from-scratch build. Cargo and SwiftPM reuse incremental artifacts here, and this repo has
+#     already produced phantom failures from stale rlibs after mtime-preserving edits (AGENTS.md).
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+fail=0
+run() {
+	label=$1
+	shift
+	printf '\n\033[1m== %s\033[0m\n' "$label"
+	if "$@"; then
+		return 0
+	fi
+	printf '\033[31mFAILED: %s\033[0m\n' "$label"
+	fail=1
+}
+
+# --- Registry Validation (CI: job `registry`) --------------------------------
+run "registry: validate_registry.py" uv run python protocol/validate_registry.py
+run "registry: pytest" uv run pytest protocol/tests -q
+
+# --- Rust Build (CI: job `rust`) ---------------------------------------------
+# `--all-targets` compiles tests, benches and examples, so CI's separate `cargo check` adds
+# nothing beyond what these two already build.
+run "rust: cargo test" cargo test --manifest-path server-rust/Cargo.toml --workspace --all-targets
+run "rust: cargo clippy" cargo clippy --manifest-path server-rust/Cargo.toml --workspace --all-targets -- -D warnings
+run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
+run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+
+# --- Swift Build (CI: job `swift`) -------------------------------------------
+# The integration tests drive a real sessiond and counter server, so both must be built first,
+# exactly as CI does.
+run "swift: build server binaries" cargo build --manifest-path server-rust/Cargo.toml
+run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
+
+printf '\n\033[1m== swift: SemanticModel must not import AppKit or Cocoa (§1)\033[0m\n'
+if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then
+	printf '\033[31mFAILED: SemanticModel must never import AppKit or Cocoa\033[0m\n'
+	fail=1
+fi
+
+run "swift: swift test" swift test --package-path client-macos
+
+# --- Generated-file freshness (CI: job `swift`, final step) -------------------
+# The committed Swift bindings are generated output; CI fails on any diff after regeneration.
+# Checked last because it rewrites files in the working tree.
+run "protocol: regenerate bindings" ./protocol/generate_proto.sh
+run "protocol: committed bindings are fresh" git diff --exit-code \
+	client-macos/Protocol/srui.pb.swift \
+	client-macos/SemanticModel/RegistryTables.swift
+
+if [ "$fail" -ne 0 ]; then
+	printf '\n\033[31mpre-push checks failed; push aborted.\033[0m\n'
+	printf 'Re-run an individual check above, or bypass with: git push --no-verify\n'
+	exit 1
+fi
+
+printf '\n\033[32mAll pre-push checks passed.\033[0m\n'

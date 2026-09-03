@@ -1,14 +1,159 @@
 name: CI
 
+# Runs immediately before merge, not on every push.
+#
+# The check set is unchanged — the same four jobs run the same commands. What changed is how often
+# GitHub pays for them. `synchronize` (every push to an open PR) and `push` (every merge to main,
+# re-validating a tree the PR already validated) were the two high-frequency triggers, and neither
+# adds signal that `.githooks/pre-push` does not already produce locally on every push.
+#
+# Review comes first, then CI. The intended order is:
+#
+#   1. gh pr create --draft   -> no runner time; `codex-draft-review.yml` requests a Codex review
+#   2. push freely            -> `.githooks/pre-push` runs CI's checks locally, and each push gets
+#                                a fresh Codex review
+#   3. resolve every Codex thread on the PR
+#   4. gh pr ready <n>        -> CI runs once, as the merge gate
+#
+# Step 3 is enforced, not merely documented: the `review-gate` job below fails while any Codex
+# review thread is unresolved, and every other job depends on it. Ordering the pipeline this way
+# keeps the expensive macOS job from running against code that review has already flagged.
+#
+# Every non-draft head is validated. Drafts are skipped by the `if:` on each job rather than by
+# the trigger list: gating on `ready_for_review` alone would silently skip a PR opened directly in
+# the normal non-draft state, and skip every push made after a draft became ready, leaving merge
+# candidates unvalidated. Cost control comes from staying in draft while iterating, not from
+# letting a ready PR merge unchecked.
 on:
-  push:
-    branches: [ main, master ]
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
     branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      skip_review_gate:
+        description: "Bypass the Codex review gate (recorded in the run log)"
+        type: boolean
+        default: false
 
 jobs:
+  # Cheap Linux gate in front of everything else, so unresolved review findings cost one Linux
+  # minute rather than a full macOS run.
+  review-gate:
+    name: Codex Review Resolved
+    # Draft PRs iterate for free: `codex-draft-review.yml` reviews them, `.githooks/pre-push` runs
+    # the checks locally, and no runner time is spent here until the PR is marked ready.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      # `workflow_dispatch` carries no PR context, but it is the documented way to re-run after
+      # resolving a finding — so it must be gated too, or the remediation instruction is itself
+      # the bypass. The PR is recovered from the dispatched branch.
+      - name: Identify the pull request under test
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            number='${{ github.event.pull_request.number }}'
+            head='${{ github.event.pull_request.head.sha }}'
+          else
+            number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$GITHUB_REF_NAME" \
+              --state open --json number --jq '.[0].number // ""')
+            head="$GITHUB_SHA"
+          fi
+          if [ -z "$number" ]; then
+            echo "No open pull request for '${GITHUB_REF_NAME}'; review gate does not apply."
+          else
+            echo "Gating pull request #${number} at ${head}."
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Record review gate bypass
+        if: inputs.skip_review_gate
+        run: |
+          echo "::warning::Codex review gate bypassed by explicit workflow_dispatch input."
+
+      # CI and the Codex review start independently on `opened` and `ready_for_review`. Querying
+      # threads immediately would find none and pass, letting every expensive job run against code
+      # a review is about to flag. Waiting for a review of *this* head closes that race.
+      - name: Wait for a Codex review of the current head
+        if: steps.pr.outputs.number != '' && !inputs.skip_review_gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 900 ))
+          while :; do
+            # `--paginate` emits one JSON document per page, so a per-page `length` yields one
+            # number per line: on a PR with enough reviews to span pages, `reviewed` becomes
+            # something like "0\n1", the numeric test below errors, and the gate times out even
+            # though the current head has been reviewed. `jq -s add` folds the pages into one
+            # integer.
+            reviewed=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate \
+              --jq "[.[] | select((.user.login // \"\") | startswith(\"chatgpt-codex-connector\"))
+                     | select(.commit_id == \"$HEAD_SHA\")] | length" \
+              | jq -s 'add // 0')
+            if [ "$reviewed" -gt 0 ]; then
+              echo "Codex has reviewed ${HEAD_SHA}."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "No Codex review of ${HEAD_SHA} after 15 minutes."
+              echo
+              echo "Fail closed rather than run the suite against unreviewed code. Either:"
+              echo "  - comment '@codex review' on the PR and re-run, or"
+              echo "  - re-run with skip_review_gate=true if Codex is unavailable."
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Require every Codex review thread to be resolved
+        if: steps.pr.outputs.number != '' && !inputs.skip_review_gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          # Paginated: a long-lived draft accumulates a thread per review, and an unresolved
+          # finding on page two must still fail the gate.
+          #
+          # `isOutdated` threads are deliberately counted too. A thread going stale because the
+          # line moved is not the same as the finding being addressed; resolve it explicitly.
+          unresolved=$(gh api graphql --paginate \
+            -f query='
+              query($owner:String!,$repo:String!,$pr:Int!,$endCursor:String){
+                repository(owner:$owner,name:$repo){
+                  pullRequest(number:$pr){
+                    reviewThreads(first:100, after:$endCursor){
+                      pageInfo{ hasNextPage endCursor }
+                      nodes{ isResolved path
+                        comments(first:1){ nodes{ author{login} } } } } } } }' \
+            -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" -F pr="$PR" \
+            --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+                  | select(.isResolved == false)
+                  | select((.comments.nodes[0].author.login // "") | startswith("chatgpt-codex-connector"))
+                  | .path' | sort | uniq -c | sed 's/^ */  - /')
+
+          if [ -z "$unresolved" ]; then
+            echo "No unresolved Codex review threads."
+            exit 0
+          fi
+
+          echo "Unresolved Codex review thread(s):"
+          printf '%s\n' "$unresolved"
+          echo
+          echo "Resolve each thread on the PR, then re-run:"
+          echo "  gh workflow run ci.yml --ref ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          exit 1
+
   registry:
     name: Registry Validation
+    needs: review-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,27 +165,14 @@ jobs:
       - name: Run registry validator tests
         run: uv run pytest protocol/tests
 
+  # The server workspace is built and tested on Linux only. It was previously also built on
+  # macOS, but that job ran an identical command set at ~10x the per-minute price, and the one
+  # platform-specific path in the workspace (`pidfd`, below) is the Linux one. macOS coverage of
+  # this code still happens: the `swift` job builds these same crates to run its integration
+  # tests against a real `sessiond`.
   rust:
-    name: Rust Build
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Build and test server-rust workspace
-        run: |
-          cargo test --workspace --all-targets
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo check --workspace --all-targets
-        working-directory: server-rust
-      - name: Build and test examples
-        run: |
-          cargo test --manifest-path ../examples/process-monitor/Cargo.toml
-          cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
-        working-directory: server-rust
-
-  rust-linux:
     name: Rust Build (Linux)
+    needs: review-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,9 +191,12 @@ jobs:
           cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
         working-directory: server-rust
 
+  # libFuzzer and its sanitizers are best supported on Linux, and nothing in the decoders is
+  # platform-specific, so this runs where it is cheapest (§26 decode limits are host-independent).
   fuzz:
     name: Decoder Fuzz Regression
-    runs-on: macos-15
+    needs: review-gate
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust nightly toolchain
@@ -114,6 +249,7 @@ jobs:
 
   swift:
     name: Swift Build
+    needs: review-gate
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +258,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build server-rust binaries for integration tests
         run: cargo build --manifest-path server-rust/Cargo.toml
+      # `terminate_key` has a `cfg(not(target_os = "linux"))` fallback that the Linux job never
+      # compiles. This job is the only macOS compile in CI, so the non-Linux branch is checked
+      # here or nowhere. `clippy --all-targets` type-checks it without paying to run the suite
+      # twice; the tests themselves run on Linux, the expected server platform.
+      - name: Type-check the non-Linux process-monitor fallback
+        run: cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
       - name: Build example servers for integration tests
         run: cargo build --manifest-path examples/counter/Cargo.toml
       - name: Verify SemanticModel does not import AppKit or Cocoa (§1)

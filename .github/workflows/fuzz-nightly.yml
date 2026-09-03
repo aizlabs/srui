@@ -1,17 +1,23 @@
-name: Nightly Fuzz and AddressSanitizer
+name: Weekly Fuzz and AddressSanitizer
 
+# Weekly, not nightly: this job is ~14 minutes of pure fuzzing by construction
+# (4 targets x `-max_total_time=180`), which made it the largest single consumer of runner time in
+# the repository. Fuzzing here is a soak test for accumulated coverage; the per-PR regression in
+# `ci.yml` still replays every conformance and malformed vector on every change (§26).
 on:
   schedule:
-    - cron: "23 2 * * *"
+    - cron: "23 2 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  # Runs on Linux: AddressSanitizer under libFuzzer is best supported there, and at ~14 minutes a
+  # night this is the single largest consumer of runner time in the repository.
   fuzz-asan:
     name: Stateful fuzzing (ASan)
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

@@ -131,6 +131,8 @@ public final class SessionController: @unchecked Sendable {
     /// Negotiated set from the last successful `SERVER WELCOME`, retained across `stop()` so a
     /// later `CLIENT RESUME` can restore it (§15, §18).
     private var retainedCapabilities: CapabilitySet?
+    /// Hashes whose transfer was already rejected; suppress per-chunk log spam (§14, §26).
+    private var rejectedResourceHashes: Set<ResourceHash> = []
 
     public init(
         transport: any Transport,
@@ -138,6 +140,8 @@ public final class SessionController: @unchecked Sendable {
         outbox: EventOutbox = EventOutbox(),
         decoder: ProtocolDecoder = ProtocolDecoder(),
         renderer: AppKitRenderer? = nil,
+        /// Inject a shared cache across reconnecting controller instances so committed resources
+        /// survive replacement; the default constructs a fresh CAS per controller (§14, §18).
         resourceCache: ResourceCache = ResourceCache(),
         sessionId: String? = nil,
         clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1],
@@ -864,6 +868,7 @@ public final class SessionController: @unchecked Sendable {
                 await dispatchResourceCommit(commit)
             }
         } catch {
+            rejectedResourceHashes.insert(input.resourceHash)
             SessionDiagnostics.error(
                 "Resource metadata rejected for \(input.resourceHash): \(error); keeping placeholder (§14)"
             )
@@ -880,11 +885,17 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
+        if rejectedResourceHashes.contains(input.resourceHash) {
+            // Already rejected (e.g. oversized metadata); do not flood diagnostics per chunk.
+            return
+        }
+
         do {
             if let commit = try await resourceCache.ingestChunk(input) {
                 await dispatchResourceCommit(commit)
             }
         } catch {
+            rejectedResourceHashes.insert(input.resourceHash)
             SessionDiagnostics.error(
                 "Resource chunk rejected for \(input.resourceHash): \(error); keeping placeholder (§14)"
             )
@@ -893,8 +904,12 @@ public final class SessionController: @unchecked Sendable {
 
     /// Pushes a newly committed decoded image onto AppKit on the main actor (§14, §22.2).
     private func dispatchResourceCommit(_ commit: ResourceCommit) async {
-        guard commit.newlyCommitted else { return }
+        rejectedResourceHashes.remove(commit.image.hash)
         await MainActor.run {
+            if !commit.evictedHashes.isEmpty {
+                self.renderer?.evictResourceImages(commit.evictedHashes)
+            }
+            guard commit.newlyCommitted else { return }
             self.renderer?.commitResourceImage(commit.image)
         }
     }
@@ -1276,8 +1291,11 @@ public final class SessionController: @unchecked Sendable {
             await outbox.stopResumeWork(generation: replayGeneration)
         }
 
-        // Disconnect drops in-flight assemblies; the committed CAS persists across reconnect (§14).
+        // Disconnect drops in-flight assemblies. Committed CAS entries persist on this
+        // `resourceCache` instance — inject the same cache into a replacement controller to keep
+        // them across reconnect (§14, §18). Task 26 still re-seeds retained server resources.
         await resourceCache.clearPartials()
+        rejectedResourceHashes.removeAll(keepingCapacity: false)
 
         clearSessionStateAfterStop()
 

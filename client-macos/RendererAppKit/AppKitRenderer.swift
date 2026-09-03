@@ -63,6 +63,26 @@ public final class AppKitRenderer {
         refreshImageHandles(matching: image.hash, with: nsImage)
     }
 
+    /// Drops retained images for hashes evicted from the client resource CAS and restores
+    /// placeholders on any Image handles still pointing at those hashes (§14, §26).
+    public func evictResourceImages(_ hashes: [ResourceHash]) {
+        guard !hashes.isEmpty else { return }
+        let evicted = Set(hashes)
+        for hash in hashes {
+            imagesByHash.removeValue(forKey: hash)
+        }
+        for handle in registry.allHandles {
+            guard let pending = handle.pendingResourceHash, evicted.contains(pending) else {
+                continue
+            }
+            guard handle.nodeType == .image,
+                  let imageView = handle.view as? NSImageView else {
+                continue
+            }
+            imageView.image = NSImage(systemSymbolName: "photo", accessibilityDescription: nil)
+        }
+    }
+
     /// Convenience overload accepting a raw `CGImage` already verified by the resource cache (§14).
     public func commitResourceImage(hash: ResourceHash, cgImage: CGImage, pixelWidth: Int, pixelHeight: Int) {
         let size = NSSize(width: pixelWidth, height: pixelHeight)

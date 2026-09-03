@@ -101,6 +101,11 @@ impl ResourceTransferQueue {
         self.pending.push_back(entry);
     }
 
+    /// Returns `true` when a metadata/chunk frame can still be emitted.
+    pub(crate) fn has_work(&self) -> bool {
+        self.active.is_some() || !self.pending.is_empty()
+    }
+
     /// Emits the next metadata or chunk frame, advancing the cursor by at most one frame.
     pub(crate) fn pop_frame(&mut self) -> Option<ResourceOutboundFrame> {
         loop {

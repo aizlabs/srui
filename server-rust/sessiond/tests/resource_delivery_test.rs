@@ -16,14 +16,14 @@ use srui_resources::CHUNK_PAYLOAD_SIZE;
 use srui_sdk::*;
 use srui_sessiond::{handle_connection, Session};
 
-/// Minimal valid 1×1 PNG (68 bytes) — deterministic fixture for image delivery.
+/// Deterministic valid 1×1 RGB PNG (69 bytes); shared with Swift ResourceCacheTests.
 fn tiny_png() -> Vec<u8> {
     vec![
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
-        0xCF, 0xC0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xFE, 0xD4, 0xEF, 0x00, 0x00,
-        0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60,
+        0x60, 0x60, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0xF6, 0x17, 0x38, 0x55, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ]
 }
 
@@ -325,6 +325,77 @@ async fn republish_does_not_duplicate_transfer_to_attached_client() {
             "deduped publish must not re-announce metadata"
         );
     }
+
+    shutdown.cancel();
+    let _ = server_task.await;
+}
+
+#[tokio::test]
+async fn oversized_for_client_ceiling_is_not_transferred() {
+    let session = Arc::new(Session::new("resource-client-limit"));
+    let png = tiny_png();
+    session.publish_resource(&png).expect("publish");
+
+    let (client, server) = duplex(1024 * 1024);
+    let shutdown = CancellationToken::new();
+    let shutdown_server = shutdown.clone();
+    let session_server = Arc::clone(&session);
+    let server_task = tokio::spawn(async move {
+        let _ = handle_connection(server, session_server, shutdown_server).await;
+    });
+
+    let (read_half, write_half) = tokio::io::split(client);
+    let mut framed_read = FramedRead::new(read_half, SruiCodec::new());
+    let mut framed_write = FramedWrite::new(write_half, SruiCodec::new());
+
+    // Advertise a ceiling below the published PNG so the server must skip transfer (§15, §26).
+    let hello = SruiMessage {
+        msg: Some(srui_message::Msg::ClientHello(srui_protocol::ClientHello {
+            core_version: "0.4.0".into(),
+            profiles: vec!["org.srui.standard-widgets/1".into()],
+            limits: Some(srui_protocol::ClientLimits {
+                max_frame_size: 0,
+                max_transaction_operations: 0,
+                max_tree_depth: 0,
+                max_node_count: 0,
+                max_string_length: 0,
+                max_resource_size: 8,
+            }),
+            client_instance_id: vec![9, 9, 9],
+            client_metadata: Default::default(),
+        })),
+    };
+    framed_write.send(hello).await.expect("send hello");
+    let welcome = timeout(Duration::from_secs(2), framed_read.next())
+        .await
+        .expect("welcome timeout")
+        .expect("welcome eof")
+        .expect("welcome frame");
+    match welcome.msg {
+        Some(srui_message::Msg::ServerWelcome(w)) => {
+            let limits = w.limits.expect("welcome limits");
+            assert_eq!(limits.max_resource_size, 8);
+        }
+        other => panic!("expected welcome, got {other:?}"),
+    }
+
+    let mut saw_resource = false;
+    for _ in 0..20 {
+        if let Ok(Some(Ok(msg))) = timeout(Duration::from_millis(50), framed_read.next()).await {
+            match msg.msg {
+                Some(srui_message::Msg::ResourceMetadata(_))
+                | Some(srui_message::Msg::ResourceChunk(_)) => {
+                    saw_resource = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        !saw_resource,
+        "resources above the negotiated client ceiling must not be transferred"
+    );
 
     shutdown.cancel();
     let _ = server_task.await;

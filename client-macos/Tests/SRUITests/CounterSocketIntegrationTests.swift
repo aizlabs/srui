@@ -202,12 +202,14 @@ struct CounterSocketIntegrationTests {
         let counterBinary = repoRoot
             .appendingPathComponent("examples/counter/target/debug/counter")
 
-        guard FileManager.default.fileExists(atPath: counterBinary.path) else {
-            return
-        }
-        guard Self.counterSupportsImageFixture(counterBinary) else {
-            return
-        }
+        try #require(
+            FileManager.default.fileExists(atPath: counterBinary.path),
+            "counter debug binary missing; build examples/counter first"
+        )
+        try #require(
+            Self.counterSupportsImageFixture(counterBinary),
+            "counter binary lacks --image-fixture; rebuild examples/counter"
+        )
 
         let server = Process()
         server.executableURL = counterBinary
@@ -276,12 +278,14 @@ struct CounterSocketIntegrationTests {
         let counterBinary = repoRoot
             .appendingPathComponent("examples/counter/target/debug/counter")
 
-        guard FileManager.default.fileExists(atPath: counterBinary.path) else {
-            return
-        }
-        guard Self.counterSupportsImageFixture(counterBinary) else {
-            return
-        }
+        try #require(
+            FileManager.default.fileExists(atPath: counterBinary.path),
+            "counter debug binary missing; build examples/counter first"
+        )
+        try #require(
+            Self.counterSupportsImageFixture(counterBinary),
+            "counter binary lacks --image-fixture; rebuild examples/counter"
+        )
 
         let server = Process()
         server.executableURL = counterBinary
@@ -352,7 +356,10 @@ struct CounterSocketIntegrationTests {
             .deletingLastPathComponent()
     }
 
-    /// Soft-detects whether the counter binary advertises `--image-fixture`.
+    /// Detects whether the counter binary advertises `--image-fixture` via `strings`.
+    ///
+    /// Returns `false` when the flag is absent or when `strings` cannot run — callers should
+    /// `#require` the result rather than soft-passing.
     private static func counterSupportsImageFixture(_ binary: URL) -> Bool {
         // The counter binary has no `--help`; scan its strings for the flag name.
         let process = Process()
@@ -368,9 +375,8 @@ struct CounterSocketIntegrationTests {
             let text = String(data: data, encoding: .utf8) ?? ""
             return text.contains("image-fixture")
         } catch {
-            // If `strings` is unavailable, attempt the fixture path and let the
-            // pending-hash wait soft-skip below.
-            return true
+            // Fail closed: do not claim fixture support when we cannot verify it.
+            return false
         }
     }
 

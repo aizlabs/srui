@@ -520,6 +520,10 @@ impl Session {
 
     /// Subscribes to committed transactions for the specified `client_instance_id` (§20.2).
     ///
+    /// Holds [`SessionInner`] through subscribe + retained-resource seeding so a concurrent
+    /// [`Session::publish_resource`] cannot insert between the snapshot and the live
+    /// subscription (same invariant as handshake bootstrap).
+    ///
     /// Returns [`SessionError::OutboundClosed`] once [`Session::close_outbound`] has closed the hub.
     pub fn subscribe_transactions(
         &self,
@@ -528,13 +532,19 @@ impl Session {
         let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let max_ops = guard.limits.max_transaction_operations as usize;
         let max_frame_size = guard.limits.max_frame_size as usize;
+        let max_resource_size = guard.limits.max_resource_size as u64;
         let capacity = self.outbound_queue_capacity;
         let retained = guard.resources.retained_entries();
-        drop(guard);
-        let receiver =
-            self.outbound_hub
-                .subscribe(client_instance_id, capacity, max_ops, max_frame_size)?;
+        // SessionInner -> OutboundHub: do not drop `guard` until after seed_resources.
+        let receiver = self.outbound_hub.subscribe(
+            client_instance_id,
+            capacity,
+            max_ops,
+            max_frame_size,
+            max_resource_size,
+        )?;
         self.outbound_hub.seed_resources(&receiver, &retained);
+        drop(guard);
         Ok(receiver)
     }
 

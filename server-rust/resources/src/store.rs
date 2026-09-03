@@ -154,20 +154,32 @@ impl ResourceStore {
             });
         }
 
-        if self.entries.len() >= self.limits.max_entries {
-            return Err(ResourceError::EntryLimitExceeded {
-                limit: self.limits.max_entries,
-            });
+        // Evict oldest retained entries until the new payload fits. Hitting the ceiling is not a
+        // permanent hard failure for long-lived sessions that publish many distinct images (§14).
+        while self.entries.len() >= self.limits.max_entries {
+            if !self.evict_oldest() {
+                return Err(ResourceError::EntryLimitExceeded {
+                    limit: self.limits.max_entries,
+                });
+            }
         }
-        let next_total = self.total_bytes.checked_add(slice.len()).ok_or(
+
+        let mut next_total = self.total_bytes.checked_add(slice.len()).ok_or(
             ResourceError::TotalBytesLimitExceeded {
                 limit: self.limits.max_total_bytes,
             },
         )?;
-        if next_total > self.limits.max_total_bytes {
-            return Err(ResourceError::TotalBytesLimitExceeded {
-                limit: self.limits.max_total_bytes,
-            });
+        while next_total > self.limits.max_total_bytes {
+            if !self.evict_oldest() {
+                return Err(ResourceError::TotalBytesLimitExceeded {
+                    limit: self.limits.max_total_bytes,
+                });
+            }
+            next_total = self.total_bytes.checked_add(slice.len()).ok_or(
+                ResourceError::TotalBytesLimitExceeded {
+                    limit: self.limits.max_total_bytes,
+                },
+            )?;
         }
 
         let owned: Arc<[u8]> = Arc::from(slice.to_vec().into_boxed_slice());
@@ -185,6 +197,18 @@ impl ResourceStore {
             inserted: true,
             entry,
         })
+    }
+
+    /// Removes the oldest retained entry (insertion order). Returns `false` when empty.
+    fn evict_oldest(&mut self) -> bool {
+        let Some(oldest) = self.order.first().copied() else {
+            return false;
+        };
+        self.order.remove(0);
+        if let Some(entry) = self.entries.remove(&oldest) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
+        }
+        true
     }
 
     /// Looks up a retained resource by hash.

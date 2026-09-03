@@ -96,6 +96,8 @@ struct SubscriberState {
     capacity: usize,
     max_ops: usize,
     max_frame_size: usize,
+    /// Negotiated per-connection encoded resource ceiling from ClientHello (§15, §26).
+    max_resource_size: u64,
     items: VecDeque<Transaction>,
     /// Domain form of `items.back()`, the only item absorption can still merge into.
     ///
@@ -104,10 +106,17 @@ struct SubscriberState {
     tail_domain: Option<DomainTxn>,
     /// Low-priority resource transfer cursor for this connection (§14, §19.2).
     resources: resource::ResourceTransferQueue,
+    /// Consecutive transaction frames emitted since the last resource frame; used for aging so
+    /// continuous UI traffic cannot starve resource progress indefinitely (§19.2).
+    transactions_since_resource: usize,
     peak_depth: usize,
     stale_reason: Option<String>,
     is_closed: bool,
 }
+
+/// Emit one resource frame after this many consecutive transaction pops while resources remain
+/// queued. Keeps UI latency low without absolute resource starvation under continuous updates.
+const RESOURCE_AGING_EVERY: usize = 8;
 
 impl SubscriberState {
     /// Returns `true` if an unsent tail exists that absorption could still merge into.
@@ -124,17 +133,53 @@ impl SubscriberState {
         Some(item)
     }
 
-    /// Two-class selector: transactions always precede a single resource frame (§19.2).
-    fn pop_item(&mut self) -> Option<OutboundItem> {
-        if let Some(tx) = self.pop_transaction() {
-            return Some(OutboundItem::Transaction(tx));
+    /// Enqueues `entry` when it fits this subscriber's negotiated resource ceiling (§15, §26).
+    fn maybe_enqueue_resource(&mut self, entry: ResourceEntry) {
+        if entry.encoded_length > self.max_resource_size {
+            tracing::debug!(
+                hash = %entry.hash,
+                encoded_length = entry.encoded_length,
+                max_resource_size = self.max_resource_size,
+                "skipping resource transfer above negotiated client ceiling"
+            );
+            return;
         }
+        self.resources.enqueue(entry);
+    }
+
+    /// Two-class selector with aging: transactions usually precede one resource frame, but after
+    /// [`RESOURCE_AGING_EVERY`] consecutive transaction pops a pending resource frame is emitted
+    /// so continuous UI traffic cannot starve transfer progress (§19.2).
+    fn pop_item(&mut self) -> Option<OutboundItem> {
+        let force_resource =
+            self.transactions_since_resource >= RESOURCE_AGING_EVERY && self.resources.has_work();
+
+        if !force_resource {
+            if let Some(tx) = self.pop_transaction() {
+                self.transactions_since_resource =
+                    self.transactions_since_resource.saturating_add(1);
+                return Some(OutboundItem::Transaction(tx));
+            }
+        }
+
         match self.resources.pop_frame() {
             Some(ResourceOutboundFrame::Metadata(meta)) => {
+                self.transactions_since_resource = 0;
                 Some(OutboundItem::ResourceMetadata(meta))
             }
-            Some(ResourceOutboundFrame::Chunk(chunk)) => Some(OutboundItem::ResourceChunk(chunk)),
-            None => None,
+            Some(ResourceOutboundFrame::Chunk(chunk)) => {
+                self.transactions_since_resource = 0;
+                Some(OutboundItem::ResourceChunk(chunk))
+            }
+            None => {
+                // Forced path had no resource work; fall through to any pending transaction.
+                if let Some(tx) = self.pop_transaction() {
+                    self.transactions_since_resource =
+                        self.transactions_since_resource.saturating_add(1);
+                    return Some(OutboundItem::Transaction(tx));
+                }
+                None
+            }
         }
     }
 
@@ -142,6 +187,7 @@ impl SubscriberState {
         self.items.clear();
         self.tail_domain = None;
         self.resources.clear();
+        self.transactions_since_resource = 0;
     }
 
     /// Enqueues `tx`, or merges it into the unsent tail when `incoming_domain` allows coalescing.
@@ -401,6 +447,7 @@ impl OutboundHub {
         capacity: usize,
         max_ops: usize,
         max_frame_size: usize,
+        max_resource_size: u64,
     ) -> Result<OutboundReceiver, SessionError> {
         if capacity == 0 {
             return Err(SessionError::InvalidConfiguration(
@@ -417,9 +464,11 @@ impl OutboundHub {
             capacity,
             max_ops,
             max_frame_size,
+            max_resource_size,
             items: VecDeque::with_capacity(capacity),
             tail_domain: None,
             resources: resource::ResourceTransferQueue::default(),
+            transactions_since_resource: 0,
             peak_depth: 0,
             stale_reason: None,
             is_closed: false,
@@ -525,7 +574,7 @@ impl OutboundHub {
                 if guard.is_closed {
                     true
                 } else {
-                    guard.resources.enqueue(entry.clone());
+                    guard.maybe_enqueue_resource(entry.clone());
                     let _ = sub.notify_tx.try_send(());
                     false
                 }
@@ -543,28 +592,32 @@ impl OutboundHub {
     ///
     /// Called while the session lock is held, immediately after [`OutboundHub::subscribe`], so a
     /// resource published between snapshot creation and live subscription cannot be missed.
+    ///
+    /// Task 26 has no client "already have hash" signal, so retained resources are re-queued on
+    /// every attach; sharing a client `ResourceCache` across controller generations makes the
+    /// duplicate decode path cheap.
     pub fn seed_resources(&self, receiver: &OutboundReceiver, entries: &[ResourceEntry]) {
         if entries.is_empty() {
             return;
         }
-        let mut guard = lock_or_recover(&receiver.state);
-        if guard.is_closed {
-            return;
-        }
-        for entry in entries {
-            guard.resources.enqueue(entry.clone());
-        }
-        drop(guard);
-        // Wake the connection even if it has not entered recv yet; notify capacity may be full
-        // when transactions already queued notifications, which is fine — try_recv/recv drain.
-        let _ = receiver; // state already updated; notify via matching subscriber below
+        // Lock order: subscribers -> SubscriberState (never state first).
         let subs = lock_or_recover(&self.subscribers);
-        for sub in subs.iter() {
-            if Arc::ptr_eq(&sub.state, &receiver.state) {
-                let _ = sub.notify_tx.try_send(());
-                break;
+        let Some(sub) = subs
+            .iter()
+            .find(|sub| Arc::ptr_eq(&sub.state, &receiver.state))
+        else {
+            return;
+        };
+        {
+            let mut guard = lock_or_recover(&sub.state);
+            if guard.is_closed {
+                return;
+            }
+            for entry in entries {
+                guard.maybe_enqueue_resource(entry.clone());
             }
         }
+        let _ = sub.notify_tx.try_send(());
     }
 
     pub fn is_client_stale(&self, client_instance_id: &[u8]) -> bool {
@@ -690,7 +743,7 @@ mod tests {
     fn test_scalar_coalescing_retains_latest_value_and_revision_span() {
         let hub = OutboundHub::new();
         let mut rx = hub
-            .subscribe(vec![1], 4, 10, 1024 * 1024)
+            .subscribe(vec![1], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("subscribe");
 
         let tx1 = make_scalar_tx(0, 1, 10, 1, "v1");
@@ -729,7 +782,7 @@ mod tests {
     fn test_structural_transaction_acts_as_barrier() {
         let hub = OutboundHub::new();
         let mut rx = hub
-            .subscribe(vec![1], 4, 10, 1024 * 1024)
+            .subscribe(vec![1], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("subscribe");
 
         let tx1 = make_scalar_tx(0, 1, 10, 1, "v1");
@@ -791,7 +844,7 @@ mod tests {
 
         let hub = OutboundHub::new();
         let mut rx = hub
-            .subscribe(vec![8, 8], 4, 10, max_frame_size)
+            .subscribe(vec![8, 8], 4, 10, max_frame_size, 50 * 1024 * 1024)
             .expect("subscribe");
 
         hub.publish(&tx1);
@@ -816,7 +869,7 @@ mod tests {
     fn test_overflow_discards_backlog_and_marks_stale() {
         let hub = OutboundHub::new();
         let mut rx = hub
-            .subscribe(vec![7, 7], 2, 10, 1024 * 1024)
+            .subscribe(vec![7, 7], 2, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("subscribe");
 
         let b1 = make_create_node_tx(0, 1, 1);
@@ -868,7 +921,7 @@ mod tests {
 
         let hub = OutboundHub::new();
         let rx = hub
-            .subscribe(vec![3], 4, 10, 1024 * 1024)
+            .subscribe(vec![3], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("subscribe");
 
         let observer = Arc::new(ObservingWaker {
@@ -900,8 +953,14 @@ mod tests {
         let mut receivers = Vec::with_capacity(client_count);
         for i in 0..client_count {
             receivers.push(
-                hub.subscribe(i.to_be_bytes().to_vec(), 1, 10, 1024 * 1024)
-                    .expect("subscribe"),
+                hub.subscribe(
+                    i.to_be_bytes().to_vec(),
+                    1,
+                    10,
+                    1024 * 1024,
+                    50 * 1024 * 1024,
+                )
+                .expect("subscribe"),
             );
         }
 
@@ -924,7 +983,7 @@ mod tests {
         let mut receivers = Vec::new();
         for i in 0..8u8 {
             receivers.push(
-                hub.subscribe(vec![i], 4, 10, 1024 * 1024)
+                hub.subscribe(vec![i], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
                     .expect("subscribe"),
             );
         }
@@ -950,7 +1009,7 @@ mod tests {
     fn test_hub_survives_poisoned_locks() {
         let hub = OutboundHub::new();
         let mut rx = hub
-            .subscribe(vec![5], 4, 10, 1024 * 1024)
+            .subscribe(vec![5], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("subscribe");
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -974,7 +1033,7 @@ mod tests {
         );
         assert!(!hub.is_client_stale(&[5]));
         let _second = hub
-            .subscribe(vec![6], 4, 10, 1024 * 1024)
+            .subscribe(vec![6], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("subscribe must still work after a poisoned lock");
     }
 
@@ -985,13 +1044,13 @@ mod tests {
         let hub = OutboundHub::new();
         for _ in 0..5 {
             let rx = hub
-                .subscribe(vec![1], 4, 10, 1024 * 1024)
+                .subscribe(vec![1], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
                 .expect("subscribe");
             drop(rx);
         }
 
         let _live = hub
-            .subscribe(vec![2], 4, 10, 1024 * 1024)
+            .subscribe(vec![2], 4, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("subscribe");
 
         assert_eq!(
@@ -1007,7 +1066,7 @@ mod tests {
     fn test_subscribe_accepts_empty_client_instance_id() {
         let hub = OutboundHub::new();
         let mut rx = hub
-            .subscribe(Vec::new(), 4, 10, 1024 * 1024)
+            .subscribe(Vec::new(), 4, 10, 1024 * 1024, 50 * 1024 * 1024)
             .expect("empty client_instance_id is the proto3 default, not a handshake failure");
 
         let tx = make_create_node_tx(0, 1, 1);

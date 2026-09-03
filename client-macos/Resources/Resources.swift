@@ -10,7 +10,8 @@
 // - §19.2 Priority classes: chunk payloads are bounded (≤32 KiB) so resource traffic can interleave
 //   with UI/control frames.
 // - §26 Attack-surface controls: encoded size, decoded axis/total pixels, concurrent assemblies,
-//   and in-flight byte budgets; ImageIO decoding runs off the main actor.
+//   in-flight byte budgets, and bounded committed CAS (entry + decoded-byte ceilings); ImageIO
+//   decoding runs off the main actor.
 //
 // Platform note: ImageIO + CoreGraphics only. AppKit conversion belongs in RendererAppKit.
 // SemanticModel must never import AppKit — this target imports neither AppKit nor Cocoa.
@@ -38,6 +39,10 @@ public struct ResourceLimits: Sendable, Equatable {
     public var maxConcurrentAssemblies: Int
     /// Maximum aggregate encoded bytes across all in-flight assemblies.
     public var maxInFlightBytes: Int
+    /// Maximum number of committed decoded images retained in the CAS.
+    public var maxCommittedEntries: Int
+    /// Maximum aggregate decoded RGBA bytes (`width × height × 4`) across committed images.
+    public var maxCommittedDecodedBytes: Int
 
     public init(
         maxEncodedBytes: Int = 50 * 1024 * 1024,
@@ -45,7 +50,9 @@ public struct ResourceLimits: Sendable, Equatable {
         maxTotalPixels: Int = 100_000_000,
         maxChunkBytes: Int = 32 * 1024,
         maxConcurrentAssemblies: Int = 16,
-        maxInFlightBytes: Int = 64 * 1024 * 1024
+        maxInFlightBytes: Int = 64 * 1024 * 1024,
+        maxCommittedEntries: Int = 64,
+        maxCommittedDecodedBytes: Int = 256 * 1024 * 1024
     ) {
         self.maxEncodedBytes = maxEncodedBytes
         self.maxAxisPixels = maxAxisPixels
@@ -53,6 +60,8 @@ public struct ResourceLimits: Sendable, Equatable {
         self.maxChunkBytes = maxChunkBytes
         self.maxConcurrentAssemblies = maxConcurrentAssemblies
         self.maxInFlightBytes = maxInFlightBytes
+        self.maxCommittedEntries = maxCommittedEntries
+        self.maxCommittedDecodedBytes = maxCommittedDecodedBytes
     }
 }
 
@@ -185,10 +194,17 @@ public struct ResourceCommit: Sendable {
     public let image: ValidatedDecodedImage
     /// `true` when this ingest finalized a new assembly; `false` when the hash was already committed.
     public let newlyCommitted: Bool
+    /// Hashes evicted from the committed CAS to stay within retained bounds (§26).
+    public let evictedHashes: [ResourceHash]
 
-    public init(image: ValidatedDecodedImage, newlyCommitted: Bool) {
+    public init(
+        image: ValidatedDecodedImage,
+        newlyCommitted: Bool,
+        evictedHashes: [ResourceHash] = []
+    ) {
         self.image = image
         self.newlyCommitted = newlyCommitted
+        self.evictedHashes = evictedHashes
     }
 }
 
@@ -221,6 +237,9 @@ public actor ResourceCache {
     public nonisolated let limits: ResourceLimits
 
     private var committed: [ResourceHash: ValidatedDecodedImage] = [:]
+    /// Insertion order for LRU eviction of committed entries (§26).
+    private var committedOrder: [ResourceHash] = []
+    private var committedDecodedBytes: Int = 0
     private var partials: [ResourceHash: PartialAssembly] = [:]
     private var inFlightBytes: Int = 0
 
@@ -236,6 +255,11 @@ public actor ResourceCache {
     /// Looks up a committed decoded image. Partials are never visible.
     public func lookup(_ hash: ResourceHash) -> ValidatedDecodedImage? {
         committed[hash]
+    }
+
+    /// Number of committed CAS entries (tests / diagnostics).
+    public func committedCount() -> Int {
+        committed.count
     }
 
     /// Discards all in-flight assemblies while retaining the committed CAS (§14, §18).
@@ -420,8 +444,64 @@ public actor ResourceCache {
             encodedLength: metadata.encodedLength,
             cgImage: cgImage
         )
-        committed[hash] = validated
-        return ResourceCommit(image: validated, newlyCommitted: true)
+        let evicted = insertCommitted(validated)
+        return ResourceCommit(image: validated, newlyCommitted: true, evictedHashes: evicted)
+    }
+
+    /// Inserts into the committed CAS, evicting oldest entries to honor committed bounds (§26).
+    private func insertCommitted(_ image: ValidatedDecodedImage) -> [ResourceHash] {
+        if committed[image.hash] != nil {
+            // Already retained (idempotent finalize); touch order.
+            if let idx = committedOrder.firstIndex(of: image.hash) {
+                committedOrder.remove(at: idx)
+                committedOrder.append(image.hash)
+            }
+            return []
+        }
+
+        var evicted: [ResourceHash] = []
+        let decodedBytes = Self.estimatedDecodedBytes(
+            width: image.pixelWidth,
+            height: image.pixelHeight
+        )
+
+        while committed.count >= limits.maxCommittedEntries {
+            guard let oldest = evictOldestCommitted() else { break }
+            evicted.append(oldest)
+        }
+        while committedDecodedBytes + decodedBytes > limits.maxCommittedDecodedBytes {
+            guard !committed.isEmpty else { break }
+            guard let oldest = evictOldestCommitted() else { break }
+            evicted.append(oldest)
+        }
+
+        committed[image.hash] = image
+        committedOrder.append(image.hash)
+        committedDecodedBytes += decodedBytes
+        return evicted
+    }
+
+    private func evictOldestCommitted() -> ResourceHash? {
+        guard let oldest = committedOrder.first else { return nil }
+        committedOrder.removeFirst()
+        if let removed = committed.removeValue(forKey: oldest) {
+            committedDecodedBytes = max(
+                0,
+                committedDecodedBytes - Self.estimatedDecodedBytes(
+                    width: removed.pixelWidth,
+                    height: removed.pixelHeight
+                )
+            )
+        }
+        return oldest
+    }
+
+    private static func estimatedDecodedBytes(width: Int, height: Int) -> Int {
+        let pixels = width.multipliedReportingOverflow(by: height)
+        if pixels.overflow { return Int.max / 4 }
+        let bytes = pixels.partialValue.multipliedReportingOverflow(by: 4)
+        if bytes.overflow { return Int.max }
+        return bytes.partialValue
     }
 
     private func decodeRasterImage(bytes: Data, mediaType: String) throws -> CGImage {

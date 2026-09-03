@@ -411,9 +411,14 @@ impl Session {
         }
     }
 
-    /// Publishes immutable `bytes` into the session resource CAS (§14).
+    /// Publishes immutable `bytes` into this in-process session resource CAS (§14).
     ///
     /// Returns the canonical [`ResourceHash`]. Identical content is deduplicated.
+    ///
+    /// This SDK session has no network outbound path: published bytes are retained locally
+    /// for in-process lookup only. Live delivery to attached clients requires
+    /// [`srui_sessiond::Session::publish_resource`] (or an equivalent runtime that owns an
+    /// outbound hub). Prefer that API when serving remote renderers.
     pub fn publish_resource(&self, bytes: impl AsRef<[u8]>) -> Result<PublishOutcome, SdkError> {
         let mut guard = self.inner.lock().map_err(|_| SdkError::LockPoisoned)?;
         Ok(guard.resources.publish_resource(bytes)?)

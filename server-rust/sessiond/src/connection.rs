@@ -304,14 +304,13 @@ where
     // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
     // -------------------------------------------------------------------------
     //
-    // Incoming control/input is preferred over outbound delivery so a client event
-    // is not delayed behind resource chunk selection. Within outbound selection,
-    // transactions always precede a single resource metadata/chunk frame (§19.2).
+    // Fair select: a pipelined burst of inbound events must not starve outbound
+    // delivery (bounded queue → LaggedResyncRequired). Within outbound selection,
+    // transactions usually precede one resource frame, with aging so continuous UI
+    // traffic cannot starve resource progress entirely (§19.2).
 
     loop {
         tokio::select! {
-            biased;
-
             // Cancel-safe incoming message receiver (async-cancel-safety)
             incoming = framed_read.next() => {
                 match incoming {

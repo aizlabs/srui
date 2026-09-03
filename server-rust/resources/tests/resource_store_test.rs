@@ -95,28 +95,32 @@ fn exact_limit_accepted_over_limit_rejected_before_store() {
 }
 
 #[test]
-fn entry_and_total_byte_limits_are_enforced() {
+fn entry_and_total_byte_limits_evict_oldest() {
     let limits = ResourceLimits {
         max_resource_bytes: 16,
         max_entries: 2,
         max_total_bytes: 20,
     };
     let mut store = ResourceStore::with_limits(limits);
-    store.publish_resource(b"one").unwrap();
+    let first = store.publish_resource(b"one").unwrap().hash;
     store.publish_resource(b"two-bytes!!").unwrap(); // 11 bytes; total 14
     assert_eq!(store.len(), 2);
 
-    match store.publish_resource(b"three") {
-        Err(ResourceError::EntryLimitExceeded { limit }) => assert_eq!(limit, 2),
-        other => panic!("expected EntryLimitExceeded, got {other:?}"),
-    }
+    // Third distinct entry evicts the oldest rather than permanently failing.
+    let third = store.publish_resource(b"three").unwrap();
+    assert!(third.inserted);
+    assert_eq!(store.len(), 2);
+    assert!(!store.contains(&first));
+    assert!(store.contains(&third.hash));
 
     let mut store = ResourceStore::with_limits(limits);
-    store.publish_resource(vec![1u8; 12]).unwrap();
-    match store.publish_resource(vec![2u8; 12]) {
-        Err(ResourceError::TotalBytesLimitExceeded { limit }) => assert_eq!(limit, 20),
-        other => panic!("expected TotalBytesLimitExceeded, got {other:?}"),
-    }
+    let oversized_first = store.publish_resource(vec![1u8; 12]).unwrap().hash;
+    let second = store.publish_resource(vec![2u8; 12]).unwrap();
+    assert!(second.inserted);
+    assert_eq!(store.len(), 1);
+    assert!(!store.contains(&oversized_first));
+    assert!(store.contains(&second.hash));
+    assert_eq!(store.total_bytes(), 12);
 }
 
 #[test]

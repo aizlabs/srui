@@ -303,4 +303,63 @@ struct ResourceCacheTests {
             )
         }
     }
+
+    @Test
+    func committedCacheEvictsOldestWhenEntryLimitExceeded() async throws {
+        let cache = ResourceCache(
+            limits: ResourceLimits(maxCommittedEntries: 1, maxCommittedDecodedBytes: 1_048_576)
+        )
+        let hash = try FixturePNG.hash()
+        let meta = ResourceMetadataInput(
+            resourceHash: hash,
+            mediaType: "image/png",
+            encodedLength: UInt64(FixturePNG.bytes.count),
+            decodedWidth: 1,
+            decodedHeight: 1,
+            priority: .normal
+        )
+        _ = try await cache.ingestMetadata(meta)
+        let first = try #require(
+            try await cache.ingestChunk(
+                ResourceChunkInput(resourceHash: hash, byteOffset: 0, data: FixturePNG.data)
+            )
+        )
+        #expect(first.newlyCommitted)
+        #expect(first.evictedHashes.isEmpty)
+        #expect(await cache.committedCount() == 1)
+
+        // Distinct valid 1×1 green RGB PNG (different IDAT → different SHA-256).
+        let secondBytes: [UInt8] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xDA, 0x63, 0x60, 0xF8, 0xCF, 0x00, 0x00, 0x02, 0x02, 0x01, 0x00, 0x45, 0xF4, 0x52,
+            0xD4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ]
+        let secondData = Data(secondBytes)
+        let secondDigest = SHA256.hash(data: secondData)
+        let secondHash = try ResourceHash(rawBytes: Array(secondDigest))
+        #expect(secondHash != hash)
+
+        _ = try await cache.ingestMetadata(
+            ResourceMetadataInput(
+                resourceHash: secondHash,
+                mediaType: "image/png",
+                encodedLength: UInt64(secondBytes.count),
+                decodedWidth: 1,
+                decodedHeight: 1,
+                priority: .normal
+            )
+        )
+        let second = try #require(
+            try await cache.ingestChunk(
+                ResourceChunkInput(resourceHash: secondHash, byteOffset: 0, data: secondData)
+            )
+        )
+        #expect(second.newlyCommitted)
+        #expect(second.evictedHashes == [hash])
+        #expect(await cache.contains(secondHash))
+        #expect(await cache.contains(hash) == false)
+        #expect(await cache.committedCount() == 1)
+    }
 }

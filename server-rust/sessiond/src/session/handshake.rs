@@ -11,8 +11,8 @@
 
 use crate::outbound::OutboundReceiver;
 use srui_protocol::{
-    ClientHello, ClientResume, ExtensionNamespaceMapping, ServerResumeOk, ServerResyncRequired,
-    ServerWelcome, SessionContinuity, Transaction,
+    ClientHello, ClientLimits, ClientResume, ExtensionNamespaceMapping, ServerResumeOk,
+    ServerResyncRequired, ServerWelcome, SessionContinuity, Transaction,
 };
 use srui_semantic_tree::{CapabilitySet, Profile, SemanticStore};
 
@@ -102,6 +102,10 @@ fn negotiate_hello(
     let _negotiated = inner.capabilities.negotiate(&client_caps)?;
 
     let initial_revision = inner.store.revision().get();
+    // Advertise the effective (server ∩ client) resource ceiling so peers agree on §15/§26 limits.
+    let mut limits = inner.limits;
+    limits.max_resource_size =
+        negotiated_max_resource_size(inner.limits.max_resource_size, hello.limits.as_ref()) as u32;
     let welcome = ServerWelcome {
         core_version: CORE_VERSION.to_string(),
         required_profiles: inner.capabilities.required.to_string_vec(),
@@ -112,7 +116,7 @@ fn negotiate_hello(
             extension_uri: "org.srui.standard-widgets".to_string(),
             namespace_id: 0,
         }],
-        limits: Some(inner.limits),
+        limits: Some(limits),
     };
 
     let store_clone = if initial_revision > 0 {
@@ -122,6 +126,21 @@ fn negotiate_hello(
     };
 
     Ok((welcome, store_clone))
+}
+
+/// Intersects the client's advertised `max_resource_size` with the server ceiling (§15, §26).
+///
+/// A missing or zero client value means "no client preference" and keeps the server default.
+fn negotiated_max_resource_size(server: u32, client_limits: Option<&ClientLimits>) -> u64 {
+    let server = u64::from(server);
+    let client = client_limits
+        .map(|limits| u64::from(limits.max_resource_size))
+        .unwrap_or(0);
+    if client == 0 {
+        server
+    } else {
+        server.min(client)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,15 +209,21 @@ impl Session {
 
         let max_ops = inner_guard.limits.max_transaction_operations as usize;
         let max_frame_size = inner_guard.limits.max_frame_size as usize;
+        let max_resource_size = negotiated_max_resource_size(
+            inner_guard.limits.max_resource_size,
+            hello.limits.as_ref(),
+        );
         let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
             hello.client_instance_id.clone(),
             self.outbound_queue_capacity,
             max_ops,
             max_frame_size,
+            max_resource_size,
         )?;
         // Seed while still holding SessionInner so a resource published between snapshot
         // creation and live subscription cannot be missed (SessionInner -> OutboundHub order).
+        // Task 26 re-sends the retained CAS on every attach (no client known-hash protocol yet).
         self.outbound_hub
             .seed_resources(&transactions, &retained_resources);
         drop(inner_guard);
@@ -309,13 +334,19 @@ impl Session {
 
         let max_ops = inner_guard.limits.max_transaction_operations as usize;
         let max_frame_size = inner_guard.limits.max_frame_size as usize;
+        // ClientResume carries no limits; use the server ceiling until a known-hash / renegotiate
+        // path exists (Task 26).
+        let max_resource_size = u64::from(inner_guard.limits.max_resource_size);
         let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
             resume.client_instance_id.clone(),
             self.outbound_queue_capacity,
             max_ops,
             max_frame_size,
+            max_resource_size,
         )?;
+        // Re-seed retained resources on resume; clients should share one ResourceCache across
+        // controller generations so duplicate transfers stay cheap (§14, §18).
         self.outbound_hub
             .seed_resources(&transactions, &retained_resources);
         drop(inner_guard);

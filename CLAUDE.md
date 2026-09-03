@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 SRUI (Semantic Remote UI) replicates application UI *meaning* and authoritative state to a native local renderer instead of streaming pixels. The server owns the semantic tree; the client applies atomic transactions and renders with the platform toolkit (AppKit today).
 
-`SRUI_Semantic_Remote_UI_Design_v0.4.md` (repo root, 2149 lines) is the **authoritative specification**. Code, docs, and tests cite it by section (`§12.1`, `§26`, …), and those citations are load-bearing: when changing behavior, find the cited section first and keep the citation accurate. `spec/*.md` are mostly stubs pointing back to the design doc; `spec/registries.md` and `protocol/README.md` have real content.
+`SRUI_Semantic_Remote_UI_Design_v0.6.md` (repo root, 2370 lines) is the **authoritative specification**. Code, docs, and tests cite it by section (`§12.1`, `§26`, …), and those citations are load-bearing: when changing behavior, find the cited section first and keep the citation accurate. `spec/*.md` are mostly stubs pointing back to the design doc; `spec/registries.md` and `protocol/README.md` have real content.
 
 ## Build, test, lint
 

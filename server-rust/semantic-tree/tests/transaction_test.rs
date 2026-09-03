@@ -1,8 +1,9 @@
 //! Integration tests for SemanticStore transactions and atomic revisions (§12, §12.1, §12.2, §26).
 
 use srui_semantic_tree::{
-    NodeId, Operation, PropertyRef, Revision, SemanticStore, StoreError, StoreLimits, Transaction,
-    TxnError, TypeRef, Value,
+    AuthoritativeCommit, CoalescedScalarDelta, DeliveredTransaction, NodeId, Operation,
+    PropertyRef, Revision, SemanticStore, StoreError, StoreLimits, Transaction, TxnError, TypeRef,
+    Value,
 };
 
 #[test]
@@ -321,8 +322,10 @@ fn test_transaction_record_with_invalid_new_revision_rejected() {
     assert!(store.is_empty());
 }
 
+/// A coalesced scalar span is a *delivery* form: a replica applies it and advances several
+/// revisions at once, while the authoritative entry points refuse it (§12.1, §20.4).
 #[test]
-fn test_coalesceable_forward_span_applies_and_advances_revision() {
+fn test_coalesced_scalar_delta_applies_to_replica_but_not_authoritative_path() {
     let mut store = SemanticStore::new();
     let root_id = NodeId::new(1);
 
@@ -341,7 +344,7 @@ fn test_coalesceable_forward_span_applies_and_advances_revision() {
         .expect("initial setup");
     assert_eq!(store.revision(), Revision::new(1));
 
-    // Rev 1 -> 5: Multi-revision forward span with scalar SetProperty (§12.1, §20.2)
+    // Rev 1 -> 5: coalesced run of scalar updates (§12.1 delivery forms, §20.4)
     let span_txn = Transaction::with_revisions(
         Revision::new(1),
         Revision::new(5),
@@ -352,9 +355,27 @@ fn test_coalesceable_forward_span_applies_and_advances_revision() {
         }],
         0,
     );
-    let committed = store
+
+    let err = store
         .apply_transaction_record(&span_txn)
-        .expect("coalesced span must apply");
+        .expect_err("the authoritative path must advance exactly one revision");
+    assert_eq!(
+        err,
+        TxnError::InvalidNewRevision {
+            expected: Revision::new(2),
+            actual: Revision::new(5),
+        }
+    );
+    assert_eq!(
+        store.revision(),
+        Revision::new(1),
+        "a refused commit must leave the store on its committed revision"
+    );
+
+    let delta = CoalescedScalarDelta::try_from(span_txn).expect("scalar span is a valid delta");
+    let committed = store
+        .apply_coalesced_delta(&delta)
+        .expect("a replica must accept a coalesced scalar delta");
     assert_eq!(committed, Revision::new(5));
     assert_eq!(store.revision(), Revision::new(5));
     assert_eq!(
@@ -366,10 +387,84 @@ fn test_coalesceable_forward_span_applies_and_advances_revision() {
     );
 }
 
+/// A structural operation is a coalescing barrier: it may never ride inside a multi-revision
+/// delivery span, on either the authoritative or the replica path (§20.4).
 #[test]
-fn test_transaction_try_absorb_semantics_and_limits() {
+fn test_structural_span_is_refused_as_a_delta() {
+    let structural_span = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(5),
+        vec![Operation::create_node(
+            NodeId::new(2),
+            TypeRef::SURFACE,
+            None,
+            None,
+            [],
+        )],
+        0,
+    );
+
+    let err = CoalescedScalarDelta::try_from(structural_span)
+        .expect_err("a structural operation must not be coalesced across revisions");
+    assert_eq!(
+        err,
+        TxnError::InvalidNewRevision {
+            expected: Revision::new(2),
+            actual: Revision::new(5),
+        }
+    );
+}
+
+/// The delivered entry point classifies by shape and refuses anything that is neither form.
+#[test]
+fn test_delivered_transaction_classifies_commit_and_delta() {
+    let root_id = NodeId::new(1);
+
+    let commit = Transaction::new(
+        Revision::INITIAL,
+        vec![Operation::create_node(
+            root_id,
+            TypeRef::SURFACE,
+            None,
+            None,
+            [(PropertyRef::LABEL, Value::from("v0"))],
+        )],
+    );
+    assert!(matches!(
+        DeliveredTransaction::try_from(commit).expect("single-step frame"),
+        DeliveredTransaction::Commit(_)
+    ));
+
+    let delta = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(5),
+        vec![Operation::SetProperty {
+            id: root_id,
+            property: PropertyRef::LABEL,
+            value: Value::from("v5"),
+        }],
+        0,
+    );
+    assert!(matches!(
+        DeliveredTransaction::try_from(delta).expect("scalar span frame"),
+        DeliveredTransaction::Delta(_)
+    ));
+
+    let backwards = Transaction::with_revisions(Revision::new(5), Revision::new(2), vec![], 0);
+    assert!(
+        DeliveredTransaction::try_from(backwards).is_err(),
+        "a span that is neither form must be rejected rather than guessed at"
+    );
+}
+
+/// Performing the merge moved to the outbound queue that owns the policy
+/// (`srui_sessiond::outbound::coalesce`, where its semantics and §26 limits are tested). The model
+/// keeps only the predicate saying which transactions are eligible (§12.1, §20.4).
+#[test]
+fn test_is_coalesceable_admits_only_non_empty_scalar_property_runs() {
     let node_id = NodeId::new(10);
-    let mut t1 = Transaction::with_revisions(
+
+    let scalar = Transaction::with_revisions(
         Revision::new(1),
         Revision::new(2),
         vec![Operation::SetProperty {
@@ -379,41 +474,43 @@ fn test_transaction_try_absorb_semantics_and_limits() {
         }],
         0,
     );
+    assert!(scalar.is_coalesceable());
 
-    let t2 = Transaction::with_revisions(
+    let structural = Transaction::with_revisions(
+        Revision::new(1),
         Revision::new(2),
-        Revision::new(3),
-        vec![Operation::SetProperty {
-            id: node_id,
-            property: PropertyRef::LABEL,
-            value: Value::from("second"),
-        }],
-        0,
-    );
-
-    // Contiguous scalar absorption succeeds and updates target revision
-    assert!(t1.try_absorb(&t2, 100, 1024 * 1024));
-    assert_eq!(t1.base_revision, Revision::new(1));
-    assert_eq!(t1.new_revision, Revision::new(3));
-    assert_eq!(t1.operations.len(), 1);
-    match &t1.operations[0] {
-        Operation::SetProperty { value, .. } => assert_eq!(value, &Value::from("second")),
-        _ => panic!("expected SetProperty"),
-    }
-
-    // Structural transaction cannot be absorbed
-    let t_structural = Transaction::with_revisions(
-        Revision::new(3),
-        Revision::new(4),
         vec![Operation::DeleteNode { id: node_id }],
         0,
     );
-    assert!(!t1.try_absorb(&t_structural, 100, 1024 * 1024));
+    assert!(!structural.is_coalesceable());
 
-    // Exceeding max_ops is rejected
-    let t3 = Transaction::with_revisions(
-        Revision::new(3),
-        Revision::new(4),
+    let mixed = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(2),
+        vec![
+            Operation::SetProperty {
+                id: node_id,
+                property: PropertyRef::LABEL,
+                value: Value::from("first"),
+            },
+            Operation::DeleteNode { id: node_id },
+        ],
+        0,
+    );
+    assert!(
+        !mixed.is_coalesceable(),
+        "one structural operation disqualifies the whole transaction"
+    );
+
+    let empty = Transaction::with_revisions(Revision::new(1), Revision::new(2), vec![], 0);
+    assert!(
+        !empty.is_coalesceable(),
+        "an empty transaction carries no scalar state to collapse"
+    );
+
+    let value_change = Transaction::with_revisions(
+        Revision::new(1),
+        Revision::new(2),
         vec![Operation::SetProperty {
             id: node_id,
             property: PropertyRef::VALUE,
@@ -421,10 +518,7 @@ fn test_transaction_try_absorb_semantics_and_limits() {
         }],
         0,
     );
-    assert!(!t1.try_absorb(&t3, 1, 1024 * 1024));
-
-    // Exceeding max_frame_size is rejected
-    assert!(!t1.try_absorb(&t3, 100, 5));
+    assert!(value_change.is_coalesceable());
 }
 
 #[test]
@@ -612,4 +706,56 @@ fn test_monotonic_sequential_revisions() {
 
     assert_eq!(store.revision(), Revision::new(10));
     assert_eq!(store.node_count(), 10);
+}
+
+/// A decoded frame may claim `base_revision = u64::MAX`, a revision with no successor. Every
+/// validation path computes `base + 1`, so an unguarded check panics in debug builds and wraps to
+/// `Revision(0)` in release ones — turning a malformed frame into a crash or a backwards revision.
+/// Rejection must be explicit (§12.1, §26).
+#[test]
+fn test_exhausted_base_revision_is_rejected_not_overflowed() {
+    let exhausted = Revision::new(u64::MAX);
+    let node_id = NodeId::new(1);
+    let scalar = || {
+        vec![Operation::SetProperty {
+            id: node_id,
+            property: PropertyRef::LABEL,
+            value: Value::from("v"),
+        }]
+    };
+
+    let exhausted_err = TxnError::RevisionExhausted { base: exhausted };
+
+    let as_commit = Transaction::with_revisions(exhausted, Revision::INITIAL, vec![], 0);
+    assert_eq!(
+        AuthoritativeCommit::try_from(as_commit.clone()).unwrap_err(),
+        exhausted_err,
+        "an exhausted base revision has no successor and cannot be an authoritative commit"
+    );
+
+    let as_delta = Transaction::with_revisions(exhausted, Revision::INITIAL, scalar(), 0);
+    assert_eq!(
+        CoalescedScalarDelta::try_from(as_delta.clone()).unwrap_err(),
+        exhausted_err,
+        "an exhausted base revision cannot be spanned by a delta either"
+    );
+    assert_eq!(
+        DeliveredTransaction::try_from(as_delta).unwrap_err(),
+        exhausted_err,
+        "neither delivery form admits an exhausted base revision"
+    );
+    assert_eq!(
+        DeliveredTransaction::try_from(as_commit.clone()).unwrap_err(),
+        exhausted_err,
+        "classification by shape must not overflow before it rejects"
+    );
+
+    let mut store = SemanticStore::new();
+    assert_eq!(
+        store.apply_transaction_record(&as_commit).unwrap_err(),
+        exhausted_err,
+        "the store must refuse an exhausted base revision without overflowing"
+    );
+    assert_eq!(store.revision(), Revision::INITIAL);
+    assert_eq!(exhausted_err.conformance_code(), Some("revision_exhausted"));
 }

@@ -136,8 +136,8 @@ async fn test_throttled_1000_updates_coalesce_with_structural_barrier() {
                     continuous_ranges = false;
                 }
                 client_store
-                    .apply_wire_transaction(tx)
-                    .expect("apply wire transaction to client replica");
+                    .apply_delivered_transaction(tx)
+                    .expect("apply delivered transaction to client replica");
             }
             other => panic!("expected Transaction message, got {:?}", other),
         }

@@ -43,8 +43,19 @@ public struct Revision: Hashable, Equatable, Comparable, Sendable, CustomStringC
     }
 
     /// Returns the next monotonically increasing revision (`self.value + 1`).
+    ///
+    /// Traps on overflow. Use `checkedNext` for any revision that came off the wire: a decoded
+    /// frame may claim `UInt64.max`, which has no successor.
     public var next: Revision {
         Revision(value + 1)
+    }
+
+    /// Returns the next revision, or `nil` when this one is exhausted (`UInt64.max`).
+    ///
+    /// A revision counter never repeats, so `UInt64.max` is the end of a session's sequence rather
+    /// than a wrap point: wrapping would hand out a revision the session already used (§12.1).
+    public var checkedNext: Revision? {
+        value == UInt64.max ? nil : Revision(value + 1)
     }
 
     public var description: String {
@@ -64,6 +75,8 @@ public enum TxnError: Error, Equatable, Sendable, CustomStringConvertible {
     case staleBaseRevision(expected: Revision, actual: Revision)
     /// New revision is not strictly monotonic (`expected != actual`).
     case invalidNewRevision(expected: Revision, actual: Revision)
+    /// Base revision is `UInt64.max`, which has no successor: no transaction can extend it (§12.1).
+    case revisionExhausted(base: Revision)
     /// Transaction exceeds the configured maximum operations limit (§26).
     case maxOperationsExceeded(limit: Int, actual: Int)
     /// An operation within the transaction failed during application.
@@ -77,6 +90,8 @@ public enum TxnError: Error, Equatable, Sendable, CustomStringConvertible {
             return "stale base revision: store committed revision is \(expected), transaction base is \(actual)"
         case .invalidNewRevision(let expected, let actual):
             return "invalid new revision: expected \(expected) (base + 1), but got \(actual)"
+        case .revisionExhausted(let base):
+            return "revision exhausted: base revision \(base) has no successor"
         case .maxOperationsExceeded(let limit, let actual):
             return "transaction operations limit exceeded: \(actual) ops exceeds max limit of \(limit) (§26)"
         case .opFailed(let opIndex, let source):
@@ -91,6 +106,7 @@ public enum TxnError: Error, Equatable, Sendable, CustomStringConvertible {
         switch self {
         case .staleBaseRevision: return "stale_base_revision"
         case .invalidNewRevision: return "invalid_new_revision"
+        case .revisionExhausted: return "revision_exhausted"
         case .maxOperationsExceeded: return "max_operations_exceeded"
         case .opFailed(_, let source): return source.conformanceCode
         case .wireError: return nil
@@ -264,23 +280,27 @@ public final class TransactionApplier: @unchecked Sendable {
                 .staleBaseRevision(expected: currentRevision, actual: baseRevision)
             )
         }
+        // A replica's revision can be set from a snapshot, so the store may legitimately sit at a
+        // revision with no successor; refuse rather than trap (§12.1).
+        guard let newRevision = baseRevision.checkedNext else {
+            return .failure(.revisionExhausted(base: baseRevision))
+        }
 
         return applyStaged(
             operations: operations,
-            newRevision: baseRevision.next
+            newRevision: newRevision
         )
     }
 
-    /// Applies a structured `Transaction` record, validating its base and target revisions.
+    /// Applies an authoritative commit, validating its base and target revisions.
     ///
-    /// Single-step increments (`newRevision == baseRevision.next`) accept arbitrary operations.
-    /// Multi-revision forward spans (`newRevision > baseRevision.next`) are legal exclusively for
-    /// coalesced scalar updates (`record.isCoalesceable`).
+    /// Accepts only `newRevision == baseRevision.next`. A coalesced delivery span belongs to
+    /// `applyDelivered(record:)` and a resync snapshot to `applySnapshot(record:)` (§12.1).
     public func apply(record: Transaction) -> Result<Revision, TxnError> {
         applyCommitted(record: record).map(\.revision)
     }
 
-    /// Applies a structured `Transaction` record and atomically returns the committed snapshot.
+    /// Applies an authoritative commit and atomically returns the committed snapshot.
     ///
     /// Callers that must hand the renderer a store matching exactly the transaction they just
     /// applied MUST use this instead of `apply(record:)` followed by a separate `currentSnapshot`
@@ -290,30 +310,58 @@ public final class TransactionApplier: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        guard let expected = record.baseRevision.checkedNext else {
+            return .failure(.revisionExhausted(base: record.baseRevision))
+        }
+        guard record.newRevision == expected else {
+            return .failure(
+                .invalidNewRevision(expected: expected, actual: record.newRevision)
+            )
+        }
+
+        return applyValidated(record: record)
+    }
+
+    /// Applies one frame of the live stream, and atomically returns the committed snapshot
+    /// (§12.1, §20.4).
+    ///
+    /// This is the entry point for streamed transactions. A frame is either an authoritative commit
+    /// (`newRevision == baseRevision.next`) or a coalesced scalar delta standing in for a run of
+    /// them (`newRevision > baseRevision.next`, `record.isCoalesceable`). Both are legal for a
+    /// replica and neither is authoritative, which is why they share an entry point; a span that is
+    /// neither form is rejected rather than guessed at.
+    ///
+    /// A resync snapshot is deliberately not accepted here — its shape is indistinguishable from a
+    /// replayed first transaction, so it may only be applied from explicit protocol context via
+    /// `applySnapshot(record:)` (§18).
+    public func applyDelivered(record: Transaction) -> Result<TransactionSnapshot, TxnError> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        // Classification happens on decoded input, so it must survive an exhausted base revision:
+        // `baseRevision.next` would trap before either form could be rejected (§12.1).
+        guard let expected = record.baseRevision.checkedNext else {
+            return .failure(.revisionExhausted(base: record.baseRevision))
+        }
+        let isCommit = record.newRevision == expected
+        let isDelta = record.newRevision > expected && record.isCoalesceable
+        guard isCommit || isDelta else {
+            return .failure(
+                .invalidNewRevision(expected: expected, actual: record.newRevision)
+            )
+        }
+
+        return applyValidated(record: record)
+    }
+
+    /// Applies a record whose delivery form has already been validated. Caller holds `lock`.
+    private func applyValidated(record: Transaction) -> Result<TransactionSnapshot, TxnError> {
         let currentRevision = _store.revision
         if record.baseRevision != currentRevision {
             return .failure(
                 .staleBaseRevision(
                     expected: currentRevision,
                     actual: record.baseRevision
-                )
-            )
-        }
-
-        guard record.newRevision >= record.baseRevision.next else {
-            return .failure(
-                .invalidNewRevision(
-                    expected: record.baseRevision.next,
-                    actual: record.newRevision
-                )
-            )
-        }
-
-        if record.newRevision > record.baseRevision.next && !record.isCoalesceable {
-            return .failure(
-                .invalidNewRevision(
-                    expected: record.baseRevision.next,
-                    actual: record.newRevision
                 )
             )
         }

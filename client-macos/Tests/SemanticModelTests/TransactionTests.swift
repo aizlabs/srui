@@ -228,10 +228,18 @@ final class TransactionTests: XCTestCase {
 
         let scalarOps: [StoreOperation] = [.setProperty(id: rootID, property: .label, value: .string("v5"))]
 
-        // Coalesced delta specifies forward range base 1 -> new 5 via applyCommitted (§12.1, §20.2)
+        // Coalesced delta specifies forward range base 1 -> new 5 (§12.1 delivery forms, §20.4)
         let forwardTxn = Transaction(baseRevision: Revision(1), newRevision: Revision(5), operations: scalarOps, priority: 0)
 
-        let res = applier.applyCommitted(record: forwardTxn)
+        // The authoritative path advances exactly one revision and refuses the span
+        XCTAssertEqual(
+            applier.applyCommitted(record: forwardTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(2), actual: Revision(5)))
+        )
+        XCTAssertEqual(applier.store.revision, Revision(1), "a refused commit must not advance the replica")
+
+        // The delivery path accepts it, because a replica is what a delta is addressed to
+        let res = applier.applyDelivered(record: forwardTxn)
         guard case .success(let snapshot) = res else {
             XCTFail("expected success for forward coalesced delta, got \(res)")
             return
@@ -241,7 +249,8 @@ final class TransactionTests: XCTestCase {
         XCTAssertEqual(applier.lastAppliedRevision, Revision(5))
         XCTAssertEqual(applier.store.nodeCount, 1)
 
-        // Forward range with structural mutation (non-coalesceable) is rejected (§12.1, §20.2)
+        // Forward range with structural mutation (non-coalesceable) is rejected on both paths
+        // (§12.1, §20.4)
         let structuralSpanTxn = Transaction(
             baseRevision: Revision(5),
             newRevision: Revision(10),
@@ -252,18 +261,30 @@ final class TransactionTests: XCTestCase {
             applier.applyCommitted(record: structuralSpanTxn).map(\.revision),
             .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(10)))
         )
+        XCTAssertEqual(
+            applier.applyDelivered(record: structuralSpanTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(10)))
+        )
 
-        // Equal revision is rejected by applyCommitted
+        // Equal revision is rejected by both paths
         let equalTxn = Transaction(baseRevision: Revision(5), newRevision: Revision(5), operations: [], priority: 0)
         XCTAssertEqual(
             applier.applyCommitted(record: equalTxn).map(\.revision),
             .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(5)))
         )
+        XCTAssertEqual(
+            applier.applyDelivered(record: equalTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(5)))
+        )
 
-        // Backward revision is rejected by applyCommitted
+        // Backward revision is rejected by both paths
         let backwardTxn = Transaction(baseRevision: Revision(5), newRevision: Revision(3), operations: [], priority: 0)
         XCTAssertEqual(
             applier.applyCommitted(record: backwardTxn).map(\.revision),
+            .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(3)))
+        )
+        XCTAssertEqual(
+            applier.applyDelivered(record: backwardTxn).map(\.revision),
             .failure(.invalidNewRevision(expected: Revision(6), actual: Revision(3)))
         )
     }
@@ -456,5 +477,92 @@ final class TransactionTests: XCTestCase {
         XCTAssertEqual(applier.store.revision, Revision(10))
         XCTAssertEqual(applier.lastAppliedRevision, Revision(10))
         XCTAssertEqual(applier.store.nodeCount, 10)
+    }
+
+    /// A frame decoded from the wire may claim `baseRevision = UInt64.max`, a revision with no
+    /// successor. Every validation path computes `baseRevision.next`, which traps on overflow, so
+    /// an unguarded check turns a malformed server frame into a client crash (§12.1, §26).
+    func testExhaustedBaseRevisionIsRejectedWithoutOverflowTrap() {
+        let applier = TransactionApplier()
+        let exhausted = Revision(UInt64.max)
+        let txn = Transaction(baseRevision: exhausted, newRevision: Revision(0), operations: [], priority: 0)
+
+        XCTAssertEqual(
+            applier.applyCommitted(record: txn).map(\.revision),
+            .failure(.revisionExhausted(base: exhausted)),
+            "an exhausted base revision has no successor and cannot be an authoritative commit"
+        )
+        XCTAssertEqual(
+            applier.applyDelivered(record: txn).map(\.revision),
+            .failure(.revisionExhausted(base: exhausted)),
+            "neither delivery form admits an exhausted base revision"
+        )
+        XCTAssertEqual(
+            applier.apply(baseRevision: exhausted, operations: []),
+            .failure(.staleBaseRevision(expected: .initial, actual: exhausted)),
+            "an exhausted base revision does not match the store and must be refused"
+        )
+        XCTAssertEqual(applier.store.revision, .initial, "a refused frame must not advance the replica")
+    }
+
+    /// The wire helpers are the documented entry point for SDK consumers, so they must cover every
+    /// form the server legitimately emits: a coalesced scalar delta spanning several revisions is
+    /// refused by the authoritative helper and accepted by the delivered one (§12.1, §20.4).
+    func testDeliveredWireTransactionAcceptsCoalescedScalarSpan() {
+        let applier = TransactionApplier()
+        let rootID = NodeId(1)
+        XCTAssertEqual(
+            applier.apply(baseRevision: .initial, operations: [.createNode(id: rootID, nodeType: .surface)]),
+            .success(Revision(1))
+        )
+
+        var wireTxn = SRUITransaction()
+        wireTxn.baseRevision = 1
+        wireTxn.newRevision = 5
+        var setOp = SRUIOperation()
+        var setPayload = Srui_Protocol_SetPropertyOp()
+        setPayload.nodeID = rootID.value
+        setPayload.property = PropertyRef.label.toWire()
+        setPayload.value = Value.string("v5").toWire()
+        setOp.setProperty = setPayload
+        wireTxn.operations = [setOp]
+
+        XCTAssertEqual(
+            applier.apply(wire: wireTxn),
+            .failure(.invalidNewRevision(expected: Revision(2), actual: Revision(5))),
+            "the authoritative wire helper must keep refusing a multi-revision span"
+        )
+        XCTAssertEqual(applier.store.revision, Revision(1))
+
+        XCTAssertEqual(applier.applyDelivered(wire: wireTxn), .success(Revision(5)))
+        XCTAssertEqual(applier.store.revision, Revision(5))
+        XCTAssertEqual(applier.store.getNode(rootID)?.getProperty(.label), .string("v5"))
+
+        var store = SemanticStore()
+        XCTAssertEqual(
+            store.applyWireTransaction(rootCreateWire(rootID)),
+            .success(Revision(1))
+        )
+        XCTAssertEqual(store.applyDeliveredWireTransaction(wireTxn), .success(Revision(5)))
+        XCTAssertEqual(store.revision, Revision(5))
+        XCTAssertEqual(store.getNode(rootID)?.getProperty(.label), .string("v5"))
+    }
+
+    /// Builds a wire transaction creating `id` as a root Surface at revision 0 -> 1.
+    private func rootCreateWire(_ id: NodeId) -> SRUITransaction {
+        var wire = SRUITransaction()
+        wire.baseRevision = 0
+        wire.newRevision = 1
+        var op = SRUIOperation()
+        var payload = Srui_Protocol_CreateNodeOp()
+        var record = Srui_Protocol_NodeRecord()
+        record.nodeID = id.value
+        record.type = TypeRef.surface.toWire()
+        record.parentID = 0
+        record.childIndex = 0
+        payload.node = record
+        op.createNode = payload
+        wire.operations = [op]
+        return wire
     }
 }

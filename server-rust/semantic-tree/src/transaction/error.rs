@@ -17,6 +17,8 @@ pub enum TxnError {
         expected: Revision,
         actual: Revision,
     },
+    /// Base revision is `u64::MAX`, which has no successor: no transaction can extend it (§12.1).
+    RevisionExhausted { base: Revision },
     /// Transaction exceeds the configured maximum operations limit (§26).
     MaxOperationsExceeded { limit: usize, actual: usize },
     /// An operation within the transaction failed during application.
@@ -37,6 +39,11 @@ impl fmt::Display for TxnError {
                 f,
                 "invalid new revision: expected {} (base + 1), but got {}",
                 expected, actual
+            ),
+            Self::RevisionExhausted { base } => write!(
+                f,
+                "revision exhausted: base revision {} has no successor",
+                base
             ),
             Self::MaxOperationsExceeded { limit, actual } => write!(
                 f,
@@ -59,6 +66,7 @@ impl TxnError {
         match self {
             Self::StaleBaseRevision { .. } => Some("stale_base_revision"),
             Self::InvalidNewRevision { .. } => Some("invalid_new_revision"),
+            Self::RevisionExhausted { .. } => Some("revision_exhausted"),
             Self::MaxOperationsExceeded { .. } => Some("max_operations_exceeded"),
             Self::OpFailed { source, .. } => Some(source.conformance_code()),
             Self::WireError(_) => None,

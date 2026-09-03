@@ -56,7 +56,10 @@ pub use store::{
     DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 
-pub use transaction::{Operation, Revision, Transaction, TxnError};
+pub use transaction::{
+    AuthoritativeCommit, CoalescedScalarDelta, DeliveredTransaction, Operation, ResyncSnapshot,
+    Revision, Transaction, TxnError,
+};
 
 pub use value::{
     EdgeInsets, EnumToken, Point, Property, Range, Rect, Size, SmallRecord, Value,

@@ -47,6 +47,15 @@ impl std::error::Error for FramingError {
     }
 }
 
+/// Returns the payload size a framed message would occupy, without encoding it (§16, §26).
+///
+/// This is exactly the quantity [`encode_framed_with_limit`] and [`SruiCodec`](crate::SruiCodec)
+/// compare against `max_frame_size`, so a caller deciding whether a message *would* fit — an
+/// outbound queue weighing a merge, say — measures the same thing the encoder will.
+pub fn framed_payload_len<M: Message>(msg: &M) -> usize {
+    msg.encoded_len()
+}
+
 /// Encodes a message with a varint length prefix, enforcing `DEFAULT_MAX_FRAME_SIZE` (§16, §26).
 pub fn encode_framed<M: Message>(msg: &M) -> Result<Vec<u8>, FramingError> {
     encode_framed_with_limit(msg, DEFAULT_MAX_FRAME_SIZE)

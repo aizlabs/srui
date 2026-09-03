@@ -9,7 +9,7 @@ Cross-language conformance test vectors validating the **Protocol Core State Mac
 These fixtures encode the formal behavioral invariants of the SRUI distributed state store into declarative, human-readable JSON files. They are designed to be executed against any conforming SRUI client or server implementation (e.g. Rust Core in Task 8, Swift Core in Task 14) without language-specific scaffolding or re-deriving test scenarios.
 
 ### Scope of Coverage
-- **Atomic Transactions & Revisions (§12.1, §12.2)**: All-or-nothing execution advancing monotonically from `base_revision` to `new_revision = base_revision + 1`.
+- **Atomic Transactions & Revisions (§12.1, §12.2)**: All-or-nothing execution advancing monotonically from `base_revision` to `new_revision`. An *authoritative commit* — the default applier for these fixtures — advances exactly one revision (`new_revision = base_revision + 1`). A *coalesced scalar delta* delivered to a replica may span `new_revision > base_revision + 1` when every operation is a scalar `SET_PROPERTY`; fixtures exercise that form by setting `"applier": "delivered"` (§12.1 delivery forms, §20.4).
 - **Stable Identity & Lifetime Scoping (§6.2)**: `NodeId` and `ModelId` must never be reused within the same session, even after deletion.
 - **Referential Integrity (§6.2, §13)**: Parent-child hierarchy validation, orphan rejection, and late-binding model reference validation.
 - **Rollback on Failure (§12.1)**: Speculative execution where any failing operation discards the entire transaction with zero side effects.
@@ -137,6 +137,7 @@ Properties are encoded as JSON primitives or typed objects:
 |---|---|---|
 | `stale_base_revision` | `TxnError::StaleBaseRevision` | §12.1 |
 | `invalid_new_revision` | `TxnError::InvalidNewRevision` | §12.1 |
+| `revision_exhausted` | `TxnError::RevisionExhausted` | §12.1 |
 | `max_operations_exceeded` | `TxnError::MaxOperationsExceeded` | §26 |
 | `node_id_already_used` | `StoreError::NodeIdAlreadyUsed` | §6.2 |
 | `node_not_found` | `StoreError::NodeNotFound` | §13 |

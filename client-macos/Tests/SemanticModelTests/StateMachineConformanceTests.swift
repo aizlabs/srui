@@ -116,7 +116,19 @@ final class StateMachineConformanceTests: XCTestCase {
         let outcomeDict = try XCTUnwrap(json["expected_outcome"] as? [String: Any], "[\(fileName)] Missing 'expected_outcome' object")
         let status = try XCTUnwrap(outcomeDict["status"] as? String, "[\(fileName)] Missing 'status' in outcome")
 
-        let result = applier.apply(record: transaction)
+        // Which application path the fixture exercises (§12.1 delivery forms). Setup transactions
+        // always take the authoritative path: they establish committed state.
+        let applierKind = json["applier"] as? String ?? "authoritative"
+        let result: Result<Revision, TxnError>
+        switch applierKind {
+        case "authoritative":
+            result = applier.apply(record: transaction)
+        case "delivered":
+            result = applier.applyDelivered(record: transaction).map(\.revision)
+        default:
+            XCTFail("[\(fileName)] Unknown applier '\(applierKind)'")
+            return
+        }
 
         switch status {
         case "success":

@@ -880,7 +880,9 @@ public final class SessionController: @unchecked Sendable {
             }
             applyResult = published
         } else {
-            applyResult = applier.applyCommitted(record: domainTx)
+            // Live-stream frames are deliveries: either a committed transaction verbatim, or a
+            // coalesced scalar delta standing in for a run of them (§12.1, §20.4).
+            applyResult = applier.applyDelivered(record: domainTx)
         }
 
         switch applyResult {

@@ -21,6 +21,7 @@
 //! transaction (§12.1).
 
 use srui_protocol::Transaction;
+use srui_semantic_tree::AuthoritativeCommit;
 use std::collections::VecDeque;
 use thiserror::Error;
 
@@ -37,6 +38,22 @@ pub enum JournalError {
     /// The transaction's base revision does not match the journal's current head.
     #[error("non-contiguous revision: expected base {expected}, got {actual}")]
     NonContiguousRevision { expected: u64, actual: u64 },
+}
+
+/// A transaction validated against a journal head, ready for an infallible append (§12.1, §18.1).
+///
+/// Produced by [`TransactionJournal::prepare`] and consumed by [`TransactionJournal::append`].
+#[derive(Debug)]
+pub struct JournalPermit {
+    tx: Transaction,
+}
+
+impl JournalPermit {
+    /// The wire transaction this permit will append.
+    #[must_use]
+    pub fn transaction(&self) -> &Transaction {
+        &self.tx
+    }
 }
 
 /// Bounded transaction journal for session mutation replay and reconnection catch-up (§20.2, §21).
@@ -76,33 +93,43 @@ impl TransactionJournal {
         }
     }
 
-    /// Reports whether [`Self::record`] would accept `tx`, without recording it.
-    ///
-    /// A caller that mutates authoritative state before recording must consult this first: the
-    /// store and the journal advance together or they diverge permanently, since the store cannot
-    /// roll back a committed revision and every later transaction then fails
-    /// [`JournalError::NonContiguousRevision`] (§12.1, §18.1).
-    pub fn check_admissible(&self, tx: &Transaction) -> Result<(), JournalError> {
-        if tx.new_revision != tx.base_revision.saturating_add(1) {
-            return Err(JournalError::InvalidRevisionRange {
-                base: tx.base_revision,
-                new: tx.new_revision,
-            });
-        }
-
+    /// Checks that `tx` continues this journal's retained history (§18.1).
+    fn check_contiguity(&self, tx: &Transaction) -> Result<(), JournalError> {
         if !self.entries.is_empty() && tx.base_revision != self.latest_revision {
             return Err(JournalError::NonContiguousRevision {
                 expected: self.latest_revision,
                 actual: tx.base_revision,
             });
         }
-
         Ok(())
     }
 
-    /// Records a newly committed transaction into the journal.
-    pub fn record(&mut self, tx: Transaction) -> Result<(), JournalError> {
-        self.check_admissible(&tx)?;
+    /// Validates `commit` against the journal head and returns a permit for an infallible append.
+    ///
+    /// The store owns committed revisions and cannot roll one back, so a caller that mutates the
+    /// store and *then* discovers the journal will not accept the transaction has already diverged
+    /// the two: the store is ahead, the journal is behind, and every later commit fails
+    /// [`JournalError::NonContiguousRevision`] forever. Preparing first removes that window —
+    /// [`Self::append`] cannot fail (§12.1, §18.1).
+    ///
+    /// Only an [`AuthoritativeCommit`] can be prepared, so a coalesced delivery span cannot reach
+    /// the journal even by mistake (§12.1, §20.4).
+    pub fn prepare(&self, commit: &AuthoritativeCommit) -> Result<JournalPermit, JournalError> {
+        let tx: Transaction = commit.as_transaction().into();
+        self.check_contiguity(&tx)?;
+        Ok(JournalPermit { tx })
+    }
+
+    /// Appends a permit obtained from [`Self::prepare`] on this journal.
+    ///
+    /// Infallible by construction. The permit must not outlive an intervening append: it carries
+    /// the base revision the journal had when it was prepared.
+    pub fn append(&mut self, permit: JournalPermit) {
+        let tx = permit.tx;
+        debug_assert!(
+            self.entries.is_empty() || tx.base_revision == self.latest_revision,
+            "permit was prepared against a different journal head"
+        );
 
         if self.entries.is_empty() {
             self.earliest_revision = tx.base_revision;
@@ -116,6 +143,22 @@ impl TransactionJournal {
 
         self.latest_revision = tx.new_revision;
         self.entries.push_back(tx);
+    }
+
+    /// Records a newly committed transaction into the journal.
+    ///
+    /// Retains the single-step shape check for wire-decoded input, which carries no proof of form.
+    /// A caller that must keep the store in lockstep should use [`Self::prepare`] and
+    /// [`Self::append`] instead, so no failure can occur after the store has mutated.
+    pub fn record(&mut self, tx: Transaction) -> Result<(), JournalError> {
+        if tx.new_revision != tx.base_revision.saturating_add(1) {
+            return Err(JournalError::InvalidRevisionRange {
+                base: tx.base_revision,
+                new: tx.new_revision,
+            });
+        }
+        self.check_contiguity(&tx)?;
+        self.append(JournalPermit { tx });
         Ok(())
     }
 
@@ -164,6 +207,9 @@ impl TransactionJournal {
     }
 
     /// Returns the latest committed revision in the journal.
+    ///
+    /// After a successful commit this equals the store's committed revision: the two advancing
+    /// apart is exactly the divergence [`Self::prepare`] exists to prevent (§12.1, §18.1).
     #[must_use]
     pub const fn latest_revision(&self) -> u64 {
         self.latest_revision

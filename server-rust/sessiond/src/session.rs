@@ -74,9 +74,10 @@ use srui_journal::{JournalError, TransactionJournal, DEFAULT_MAX_JOURNAL_ENTRIES
 use srui_protocol::{Event, ServerLimits, Transaction};
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
-    EventValidationError, NegotiationError, NodeId, PropertyRef, SemanticStore, ServerCapabilities,
-    StoreError, TxnError, TypeRef, Value, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
-    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
+    AuthoritativeCommit, EventValidationError, NegotiationError, NodeId, PropertyRef,
+    SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef, Value,
+    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
+    DEFAULT_MAX_TREE_DEPTH,
 };
 use thiserror::Error;
 
@@ -570,12 +571,15 @@ impl Session {
             match result {
                 Ok(Ok(val)) => {
                     let (staged, ops) = ui.into_staged_and_ops();
-                    let new_rev = base_revision.next();
-                    guard.store.commit_staging(staged, new_rev);
+                    let commit = AuthoritativeCommit::new(base_revision, ops);
 
-                    let tx_domain = srui_semantic_tree::Transaction::new(base_revision, ops);
-                    let tx_wire: Transaction = tx_domain.into();
-                    guard.journal.record(tx_wire.clone())?;
+                    // Journal admission is decided before the store mutates: `append` below cannot
+                    // fail, so the store and the journal advance together or neither does
+                    // (§12.1, §18.1).
+                    let permit = guard.journal.prepare(&commit)?;
+                    let tx_wire = permit.transaction().clone();
+                    guard.store.commit_staging(staged, commit.new_revision());
+                    guard.journal.append(permit);
                     (val, tx_wire)
                 }
                 Ok(Err(store_err)) => return Err(SessionError::Store(store_err)),
@@ -599,19 +603,29 @@ impl Session {
 
     /// Applies a wire transaction to the store, logs it to the journal,
     /// and publishes it to attached client streams without holding locks across await.
+    ///
+    /// Only an authoritative commit — `new_revision == base_revision + 1` — may be committed. A
+    /// coalesced delivery span is refused here by type: it belongs to a replica's stream, never to
+    /// authoritative state (§12.1, §20.4).
     pub fn commit_transaction(&self, tx: Transaction) -> Result<Transaction, SessionError> {
+        let commit = AuthoritativeCommit::try_from(tx)?;
+
         // Fast in-memory critical section (async-no-lock-await)
-        {
+        let tx = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-            // Refuse anything the journal cannot record *before* the store mutates. The store owns
-            // committed revisions and cannot roll one back, so a transaction that passes
-            // `apply_wire_transaction` but fails `record` (a coalesced multi-revision span, for
-            // instance) would leave the journal behind the store and wedge every later commit on
-            // this session with `NonContiguousRevision` (§12.1, §18.1, §20.2).
-            guard.journal.check_admissible(&tx)?;
-            guard.store.apply_wire_transaction(tx.clone())?;
-            guard.journal.record(tx.clone())?;
-        }
+
+            // Everything that can fail happens first: staging the operations and admitting the
+            // transaction to the journal. The two mutations that follow are infallible, so the
+            // store cannot end up ahead of the journal and wedge every later commit on this
+            // session with `NonContiguousRevision` (§12.1, §18.1, §20.2).
+            let staged = guard.store.prepare_commit(&commit)?;
+            let permit = guard.journal.prepare(&commit)?;
+            let tx_wire = permit.transaction().clone();
+
+            guard.store.commit_prepared(staged);
+            guard.journal.append(permit);
+            tx_wire
+        };
 
         // Publish to attached client queues outside of the mutex lock
         self.outbound_hub.publish(&tx);
@@ -888,9 +902,9 @@ mod tests {
         );
     }
 
-    /// The journal only accepts single-step spans, so a transaction it will refuse must be rejected
-    /// *before* the store mutates. Otherwise the store advances, the journal does not, and every
-    /// later commit on the session fails with `NonContiguousRevision` forever (§12.1, §18.1, §20.2).
+    /// A coalesced delivery span is refused at the type boundary, before anything is staged, so the
+    /// store cannot advance past a journal that will not record it and wedge every later commit
+    /// with `NonContiguousRevision` (§12.1, §18.1, §20.4).
     #[test]
     fn test_commit_transaction_rejects_inadmissible_span_without_advancing_store() {
         use srui_sdk::Surface;
@@ -919,13 +933,16 @@ mod tests {
 
         let err = session
             .commit_transaction(wire)
-            .expect_err("a multi-revision span is not journal-admissible");
+            .expect_err("a multi-revision span is not an authoritative commit");
         assert!(
             matches!(
                 err,
-                SessionError::Journal(JournalError::InvalidRevisionRange { base: 1, new: 5 })
+                SessionError::Transaction(TxnError::InvalidNewRevision {
+                    expected: e,
+                    actual: a,
+                }) if e == Revision::new(2) && a == Revision::new(5)
             ),
-            "expected a journal rejection, got {err:?}"
+            "expected refusal as a non-authoritative form, got {err:?}"
         );
         assert_eq!(
             session.current_revision(),

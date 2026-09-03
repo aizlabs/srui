@@ -76,9 +76,18 @@ jobs:
             ~/.cargo/registry/cache
           key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('server-rust/fuzz/Cargo.lock') }}
           restore-keys: cargo-fuzz-${{ runner.os }}-
+      # `restore-keys` can restore an older cache on a key miss (any change to fuzz/Cargo.lock
+      # changes the key), which brings back ~/.cargo/bin/cargo-fuzz while `cache-hit` stays false.
+      # Gating on the binary itself rather than on an exact cache hit keeps that partial restore
+      # from failing the job with "binary `cargo-fuzz` already exists in destination".
       - name: Install cargo-fuzz
-        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
-        run: cargo install cargo-fuzz --locked
+        run: |
+          set -euo pipefail
+          if command -v cargo-fuzz >/dev/null 2>&1; then
+            echo "cargo-fuzz already present: $(cargo fuzz --version)"
+          else
+            cargo install cargo-fuzz --locked
+          fi
       - name: Seed fuzz corpora from conformance vectors
         run: |
           set -euo pipefail

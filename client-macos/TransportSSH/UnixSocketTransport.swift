@@ -12,42 +12,69 @@ import Darwin
 import Glibc
 #endif
 
-/// Owns the socket descriptor read by a blocking reader thread, and closes it exactly once.
+/// Owns a descriptor used concurrently by a blocking reader thread and a serial writer queue, and
+/// closes it exactly once.
 ///
 /// A stop flag alone is not enough: `while !isStopped { read(fd) }` is check-then-act, so the
 /// reader can pass the check, be descheduled while `close()` runs to completion, and then call
 /// `read` on a descriptor number the kernel has already recycled to an unrelated `open` elsewhere
 /// in the process — silently consuming another owner's bytes. The latch therefore keeps the
-/// descriptor: a stop requested while the reader is inside `read(2)` only shuts the socket down (to
-/// wake it) and defers the `close(2)` to the reader on its way out, so the number can never be
-/// recycled while the reader might still touch it.
+/// descriptor: a stop requested while an I/O call is in flight only shuts the socket down (to wake
+/// it) and defers the `close(2)` to the last claim holder, so the number can never be recycled
+/// while the reader or writer might still touch it.
+///
+/// Claims are counted rather than boolean because reads and writes overlap: the reader parks in
+/// `read(2)` for the whole connection while the writer issues independent `write(2)` calls.
 final class SocketReadLatch: @unchecked Sendable {
     private let lock = NSLock()
     private var _isStopped = false
     private var fd: Int32 = -1
-    private var readerHoldsFD = false
+    private var activeClaims = 0
 
     /// Transfers ownership of `descriptor` to the latch. After this only the latch closes it.
+    ///
+    /// Two descriptor flags are set here because both are load-bearing for teardown (§22.2):
+    ///
+    /// - `F_SETNOSIGPIPE`: a write to a descriptor whose peer has gone away must return `EPIPE`,
+    ///   not raise SIGPIPE and take the process down. `stop()` deliberately shuts the descriptor
+    ///   down underneath an in-flight write — that is the mechanism by which `close()` preempts a
+    ///   peer that stopped reading — so this is a normal path, not an exceptional one.
+    /// - `O_NONBLOCK`: a blocking `write(2)` cannot honour a deadline, because a single call parks
+    ///   inside the kernel until the peer drains. Non-blocking I/O plus an explicit `poll(2)` wait
+    ///   is what lets both the reader and the writer re-check the stop flag and the deadline while
+    ///   a peer is unresponsive.
     func adopt(descriptor: Int32) {
+        _ = fcntl(descriptor, F_SETNOSIGPIPE, 1)
+        let flags = fcntl(descriptor, F_GETFL, 0)
+        if flags >= 0 {
+            _ = fcntl(descriptor, F_SETFL, flags | O_NONBLOCK)
+        }
         lock.lock()
         fd = descriptor
         lock.unlock()
     }
 
-    /// Returns the descriptor to read from, or `nil` once stopped, claiming it for the reader.
-    func beginRead() -> Int32? {
+    /// Whether teardown has been requested.
+    var isStopped: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _isStopped
+    }
+
+    /// Claims the descriptor for one I/O call, or returns `nil` once stopped.
+    func beginIO() -> Int32? {
         lock.lock()
         defer { lock.unlock() }
         guard !_isStopped, fd >= 0 else { return nil }
-        readerHoldsFD = true
+        activeClaims += 1
         return fd
     }
 
-    /// Releases the reader's claim, performing the deferred close if a stop landed mid-read.
-    func endRead() {
+    /// Releases one claim, performing the deferred close if a stop landed while it was held.
+    func endIO() {
         lock.lock()
-        readerHoldsFD = false
-        let doomed = _isStopped ? fd : -1
+        activeClaims = Swift.max(0, activeClaims - 1)
+        let doomed = (_isStopped && activeClaims == 0) ? fd : -1
         if doomed >= 0 { fd = -1 }
         lock.unlock()
 
@@ -56,19 +83,23 @@ final class SocketReadLatch: @unchecked Sendable {
         }
     }
 
-    /// Stops the loop, wakes a blocked `read(2)`, and releases the descriptor unless the reader is
-    /// currently inside `read`, in which case `endRead()` closes it.
+    func beginRead() -> Int32? { beginIO() }
+
+    func endRead() { endIO() }
+
+    /// Stops all I/O, wakes a blocked `read(2)` or `write(2)` by shutting the socket down, and
+    /// releases the descriptor unless a claim is outstanding, in which case `endIO()` closes it.
     func stop() {
         lock.lock()
         _isStopped = true
         let current = fd
-        let readerBusy = readerHoldsFD
-        if current >= 0 && !readerBusy { fd = -1 }
+        let busy = activeClaims > 0
+        if current >= 0 && !busy { fd = -1 }
         lock.unlock()
 
         guard current >= 0 else { return }
         Darwin.shutdown(current, SHUT_RDWR)
-        if !readerBusy {
+        if !busy {
             Darwin.close(current)
         }
     }
@@ -82,6 +113,10 @@ public actor UnixSocketTransport: Transport {
     private var isClosed = false
     private var readThread: Thread?
     private var readLatch = SocketReadLatch()
+    /// Writes run off the actor so `close()` can preempt a peer that stopped reading (§22.2).
+    private let writer = SocketWriter(label: "org.srui.UnixSocketTransport.write")
+    /// Bounds inbound read-ahead so a stalled consumer cannot grow memory without limit (§26).
+    private let backlogGate = InboundBacklogGate()
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 
@@ -99,9 +134,11 @@ public actor UnixSocketTransport: Transport {
     }
 
     deinit {
-        // The latch owns the descriptor and closes it exactly once, deferring to the reader thread
-        // if one is parked in `read(2)`.
+        // The latch owns the descriptor and closes it exactly once, deferring to whichever of the
+        // reader thread or writer queue still holds a claim.
+        writer.stop()
         readLatch.stop()
+        backlogGate.release()
         // Otherwise a consumer still iterating `receiveStream()` would hang forever. Drop the
         // termination handler first: it captures `self` weakly, and forming that reference while
         // the actor is mid-deallocation traps.
@@ -173,31 +210,20 @@ public actor UnixSocketTransport: Transport {
         guard socketFD >= 0 else {
             throw TransportError.closed
         }
-        let fd = socketFD
 
-        try data.withUnsafeBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.baseAddress else { return }
-            var bytesWritten = 0
-            let totalBytes = rawBuffer.count
+        // Handed to the serial writer queue rather than performed here: a blocking `write(2)` on
+        // the actor executor holds this actor for its whole duration, and `close()` is
+        // actor-isolated, so a peer that stops reading would make teardown unreachable (§22.2).
+        try await writer.write(data, claiming: readLatch)
+    }
 
-            while bytesWritten < totalBytes {
-                let chunkPtr = baseAddress.advanced(by: bytesWritten)
-                let remaining = totalBytes - bytesWritten
-                let written = Darwin.write(fd, chunkPtr, remaining)
+    public func acknowledgeReceived(byteCount: Int) async {
+        backlogGate.recordConsumed(byteCount)
+    }
 
-                if written < 0 {
-                    let err = errno
-                    if err == EINTR {
-                        continue
-                    }
-                    throw TransportError.ioError("Socket write failed: \(String(cString: strerror(err)))")
-                } else if written == 0 {
-                    throw TransportError.closed
-                }
-
-                bytesWritten += written
-            }
-        }
+    /// Bytes read from the socket that the consumer has not acknowledged yet (§26).
+    public var pendingInboundBytes: Int {
+        backlogGate.outstandingBytes
     }
 
     public nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
@@ -226,31 +252,36 @@ public actor UnixSocketTransport: Transport {
         let cont = self.continuation
         let latch = self.readLatch
 
+        let gate = self.backlogGate
+
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
 
-            while true {
-                // The latch hands out the descriptor only while it is guaranteed open, and takes it
-                // back in `endRead()`, so the number can never be recycled underneath this `read`.
-                guard let fd = latch.beginRead() else { break }
-                let bytesRead = Darwin.read(fd, &buffer, buffer.count)
-                let err = errno
-                latch.endRead()
+            readLoop: while true {
+                // §26: stop pulling from the socket while the consumer is behind. Committed
+                // transactions may not be dropped, so the bound has to be real backpressure.
+                guard gate.waitForCapacity() else { break readLoop }
 
-                if bytesRead > 0 {
-                    cont.yield(Data(buffer[0..<bytesRead]))
-                } else if bytesRead == 0 {
-                    // EOF
+                // The latch hands out the descriptor only while it is guaranteed open, so the
+                // number can never be recycled underneath this read.
+                switch readAvailable(from: latch, into: &buffer) {
+                case .bytes(let count):
+                    gate.recordDelivered(count)
+                    cont.yield(Data(buffer[0..<count]))
+                case .retry:
+                    continue readLoop
+                case .stopped:
+                    break readLoop
+                case .endOfStream:
                     cont.finish()
                     return
-                } else {
-                    if err == EINTR {
-                        continue
-                    }
+                case .failed(let err):
                     if err == EBADF || err == ECONNRESET || err == ENOTCONN {
                         cont.finish()
                     } else {
-                        cont.finish(throwing: TransportError.ioError("Socket read failed: \(String(cString: strerror(err)))"))
+                        cont.finish(throwing: TransportError.ioError(
+                            "Socket read failed: \(String(cString: strerror(err)))"
+                        ))
                     }
                     return
                 }
@@ -267,12 +298,14 @@ public actor UnixSocketTransport: Transport {
         guard !isClosed else { return }
         isClosed = true
 
-        // The latch stops the loop, shuts the socket down to wake a blocked `read`, and closes the
-        // descriptor — or hands that close to the reader if it is inside `read(2)` right now. That
-        // ordering is what makes joining the reader thread unnecessary: the number is never
-        // released while the reader might still use it. `send` and `close` are both actor-isolated,
-        // so no write can be in flight against this fd here.
+        // The latch stops both loops, shuts the socket down to wake a blocked `read` or `write`,
+        // and closes the descriptor — or hands that close to whichever side still holds a claim.
+        // That ordering is what makes joining the reader thread unnecessary: the number is never
+        // released while the reader or writer might still use it. Releasing the gate additionally
+        // wakes a reader parked on consumer backpressure so teardown cannot deadlock on it.
+        writer.stop()
         readLatch.stop()
+        backlogGate.release()
         readThread = nil
         socketFD = -1
         continuation.finish()

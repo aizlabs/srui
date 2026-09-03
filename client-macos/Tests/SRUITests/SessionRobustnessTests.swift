@@ -34,6 +34,7 @@ struct SessionRobustnessTests {
 
     private static func framedWelcome(sessionId: String = "test-session") throws -> Data {
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = sessionId
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var msg = SRUIMessage()
@@ -176,6 +177,7 @@ struct SessionRobustnessTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "default"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var welcomeMessage = SRUIMessage()
@@ -573,6 +575,7 @@ struct SessionRobustnessTests {
 
         var welcomeMsg = SRUIMessage()
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "test-session"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         welcomeMsg.serverWelcome = welcome

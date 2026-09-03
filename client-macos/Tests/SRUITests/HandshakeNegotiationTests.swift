@@ -71,6 +71,86 @@ struct HandshakeNegotiationTests {
         await serverTransport.close()
     }
 
+    /// §15: `core_version` is part of the handshake, not decoration.
+    ///
+    /// A proto3 string field that is absent decodes to `""`, so "omitted" and "empty" are the same
+    /// wire state. Treating that as "unspecified, therefore compatible" would let a generated
+    /// default authorize a session between peers that disagree about required semantics
+    /// (§4 inv. 13), so it must fail closed alongside an explicitly incompatible version.
+    @Test(
+        "Incompatible or absent SERVER WELCOME core_version fails the handshake",
+        arguments: ["", "1.0.0", "0.5.0", "garbage", "0"]
+    )
+    func incompatibleCoreVersionFailsHandshake(advertised: String) async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = advertised
+        welcome.sessionID = "core-version-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 0
+
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        try await AsyncTestSupport.eventually(description: "core version refusal") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+        #expect(!controller.isHandshakeComplete)
+        #expect(!controller.isEventDispatchEnabled)
+
+        if case .protocolViolation(let message)? = failurePromise.load() {
+            #expect(message.contains("core_version"))
+        } else {
+            Issue.record("Expected protocolViolation, got \(String(describing: failurePromise.load()))")
+        }
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    /// The patch level is free: only `major.minor` decides compatibility (§15).
+    @Test("A differing patch level still completes the handshake")
+    func compatiblePatchLevelIsAccepted() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = "0.4.99"
+        welcome.sessionID = "core-version-patch"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 0
+
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        try await AsyncTestSupport.eventually(description: "handshake completion") {
+            controller.isHandshakeComplete
+        }
+        #expect(!controller.isDiverged)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     @Test("Mismatched required profile fails cleanly at handshake time (§4 inv. 13)")
     func mismatchedRequiredProfileFailsCleanly() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()

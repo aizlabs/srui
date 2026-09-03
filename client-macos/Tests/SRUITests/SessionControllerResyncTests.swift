@@ -33,6 +33,7 @@ struct SessionControllerResyncTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "test-session"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var welcomeMsg = SRUIMessage()
@@ -116,6 +117,7 @@ struct SessionControllerResyncTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "test-session"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var welcomeMsg = SRUIMessage()
@@ -203,6 +205,7 @@ struct SessionControllerResyncTests {
 
         await controller.handleIncomingMessage({
             var welcome = SRUIServerWelcome()
+            welcome.coreVersion = SRUICoreVersion
             welcome.sessionID = "test-session"
             welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
             var msg = SRUIMessage()

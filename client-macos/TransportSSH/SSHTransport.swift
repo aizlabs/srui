@@ -64,10 +64,24 @@ public actor SSHTransport: Transport {
     public let configuration: SSHConfiguration
 
     private var process: Process?
-    private var stdinFD: Int32 = -1
+    /// Latched duplicate of the SSH child's stdin. The `Pipe` keeps owning the original; this
+    /// process-local copy is what the writer queue claims, so releasing the `Pipe` in `close()`
+    /// can never recycle a descriptor number a parked `write(2)` is still holding.
+    private var stdinLatch = SocketReadLatch()
+    private var hasStdin = false
+    /// Latched duplicate of the child's stdout, for the same reason as `stdinLatch`: the `Pipe`
+    /// closes its own descriptor when `process` is released, so the reader must hold a private
+    /// copy or `close()` can free a descriptor number out from under an in-flight `read(2)`.
     private var stdoutLatch = SocketReadLatch()
+    /// Latched duplicate of the child's stderr. Latched rather than raw so `close()` can stop the
+    /// diagnostic reader instead of leaving a thread parked in `read(2)` for the process lifetime.
+    private var stderrLatch = SocketReadLatch()
     private var stdoutReadThread: Thread?
     private var stderrReadThread: Thread?
+    /// Writes run off the actor so `close()` can preempt a stalled SSH child (§22.2).
+    private let writer = SocketWriter(label: "org.srui.SSHTransport.write")
+    /// Bounds inbound read-ahead so a stalled consumer cannot grow memory without limit (§26).
+    private let backlogGate = InboundBacklogGate()
 
     private var isClosed = false
     private var isConnected = false
@@ -121,7 +135,14 @@ public actor SSHTransport: Transport {
         if let proc = process, proc.isRunning {
             proc.terminate()
         }
+        writer.stop()
+        stdinLatch.stop()
         stdoutLatch.stop()
+        // Stopped here as well as in `close()`: a latch never marked stopped never performs its
+        // deferred close, so a transport released without an explicit `close()` would leak its
+        // private duplicate of the child's stderr (§22.2).
+        stderrLatch.stop()
+        backlogGate.release()
         continuation.onTermination = nil
         finishGuard.finish()
     }
@@ -151,12 +172,44 @@ public actor SSHTransport: Transport {
             throw TransportError.connectionFailed("Failed to spawn SSH process at \(configuration.sshBinaryPath): \(error.localizedDescription)")
         }
 
-        let stdoutFD = outPipe.fileHandleForReading.fileDescriptor
-        let stderrFD = errPipe.fileHandleForReading.fileDescriptor
-        let stdinWriteFD = inPipe.fileHandleForWriting.fileDescriptor
+        // Each parent-side pipe end is duplicated, then the `Pipe`'s own handle is closed, so the
+        // latch that adopts the duplicate becomes the descriptor's sole owner.
+        //
+        // Sharing a descriptor with the `Pipe` gives it two owners: the latch closes it in
+        // `close()` and the `FileHandle` closes it again when `process` is released. The second
+        // close lands on whatever the kernel has since handed that number to — an unrelated
+        // subsystem's socket, or worse, a descriptor the reader thread is still inside `read(2)`
+        // on. Duplicating also decouples teardown from `Pipe` deallocation timing, which nothing
+        // here controls (§22.2).
+        let handles = [
+            inPipe.fileHandleForWriting,
+            outPipe.fileHandleForReading,
+            errPipe.fileHandleForReading,
+        ]
+        let descriptors = handles.map { Darwin.dup($0.fileDescriptor) }
+
+        guard descriptors.allSatisfy({ $0 >= 0 }) else {
+            let failure = String(cString: strerror(errno))
+            for descriptor in descriptors where descriptor >= 0 {
+                Darwin.close(descriptor)
+            }
+            proc.terminate()
+            throw TransportError.connectionFailed("Failed to duplicate SSH pipes: \(failure)")
+        }
+
+        // Safe once the duplicates exist: the child holds its own ends, so neither the stdin write
+        // end nor the stdout/stderr read ends disappear from underneath it.
+        for handle in handles {
+            try? handle.close()
+        }
+
+        let stdinWriteFD = descriptors[0]
+        let stdoutFD = descriptors[1]
+        let stderrFD = descriptors[2]
 
         self.process = proc
-        self.stdinFD = stdinWriteFD
+        self.stdinLatch.adopt(descriptor: stdinWriteFD)
+        self.hasStdin = true
         self.isConnected = true
 
         startStderrReader(stderrFD: stderrFD)
@@ -167,38 +220,28 @@ public actor SSHTransport: Transport {
         if !isConnected {
             try connect()
         }
-        guard !isClosed, stdinFD >= 0, let proc = process, proc.isRunning else {
+        guard !isClosed, hasStdin, let proc = process, proc.isRunning else {
             throw TransportError.closed
         }
 
-        let fd = stdinFD
-        try data.withUnsafeBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.baseAddress else { return }
-            var bytesWritten = 0
-            let totalBytes = rawBuffer.count
-
-            while bytesWritten < totalBytes {
-                let chunkPtr = baseAddress.advanced(by: bytesWritten)
-                let remaining = totalBytes - bytesWritten
-                let written = Darwin.write(fd, chunkPtr, remaining)
-
-                if written < 0 {
-                    let err = errno
-                    if err == EINTR {
-                        continue
-                    }
-                    let stderrDiag = stderrAccumulator.summary()
-                    if !stderrDiag.isEmpty {
-                        throw TransportError.ioError("SSH write failed: \(String(cString: strerror(err))). Stderr: \(stderrDiag)")
-                    }
-                    throw TransportError.ioError("SSH write failed: \(String(cString: strerror(err)))")
-                } else if written == 0 {
-                    throw TransportError.closed
-                }
-
-                bytesWritten += written
-            }
+        // Off the actor executor: a blocking write to a child that stopped reading would hold this
+        // actor and make the actor-isolated `close()` unreachable (§22.2).
+        do {
+            try await writer.write(data, claiming: stdinLatch)
+        } catch let error as TransportError {
+            let stderrDiag = stderrAccumulator.summary()
+            guard !stderrDiag.isEmpty else { throw error }
+            throw TransportError.ioError("\(error.description). Stderr: \(stderrDiag)")
         }
+    }
+
+    public func acknowledgeReceived(byteCount: Int) async {
+        backlogGate.recordConsumed(byteCount)
+    }
+
+    /// Bytes read from the SSH channel that the consumer has not acknowledged yet (§26).
+    public var pendingInboundBytes: Int {
+        backlogGate.outstandingBytes
     }
 
     public nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
@@ -224,19 +267,28 @@ public actor SSHTransport: Transport {
     }
 
     /// Runs stderr capture on a dedicated thread (§19.1: stderr separate from binary protocol).
+    ///
+    /// Latched and poll-driven like the stdout reader so `close()` terminates it. A raw blocking
+    /// `read(2)` here would leave the thread parked for the lifetime of the process, holding a
+    /// descriptor nothing can revoke (§22.2).
     private func startStderrReader(stderrFD: Int32) {
         guard stderrReadThread == nil else { return }
+        stderrLatch.adopt(descriptor: stderrFD)
         let accumulator = stderrAccumulator
+        let latch = stderrLatch
 
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
-            while true {
-                let bytesRead = Darwin.read(stderrFD, &buffer, buffer.count)
-                if bytesRead <= 0 {
-                    break
-                }
-                if let str = String(bytes: buffer[0..<bytesRead], encoding: .utf8) {
-                    accumulator.append(str)
+            readLoop: while true {
+                switch readAvailable(from: latch, into: &buffer) {
+                case .bytes(let count):
+                    if let str = String(bytes: buffer[0..<count], encoding: .utf8) {
+                        accumulator.append(str)
+                    }
+                case .retry:
+                    continue readLoop
+                case .stopped, .endOfStream, .failed:
+                    break readLoop
                 }
             }
         }
@@ -255,23 +307,28 @@ public actor SSHTransport: Transport {
         let finishGuard = finishGuard
         let latch = stdoutLatch
         let accumulator = stderrAccumulator
+        let gate = backlogGate
 
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
 
-            while true {
-                guard let fd = latch.beginRead() else { break }
-                let bytesRead = Darwin.read(fd, &buffer, buffer.count)
-                latch.endRead()
+            readLoop: while true {
+                // §26: stop draining the channel while the consumer is behind, rather than
+                // buffering committed transactions without bound.
+                guard gate.waitForCapacity() else { break readLoop }
 
-                if bytesRead > 0 {
-                    cont.yield(Data(buffer[0..<bytesRead]))
-                } else if bytesRead == 0 {
-                    break
-                } else if errno == EINTR {
-                    continue
-                } else {
-                    finishGuard.finish(throwing: TransportError.ioError("SSH read failed: \(String(cString: strerror(errno)))"))
+                switch readAvailable(from: latch, into: &buffer) {
+                case .bytes(let count):
+                    gate.recordDelivered(count)
+                    cont.yield(Data(buffer[0..<count]))
+                case .retry:
+                    continue readLoop
+                case .stopped, .endOfStream:
+                    break readLoop
+                case .failed(let err):
+                    finishGuard.finish(throwing: TransportError.ioError(
+                        "SSH read failed: \(String(cString: strerror(err)))"
+                    ))
                     return
                 }
             }
@@ -302,7 +359,13 @@ public actor SSHTransport: Transport {
         isConnected = false
 
         process?.terminationHandler = nil
+        // Stopping the writer and its latch first unblocks any write parked against a child that
+        // stopped reading, so teardown never waits on a stalled peer (§22.2).
+        writer.stop()
+        stdinLatch.stop()
         stdoutLatch.stop()
+        stderrLatch.stop()
+        backlogGate.release()
         stdoutReadThread = nil
         stderrReadThread = nil
 
@@ -310,7 +373,7 @@ public actor SSHTransport: Transport {
             proc.terminate()
         }
         process = nil
-        stdinFD = -1
+        hasStdin = false
 
         // When connected, the stdout reader drains to EOF and owns the single finish call.
         if !wasConnected {

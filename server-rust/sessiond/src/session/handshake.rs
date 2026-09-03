@@ -19,6 +19,30 @@ use srui_semantic_tree::{CapabilitySet, Profile, SemanticStore};
 use super::snapshot::export_snapshot_transaction;
 use super::{Session, SessionError};
 
+/// Core protocol version this build speaks (§15).
+pub const CORE_VERSION: &str = "0.4.0";
+
+/// Whether `requested` names a core version this build can serve (§15, §4 inv. 13).
+///
+/// Compatibility is decided on `major.minor`; the patch level is free. An absent field decodes to
+/// the proto3 default `""`, which is indistinguishable from "omitted" on the wire, so it is
+/// refused rather than treated as "unspecified, therefore fine": a default must never be the thing
+/// that authorizes a session.
+fn core_version_is_compatible(requested: &str) -> bool {
+    fn major_minor(version: &str) -> Option<(&str, &str)> {
+        let mut parts = version.split('.');
+        let major = parts.next()?;
+        let minor = parts.next()?;
+        let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        (numeric(major) && numeric(minor)).then_some((major, minor))
+    }
+
+    match (major_minor(requested), major_minor(CORE_VERSION)) {
+        (Some(requested), Some(supported)) => requested == supported,
+        _ => false,
+    }
+}
+
 /// Result of an atomic fresh-client handshake bootstrap (§15, §18, §20.2).
 #[derive(Debug)]
 pub struct FreshClientBootstrap {
@@ -58,6 +82,16 @@ fn negotiate_hello(
     inner: &super::SessionInner,
     hello: &ClientHello,
 ) -> Result<(ServerWelcome, Option<SemanticStore>), SessionError> {
+    // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
+    // version would let two peers that disagree about required semantics reach the data plane
+    // (§4 inv. 13).
+    if !core_version_is_compatible(&hello.core_version) {
+        return Err(SessionError::UnsupportedCoreVersion {
+            requested: hello.core_version.clone(),
+            supported: CORE_VERSION.to_string(),
+        });
+    }
+
     let mut client_caps = CapabilitySet::new();
     for p_str in &hello.profiles {
         if let Ok(p) = Profile::parse(p_str) {
@@ -69,7 +103,7 @@ fn negotiate_hello(
 
     let initial_revision = inner.store.revision().get();
     let welcome = ServerWelcome {
-        core_version: "0.4.0".to_string(),
+        core_version: CORE_VERSION.to_string(),
         required_profiles: inner.capabilities.required.to_string_vec(),
         optional_profiles: inner.capabilities.optional.to_string_vec(),
         session_id: inner.session_id.clone(),
@@ -164,9 +198,18 @@ impl Session {
         )?;
         drop(inner_guard);
 
+        // Fails the handshake rather than emitting a catch-up transaction the client must reject
+        // and would then re-request forever (§18, §26).
+        let snapshot = match store_clone {
+            Some(store) => Some(export_snapshot_transaction(&store).inspect_err(|error| {
+                tracing::error!(%error, "refusing to send an unrepresentable catch-up snapshot");
+            })?),
+            None => None,
+        };
+
         Ok(FreshClientBootstrap {
             welcome,
-            snapshot: store_clone.map(|store| export_snapshot_transaction(&store)),
+            snapshot,
             transactions,
         })
     }
@@ -292,7 +335,13 @@ impl Session {
                     continuity: continuity as i32,
                     last_processed_event_seq,
                 },
-                snapshot_transaction: export_snapshot_transaction(&store_snapshot),
+                // A resync the client cannot decode is worse than a refused resume: it strands the
+                // client awaiting a snapshot that every retry reproduces byte-for-byte (§18, §26).
+                snapshot_transaction: export_snapshot_transaction(&store_snapshot).inspect_err(
+                    |error| {
+                        tracing::error!(%error, "refusing to send an unrepresentable resync snapshot");
+                    },
+                )?,
             },
         };
 

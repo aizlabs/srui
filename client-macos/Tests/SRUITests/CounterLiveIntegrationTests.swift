@@ -36,6 +36,7 @@ struct CounterLiveIntegrationTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "default"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var welcomeMessage = SRUIMessage()

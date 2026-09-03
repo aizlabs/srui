@@ -21,6 +21,10 @@ public actor TCPSocketTransport: Transport {
     private var isClosed = false
     private var readThread: Thread?
     private var readLatch = SocketReadLatch()
+    /// Writes run off the actor so `close()` can preempt a peer that stopped reading (§22.2).
+    private let writer = SocketWriter(label: "org.srui.TCPSocketTransport.write")
+    /// Bounds inbound read-ahead so a stalled consumer cannot grow memory without limit (§26).
+    private let backlogGate = InboundBacklogGate()
     private let stream: AsyncThrowingStream<Data, Error>
     private let continuation: AsyncThrowingStream<Data, Error>.Continuation
 
@@ -39,9 +43,11 @@ public actor TCPSocketTransport: Transport {
     }
 
     deinit {
-        // The latch owns the descriptor and closes it exactly once, deferring to the reader thread
-        // if one is parked in `read(2)`.
+        // The latch owns the descriptor and closes it exactly once, deferring to whichever of the
+        // reader thread or writer queue still holds a claim.
+        writer.stop()
         readLatch.stop()
+        backlogGate.release()
         // Otherwise a consumer still iterating `receiveStream()` would hang forever. Drop the
         // termination handler first: it captures `self` weakly, and forming that reference while
         // the actor is mid-deallocation traps.
@@ -103,31 +109,19 @@ public actor TCPSocketTransport: Transport {
         guard socketFD >= 0 else {
             throw TransportError.closed
         }
-        let fd = socketFD
 
-        try data.withUnsafeBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.baseAddress else { return }
-            var bytesWritten = 0
-            let totalBytes = rawBuffer.count
+        // Off the actor executor: see `SocketWriter` for why a blocking write here would make
+        // `close()` unreachable while a peer is not draining its buffer (§22.2).
+        try await writer.write(data, claiming: readLatch)
+    }
 
-            while bytesWritten < totalBytes {
-                let chunkPtr = baseAddress.advanced(by: bytesWritten)
-                let remaining = totalBytes - bytesWritten
-                let written = Darwin.write(fd, chunkPtr, remaining)
+    public func acknowledgeReceived(byteCount: Int) async {
+        backlogGate.recordConsumed(byteCount)
+    }
 
-                if written < 0 {
-                    let err = errno
-                    if err == EINTR {
-                        continue
-                    }
-                    throw TransportError.ioError("TCP write failed: \(String(cString: strerror(err)))")
-                } else if written == 0 {
-                    throw TransportError.closed
-                }
-
-                bytesWritten += written
-            }
-        }
+    /// Bytes read from the socket that the consumer has not acknowledged yet (§26).
+    public var pendingInboundBytes: Int {
+        backlogGate.outstandingBytes
     }
 
     public nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
@@ -153,31 +147,36 @@ public actor TCPSocketTransport: Transport {
         let cont = self.continuation
         let latch = self.readLatch
 
+        let gate = self.backlogGate
+
         let thread = Thread {
             var buffer = [UInt8](repeating: 0, count: 65536)
 
-            while true {
-                // The latch hands out the descriptor only while it is guaranteed open, and takes it
-                // back in `endRead()`, so the number can never be recycled underneath this `read`.
-                guard let fd = latch.beginRead() else { break }
-                let bytesRead = Darwin.read(fd, &buffer, buffer.count)
-                let err = errno
-                latch.endRead()
+            readLoop: while true {
+                // §26: stop pulling from the socket while the consumer is behind, rather than
+                // buffering committed transactions without bound.
+                guard gate.waitForCapacity() else { break readLoop }
 
-                if bytesRead > 0 {
-                    cont.yield(Data(buffer[0..<bytesRead]))
-                } else if bytesRead == 0 {
-                    // EOF
+                // The latch hands out the descriptor only while it is guaranteed open, so the
+                // number can never be recycled underneath this read.
+                switch readAvailable(from: latch, into: &buffer) {
+                case .bytes(let count):
+                    gate.recordDelivered(count)
+                    cont.yield(Data(buffer[0..<count]))
+                case .retry:
+                    continue readLoop
+                case .stopped:
+                    break readLoop
+                case .endOfStream:
                     cont.finish()
                     return
-                } else {
-                    if err == EINTR {
-                        continue
-                    }
+                case .failed(let err):
                     if err == EBADF || err == ECONNRESET || err == ENOTCONN {
                         cont.finish()
                     } else {
-                        cont.finish(throwing: TransportError.ioError("TCP read failed: \(String(cString: strerror(err)))"))
+                        cont.finish(throwing: TransportError.ioError(
+                            "TCP read failed: \(String(cString: strerror(err)))"
+                        ))
                     }
                     return
                 }
@@ -194,12 +193,13 @@ public actor TCPSocketTransport: Transport {
         guard !isClosed else { return }
         isClosed = true
 
-        // The latch stops the loop, shuts the socket down to wake a blocked `read`, and closes the
-        // descriptor — or hands that close to the reader if it is inside `read(2)` right now. That
-        // ordering is what makes joining the reader thread unnecessary: the number is never
-        // released while the reader might still use it. `send` and `close` are both actor-isolated,
-        // so no write can be in flight against this fd here.
+        // The latch stops both loops, shuts the socket down to wake a blocked `read` or `write`,
+        // and closes the descriptor — or hands that close to whichever side still holds a claim.
+        // Releasing the gate additionally wakes a reader parked on consumer backpressure, so
+        // teardown cannot deadlock on it.
+        writer.stop()
         readLatch.stop()
+        backlogGate.release()
         readThread = nil
         socketFD = -1
         continuation.finish()

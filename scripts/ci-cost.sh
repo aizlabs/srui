@@ -18,16 +18,33 @@ since=$(date -u -v-"${days}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "${d
 
 printf 'Repository: %s\nSince:      %s (%s days)\n\n' "$repo" "$since" "$days"
 
-gh api --paginate "repos/$repo/actions/runs?created=>$since" --jq '.workflow_runs[].id' \
-| while read -r run_id; do
-	gh api "repos/$repo/actions/runs/$run_id/jobs" --jq '
-		.jobs[]
-		| select(.started_at != null and .completed_at != null)
-		| [ (.labels[0] // "unknown"), .name,
-		    (((.completed_at | fromdate) - (.started_at | fromdate)) / 60) ]
-		| @tsv'
-done \
-| awk -F'\t' '
+# Every API result is materialised and checked before anything is summed. `/bin/sh` has no
+# `pipefail`, so piping `gh api` straight into `awk` would report awk's status only: an expired
+# token, a rate limit, or a transient 5xx would silently produce partial totals — or a confident
+# "No completed jobs in this window." — and exit 0, understating spend exactly when it matters.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT INT TERM
+
+if ! gh api --paginate "repos/$repo/actions/runs?created=>$since" --jq '.workflow_runs[].id' \
+	> "$work/runs"; then
+	echo "error: could not list workflow runs for $repo" >&2
+	exit 1
+fi
+
+while read -r run_id; do
+	[ -n "$run_id" ] || continue
+	if ! gh api "repos/$repo/actions/runs/$run_id/jobs" --jq '
+			.jobs[]
+			| select(.started_at != null and .completed_at != null)
+			| [ (.labels[0] // "unknown"), .name,
+			    (((.completed_at | fromdate) - (.started_at | fromdate)) / 60) ]
+			| @tsv' >> "$work/jobs"; then
+		echo "error: could not read jobs for run $run_id; totals would be incomplete" >&2
+		exit 1
+	fi
+done < "$work/runs"
+
+awk -F'\t' '
 	# Public per-minute rates for private repositories.
 	BEGIN {
 		rate["ubuntu-latest"] = 0.008; rate["ubuntu-22.04"] = 0.008; rate["ubuntu-24.04"] = 0.008
@@ -43,6 +60,8 @@ done \
 		total_min += billed; total_cost += billed * r; runs++
 	}
 	END {
+		# Reachable only when the API genuinely returned no jobs: every request above is
+		# checked, so this can no longer mean "the token expired".
 		if (runs == 0) { print "No completed jobs in this window."; exit }
 		printf "%-34s %-16s %8s %10s\n", "JOB", "RUNNER", "MINUTES", "COST"
 		# Insertion sort by cost, descending. `asorti` is a gawk extension and macOS ships the
@@ -64,4 +83,4 @@ done \
 			printf "%-34s %-16s %8d %9.2f$\n", r, "", run_min[r], run_cost[r]
 		printf "\n%-51s %8d %9.2f$\n", "TOTAL", total_min, total_cost
 	}
-'
+' "$work/jobs"

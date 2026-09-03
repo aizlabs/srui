@@ -7,28 +7,78 @@ name: CI
 # re-validating a tree the PR already validated) were the two high-frequency triggers, and neither
 # adds signal that `.githooks/pre-push` does not already produce locally on every push.
 #
-# Workflow:
-#   1. gh pr create --draft                      -> no runner time, no Codex review
-#   2. push freely; `.githooks/pre-push` runs the identical checks locally
-#   3. gh pr comment <n> --body "@codex review"  -> free, repeatable, while still a draft
-#   4. gh pr ready <n>                           -> Codex reviews + CI runs once, as the gate
+# Review comes first, then CI. The intended order is:
 #
-# Step 3 exists because Codex review and CI have different costs. Codex triggers on exactly three
-# events -- PR opened for review, draft marked ready, and an "@codex review" comment -- so it never
-# reacts to a push either. Asking for it explicitly keeps the review loop free while drafting, and
-# spends runner minutes only at step 4.
+#   1. gh pr create --draft   -> no runner time; `codex-draft-review.yml` requests a Codex review
+#   2. push freely            -> `.githooks/pre-push` runs CI's checks locally, and each push gets
+#                                a fresh Codex review
+#   3. resolve every Codex thread on the PR
+#   4. gh pr ready <n>        -> CI runs once, as the merge gate
 #
-# To re-run after a post-ready fix, without toggling draft state:
-#   gh workflow run ci.yml --ref <branch>
+# Step 3 is enforced, not merely documented: the `review-gate` job below fails while any Codex
+# review thread is unresolved, and every other job depends on it. Ordering the pipeline this way
+# keeps the expensive macOS job from running against code that review has already flagged.
+#
+# Every non-draft head is validated. Drafts are skipped by the `if:` on each job rather than by
+# the trigger list: gating on `ready_for_review` alone would silently skip a PR opened directly in
+# the normal non-draft state, and skip every push made after a draft became ready, leaving merge
+# candidates unvalidated. Cost control comes from staying in draft while iterating, not from
+# letting a ready PR merge unchecked.
 on:
   pull_request:
-    types: [ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review]
     branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
+  # Cheap Linux gate in front of everything else, so unresolved review findings cost one Linux
+  # minute rather than a full macOS run. Skipped for `workflow_dispatch`, which carries no PR.
+  review-gate:
+    name: Codex Review Resolved
+    # Draft PRs iterate for free: `codex-draft-review.yml` reviews them, `.githooks/pre-push` runs
+    # the checks locally, and no runner time is spent here until the PR is marked ready.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every Codex review thread to be resolved
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # `isOutdated` threads are deliberately still counted: a thread going stale because the
+          # line moved is not the same as the finding being addressed. Resolve it explicitly.
+          unresolved=$(gh api graphql \
+            -f query='
+              query($owner:String!,$repo:String!,$pr:Int!){
+                repository(owner:$owner,name:$repo){
+                  pullRequest(number:$pr){
+                    reviewThreads(first:100){
+                      nodes{ isResolved path
+                        comments(first:1){ nodes{ author{login} } } } } } } }' \
+            -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" -F pr="$PR" \
+            --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+                   | select(.isResolved == false)
+                   | select((.comments.nodes[0].author.login // "") | startswith("chatgpt-codex-connector"))
+                   | .path]')
+
+          count=$(printf '%s' "$unresolved" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "No unresolved Codex review threads."
+            exit 0
+          fi
+
+          echo "$count unresolved Codex review thread(s):"
+          printf '%s' "$unresolved" | jq -r '.[] | "  - \(.)"'
+          echo
+          echo "Resolve each thread on the PR, then re-run:"
+          echo "  gh workflow run ci.yml --ref ${GITHUB_HEAD_REF:-<branch>}"
+          exit 1
+
   registry:
     name: Registry Validation
+    needs: review-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +97,7 @@ jobs:
   # tests against a real `sessiond`.
   rust:
     name: Rust Build (Linux)
+    needs: review-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +120,7 @@ jobs:
   # platform-specific, so this runs where it is cheapest (§26 decode limits are host-independent).
   fuzz:
     name: Decoder Fuzz Regression
+    needs: review-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +174,7 @@ jobs:
 
   swift:
     name: Swift Build
+    needs: review-gate
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -130,6 +183,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build server-rust binaries for integration tests
         run: cargo build --manifest-path server-rust/Cargo.toml
+      # `terminate_key` has a `cfg(not(target_os = "linux"))` fallback that the Linux job never
+      # compiles. This job is the only macOS compile in CI, so the non-Linux branch is checked
+      # here or nowhere. `clippy --all-targets` type-checks it without paying to run the suite
+      # twice; the tests themselves run on Linux, the expected server platform.
+      - name: Type-check the non-Linux process-monitor fallback
+        run: cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
       - name: Build example servers for integration tests
         run: cargo build --manifest-path examples/counter/Cargo.toml
       - name: Verify SemanticModel does not import AppKit or Cocoa (§1)

@@ -8,9 +8,15 @@ name: CI
 # adds signal that `.githooks/pre-push` does not already produce locally on every push.
 #
 # Workflow:
-#   1. open the PR as a draft            -> no runner time
+#   1. gh pr create --draft                      -> no runner time, no Codex review
 #   2. push freely; `.githooks/pre-push` runs the identical checks locally
-#   3. `gh pr ready <n>`                 -> CI runs once, as the merge gate
+#   3. gh pr comment <n> --body "@codex review"  -> free, repeatable, while still a draft
+#   4. gh pr ready <n>                           -> Codex reviews + CI runs once, as the gate
+#
+# Step 3 exists because Codex review and CI have different costs. Codex triggers on exactly three
+# events -- PR opened for review, draft marked ready, and an "@codex review" comment -- so it never
+# reacts to a push either. Asking for it explicitly keeps the review loop free while drafting, and
+# spends runner minutes only at step 4.
 #
 # To re-run after a post-ready fix, without toggling draft state:
 #   gh workflow run ci.yml --ref <branch>

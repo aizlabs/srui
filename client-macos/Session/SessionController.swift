@@ -863,6 +863,7 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
+        await syncLiveResourceReferences()
         do {
             if let commit = try await resourceCache.ingestMetadata(input) {
                 await dispatchResourceCommit(commit)
@@ -890,6 +891,7 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
+        await syncLiveResourceReferences()
         do {
             if let commit = try await resourceCache.ingestChunk(input) {
                 await dispatchResourceCommit(commit)
@@ -902,15 +904,26 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// Pins hashes currently shown by Image nodes so committed-CAS eviction cannot drop them (§26).
+    private func syncLiveResourceReferences() async {
+        let live = await MainActor.run { self.renderer?.liveResourceHashes() ?? [] }
+        await resourceCache.setLiveReferences(live)
+    }
+
     /// Pushes a newly committed decoded image onto AppKit on the main actor (§14, §22.2).
+    ///
+    /// Reconfirmed commits (`newlyCommitted == false`) still hydrate a replacement renderer that
+    /// shares the cache but does not yet hold the `NSImage`.
     private func dispatchResourceCommit(_ commit: ResourceCommit) async {
         rejectedResourceHashes.remove(commit.image.hash)
         await MainActor.run {
             if !commit.evictedHashes.isEmpty {
                 self.renderer?.evictResourceImages(commit.evictedHashes)
             }
-            guard commit.newlyCommitted else { return }
-            self.renderer?.commitResourceImage(commit.image)
+            let alreadyInstalled = self.renderer?.resolveResourceImage(commit.image.hash) != nil
+            if commit.newlyCommitted || !alreadyInstalled {
+                self.renderer?.commitResourceImage(commit.image)
+            }
         }
     }
 

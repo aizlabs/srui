@@ -1,6 +1,6 @@
 //! Bounded SHA-256 content-addressed resource store (§14).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -132,10 +132,19 @@ impl ResourceStore {
     ///
     /// Oversized payloads are rejected before hashing or copying into store-owned
     /// memory. Identical content is deduplicated and never overwrites an existing
-    /// hash.
+    /// hash. Eviction never removes hashes in `protected` (live semantic references).
     pub fn publish_resource(
         &mut self,
         bytes: impl AsRef<[u8]>,
+    ) -> Result<PublishOutcome, ResourceError> {
+        self.publish_resource_protecting(bytes, &HashSet::new())
+    }
+
+    /// Like [`Self::publish_resource`], but refuses to evict hashes in `protected` (§14).
+    pub fn publish_resource_protecting(
+        &mut self,
+        bytes: impl AsRef<[u8]>,
+        protected: &HashSet<ResourceHash>,
     ) -> Result<PublishOutcome, ResourceError> {
         let slice = bytes.as_ref();
         if slice.len() > self.limits.max_resource_bytes {
@@ -154,10 +163,9 @@ impl ResourceStore {
             });
         }
 
-        // Evict oldest retained entries until the new payload fits. Hitting the ceiling is not a
-        // permanent hard failure for long-lived sessions that publish many distinct images (§14).
+        // Evict oldest unprotected entries until the new payload fits (§14).
         while self.entries.len() >= self.limits.max_entries {
-            if !self.evict_oldest() {
+            if !self.evict_oldest(protected) {
                 return Err(ResourceError::EntryLimitExceeded {
                     limit: self.limits.max_entries,
                 });
@@ -170,7 +178,7 @@ impl ResourceStore {
             },
         )?;
         while next_total > self.limits.max_total_bytes {
-            if !self.evict_oldest() {
+            if !self.evict_oldest(protected) {
                 return Err(ResourceError::TotalBytesLimitExceeded {
                     limit: self.limits.max_total_bytes,
                 });
@@ -199,12 +207,12 @@ impl ResourceStore {
         })
     }
 
-    /// Removes the oldest retained entry (insertion order). Returns `false` when empty.
-    fn evict_oldest(&mut self) -> bool {
-        let Some(oldest) = self.order.first().copied() else {
+    /// Removes the oldest retained entry that is not in `protected`. Returns `false` when none.
+    fn evict_oldest(&mut self, protected: &HashSet<ResourceHash>) -> bool {
+        let Some(idx) = self.order.iter().position(|hash| !protected.contains(hash)) else {
             return false;
         };
-        self.order.remove(0);
+        let oldest = self.order.remove(idx);
         if let Some(entry) = self.entries.remove(&oldest) {
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
         }

@@ -124,6 +124,28 @@ fn entry_and_total_byte_limits_evict_oldest() {
 }
 
 #[test]
+fn eviction_skips_protected_hashes() {
+    use std::collections::HashSet;
+
+    let limits = ResourceLimits {
+        max_resource_bytes: 16,
+        max_entries: 1,
+        max_total_bytes: 32,
+    };
+    let mut store = ResourceStore::with_limits(limits);
+    let first = store.publish_resource(b"one").unwrap().hash;
+    let mut protected = HashSet::new();
+    protected.insert(first);
+
+    match store.publish_resource_protecting(b"two", &protected) {
+        Err(ResourceError::EntryLimitExceeded { limit }) => assert_eq!(limit, 1),
+        other => panic!("expected EntryLimitExceeded while protected, got {other:?}"),
+    }
+    assert!(store.contains(&first));
+    assert_eq!(store.len(), 1);
+}
+
+#[test]
 fn multi_chunk_reconstruction_matches_source() {
     let len = CHUNK_PAYLOAD_SIZE * 3 + 7;
     let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();

@@ -63,6 +63,17 @@ public final class AppKitRenderer {
         refreshImageHandles(matching: image.hash, with: nsImage)
     }
 
+    /// Hashes currently referenced by mounted Image handles (`pendingResourceHash`) (§14, §26).
+    public func liveResourceHashes() -> Set<ResourceHash> {
+        var hashes = Set<ResourceHash>()
+        for handle in registry.allHandles {
+            if let pending = handle.pendingResourceHash {
+                hashes.insert(pending)
+            }
+        }
+        return hashes
+    }
+
     /// Drops retained images for hashes evicted from the client resource CAS and restores
     /// placeholders on any Image handles still pointing at those hashes (§14, §26).
     public func evictResourceImages(_ hashes: [ResourceHash]) {

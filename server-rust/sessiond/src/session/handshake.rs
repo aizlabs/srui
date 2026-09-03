@@ -143,6 +143,24 @@ fn negotiated_max_resource_size(server: u32, client_limits: Option<&ClientLimits
     }
 }
 
+/// Bounds remembered per-client ceilings; `client_instance_id` is client-supplied (§15, §26).
+const MAX_CLIENT_RESOURCE_CEILINGS: usize = 256;
+
+fn remember_client_resource_ceiling(
+    ceilings: &mut std::collections::HashMap<Vec<u8>, u64>,
+    client_instance_id: &[u8],
+    max_resource_size: u64,
+) {
+    if ceilings.len() >= MAX_CLIENT_RESOURCE_CEILINGS && !ceilings.contains_key(client_instance_id)
+    {
+        // Drop an arbitrary entry to keep the table bounded.
+        if let Some(key) = ceilings.keys().next().cloned() {
+            ceilings.remove(&key);
+        }
+    }
+    ceilings.insert(client_instance_id.to_vec(), max_resource_size);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResyncCause {
     ReplacedIncarnation,
@@ -202,7 +220,7 @@ impl Session {
     where
         F: FnOnce(),
     {
-        let inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let (welcome, store_clone) = negotiate_hello(&inner_guard, hello)?;
 
         before_subscribe();
@@ -212,6 +230,11 @@ impl Session {
         let max_resource_size = negotiated_max_resource_size(
             inner_guard.limits.max_resource_size,
             hello.limits.as_ref(),
+        );
+        remember_client_resource_ceiling(
+            &mut inner_guard.client_resource_ceilings,
+            &hello.client_instance_id,
+            max_resource_size,
         );
         let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
@@ -334,9 +357,13 @@ impl Session {
 
         let max_ops = inner_guard.limits.max_transaction_operations as usize;
         let max_frame_size = inner_guard.limits.max_frame_size as usize;
-        // ClientResume carries no limits; use the server ceiling until a known-hash / renegotiate
-        // path exists (Task 26).
-        let max_resource_size = u64::from(inner_guard.limits.max_resource_size);
+        // ClientResume carries no limits; reuse the last negotiated ceiling for this
+        // client_instance_id, falling back to the server default (§15, §26).
+        let max_resource_size = inner_guard
+            .client_resource_ceilings
+            .get(&resume.client_instance_id)
+            .copied()
+            .unwrap_or_else(|| u64::from(inner_guard.limits.max_resource_size));
         let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
             resume.client_instance_id.clone(),

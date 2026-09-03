@@ -128,6 +128,8 @@ public enum ResourceCacheError: Error, Equatable, Sendable, CustomStringConverti
     case dimensionLimit(width: Int, height: Int, reason: String)
     case assemblyLimit(concurrent: Int, limit: Int)
     case inFlightBytesLimit(requested: Int, limit: Int)
+    case committedBytesLimit(requested: Int, limit: Int)
+    case committedEntryLimit(count: Int, limit: Int)
     case metadataConflict(ResourceHash)
 
     public var description: String {
@@ -154,6 +156,10 @@ public enum ResourceCacheError: Error, Equatable, Sendable, CustomStringConverti
             return "concurrent assemblies \(concurrent) exceed limit \(limit)"
         case .inFlightBytesLimit(let requested, let limit):
             return "in-flight bytes would become \(requested), limit \(limit)"
+        case .committedBytesLimit(let requested, let limit):
+            return "committed decoded bytes would become \(requested), limit \(limit)"
+        case .committedEntryLimit(let count, let limit):
+            return "committed entry count would become \(count), limit \(limit)"
         case .metadataConflict(let hash):
             return "conflicting metadata for already-assembling resource \(hash)"
         }
@@ -242,6 +248,8 @@ public actor ResourceCache {
     private var committedDecodedBytes: Int = 0
     private var partials: [ResourceHash: PartialAssembly] = [:]
     private var inFlightBytes: Int = 0
+    /// Hashes currently shown by live Image nodes; never evicted while live (§14, §26).
+    private var liveReferences: Set<ResourceHash> = []
 
     public init(limits: ResourceLimits = ResourceLimits()) {
         self.limits = limits
@@ -444,12 +452,18 @@ public actor ResourceCache {
             encodedLength: metadata.encodedLength,
             cgImage: cgImage
         )
-        let evicted = insertCommitted(validated)
+        let evicted = try insertCommitted(validated)
         return ResourceCommit(image: validated, newlyCommitted: true, evictedHashes: evicted)
     }
 
-    /// Inserts into the committed CAS, evicting oldest entries to honor committed bounds (§26).
-    private func insertCommitted(_ image: ValidatedDecodedImage) -> [ResourceHash] {
+    /// Updates the set of hashes currently referenced by live Image nodes. Eviction never drops
+    /// these entries, so visible content is not permanently replaced with placeholders (§14, §26).
+    public func setLiveReferences(_ hashes: Set<ResourceHash>) {
+        liveReferences = hashes
+    }
+
+    /// Inserts into the committed CAS, evicting oldest *non-live* entries to honor bounds (§26).
+    private func insertCommitted(_ image: ValidatedDecodedImage) throws -> [ResourceHash] {
         if committed[image.hash] != nil {
             // Already retained (idempotent finalize); touch order.
             if let idx = committedOrder.firstIndex(of: image.hash) {
@@ -459,19 +473,36 @@ public actor ResourceCache {
             return []
         }
 
-        var evicted: [ResourceHash] = []
         let decodedBytes = Self.estimatedDecodedBytes(
             width: image.pixelWidth,
             height: image.pixelHeight
         )
+        // A single image larger than the committed budget must be rejected, not force-inserted
+        // after emptying the CAS (§26).
+        if decodedBytes > limits.maxCommittedDecodedBytes {
+            throw ResourceCacheError.committedBytesLimit(
+                requested: decodedBytes,
+                limit: limits.maxCommittedDecodedBytes
+            )
+        }
 
+        var evicted: [ResourceHash] = []
         while committed.count >= limits.maxCommittedEntries {
-            guard let oldest = evictOldestCommitted() else { break }
+            guard let oldest = evictOldestCommitted(excluding: liveReferences) else {
+                throw ResourceCacheError.committedEntryLimit(
+                    count: committed.count + 1,
+                    limit: limits.maxCommittedEntries
+                )
+            }
             evicted.append(oldest)
         }
         while committedDecodedBytes + decodedBytes > limits.maxCommittedDecodedBytes {
-            guard !committed.isEmpty else { break }
-            guard let oldest = evictOldestCommitted() else { break }
+            guard let oldest = evictOldestCommitted(excluding: liveReferences) else {
+                throw ResourceCacheError.committedBytesLimit(
+                    requested: committedDecodedBytes + decodedBytes,
+                    limit: limits.maxCommittedDecodedBytes
+                )
+            }
             evicted.append(oldest)
         }
 
@@ -481,9 +512,11 @@ public actor ResourceCache {
         return evicted
     }
 
-    private func evictOldestCommitted() -> ResourceHash? {
-        guard let oldest = committedOrder.first else { return nil }
-        committedOrder.removeFirst()
+    private func evictOldestCommitted(excluding protected: Set<ResourceHash>) -> ResourceHash? {
+        guard let idx = committedOrder.firstIndex(where: { !protected.contains($0) }) else {
+            return nil
+        }
+        let oldest = committedOrder.remove(at: idx)
         if let removed = committed.removeValue(forKey: oldest) {
             committedDecodedBytes = max(
                 0,

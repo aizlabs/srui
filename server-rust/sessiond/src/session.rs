@@ -205,6 +205,10 @@ pub(crate) struct SessionInner {
     pub(crate) capabilities: ServerCapabilities,
     pub(crate) limits: ServerLimits,
     pub(crate) resources: ResourceStore,
+    /// Negotiated per-`client_instance_id` resource ceilings from ClientHello (§15, §26).
+    ///
+    /// Retained so ClientResume (which carries no limits) can reuse the last negotiated value.
+    pub(crate) client_resource_ceilings: HashMap<Vec<u8>, u64>,
     pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
 }
 
@@ -220,6 +224,10 @@ impl std::fmt::Debug for SessionInner {
             .field("capabilities", &self.capabilities)
             .field("limits", &self.limits)
             .field("resources", &self.resources)
+            .field(
+                "client_resource_ceilings",
+                &self.client_resource_ceilings.len(),
+            )
             .field("handler_count", &self.handlers.len())
             .finish()
     }
@@ -376,6 +384,7 @@ impl Session {
             capabilities: config.capabilities,
             limits,
             resources: ResourceStore::new(),
+            client_resource_ceilings: HashMap::new(),
             handlers: HashMap::new(),
         };
 
@@ -504,7 +513,11 @@ impl Session {
     ) -> Result<PublishOutcome, SessionError> {
         let outcome = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-            guard.resources.publish_resource(bytes)?
+            // Never evict hashes still referenced by the authoritative tree (§14).
+            let protected = guard.store.referenced_resource_hashes();
+            guard
+                .resources
+                .publish_resource_protecting(bytes, &protected)?
         };
         if outcome.inserted {
             self.outbound_hub.publish_resource(&outcome.entry);

@@ -28,15 +28,18 @@ guarantee — the conformance vectors and the test suites are what enforce behav
 
 ## Why they are kept anyway
 
-Measured before deciding, since "a corpus is just a cache" is an argument for deleting it. Each
-target was run three ways — the committed corpus replayed without mutation, the CI seeds alone for
-15 s, and both together for 15 s (`cov` = edges, `ft` = features):
+Measured before deciding, since "a corpus is just a cache" is an argument for deleting it. The
+three targets shown below were run three ways — the committed corpus replayed without mutation, the
+CI seeds alone for 15 s, and both together for 15 s (`cov` = edges, `ft` = features):
 
 | Target | Corpus replay, no mutation | CI seeds + 15 s | Corpus + seeds + 15 s | Corpus contribution |
 |---|---|---|---|---|
 | `decode_framed` | cov 2664 / ft 7345 | cov 3395 / ft 9595 | cov 3470 / ft 10245 | +2.2% cov, +6.8% ft |
 | `decode_wire` | cov 1851 / ft 4505 | cov 2285 / ft 5339 | cov 2539 / ft 6490 | +11.1% cov, +21.6% ft |
 | `apply_transaction` | cov 1397 / ft 2564 | cov 1615 / ft 3748 | cov 1745 / ft 4264 | +8.0% cov, +13.8% ft |
+
+`state_sequence` is absent from this historical comparison because no equivalent seeds-only
+measurement has been recorded for it yet.
 
 Three things follow, and they are the reason this directory still exists:
 
@@ -68,6 +71,18 @@ below before acting on these numbers.
   anything outside the four target directories for exactly that reason.
 
 ## Working with the corpora
+
+From the repository root, the helper script copies the committed corpus and canonical fixtures to a
+temporary directory, replays them, then fuzzes every target for 15 seconds without dirtying the
+working tree. Pass a different per-target duration, or `0` for replay only:
+
+```bash
+./scripts/run-fuzz.sh
+./scripts/run-fuzz.sh 60
+./scripts/run-fuzz.sh 0
+```
+
+For direct work on one corpus:
 
 ```bash
 cd server-rust/fuzz

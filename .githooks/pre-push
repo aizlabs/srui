@@ -40,6 +40,8 @@ run "rust: cargo test" cargo test --manifest-path server-rust/Cargo.toml --works
 run "rust: cargo clippy" cargo clippy --manifest-path server-rust/Cargo.toml --workspace --all-targets -- -D warnings
 run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
 run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+run "rust: ui-gallery test" cargo test --manifest-path examples/ui-gallery/Cargo.toml
+run "rust: ui-gallery clippy" cargo clippy --manifest-path examples/ui-gallery/Cargo.toml --all-targets -- -D warnings
 
 # --- Swift Build (CI: job `swift`) -------------------------------------------
 # The integration tests drive a real sessiond and counter server, so both must be built first,

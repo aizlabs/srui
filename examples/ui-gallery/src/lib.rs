@@ -1,0 +1,588 @@
+//! Extensible SRUI UI gallery (§5.2, §7.2, §7.3, §7.6, §7.7, §8, §12.1, §12.2, §14, §19.2, §23).
+//!
+//! # What this example is for
+//!
+//! One scrollable surface containing every node type the AppKit renderer can build today, a real
+//! image delivered through the chunked resource path, a guided sequence of server-driven
+//! mutations, and two live telemetry panels. It is the visual counterpart to the protocol tests:
+//! if a semantic feature works, it is visible here.
+//!
+//! # Architecture & Protocol Invariants
+//!
+//! - **§5.2 Semantic state, not display remoting**: nothing here paints, encodes a frame, or
+//!   measures a pixel. Every visible change is a property, model, or structural operation.
+//! - **§12.1 Atomic transactions**: each scene change and each accepted event produces exactly one
+//!   all-or-nothing transaction. The inspector row describing a change is committed inside the
+//!   same transaction as the change, so the two can never be observed apart.
+//! - **§23 Incremental rendering**: scenes mutate existing nodes. `CREATE_NODE` after startup only
+//!   ever appears in the structure scene, which creates one node and deletes it again.
+//! - **§4 inv. 13 No silent degradation**: the gallery instantiates only node types the renderer
+//!   implements, and labels the two interaction paths that are not wired yet (text editing, tree
+//!   expansion) in the UI rather than pretending they work.
+//! - **§7.7 `action_key` is data**: keys are published for the client and for logs. Dispatch is by
+//!   `(NodeId, TypeRef)` handler registration only; no key is ever parsed or executed.
+//!
+//! # Locking
+//!
+//! One mutex guards application state. The lock order is **state → session**, never the reverse.
+//! Session counters are read *before* the state lock is taken and before a transaction opens,
+//! because `Session::transaction` holds the same inner mutex those accessors need.
+
+pub mod ids;
+pub mod scenes;
+pub mod stats;
+pub mod trace;
+pub mod ui;
+
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Instant;
+
+use srui_protocol::Event as WireEvent;
+use srui_sdk::*;
+use srui_semantic_tree::Event as SemanticEvent;
+use srui_sessiond::{Session, SessionError};
+
+pub use scenes::{Scene, SceneContext, SCENES};
+pub use stats::{Metrics, SessionFacts, SIZE_BUCKETS};
+pub use trace::{Trigger, MAX_TRACE_ROWS};
+
+/// The gallery image, published into the session resource store at startup (§14).
+///
+/// Embedded rather than read at runtime so the binary and the tests always agree on the bytes,
+/// and so a working directory change cannot silently turn the hero image into a placeholder.
+/// Provenance and licence: `assets/NOTICE.md`.
+pub const GALLERY_IMAGE: &[u8] = include_bytes!("../assets/gallery.png");
+
+/// Application state owned by the gallery server.
+#[derive(Debug, Default)]
+pub struct GalleryState {
+    /// Scene currently applied to the graph.
+    pub scene: Scene,
+    /// Whether the autoplay timer is advancing scenes.
+    pub autoplay: bool,
+    /// Last list item the client selected, resolved against authoritative state (§8, §27).
+    pub list_selection: Option<ItemId>,
+    /// Last table item the client selected, resolved against authoritative state (§8, §27).
+    pub table_selection: Option<ItemId>,
+    /// Resource hash and transient-node allocator shared by every scene.
+    pub scenes: SceneContext,
+    /// Bounded protocol inspector log.
+    pub trace: trace::TraceLog,
+    /// Bounded traffic and latency accumulator.
+    pub metrics: Metrics,
+}
+
+/// The gallery application: a [`Session`], deterministic state, and the handlers wired to it.
+#[derive(Debug)]
+pub struct GalleryApp {
+    session: Arc<Session>,
+    state: Mutex<GalleryState>,
+    image: Option<ResourceHash>,
+}
+
+impl GalleryApp {
+    /// Publishes the gallery resource, builds the initial graph, and registers every handler.
+    pub fn start(session: Arc<Session>) -> Result<Arc<Self>, SessionError> {
+        let outcome = session.publish_resource(GALLERY_IMAGE)?;
+        let image = outcome.hash;
+
+        let base_revision = session.current_revision();
+        let initial = ui::build_initial_ui(&session, Some(image), Scene::Baseline.label())?;
+
+        let mut state = GalleryState {
+            scenes: SceneContext::new(Some(image)),
+            ..GalleryState::default()
+        };
+        state.metrics.observe_resource(GALLERY_IMAGE.len() as u64);
+        state.metrics.observe_transaction(base_revision, &initial);
+
+        let app = Arc::new(Self {
+            session,
+            state: Mutex::new(state),
+            image: Some(image),
+        });
+
+        // The initial graph is already committed, so its operations are described from the next
+        // transaction rather than from inside itself. Every later transaction is self-describing.
+        app.commit(
+            Trigger::server(format!(
+                "initial gallery graph \u{b7} {} operations",
+                initial.len()
+            )),
+            initial,
+            None,
+            |_, _| Ok(()),
+        )?;
+
+        app.register_handlers();
+        Ok(app)
+    }
+
+    /// The underlying session.
+    pub fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    /// Hash of the published gallery image, if publication succeeded.
+    pub fn image(&self) -> Option<ResourceHash> {
+        self.image
+    }
+
+    /// Runs `f` against authoritative application state.
+    pub fn with_state<T>(&self, f: impl FnOnce(&GalleryState) -> T) -> T {
+        f(&lock_or_recover(&self.state))
+    }
+
+    /// Scene currently applied to the graph.
+    pub fn scene(&self) -> Scene {
+        lock_or_recover(&self.state).scene
+    }
+
+    /// Whether autoplay is advancing scenes.
+    pub fn autoplay(&self) -> bool {
+        lock_or_recover(&self.state).autoplay
+    }
+
+    // =========================================================================
+    // Transactions
+    // =========================================================================
+
+    /// Commits one transaction, appending the inspector rows and telemetry it implies.
+    ///
+    /// `prior` describes operations committed by an earlier transaction (used once, for the
+    /// bootstrap graph); everything else described comes from the operations `f` stages here.
+    fn commit<F>(
+        &self,
+        trigger: Trigger,
+        prior: Vec<Operation>,
+        started: Option<Instant>,
+        f: F,
+    ) -> Result<Vec<Operation>, SessionError>
+    where
+        F: FnOnce(&mut UiTransaction, &mut GalleryState) -> Result<(), StoreError>,
+    {
+        // Read before locking state and before the transaction opens: these accessors take the
+        // session's inner mutex, which `Session::transaction` holds for the whole closure.
+        let facts = SessionFacts::capture(&self.session);
+        let mut state = lock_or_recover(&self.state);
+
+        let committed = self.session.transaction(|ui| {
+            f(ui, &mut state)?;
+
+            // Snapshot before the inspector writes, so the inspector never describes itself.
+            let mut described = prior;
+            described.extend_from_slice(ui.operations());
+            state.trace.record(ui, &trigger, &described)?;
+
+            // Observed before rendering so the panel reflects the event that caused this
+            // transaction rather than lagging one behind it. The sample covers decode,
+            // validation, and staging — every server-side step except the commit itself.
+            if let (
+                Some(started),
+                Trigger::Event {
+                    observed_revision, ..
+                },
+            ) = (started, &trigger)
+            {
+                let lag = facts.revision.saturating_sub(*observed_revision);
+                state.metrics.observe_event(started.elapsed(), lag);
+            }
+
+            state.metrics.render(ui, &facts)?;
+            Ok(ui.operations().to_vec())
+        })?;
+
+        // Framed size is only knowable once the operation list is final, so the throughput panel
+        // reports every transaction committed strictly before the one being rendered.
+        state
+            .metrics
+            .observe_transaction(facts.revision, &committed);
+
+        Ok(committed)
+    }
+
+    /// Commits a server-initiated transaction described by `label`.
+    pub fn mutate<F>(&self, label: impl Into<String>, f: F) -> Result<Vec<Operation>, SessionError>
+    where
+        F: FnOnce(&mut UiTransaction, &mut GalleryState) -> Result<(), StoreError>,
+    {
+        self.commit(Trigger::server(label), Vec::new(), None, f)
+    }
+
+    // =========================================================================
+    // Scene navigation
+    // =========================================================================
+
+    /// Applies `target`, reverting whatever scene is currently applied first.
+    ///
+    /// Reverting before applying is what makes the tour path-independent: the graph after this
+    /// call depends only on `target`, never on the route taken to it.
+    pub fn goto_scene(&self, target: Scene) -> Result<Vec<Operation>, SessionError> {
+        self.goto_scene_traced(
+            target,
+            Trigger::server(format!("scene \u{2192} {}", target.name())),
+            None,
+        )
+    }
+
+    fn goto_scene_traced(
+        &self,
+        target: Scene,
+        trigger: Trigger,
+        started: Option<Instant>,
+    ) -> Result<Vec<Operation>, SessionError> {
+        self.commit(trigger, Vec::new(), started, move |ui, state| {
+            if state.scene == target {
+                return Ok(());
+            }
+            state.scene.revert(ui, &mut state.scenes)?;
+            target.apply(ui, &mut state.scenes)?;
+            state.scene = target;
+            Text::set_text_for(ui, ids::SCENE_LABEL, target.label())?;
+            Text::set_text_for(ui, ids::INSPECT_SCENE, target.label())?;
+            Ok(())
+        })
+    }
+
+    /// Advances one scene, wrapping back to the baseline.
+    pub fn next_scene(&self) -> Result<Vec<Operation>, SessionError> {
+        self.goto_scene(self.scene().next())
+    }
+
+    /// Steps back one scene, wrapping to the last scene.
+    pub fn previous_scene(&self) -> Result<Vec<Operation>, SessionError> {
+        self.goto_scene(self.scene().previous())
+    }
+
+    /// Reverts the applied scene and restores every baseline value the gallery owns.
+    ///
+    /// Node, model, and item identities are preserved: this is a revert, not a rebuild.
+    pub fn reset(&self) -> Result<Vec<Operation>, SessionError> {
+        self.commit(
+            Trigger::server("reset to baseline"),
+            Vec::new(),
+            None,
+            move |ui, state| {
+                state.scene.revert(ui, &mut state.scenes)?;
+                state.scene = Scene::Baseline;
+                state.list_selection = None;
+                state.table_selection = None;
+                Text::set_text_for(ui, ids::SCENE_LABEL, Scene::Baseline.label())?;
+                Text::set_text_for(ui, ids::INSPECT_SCENE, Scene::Baseline.label())?;
+                Text::set_text_for(ui, ids::CTRL_STATUS, ui::BASELINE_CTRL_STATUS)?;
+                Text::set_text_for(ui, ids::COLL_SELECTION, ui::BASELINE_COLL_SELECTION)?;
+                Text::set_text_for(ui, ids::HERO_STATUS, ui::BASELINE_HERO_STATUS)?;
+                Ok(())
+            },
+        )
+    }
+
+    /// Turns the autoplay timer on or off and echoes the authoritative value back to the client.
+    pub fn set_autoplay(&self, enabled: bool) -> Result<Vec<Operation>, SessionError> {
+        self.mutate(format!("autoplay \u{2192} {enabled}"), move |ui, state| {
+            state.autoplay = enabled;
+            Toggle::set_value_for(ui, ids::TOGGLE_AUTOPLAY, enabled)?;
+            Ok(())
+        })
+    }
+
+    // =========================================================================
+    // Event handlers (§7.6, §7.7, §29)
+    // =========================================================================
+
+    fn register_handlers(self: &Arc<Self>) {
+        for (node, scene_action) in [
+            (ids::BTN_PREV, SceneAction::Previous),
+            (ids::BTN_NEXT, SceneAction::Next),
+            (ids::BTN_RESET, SceneAction::Reset),
+        ] {
+            let target: Weak<Self> = Arc::downgrade(self);
+            self.session.on(node, ACTIVATE, move |_, event| {
+                if let Some(app) = target.upgrade() {
+                    app.on_scene_action(scene_action, event);
+                }
+            });
+        }
+
+        let autoplay: Weak<Self> = Arc::downgrade(self);
+        self.session
+            .on(ids::TOGGLE_AUTOPLAY, VALUE_CHANGED, move |_, event| {
+                if let Some(app) = autoplay.upgrade() {
+                    app.on_autoplay_changed(event);
+                }
+            });
+
+        for (node, label) in [
+            (ids::BTN_NORMAL, "Normal"),
+            (ids::BTN_PRIMARY, "Primary"),
+            (ids::BTN_DESTRUCTIVE, "Destructive"),
+            (ids::BTN_QUIET, "Quiet"),
+        ] {
+            let target: Weak<Self> = Arc::downgrade(self);
+            self.session.on(node, ACTIVATE, move |_, event| {
+                if let Some(app) = target.upgrade() {
+                    app.on_demo_button(label, event);
+                }
+            });
+        }
+
+        for (node, label) in [
+            (ids::TOGGLE_CHECKBOX, "Checkbox hint"),
+            (ids::TOGGLE_SWITCH, "Switch hint"),
+            (ids::TOGGLE_AUTOMATIC, "Automatic hint"),
+        ] {
+            let target: Weak<Self> = Arc::downgrade(self);
+            self.session.on(node, VALUE_CHANGED, move |_, event| {
+                if let Some(app) = target.upgrade() {
+                    app.on_demo_toggle(node, label, event);
+                }
+            });
+        }
+
+        for (node, collection) in [
+            (ids::LIST, Collection::List),
+            (ids::TABLE, Collection::Table),
+        ] {
+            let target: Weak<Self> = Arc::downgrade(self);
+            self.session.on(node, SELECTION_CHANGED, move |_, event| {
+                if let Some(app) = target.upgrade() {
+                    app.on_selection_changed(collection, event);
+                }
+            });
+        }
+    }
+
+    fn on_scene_action(&self, action: SceneAction, event: &WireEvent) {
+        let started = Instant::now();
+        let trigger = event_trigger(event, action.detail());
+        let result = match action {
+            SceneAction::Next => {
+                self.goto_scene_traced(self.scene().next(), trigger, Some(started))
+            }
+            SceneAction::Previous => {
+                self.goto_scene_traced(self.scene().previous(), trigger, Some(started))
+            }
+            SceneAction::Reset => {
+                self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
+                    state.scene.revert(ui, &mut state.scenes)?;
+                    state.scene = Scene::Baseline;
+                    state.list_selection = None;
+                    state.table_selection = None;
+                    Text::set_text_for(ui, ids::SCENE_LABEL, Scene::Baseline.label())?;
+                    Text::set_text_for(ui, ids::INSPECT_SCENE, Scene::Baseline.label())?;
+                    Text::set_text_for(ui, ids::CTRL_STATUS, ui::BASELINE_CTRL_STATUS)?;
+                    Text::set_text_for(ui, ids::COLL_SELECTION, ui::BASELINE_COLL_SELECTION)?;
+                    Text::set_text_for(ui, ids::HERO_STATUS, ui::BASELINE_HERO_STATUS)?;
+                    Ok(())
+                })
+            }
+        };
+        report("scene action", result);
+    }
+
+    fn on_autoplay_changed(&self, event: &WireEvent) {
+        let started = Instant::now();
+        let Some(enabled) = decode_bool(event) else {
+            tracing::warn!(
+                "rejecting VALUE_CHANGED on the autoplay toggle without a bool argument"
+            );
+            return;
+        };
+        let trigger = event_trigger(event, format!("value = {enabled}"));
+        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
+            state.autoplay = enabled;
+            Toggle::set_value_for(ui, ids::TOGGLE_AUTOPLAY, enabled)?;
+            Ok(())
+        });
+        report("autoplay toggle", result);
+    }
+
+    fn on_demo_button(&self, label: &'static str, event: &WireEvent) {
+        let started = Instant::now();
+        let trigger = event_trigger(event, format!("button \"{label}\""));
+        let seq = event.event_seq;
+        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, _| {
+            Text::set_text_for(
+                ui,
+                ids::CTRL_STATUS,
+                format!("ACTIVATE on the {label} button \u{b7} client event seq {seq}"),
+            )?;
+            Ok(())
+        });
+        report("demo button", result);
+    }
+
+    fn on_demo_toggle(&self, node: NodeId, label: &'static str, event: &WireEvent) {
+        let started = Instant::now();
+        let Some(value) = decode_bool(event) else {
+            tracing::warn!(
+                "rejecting VALUE_CHANGED on {} without a bool argument",
+                node.get()
+            );
+            return;
+        };
+        let trigger = event_trigger(event, format!("value = {value}"));
+        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, _| {
+            // The server is authoritative: it echoes the value back rather than trusting that the
+            // client's local view already matches (§7.7).
+            Toggle::set_value_for(ui, node, value)?;
+            Text::set_text_for(
+                ui,
+                ids::CTRL_STATUS,
+                format!("VALUE_CHANGED on the {label} toggle \u{b7} now {value}"),
+            )?;
+            Ok(())
+        });
+        report("demo toggle", result);
+    }
+
+    fn on_selection_changed(&self, collection: Collection, event: &WireEvent) {
+        let started = Instant::now();
+        let Some(item) = decode_item_id(event) else {
+            tracing::warn!("rejecting SELECTION_CHANGED without a usable item id argument");
+            return;
+        };
+        let model = collection.model();
+        let trigger = event_trigger(event, format!("item {}", item.get()));
+
+        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
+            // Only the item id is trusted, and only if authoritative state still holds it. Row
+            // text, index, and `action_key` from the client are never consulted (§7.7, §27).
+            let resolved = ui
+                .get_model(model)
+                .and_then(|model| model.get_item_by_id(item))
+                .map(|item| item.value.clone());
+
+            let text = match (&resolved, collection) {
+                (Some(value), Collection::List) => {
+                    format!(
+                        "List selection \u{b7} item {} \u{b7} {}",
+                        item.get(),
+                        summarize(value)
+                    )
+                }
+                (Some(value), Collection::Table) => {
+                    format!(
+                        "Table selection \u{b7} item {} \u{b7} {}",
+                        item.get(),
+                        summarize(value)
+                    )
+                }
+                (None, _) => format!(
+                    "Selection refused \u{b7} item {} is not in authoritative state",
+                    item.get()
+                ),
+            };
+
+            if resolved.is_some() {
+                match collection {
+                    Collection::List => state.list_selection = Some(item),
+                    Collection::Table => state.table_selection = Some(item),
+                }
+            }
+            Text::set_text_for(ui, ids::COLL_SELECTION, text)?;
+            Ok(())
+        });
+        report("selection", result);
+    }
+}
+
+/// Which toolbar button was activated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SceneAction {
+    Previous,
+    Next,
+    Reset,
+}
+
+impl SceneAction {
+    fn detail(self) -> String {
+        match self {
+            Self::Previous => "previous scene".to_string(),
+            Self::Next => "next scene".to_string(),
+            Self::Reset => "reset".to_string(),
+        }
+    }
+}
+
+/// Which model-backed collection reported a selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Collection {
+    List,
+    Table,
+}
+
+impl Collection {
+    fn model(self) -> ModelId {
+        match self {
+            Self::List => ids::LIST_MODEL,
+            Self::Table => ids::TABLE_MODEL,
+        }
+    }
+}
+
+/// Renders a model item value for the selection status line.
+fn summarize(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::List(cells) => cells
+            .iter()
+            .map(|cell| match cell {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" \u{b7} "),
+        other => other.to_string(),
+    }
+}
+
+fn event_trigger(event: &WireEvent, detail: String) -> Trigger {
+    Trigger::Event {
+        node: NodeId::new(event.node_id),
+        event_type: event
+            .event_type
+            .as_ref()
+            .map(|type_ref| TypeRef::new(type_ref.namespace_id, type_ref.local_id))
+            .unwrap_or_else(|| TypeRef::standard(0)),
+        event_seq: event.event_seq,
+        observed_revision: event.observed_revision,
+        detail,
+    }
+}
+
+fn decode_semantic_event(event: &WireEvent) -> Option<SemanticEvent> {
+    SemanticEvent::try_from(event.clone()).ok()
+}
+
+fn decode_bool(event: &WireEvent) -> Option<bool> {
+    match decode_semantic_event(event)?.value_arg() {
+        Some(Value::Bool(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn decode_item_id(event: &WireEvent) -> Option<ItemId> {
+    match decode_semantic_event(event)?.value_arg() {
+        Some(Value::ItemId(item)) => Some(*item),
+        Some(Value::UnsignedInt(raw)) => Some(ItemId::new(*raw)),
+        _ => None,
+    }
+}
+
+fn report(what: &str, result: Result<Vec<Operation>, SessionError>) {
+    if let Err(error) = result {
+        tracing::warn!("{what} transaction failed: {error}");
+    }
+}
+
+/// Recovers a poisoned mutex rather than propagating the panic.
+///
+/// A panic inside a transaction closure is already converted to `SessionError::Panicked` by the
+/// session, so a poisoned application-state lock means state may be stale, never torn: refusing to
+/// serve any further event would be a worse outcome than continuing.
+pub fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}

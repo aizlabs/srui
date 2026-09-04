@@ -189,6 +189,8 @@ jobs:
         run: |
           cargo test --manifest-path ../examples/process-monitor/Cargo.toml
           cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path ../examples/ui-gallery/Cargo.toml
+          cargo clippy --manifest-path ../examples/ui-gallery/Cargo.toml --all-targets -- -D warnings
         working-directory: server-rust
 
   # libFuzzer and its sanitizers are best supported on Linux, and nothing in the decoders is

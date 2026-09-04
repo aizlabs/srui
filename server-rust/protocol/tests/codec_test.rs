@@ -103,6 +103,7 @@ async fn test_async_codec_roundtrip() {
             }),
             client_instance_id: vec![1, 2, 3, 4],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
 
@@ -180,6 +181,7 @@ async fn test_async_codec_cancel_safety_in_select() {
             limits: None,
             client_instance_id: vec![42],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
 

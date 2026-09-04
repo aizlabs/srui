@@ -21,7 +21,7 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::outbound::{OutboundReceiver, OutboundRecvError};
+use crate::outbound::{OutboundItem, OutboundReceiver, OutboundRecvError};
 use crate::session::{EventOutcome, ResumeOutcome, Session, SessionError};
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
@@ -303,6 +303,11 @@ where
     // -------------------------------------------------------------------------
     // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
     // -------------------------------------------------------------------------
+    //
+    // Fair select: a pipelined burst of inbound events must not starve outbound
+    // delivery (bounded queue → LaggedResyncRequired). Within outbound selection,
+    // transactions usually precede one resource frame, with aging so continuous UI
+    // traffic cannot starve resource progress entirely (§19.2).
 
     loop {
         tokio::select! {
@@ -338,12 +343,20 @@ where
                 }
             }
 
-            // Outgoing transaction queue receiver (async-bounded-channel)
-            outbound_tx = tx_rx.recv() => {
-                match outbound_tx {
-                    Ok(tx) => {
-                        let envelope = SruiMessage {
-                            msg: Some(srui_message::Msg::Transaction(tx)),
+            // Outgoing selector: UI transaction first, else exactly one resource frame (§14, §19.2)
+            outbound_item = tx_rx.recv() => {
+                match outbound_item {
+                    Ok(item) => {
+                        let envelope = match item {
+                            OutboundItem::Transaction(tx) => SruiMessage {
+                                msg: Some(srui_message::Msg::Transaction(tx)),
+                            },
+                            OutboundItem::ResourceMetadata(meta) => SruiMessage {
+                                msg: Some(srui_message::Msg::ResourceMetadata(meta)),
+                            },
+                            OutboundItem::ResourceChunk(chunk) => SruiMessage {
+                                msg: Some(srui_message::Msg::ResourceChunk(chunk)),
+                            },
                         };
                         if !send_message(
                             &mut framed_write,

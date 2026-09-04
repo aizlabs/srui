@@ -489,6 +489,23 @@ struct HandshakeNegotiationTests {
         try await controller.start()
         #expect(controller.isHandshakeComplete == false)
 
+        let serverStream = serverTransport.receiveStream()
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var receivedResume: SRUIClientResume?
+        for try await chunk in serverStream {
+            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .clientResume(let resume) = message.msg {
+                    receivedResume = resume
+                    break
+                }
+            }
+            if receivedResume != nil { break }
+        }
+        let resume = try #require(receivedResume)
+        #expect(resume.hasLimits)
+        #expect(resume.limits.maxResourceSize == 50 * 1024 * 1024)
+        #expect(resume.knownResourceHashes.isEmpty)
+
         var resumeOk = SRUIServerResumeOk()
         resumeOk.sessionID = "resume-session"
         var resumeMsg = SRUIMessage()

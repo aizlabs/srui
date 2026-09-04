@@ -14,8 +14,14 @@ pub use srui_semantic_tree::{
     decode_event, decode_message, decode_node_record, decode_operation, decode_transaction,
     decode_value, encode_event, encode_message, encode_node_record, encode_operation,
     encode_transaction, encode_value, CapabilitySet, ClientInstanceId, EnumToken, Event, EventId,
-    EventValidationError, NegotiationError, NodeRecord, Profile, Revision, ServerCapabilities,
-    Transaction, TxnError, WireError,
+    EventValidationError, NegotiationError, NodeRecord, Profile, ResourceHash, Revision,
+    ServerCapabilities, Transaction, TxnError, WireError,
+};
+
+// Resource CAS API (§14)
+pub use srui_resources::{
+    PublishOutcome, ResourceEntry, ResourceError, ResourceLimits, ResourceStore,
+    CHUNK_PAYLOAD_SIZE, DEFAULT_MAX_RESOURCE_BYTES,
 };
 
 // =============================================================================

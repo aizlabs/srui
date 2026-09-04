@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+import CoreGraphics
 
 @MainActor
 struct AppKitRendererTests {
@@ -262,6 +263,111 @@ struct AppKitRendererTests {
         #expect(renderer.registry.view(for: 2) === tableBefore)
         #expect(renderer.registry.handle(for: 1)?.window === windowBefore)
         #expect(adapter.rows.map(\.cells) == [["Initial Item"], ["Second Item"]])
+    }
+
+    @Test
+    func resourceCommitRefreshesMatchingImageHandleInPlace() throws {
+        let hash = try ResourceHash(rawBytes: Array(repeating: 0x42, count: 32))
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .image,
+                parentID: 1,
+                properties: [(.resource, .resourceHash(hash))]
+            ),
+        ])
+        let renderer = AppKitRenderer()
+        try renderer.attach(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: 2))
+        let imageView = try #require(handle.view as? NSImageView)
+        let viewIdentityBefore = ObjectIdentifier(imageView)
+        #expect(handle.pendingResourceHash == hash)
+
+        // Build a tiny CGImage without going through ResourceCache.
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+        let context = try #require(
+            CGContext(
+                data: nil,
+                width: 5,
+                height: 7,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo
+            )
+        )
+        context.setFillColor(red: 0, green: 1, blue: 0, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 5, height: 7))
+        let cgImage = try #require(context.makeImage())
+
+        renderer.commitResourceImage(hash: hash, cgImage: cgImage, pixelWidth: 5, pixelHeight: 7)
+
+        let imageViewAfter = try #require(renderer.registry.view(for: 2) as? NSImageView)
+        #expect(ObjectIdentifier(imageViewAfter) == viewIdentityBefore)
+        #expect(imageViewAfter.image?.size.width == 5)
+        #expect(imageViewAfter.image?.size.height == 7)
+        #expect(renderer.resolveResourceImage(hash) != nil)
+    }
+
+
+    @Test
+    func preCachedResourceMountsImmediately() throws {
+        let hash = try ResourceHash(rawBytes: Array(repeating: 0x77, count: 32))
+        let renderer = AppKitRenderer()
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let context = try #require(
+            CGContext(
+                data: nil,
+                width: 4,
+                height: 5,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        )
+        context.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 4, height: 5))
+        let cgImage = try #require(context.makeImage())
+        renderer.commitResourceImage(hash: hash, cgImage: cgImage, pixelWidth: 4, pixelHeight: 5)
+
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .image,
+                parentID: 1,
+                properties: [(.resource, .resourceHash(hash))]
+            ),
+        ])
+        try renderer.attach(store: store)
+
+        let imageView = try #require(renderer.registry.view(for: 2) as? NSImageView)
+        #expect(imageView.image?.size.width == 4)
+        #expect(imageView.image?.size.height == 5)
+    }
+
+    @Test
+    func unresolvedResourceNeverBecomesVisible() throws {
+        let hash = try ResourceHash(rawBytes: Array(repeating: 0x88, count: 32))
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .image,
+                parentID: 1,
+                properties: [(.resource, .resourceHash(hash))]
+            ),
+        ])
+        let renderer = AppKitRenderer()
+        try renderer.attach(store: store)
+        let imageView = try #require(renderer.registry.view(for: 2) as? NSImageView)
+        let placeholder = imageView.image
+        #expect(renderer.resolveResourceImage(hash) == nil)
+        #expect(imageView.image === placeholder)
     }
 
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {

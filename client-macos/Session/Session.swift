@@ -8,3 +8,4 @@
 @_exported import TransportSSH
 @_exported import SemanticModel
 @_exported import Protocol
+@_exported import Resources

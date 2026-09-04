@@ -329,8 +329,10 @@ fn test_coalesced_delivery_stream_matches_raw_commit_stream() {
     }
 
     let mut delivered = Vec::new();
-    while let Some(tx) = outbound.try_recv().expect("queue did not overflow") {
-        delivered.push(tx);
+    while let Some(item) = outbound.try_recv().expect("queue did not overflow") {
+        if let Some(tx) = item.into_transaction() {
+            delivered.push(tx);
+        }
     }
     assert!(
         delivered.len() < 40,

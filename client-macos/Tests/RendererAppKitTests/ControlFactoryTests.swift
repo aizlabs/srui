@@ -625,6 +625,71 @@ struct ControlFactoryTests {
     }
 
     @Test
+    func resourcePropertyUsesResolverWhenCachedAndPlaceholderWhenMissing() throws {
+        let factory = ControlFactory()
+        let hash = try ResourceHash(rawBytes: Array(repeating: 0xcd, count: 32))
+        let cachedImage = NSImage(size: NSSize(width: 2, height: 2), flipped: false) { rect in
+            NSColor.red.setFill()
+            rect.fill()
+            return true
+        }
+
+        factory.resolveResourceImage = { candidate in
+            candidate == hash ? cachedImage : nil
+        }
+
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .image))
+        let imageView = try #require(handle.view as? NSImageView)
+        let placeholder = imageView.image
+
+        factory.apply(property: .resource, value: .resourceHash(hash), to: handle)
+        #expect(handle.pendingResourceHash == hash)
+        #expect(imageView.image === cachedImage)
+
+        let missing = try ResourceHash(rawBytes: Array(repeating: 0xee, count: 32))
+        factory.apply(property: .resource, value: .resourceHash(missing), to: handle)
+        #expect(handle.pendingResourceHash == missing)
+        #expect(imageView.image !== cachedImage)
+        #expect(imageView.image != nil)
+
+        // Changing away from the cached hash must not leave the old bitmap.
+        #expect(imageView.image !== cachedImage || missing == hash)
+        _ = placeholder
+    }
+
+    @Test
+    func clearingOrReplacingResourceHashDropsStaleImage() throws {
+        let factory = ControlFactory()
+        let hashA = try ResourceHash(rawBytes: Array(repeating: 0xa1, count: 32))
+        let hashB = try ResourceHash(rawBytes: Array(repeating: 0xb2, count: 32))
+        let imageA = NSImage(size: NSSize(width: 3, height: 3))
+        let imageB = NSImage(size: NSSize(width: 4, height: 4))
+
+        factory.resolveResourceImage = { hash in
+            if hash == hashA { return imageA }
+            if hash == hashB { return imageB }
+            return nil
+        }
+
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .image))
+        let imageView = try #require(handle.view as? NSImageView)
+
+        factory.apply(property: .resource, value: .resourceHash(hashA), to: handle)
+        #expect(imageView.image === imageA)
+
+        factory.apply(property: .resource, value: .resourceHash(hashB), to: handle)
+        #expect(handle.pendingResourceHash == hashB)
+        #expect(imageView.image === imageB)
+        #expect(imageView.image !== imageA)
+
+        factory.apply(property: .resource, value: nil, to: handle)
+        #expect(handle.pendingResourceHash == nil)
+        #expect(imageView.image !== imageA)
+        #expect(imageView.image !== imageB)
+        #expect(imageView.image != nil)
+    }
+
+    @Test
     func initialPropertiesAreAppliedInDeterministicOrder() {
         let node = Node(
             id: 1,
@@ -741,5 +806,80 @@ struct ControlFactoryTests {
         trampoline.performToggleAction(button)
 
         #expect(receivedValues == [true, false, true])
+    }
+
+    @Test
+    func cachedResourceResolvesImmediatelyOnApply() throws {
+        let factory = ControlFactory()
+        let hash = try ResourceHash(rawBytes: Array(repeating: 0x11, count: 32))
+        let resolved = NSImage(size: NSSize(width: 2, height: 2))
+        factory.resolveResourceImage = { candidate in
+            candidate == hash ? resolved : nil
+        }
+
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .image))
+        factory.apply(property: .resource, value: .resourceHash(hash), to: handle)
+
+        let imageView = try #require(handle.view as? NSImageView)
+        #expect(handle.pendingResourceHash == hash)
+        #expect(imageView.image === resolved)
+    }
+
+    @Test
+    func missingResourceKeepsPlaceholder() throws {
+        let factory = ControlFactory()
+        let hash = try ResourceHash(rawBytes: Array(repeating: 0x22, count: 32))
+        factory.resolveResourceImage = { _ in nil }
+
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .image))
+        let before = (handle.view as? NSImageView)?.image
+        factory.apply(property: .resource, value: .resourceHash(hash), to: handle)
+        let after = (handle.view as? NSImageView)?.image
+
+        #expect(handle.pendingResourceHash == hash)
+        #expect(after != nil)
+        // Placeholder must remain (same system symbol identity class, not a resolved bitmap).
+        #expect(before != nil)
+        #expect(after?.size == before?.size)
+    }
+
+    @Test
+    func changingResourceHashDropsStaleResolvedImage() throws {
+        let factory = ControlFactory()
+        let first = try ResourceHash(rawBytes: Array(repeating: 0x33, count: 32))
+        let second = try ResourceHash(rawBytes: Array(repeating: 0x44, count: 32))
+        let firstImage = NSImage(size: NSSize(width: 3, height: 3))
+        let secondImage = NSImage(size: NSSize(width: 4, height: 4))
+        factory.resolveResourceImage = { hash in
+            if hash == first { return firstImage }
+            if hash == second { return secondImage }
+            return nil
+        }
+
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .image))
+        factory.apply(property: .resource, value: .resourceHash(first), to: handle)
+        #expect((handle.view as? NSImageView)?.image === firstImage)
+
+        factory.apply(property: .resource, value: .resourceHash(second), to: handle)
+        #expect(handle.pendingResourceHash == second)
+        #expect((handle.view as? NSImageView)?.image === secondImage)
+    }
+
+    @Test
+    func clearingResourceHashRestoresPlaceholder() throws {
+        let factory = ControlFactory()
+        let hash = try ResourceHash(rawBytes: Array(repeating: 0x55, count: 32))
+        let resolved = NSImage(size: NSSize(width: 5, height: 5))
+        factory.resolveResourceImage = { candidate in
+            candidate == hash ? resolved : nil
+        }
+
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .image))
+        factory.apply(property: .resource, value: .resourceHash(hash), to: handle)
+        #expect((handle.view as? NSImageView)?.image === resolved)
+
+        factory.apply(property: .resource, value: nil, to: handle)
+        #expect(handle.pendingResourceHash == nil)
+        #expect((handle.view as? NSImageView)?.image !== resolved)
     }
 }

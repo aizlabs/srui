@@ -157,6 +157,30 @@ impl SemanticStore {
         self.nodes.get(&id)
     }
 
+    /// Collects every [`ResourceHash`] currently referenced by node properties or cached
+    /// model items (§14).
+    ///
+    /// Used by the resource CAS so eviction never drops hashes still required by authoritative
+    /// state when no demand-fetch protocol exists.
+    #[must_use]
+    pub fn referenced_resource_hashes(&self) -> HashSet<crate::ids::ResourceHash> {
+        let mut hashes = HashSet::new();
+        for node in self.nodes.values() {
+            for (_, value) in node.iter_properties() {
+                value.collect_resource_hashes(&mut hashes);
+            }
+        }
+        for model in self.models.values() {
+            for (_, item) in model.iter_cached_items() {
+                item.value.collect_resource_hashes(&mut hashes);
+                for value in item.properties.values() {
+                    value.collect_resource_hashes(&mut hashes);
+                }
+            }
+        }
+        hashes
+    }
+
     /// Returns a mutable reference to the node with the given ID.
     pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
         self.nodes.get_mut(&id)

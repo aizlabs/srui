@@ -927,7 +927,11 @@ Image #31
   resource = sha256:9d4e...a10f
 ```
 
-The client cache may persist across sessions.
+The client cache may persist across sessions. During `CLIENT HELLO` or `CLIENT RESUME`, a
+client may advertise the hashes of verified committed cache entries. The server omits those
+hashes when seeding retained resources for that connection, and the client hydrates a newly
+created renderer directly from its verified cache. The signal is advisory and backward
+compatible: absent or malformed hashes are treated as unknown and are transferred normally.
 
 Protocol properties include:
 

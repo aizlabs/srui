@@ -518,6 +518,8 @@ message ClientHello {
   ClientLimits limits = 3;
   bytes client_instance_id = 4;
   map<string, string> client_metadata = 5;
+  // Verified committed CAS entries the server need not transfer again (§14, §18).
+  repeated bytes known_resource_hashes = 6;
 }
 
 message ServerWelcome {
@@ -537,6 +539,10 @@ message ClientResume {
   uint64 last_applied_revision = 3;
   uint64 last_acked_event_seq = 4;
   map<uint64, uint64> terminal_stream_offsets = 5;
+  // Re-advertised because server-side per-client negotiation state is bounded (§15, §26).
+  ClientLimits limits = 6;
+  // Verified committed CAS entries the server need not transfer again (§14, §18).
+  repeated bytes known_resource_hashes = 7;
 }
 
 // Machine-readable session identity continuity for a full snapshot response.
@@ -566,6 +572,40 @@ message ServerResyncRequired {
 }
 
 // -----------------------------------------------------------------------------
+// Resource Transfer (§14, §19.2)
+// -----------------------------------------------------------------------------
+
+// Transfer priority for resource payloads. Resource traffic is always scheduled
+// below UI/control traffic (§19.2); this field distinguishes resources from each
+// other when a multi-class scheduler is introduced later.
+enum ResourcePriority {
+  RESOURCE_PRIORITY_UNSPECIFIED = 0;
+  RESOURCE_PRIORITY_NORMAL = 1;
+  RESOURCE_PRIORITY_LOW = 2;
+}
+
+// Immutable resource announcement. Completion is defined by receiving the
+// contiguous byte range [0, encoded_length); there is no separate terminal frame.
+message ResourceMetadata {
+  bytes resource_hash = 1; // Exactly 32-byte SHA-256 digest
+  string media_type = 2;
+  uint64 encoded_length = 3;
+  // Optional decoded dimension hints (0 = unset). Clients must still validate
+  // decoded size independently (§14, §26).
+  uint32 decoded_width = 4;
+  uint32 decoded_height = 5;
+  ResourcePriority priority = 6;
+}
+
+// One contiguous slice of a resource's encoded bytes. Every chunk carries the
+// resource hash so concurrent transfers cannot be mixed.
+message ResourceChunk {
+  bytes resource_hash = 1; // Exactly 32-byte SHA-256 digest
+  uint64 byte_offset = 2;
+  bytes data = 3;
+}
+
+// -----------------------------------------------------------------------------
 // Top-Level Message Envelope
 // -----------------------------------------------------------------------------
 
@@ -579,5 +619,7 @@ message SruiMessage {
     Transaction transaction = 6;
     Event event = 7;
     ServerEventAck server_event_ack = 8;
+    ResourceMetadata resource_metadata = 9;
+    ResourceChunk resource_chunk = 10;
   }
 }

@@ -255,7 +255,9 @@ async fn test_broadcast_reflects_committed_state() {
         let tx = broadcast_rx
             .recv()
             .await
-            .expect("committed transaction must be broadcast");
+            .expect("committed transaction must be broadcast")
+            .into_transaction()
+            .expect("transaction item");
         broadcasts.push(tx);
     }
 
@@ -328,7 +330,10 @@ fn test_broadcast_delivery_order_matches_commit_order_under_concurrency() {
         // merging can only ever reduce the count — never invent a delivery.
         let mut replica_revision = 0u64;
         let mut delivered: Vec<u64> = Vec::with_capacity(CONCURRENT_WORKERS);
-        while let Ok(Some(tx)) = broadcast_rx.try_recv() {
+        while let Ok(Some(item)) = broadcast_rx.try_recv() {
+            let Some(tx) = item.into_transaction() else {
+                continue;
+            };
             assert_eq!(
                 tx.base_revision, replica_revision,
                 "round {round}: replica at revision {replica_revision} cannot apply a transaction \
@@ -391,11 +396,17 @@ fn test_committed_revision_is_never_visible_before_it_is_published() {
                 // Drained first, so `published` can only lag the store, never lead it: a sample
                 // where the store is behind the stream would be the reader's own staleness, not a
                 // violation. The failing direction is the store running ahead of publication.
-                while let Ok(Some(tx)) = rx.try_recv() {
+                while let Ok(Some(item)) = rx.try_recv() {
+                    let Some(tx) = item.into_transaction() else {
+                        continue;
+                    };
                     published = tx.new_revision;
                 }
                 let revision = session.current_revision();
-                while let Ok(Some(tx)) = rx.try_recv() {
+                while let Ok(Some(item)) = rx.try_recv() {
+                    let Some(tx) = item.into_transaction() else {
+                        continue;
+                    };
                     published = tx.new_revision;
                 }
                 if published < revision {

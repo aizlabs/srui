@@ -153,7 +153,12 @@ impl CounterApp {
     /// Simulates clicking the increment button by dispatching an `ACTIVATE` event (§7.6, §7.7, §29).
     pub fn click(&self, event_seq: u64) -> Result<usize, SdkError> {
         let rev = self.session.current_revision();
-        let event = Event::activate(event_seq, format!("click-{}", event_seq), rev, self.button_id);
+        let event = Event::activate(
+            event_seq,
+            format!("click-{}", event_seq),
+            rev,
+            self.button_id,
+        );
         self.session.dispatch(event)
     }
 }

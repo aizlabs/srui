@@ -66,7 +66,8 @@ fn test_counter_dispatch_increments_text_and_progress_sequentially() {
         assert_eq!(text.text(store), Some("Count: 4"));
         assert_eq!(text.role(store), Some(TextRole::Heading));
 
-        let prog = Progress::from_store(store, app.progress_id()).expect("Progress widget not found");
+        let prog =
+            Progress::from_store(store, app.progress_id()).expect("Progress widget not found");
         assert_eq!(prog.value(store), Some(0.04));
         assert_eq!(prog.value_description(store), Some("4 / 100"));
 
@@ -106,7 +107,9 @@ fn test_panicking_handler_transaction_preserves_store_atomicity() {
         });
         assert!(res.is_err());
         match res {
-            Err(SdkError::Panicked(msg)) => assert!(msg.contains("handler business logic exploded")),
+            Err(SdkError::Panicked(msg)) => {
+                assert!(msg.contains("handler business logic exploded"))
+            }
             other => panic!("expected SdkError::Panicked, got {:?}", other),
         }
     });
@@ -155,7 +158,9 @@ fn test_erroring_handler_transaction_preserves_store_atomicity() {
         error_flag.store(true, Ordering::SeqCst);
         let res: Result<(), SdkError> = ctx.transaction(|ui| {
             ui.set(text_id, TEXT, "Uncommitted Text")?;
-            Err(StoreError::OperationError("business rule validation rejected".to_string()))
+            Err(StoreError::OperationError(
+                "business rule validation rejected".to_string(),
+            ))
         });
         assert!(res.is_err());
     });
@@ -276,7 +281,10 @@ fn test_live_counter_app_dispatch_with_wire_encoding_and_store_replay() {
         assert_eq!(decoded_event, original_event);
 
         // Dispatch decoded event to the live CounterApp session
-        let handled = app.session().dispatch(decoded_event).expect("dispatch decoded event");
+        let handled = app
+            .session()
+            .dispatch(decoded_event)
+            .expect("dispatch decoded event");
         assert_eq!(handled, 1);
 
         // Live CounterApp updated its store atomically (§12.1)
@@ -289,7 +297,11 @@ fn test_live_counter_app_dispatch_with_wire_encoding_and_store_replay() {
             vec![
                 Operation::set_property(app.text_id(), TEXT, format!("Count: {}", seq)),
                 Operation::set_property(app.progress_id(), VALUE, (seq as f64) / 100.0),
-                Operation::set_property(app.progress_id(), VALUE_DESCRIPTION, format!("{} / 100", seq)),
+                Operation::set_property(
+                    app.progress_id(),
+                    VALUE_DESCRIPTION,
+                    format!("{} / 100", seq),
+                ),
             ],
         );
 
@@ -303,12 +315,24 @@ fn test_live_counter_app_dispatch_with_wire_encoding_and_store_replay() {
         assert_eq!(fresh_store.revision(), app.session().current_revision());
         assert_eq!(fresh_store.node_count(), app.session().node_count());
         assert_eq!(
-            fresh_store.get_node(app.text_id()).unwrap().get_property(TEXT),
-            app.session().get_node(app.text_id()).unwrap().get_property(TEXT)
+            fresh_store
+                .get_node(app.text_id())
+                .unwrap()
+                .get_property(TEXT),
+            app.session()
+                .get_node(app.text_id())
+                .unwrap()
+                .get_property(TEXT)
         );
         assert_eq!(
-            fresh_store.get_node(app.progress_id()).unwrap().get_property(VALUE),
-            app.session().get_node(app.progress_id()).unwrap().get_property(VALUE)
+            fresh_store
+                .get_node(app.progress_id())
+                .unwrap()
+                .get_property(VALUE),
+            app.session()
+                .get_node(app.progress_id())
+                .unwrap()
+                .get_property(VALUE)
         );
     }
 }

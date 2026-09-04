@@ -35,6 +35,7 @@ async fn test_ssh_bridge_forwarding() {
             limits: None,
             client_instance_id: vec![7, 7, 7],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     ssh_framed_write

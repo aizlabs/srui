@@ -115,6 +115,26 @@ impl Value {
         }
     }
 
+    /// Recursively collects every [`ResourceHash`] nested in this value (§14).
+    pub fn collect_resource_hashes(&self, out: &mut std::collections::HashSet<ResourceHash>) {
+        match self {
+            Self::ResourceHash(hash) => {
+                out.insert(*hash);
+            }
+            Self::List(items) => {
+                for item in items {
+                    item.collect_resource_hashes(out);
+                }
+            }
+            Self::Record(record) => {
+                for prop in &record.properties {
+                    prop.value.collect_resource_hashes(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn as_enum_token(&self) -> Option<EnumToken> {
         match self {
             Self::EnumToken(e) => Some(*e),

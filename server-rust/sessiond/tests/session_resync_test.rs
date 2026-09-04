@@ -149,6 +149,8 @@ fn test_handle_resume_resync_snapshot_reconstructs_tree_and_models() {
         last_applied_revision: 0,
         last_acked_event_seq: 0,
         terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
     };
 
     let (resync_msg, snapshot_tx) = match session
@@ -234,6 +236,8 @@ fn test_resync_snapshot_chunks_cached_ranges_within_item_limit() {
         last_applied_revision: 0,
         last_acked_event_seq: 0,
         terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
     };
     let snapshot_tx = match session
         .bootstrap_resume(&resume)
@@ -297,6 +301,8 @@ async fn test_connection_resync_delivers_snapshot_matching_authoritative_store()
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         })),
     };
     framed_write.send(resume).await.expect("send client resume");
@@ -362,6 +368,7 @@ async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
         limits: None,
         client_instance_id: vec![1, 2, 3],
         client_metadata: Default::default(),
+        known_resource_hashes: vec![],
     };
 
     let mut bootstrap = session
@@ -415,7 +422,9 @@ async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
         .transactions
         .recv()
         .await
-        .expect("receive transaction");
+        .expect("receive transaction")
+        .into_transaction()
+        .expect("transaction");
     assert_eq!(received.base_revision, snapshot.new_revision);
     assert_eq!(received.new_revision, snapshot.new_revision + 1);
 }
@@ -431,6 +440,7 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
         limits: None,
         client_instance_id: vec![4, 5, 6],
         client_metadata: Default::default(),
+        known_resource_hashes: vec![],
     };
 
     let mut bootstrap = session
@@ -457,7 +467,9 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
         .transactions
         .recv()
         .await
-        .expect("receive first transaction");
+        .expect("receive first transaction")
+        .into_transaction()
+        .expect("transaction");
     assert_eq!(received.base_revision, 0);
     assert_eq!(received.new_revision, 1);
 }
@@ -506,6 +518,7 @@ async fn oversized_catch_up_snapshot_fails_the_handshake_instead_of_being_sent()
         limits: None,
         client_instance_id: vec![7],
         client_metadata: Default::default(),
+        known_resource_hashes: vec![],
     };
     match session.bootstrap_fresh_client(&hello) {
         Err(SessionError::SnapshotUnrepresentable { limit, actual }) => {
@@ -530,6 +543,8 @@ async fn oversized_catch_up_snapshot_fails_the_handshake_instead_of_being_sent()
         last_applied_revision: 0,
         last_acked_event_seq: 0,
         terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
     };
     assert!(matches!(
         session.bootstrap_resume(&resume),

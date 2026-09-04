@@ -72,9 +72,10 @@ pub fn mint_session_id() -> String {
 use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, EventSequenceError, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal, DEFAULT_MAX_JOURNAL_ENTRIES};
 use srui_protocol::{Event, ServerLimits, Transaction};
+use srui_resources::{PublishOutcome, ResourceEntry, ResourceStore};
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
-    AuthoritativeCommit, EventValidationError, NegotiationError, NodeId, PropertyRef,
+    AuthoritativeCommit, EventValidationError, NegotiationError, NodeId, PropertyRef, ResourceHash,
     SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef, Value,
     DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
     DEFAULT_MAX_TREE_DEPTH,
@@ -137,6 +138,9 @@ pub enum SessionError {
 
     #[error("transaction panicked: {0}")]
     Panicked(String),
+
+    #[error("resource error: {0}")]
+    Resource(#[from] srui_resources::ResourceError),
 }
 
 /// Takes `mutex`, recovering from poisoning instead of propagating the panic.
@@ -200,6 +204,11 @@ pub(crate) struct SessionInner {
     pub(crate) dedupe: EventDeduplicator,
     pub(crate) capabilities: ServerCapabilities,
     pub(crate) limits: ServerLimits,
+    pub(crate) resources: ResourceStore,
+    /// Negotiated per-`client_instance_id` resource ceilings from ClientHello (§15, §26).
+    ///
+    /// Retained so ClientResume (which carries no limits) can reuse the last negotiated value.
+    pub(crate) client_resource_ceilings: HashMap<Vec<u8>, u64>,
     pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
 }
 
@@ -214,6 +223,11 @@ impl std::fmt::Debug for SessionInner {
             .field("dedupe", &self.dedupe)
             .field("capabilities", &self.capabilities)
             .field("limits", &self.limits)
+            .field("resources", &self.resources)
+            .field(
+                "client_resource_ceilings",
+                &self.client_resource_ceilings.len(),
+            )
             .field("handler_count", &self.handlers.len())
             .finish()
     }
@@ -369,6 +383,8 @@ impl Session {
             dedupe: EventDeduplicator::default(),
             capabilities: config.capabilities,
             limits,
+            resources: ResourceStore::new(),
+            client_resource_ceilings: HashMap::new(),
             handlers: HashMap::new(),
         };
 
@@ -485,7 +501,41 @@ impl Session {
         tracing::info!(session_id = %guard.session_id, "Session marked as EXPIRED");
     }
 
+    /// Publishes immutable `bytes` into the session resource CAS and, when newly
+    /// inserted, schedules transfer to every attached client (§14, §19.2).
+    ///
+    /// Repeated publication of identical content returns the same hash without
+    /// duplicating transfer work. The CAS survives detach/resume for the session
+    /// incarnation.
+    pub fn publish_resource(
+        &self,
+        bytes: impl AsRef<[u8]>,
+    ) -> Result<PublishOutcome, SessionError> {
+        let outcome = {
+            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            // Never evict hashes still referenced by the authoritative tree (§14).
+            let protected = guard.store.referenced_resource_hashes();
+            guard
+                .resources
+                .publish_resource_protecting(bytes, &protected)?
+        };
+        if outcome.inserted {
+            self.outbound_hub.publish_resource(&outcome.entry);
+        }
+        Ok(outcome)
+    }
+
+    /// Looks up a retained resource by hash (§14).
+    pub fn lookup_resource(&self, hash: &ResourceHash) -> Option<ResourceEntry> {
+        let guard = lock_or_recover(&self.inner);
+        guard.resources.lookup(hash).cloned()
+    }
+
     /// Subscribes to committed transactions for the specified `client_instance_id` (§20.2).
+    ///
+    /// Holds [`SessionInner`] through subscribe + retained-resource seeding so a concurrent
+    /// [`Session::publish_resource`] cannot insert between the snapshot and the live
+    /// subscription (same invariant as handshake bootstrap).
     ///
     /// Returns [`SessionError::OutboundClosed`] once [`Session::close_outbound`] has closed the hub.
     pub fn subscribe_transactions(
@@ -495,10 +545,20 @@ impl Session {
         let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let max_ops = guard.limits.max_transaction_operations as usize;
         let max_frame_size = guard.limits.max_frame_size as usize;
+        let max_resource_size = guard.limits.max_resource_size as u64;
         let capacity = self.outbound_queue_capacity;
+        let retained = guard.resources.retained_entries();
+        // SessionInner -> OutboundHub: do not drop `guard` until after seed_resources.
+        let receiver = self.outbound_hub.subscribe(
+            client_instance_id,
+            capacity,
+            max_ops,
+            max_frame_size,
+            max_resource_size,
+        )?;
+        self.outbound_hub.seed_resources(&receiver, &retained);
         drop(guard);
-        self.outbound_hub
-            .subscribe(client_instance_id, capacity, max_ops, max_frame_size)
+        Ok(receiver)
     }
 
     /// Clears the overflow stale marker after a catch-up snapshot has been written (§20.2).
@@ -1008,6 +1068,7 @@ mod tests {
             limits: None,
             client_instance_id: Vec::new(),
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         };
 
         let bootstrap = session

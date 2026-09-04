@@ -53,6 +53,7 @@ async fn test_throttled_1000_updates_coalesce_with_structural_barrier() {
             limits: None,
             client_instance_id: vec![1, 2, 3, 4],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     framed_write.send(hello).await.expect("send ClientHello");
@@ -209,6 +210,7 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
             limits: None,
             client_instance_id: client_instance.clone(),
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     framed_write.send(hello).await.expect("send ClientHello");
@@ -282,6 +284,8 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         })),
     };
     r_framed_write

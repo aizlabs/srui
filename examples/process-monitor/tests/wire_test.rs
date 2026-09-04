@@ -80,6 +80,7 @@ async fn connect(session: Arc<Session>, shutdown: CancellationToken) -> DuplexSt
             limits: None,
             client_instance_id: vec![9, 9, 9, 9],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     client_io

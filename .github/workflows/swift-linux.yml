@@ -18,6 +18,15 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# One run per pull request. A burst of pushes cancels the earlier runs so a draft does not stack
+# concurrent (uncached) Swift toolchain installs.
+concurrency:
+  group: swift-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   swift-parse:
     name: Swift Parse (Linux, syntax-only)
@@ -66,12 +75,39 @@ jobs:
           expected = ["LogicalChannelScheduling", "LogicalChannelSchedulingTests"]
           if names != expected:
               sys.exit(f"unexpected targets {names}; wanted {expected}")
+          # `swift package describe` reports these as `target_dependencies` (target names) and
+          # `product_dependencies` (external products), both omitted when empty.
+          if not any(
+              "target_dependencies" in t or "product_dependencies" in t for t in desc["targets"]
+          ):
+              sys.exit("no dependency keys in describe output; schema changed, update this check")
+
+          def dep_names(raw):
+              names = []
+              for dep in raw or []:
+                  if isinstance(dep, dict):
+                      names.append(dep.get("product") or dep.get("name") or str(dep))
+                  else:
+                      names.append(str(dep))
+              return sorted(names)
+
           for target in desc["targets"]:
-              raw = target.get("dependencies") or []
-              deps = []
-              for dep in raw:
-                  deps.append(dep.get("product") or dep.get("name") or dep)
-              print(f"{target['name']}: type={target['type']} deps={deps}")
+              target_deps = dep_names(target.get("target_dependencies"))
+              product_deps = dep_names(target.get("product_dependencies"))
+              print(
+                  f"{target['name']}: type={target['type']} "
+                  f"target_deps={target_deps} product_deps={product_deps}"
+              )
+              if product_deps:
+                  sys.exit(
+                      f"{target['name']} depends on external products {product_deps}; "
+                      "the nested package must stay dependency-free"
+                  )
+              wanted = [] if target["type"] == "library" else ["LogicalChannelScheduling"]
+              if target_deps != wanted:
+                  sys.exit(
+                      f"{target['name']} target dependencies {target_deps}; wanted {wanted}"
+                  )
           print("nested package is self-contained")
           PY
       - name: Build and test LogicalChannelScheduling

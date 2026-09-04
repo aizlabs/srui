@@ -54,8 +54,9 @@ list_changed_handwritten() {
     git diff --name-only --diff-filter=ACMR HEAD -- '*.swift' \
         | while IFS= read -r path; do emit_if_handwritten "$path"; done
     # Untracked files. Pathspec globs do not recurse for `--others`.
+    # `grep` exits 1 when nothing matches, which `pipefail` would turn into a gate failure.
     git ls-files --others --exclude-standard \
-        | grep '\.swift$' \
+        | { grep '\.swift$' || true; } \
         | while IFS= read -r path; do emit_if_handwritten "$path"; done
 }
 
@@ -74,32 +75,40 @@ echo "Swift parse gate: syntax-only (no type checking, module resolution, linkin
 echo "swiftc: $(command -v swiftc)"
 swiftc --version | sed 's/^/  /'
 
+# The selection goes through a temp file rather than `mapfile`: macOS ships bash 3.2, which has
+# no such builtin, and `.githooks/pre-push` runs this script with `bash`.
+selected=$(mktemp "${TMPDIR:-/tmp}/srui-swift-parse.XXXXXX")
+trap 'rm -f "$selected"' EXIT
+
 if [ -n "$base" ]; then
     echo "Range: ${base}...${head} (merge-base through head)"
-    mapfile -t files < <(list_changed_handwritten "$base" "$head" | sort -u)
+    list_changed_handwritten "$base" "$head" | sort -u > "$selected"
 else
     echo "No merge base; parsing every tracked hand-written Swift file."
-    mapfile -t files < <(list_all_handwritten | sort -u)
+    list_all_handwritten | sort -u > "$selected"
 fi
 
-if [ "${#files[@]}" -eq 0 ] || [ -z "${files[0]:-}" ]; then
+if [ ! -s "$selected" ]; then
     echo "No changed hand-written Swift files."
     exit 0
 fi
 
 fail=0
-for path in "${files[@]}"; do
+count=0
+while IFS= read -r path; do
     [ -n "$path" ] || continue
+    count=$((count + 1))
     printf 'parse %s\n' "$path"
-    if ! swiftc -frontend -parse "$path"; then
+    # stdin is the file list; keep swiftc from consuming it.
+    if ! swiftc -frontend -parse "$path" </dev/null; then
         printf 'FAILED: parser rejected %s\n' "$path" >&2
         fail=1
     fi
-done
+done < "$selected"
 
 if [ "$fail" -ne 0 ]; then
     echo "Swift parse gate failed." >&2
     exit 1
 fi
 
-echo "Parsed ${#files[@]} hand-written Swift file(s)."
+echo "Parsed ${count} hand-written Swift file(s)."

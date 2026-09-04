@@ -49,9 +49,11 @@ if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then
 	fail=1
 fi
 
+# Pure grep, no Swift toolchain required, so it runs on every platform.
+run "swift: LogicalChannelScheduling imports" bash scripts/check-logical-channel-scheduling-imports.sh
+
 if command -v swiftc >/dev/null 2>&1; then
 	run "swift: parse changed sources (syntax-only)" bash scripts/parse-changed-swift.sh
-	run "swift: LogicalChannelScheduling imports" bash scripts/check-logical-channel-scheduling-imports.sh
 else
 	printf '\nskipping Swift parse gate (swiftc not on PATH)\n'
 fi
@@ -63,13 +65,17 @@ else
 	printf '\nskipping LogicalChannelScheduling tests (swift not on PATH)\n'
 fi
 
-# Policy codegen is Python and runs on Linux. Full proto regeneration needs
+# Policy and registry codegen are pure Python and run everywhere. Only the protobuf half needs
 # protoc-gen-swift (macOS CI).
 run "protocol: regenerate logical-channel policy" \
 	uv run python protocol/generate_logical_channel_policy.py
+run "protocol: regenerate Swift registry tables" \
+	uv run python protocol/generate_swift_registry.py
 run "protocol: committed scheduling policy is fresh" git diff --exit-code \
 	client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
 	server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs
+run "protocol: committed registry tables are fresh" git diff --exit-code \
+	client-macos/SemanticModel/RegistryTables.swift
 
 # Full client + proto regeneration need AppKit and protoc-gen-swift (macOS CI).
 if [ "$(uname -s)" = Darwin ]; then

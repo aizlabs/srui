@@ -737,6 +737,34 @@ fn test_model_reset_range_evicts_farthest_cached_items_to_stay_in_budget() {
 }
 
 #[test]
+fn test_evict_farthest_outside_count_zero_is_a_no_op() {
+    let limits = StoreLimits::default().with_max_cached_items_per_model(3);
+    let mut store = SemanticStore::with_limits(limits);
+    let list_type = resolve_standard_node_type("List").unwrap();
+    let model_id = ModelId::new(1);
+    store.create_model(model_id, list_type, 10_000).unwrap();
+    store
+        .model_reset_range(
+            model_id,
+            0,
+            vec![
+                ModelItem::with_value(ItemId::new(1), "a"),
+                ModelItem::with_value(ItemId::new(2), "b"),
+            ],
+            None,
+        )
+        .unwrap();
+    store
+        .get_model_mut(model_id)
+        .unwrap()
+        .evict_farthest_outside(0, 2, 0);
+    let model = store.get_model(model_id).unwrap();
+    assert_eq!(model.cached_item_count(), 2);
+    assert!(model.get_item_by_index(0).is_some());
+    assert!(model.get_item_by_index(1).is_some());
+}
+
+#[test]
 fn test_model_delete_combined_identity_and_range_preserves_item_count() {
     let mut store = SemanticStore::new();
     let list_type = resolve_standard_node_type("List").unwrap();

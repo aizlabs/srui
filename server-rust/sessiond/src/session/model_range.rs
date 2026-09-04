@@ -523,8 +523,8 @@ pub async fn run_model_range_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use srui_sdk::{NodeId, Surface, Table};
-    use srui_semantic_tree::{ItemId, Value};
+    use srui_sdk::{NodeId, Surface, Table, Tree};
+    use srui_semantic_tree::{ItemId, StoreError, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn table_and_model(item_count: u64) -> (Session, NodeId, ModelId) {
@@ -871,6 +871,337 @@ mod tests {
         let jumped = inbox.try_pop().expect("far jump");
         assert_eq!(jumped.start_index, 10_000);
         assert_eq!(jumped.count, 8);
+        assert!(inbox.try_pop().is_none());
+    }
+
+    #[tokio::test]
+    async fn count_above_operation_limit_is_refused_before_bounds() {
+        let (session, node_id, model_id) = table_and_model(20_000);
+        let calls = Arc::new(AtomicUsize::new(0));
+        session.register_model_range_provider(model_id, counting_provider(Arc::clone(&calls)));
+        let revision = session.current_revision();
+        let err = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 10_001, revision))
+            .await
+            .expect_err("count exceeds max_items_per_model_operation");
+        assert!(matches!(
+            err,
+            ModelRangeError::CountExceedsLimit {
+                count: 10_001,
+                limit: 10_000
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn missing_provider_is_a_no_op() {
+        let (session, node_id, model_id) = table_and_model(16);
+        let revision = session.current_revision();
+        let outcome = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 4, revision))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ModelRangeFulfillment::NoProvider);
+    }
+
+    #[tokio::test]
+    async fn provider_length_mismatch_is_refused() {
+        let (session, node_id, model_id) = table_and_model(16);
+        session.register_model_range_provider(
+            model_id,
+            Arc::new(|_| Box::pin(async { Ok(vec![item_at(0)]) })),
+        );
+        let revision = session.current_revision();
+        let err = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 2, revision))
+            .await
+            .expect_err("provider must return exactly count items");
+        assert!(matches!(
+            err,
+            ModelRangeError::ProviderItemCountMismatch {
+                expected: 2,
+                actual: 1
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_error_is_surfaced() {
+        let (session, node_id, model_id) = table_and_model(16);
+        session.register_model_range_provider(
+            model_id,
+            Arc::new(|_| Box::pin(async { Err(ModelRangeError::Provider("boom".into())) })),
+        );
+        let revision = session.current_revision();
+        let err = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 2, revision))
+            .await
+            .expect_err("provider failure");
+        assert!(matches!(err, ModelRangeError::Provider(_)));
+    }
+
+    #[tokio::test]
+    async fn tree_nodes_are_collection_targets() {
+        let session = Session::new("range-tree");
+        let node_id = NodeId::new(2);
+        let model_id = ModelId::new(7);
+        session
+            .transaction(|ui| {
+                Surface::builder(NodeId::new(1)).create(ui)?;
+                ui.apply_op(&Operation::create_model(model_id, TypeRef::TREE, 32))?;
+                Tree::builder(node_id)
+                    .parent(NodeId::new(1))
+                    .model_ref(model_id)
+                    .create(ui)?;
+                Ok(())
+            })
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        session.register_model_range_provider(model_id, counting_provider(Arc::clone(&calls)));
+        let revision = session.current_revision();
+        let outcome = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 2, revision))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ModelRangeFulfillment::Committed { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn session_error_converts_to_model_range_session() {
+        let from_input = ModelRangeError::from(SessionError::InvalidInput("nope".into()));
+        assert!(matches!(from_input, ModelRangeError::Session(text) if text.contains("nope")));
+        let from_store = ModelRangeError::from(SessionError::Store(StoreError::ModelNotFound(
+            ModelId::new(9),
+        )));
+        assert!(matches!(from_store, ModelRangeError::Session(_)));
+    }
+
+    #[test]
+    fn session_inner_debug_includes_provider_count() {
+        let (session, _, model_id) = table_and_model(4);
+        session.register_model_range_provider(
+            model_id,
+            counting_provider(Arc::new(AtomicUsize::new(0))),
+        );
+        let guard = lock_or_recover(&session.inner);
+        let rendered = format!("{guard:?}");
+        assert!(rendered.contains("model_range_provider_count"));
+        assert!(rendered.contains("1"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_fill_of_the_same_range_is_already_cached_after_commit() {
+        let (session, node_id, model_id) = table_and_model(20);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let entered = Arc::new(AtomicUsize::new(0));
+        session.register_model_range_provider(
+            model_id,
+            Arc::new({
+                let entered = Arc::clone(&entered);
+                move |query: ModelRangeQuery| {
+                    let release_rx = Arc::clone(&release_rx);
+                    let entered = Arc::clone(&entered);
+                    Box::pin(async move {
+                        let n = entered.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            if let Some(rx) = release_rx.lock().await.take() {
+                                let _ = rx.await;
+                            }
+                        }
+                        Ok((0..query.count)
+                            .map(|offset| item_at(query.start_index + offset))
+                            .collect())
+                    })
+                }
+            }),
+        );
+        let revision = session.current_revision();
+        let first = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .fulfill_model_range_request(request(node_id, model_id, 0, 2, revision))
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first provider entered");
+        let second = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 2, revision))
+            .await
+            .unwrap();
+        assert!(matches!(second, ModelRangeFulfillment::Committed { .. }));
+        release_tx.send(()).unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first, ModelRangeFulfillment::AlreadyCached);
+    }
+
+    #[tokio::test]
+    async fn node_type_change_during_provider_is_a_hard_error() {
+        let (session, node_id, model_id) = table_and_model(20);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let entered = Arc::new(AtomicUsize::new(0));
+        session.register_model_range_provider(
+            model_id,
+            Arc::new({
+                let entered = Arc::clone(&entered);
+                move |query: ModelRangeQuery| {
+                    let release_rx = Arc::clone(&release_rx);
+                    let entered = Arc::clone(&entered);
+                    Box::pin(async move {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        if let Some(rx) = release_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                        Ok((0..query.count)
+                            .map(|offset| item_at(query.start_index + offset))
+                            .collect())
+                    })
+                }
+            }),
+        );
+        let revision = session.current_revision();
+        let fulfill = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .fulfill_model_range_request(request(node_id, model_id, 0, 2, revision))
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider entered");
+        {
+            let mut guard = lock_or_recover(&session.inner);
+            guard
+                .store
+                .get_node_mut(node_id)
+                .expect("table node")
+                .node_type = TypeRef::TEXT;
+        }
+        release_tx.send(()).unwrap();
+        let err = fulfill
+            .await
+            .unwrap()
+            .expect_err("type change is not stale");
+        assert!(matches!(err, ModelRangeError::NotACollectionNode(_)));
+    }
+
+    #[test]
+    fn inbox_default_submit_after_close_and_overflow_helpers() {
+        let inbox = ModelRangeRequestInbox::default();
+        inbox.close();
+        inbox.submit(request(NodeId::new(1), ModelId::new(3), 0, 8, 1));
+        assert!(inbox.try_pop().is_none());
+
+        let zero = request(NodeId::new(1), ModelId::new(3), 40, 0, 1);
+        assert!(bounding_range(&zero, &zero).is_none());
+        let left = request(NodeId::new(1), ModelId::new(3), 0, 1, 1);
+        let right = request(NodeId::new(1), ModelId::new(3), MAX_MERGED_COUNT, 2, 1);
+        assert!(bounding_range(&left, &right).is_none());
+
+        let overflow = ClientModelRangeRequest {
+            node_id: 1,
+            model_id: 3,
+            start_index: u64::MAX,
+            count: 1,
+            observed_revision: 1,
+        };
+        assert!(!ranges_are_close(&overflow, &overflow));
+        assert!(!ranges_are_close(
+            &overflow,
+            &request(NodeId::new(1), ModelId::new(3), 0, 1, 1)
+        ));
+
+        let model = ModelId::new(3);
+        let mut packed: Vec<_> = (0..9)
+            .map(|i| request(NodeId::new(i + 1), model, i * 300, 8, 1))
+            .collect();
+        integrate_pending(&mut packed, request(NodeId::new(1), model, 0, 8, 1));
+        assert!(packed.len() <= MAX_PENDING_RANGES_PER_MODEL);
+    }
+
+    #[test]
+    fn try_pop_skips_stale_order_and_requeues_remaining() {
+        let inbox = ModelRangeRequestInbox::new();
+        let stale = ModelId::new(99);
+        let live = ModelId::new(3);
+        {
+            let mut guard = lock_or_recover(&inbox.inner);
+            guard.order.push_back(stale);
+            guard.order.push_back(live);
+            guard.pending.insert(live, Vec::new());
+            guard.order.push_back(ModelId::new(4));
+            guard.pending.insert(
+                ModelId::new(4),
+                vec![
+                    request(NodeId::new(1), ModelId::new(4), 0, 2, 1),
+                    request(NodeId::new(1), ModelId::new(4), 10, 2, 1),
+                ],
+            );
+        }
+        let first = inbox.try_pop().expect("live after stale/empty");
+        assert_eq!(first.model_id, 4);
+        assert_eq!(first.start_index, 0);
+        let second = inbox.try_pop().expect("requeued remainder");
+        assert_eq!(second.start_index, 10);
+        assert!(inbox.try_pop().is_none());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::redundant_async_block)]
+    async fn inbox_recv_observes_close_and_late_submit() {
+        let closed = ModelRangeRequestInbox::new();
+        closed.close();
+        assert!(InboxRecv { inbox: &closed }.await.is_none());
+
+        let inbox = ModelRangeRequestInbox::new();
+        let pending = inbox.clone();
+        let waiter = tokio::spawn(async move { InboxRecv { inbox: &pending }.await });
+        tokio::task::yield_now().await;
+        inbox.submit(request(NodeId::new(1), ModelId::new(3), 0, 4, 1));
+        let got = waiter.await.unwrap().expect("submitted after park");
+        assert_eq!(got.count, 4);
+
+        let closing = ModelRangeRequestInbox::new();
+        let pending = closing.clone();
+        let waiter = tokio::spawn(async move { InboxRecv { inbox: &pending }.await });
+        tokio::task::yield_now().await;
+        closing.close();
+        assert!(waiter.await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_exits_on_shutdown_and_closes_the_inbox() {
+        let (session, node_id, model_id) = table_and_model(8);
+        let session = Arc::new(session);
+        let inbox = ModelRangeRequestInbox::new();
+        let shutdown = CancellationToken::new();
+        let session_cancel = CancellationToken::new();
+        let worker = tokio::spawn(run_model_range_worker(
+            Arc::clone(&session),
+            inbox.clone(),
+            shutdown.clone(),
+            session_cancel,
+        ));
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        worker.await.unwrap();
+        inbox.submit(request(node_id, model_id, 0, 1, session.current_revision()));
         assert!(inbox.try_pop().is_none());
     }
 }

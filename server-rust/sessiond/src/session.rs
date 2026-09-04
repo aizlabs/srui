@@ -1078,6 +1078,61 @@ mod tests {
         assert!(bootstrap.transactions.termination().is_none());
     }
 
+    /// `client_instance_id` is client-supplied and is retained as a key by the remembered-ceiling
+    /// table, the stale-client record, and every subscriber. Those tables cap their entry count,
+    /// not the key size, so an oversized identifier must be refused at the handshake (§15, §26).
+    #[test]
+    fn test_bootstrap_fresh_client_rejects_oversized_client_instance_id() {
+        use super::handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let session = Session::new("oversized-instance-id");
+        let hello = srui_protocol::ClientHello {
+            core_version: "0.4.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: vec![7u8; MAX_CLIENT_INSTANCE_ID_BYTES + 1],
+            client_metadata: Default::default(),
+            known_resource_hashes: vec![],
+        };
+
+        match session.bootstrap_fresh_client(&hello) {
+            Err(SessionError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("client_instance_id"),
+                    "diagnostic must name the offending field, got {message:?}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// The resume path keys the same tables, so it must refuse the identifier the fresh path does.
+    #[test]
+    fn test_bootstrap_resume_rejects_oversized_client_instance_id() {
+        use super::handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let session = Session::new("oversized-instance-id-resume");
+        let resume = srui_protocol::ClientResume {
+            session_id: "oversized-instance-id-resume".to_string(),
+            client_instance_id: vec![7u8; MAX_CLIENT_INSTANCE_ID_BYTES + 1],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+        };
+
+        match session.bootstrap_resume(&resume) {
+            Err(SessionError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("client_instance_id"),
+                    "diagnostic must name the offending field, got {message:?}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_outbound_hub_accessible() {
         let session = Session::new("test-outbound-hub");

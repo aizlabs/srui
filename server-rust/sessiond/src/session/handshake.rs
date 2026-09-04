@@ -84,6 +84,9 @@ fn negotiate_hello(
     inner: &super::SessionInner,
     hello: &ClientHello,
 ) -> Result<(ServerWelcome, Option<SemanticStore>), SessionError> {
+    // Refuse an unretainable identity before any per-client table copies it (§15, §26).
+    validate_client_instance_id(&hello.client_instance_id)?;
+
     // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
     // version would let two peers that disagree about required semantics reach the data plane
     // (§4 inv. 13).
@@ -161,6 +164,27 @@ fn known_resource_hashes(raw_hashes: &[Vec<u8>], limit: usize) -> HashSet<Resour
 
 /// Bounds remembered per-client ceilings; `client_instance_id` is client-supplied (§15, §26).
 const MAX_CLIENT_RESOURCE_CEILINGS: usize = 256;
+
+/// Maximum accepted `client_instance_id` length, in bytes (§15, §26).
+///
+/// The identifier is client-supplied and is retained as a *key* in several long-lived per-client
+/// tables: remembered resource ceilings, the stale-client record, and each subscriber's identity.
+/// Those tables bound their entry count, not the size of a key, so an unbounded identifier lets
+/// ordinary handshakes grow daemon memory toward the frame ceiling times the entry cap. 64 bytes
+/// holds a UUID or a SHA-256 with room to spare.
+pub const MAX_CLIENT_INSTANCE_ID_BYTES: usize = 64;
+
+/// Refuses a `client_instance_id` too large to retain, before anything stores a copy of it.
+fn validate_client_instance_id(client_instance_id: &[u8]) -> Result<(), SessionError> {
+    if client_instance_id.len() > MAX_CLIENT_INSTANCE_ID_BYTES {
+        return Err(SessionError::InvalidInput(format!(
+            "client_instance_id is {} bytes; at most {} are accepted (§15, §26)",
+            client_instance_id.len(),
+            MAX_CLIENT_INSTANCE_ID_BYTES
+        )));
+    }
+    Ok(())
+}
 
 fn remember_client_resource_ceiling(
     ceilings: &mut HashMap<Vec<u8>, u64>,
@@ -327,6 +351,9 @@ impl Session {
                 last_processed_event_seq: u64,
             },
         }
+
+        // Refuse an unretainable identity before any per-client table copies it (§15, §26).
+        validate_client_instance_id(&resume.client_instance_id)?;
 
         let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let last_processed_event_seq = inner_guard

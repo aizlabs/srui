@@ -43,6 +43,9 @@ public struct ResourceLimits: Sendable, Equatable {
     public var maxCommittedEntries: Int
     /// Maximum aggregate decoded backing-store bytes (`bytesPerRow × height`) across committed images.
     public var maxCommittedDecodedBytes: Int
+    /// Maximum UTF-8 length of a resource's `media_type`. The string is retained per partial
+    /// assembly and per committed image, outside both byte budgets. Default: 255.
+    public var maxMediaTypeBytes: Int
 
     public init(
         maxEncodedBytes: Int = 50 * 1024 * 1024,
@@ -52,7 +55,8 @@ public struct ResourceLimits: Sendable, Equatable {
         maxConcurrentAssemblies: Int = 16,
         maxInFlightBytes: Int = 64 * 1024 * 1024,
         maxCommittedEntries: Int = 64,
-        maxCommittedDecodedBytes: Int = 256 * 1024 * 1024
+        maxCommittedDecodedBytes: Int = 256 * 1024 * 1024,
+        maxMediaTypeBytes: Int = 255
     ) {
         self.maxEncodedBytes = maxEncodedBytes
         self.maxAxisPixels = maxAxisPixels
@@ -62,6 +66,7 @@ public struct ResourceLimits: Sendable, Equatable {
         self.maxInFlightBytes = maxInFlightBytes
         self.maxCommittedEntries = maxCommittedEntries
         self.maxCommittedDecodedBytes = maxCommittedDecodedBytes
+        self.maxMediaTypeBytes = maxMediaTypeBytes
     }
 }
 
@@ -122,6 +127,7 @@ public enum ResourceCacheError: Error, Equatable, Sendable, CustomStringConverti
     case nonContiguousOffset(expected: UInt64, actual: UInt64)
     case oversizedChunk(length: Int, limit: Int)
     case oversizedEncoded(length: UInt64, limit: Int)
+    case oversizedMediaType(length: Int, limit: Int)
     case lengthMismatch(expected: UInt64, actual: UInt64)
     case hashMismatch(expected: ResourceHash, actual: ResourceHash)
     case invalidImage(String)
@@ -144,6 +150,8 @@ public enum ResourceCacheError: Error, Equatable, Sendable, CustomStringConverti
             return "chunk payload \(length) bytes exceeds limit \(limit)"
         case .oversizedEncoded(let length, let limit):
             return "encoded length \(length) exceeds limit \(limit)"
+        case .oversizedMediaType(let length, let limit):
+            return "media type of \(length) bytes exceeds limit \(limit)"
         case .lengthMismatch(let expected, let actual):
             return "assembled length \(actual) does not match encoded_length \(expected)"
         case .hashMismatch(let expected, let actual):
@@ -425,6 +433,15 @@ public actor ResourceCache {
             throw ResourceCacheError.oversizedEncoded(
                 length: input.encodedLength,
                 limit: limits.maxEncodedBytes
+            )
+        }
+        // `media_type` is retained by every partial assembly and every committed image, and is
+        // accounted for by neither the encoded nor the decoded byte budget (§26).
+        let mediaTypeBytes = input.mediaType.utf8.count
+        if mediaTypeBytes > limits.maxMediaTypeBytes {
+            throw ResourceCacheError.oversizedMediaType(
+                length: mediaTypeBytes,
+                limit: limits.maxMediaTypeBytes
             )
         }
     }

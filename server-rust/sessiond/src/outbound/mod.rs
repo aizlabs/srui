@@ -13,6 +13,7 @@
 //! and chunks are both `resource` traffic and are generated lazily, one frame per selection.
 
 mod coalesce;
+mod receiver;
 mod resource;
 mod scheduler;
 
@@ -28,6 +29,7 @@ use srui_semantic_tree::{ResourceHash, Transaction as DomainTxn};
 
 use crate::session::{lock_or_recover, SessionError};
 
+pub use receiver::OutboundReceiver;
 pub use resource::ResourceOutboundFrame;
 pub use scheduler::{
     logical_class_for_server_envelope, LogicalChannelClass, LogicalChannelScheduler, SERVICE_CYCLE,
@@ -41,7 +43,7 @@ pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 /// `client_instance_id` is client-supplied, so the marker table is bounded on the same terms as
 /// the journal retention window (§18.1): the oldest marker is evicted once the bound is reached.
 /// An evicted client that later resumes falls back to journal-gap evaluation.
-pub(crate) const MAX_TRACKED_STALE_CLIENTS: usize = 1024;
+pub const MAX_TRACKED_STALE_CLIENTS: usize = 1024;
 
 /// One outbound delivery unit: UI transaction or a single resource frame (§14, §19.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -191,11 +193,6 @@ impl SubscriberState {
         }
     }
 
-    fn pop_scheduled(&mut self, scheduler: &mut LogicalChannelScheduler) -> Option<OutboundItem> {
-        let class = scheduler.select_next(|class| self.class_ready(class))?;
-        self.pop_class(class)
-    }
-
     fn clear(&mut self) {
         self.items.clear();
         self.tail_domain = None;
@@ -291,6 +288,14 @@ impl StaleClientRegistry {
         self.entries.contains_key(client_instance_id)
     }
 
+    /// Client-supplied bytes retained by this table, i.e. the identifiers themselves.
+    ///
+    /// The entry cap bounds how many identifiers are kept, not how large each one is; this is the
+    /// quantity a retention invariant can assert against (§20.2, §26).
+    fn retained_key_bytes(&self) -> usize {
+        self.entries.keys().map(Vec::len).sum()
+    }
+
     fn clear_client(&mut self, client_instance_id: &[u8]) {
         if self.entries.remove(client_instance_id).is_some() {
             // Bounded by MAX_TRACKED_STALE_CLIENTS, so the linear scan is bounded too.
@@ -311,165 +316,6 @@ impl StaleClientRegistry {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
-    }
-}
-
-/// A handle for receiving outbound transactions streamed to a connection.
-#[derive(Debug)]
-pub struct OutboundReceiver {
-    notify_rx: mpsc::Receiver<()>,
-    state: Arc<Mutex<SubscriberState>>,
-    disconnect: CancellationToken,
-    scheduler: LogicalChannelScheduler,
-}
-
-impl OutboundReceiver {
-    /// Asynchronously waits for the next outbound item selected by the logical-channel scheduler.
-    ///
-    /// This is the single, authoritative signal for queue lag: on overflow, it returns
-    /// [`OutboundRecvError::Lagged`].
-    pub async fn recv(&mut self) -> Result<OutboundItem, OutboundRecvError> {
-        loop {
-            {
-                let mut guard = lock_or_recover(&self.state);
-                if let Some(reason) = &guard.stale_reason {
-                    return Err(OutboundRecvError::Lagged(reason.clone()));
-                }
-                if let Some(item) = guard.pop_scheduled(&mut self.scheduler) {
-                    return Ok(item);
-                }
-                if guard.is_closed {
-                    return Err(OutboundRecvError::Closed);
-                }
-            }
-
-            match self.notify_rx.recv().await {
-                Some(()) => {}
-                None => {
-                    let mut guard = lock_or_recover(&self.state);
-                    if let Some(reason) = &guard.stale_reason {
-                        return Err(OutboundRecvError::Lagged(reason.clone()));
-                    }
-                    if let Some(item) = guard.pop_scheduled(&mut self.scheduler) {
-                        return Ok(item);
-                    }
-                    return Err(OutboundRecvError::Closed);
-                }
-            }
-        }
-    }
-
-    /// Non-blocking synchronous poll for the next outbound item.
-    pub fn try_recv(&mut self) -> Result<Option<OutboundItem>, OutboundRecvError> {
-        let mut guard = lock_or_recover(&self.state);
-        if let Some(reason) = &guard.stale_reason {
-            return Err(OutboundRecvError::Lagged(reason.clone()));
-        }
-        if let Some(item) = guard.pop_scheduled(&mut self.scheduler) {
-            let _ = self.notify_rx.try_recv();
-            return Ok(Some(item));
-        }
-        if guard.is_closed {
-            return Err(OutboundRecvError::Closed);
-        }
-        Ok(None)
-    }
-
-    /// Returns `true` when `class` has a frame that [`Self::pop_class`] can emit.
-    #[must_use]
-    pub(crate) fn class_ready(&self, class: LogicalChannelClass) -> bool {
-        lock_or_recover(&self.state).class_ready(class)
-    }
-
-    /// Pops one frame of `class` without consulting the receiver's own scheduler cursor.
-    ///
-    /// The connection write loop owns the scheduler that combines this queue with the
-    /// per-connection control channel.
-    pub(crate) fn pop_class(
-        &mut self,
-        class: LogicalChannelClass,
-    ) -> Result<Option<OutboundItem>, OutboundRecvError> {
-        let mut guard = lock_or_recover(&self.state);
-        if let Some(reason) = &guard.stale_reason {
-            return Err(OutboundRecvError::Lagged(reason.clone()));
-        }
-        if let Some(item) = guard.pop_class(class) {
-            let _ = self.notify_rx.try_recv();
-            return Ok(Some(item));
-        }
-        Ok(None)
-    }
-
-    /// Waits until UI or resource work is queued, or the subscriber terminates.
-    pub(crate) async fn wait_for_work(&mut self) -> Result<(), OutboundRecvError> {
-        loop {
-            {
-                let guard = lock_or_recover(&self.state);
-                if let Some(reason) = &guard.stale_reason {
-                    return Err(OutboundRecvError::Lagged(reason.clone()));
-                }
-                if guard.has_scheduled_work() {
-                    return Ok(());
-                }
-                if guard.is_closed {
-                    return Err(OutboundRecvError::Closed);
-                }
-            }
-
-            match self.notify_rx.recv().await {
-                Some(()) => {}
-                None => {
-                    let guard = lock_or_recover(&self.state);
-                    if let Some(reason) = &guard.stale_reason {
-                        return Err(OutboundRecvError::Lagged(reason.clone()));
-                    }
-                    if guard.has_scheduled_work() {
-                        return Ok(());
-                    }
-                    return Err(OutboundRecvError::Closed);
-                }
-            }
-        }
-    }
-
-    /// Token cancelled when this subscriber overflows or the hub closes.
-    ///
-    /// Connection writes must race this against `framed_write.send` so a blocked
-    /// socket does not delay `LaggedResyncRequired` (§20.2).
-    #[must_use]
-    pub fn disconnect_token(&self) -> &CancellationToken {
-        &self.disconnect
-    }
-
-    /// Current terminal state, if the queue has overflowed or closed.
-    #[must_use]
-    pub fn termination(&self) -> Option<OutboundRecvError> {
-        let guard = lock_or_recover(&self.state);
-        if let Some(reason) = &guard.stale_reason {
-            Some(OutboundRecvError::Lagged(reason.clone()))
-        } else if guard.is_closed {
-            Some(OutboundRecvError::Closed)
-        } else {
-            None
-        }
-    }
-
-    /// Returns `true` if the underlying queue has closed.
-    pub fn is_closed(&self) -> bool {
-        lock_or_recover(&self.state).is_closed
-    }
-}
-
-/// Releases the queue as soon as the connection ends, rather than at the next publish (§20.2).
-///
-/// The hub reaps the matching subscriber entry on the next [`OutboundHub::publish`] or
-/// [`OutboundHub::subscribe`]; marking the state closed here frees the queued transactions
-/// immediately so an idle session does not hold them until then.
-impl Drop for OutboundReceiver {
-    fn drop(&mut self) {
-        let mut guard = lock_or_recover(&self.state);
-        guard.is_closed = true;
-        guard.clear();
     }
 }
 
@@ -557,12 +403,7 @@ impl OutboundHub {
         subs.push(sub);
         drop(subs);
 
-        Ok(OutboundReceiver {
-            notify_rx,
-            state,
-            disconnect,
-            scheduler: LogicalChannelScheduler::new(),
-        })
+        Ok(OutboundReceiver::new(notify_rx, state, disconnect))
     }
 
     pub fn publish(&self, tx: &Transaction) {
@@ -701,6 +542,11 @@ impl OutboundHub {
         if enqueued {
             let _ = sub.notify_tx.try_send(());
         }
+    }
+
+    /// Client-supplied bytes retained by the stale-client registry (§20.2, §26).
+    pub fn retained_stale_client_bytes(&self) -> usize {
+        lock_or_recover(&self.stale_clients).retained_key_bytes()
     }
 
     pub fn is_client_stale(&self, client_instance_id: &[u8]) -> bool {
@@ -842,7 +688,7 @@ mod tests {
         assert_eq!(hub.peak_depth_for_client(&[1]), 1);
 
         let merged = rx
-            .try_recv()
+            .try_recv_class(LogicalChannelClass::Ui)
             .expect("poll")
             .expect("merged tx")
             .into_transaction()
@@ -883,11 +729,26 @@ mod tests {
         hub.publish(&tx4);
         assert_eq!(hub.peak_depth_for_client(&[1]), 3);
 
-        let p1 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
+        let p1 = rx
+            .try_recv_class(LogicalChannelClass::Ui)
+            .unwrap()
+            .unwrap()
+            .into_transaction()
+            .unwrap();
         assert_eq!(p1.new_revision, 1);
-        let p2 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
+        let p2 = rx
+            .try_recv_class(LogicalChannelClass::Ui)
+            .unwrap()
+            .unwrap()
+            .into_transaction()
+            .unwrap();
         assert_eq!(p2.new_revision, 2);
-        let p3 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
+        let p3 = rx
+            .try_recv_class(LogicalChannelClass::Ui)
+            .unwrap()
+            .unwrap()
+            .into_transaction()
+            .unwrap();
         assert_eq!(p3.new_revision, 4);
     }
 
@@ -939,11 +800,19 @@ mod tests {
             "coalescing must not create an SruiMessage larger than the frame limit"
         );
         assert_eq!(
-            rx.try_recv().unwrap().unwrap().into_transaction().unwrap(),
+            rx.try_recv_class(LogicalChannelClass::Ui)
+                .unwrap()
+                .unwrap()
+                .into_transaction()
+                .unwrap(),
             tx1
         );
         assert_eq!(
-            rx.try_recv().unwrap().unwrap().into_transaction().unwrap(),
+            rx.try_recv_class(LogicalChannelClass::Ui)
+                .unwrap()
+                .unwrap()
+                .into_transaction()
+                .unwrap(),
             tx2
         );
     }
@@ -971,7 +840,10 @@ mod tests {
             "overflow must wake a connection blocked in framed_write.send"
         );
 
-        assert!(matches!(rx.try_recv(), Err(OutboundRecvError::Lagged(_))));
+        assert!(matches!(
+            rx.try_recv_class(LogicalChannelClass::Ui),
+            Err(OutboundRecvError::Lagged(_))
+        ));
         assert!(matches!(
             rx.termination(),
             Some(OutboundRecvError::Lagged(_))
@@ -1107,7 +979,7 @@ mod tests {
         let tx = make_create_node_tx(0, 1, 1);
         hub.publish(&tx);
         assert_eq!(
-            rx.try_recv()
+            rx.try_recv_class(LogicalChannelClass::Ui)
                 .expect("poll")
                 .expect("queued tx")
                 .into_transaction()
@@ -1145,6 +1017,46 @@ mod tests {
 
     /// `ClientHello.client_instance_id` is a proto3 `bytes` field with no non-empty requirement,
     /// so an omitted id must still receive transactions rather than lose the connection.
+    /// The stale registry caps entries, not identifier size. Marking far more clients than the cap
+    /// allows, each with a maximal identifier, must plateau in *bytes* — the quantity a count
+    /// assertion cannot see (§20.2, §26).
+    #[test]
+    fn test_stale_registry_retained_bytes_plateau_under_distinct_ids() {
+        use crate::session::MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let mut registry = StaleClientRegistry::default();
+        let budget = MAX_TRACKED_STALE_CLIENTS * MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let mut at_cap = None;
+        for nonce in 0..(MAX_TRACKED_STALE_CLIENTS as u64 * 4) {
+            let mut id = nonce.to_be_bytes().to_vec();
+            id.resize(MAX_CLIENT_INSTANCE_ID_BYTES, 0xAB);
+            registry.mark(id, 1);
+
+            let retained = registry.retained_key_bytes();
+            assert!(
+                retained <= budget,
+                "after {} marks: retained {retained} bytes exceeds the {budget} byte budget",
+                nonce + 1
+            );
+            if registry.len() == MAX_TRACKED_STALE_CLIENTS {
+                match at_cap {
+                    None => at_cap = Some(retained),
+                    Some(previous) => assert_eq!(
+                        previous, retained,
+                        "retained bytes must stop growing once the entry cap is reached"
+                    ),
+                }
+            }
+        }
+
+        assert_eq!(
+            at_cap,
+            Some(budget),
+            "the sequence must saturate the table, or the bound is untested"
+        );
+    }
+
     #[test]
     fn test_subscribe_accepts_empty_client_instance_id() {
         let hub = OutboundHub::new();
@@ -1155,7 +1067,7 @@ mod tests {
         let tx = make_create_node_tx(0, 1, 1);
         hub.publish(&tx);
         assert_eq!(
-            rx.try_recv()
+            rx.try_recv_class(LogicalChannelClass::Ui)
                 .expect("poll")
                 .expect("queued tx")
                 .into_transaction()

@@ -713,7 +713,7 @@ private actor GatedSendTransport: Transport {
         releaseContinuation.yield()
     }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         sentFrameCount += 1
         var releases = releaseStream.makeAsyncIterator()
         _ = await releases.next()
@@ -746,7 +746,7 @@ private actor DrainOnCloseTransport: Transport {
         buffered.append(try SRUIFraming.encodeFramed(message))
     }
 
-    func send(data: Data) async throws {}
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {}
 
     nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
         stream

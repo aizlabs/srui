@@ -37,70 +37,28 @@ impl LogicalChannelClass {
         Self::TerminalNormal,
         Self::Resource,
     ];
-
-    /// Maximum head-of-line service distance under continuous saturation of every lane.
-    ///
-    /// Distance is measured in dispatched frames between consecutive services of this class
-    /// (the later service included). Resource as the only backlog is a special case: newly
-    /// ready control, input, and UI frames are selected before another resource frame.
-    #[must_use]
-    pub const fn max_service_gap(self) -> usize {
-        match self {
-            Self::Control => 5,
-            Self::Input => 5,
-            Self::Ui => 8,
-            Self::TerminalHigh => 12,
-            Self::TerminalNormal => 14,
-            Self::Resource => 24,
-        }
-    }
 }
 
-/// Deterministic 24-slot weighted cycle shared with the Swift client.
-pub const SERVICE_CYCLE: [LogicalChannelClass; 24] = [
-    LogicalChannelClass::Control,
-    LogicalChannelClass::Input,
-    LogicalChannelClass::Ui,
-    LogicalChannelClass::Control,
-    LogicalChannelClass::Input,
-    LogicalChannelClass::TerminalHigh,
-    LogicalChannelClass::Control,
-    LogicalChannelClass::Input,
-    LogicalChannelClass::Ui,
-    LogicalChannelClass::Control,
-    LogicalChannelClass::Input,
-    LogicalChannelClass::TerminalNormal,
-    LogicalChannelClass::Control,
-    LogicalChannelClass::Input,
-    LogicalChannelClass::Ui,
-    LogicalChannelClass::Control,
-    LogicalChannelClass::Input,
-    LogicalChannelClass::TerminalHigh,
-    LogicalChannelClass::Ui,
-    LogicalChannelClass::Control,
-    LogicalChannelClass::Input,
-    LogicalChannelClass::TerminalNormal,
-    LogicalChannelClass::TerminalHigh,
-    LogicalChannelClass::Resource,
-];
+include!("logical_channel_policy.generated.rs");
 
 /// Maps a server-originated envelope to its logical class (§19.2).
 ///
-/// `SERVER EVENT_ACK` is always control-class and is never coalesced or merged.
+/// `SERVER EVENT_ACK` is always control-class and is never coalesced or merged. Client-originated
+/// and unknown envelopes return `None` so they cannot be admitted into an outbound lane.
 #[must_use]
-pub fn logical_class_for_server_envelope(message: &SruiMessage) -> LogicalChannelClass {
+pub fn logical_class_for_server_envelope(message: &SruiMessage) -> Option<LogicalChannelClass> {
     match &message.msg {
         Some(srui_message::Msg::ServerWelcome(_))
         | Some(srui_message::Msg::ServerResumeOk(_))
         | Some(srui_message::Msg::ServerResyncRequired(_))
-        | Some(srui_message::Msg::ServerEventAck(_))
-        | Some(srui_message::Msg::ClientHello(_))
-        | Some(srui_message::Msg::ClientResume(_)) => LogicalChannelClass::Control,
-        Some(srui_message::Msg::Event(_)) => LogicalChannelClass::Input,
-        Some(srui_message::Msg::Transaction(_)) => LogicalChannelClass::Ui,
+        | Some(srui_message::Msg::ServerEventAck(_)) => Some(LogicalChannelClass::Control),
+        Some(srui_message::Msg::Transaction(_)) => Some(LogicalChannelClass::Ui),
         Some(srui_message::Msg::ResourceMetadata(_))
-        | Some(srui_message::Msg::ResourceChunk(_)) => LogicalChannelClass::Resource,
-        None => LogicalChannelClass::Control,
+        | Some(srui_message::Msg::ResourceChunk(_)) => Some(LogicalChannelClass::Resource),
+        Some(srui_message::Msg::ClientHello(_))
+        | Some(srui_message::Msg::ClientResume(_))
+        | Some(srui_message::Msg::Event(_))
+        | None => None,
     }
 }
 
@@ -196,41 +154,6 @@ mod tests {
 
     fn envelope(msg: srui_message::Msg) -> SruiMessage {
         SruiMessage { msg: Some(msg) }
-    }
-
-    #[test]
-    fn service_cycle_is_the_documented_24_slot_sequence() {
-        use LogicalChannelClass::*;
-        assert_eq!(
-            SERVICE_CYCLE,
-            [
-                Control,
-                Input,
-                Ui,
-                Control,
-                Input,
-                TerminalHigh,
-                Control,
-                Input,
-                Ui,
-                Control,
-                Input,
-                TerminalNormal,
-                Control,
-                Input,
-                Ui,
-                Control,
-                Input,
-                TerminalHigh,
-                Ui,
-                Control,
-                Input,
-                TerminalNormal,
-                TerminalHigh,
-                Resource,
-            ]
-        );
-        assert_eq!(SERVICE_CYCLE.len(), 24);
     }
 
     #[test]
@@ -415,11 +338,11 @@ mod tests {
         }));
         assert_eq!(
             logical_class_for_server_envelope(&ack),
-            LogicalChannelClass::Control
+            Some(LogicalChannelClass::Control)
         );
         for class in LogicalChannelClass::ALL {
             if class != LogicalChannelClass::Control {
-                assert_ne!(logical_class_for_server_envelope(&ack), class);
+                assert_ne!(logical_class_for_server_envelope(&ack), Some(class));
             }
         }
 
@@ -427,25 +350,32 @@ mod tests {
             logical_class_for_server_envelope(&envelope(srui_message::Msg::Transaction(
                 Transaction::default()
             ))),
-            LogicalChannelClass::Ui
+            Some(LogicalChannelClass::Ui)
         );
         assert_eq!(
             logical_class_for_server_envelope(&envelope(srui_message::Msg::ResourceMetadata(
                 ResourceMetadata::default()
             ))),
-            LogicalChannelClass::Resource
+            Some(LogicalChannelClass::Resource)
         );
         assert_eq!(
             logical_class_for_server_envelope(&envelope(srui_message::Msg::ResourceChunk(
                 ResourceChunk::default()
             ))),
-            LogicalChannelClass::Resource
+            Some(LogicalChannelClass::Resource)
         );
-        assert_eq!(
-            logical_class_for_server_envelope(&envelope(srui_message::Msg::Event(
-                srui_protocol::Event::default()
-            ))),
-            LogicalChannelClass::Input
-        );
+
+        for unschedulable in [
+            SruiMessage::default(),
+            envelope(srui_message::Msg::ClientHello(Default::default())),
+            envelope(srui_message::Msg::ClientResume(Default::default())),
+            envelope(srui_message::Msg::Event(Default::default())),
+        ] {
+            assert_eq!(
+                logical_class_for_server_envelope(&unschedulable),
+                None,
+                "client or unknown envelopes must not enter a server outbound lane"
+            );
+        }
     }
 }

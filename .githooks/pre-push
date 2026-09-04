@@ -63,6 +63,14 @@ else
 	printf '\nskipping LogicalChannelScheduling tests (swift not on PATH)\n'
 fi
 
+# Policy codegen is Python and runs on Linux. Full proto regeneration needs
+# protoc-gen-swift (macOS CI).
+run "protocol: regenerate logical-channel policy" \
+	uv run python protocol/generate_logical_channel_policy.py
+run "protocol: committed scheduling policy is fresh" git diff --exit-code \
+	client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
+	server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs
+
 # Full client + proto regeneration need AppKit and protoc-gen-swift (macOS CI).
 if [ "$(uname -s)" = Darwin ]; then
 	# The integration tests drive a real sessiond and counter server, so both must be built first,
@@ -72,12 +80,14 @@ if [ "$(uname -s)" = Darwin ]; then
 	run "swift: swift test" swift test --package-path client-macos
 
 	# --- Generated-file freshness (CI: job `swift`, final step) -------------------
-	# The committed Swift bindings are generated output; CI fails on any diff after regeneration.
-	# Checked last because it rewrites files in the working tree.
+	# The committed protobuf, registry, and scheduling bindings are generated output; CI fails on
+	# any diff after regeneration. Checked last because it rewrites files in the working tree.
 	run "protocol: regenerate bindings" ./protocol/generate_proto.sh
 	run "protocol: committed bindings are fresh" git diff --exit-code \
 		client-macos/Protocol/srui.pb.swift \
-		client-macos/SemanticModel/RegistryTables.swift
+		client-macos/SemanticModel/RegistryTables.swift \
+		client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
+		server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs
 else
 	printf '\nskipping macOS client tests and proto regen on %s\n' "$(uname -s)"
 fi

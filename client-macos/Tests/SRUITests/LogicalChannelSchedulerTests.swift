@@ -108,10 +108,6 @@ private actor RecordingTransport: Transport {
         self.continuation = continuation
     }
 
-    func send(data: Data) async throws {
-        try await send(data: data, logicalClass: .control)
-    }
-
     func send(data: Data, logicalClass: LogicalChannelClass) async throws {
         writes.append(RecordedWrite(data: data, logicalClass: logicalClass))
     }

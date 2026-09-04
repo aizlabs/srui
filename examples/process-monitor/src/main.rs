@@ -302,7 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tasks.spawn(async move {
             loop {
                 tokio::select! {
-                    received = receiver.recv() => match received {
+                    received = receiver.recv_class(srui_sessiond::LogicalChannelClass::Ui) => match received {
                         Ok(srui_sessiond::OutboundItem::Transaction(transaction)) => {
                             match measure_transaction(&transaction) {
                                 Ok(stats) => info!(target: "srui::wire_stats", "{stats}"),

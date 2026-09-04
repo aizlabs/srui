@@ -29,35 +29,10 @@ public enum LogicalChannelClass: Int, CaseIterable, Sendable, Hashable {
     /// Resource metadata and chunks (images, attachments).
     case resource
 
-    /// Maximum head-of-line service distance under continuous saturation of every lane.
-    ///
-    /// Distance is measured in dispatched frames between consecutive services of this class
-    /// (the later service included).
-    public var maxServiceGap: Int {
-        switch self {
-        case .control: return 5
-        case .input: return 5
-        case .ui: return 8
-        case .terminalHigh: return 12
-        case .terminalNormal: return 14
-        case .resource: return 24
-        }
-    }
 }
 
-/// Weighted round-robin selector over the shared 24-slot cycle.
+/// Weighted round-robin selector over the generated shared service cycle.
 public struct LogicalChannelScheduler: Sendable {
-    /// Deterministic 24-slot weighted cycle, identical to the Rust sessiond scheduler.
-    public static let serviceCycle: [LogicalChannelClass] = [
-        .control, .input, .ui,
-        .control, .input, .terminalHigh,
-        .control, .input, .ui,
-        .control, .input, .terminalNormal,
-        .control, .input, .ui,
-        .control, .input, .terminalHigh,
-        .ui, .control, .input,
-        .terminalNormal, .terminalHigh, .resource,
-    ]
 
     private var cursor = 0
 

@@ -131,7 +131,7 @@ private actor ScriptedReplayTransport: Transport {
         }
     }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         let index = sentFrames.count
         sentFrames.append(data)
         let verdict = index < script.count ? script[index] : .fail("unscripted send #\(index)")

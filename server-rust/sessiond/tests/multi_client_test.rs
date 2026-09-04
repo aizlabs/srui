@@ -301,5 +301,8 @@ async fn test_transaction_broadcast_closed_notifies_subscribers() {
         .expect("broadcast open");
     session.close_outbound();
 
-    assert!(matches!(rx.recv().await, Err(OutboundRecvError::Closed)));
+    assert!(matches!(
+        rx.recv_class(srui_sessiond::LogicalChannelClass::Ui).await,
+        Err(OutboundRecvError::Closed)
+    ));
 }

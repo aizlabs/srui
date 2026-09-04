@@ -420,7 +420,7 @@ async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
 
     let received = bootstrap
         .transactions
-        .recv()
+        .recv_class(srui_sessiond::LogicalChannelClass::Ui)
         .await
         .expect("receive transaction")
         .into_transaction()
@@ -465,7 +465,7 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
 
     let received = bootstrap
         .transactions
-        .recv()
+        .recv_class(srui_sessiond::LogicalChannelClass::Ui)
         .await
         .expect("receive first transaction")
         .into_transaction()

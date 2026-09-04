@@ -27,6 +27,9 @@ struct LogicalChannelSchedulerTests {
             .terminalNormal, .terminalHigh, .resource,
         ])
         #expect(LogicalChannelScheduler.serviceCycle.count == 24)
+        for logicalClass in LogicalChannelClass.allCases {
+            #expect(LogicalChannelScheduler.serviceCycle.contains(logicalClass))
+        }
     }
 
     @Test("Each class declares its saturation service gap")

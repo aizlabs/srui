@@ -85,7 +85,7 @@ private actor GatedTransport: Transport {
         sendReleaseContinuation.yield()
     }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         sentFrames.append(data)
         var releases = sendReleaseStream.makeAsyncIterator()
         _ = await releases.next()
@@ -112,7 +112,7 @@ private actor FailingTransport: Transport {
         self.streamContinuation = continuation
     }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         throw TransportError.ioError("simulated replay transport failure")
     }
 
@@ -140,7 +140,7 @@ private actor FailAfterFirstSendTransport: Transport {
 
     var closeCallCount: Int { closeCount }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         sendCount += 1
         if sendCount > 1 {
             throw TransportError.ioError("simulated background replay failure")

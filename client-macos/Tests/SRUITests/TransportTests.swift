@@ -9,8 +9,40 @@ import Testing
 import Foundation
 import TransportSSH
 
+/// Minimal test double that implements only the required classified-send API.
+private actor ClassifiedOnlyTransport: Transport {
+    private var logicalClasses: [LogicalChannelClass] = []
+
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        _ = data
+        logicalClasses.append(logicalClass)
+    }
+
+    var recordedLogicalClasses: [LogicalChannelClass] {
+        logicalClasses
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+
+    func close() async {}
+}
+
 @Suite("Transport Tests")
 struct TransportTests {
+
+    @Test("Unclassified sends default to control without erasing explicit classes")
+    func unclassifiedSendDefaultsToControl() async throws {
+        let transport = ClassifiedOnlyTransport()
+        try await transport.send(data: Data([0x01]), logicalClass: .input)
+        try await transport.send(data: Data([0x02]))
+
+        let logicalClasses = await transport.recordedLogicalClasses
+        #expect(logicalClasses == [.input, .control])
+    }
 
     @Test("PipeTransport bidirectional in-memory message delivery")
     func pipeTransportBidirectionalDelivery() async throws {

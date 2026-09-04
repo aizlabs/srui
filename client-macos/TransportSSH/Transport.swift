@@ -408,13 +408,7 @@ final class SocketWriter: @unchecked Sendable {
 /// Abstract stream transport interface decoupling the protocol and session layers
 /// from the underlying socket or SSH channel implementation (§19, §20.2, §22).
 public protocol Transport: Sendable {
-    /// Transmits raw framed bytes over the transport connection as control-class traffic.
-    func send(data: Data) async throws
-
     /// Transmits raw framed bytes on an explicit logical class (§19.2).
-    ///
-    /// Production transports must implement this overload. The default calls `send(data:)` so
-    /// unrelated test doubles that only implement the compatibility path keep compiling.
     func send(data: Data, logicalClass: LogicalChannelClass) async throws
 
     /// Returns an asynchronous throwing stream of incoming raw byte chunks from the remote peer.
@@ -433,10 +427,9 @@ public protocol Transport: Sendable {
 }
 
 extension Transport {
-    /// Compatibility path: unclassified writes are treated as `send(data:)` by test doubles.
-    public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
-        _ = logicalClass
-        try await send(data: data)
+    /// Convenience path: unclassified writes are control-class traffic.
+    public func send(data: Data) async throws {
+        try await send(data: data, logicalClass: .control)
     }
 
     /// In-memory transports have no socket to throttle, so acknowledgement is a no-op for them.

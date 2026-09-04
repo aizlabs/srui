@@ -21,6 +21,7 @@ fi
 is_generated_swift() {
     case "$1" in
         *.pb.swift) return 0 ;;
+        *.generated.swift) return 0 ;;
         */RegistryTables.swift|RegistryTables.swift) return 0 ;;
     esac
     return 1

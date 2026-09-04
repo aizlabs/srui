@@ -14,4 +14,5 @@ pub use outbound::{
 pub use session::{
     mint_session_id, AttachmentGuard, EventOutcome, FreshClientBootstrap, ResumeClientBootstrap,
     ResumeOutcome, Session, SessionConfig, SessionError, SessionState, CORE_VERSION,
+    MAX_CLIENT_INSTANCE_ID_BYTES, MAX_RETAINED_CLIENT_STATE_BYTES,
 };

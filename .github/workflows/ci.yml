@@ -279,7 +279,11 @@ jobs:
       - name: Build and test client-macos
         run: swift test
         working-directory: client-macos
-      - name: Verify committed Swift protobuf and registry output is fresh
+      - name: Verify committed generated protocol outputs are fresh
         run: |
           ./protocol/generate_proto.sh
-          git diff --exit-code client-macos/Protocol/srui.pb.swift client-macos/SemanticModel/RegistryTables.swift
+          git diff --exit-code \
+            client-macos/Protocol/srui.pb.swift \
+            client-macos/SemanticModel/RegistryTables.swift \
+            client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
+            server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs

@@ -703,7 +703,7 @@ private actor BlockingTransport: Transport {
     var isSendBlocked: Bool { sendBlocked }
     var isClosed: Bool { closed }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         guard !closed else { throw TransportError.closed }
         sendBlocked = true
         await withCheckedContinuation { sendWaiters.append($0) }
@@ -745,7 +745,7 @@ private actor FlakyTransport: Transport {
 
     var sentFrameCount: Int { sentFrames.count }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         if failNextSend {
             failNextSend = false
             throw TransportError.closed

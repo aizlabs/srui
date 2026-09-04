@@ -11,7 +11,10 @@
 mod handshake;
 mod snapshot;
 
-pub use handshake::{FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION};
+pub use handshake::{
+    FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION,
+    MAX_CLIENT_INSTANCE_ID_BYTES,
+};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -50,6 +53,16 @@ impl std::fmt::Display for SessionState {
         }
     }
 }
+
+/// Ceiling for [`Session::retained_client_state_bytes`], composed from the caps that produce it
+/// (§15, §20.2, §26).
+///
+/// Written as the product of the entry caps and the per-identifier byte cap rather than as a
+/// literal, so that raising any one of the three moves the budget with it instead of silently
+/// invalidating the invariant test.
+pub const MAX_RETAINED_CLIENT_STATE_BYTES: usize = (handshake::MAX_CLIENT_RESOURCE_CEILINGS
+    + crate::outbound::MAX_TRACKED_STALE_CLIENTS)
+    * handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
@@ -566,6 +579,22 @@ impl Session {
         self.outbound_hub.clear_stale_client(client_instance_id);
     }
 
+    /// Client-supplied bytes retained across every long-lived per-client table (§15, §20.2, §26).
+    ///
+    /// Each of those tables caps its entry *count*; a count cap says nothing about the size of
+    /// what an entry holds, which is precisely how an unbounded `client_instance_id` could grow
+    /// the daemon without breaching any declared limit. Exposing the byte total is what makes the
+    /// retention invariant assertable: no test can check a budget nothing computes.
+    ///
+    /// Fixed-size components (a `u64` ceiling, a `usize` depth) are deliberately excluded — they
+    /// are already bounded by the entry caps. Only client-controlled, variable-size bytes count.
+    pub fn retained_client_state_bytes(&self) -> Result<usize, SessionError> {
+        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let ceiling_key_bytes: usize = guard.client_resource_ceilings.keys().map(Vec::len).sum();
+        drop(guard);
+        Ok(ceiling_key_bytes + self.outbound_hub.retained_stale_client_bytes())
+    }
+
     /// Returns a reference to the session's outbound transaction hub.
     #[cfg(test)]
     pub(crate) fn outbound_hub(&self) -> &Arc<OutboundHub> {
@@ -1076,6 +1105,61 @@ mod tests {
             .expect("empty client_instance_id must complete the handshake");
         assert_eq!(bootstrap.welcome.session_id, "empty-instance-id");
         assert!(bootstrap.transactions.termination().is_none());
+    }
+
+    /// `client_instance_id` is client-supplied and is retained as a key by the remembered-ceiling
+    /// table, the stale-client record, and every subscriber. Those tables cap their entry count,
+    /// not the key size, so an oversized identifier must be refused at the handshake (§15, §26).
+    #[test]
+    fn test_bootstrap_fresh_client_rejects_oversized_client_instance_id() {
+        use super::handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let session = Session::new("oversized-instance-id");
+        let hello = srui_protocol::ClientHello {
+            core_version: "0.4.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: vec![7u8; MAX_CLIENT_INSTANCE_ID_BYTES + 1],
+            client_metadata: Default::default(),
+            known_resource_hashes: vec![],
+        };
+
+        match session.bootstrap_fresh_client(&hello) {
+            Err(SessionError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("client_instance_id"),
+                    "diagnostic must name the offending field, got {message:?}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// The resume path keys the same tables, so it must refuse the identifier the fresh path does.
+    #[test]
+    fn test_bootstrap_resume_rejects_oversized_client_instance_id() {
+        use super::handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let session = Session::new("oversized-instance-id-resume");
+        let resume = srui_protocol::ClientResume {
+            session_id: "oversized-instance-id-resume".to_string(),
+            client_instance_id: vec![7u8; MAX_CLIENT_INSTANCE_ID_BYTES + 1],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+        };
+
+        match session.bootstrap_resume(&resume) {
+            Err(SessionError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("client_instance_id"),
+                    "diagnostic must name the offending field, got {message:?}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[test]

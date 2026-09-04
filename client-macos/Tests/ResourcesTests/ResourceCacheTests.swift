@@ -479,4 +479,33 @@ struct ResourceCacheTests {
         #expect(await cache.contains(first.image.hash) == false)
         #expect(await cache.contains(second.image.hash))
     }
+
+    /// `media_type` is retained per assembly and per committed image but is counted by neither the
+    /// encoded nor the decoded byte budget, so a hostile server could retain ≈ the frame ceiling
+    /// per entry while every advertised limit still reads as satisfied (§26).
+    @Test
+    func oversizedMediaTypeIsRejectedBeforeRetainingMetadata() async throws {
+        let cache = ResourceCache(limits: ResourceLimits(maxMediaTypeBytes: 32))
+        let hash = try FixturePNG.hash()
+        let metadata = ResourceMetadataInput(
+            resourceHash: hash,
+            mediaType: "image/" + String(repeating: "x", count: 64),
+            encodedLength: UInt64(FixturePNG.bytes.count),
+            decodedWidth: 1,
+            decodedHeight: 1,
+            priority: .normal
+        )
+
+        await #expect(throws: ResourceCacheError.oversizedMediaType(length: 70, limit: 32)) {
+            _ = try await cache.ingestMetadata(metadata)
+        }
+
+        // Nothing was retained: the follow-up chunk has no assembly to append to.
+        await #expect(throws: ResourceCacheError.unknownResource(hash)) {
+            _ = try await cache.ingestChunk(
+                ResourceChunkInput(resourceHash: hash, byteOffset: 0, data: FixturePNG.data)
+            )
+        }
+        #expect(await cache.committedCount() == 0)
+    }
 }

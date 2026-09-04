@@ -216,10 +216,6 @@ public actor SSHTransport: Transport {
         startStdoutReader(stdoutFD: stdoutFD, process: proc)
     }
 
-    public func send(data: Data) async throws {
-        try await send(data: data, logicalClass: .control)
-    }
-
     public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
         if !isConnected {
             try connect()

@@ -690,12 +690,12 @@ mod tests {
         session.register_model_range_provider(model_id, counting_provider(Arc::clone(&calls)));
         let revision = session.current_revision();
         session
-            .fulfill_model_range_request(request(node_id, model_id, 0, 4, revision))
+            .fulfill_model_range_request(request(node_id, model_id, 10, 4, revision))
             .await
             .unwrap();
         let after = session.current_revision();
         let outcome = session
-            .fulfill_model_range_request(request(node_id, model_id, 0, 4, after))
+            .fulfill_model_range_request(request(node_id, model_id, 10, 4, after))
             .await
             .unwrap();
         assert_eq!(outcome, ModelRangeFulfillment::AlreadyCached);
@@ -892,6 +892,31 @@ mod tests {
             }
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn last_index_and_exact_operation_limit_are_accepted() {
+        let (session, node_id, model_id) = table_and_model(20_000);
+        let calls = Arc::new(AtomicUsize::new(0));
+        session.register_model_range_provider(model_id, counting_provider(Arc::clone(&calls)));
+        let revision = session.current_revision();
+        let last = session
+            .fulfill_model_range_request(request(node_id, model_id, 19_999, 1, revision))
+            .await
+            .unwrap();
+        assert!(matches!(last, ModelRangeFulfillment::Committed { .. }));
+        let at_limit = session
+            .fulfill_model_range_request(request(
+                node_id,
+                model_id,
+                0,
+                10_000,
+                session.current_revision(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(at_limit, ModelRangeFulfillment::Committed { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1113,6 +1138,10 @@ mod tests {
         let left = request(NodeId::new(1), ModelId::new(3), 0, 1, 1);
         let right = request(NodeId::new(1), ModelId::new(3), MAX_MERGED_COUNT, 2, 1);
         assert!(bounding_range(&left, &right).is_none());
+        let exact = request(NodeId::new(1), ModelId::new(3), MAX_MERGED_COUNT - 1, 1, 1);
+        let bound = bounding_range(&left, &exact).expect("span of MAX_MERGED_COUNT is allowed");
+        assert_eq!(bound.start_index, 0);
+        assert_eq!(bound.count, MAX_MERGED_COUNT);
 
         let overflow = ClientModelRangeRequest {
             node_id: 1,
@@ -1123,16 +1152,16 @@ mod tests {
         };
         assert!(!ranges_are_close(&overflow, &overflow));
         assert!(!ranges_are_close(
-            &overflow,
-            &request(NodeId::new(1), ModelId::new(3), 0, 1, 1)
+            &request(NodeId::new(1), ModelId::new(3), 0, 1, 1),
+            &overflow
         ));
 
         let model = ModelId::new(3);
-        let mut packed: Vec<_> = (0..9)
+        let mut packed: Vec<_> = (0..10)
             .map(|i| request(NodeId::new(i + 1), model, i * 300, 8, 1))
             .collect();
         integrate_pending(&mut packed, request(NodeId::new(1), model, 0, 8, 1));
-        assert!(packed.len() <= MAX_PENDING_RANGES_PER_MODEL);
+        assert_eq!(packed.len(), MAX_PENDING_RANGES_PER_MODEL);
     }
 
     #[test]
@@ -1172,7 +1201,7 @@ mod tests {
         let inbox = ModelRangeRequestInbox::new();
         let pending = inbox.clone();
         let waiter = tokio::spawn(async move { InboxRecv { inbox: &pending }.await });
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         inbox.submit(request(NodeId::new(1), ModelId::new(3), 0, 4, 1));
         let got = waiter.await.unwrap().expect("submitted after park");
         assert_eq!(got.count, 4);
@@ -1180,7 +1209,7 @@ mod tests {
         let closing = ModelRangeRequestInbox::new();
         let pending = closing.clone();
         let waiter = tokio::spawn(async move { InboxRecv { inbox: &pending }.await });
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         closing.close();
         assert!(waiter.await.unwrap().is_none());
     }

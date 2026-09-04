@@ -861,6 +861,14 @@ mod tests {
         let model = ModelId::new(3);
         inbox.submit(request(NodeId::new(1), model, 0, 8, 1));
         inbox.submit(request(NodeId::new(1), model, 128, 8, 1));
+        {
+            let guard = lock_or_recover(&inbox.inner);
+            assert_eq!(
+                guard.order.len(),
+                1,
+                "a merge must not enqueue a second drain slot"
+            );
+        }
         let merged = inbox.try_pop().expect("pending");
         assert_eq!(merged.start_index, 0);
         assert_eq!(merged.count, 136);
@@ -1189,6 +1197,13 @@ mod tests {
         let second = inbox.try_pop().expect("requeued remainder");
         assert_eq!(second.start_index, 10);
         assert!(inbox.try_pop().is_none());
+        {
+            let guard = lock_or_recover(&inbox.inner);
+            assert!(
+                guard.order.is_empty(),
+                "popping the last remainder must not requeue an empty drain slot"
+            );
+        }
     }
 
     #[tokio::test]

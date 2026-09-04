@@ -1196,7 +1196,6 @@ mod tests {
         assert_eq!(first.start_index, 0);
         let second = inbox.try_pop().expect("requeued remainder");
         assert_eq!(second.start_index, 10);
-        assert!(inbox.try_pop().is_none());
         {
             let guard = lock_or_recover(&inbox.inner);
             assert!(
@@ -1204,6 +1203,7 @@ mod tests {
                 "popping the last remainder must not requeue an empty drain slot"
             );
         }
+        assert!(inbox.try_pop().is_none());
     }
 
     #[tokio::test]

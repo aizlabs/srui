@@ -35,3 +35,4 @@ __pycache__/
 .lemoncrow/
 scripts/test-swarm/.env
 scripts/test-swarm/logs/*.log
+.swift-version

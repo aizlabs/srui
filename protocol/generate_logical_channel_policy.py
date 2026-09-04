@@ -24,7 +24,9 @@ RUST_OUTPUT = (
 SWIFT_OUTPUT = (
     REPO_ROOT
     / "client-macos"
-    / "TransportSSH"
+    / "LogicalChannelScheduling"
+    / "Sources"
+    / "LogicalChannelScheduling"
     / "LogicalChannelPolicy.generated.swift"
 )
 _CLASS_NAME = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")

@@ -2,10 +2,9 @@ name: CI
 
 # Runs immediately before merge, not on every push.
 #
-# The check set is unchanged — the same four jobs run the same commands. What changed is how often
-# GitHub pays for them. `synchronize` (every push to an open PR) and `push` (every merge to main,
-# re-validating a tree the PR already validated) were the two high-frequency triggers, and neither
-# adds signal that `.githooks/pre-push` does not already produce locally on every push.
+# Merge-gate jobs (review-gate, registry, rust, fuzz, swift) still skip drafts. Linux Swift
+# parse and portable-scheduler jobs live in `swift-linux.yml` so they also run on draft and
+# stacked PRs; `ci.yml` only triggers for PRs into main.
 #
 # Review comes first, then CI. The intended order is:
 #
@@ -247,6 +246,9 @@ jobs:
             cargo fuzz run "$target" "corpus/$target" -- -max_total_time=15
           done
 
+  # Phase 3: macOS integration. Socket writers, SSH/TCP/Unix transports, backpressure,
+  # and the full client graph. Linux Swift jobs in `swift-linux.yml` supplement this;
+  # they do not replace it.
   swift:
     name: Swift Build
     needs: review-gate
@@ -272,6 +274,8 @@ jobs:
             echo "Error: SemanticModel must never import AppKit or Cocoa"
             exit 1
           fi
+      - name: Test portable LogicalChannelScheduling module
+        run: swift test --package-path client-macos/LogicalChannelScheduling
       - name: Build and test client-macos
         run: swift test
         working-directory: client-macos
@@ -281,5 +285,5 @@ jobs:
           git diff --exit-code \
             client-macos/Protocol/srui.pb.swift \
             client-macos/SemanticModel/RegistryTables.swift \
-            client-macos/TransportSSH/LogicalChannelPolicy.generated.swift \
+            client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
             server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs

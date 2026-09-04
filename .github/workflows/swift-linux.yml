@@ -1,0 +1,114 @@
+name: Swift Linux
+
+# Portable Swift validation on Ubuntu. These jobs are cheap and run on every pull request,
+# including drafts and stacked PRs that do not target main (unlike `ci.yml`).
+#
+# They do not replace the macOS `swift` job in `ci.yml`. Full TransportSSH, socket/backpressure,
+# and client-package coverage stays on macOS.
+#
+# Phase 1 (`swift-parse`) is syntax-only: it does not type-check, resolve modules, link, or
+# validate Apple-framework APIs. It would have rejected a parameter named `class` and the
+# invalid literal `200u32` on PR #33.
+#
+# Phase 2 (`swift-logical-channel`) builds and tests only the nested LogicalChannelScheduling
+# package. It does not run `swift test --package-path client-macos`, which would compile AppKit.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per pull request. A burst of pushes cancels the earlier runs so a draft does not stack
+# concurrent (uncached) Swift toolchain installs.
+concurrency:
+  group: swift-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift-parse:
+    name: Swift Parse (Linux, syntax-only)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch pull-request endpoints
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}"
+      - name: Install Swift 6
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+      - name: Parse changed hand-written Swift sources
+        env:
+          SRUI_SWIFT_PARSE_BASE: ${{ github.event.pull_request.base.sha }}
+          SRUI_SWIFT_PARSE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: bash scripts/parse-changed-swift.sh
+
+  swift-logical-channel:
+    name: Logical Channel Scheduler (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Swift 6
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+      - name: Refuse Apple-platform imports in the portable module
+        run: bash scripts/check-logical-channel-scheduling-imports.sh
+      - name: Describe nested package (portable targets only)
+        working-directory: client-macos/LogicalChannelScheduling
+        run: |
+          set -euo pipefail
+          swift package describe --type json > /tmp/lcs-describe.json
+          python3 - <<'PY'
+          import json, sys
+          desc = json.load(open("/tmp/lcs-describe.json"))
+          names = sorted(t["name"] for t in desc["targets"])
+          expected = ["LogicalChannelScheduling", "LogicalChannelSchedulingTests"]
+          if names != expected:
+              sys.exit(f"unexpected targets {names}; wanted {expected}")
+          # `swift package describe` reports these as `target_dependencies` (target names) and
+          # `product_dependencies` (external products), both omitted when empty.
+          if not any(
+              "target_dependencies" in t or "product_dependencies" in t for t in desc["targets"]
+          ):
+              sys.exit("no dependency keys in describe output; schema changed, update this check")
+
+          def dep_names(raw):
+              names = []
+              for dep in raw or []:
+                  if isinstance(dep, dict):
+                      names.append(dep.get("product") or dep.get("name") or str(dep))
+                  else:
+                      names.append(str(dep))
+              return sorted(names)
+
+          for target in desc["targets"]:
+              target_deps = dep_names(target.get("target_dependencies"))
+              product_deps = dep_names(target.get("product_dependencies"))
+              print(
+                  f"{target['name']}: type={target['type']} "
+                  f"target_deps={target_deps} product_deps={product_deps}"
+              )
+              if product_deps:
+                  sys.exit(
+                      f"{target['name']} depends on external products {product_deps}; "
+                      "the nested package must stay dependency-free"
+                  )
+              wanted = [] if target["type"] == "library" else ["LogicalChannelScheduling"]
+              if target_deps != wanted:
+                  sys.exit(
+                      f"{target['name']} target dependencies {target_deps}; wanted {wanted}"
+                  )
+          print("nested package is self-contained")
+          PY
+      - name: Build and test LogicalChannelScheduling
+        run: swift test --package-path client-macos/LogicalChannelScheduling

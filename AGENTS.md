@@ -49,3 +49,22 @@ stat -c 'mtime=%y ctime=%z %n' <file>                # Linux
 
 **Status.** Believed to be unintended tool behavior; not yet confirmed with the LemonCrow
 maintainers. Remove this note if the tool starts leaving `mtime` to the kernel.
+
+## Cursor Cloud specific instructions
+
+Cloud Agents run on Linux. Do not run `swift test --package-path client-macos`: that package
+pulls AppKit via `RendererAppKit` and will not build here.
+
+Linux-valid Swift checks (same as `.github/workflows/swift-linux.yml`):
+
+```bash
+bash scripts/parse-changed-swift.sh
+bash scripts/check-logical-channel-scheduling-imports.sh
+swift test --package-path client-macos/LogicalChannelScheduling
+```
+
+`parse-changed-swift.sh` is syntax-only (`swiftc -frontend -parse`). It does not type-check,
+resolve modules, link, or validate Apple-framework APIs.
+
+Socket writers, SSH/TCP/Unix transports, backpressure, and the rest of the client test graph
+stay on the macOS `swift` job in `.github/workflows/ci.yml`.

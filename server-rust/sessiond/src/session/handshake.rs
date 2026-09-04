@@ -163,7 +163,7 @@ fn known_resource_hashes(raw_hashes: &[Vec<u8>], limit: usize) -> HashSet<Resour
 }
 
 /// Bounds remembered per-client ceilings; `client_instance_id` is client-supplied (§15, §26).
-const MAX_CLIENT_RESOURCE_CEILINGS: usize = 256;
+pub const MAX_CLIENT_RESOURCE_CEILINGS: usize = 256;
 
 /// Maximum accepted `client_instance_id` length, in bytes (§15, §26).
 ///

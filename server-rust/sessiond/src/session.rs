@@ -11,7 +11,10 @@
 mod handshake;
 mod snapshot;
 
-pub use handshake::{FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION};
+pub use handshake::{
+    FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION,
+    MAX_CLIENT_INSTANCE_ID_BYTES,
+};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -50,6 +53,16 @@ impl std::fmt::Display for SessionState {
         }
     }
 }
+
+/// Ceiling for [`Session::retained_client_state_bytes`], composed from the caps that produce it
+/// (§15, §20.2, §26).
+///
+/// Written as the product of the entry caps and the per-identifier byte cap rather than as a
+/// literal, so that raising any one of the three moves the budget with it instead of silently
+/// invalidating the invariant test.
+pub const MAX_RETAINED_CLIENT_STATE_BYTES: usize = (handshake::MAX_CLIENT_RESOURCE_CEILINGS
+    + crate::outbound::MAX_TRACKED_STALE_CLIENTS)
+    * handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
@@ -564,6 +577,22 @@ impl Session {
     /// Clears the overflow stale marker after a catch-up snapshot has been written (§20.2).
     pub(crate) fn clear_stale_client(&self, client_instance_id: &[u8]) {
         self.outbound_hub.clear_stale_client(client_instance_id);
+    }
+
+    /// Client-supplied bytes retained across every long-lived per-client table (§15, §20.2, §26).
+    ///
+    /// Each of those tables caps its entry *count*; a count cap says nothing about the size of
+    /// what an entry holds, which is precisely how an unbounded `client_instance_id` could grow
+    /// the daemon without breaching any declared limit. Exposing the byte total is what makes the
+    /// retention invariant assertable: no test can check a budget nothing computes.
+    ///
+    /// Fixed-size components (a `u64` ceiling, a `usize` depth) are deliberately excluded — they
+    /// are already bounded by the entry caps. Only client-controlled, variable-size bytes count.
+    pub fn retained_client_state_bytes(&self) -> Result<usize, SessionError> {
+        let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let ceiling_key_bytes: usize = guard.client_resource_ceilings.keys().map(Vec::len).sum();
+        drop(guard);
+        Ok(ceiling_key_bytes + self.outbound_hub.retained_stale_client_bytes())
     }
 
     /// Returns a reference to the session's outbound transaction hub.

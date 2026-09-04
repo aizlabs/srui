@@ -68,6 +68,19 @@ public struct ResourceLimits: Sendable, Equatable {
         self.maxCommittedDecodedBytes = maxCommittedDecodedBytes
         self.maxMediaTypeBytes = maxMediaTypeBytes
     }
+
+    /// Ceiling that `ResourceCache.retainedBytes()` must respect, composed from the individual
+    /// limits rather than written as a literal (§26).
+    ///
+    /// One media type is retained per committed entry and per in-flight assembly, which is the
+    /// term that was missing while `media_type` had no cap: every other limit could read as
+    /// satisfied while retention grew without bound.
+    public var maxRetainedBytes: Int {
+        let entriesHoldingMediaTypes = maxCommittedEntries + maxConcurrentAssemblies
+        return maxCommittedDecodedBytes
+            + maxInFlightBytes
+            + entriesHoldingMediaTypes * maxMediaTypeBytes
+    }
 }
 
 // MARK: - Domain input (NOT protobuf)
@@ -279,6 +292,25 @@ public actor ResourceCache {
     /// Number of committed CAS entries (tests / diagnostics).
     public func committedCount() -> Int {
         committed.count
+    }
+
+    /// Total variable-size bytes this cache is holding onto (§26).
+    ///
+    /// Counts decoded backing stores, in-flight assembly buffers, and every retained metadata
+    /// string. Fixed-size components (hashes, lengths, enums) are excluded: they are already
+    /// bounded by the entry caps, whereas the quantities here are server-controlled and are what a
+    /// retention invariant must be asserted against. A budget nothing computes cannot be tested,
+    /// which is exactly how an unbounded `media_type` sat behind satisfied byte limits.
+    public func retainedBytes() -> Int {
+        var total = committedDecodedBytes
+        for image in committed.values {
+            total += image.mediaType.utf8.count
+        }
+        for assembly in partials.values {
+            total += assembly.buffer.count
+            total += assembly.metadata.mediaType.utf8.count
+        }
+        return total
     }
 
     /// Verified committed hashes suitable for reconnect negotiation (§14, §18).

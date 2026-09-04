@@ -329,7 +329,10 @@ fn test_coalesced_delivery_stream_matches_raw_commit_stream() {
     }
 
     let mut delivered = Vec::new();
-    while let Some(item) = outbound.try_recv().expect("queue did not overflow") {
+    while let Some(item) = outbound
+        .try_recv_class(srui_sessiond::LogicalChannelClass::Ui)
+        .expect("queue did not overflow")
+    {
         if let Some(tx) = item.into_transaction() {
             delivered.push(tx);
         }

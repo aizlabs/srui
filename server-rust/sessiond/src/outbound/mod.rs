@@ -1,16 +1,21 @@
-//! # Bounded Outbound Transaction Queues & Coalescing (§12.1, §20.2, §20.4)
+//! # Bounded Outbound Transaction Queues & Coalescing (§12.1, §19.2, §20.2, §20.4)
 //!
 //! Provides bounded, per-connection transaction streaming with scalar property coalescing
-//! and lossless structural barriers, plus low-priority resource metadata/chunk delivery
-//! that never starves UI traffic (§14, §19.2).
+//! and lossless structural barriers, plus class-aware resource metadata/chunk delivery
+//! selected by [`scheduler`] (§14, §19.2).
 //!
 //! What this queue emits is a *delivery* stream: either a committed transaction verbatim, or a
 //! coalesced scalar delta standing in for a run of them (§12.1). Neither the merge policy nor its
 //! revision spans belong to the authoritative transaction model, so the merge itself lives in
 //! [`coalesce`] rather than in `srui-semantic-tree`.
+//!
+//! Control, input, and terminal frames never enter the UI coalescing path. Resource metadata
+//! and chunks are both `resource` traffic and are generated lazily, one frame per selection.
 
 mod coalesce;
+mod receiver;
 mod resource;
+mod scheduler;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +29,11 @@ use srui_semantic_tree::{ResourceHash, Transaction as DomainTxn};
 
 use crate::session::{lock_or_recover, SessionError};
 
+pub use receiver::OutboundReceiver;
 pub use resource::ResourceOutboundFrame;
+pub use scheduler::{
+    logical_class_for_server_envelope, LogicalChannelClass, LogicalChannelScheduler, SERVICE_CYCLE,
+};
 
 /// Default capacity for per-connection outbound transaction queues (§20.2).
 pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
@@ -63,6 +72,15 @@ impl OutboundItem {
         match self {
             Self::Transaction(tx) => Some(tx),
             _ => None,
+        }
+    }
+
+    /// Logical class for this outbound unit (§19.2).
+    #[must_use]
+    pub fn logical_class(&self) -> LogicalChannelClass {
+        match self {
+            Self::Transaction(_) => LogicalChannelClass::Ui,
+            Self::ResourceMetadata(_) | Self::ResourceChunk(_) => LogicalChannelClass::Resource,
         }
     }
 }
@@ -106,17 +124,10 @@ struct SubscriberState {
     tail_domain: Option<DomainTxn>,
     /// Low-priority resource transfer cursor for this connection (§14, §19.2).
     resources: resource::ResourceTransferQueue,
-    /// Consecutive transaction frames emitted since the last resource frame; used for aging so
-    /// continuous UI traffic cannot starve resource progress indefinitely (§19.2).
-    transactions_since_resource: usize,
     peak_depth: usize,
     stale_reason: Option<String>,
     is_closed: bool,
 }
-
-/// Emit one resource frame after this many consecutive transaction pops while resources remain
-/// queued. Keeps UI latency low without absolute resource starvation under continuous updates.
-const RESOURCE_AGING_EVERY: usize = 8;
 
 impl SubscriberState {
     /// Returns `true` if an unsent tail exists that absorption could still merge into.
@@ -147,39 +158,38 @@ impl SubscriberState {
         self.resources.enqueue(entry);
     }
 
-    /// Two-class selector with aging: transactions usually precede one resource frame, but after
-    /// [`RESOURCE_AGING_EVERY`] consecutive transaction pops a pending resource frame is emitted
-    /// so continuous UI traffic cannot starve transfer progress (§19.2).
-    fn pop_item(&mut self) -> Option<OutboundItem> {
-        let force_resource =
-            self.transactions_since_resource >= RESOURCE_AGING_EVERY && self.resources.has_work();
-
-        if !force_resource {
-            if let Some(tx) = self.pop_transaction() {
-                self.transactions_since_resource =
-                    self.transactions_since_resource.saturating_add(1);
-                return Some(OutboundItem::Transaction(tx));
-            }
+    fn class_ready(&self, class: LogicalChannelClass) -> bool {
+        match class {
+            LogicalChannelClass::Ui => !self.items.is_empty(),
+            LogicalChannelClass::Resource => self.resources.has_work(),
+            LogicalChannelClass::Control
+            | LogicalChannelClass::Input
+            | LogicalChannelClass::TerminalHigh
+            | LogicalChannelClass::TerminalNormal => false,
         }
+    }
 
-        match self.resources.pop_frame() {
-            Some(ResourceOutboundFrame::Metadata(meta)) => {
-                self.transactions_since_resource = 0;
-                Some(OutboundItem::ResourceMetadata(meta))
-            }
-            Some(ResourceOutboundFrame::Chunk(chunk)) => {
-                self.transactions_since_resource = 0;
-                Some(OutboundItem::ResourceChunk(chunk))
-            }
-            None => {
-                // Forced path had no resource work; fall through to any pending transaction.
-                if let Some(tx) = self.pop_transaction() {
-                    self.transactions_since_resource =
-                        self.transactions_since_resource.saturating_add(1);
-                    return Some(OutboundItem::Transaction(tx));
+    fn has_scheduled_work(&self) -> bool {
+        self.class_ready(LogicalChannelClass::Ui) || self.class_ready(LogicalChannelClass::Resource)
+    }
+
+    /// Pops one frame of `class`. Control, input, and terminal never share the UI coalescing queue.
+    fn pop_class(&mut self, class: LogicalChannelClass) -> Option<OutboundItem> {
+        match class {
+            LogicalChannelClass::Ui => self.pop_transaction().map(OutboundItem::Transaction),
+            LogicalChannelClass::Resource => match self.resources.pop_frame() {
+                Some(ResourceOutboundFrame::Metadata(meta)) => {
+                    Some(OutboundItem::ResourceMetadata(meta))
                 }
-                None
-            }
+                Some(ResourceOutboundFrame::Chunk(chunk)) => {
+                    Some(OutboundItem::ResourceChunk(chunk))
+                }
+                None => None,
+            },
+            LogicalChannelClass::Control
+            | LogicalChannelClass::Input
+            | LogicalChannelClass::TerminalHigh
+            | LogicalChannelClass::TerminalNormal => None,
         }
     }
 
@@ -187,7 +197,6 @@ impl SubscriberState {
         self.items.clear();
         self.tail_domain = None;
         self.resources.clear();
-        self.transactions_since_resource = 0;
     }
 
     /// Enqueues `tx`, or merges it into the unsent tail when `incoming_domain` allows coalescing.
@@ -310,107 +319,6 @@ impl StaleClientRegistry {
     }
 }
 
-/// A handle for receiving outbound transactions streamed to a connection.
-#[derive(Debug)]
-pub struct OutboundReceiver {
-    notify_rx: mpsc::Receiver<()>,
-    state: Arc<Mutex<SubscriberState>>,
-    disconnect: CancellationToken,
-}
-
-impl OutboundReceiver {
-    /// Asynchronously waits for the next outbound item (transaction preferred over resource).
-    ///
-    /// This is the single, authoritative signal for queue lag: on overflow, it returns
-    /// [`OutboundRecvError::Lagged`].
-    pub async fn recv(&mut self) -> Result<OutboundItem, OutboundRecvError> {
-        loop {
-            {
-                let mut guard = lock_or_recover(&self.state);
-                if let Some(reason) = &guard.stale_reason {
-                    return Err(OutboundRecvError::Lagged(reason.clone()));
-                }
-                if let Some(item) = guard.pop_item() {
-                    return Ok(item);
-                }
-                if guard.is_closed {
-                    return Err(OutboundRecvError::Closed);
-                }
-            }
-
-            match self.notify_rx.recv().await {
-                Some(()) => {}
-                None => {
-                    let mut guard = lock_or_recover(&self.state);
-                    if let Some(reason) = &guard.stale_reason {
-                        return Err(OutboundRecvError::Lagged(reason.clone()));
-                    }
-                    if let Some(item) = guard.pop_item() {
-                        return Ok(item);
-                    }
-                    return Err(OutboundRecvError::Closed);
-                }
-            }
-        }
-    }
-
-    /// Non-blocking synchronous poll for the next outbound item.
-    pub fn try_recv(&mut self) -> Result<Option<OutboundItem>, OutboundRecvError> {
-        let mut guard = lock_or_recover(&self.state);
-        if let Some(reason) = &guard.stale_reason {
-            return Err(OutboundRecvError::Lagged(reason.clone()));
-        }
-        if let Some(item) = guard.pop_item() {
-            let _ = self.notify_rx.try_recv();
-            return Ok(Some(item));
-        }
-        if guard.is_closed {
-            return Err(OutboundRecvError::Closed);
-        }
-        Ok(None)
-    }
-
-    /// Token cancelled when this subscriber overflows or the hub closes.
-    ///
-    /// Connection writes must race this against `framed_write.send` so a blocked
-    /// socket does not delay `LaggedResyncRequired` (§20.2).
-    #[must_use]
-    pub fn disconnect_token(&self) -> &CancellationToken {
-        &self.disconnect
-    }
-
-    /// Current terminal state, if the queue has overflowed or closed.
-    #[must_use]
-    pub fn termination(&self) -> Option<OutboundRecvError> {
-        let guard = lock_or_recover(&self.state);
-        if let Some(reason) = &guard.stale_reason {
-            Some(OutboundRecvError::Lagged(reason.clone()))
-        } else if guard.is_closed {
-            Some(OutboundRecvError::Closed)
-        } else {
-            None
-        }
-    }
-
-    /// Returns `true` if the underlying queue has closed.
-    pub fn is_closed(&self) -> bool {
-        lock_or_recover(&self.state).is_closed
-    }
-}
-
-/// Releases the queue as soon as the connection ends, rather than at the next publish (§20.2).
-///
-/// The hub reaps the matching subscriber entry on the next [`OutboundHub::publish`] or
-/// [`OutboundHub::subscribe`]; marking the state closed here frees the queued transactions
-/// immediately so an idle session does not hold them until then.
-impl Drop for OutboundReceiver {
-    fn drop(&mut self) {
-        let mut guard = lock_or_recover(&self.state);
-        guard.is_closed = true;
-        guard.clear();
-    }
-}
-
 #[derive(Debug)]
 struct Subscriber {
     client_instance_id: Vec<u8>,
@@ -476,7 +384,6 @@ impl OutboundHub {
             items: VecDeque::with_capacity(capacity),
             tail_domain: None,
             resources: resource::ResourceTransferQueue::default(),
-            transactions_since_resource: 0,
             peak_depth: 0,
             stale_reason: None,
             is_closed: false,
@@ -496,11 +403,7 @@ impl OutboundHub {
         subs.push(sub);
         drop(subs);
 
-        Ok(OutboundReceiver {
-            notify_rx,
-            state,
-            disconnect,
-        })
+        Ok(OutboundReceiver::new(notify_rx, state, disconnect))
     }
 
     pub fn publish(&self, tx: &Transaction) {
@@ -785,7 +688,7 @@ mod tests {
         assert_eq!(hub.peak_depth_for_client(&[1]), 1);
 
         let merged = rx
-            .try_recv()
+            .try_recv_class(LogicalChannelClass::Ui)
             .expect("poll")
             .expect("merged tx")
             .into_transaction()
@@ -826,11 +729,26 @@ mod tests {
         hub.publish(&tx4);
         assert_eq!(hub.peak_depth_for_client(&[1]), 3);
 
-        let p1 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
+        let p1 = rx
+            .try_recv_class(LogicalChannelClass::Ui)
+            .unwrap()
+            .unwrap()
+            .into_transaction()
+            .unwrap();
         assert_eq!(p1.new_revision, 1);
-        let p2 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
+        let p2 = rx
+            .try_recv_class(LogicalChannelClass::Ui)
+            .unwrap()
+            .unwrap()
+            .into_transaction()
+            .unwrap();
         assert_eq!(p2.new_revision, 2);
-        let p3 = rx.try_recv().unwrap().unwrap().into_transaction().unwrap();
+        let p3 = rx
+            .try_recv_class(LogicalChannelClass::Ui)
+            .unwrap()
+            .unwrap()
+            .into_transaction()
+            .unwrap();
         assert_eq!(p3.new_revision, 4);
     }
 
@@ -882,11 +800,19 @@ mod tests {
             "coalescing must not create an SruiMessage larger than the frame limit"
         );
         assert_eq!(
-            rx.try_recv().unwrap().unwrap().into_transaction().unwrap(),
+            rx.try_recv_class(LogicalChannelClass::Ui)
+                .unwrap()
+                .unwrap()
+                .into_transaction()
+                .unwrap(),
             tx1
         );
         assert_eq!(
-            rx.try_recv().unwrap().unwrap().into_transaction().unwrap(),
+            rx.try_recv_class(LogicalChannelClass::Ui)
+                .unwrap()
+                .unwrap()
+                .into_transaction()
+                .unwrap(),
             tx2
         );
     }
@@ -914,7 +840,10 @@ mod tests {
             "overflow must wake a connection blocked in framed_write.send"
         );
 
-        assert!(matches!(rx.try_recv(), Err(OutboundRecvError::Lagged(_))));
+        assert!(matches!(
+            rx.try_recv_class(LogicalChannelClass::Ui),
+            Err(OutboundRecvError::Lagged(_))
+        ));
         assert!(matches!(
             rx.termination(),
             Some(OutboundRecvError::Lagged(_))
@@ -1050,7 +979,7 @@ mod tests {
         let tx = make_create_node_tx(0, 1, 1);
         hub.publish(&tx);
         assert_eq!(
-            rx.try_recv()
+            rx.try_recv_class(LogicalChannelClass::Ui)
                 .expect("poll")
                 .expect("queued tx")
                 .into_transaction()
@@ -1138,7 +1067,7 @@ mod tests {
         let tx = make_create_node_tx(0, 1, 1);
         hub.publish(&tx);
         assert_eq!(
-            rx.try_recv()
+            rx.try_recv_class(LogicalChannelClass::Ui)
                 .expect("poll")
                 .expect("queued tx")
                 .into_transaction()

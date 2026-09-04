@@ -8,7 +8,8 @@ pub mod session;
 
 pub use connection::{handle_connection, ConnectionError, HANDSHAKE_TIMEOUT, WRITE_TIMEOUT};
 pub use outbound::{
-    OutboundItem, OutboundReceiver, OutboundRecvError, DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+    logical_class_for_server_envelope, LogicalChannelClass, LogicalChannelScheduler, OutboundItem,
+    OutboundReceiver, OutboundRecvError, DEFAULT_OUTBOUND_QUEUE_CAPACITY, SERVICE_CYCLE,
 };
 pub use session::{
     mint_session_id, AttachmentGuard, EventOutcome, FreshClientBootstrap, ResumeClientBootstrap,

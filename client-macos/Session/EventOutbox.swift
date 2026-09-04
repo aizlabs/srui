@@ -55,7 +55,9 @@ public actor EventOutbox {
     /// Tail of the FIFO transport-write chain. Actor isolation alone is insufficient because
     /// `transport.send` is a reentrancy point; each new write task awaits this tail. Retained as
     /// the writer itself (not a result-swallowing wrapper) so an abandoned generation can cancel
-    /// it instead of merely dropping the reference (§18).
+    /// it instead of merely dropping the reference (§18). Scheduler FIFO inside the input lane
+    /// does not replace this: increasing `event_seq` must reach the transport in allocation order
+    /// (§18.2).
     private var sendTail: Task<Void, any Error>?
 
     public init(
@@ -130,7 +132,7 @@ public actor EventOutbox {
         // awaiting transport completion and must be able to remove this entry exactly once.
         try retainPending(event)
         let send = enqueueSend {
-            try await transport.send(data: framedBytes)
+            try await transport.send(data: framedBytes, logicalClass: .input)
         }
         try await send.value
     }
@@ -187,7 +189,7 @@ public actor EventOutbox {
                 try Task.checkCancellation()
                 var msg = SRUIMessage()
                 msg.event = event.toWire()
-                try await transport.send(data: try SRUIFraming.encodeFramed(msg))
+                try await transport.send(data: try SRUIFraming.encodeFramed(msg), logicalClass: .input)
             }
         }
         try await withTaskCancellationHandler {

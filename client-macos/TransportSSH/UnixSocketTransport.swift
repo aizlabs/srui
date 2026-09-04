@@ -200,7 +200,7 @@ public actor UnixSocketTransport: Transport {
         startReadingLoop()
     }
 
-    public func send(data: Data) async throws {
+    public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
         guard !isClosed else {
             throw TransportError.closed
         }
@@ -214,7 +214,7 @@ public actor UnixSocketTransport: Transport {
         // Handed to the serial writer queue rather than performed here: a blocking `write(2)` on
         // the actor executor holds this actor for its whole duration, and `close()` is
         // actor-isolated, so a peer that stops reading would make teardown unreachable (§22.2).
-        try await writer.write(data, claiming: readLatch)
+        try await writer.write(data, logicalClass: logicalClass, claiming: readLatch)
     }
 
     public func acknowledgeReceived(byteCount: Int) async {

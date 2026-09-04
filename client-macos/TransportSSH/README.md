@@ -4,6 +4,56 @@ This module provides the secure transport binding for the macOS SRUI client as s
 
 ---
 
+## Logical channel scheduler (§19.2)
+
+Outbound frames are classified independently of protobuf/Core semantics. SSH and TCP serialize
+whichever frame the scheduler selects onto **one** byte stream. A future QUIC binding may map the
+same classes to independent streams without changing Core messages. This module does not implement
+QUIC.
+
+| Logical class | Priority | Examples |
+| :--- | ---: | :--- |
+| `control` | highest | `CLIENT HELLO`, `CLIENT RESUME`, `SERVER WELCOME`, resume responses, `SERVER EVENT_ACK` |
+| `input` | highest | semantic user events (`EventOutbox`) |
+| `ui` | high | committed transactions (reserved on the client outbound path) |
+| `terminalHigh` | high | interactive PTY bytes (reserved; Task 30) |
+| `terminalNormal` | normal | bulk terminal output (reserved; Task 30) |
+| `resource` | low | images and attachments (reserved on the client outbound path) |
+
+`Transport.send(data:)` is the compatibility path and defaults to `control`. Production writers
+use `send(data:logicalClass:)`. `SocketWriter` keeps per-class FIFO queues and drains them through
+the shared 24-slot weighted cycle:
+
+```text
+control, input, ui,
+control, input, terminalHigh,
+control, input, ui,
+control, input, terminalNormal,
+control, input, ui,
+control, input, terminalHigh,
+ui, control, input,
+terminalNormal, terminalHigh, resource
+```
+
+Empty lanes are skipped without consuming a write. FIFO order is preserved inside each lane, and
+the cursor is retained between selections. Maximum head-of-line service distances under continuous
+saturation:
+
+| Class | Max dispatched frames |
+| :--- | ---: |
+| control | 5 |
+| input | 5 |
+| UI | 8 |
+| terminal-high | 12 |
+| terminal-normal | 14 |
+| resource | 24 |
+
+No scheduler can promise wall-clock delivery when the peer stops reading. The meaningful invariant
+is bounded scheduler selections plus at most the currently non-preemptible 16 KiB resource chunk;
+the existing 30-second write timeout remains the terminal stalled-peer bound.
+
+---
+
 ## Architectural Choices & Rationale (§19.1, §25)
 
 The SRUI reference macOS client executes the system OpenSSH binary (`/usr/bin/ssh`) directly via `Foundation.Process` rather than embedding a third-party C library (e.g. `libssh2`/`libssh`).

@@ -216,7 +216,7 @@ public actor SSHTransport: Transport {
         startStdoutReader(stdoutFD: stdoutFD, process: proc)
     }
 
-    public func send(data: Data) async throws {
+    public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
         if !isConnected {
             try connect()
         }
@@ -227,7 +227,7 @@ public actor SSHTransport: Transport {
         // Off the actor executor: a blocking write to a child that stopped reading would hold this
         // actor and make the actor-isolated `close()` unreachable (§22.2).
         do {
-            try await writer.write(data, claiming: stdinLatch)
+            try await writer.write(data, logicalClass: logicalClass, claiming: stdinLatch)
         } catch let error as TransportError {
             let stderrDiag = stderrAccumulator.summary()
             guard !stderrDiag.isEmpty else { throw error }

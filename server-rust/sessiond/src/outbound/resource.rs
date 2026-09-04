@@ -1,9 +1,11 @@
 //! Per-connection resource transfer cursors (§14, §19.2).
 //!
 //! Tracks which retained resources still need metadata/chunk delivery on one
-//! outbound subscriber. Exactly one resource frame is emitted per selection when
-//! no transaction is pending, so UI traffic can interleave after at most the
-//! chunk whose socket write has already begun.
+//! outbound subscriber. The logical-channel scheduler treats both metadata and
+//! chunk frames as `resource` traffic and emits at most one frame per selection
+//! ([`crate::outbound::LogicalChannelScheduler`]). A chunk whose socket write has
+//! already begun is not preemptible; newly ready control, input, and UI frames are
+//! selected before another resource frame.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

@@ -56,12 +56,14 @@ fi
 run "swift: swift test" swift test --package-path client-macos
 
 # --- Generated-file freshness (CI: job `swift`, final step) -------------------
-# The committed Swift bindings are generated output; CI fails on any diff after regeneration.
-# Checked last because it rewrites files in the working tree.
+# The committed protobuf, registry, and scheduling bindings are generated output; CI fails on
+# any diff after regeneration. Checked last because it rewrites files in the working tree.
 run "protocol: regenerate bindings" ./protocol/generate_proto.sh
 run "protocol: committed bindings are fresh" git diff --exit-code \
 	client-macos/Protocol/srui.pb.swift \
-	client-macos/SemanticModel/RegistryTables.swift
+	client-macos/SemanticModel/RegistryTables.swift \
+	client-macos/TransportSSH/LogicalChannelPolicy.generated.swift \
+	server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs
 
 if [ "$fail" -ne 0 ]; then
 	printf '\n\033[31mpre-push checks failed; push aborted.\033[0m\n'

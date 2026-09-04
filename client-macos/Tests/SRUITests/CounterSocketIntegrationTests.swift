@@ -449,8 +449,8 @@ private final class ResourceChunkCorruptingTransport: Transport, @unchecked Send
         self.inner = inner
     }
 
-    func send(data: Data) async throws {
-        try await inner.send(data: data)
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        try await inner.send(data: data, logicalClass: logicalClass)
     }
 
     func close() async {

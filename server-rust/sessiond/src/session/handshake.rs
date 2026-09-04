@@ -519,7 +519,11 @@ mod tests {
         hello.known_resource_hashes = vec![published.hash.0.to_vec()];
 
         let mut bootstrap = session.bootstrap_fresh_client(&hello).unwrap();
-        assert!(bootstrap.transactions.try_recv().unwrap().is_none());
+        assert!(bootstrap
+            .transactions
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -537,7 +541,11 @@ mod tests {
         };
 
         let mut bootstrap = session.bootstrap_resume(&resume).unwrap();
-        assert!(bootstrap.transactions.try_recv().unwrap().is_none());
+        assert!(bootstrap
+            .transactions
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -558,7 +566,11 @@ mod tests {
         };
 
         let mut bootstrap = session.bootstrap_resume(&resume).unwrap();
-        assert!(bootstrap.transactions.try_recv().unwrap().is_none());
+        assert!(bootstrap
+            .transactions
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -775,7 +787,7 @@ mod tests {
 
         let rec_tx = bootstrap0
             .transactions
-            .try_recv()
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
             .expect("receive broadcast")
             .unwrap()
             .into_transaction()
@@ -872,7 +884,7 @@ mod tests {
 
         let streamed = bootstrap
             .transactions
-            .try_recv()
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
             .expect("post-snapshot transaction")
             .unwrap()
             .into_transaction()
@@ -957,7 +969,7 @@ mod tests {
 
         let streamed = bootstrap
             .transactions
-            .try_recv()
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
             .expect("post-replay transaction")
             .unwrap()
             .into_transaction()

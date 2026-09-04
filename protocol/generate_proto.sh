@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SRUI Protocol Buffers & Registry Code Generation Script
-# Compiles protocol/srui.proto for Swift (client-macos/Protocol/srui.pb.swift)
-# and generates standard registry tables (client-macos/SemanticModel/RegistryTables.swift).
+# SRUI Protocol Buffers, Registry & Scheduling Policy Code Generation Script
+# Compiles protocol/srui.proto for Swift, generates standard registry tables,
+# and generates the shared Rust/Swift logical-channel scheduling policy.
 # ==============================================================================
 set -euo pipefail
 
@@ -81,14 +81,16 @@ mkdir -p "${SWIFT_OUT}"
 echo "Generated Swift protobuf code -> ${SWIFT_OUT}/srui.pb.swift"
 echo "Rust code generation is handled automatically at build time via server-rust/protocol/build.rs (prost-build)."
 
-# 4. Generate Swift Registry Tables
-echo "=== Generating SRUI Registry Tables ==="
+# 4. Generate Swift Registry Tables and the shared logical-channel policy
+echo "=== Generating SRUI Registry Tables and Logical-Channel Policy ==="
 if command -v uv >/dev/null 2>&1; then
     uv run python "${REPO_ROOT}/protocol/generate_swift_registry.py"
+    uv run python "${REPO_ROOT}/protocol/generate_logical_channel_policy.py"
 elif command -v python3 >/dev/null 2>&1; then
     python3 "${REPO_ROOT}/protocol/generate_swift_registry.py"
+    python3 "${REPO_ROOT}/protocol/generate_logical_channel_policy.py"
 else
-    echo "Warning: Python 3 not found to regenerate Swift registry tables."
+    echo "Warning: Python 3 not found to regenerate registry or scheduling policy."
 fi
 
 echo "=== SRUI Codegen Complete ==="

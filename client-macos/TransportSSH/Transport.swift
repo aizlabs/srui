@@ -221,6 +221,13 @@ final class SocketWriter: @unchecked Sendable {
         }
     }
 
+    /// Frames waiting in one logical-class queue, excluding a write already popped for I/O.
+    func queuedCount(for logicalClass: LogicalChannelClass) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return queues[logicalClass]?.count ?? 0
+    }
+
     private var isStopped: Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -271,8 +278,8 @@ final class SocketWriter: @unchecked Sendable {
                 resumeAll(pending, throwing: TransportError.closed)
                 return
             }
-            guard let logicalClass = scheduler.selectNext(ready: { class in
-                !(self.queues[class] ?? []).isEmpty
+            guard let logicalClass = scheduler.selectNext(ready: { candidate in
+                !(self.queues[candidate] ?? []).isEmpty
             }) else {
                 drainScheduled = false
                 lock.unlock()

@@ -3,12 +3,18 @@
 //! Correctness is asserted with frame counts and gated reads. `timeout` is only a deadlock guard;
 //! wall-clock sleeps are not used.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashSet;
+use std::io;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use futures::task::AtomicWaker;
 use futures::{SinkExt, StreamExt};
-use tokio::io::duplex;
+use tokio::io::{duplex, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
@@ -18,7 +24,7 @@ use srui_protocol::{
     SruiMessage,
 };
 use srui_resources::CHUNK_PAYLOAD_SIZE;
-use srui_sdk::{Button, NodeId, Surface, Text, ACTIVATE, LABEL, TEXT};
+use srui_sdk::{Button, NodeId, Surface, Text, ACTIVATE, TEXT};
 use srui_semantic_tree::Event;
 use srui_sessiond::{
     handle_connection, logical_class_for_server_envelope, LogicalChannelClass, Session,
@@ -29,6 +35,87 @@ type ClientWrite = FramedWrite<tokio::io::WriteHalf<tokio::io::DuplexStream>, Sr
 
 const CLIENT_ID: &[u8] = b"scheduler-client";
 const DEADLOCK: Duration = Duration::from_secs(5);
+
+struct ServerWriteGate {
+    accepting_writes: AtomicBool,
+    blocked: Notify,
+    writer_waker: AtomicWaker,
+}
+
+impl ServerWriteGate {
+    fn new() -> Self {
+        Self {
+            accepting_writes: AtomicBool::new(true),
+            blocked: Notify::new(),
+            writer_waker: AtomicWaker::new(),
+        }
+    }
+
+    fn block(&self) {
+        self.accepting_writes.store(false, Ordering::Release);
+    }
+
+    fn release(&self) {
+        self.accepting_writes.store(true, Ordering::Release);
+        self.writer_waker.wake();
+    }
+
+    async fn wait_until_blocked(&self) {
+        timeout(DEADLOCK, self.blocked.notified())
+            .await
+            .expect("server never attempted the gated resource write");
+    }
+
+    fn poll_permission(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.accepting_writes.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        self.writer_waker.register(cx.waker());
+        if self.accepting_writes.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            self.blocked.notify_one();
+            Poll::Pending
+        }
+    }
+}
+
+struct WriteGatedStream {
+    inner: DuplexStream,
+    gate: Arc<ServerWriteGate>,
+}
+
+impl AsyncRead for WriteGatedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for WriteGatedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.gate.poll_permission(cx).is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 async fn recv_frame(read: &mut ClientRead) -> SruiMessage {
     timeout(DEADLOCK, read.next())
@@ -85,6 +172,59 @@ async fn connect(
     assert_eq!(classify(&welcome), LogicalChannelClass::Control);
 
     (write, read, shutdown, server_task)
+}
+
+async fn connect_with_write_gate(
+    session: Arc<Session>,
+    duplex_bytes: usize,
+    client_instance_id: &[u8],
+) -> (
+    ClientWrite,
+    ClientRead,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+    Arc<ServerWriteGate>,
+) {
+    let (client, server) = duplex(duplex_bytes);
+    let gate = Arc::new(ServerWriteGate::new());
+    let gated_server = WriteGatedStream {
+        inner: server,
+        gate: Arc::clone(&gate),
+    };
+    let shutdown = CancellationToken::new();
+    let shutdown_server = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        handle_connection(gated_server, session, shutdown_server)
+            .await
+            .expect("gated server connection failed");
+    });
+
+    let (read_half, write_half) = tokio::io::split(client);
+    let mut read = FramedRead::new(read_half, SruiCodec::new());
+    let mut write = FramedWrite::new(write_half, SruiCodec::new());
+
+    write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::ClientHello(srui_protocol::ClientHello {
+                core_version: "0.4.0".into(),
+                profiles: vec!["org.srui.standard-widgets/1".into()],
+                limits: None,
+                client_instance_id: client_instance_id.to_vec(),
+                client_metadata: Default::default(),
+                known_resource_hashes: vec![],
+            })),
+        })
+        .await
+        .expect("send hello");
+
+    let welcome = recv_frame(&mut read).await;
+    assert!(matches!(
+        welcome.msg,
+        Some(srui_message::Msg::ServerWelcome(_))
+    ));
+    assert_eq!(classify(&welcome), LogicalChannelClass::Control);
+
+    (write, read, shutdown, server_task, gate)
 }
 
 async fn drain_handshake_snapshot(read: &mut ClientRead, initial_revision: u64) {
@@ -318,9 +458,13 @@ async fn resource_backlog_yields_to_control_input_and_ui_on_the_wire() {
     let _ = timeout(DEADLOCK, server_task).await;
 }
 
-/// A control/UI flood still gives resource a slot inside its documented service bound.
+/// A saturated control/UI flood still gives resource and UI their documented service slots.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resource_progresses_under_control_and_ui_flood() {
+    const CONTROL_FLOOD_EVENTS: u64 = 96;
+    const UI_FLOOD_TRANSACTIONS: u64 = 48;
+    const SATURATED_CONTROL_HANDLERS: u64 = 65;
+
     let session = Arc::new(Session::new("scheduler-flood"));
     let button = NodeId::new(3);
     session
@@ -333,91 +477,203 @@ async fn resource_progresses_under_control_and_ui_flood() {
             Ok(())
         })
         .unwrap();
-    session.on(button, ACTIVATE, move |_, _| {});
 
-    let (mut write, mut read, shutdown, server_task) =
-        connect(Arc::clone(&session), 64 * 1024, CLIENT_ID).await;
+    let invocations = Arc::new(AtomicU64::new(0));
+    let invocation_counter = Arc::clone(&invocations);
+    session.on(button, ACTIVATE, move |_, _| {
+        invocation_counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let (write, mut read, shutdown, server_task, write_gate) =
+        connect_with_write_gate(Arc::clone(&session), 16 * 1024, CLIENT_ID).await;
     drain_handshake_snapshot(&mut read, session.current_revision()).await;
+
+    write_gate.block();
 
     let mut payload = vec![0u8; CHUNK_PAYLOAD_SIZE * 32];
     png_prefix(&mut payload);
     session
         .publish_resource(&payload)
         .expect("publish resource");
+    write_gate.wait_until_blocked().await;
 
-    let flood = {
+    // CreateNode is structural, so every transaction remains a distinct UI envelope instead of
+    // coalescing into one scalar tail item. The count stays below the 128-item subscriber bound.
+    let ui_base_revision = session.current_revision();
+    let ui_flood = {
         let session = Arc::clone(&session);
         tokio::spawn(async move {
-            for i in 0..64u64 {
-                let _ = session.transaction(|ui| {
-                    ui.set(button, LABEL, format!("flood-{i}"))?;
-                    Ok(())
-                });
-                tokio::task::yield_now().await;
+            for i in 0..UI_FLOOD_TRANSACTIONS {
+                session
+                    .transaction(|ui| {
+                        Text::builder(10_000 + i)
+                            .parent(1)
+                            .text(format!("ui-flood-{i}"))
+                            .create(ui)?;
+                        Ok(())
+                    })
+                    .expect("commit structural UI flood transaction");
             }
         })
     };
+    timeout(DEADLOCK, ui_flood)
+        .await
+        .expect("UI flood producer did not complete")
+        .expect("UI flood producer panicked");
+    assert_eq!(
+        session.current_revision(),
+        ui_base_revision + UI_FLOOD_TRANSACTIONS,
+        "every structural UI flood transaction must commit"
+    );
 
-    for seq in 1u64..=32 {
+    let event_revision = session.current_revision();
+    let control_flood = tokio::spawn(async move {
+        let mut write = write;
+        for seq in 1..=CONTROL_FLOOD_EVENTS {
+            write
+                .send(wire_activate(
+                    CLIENT_ID,
+                    seq,
+                    &format!("e{seq}"),
+                    event_revision,
+                    button,
+                ))
+                .await
+                .expect("send control-flood event");
+        }
         write
-            .send(wire_activate(
-                CLIENT_ID,
-                seq,
-                &format!("flood-evt-{seq}"),
-                session.current_revision(),
-                button,
-            ))
-            .await
-            .unwrap();
+    });
+
+    // With the outbound write gated, handlers 1..=64 fill the bounded ACK channel and handler 65
+    // blocks while enqueuing its ACK. This proves control is continuously ready before measuring
+    // resource/UI service, instead of relying on task timing.
+    wait_until(|| invocations.load(Ordering::SeqCst) == SATURATED_CONTROL_HANDLERS).await;
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        SATURATED_CONTROL_HANDLERS
+    );
+
+    write_gate.release();
+
+    let first = recv_frame(&mut read).await;
+    assert_eq!(
+        classify(&first),
+        LogicalChannelClass::Resource,
+        "the deterministically gated write must be the first resource frame"
+    );
+
+    let mut saw_metadata = false;
+    let mut reconstructed = 0usize;
+    match first.msg {
+        Some(srui_message::Msg::ResourceMetadata(meta)) => {
+            saw_metadata = true;
+            assert_eq!(meta.encoded_length, payload.len() as u64);
+        }
+        Some(srui_message::Msg::ResourceChunk(chunk)) => {
+            reconstructed += chunk.data.len();
+        }
+        other => panic!("expected gated resource envelope, got {other:?}"),
     }
 
-    let mut since_resource = 0usize;
-    let mut reconstructed = 0usize;
-    let mut saw_resource = false;
-    let mut max_gap = 0usize;
+    let mut ack_ids = HashSet::new();
+    let mut ui_frames = 0u64;
+    let mut resource_distance = 0usize;
+    let mut ui_distance = 0usize;
 
-    loop {
+    while ack_ids.len() < CONTROL_FLOOD_EVENTS as usize
+        || ui_frames < UI_FLOOD_TRANSACTIONS
+        || reconstructed < payload.len()
+    {
         let msg = recv_frame(&mut read).await;
+        let class = classify(&msg);
+
+        if reconstructed < payload.len() {
+            resource_distance += 1;
+            if class == LogicalChannelClass::Resource {
+                assert!(
+                    resource_distance <= LogicalChannelClass::Resource.max_service_gap(),
+                    "resource service distance {resource_distance} exceeded bound {}",
+                    LogicalChannelClass::Resource.max_service_gap()
+                );
+                resource_distance = 0;
+            } else {
+                assert!(
+                    resource_distance < LogicalChannelClass::Resource.max_service_gap(),
+                    "resource missed its next service slot after {} dispatched frames",
+                    LogicalChannelClass::Resource.max_service_gap()
+                );
+            }
+        }
+
+        if ui_frames < UI_FLOOD_TRANSACTIONS {
+            ui_distance += 1;
+            if class == LogicalChannelClass::Ui {
+                assert!(
+                    ui_distance <= LogicalChannelClass::Ui.max_service_gap(),
+                    "UI service distance {ui_distance} exceeded bound {}",
+                    LogicalChannelClass::Ui.max_service_gap()
+                );
+                ui_distance = 0;
+            } else {
+                assert!(
+                    ui_distance < LogicalChannelClass::Ui.max_service_gap(),
+                    "UI missed its next service slot after {} dispatched frames",
+                    LogicalChannelClass::Ui.max_service_gap()
+                );
+            }
+        }
+
         match msg.msg {
             Some(srui_message::Msg::ResourceMetadata(meta)) => {
-                saw_resource = true;
-                max_gap = max_gap.max(since_resource);
-                since_resource = 0;
+                assert!(!saw_metadata, "resource metadata sent more than once");
+                saw_metadata = true;
                 assert_eq!(meta.encoded_length, payload.len() as u64);
             }
             Some(srui_message::Msg::ResourceChunk(chunk)) => {
-                saw_resource = true;
-                max_gap = max_gap.max(since_resource);
-                since_resource = 0;
                 reconstructed += chunk.data.len();
-                if reconstructed >= payload.len() {
-                    break;
-                }
+                assert!(
+                    reconstructed <= payload.len(),
+                    "resource chunks exceeded the published payload"
+                );
             }
-            Some(srui_message::Msg::ServerEventAck(_) | srui_message::Msg::Transaction(_)) => {
-                if saw_resource && reconstructed < payload.len() {
-                    since_resource += 1;
-                    assert!(
-                        since_resource <= LogicalChannelClass::Resource.max_service_gap(),
-                        "resource starved for {since_resource} frames (bound {})",
-                        LogicalChannelClass::Resource.max_service_gap()
-                    );
-                }
+            Some(srui_message::Msg::ServerEventAck(ack)) => {
+                assert_eq!(ack.status(), EventAckStatus::Processed);
+                assert!(
+                    ack_ids.insert(ack.event_id),
+                    "control flood returned a duplicate EVENT_ACK"
+                );
+            }
+            Some(srui_message::Msg::Transaction(_)) => {
+                ui_frames += 1;
+                assert!(
+                    ui_frames <= UI_FLOOD_TRANSACTIONS,
+                    "received more UI frames than structural transactions"
+                );
             }
             other => panic!("unexpected envelope {other:?}"),
         }
-        assert!(
-            reconstructed < payload.len() + CHUNK_PAYLOAD_SIZE,
-            "frame loop exceeded payload"
-        );
     }
 
-    assert!(saw_resource);
-    assert!(max_gap <= LogicalChannelClass::Resource.max_service_gap());
-    let _ = timeout(DEADLOCK, flood).await;
+    assert!(saw_metadata, "resource metadata was not delivered");
+    assert_eq!(reconstructed, payload.len());
+    assert_eq!(ui_frames, UI_FLOOD_TRANSACTIONS);
+    assert_eq!(ack_ids.len(), CONTROL_FLOOD_EVENTS as usize);
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        CONTROL_FLOOD_EVENTS,
+        "every control-flood event handler must complete"
+    );
+
+    let _write = timeout(DEADLOCK, control_flood)
+        .await
+        .expect("control flood producer did not complete")
+        .expect("control flood producer panicked");
 
     shutdown.cancel();
-    let _ = timeout(DEADLOCK, server_task).await;
+    timeout(DEADLOCK, server_task)
+        .await
+        .expect("gated server task did not stop")
+        .expect("gated server task panicked");
 }
 
 /// UI still interleaves ahead of remaining resource chunks (regression from the timing-only test).

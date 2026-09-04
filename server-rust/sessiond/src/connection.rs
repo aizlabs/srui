@@ -20,7 +20,6 @@
 //! - [`async-no-lock-await`](rules/async-no-lock-await.md): no locks are held across `.await`.
 
 use futures::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -51,9 +50,9 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The deadline turns that indefinite park into a detach, after which the client resyncs (§20.2).
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bounded per-connection queue of control-class frames (`SERVER EVENT_ACK`, §18.2, §19.2).
+/// Bounded per-connection queue of control-class frames (SERVER EVENT_ACK, §18.2, §19.2).
 ///
-/// `send().await` applies backpressure into the read future instead of dropping acks.
+/// send().await applies backpressure into the read future instead of dropping acknowledgements.
 const CONTROL_CHANNEL_CAPACITY: usize = 64;
 
 /// Errors occurring during connection lifecycle.
@@ -362,8 +361,9 @@ where
 
 /// Concurrently drives inbound events and scheduled outbound writes (§18.2, §19.2, §20).
 ///
-/// The two futures share a connection-local cancellation token and are not detached: completing
-/// either one cancels the other by dropping it. Locks are never held across `.await`.
+/// Inbound event handling never waits for the physical writer, so socket backpressure cannot stall
+/// semantic input. Clean inbound EOF drops the control sender and lets the writer drain every
+/// acknowledgement already accepted by the bounded channel before closing the connection.
 async fn run_active_session<R, W>(
     framed_read: FramedRead<R, SruiCodec>,
     framed_write: FramedWrite<W, SruiCodec>,
@@ -377,9 +377,6 @@ where
     W: AsyncWrite + Unpin,
 {
     let session_cancel = CancellationToken::new();
-    // While an event is being processed (and until its SERVER EVENT_ACK is enqueued), UI and
-    // resource frames are not selectable so the ack can occupy the control lane first (§18.2).
-    let ack_hold = Arc::new(AtomicUsize::new(0));
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
 
     let read = read_loop(
@@ -389,7 +386,6 @@ where
         control_tx,
         shutdown.clone(),
         session_cancel.clone(),
-        Arc::clone(&ack_hold),
     );
     let write = write_loop(
         framed_write,
@@ -397,7 +393,6 @@ where
         control_rx,
         shutdown,
         session_cancel.clone(),
-        ack_hold,
     );
 
     tokio::pin!(read);
@@ -405,8 +400,15 @@ where
     tokio::select! {
         biased;
         result = &mut read => {
-            session_cancel.cancel();
-            result
+            match result {
+                // The completed reader has dropped control_tx. Drain queued acknowledgements
+                // rather than cancelling the writer on a clean inbound half-close.
+                Ok(()) => write.await,
+                Err(error) => {
+                    session_cancel.cancel();
+                    Err(error)
+                }
+            }
         }
         result = &mut write => {
             session_cancel.cancel();
@@ -422,7 +424,6 @@ async fn read_loop<R>(
     control_tx: mpsc::Sender<SruiMessage>,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
-    ack_hold: Arc<AtomicUsize>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncRead + Unpin,
@@ -438,21 +439,9 @@ where
             incoming = framed_read.next() => {
                 match incoming {
                     Some(Ok(msg)) => {
-                        let is_event = matches!(msg.msg, Some(srui_message::Msg::Event(_)));
-                        if is_event {
-                            ack_hold.fetch_add(1, Ordering::SeqCst);
-                        }
-                        let result = handle_incoming_message(msg, &session, &client_instance_id).await;
-                        let response = match result {
-                            Ok(response) => response,
-                            Err(error) => {
-                                if is_event {
-                                    ack_hold.fetch_sub(1, Ordering::SeqCst);
-                                }
-                                return Err(error);
-                            }
-                        };
-                        if let Some(response) = response {
+                        if let Some(response) =
+                            handle_incoming_message(msg, &session, &client_instance_id).await?
+                        {
                             debug_assert_eq!(
                                 logical_class_for_server_envelope(&response),
                                 LogicalChannelClass::Control,
@@ -462,28 +451,12 @@ where
                                 biased;
                                 sent = control_tx.send(response) => {
                                     if sent.is_err() {
-                                        if is_event {
-                                            ack_hold.fetch_sub(1, Ordering::SeqCst);
-                                        }
                                         return Ok(());
                                     }
                                 }
-                                _ = session_cancel.cancelled() => {
-                                    if is_event {
-                                        ack_hold.fetch_sub(1, Ordering::SeqCst);
-                                    }
-                                    return Ok(());
-                                }
-                                _ = shutdown.cancelled() => {
-                                    if is_event {
-                                        ack_hold.fetch_sub(1, Ordering::SeqCst);
-                                    }
-                                    return Ok(());
-                                }
+                                _ = session_cancel.cancelled() => return Ok(()),
+                                _ = shutdown.cancelled() => return Ok(()),
                             }
-                        }
-                        if is_event {
-                            ack_hold.fetch_sub(1, Ordering::SeqCst);
                         }
                     }
                     Some(Err(e)) => {
@@ -506,7 +479,6 @@ async fn write_loop<W>(
     mut control_rx: mpsc::Receiver<SruiMessage>,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
-    ack_hold: Arc<AtomicUsize>,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWrite + Unpin,
@@ -536,18 +508,20 @@ where
             }
         }
 
-        let hold_non_control = ack_hold.load(Ordering::SeqCst) > 0 && !control_closed;
+        // A closed control channel means the cleanly completed reader cannot produce more
+        // acknowledgements. Once its bounded queue is empty, finish without streaming unrelated
+        // low-priority output forever to a client that has ended its input side.
+        if control_closed && pending_control.is_none() {
+            return Ok(());
+        }
+
         let ready = |class: LogicalChannelClass| match class {
             LogicalChannelClass::Control => pending_control.is_some(),
             LogicalChannelClass::Input
             | LogicalChannelClass::TerminalHigh
             | LogicalChannelClass::TerminalNormal => false,
-            LogicalChannelClass::Ui => {
-                !hold_non_control && outbound.class_ready(LogicalChannelClass::Ui)
-            }
-            LogicalChannelClass::Resource => {
-                !hold_non_control && outbound.class_ready(LogicalChannelClass::Resource)
-            }
+            LogicalChannelClass::Ui => outbound.class_ready(LogicalChannelClass::Ui),
+            LogicalChannelClass::Resource => outbound.class_ready(LogicalChannelClass::Resource),
         };
 
         if let Some(class) = scheduler.select_next(ready) {
@@ -595,24 +569,6 @@ where
             return Ok(());
         }
 
-        if hold_non_control {
-            tokio::select! {
-                biased;
-                _ = session_cancel.cancelled() => return Ok(()),
-                _ = shutdown.cancelled() => return Ok(()),
-                msg = control_rx.recv(), if pending_control.is_none() && !control_closed => {
-                    match msg {
-                        Some(message) => pending_control = Some(message),
-                        None => control_closed = true,
-                    }
-                }
-                // Re-check `ack_hold` after the read future can run. A settled event with no
-                // ack (`Pending`) must not park this loop on `control_rx` forever.
-                _ = tokio::task::yield_now() => {}
-            }
-            continue;
-        }
-
         let disconnect = outbound.disconnect_token().clone();
         tokio::select! {
             biased;
@@ -653,7 +609,6 @@ where
         }
     }
 }
-
 async fn handle_incoming_message(
     msg: SruiMessage,
     session: &Session,

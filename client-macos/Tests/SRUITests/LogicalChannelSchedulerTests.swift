@@ -162,8 +162,8 @@ struct LogicalChannelSchedulerTests {
                     queues[logicalClass, default: []].append(nextExpected[logicalClass] ?? 0)
                 }
             }
-            let selected = scheduler.selectNext { class in
-                !(queues[class] ?? []).isEmpty
+            let selected = scheduler.selectNext { candidate in
+                !(queues[candidate] ?? []).isEmpty
             }
             let logicalClass = try #require(selected)
             let token = queues[logicalClass]!.removeFirst()
@@ -205,61 +205,85 @@ struct LogicalChannelSchedulerTests {
         let writer = SocketWriter(label: "test.scheduler-gate", testSink: { try sink.write($0) })
         let latch = SocketReadLatch()
 
-        var resourceTasks: [Task<Void, any Error>] = []
-        for id in 0..<200u32 {
-            let payload = resourceToken(id)
-            resourceTasks.append(Task {
-                try await writer.write(payload, logicalClass: .resource, claiming: latch)
-            })
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            defer {
+                writer.stop()
+                sink.fail(TransportError.closed)
+                latch.stop()
+            }
+
+            group.addTask {
+                _ = try? await writer.write(
+                    resourceToken(0),
+                    logicalClass: .resource,
+                    claiming: latch
+                )
+            }
+            sink.waitUntilEntered(1)
+
+            for id in UInt32(1)..<UInt32(200) {
+                let payload = resourceToken(id)
+                group.addTask {
+                    _ = try? await writer.write(
+                        payload,
+                        logicalClass: .resource,
+                        claiming: latch
+                    )
+                }
+            }
+            try await waitUntilQueued(199, in: .resource, writer: writer)
+
+            let control = Data("control-probe".utf8)
+            let input = Data("input-probe".utf8)
+            let ui = Data("ui-probe".utf8)
+
+            group.addTask {
+                _ = try? await writer.write(control, logicalClass: .control, claiming: latch)
+            }
+            try await waitUntilQueued(1, in: .control, writer: writer)
+
+            group.addTask {
+                _ = try? await writer.write(input, logicalClass: .input, claiming: latch)
+            }
+            try await waitUntilQueued(1, in: .input, writer: writer)
+
+            group.addTask {
+                _ = try? await writer.write(ui, logicalClass: .ui, claiming: latch)
+            }
+            try await waitUntilQueued(1, in: .ui, writer: writer)
+
+            sink.release(8)
+            sink.waitUntilDispatched(4)
+
+            let dispatched = sink.snapshot()
+            #expect(dispatched.count >= 4)
+            #expect(tokenId(dispatched[0]) == 0)
+
+            let rest = dispatched.dropFirst()
+            let controlAt = try #require(rest.firstIndex(of: control))
+            let inputAt = try #require(rest.firstIndex(of: input))
+            let uiAt = try #require(rest.firstIndex(of: ui))
+            let probeEnd = try #require([controlAt, inputAt, uiAt].max())
+            let resourceBeforeProbes = rest.prefix(through: probeEnd).filter {
+                tokenId($0) != nil
+            }.count
+            #expect(
+                resourceBeforeProbes == 0,
+                "no second resource token may precede control/input/UI probes"
+            )
         }
+    }
 
-        sink.waitUntilEntered(1)
-        let queuedBeforeProbes = writer.queuedCount()
-
-        let control = Data("control-probe".utf8)
-        let input = Data("input-probe".utf8)
-        let ui = Data("ui-probe".utf8)
-        let controlTask = Task { try await writer.write(control, logicalClass: .control, claiming: latch) }
-        let inputTask = Task { try await writer.write(input, logicalClass: .input, claiming: latch) }
-        let uiTask = Task { try await writer.write(ui, logicalClass: .ui, claiming: latch) }
-
+    private func waitUntilQueued(
+        _ expectedCount: Int,
+        in logicalClass: LogicalChannelClass,
+        writer: SocketWriter
+    ) async throws {
         var spins = 0
-        while writer.queuedCount() < queuedBeforeProbes + 3 {
+        while writer.queuedCount(for: logicalClass) < expectedCount {
             spins += 1
-            try #require(spins < 100_000, "probe writes never entered the scheduler queues")
+            try #require(spins < 100_000, "writes never entered the expected scheduler queue")
             await Task.yield()
-        }
-
-        sink.release(8)
-        sink.waitUntilDispatched(4)
-
-        let dispatched = sink.snapshot()
-        #expect(dispatched.count >= 4)
-        #expect(tokenId(dispatched[0]) == 0)
-
-        let rest = dispatched.dropFirst()
-        let controlAt = rest.firstIndex(of: control)
-        let inputAt = rest.firstIndex(of: input)
-        let uiAt = rest.firstIndex(of: ui)
-        #expect(controlAt != nil)
-        #expect(inputAt != nil)
-        #expect(uiAt != nil)
-
-        let probeEnd = [controlAt!, inputAt!, uiAt!].max()!
-        let resourceBeforeProbes = rest.prefix(through: probeEnd).filter { tokenId($0) != nil }.count
-        #expect(
-            resourceBeforeProbes == 0,
-            "no second resource token may precede control/input/UI probes"
-        )
-
-        writer.stop()
-        sink.fail(TransportError.closed)
-        latch.stop()
-        _ = await controlTask.result
-        _ = await inputTask.result
-        _ = await uiTask.result
-        for task in resourceTasks {
-            _ = await task.result
         }
     }
 

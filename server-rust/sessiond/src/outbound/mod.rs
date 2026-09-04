@@ -34,7 +34,7 @@ pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 128;
 /// `client_instance_id` is client-supplied, so the marker table is bounded on the same terms as
 /// the journal retention window (§18.1): the oldest marker is evicted once the bound is reached.
 /// An evicted client that later resumes falls back to journal-gap evaluation.
-pub(crate) const MAX_TRACKED_STALE_CLIENTS: usize = 1024;
+pub const MAX_TRACKED_STALE_CLIENTS: usize = 1024;
 
 /// One outbound delivery unit: UI transaction or a single resource frame (§14, §19.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -277,6 +277,14 @@ impl StaleClientRegistry {
 
     fn contains(&self, client_instance_id: &[u8]) -> bool {
         self.entries.contains_key(client_instance_id)
+    }
+
+    /// Client-supplied bytes retained by this table, i.e. the identifiers themselves.
+    ///
+    /// The entry cap bounds how many identifiers are kept, not how large each one is; this is the
+    /// quantity a retention invariant can assert against (§20.2, §26).
+    fn retained_key_bytes(&self) -> usize {
+        self.entries.keys().map(Vec::len).sum()
     }
 
     fn clear_client(&mut self, client_instance_id: &[u8]) {
@@ -631,6 +639,11 @@ impl OutboundHub {
         if enqueued {
             let _ = sub.notify_tx.try_send(());
         }
+    }
+
+    /// Client-supplied bytes retained by the stale-client registry (§20.2, §26).
+    pub fn retained_stale_client_bytes(&self) -> usize {
+        lock_or_recover(&self.stale_clients).retained_key_bytes()
     }
 
     pub fn is_client_stale(&self, client_instance_id: &[u8]) -> bool {
@@ -1075,6 +1088,46 @@ mod tests {
 
     /// `ClientHello.client_instance_id` is a proto3 `bytes` field with no non-empty requirement,
     /// so an omitted id must still receive transactions rather than lose the connection.
+    /// The stale registry caps entries, not identifier size. Marking far more clients than the cap
+    /// allows, each with a maximal identifier, must plateau in *bytes* — the quantity a count
+    /// assertion cannot see (§20.2, §26).
+    #[test]
+    fn test_stale_registry_retained_bytes_plateau_under_distinct_ids() {
+        use crate::session::MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let mut registry = StaleClientRegistry::default();
+        let budget = MAX_TRACKED_STALE_CLIENTS * MAX_CLIENT_INSTANCE_ID_BYTES;
+
+        let mut at_cap = None;
+        for nonce in 0..(MAX_TRACKED_STALE_CLIENTS as u64 * 4) {
+            let mut id = nonce.to_be_bytes().to_vec();
+            id.resize(MAX_CLIENT_INSTANCE_ID_BYTES, 0xAB);
+            registry.mark(id, 1);
+
+            let retained = registry.retained_key_bytes();
+            assert!(
+                retained <= budget,
+                "after {} marks: retained {retained} bytes exceeds the {budget} byte budget",
+                nonce + 1
+            );
+            if registry.len() == MAX_TRACKED_STALE_CLIENTS {
+                match at_cap {
+                    None => at_cap = Some(retained),
+                    Some(previous) => assert_eq!(
+                        previous, retained,
+                        "retained bytes must stop growing once the entry cap is reached"
+                    ),
+                }
+            }
+        }
+
+        assert_eq!(
+            at_cap,
+            Some(budget),
+            "the sequence must saturate the table, or the bound is untested"
+        );
+    }
+
     #[test]
     fn test_subscribe_accepts_empty_client_instance_id() {
         let hub = OutboundHub::new();

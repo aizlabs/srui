@@ -54,11 +54,17 @@ public final class AppKitRenderer {
         layoutRenderer.showWindows()
     }
 
-    /// Drops in-flight visible-range requests after reconnect or a failed send (§8, §22.7).
+    /// Drops in-flight visible-range requests after reconnect or a failed send, then
+    /// immediately re-requests each adapter's last known viewport (§8, §22.7).
     public func resetCollectionRangeTrackers() {
         for handle in registry.allHandles {
-            (handle.modelAdapter as? TableCollectionAdapter)?.resetRangeTracker()
-            (handle.modelAdapter as? OutlineCollectionAdapter)?.resetRangeTracker()
+            if let adapter = handle.modelAdapter as? TableCollectionAdapter {
+                adapter.resetRangeTracker()
+                adapter.reissueVisibleRangeRequests()
+            } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter {
+                adapter.resetRangeTracker()
+                adapter.reissueVisibleRangeRequests()
+            }
         }
     }
 

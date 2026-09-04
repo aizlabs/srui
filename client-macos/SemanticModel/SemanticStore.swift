@@ -1413,8 +1413,18 @@ public struct SemanticStore: Equatable, Sendable {
         }
 
         let endIndex = startIndex.addingReportingOverflow(UInt64(items.count)).partialValue
-        let removedInRange = model.iterCachedItems().filter { $0.0 >= startIndex && $0.0 < endIndex }.count
-        let projectedCached = model.cachedItemCount - removedInRange + items.count
+        func overlapCount(_ model: Model) -> Int {
+            model.iterCachedItems().filter { $0.0 >= startIndex && $0.0 < endIndex }.count
+        }
+        func projected(_ model: Model) -> Int {
+            model.cachedItemCount - overlapCount(model) + items.count
+        }
+        var projectedCached = projected(model)
+        if projectedCached > limitsValue.maxCachedItemsPerModel {
+            let need = projectedCached - limitsValue.maxCachedItemsPerModel
+            model.evictFarthestOutside(keepStart: startIndex, keepEnd: endIndex, count: need)
+            projectedCached = projected(model)
+        }
         if projectedCached > limitsValue.maxCachedItemsPerModel {
             throw StoreError.maxCachedItemsPerModelExceeded(
                 limit: limitsValue.maxCachedItemsPerModel,

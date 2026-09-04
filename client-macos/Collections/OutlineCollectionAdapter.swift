@@ -42,6 +42,8 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     private var isSuppressingSelectionEvents = false
     private weak var observedOutlineView: NSOutlineView?
     private weak var observedClipView: NSClipView?
+    private var lastVisibleStart: UInt64 = 0
+    private var lastVisibleCount: UInt64 = 0
 
     public var isModelBacked: Bool { model != nil }
 
@@ -110,6 +112,15 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
 
     public func resetRangeTracker() {
         rangeTracker.reset()
+    }
+
+    /// Re-emits cache-miss requests for the last known visible window (§8, §22.7).
+    public func reissueVisibleRangeRequests() {
+        if lastVisibleCount > 0 {
+            emitRequests(visibleStart: lastVisibleStart, visibleCount: lastVisibleCount)
+        } else {
+            emitVisibleRangeRequests()
+        }
     }
 
     public func noteVisibleRange(start: UInt64, count: UInt64) {
@@ -267,6 +278,8 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     }
 
     private func emitRequests(visibleStart: UInt64, visibleCount: UInt64) {
+        lastVisibleStart = visibleStart
+        lastVisibleCount = visibleCount
         guard let model, let modelID, let onRangeRequest else { return }
         if let window = CollectionRangeTracker.alignedWindow(
             visibleStart: visibleStart,

@@ -147,7 +147,7 @@ async fn invalid_requests_never_invoke_the_provider() {
         range_request(node_id, model_id, 0, 0, revision),
         range_request(node_id, model_id, 99, 2, revision),
         range_request(node_id, model_id, 0, 10_001, revision),
-        range_request(node_id, model_id, 0, 1, revision.saturating_sub(1)),
+        range_request(node_id, model_id, 0, 1, revision + 1),
         range_request(NodeId::new(99), model_id, 0, 1, revision),
         range_request(node_id, ModelId::new(99), 0, 1, revision),
         SruiMessage {
@@ -249,21 +249,21 @@ async fn duplicate_inflight_requests_are_coalesced() {
         .unwrap()
         .unwrap();
     assert!(
-        is_reset_range(&filled, 256),
-        "latest pending request must win, got {filled:?}"
+        is_reset_range(&filled, 128),
+        "nearby queued holes must merge, got {filled:?}"
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         starts.lock().expect("starts").as_slice(),
-        &[0, 256],
-        "the replaced 128-window must never reach the provider"
+        &[0, 128],
+        "in-flight 0 plus merged 128..264"
     );
     assert_eq!(session.current_revision(), revision + 1);
     assert!(
         timeout(Duration::from_millis(150), client.read.next())
             .await
             .is_err(),
-        "coalesced follow-up must commit exactly one revision"
+        "merged follow-up must commit exactly one revision"
     );
 }
 

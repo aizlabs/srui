@@ -415,6 +415,11 @@ struct CollectionAdaptersTests {
         adapter.noteVisibleRange(start: 0, count: 8)
         adapter.noteVisibleRange(start: 0, count: 8)
         #expect(requests.count == 1)
+
+        adapter.resetRangeTracker()
+        adapter.reissueVisibleRangeRequests()
+        #expect(requests.count == 2)
+        #expect(requests[1].startIndex == requests[0].startIndex)
     }
 
     @Test

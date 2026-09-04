@@ -42,6 +42,8 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     private var isSuppressingSelectionEvents = false
     private weak var observedTableView: NSTableView?
     private weak var observedClipView: NSClipView?
+    private var lastVisibleStart: UInt64 = 0
+    private var lastVisibleCount: UInt64 = 0
 
     public var isModelBacked: Bool { model != nil }
 
@@ -233,6 +235,15 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         rangeTracker.reset()
     }
 
+    /// Re-emits cache-miss requests for the last known visible window (§8, §22.7).
+    public func reissueVisibleRangeRequests() {
+        if lastVisibleCount > 0 {
+            emitRequests(visibleStart: lastVisibleStart, visibleCount: lastVisibleCount)
+        } else {
+            emitVisibleRangeRequests()
+        }
+    }
+
     public func update(rows: [TableRow], tableView: NSTableView) {
         model = nil
         modelID = nil
@@ -396,6 +407,8 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     }
 
     private func emitRequests(visibleStart: UInt64, visibleCount: UInt64) {
+        lastVisibleStart = visibleStart
+        lastVisibleCount = visibleCount
         guard let model, let modelID, let onRangeRequest else { return }
         let requests = rangeTracker.requests(
             visibleStart: visibleStart,

@@ -1,10 +1,13 @@
 //! Sparse collection range fulfillment (§8, §12.1, §22.7).
 //!
 //! Clients request missing model windows with `ClientModelRangeRequest` on the `.ui` lane.
-//! The request is idempotent and replaceable: it is not journaled, not replayed, and not an
-//! Event. Successful fulfillment is an authoritative `MODEL_RESET_RANGE` transaction, which
-//! is revisioned, journaled, broadcast, and replayable. Server-initiated hydration uses the
-//! same commit path via [`Session::push_visible_model_range`].
+//! The request is idempotent: it is not journaled, not replayed, and not an Event.
+//! Nearby pending windows for one model merge; a far jump replaces older pending
+//! windows. `observed_revision` in the future is refused; a behind revision is
+//! fulfilled against current store state. Successful fulfillment is an authoritative
+//! `MODEL_RESET_RANGE` transaction, which is revisioned, journaled, broadcast, and
+//! replayable. Server-initiated hydration uses the same commit path via
+//! [`Session::push_visible_model_range`].
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -87,7 +90,7 @@ pub enum ModelRangeError {
     },
     #[error("count {count} exceeds max_items_per_model_operation {limit}")]
     CountExceedsLimit { count: u64, limit: usize },
-    #[error("observed_revision {observed} does not match authoritative revision {actual}")]
+    #[error("observed_revision {observed} is ahead of authoritative revision {actual}")]
     StaleRevision { observed: u64, actual: u64 },
     #[error("provider returned {actual} items for requested count {expected}")]
     ProviderItemCountMismatch { expected: u64, actual: usize },
@@ -170,7 +173,7 @@ fn validate_request(
         });
     }
     let actual_revision = inner.store.revision().get();
-    if request.observed_revision != actual_revision {
+    if request.observed_revision > actual_revision {
         return Err(ModelRangeError::StaleRevision {
             observed: request.observed_revision,
             actual: actual_revision,
@@ -249,9 +252,6 @@ impl Session {
         items: Vec<ModelItem>,
     ) -> Result<ModelRangeFulfillment, ModelRangeError> {
         let mut guard = lock_or_recover(&self.inner);
-        if guard.store.revision().get() != query.observed_revision {
-            return Ok(ModelRangeFulfillment::Stale);
-        }
         match validate_request(
             &guard,
             &ClientModelRangeRequest {
@@ -263,7 +263,11 @@ impl Session {
             },
         ) {
             Ok(_) => {}
-            Err(ModelRangeError::StaleRevision { .. }) => {
+            Err(ModelRangeError::StaleRevision { .. })
+            | Err(ModelRangeError::OutOfBounds { .. })
+            | Err(ModelRangeError::NodeNotFound(_))
+            | Err(ModelRangeError::ModelNotFound(_))
+            | Err(ModelRangeError::ModelRefMismatch { .. }) => {
                 return Ok(ModelRangeFulfillment::Stale);
             }
             Err(error) => return Err(error),
@@ -306,8 +310,14 @@ fn commit_ops_locked(
 
 /// Per-connection coalescing inbox for [`ClientModelRangeRequest`].
 ///
-/// Latest request per `model_id` wins while queued. A single worker drains the inbox so
-/// scroll traffic cannot spawn unbounded tasks.
+/// Nearby or overlapping windows for one model merge into a single pending span so a
+/// fragmented viewport is not dropped. A far jump replaces older pending windows (scroll).
+/// A single worker drains the inbox so scroll traffic cannot spawn unbounded tasks.
+const MAX_PENDING_RANGES_PER_MODEL: usize = 8;
+/// Merge pending windows when the bounding span is at most two tracker pages.
+const COALESCE_SPAN: u64 = 256;
+const MAX_MERGED_COUNT: u64 = 10_000;
+
 #[derive(Clone)]
 pub struct ModelRangeRequestInbox {
     inner: Arc<Mutex<CoalescingState>>,
@@ -316,8 +326,72 @@ pub struct ModelRangeRequestInbox {
 
 struct CoalescingState {
     order: VecDeque<ModelId>,
-    latest: HashMap<ModelId, ClientModelRangeRequest>,
+    pending: HashMap<ModelId, Vec<ClientModelRangeRequest>>,
     closed: bool,
+}
+
+fn request_end(request: &ClientModelRangeRequest) -> Option<u64> {
+    request.start_index.checked_add(request.count)
+}
+
+fn bounding_range(
+    left: &ClientModelRangeRequest,
+    right: &ClientModelRangeRequest,
+) -> Option<ClientModelRangeRequest> {
+    let left_end = request_end(left)?;
+    let right_end = request_end(right)?;
+    let start = left.start_index.min(right.start_index);
+    let end = left_end.max(right_end);
+    let count = end.checked_sub(start)?;
+    if count == 0 || count > MAX_MERGED_COUNT {
+        return None;
+    }
+    Some(ClientModelRangeRequest {
+        node_id: right.node_id,
+        model_id: right.model_id,
+        start_index: start,
+        count,
+        observed_revision: left.observed_revision.max(right.observed_revision),
+    })
+}
+
+fn ranges_are_close(left: &ClientModelRangeRequest, right: &ClientModelRangeRequest) -> bool {
+    let Some(left_end) = request_end(left) else {
+        return false;
+    };
+    let Some(right_end) = request_end(right) else {
+        return false;
+    };
+    let start = left.start_index.min(right.start_index);
+    let end = left_end.max(right_end);
+    end.saturating_sub(start) <= COALESCE_SPAN
+}
+
+fn integrate_pending(list: &mut Vec<ClientModelRangeRequest>, incoming: ClientModelRangeRequest) {
+    let mut merged = incoming;
+    let mut absorbed = false;
+    list.retain(|existing| {
+        if existing.node_id != merged.node_id || existing.model_id != merged.model_id {
+            return true;
+        }
+        if ranges_are_close(existing, &merged) {
+            if let Some(bound) = bounding_range(existing, &merged) {
+                merged = bound;
+                absorbed = true;
+                return false;
+            }
+        }
+        true
+    });
+    if !absorbed && !list.is_empty() {
+        // Far jump: the new window replaces older pending holes for this model.
+        list.clear();
+    }
+    list.push(merged);
+    if list.len() > MAX_PENDING_RANGES_PER_MODEL {
+        let drop = list.len() - MAX_PENDING_RANGES_PER_MODEL;
+        list.drain(..drop);
+    }
 }
 
 impl ModelRangeRequestInbox {
@@ -326,21 +400,24 @@ impl ModelRangeRequestInbox {
         Self {
             inner: Arc::new(Mutex::new(CoalescingState {
                 order: VecDeque::new(),
-                latest: HashMap::new(),
+                pending: HashMap::new(),
                 closed: false,
             })),
             waker: Arc::new(AtomicWaker::new()),
         }
     }
 
-    /// Replaces any pending request for the same model. Never blocks the read loop.
+    /// Queues `request`, merging nearby windows and replacing far jumps. Never blocks the read loop.
     pub fn submit(&self, request: ClientModelRangeRequest) {
         let model_id = ModelId::new(request.model_id);
         let mut guard = lock_or_recover(&self.inner);
         if guard.closed {
             return;
         }
-        if guard.latest.insert(model_id, request).is_none() {
+        let list = guard.pending.entry(model_id).or_default();
+        let was_empty = list.is_empty();
+        integrate_pending(list, request);
+        if was_empty && !list.is_empty() {
             guard.order.push_back(model_id);
         }
         drop(guard);
@@ -355,7 +432,25 @@ impl ModelRangeRequestInbox {
     fn try_pop(&self) -> Option<ClientModelRangeRequest> {
         let mut guard = lock_or_recover(&self.inner);
         while let Some(model_id) = guard.order.pop_front() {
-            if let Some(request) = guard.latest.remove(&model_id) {
+            let remaining = {
+                let Some(list) = guard.pending.get_mut(&model_id) else {
+                    continue;
+                };
+                if list.is_empty() {
+                    guard.pending.remove(&model_id);
+                    continue;
+                }
+                let request = list.remove(0);
+                let remaining = list.len();
+                if remaining == 0 {
+                    guard.pending.remove(&model_id);
+                }
+                Some((request, remaining))
+            };
+            if let Some((request, remaining)) = remaining {
+                if remaining > 0 {
+                    guard.order.push_back(model_id);
+                }
                 return Some(request);
             }
         }
@@ -548,7 +643,7 @@ mod tests {
             },
             request(node_id, model_id, 99, 2, revision),
             request(node_id, model_id, 0, 10_001, revision),
-            request(node_id, model_id, 0, 1, revision.saturating_sub(1)),
+            request(node_id, model_id, 0, 1, revision + 1),
             request(NodeId::new(99), model_id, 0, 1, revision),
             request(node_id, ModelId::new(99), 0, 1, revision),
         ];
@@ -608,7 +703,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_provider_result_is_discarded() {
+    async fn behind_observed_revision_still_fulfills() {
+        let (session, node_id, model_id) = table_and_model(50);
+        let calls = Arc::new(AtomicUsize::new(0));
+        session.register_model_range_provider(model_id, counting_provider(Arc::clone(&calls)));
+        session
+            .transaction(|ui| {
+                ui.set(NodeId::new(1), srui_sdk::LABEL, "moved")?;
+                Ok(())
+            })
+            .unwrap();
+        let behind = session.current_revision().saturating_sub(1);
+        let outcome = session
+            .fulfill_model_range_request(request(node_id, model_id, 0, 4, behind))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ModelRangeFulfillment::Committed { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn intervening_scalar_commit_does_not_discard_provider_result() {
         let (session, node_id, model_id) = table_and_model(20);
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
@@ -656,10 +771,71 @@ mod tests {
             .unwrap();
         release_tx.send(()).unwrap();
         let outcome = fulfill.await.unwrap().unwrap();
+        assert!(matches!(outcome, ModelRangeFulfillment::Committed { .. }));
+        session.with_store(|store| {
+            let model = store.get_model(model_id).unwrap();
+            assert!(model.get_item_by_index(0).is_some());
+        });
+    }
+
+    #[tokio::test]
+    async fn intervening_bounds_change_discards_provider_result() {
+        let (session, node_id, model_id) = table_and_model(20);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let entered = Arc::new(AtomicUsize::new(0));
+        session.register_model_range_provider(
+            model_id,
+            Arc::new({
+                let entered = Arc::clone(&entered);
+                move |query: ModelRangeQuery| {
+                    let release_rx = Arc::clone(&release_rx);
+                    let entered = Arc::clone(&entered);
+                    Box::pin(async move {
+                        entered.fetch_add(1, Ordering::SeqCst);
+                        if let Some(rx) = release_rx.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                        Ok((0..query.count)
+                            .map(|offset| item_at(query.start_index + offset))
+                            .collect())
+                    })
+                }
+            }),
+        );
+        let revision = session.current_revision();
+        let fulfill = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session
+                    .fulfill_model_range_request(request(node_id, model_id, 10, 2, revision))
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider entered");
+        session
+            .transaction(|ui| {
+                ui.apply_op(&Operation::model_reset_range(
+                    model_id,
+                    0,
+                    vec![item_at(0)],
+                    Some(1),
+                ))?;
+                Ok(())
+            })
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let outcome = fulfill.await.unwrap().unwrap();
         assert_eq!(outcome, ModelRangeFulfillment::Stale);
         session.with_store(|store| {
             let model = store.get_model(model_id).unwrap();
-            assert!(model.get_item_by_index(0).is_none());
+            assert!(model.get_item_by_index(10).is_none());
         });
     }
 
@@ -680,13 +856,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inbox_replaces_duplicate_pending_requests_for_the_same_model() {
+    async fn inbox_merges_nearby_windows_and_replaces_far_jumps() {
         let inbox = ModelRangeRequestInbox::new();
         let model = ModelId::new(3);
         inbox.submit(request(NodeId::new(1), model, 0, 8, 1));
         inbox.submit(request(NodeId::new(1), model, 128, 8, 1));
-        let first = inbox.try_pop().expect("pending");
-        assert_eq!(first.start_index, 128);
+        let merged = inbox.try_pop().expect("pending");
+        assert_eq!(merged.start_index, 0);
+        assert_eq!(merged.count, 136);
+        assert!(inbox.try_pop().is_none());
+
+        inbox.submit(request(NodeId::new(1), model, 0, 8, 1));
+        inbox.submit(request(NodeId::new(1), model, 10_000, 8, 1));
+        let jumped = inbox.try_pop().expect("far jump");
+        assert_eq!(jumped.start_index, 10_000);
+        assert_eq!(jumped.count, 8);
         assert!(inbox.try_pop().is_none());
     }
 }

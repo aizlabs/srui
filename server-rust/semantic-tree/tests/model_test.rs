@@ -694,6 +694,49 @@ fn test_max_cached_items_per_model_enforced() {
 }
 
 #[test]
+fn test_model_reset_range_evicts_farthest_cached_items_to_stay_in_budget() {
+    let limits = StoreLimits::default().with_max_cached_items_per_model(3);
+    let mut store = SemanticStore::with_limits(limits);
+    let list_type = resolve_standard_node_type("List").unwrap();
+    let model_id = ModelId::new(1);
+    store.create_model(model_id, list_type, 10_000).unwrap();
+    store
+        .model_reset_range(
+            model_id,
+            0,
+            vec![
+                ModelItem::with_value(ItemId::new(1), "a"),
+                ModelItem::with_value(ItemId::new(2), "b"),
+                ModelItem::with_value(ItemId::new(3), "c"),
+            ],
+            None,
+        )
+        .unwrap();
+
+    store
+        .model_reset_range(
+            model_id,
+            100,
+            vec![
+                ModelItem::with_value(ItemId::new(10), "far-0"),
+                ModelItem::with_value(ItemId::new(11), "far-1"),
+            ],
+            None,
+        )
+        .unwrap();
+
+    let model = store.get_model(model_id).unwrap();
+    assert_eq!(model.cached_item_count(), 3);
+    assert!(model.get_item_by_index(100).is_some());
+    assert!(model.get_item_by_index(101).is_some());
+    // Midpoint of the keep window is 101; index 0 is farthest of {0,1,2} and is dropped first,
+    // then 1, leaving the closest previous row.
+    assert!(model.get_item_by_index(0).is_none());
+    assert!(model.get_item_by_index(1).is_none());
+    assert!(model.get_item_by_index(2).is_some());
+}
+
+#[test]
 fn test_model_delete_combined_identity_and_range_preserves_item_count() {
     let mut store = SemanticStore::new();
     let list_type = resolve_standard_node_type("List").unwrap();

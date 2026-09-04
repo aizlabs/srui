@@ -60,18 +60,21 @@ public struct CollectionRangeTracker: Equatable, Sendable {
         }
 
         let holes = subtract(covers: covered, from: [window])
-        pending.append(contentsOf: holes)
-
-        return holes.compactMap { hole in
-            let count = hole.upperBound - hole.lowerBound
-            guard count > 0 else { return nil }
-            return CollectionRangeRequest(
+        guard let first = holes.first, let last = holes.last else {
+            return []
+        }
+        let merged = first.lowerBound..<last.upperBound
+        pending.append(merged)
+        let count = merged.upperBound - merged.lowerBound
+        guard count > 0 else { return [] }
+        return [
+            CollectionRangeRequest(
                 nodeID: nodeID,
                 modelID: modelID,
-                startIndex: hole.lowerBound,
+                startIndex: merged.lowerBound,
                 count: count
             )
-        }
+        ]
     }
 
     public static func alignedWindow(

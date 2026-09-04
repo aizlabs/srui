@@ -125,4 +125,37 @@ struct CollectionRangeTrackerTests {
         #expect(afterReset.count == 1)
         #expect(afterReset[0].startIndex == afterScroll[0].startIndex)
     }
+
+    @Test
+    func fragmentedCachedHolesEmitOneBoundingRequest() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(4)
+        let nodeID = NodeId(5)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 500_000)
+        try store.modelResetRange(
+            id: modelID,
+            startIndex: 0,
+            items: (0..<32).map { ModelItem(itemID: ItemId($0 + 1), value: .string("a")) },
+            totalCount: 500_000
+        )
+        try store.modelResetRange(
+            id: modelID,
+            startIndex: 64,
+            items: (64..<96).map { ModelItem(itemID: ItemId($0 + 1), value: .string("b")) },
+            totalCount: 500_000
+        )
+        let model = try #require(store.getModel(modelID))
+        var tracker = CollectionRangeTracker()
+        let requests = tracker.requests(
+            visibleStart: 0,
+            visibleCount: 8,
+            itemCount: 500_000,
+            model: model,
+            nodeID: nodeID,
+            modelID: modelID
+        )
+        #expect(requests.count == 1)
+        #expect(requests[0].startIndex == 32)
+        #expect(requests[0].count == 96)
+    }
 }

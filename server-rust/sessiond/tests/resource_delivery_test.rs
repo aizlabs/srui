@@ -47,7 +47,7 @@ async fn connect_client(
 
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(srui_protocol::ClientHello {
-            core_version: "0.4.0".into(),
+            core_version: "0.5.0".into(),
             profiles: vec!["org.srui.standard-widgets/1".into()],
             limits: None,
             client_instance_id: vec![1, 2, 3],
@@ -225,7 +225,7 @@ async fn oversized_for_client_ceiling_is_not_transferred() {
     // Advertise a ceiling below the published PNG so the server must skip transfer (§15, §26).
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(srui_protocol::ClientHello {
-            core_version: "0.4.0".into(),
+            core_version: "0.5.0".into(),
             profiles: vec!["org.srui.standard-widgets/1".into()],
             limits: Some(srui_protocol::ClientLimits {
                 max_frame_size: 0,

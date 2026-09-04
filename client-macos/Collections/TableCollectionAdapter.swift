@@ -1,55 +1,13 @@
+//
+// TableCollectionAdapter.swift
+// Collections
+//
+// NSTableView data source for List (one column) and Table (multi-column). Model-backed
+// collections report logical `itemCount` and resolve rows with `getItemByIndex` (§8, §22.7).
+//
+
 import AppKit
 import SemanticModel
-
-/// How a collection adapter applied the last row mutation. Exposed for tests.
-enum TableRowUpdate: Equatable {
-    case none
-    case fullReload
-    case contentReload(IndexSet)
-}
-
-/// Shared scrolling chrome for list/table/tree when they sit inside an ancestor `.scroll` node.
-@MainActor
-enum CollectionScrollEmbedding {
-    static func apply(
-        nested: Bool,
-        scrollView: NSScrollView,
-        minHeightConstraint: NSLayoutConstraint?,
-        fitHeightConstraint: inout NSLayoutConstraint?,
-        contentHeight: CGFloat
-    ) {
-        scrollView.hasVerticalScroller = !nested
-        scrollView.hasHorizontalScroller = false
-        scrollView.verticalScrollElasticity = nested ? .none : .automatic
-        scrollView.horizontalScrollElasticity = .none
-        scrollView.borderType = nested ? .noBorder : .bezelBorder
-
-        if nested {
-            minHeightConstraint?.isActive = false
-            let height = max(contentHeight, 1)
-            if let existing = fitHeightConstraint {
-                existing.constant = height
-                existing.isActive = true
-            } else {
-                let constraint = scrollView.heightAnchor.constraint(equalToConstant: height)
-                constraint.priority = .defaultHigh
-                constraint.isActive = true
-                fitHeightConstraint = constraint
-            }
-        } else {
-            fitHeightConstraint?.isActive = false
-            minHeightConstraint?.isActive = true
-        }
-    }
-
-    static func tableContentHeight(_ tableView: NSTableView) -> CGFloat {
-        let headerHeight = tableView.headerView?.frame.height ?? 0
-        let rowHeight = tableView.rowHeight > 0 ? tableView.rowHeight : 17
-        let spacing = tableView.intercellSpacing.height
-        let rowCount = max(tableView.numberOfRows, 1)
-        return headerHeight + CGFloat(rowCount) * (rowHeight + spacing)
-    }
-}
 
 @MainActor
 public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTableViewDelegate {
@@ -67,30 +25,61 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     public static let rowIdentifier = NSUserInterfaceItemIdentifier("srui.row")
 
     public let nodeID: NodeId
-    public private(set) var rows: [TableRow]
+    private var inlineRows: [TableRow]
+    public private(set) var model: Model?
+    public private(set) var modelID: ModelId?
     public var hasExplicitColumns: Bool = false
     public var selectionMode: StandardSelectionMode = .none
-    public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
+    public var onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)?
+    public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
 
     var minHeightConstraint: NSLayoutConstraint?
     var fitHeightConstraint: NSLayoutConstraint?
     private(set) var isNestedInScroll = false
     private(set) var lastRowUpdate: TableRowUpdate = .none
+    private(set) var rangeTracker = CollectionRangeTracker()
 
     private var isSuppressingSelectionEvents = false
+    private weak var observedTableView: NSTableView?
+    private weak var observedClipView: NSClipView?
+
+    public var isModelBacked: Bool { model != nil }
+
+    /// Inline rows, or cached model rows in index order. Does not densify uncached holes.
+    public var materialisedRows: [TableRow] {
+        if let model {
+            return model.iterCachedItems().map { _, item in
+                TableRow(itemID: item.itemID, cells: CollectionCells.cells(from: item.value))
+            }
+        }
+        return inlineRows
+    }
+
+    /// Cached or inline rows only — never a dense `0..<itemCount` array (§8).
+    public var rows: [TableRow] { materialisedRows }
 
     public init(
         nodeID: NodeId,
         rows: [TableRow] = [],
+        model: Model? = nil,
+        modelID: ModelId? = nil,
         hasExplicitColumns: Bool = false,
         selectionMode: StandardSelectionMode = .none,
-        onInteraction: (@MainActor (SemanticInteraction) -> Void)? = nil
+        onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)? = nil,
+        onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)? = nil
     ) {
         self.nodeID = nodeID
-        self.rows = rows
+        self.inlineRows = rows
+        self.model = model
+        self.modelID = modelID ?? model?.id
         self.hasExplicitColumns = hasExplicitColumns
         self.selectionMode = selectionMode
-        self.onInteraction = onInteraction
+        self.onSelectionChanged = onSelectionChanged
+        self.onRangeRequest = onRangeRequest
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     public static func columnIdentifier(for title: String, occurrence: Int = 1) -> NSUserInterfaceItemIdentifier {
@@ -206,47 +195,109 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         isNestedInScroll = nested
         CollectionScrollEmbedding.apply(
             nested: nested,
+            modelBacked: isModelBacked,
             scrollView: scrollView,
             minHeightConstraint: minHeightConstraint,
             fitHeightConstraint: &fitHeightConstraint,
             contentHeight: CollectionScrollEmbedding.tableContentHeight(tableView)
         )
+        attachViewportObservation(scrollView: scrollView, tableView: tableView)
+    }
+
+    public func attachViewportObservation(scrollView: NSScrollView, tableView: NSTableView) {
+        observedTableView = tableView
+        let clipView = scrollView.contentView
+        clipView.postsBoundsChangedNotifications = true
+        if let previous = observedClipView {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSView.boundsDidChangeNotification,
+                object: previous
+            )
+        }
+        observedClipView = clipView
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(clipViewBoundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: clipView
+        )
+        emitVisibleRangeRequests(from: tableView)
+    }
+
+    @objc private func clipViewBoundsDidChange(_ notification: Notification) {
+        emitVisibleRangeRequests()
+    }
+
+    public func resetRangeTracker() {
+        rangeTracker.reset()
     }
 
     public func update(rows: [TableRow], tableView: NSTableView) {
-        let selectedRowIndexes = tableView.selectedRowIndexes
-        let selectedItemIDs: [ItemId] = selectedRowIndexes.compactMap { idx in
-            guard idx >= 0 && idx < self.rows.count else { return nil }
-            return self.rows[idx].itemID
-        }
+        model = nil
+        modelID = nil
+        rangeTracker.reset()
+        let selectedItemIDs = selectedItemIDs(in: tableView)
 
         isSuppressingSelectionEvents = true
         defer { isSuppressingSelectionEvents = false }
 
-        let oldRows = self.rows
-        self.rows = rows
+        let oldRows = self.inlineRows
+        self.inlineRows = rows
         applyRowUpdate(from: oldRows, to: rows, tableView: tableView)
-
-        if !selectedItemIDs.isEmpty {
-            var newIndices = IndexSet()
-            for id in selectedItemIDs {
-                if let newIdx = self.rows.firstIndex(where: { $0.itemID == id }) {
-                    newIndices.insert(newIdx)
-                }
-            }
-            tableView.selectRowIndexes(newIndices, byExtendingSelection: false)
-        } else {
-            tableView.deselectAll(nil)
-        }
-
+        restoreSelection(selectedItemIDs, in: tableView)
         refreshRowAccessibility(in: tableView)
-        if isNestedInScroll, let scrollView = tableView.enclosingScrollView {
-            setNestedInScroll(true, scrollView: scrollView, tableView: tableView)
+        refreshNestedChrome(tableView: tableView)
+    }
+
+    public func update(model: Model?, modelID: ModelId?, tableView: NSTableView) {
+        let selectedItemIDs = selectedItemIDs(in: tableView)
+        let previousID = self.modelID
+        let previousCount = self.model?.itemCount
+
+        isSuppressingSelectionEvents = true
+        defer { isSuppressingSelectionEvents = false }
+
+        if let model {
+            for range in model.cachedRanges() {
+                rangeTracker.noteArrived(start: range.start, count: range.length)
+            }
         }
+
+        let replaced = previousID != (modelID ?? model?.id) || (model == nil && self.model != nil)
+        if replaced {
+            rangeTracker.reset()
+        }
+
+        self.model = model
+        self.modelID = modelID ?? model?.id
+        self.inlineRows = []
+
+        let countChanged = previousCount != model?.itemCount
+        if countChanged || replaced {
+            tableView.reloadData()
+            lastRowUpdate = .fullReload
+        } else {
+            reloadVisibleRows(in: tableView)
+            lastRowUpdate = .contentReload(IndexSet(integersIn: tableView.rows(in: tableView.visibleRect)))
+        }
+
+        restoreSelection(selectedItemIDs, in: tableView)
+        refreshRowAccessibility(in: tableView)
+        refreshNestedChrome(tableView: tableView)
+        emitVisibleRangeRequests(from: tableView)
+    }
+
+    /// Test helper: treat `start..<start+count` as the visible window without a live clip view.
+    public func noteVisibleRange(start: UInt64, count: UInt64) {
+        emitRequests(visibleStart: start, visibleCount: count)
     }
 
     public func numberOfRows(in tableView: NSTableView) -> Int {
-        rows.count
+        if let model {
+            return CollectionCells.clampedRowCount(model.itemCount)
+        }
+        return inlineRows.count
     }
 
     public func tableView(
@@ -254,8 +305,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         viewFor tableColumn: NSTableColumn?,
         row: Int
     ) -> NSView? {
-        guard row >= 0 && row < rows.count else { return nil }
-        let tableRow = rows[row]
+        guard let tableRow = rowContent(at: row) else { return nil }
         let columnIndex: Int
         if let tableColumn, let idx = tableView.tableColumns.firstIndex(of: tableColumn) {
             columnIndex = idx
@@ -291,7 +341,8 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     }
 
     public func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        selectionMode != .none
+        guard selectionMode != .none else { return false }
+        return itemID(at: row) != nil
     }
 
     public func tableViewSelectionDidChange(_ notification: Notification) {
@@ -300,21 +351,89 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         guard let tableView = notification.object as? NSTableView else { return }
         refreshRowAccessibility(in: tableView)
 
-        let selectedIDs: [ItemId] = tableView.selectedRowIndexes.compactMap { index in
-            guard index >= 0 && index < rows.count else { return nil }
-            return rows[index].itemID
-        }
+        let selectedIDs: [ItemId] = tableView.selectedRowIndexes.compactMap { itemID(at: $0) }
         guard selectedIDs.isEmpty == false else { return }
 
         if selectionMode == .single {
             guard selectedIDs.count == 1, let itemID = selectedIDs.first else { return }
-            onInteraction?(.selectionChanged(nodeID: nodeID, itemID: itemID))
+            onSelectionChanged?(nodeID, itemID)
             return
         }
 
         for itemID in selectedIDs {
-            onInteraction?(.selectionChanged(nodeID: nodeID, itemID: itemID))
+            onSelectionChanged?(nodeID, itemID)
         }
+    }
+
+    public func rowContent(at row: Int) -> TableRow? {
+        if let model {
+            guard row >= 0 else { return nil }
+            let index = UInt64(row)
+            guard index < model.itemCount else { return nil }
+            if let item = model.getItemByIndex(index) {
+                return TableRow(itemID: item.itemID, cells: CollectionCells.cells(from: item.value))
+            }
+            let columns = max(1, observedTableView?.tableColumns.count ?? 1)
+            return TableRow(
+                itemID: nil,
+                cells: Array(repeating: CollectionCells.loadingPlaceholder, count: columns)
+            )
+        }
+        guard row >= 0 && row < inlineRows.count else { return nil }
+        return inlineRows[row]
+    }
+
+    public func itemID(at row: Int) -> ItemId? {
+        rowContent(at: row)?.itemID
+    }
+
+    private func emitVisibleRangeRequests(from tableView: NSTableView? = nil) {
+        let tableView = tableView ?? observedTableView
+        guard let tableView else { return }
+        let rows = tableView.rows(in: tableView.visibleRect)
+        guard rows.length > 0 else { return }
+        emitRequests(visibleStart: UInt64(rows.location), visibleCount: UInt64(rows.length))
+    }
+
+    private func emitRequests(visibleStart: UInt64, visibleCount: UInt64) {
+        guard let model, let modelID, let onRangeRequest else { return }
+        let requests = rangeTracker.requests(
+            visibleStart: visibleStart,
+            visibleCount: visibleCount,
+            itemCount: model.itemCount,
+            model: model,
+            nodeID: nodeID,
+            modelID: modelID
+        )
+        for request in requests {
+            onRangeRequest(request)
+        }
+    }
+
+    private func selectedItemIDs(in tableView: NSTableView) -> [ItemId] {
+        tableView.selectedRowIndexes.compactMap { itemID(at: $0) }
+    }
+
+    private func restoreSelection(_ selectedItemIDs: [ItemId], in tableView: NSTableView) {
+        if selectedItemIDs.isEmpty {
+            tableView.deselectAll(nil)
+            return
+        }
+        var newIndices = IndexSet()
+        if let model {
+            for (index, item) in model.iterCachedItems() {
+                if selectedItemIDs.contains(item.itemID), index <= UInt64(Int.max) {
+                    newIndices.insert(Int(index))
+                }
+            }
+        } else {
+            for row in 0..<inlineRows.count {
+                if let id = inlineRows[row].itemID, selectedItemIDs.contains(id) {
+                    newIndices.insert(row)
+                }
+            }
+        }
+        tableView.selectRowIndexes(newIndices, byExtendingSelection: false)
     }
 
     private func applyRowUpdate(from oldRows: [TableRow], to newRows: [TableRow], tableView: NSTableView) {
@@ -334,6 +453,27 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         lastRowUpdate = .fullReload
     }
 
+    private func reloadVisibleRows(in tableView: NSTableView) {
+        let visible = tableView.rows(in: tableView.visibleRect)
+        let columnIndexes = IndexSet(integersIn: 0..<tableView.numberOfColumns)
+        if visible.location != NSNotFound, visible.length > 0, !columnIndexes.isEmpty {
+            let start = visible.location
+            let end = start + visible.length
+            tableView.reloadData(
+                forRowIndexes: IndexSet(integersIn: start..<end),
+                columnIndexes: columnIndexes
+            )
+        } else {
+            tableView.reloadData()
+        }
+    }
+
+    private func refreshNestedChrome(tableView: NSTableView) {
+        if isNestedInScroll, let scrollView = tableView.enclosingScrollView {
+            setNestedInScroll(true, scrollView: scrollView, tableView: tableView)
+        }
+    }
+
     private func refreshRowAccessibility(in tableView: NSTableView) {
         let selected = tableView.selectedRowIndexes
         tableView.enumerateAvailableRowViews { rowView, row in
@@ -342,100 +482,10 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     }
 
     private func applyAccessibility(to rowView: NSTableRowView, row: Int, selected: Bool) {
-        guard row >= 0 && row < rows.count else { return }
-        let label = rows[row].cells.filter { $0.isEmpty == false }.joined(separator: ", ")
+        guard let tableRow = rowContent(at: row) else { return }
+        let label = tableRow.cells.filter { $0.isEmpty == false }.joined(separator: ", ")
         rowView.setAccessibilityRole(.row)
         rowView.setAccessibilityLabel(label.isEmpty ? nil : label)
         rowView.setAccessibilitySelected(selected)
-    }
-}
-
-@MainActor
-public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
-    public static let cellIdentifier = NSUserInterfaceItemIdentifier("srui.outline.cell")
-
-    public final class Item: NSObject {
-        public var title: String
-
-        public init(title: String) {
-            self.title = title
-        }
-    }
-
-    public private(set) var items: [Item]
-    var minHeightConstraint: NSLayoutConstraint?
-    var fitHeightConstraint: NSLayoutConstraint?
-    private(set) var isNestedInScroll = false
-
-    public init(rows: [String]) {
-        self.items = rows.map(Item.init(title:))
-    }
-
-    public func update(rows: [String], outlineView: NSOutlineView) {
-        items = reusedItems(matching: rows)
-        outlineView.reloadData()
-        if isNestedInScroll, let scrollView = outlineView.enclosingScrollView {
-            setNestedInScroll(true, scrollView: scrollView, outlineView: outlineView)
-        }
-    }
-
-    func setNestedInScroll(_ nested: Bool, scrollView: NSScrollView, outlineView: NSOutlineView) {
-        isNestedInScroll = nested
-        CollectionScrollEmbedding.apply(
-            nested: nested,
-            scrollView: scrollView,
-            minHeightConstraint: minHeightConstraint,
-            fitHeightConstraint: &fitHeightConstraint,
-            contentHeight: CollectionScrollEmbedding.tableContentHeight(outlineView)
-        )
-    }
-
-    public func outlineView(
-        _ outlineView: NSOutlineView,
-        numberOfChildrenOfItem item: Any?
-    ) -> Int {
-        item == nil ? items.count : 0
-    }
-
-    public func outlineView(
-        _ outlineView: NSOutlineView,
-        child index: Int,
-        ofItem item: Any?
-    ) -> Any {
-        items[index]
-    }
-
-    public func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
-        false
-    }
-
-    public func outlineView(
-        _ outlineView: NSOutlineView,
-        viewFor tableColumn: NSTableColumn?,
-        item: Any
-    ) -> NSView? {
-        guard let item = item as? Item else { return nil }
-        let field: NSTextField
-        if let reused = outlineView.makeView(withIdentifier: Self.cellIdentifier, owner: self) as? NSTextField {
-            field = reused
-        } else {
-            field = NSTextField(labelWithString: "")
-            field.identifier = Self.cellIdentifier
-            field.lineBreakMode = .byTruncatingTail
-            field.maximumNumberOfLines = 1
-        }
-        field.stringValue = item.title
-        field.setAccessibilityElement(false)
-        return field
-    }
-
-    private func reusedItems(matching titles: [String]) -> [Item] {
-        var unused = items
-        return titles.map { title in
-            if let index = unused.firstIndex(where: { $0.title == title }) {
-                return unused.remove(at: index)
-            }
-            return Item(title: title)
-        }
     }
 }

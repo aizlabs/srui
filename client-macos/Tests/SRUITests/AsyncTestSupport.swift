@@ -1,5 +1,6 @@
 import Foundation
 import Protocol
+import Session
 
 struct AsyncTestTimeout: Error, CustomStringConvertible {
     let description: String
@@ -31,7 +32,7 @@ enum HandshakeFixtures {
         optionalProfiles: [String] = []
     ) -> SRUIMessage {
         var welcome = SRUIServerWelcome()
-        welcome.coreVersion = "0.4.0"
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = sessionId
         welcome.requiredProfiles = requiredProfiles
         welcome.optionalProfiles = optionalProfiles

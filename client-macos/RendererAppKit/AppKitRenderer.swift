@@ -1,6 +1,7 @@
 import AppKit
 import SemanticModel
 import Resources
+@_exported import Collections
 
 /// Public main-actor entry point for mounting committed semantic state and applying render deltas.
 @MainActor
@@ -15,6 +16,11 @@ public final class AppKitRenderer {
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)? {
         get { controlFactory.onInteraction }
         set { controlFactory.onInteraction = newValue }
+    }
+
+    public var onCollectionRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)? {
+        get { controlFactory.onCollectionRangeRequest }
+        set { controlFactory.onCollectionRangeRequest = newValue }
     }
 
     public init() {
@@ -46,6 +52,14 @@ public final class AppKitRenderer {
 
     public func showWindows() {
         layoutRenderer.showWindows()
+    }
+
+    /// Drops in-flight visible-range requests after reconnect or a failed send (§8, §22.7).
+    public func resetCollectionRangeTrackers() {
+        for handle in registry.allHandles {
+            (handle.modelAdapter as? TableCollectionAdapter)?.resetRangeTracker()
+            (handle.modelAdapter as? OutlineCollectionAdapter)?.resetRangeTracker()
+        }
     }
 
     /// Looks up a previously committed resource image on the main actor (§14).

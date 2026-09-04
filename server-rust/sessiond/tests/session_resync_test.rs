@@ -363,7 +363,7 @@ async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
     assert!(seeded_revision > 0);
 
     let hello = ClientHello {
-        core_version: "0.4.0".to_string(),
+        core_version: "0.5.0".to_string(),
         profiles: vec!["org.srui.standard-widgets/1".to_string()],
         limits: None,
         client_instance_id: vec![1, 2, 3],
@@ -435,7 +435,7 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
     assert_eq!(session.current_revision(), 0);
 
     let hello = ClientHello {
-        core_version: "0.4.0".to_string(),
+        core_version: "0.5.0".to_string(),
         profiles: vec!["org.srui.standard-widgets/1".to_string()],
         limits: None,
         client_instance_id: vec![4, 5, 6],

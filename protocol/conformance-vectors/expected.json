@@ -162,6 +162,20 @@
         "reject_reason": "",
         "session_id": "s-91c"
       }
+    },
+    "golden_client_model_range_request": {
+      "file": "golden_client_model_range_request.bin",
+      "sha256": "109f2b3d87bbc0c7c485c5542fdf99fd5ac6b29912e8997bca1d53330a676dac",
+      "hex": "0d5a0b0807100b18800120402805",
+      "byte_length": 14,
+      "expected": {
+        "msg_type": "client_model_range_request",
+        "node_id": 7,
+        "model_id": 11,
+        "start_index": 128,
+        "count": 64,
+        "observed_revision": 5
+      }
     }
   },
   "malformed_vectors": {

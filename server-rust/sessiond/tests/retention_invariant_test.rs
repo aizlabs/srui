@@ -55,7 +55,7 @@ fn hostile_id(nonce: u64) -> Vec<u8> {
 
 fn hello(client_instance_id: Vec<u8>) -> ClientHello {
     ClientHello {
-        core_version: "0.4.0".to_string(),
+        core_version: "0.5.0".to_string(),
         profiles: vec!["org.srui.standard-widgets/1".to_string()],
         limits: None,
         client_instance_id,

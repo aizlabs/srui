@@ -495,6 +495,21 @@ fn create_authored_event_ack() -> SruiMessage {
     }
 }
 
+/// Authors the golden `ClientModelRangeRequest` envelope from scratch (§8, §22.7).
+fn create_authored_client_model_range_request() -> SruiMessage {
+    SruiMessage {
+        msg: Some(srui_message::Msg::ClientModelRangeRequest(
+            ClientModelRangeRequest {
+                node_id: 7,
+                model_id: 11,
+                start_index: 128,
+                count: 64,
+                observed_revision: 5,
+            },
+        )),
+    }
+}
+
 #[test]
 fn test_decode_golden_event_ack_against_expected_json() {
     let (vectors_dir, spec) = load_expected_spec();
@@ -566,6 +581,68 @@ fn test_direct_encode_golden_event_ack_matches_wire_bytes() {
     let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
 
     let encoded = encode_framed(&create_authored_event_ack()).expect("encode framed");
+
+    assert_eq!(to_hex(&encoded), expected_hex);
+    assert_eq!(encoded, fixture_bytes);
+}
+
+#[test]
+fn test_decode_golden_client_model_range_request_against_expected_json() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let range_spec = &spec["vectors"]["golden_client_model_range_request"];
+
+    let filename = range_spec["file"].as_str().expect("file name");
+    let expected_hex = range_spec["hex"].as_str().expect("hex");
+    let expected_byte_len = range_spec["byte_length"].as_u64().expect("byte_length") as usize;
+    let expected = &range_spec["expected"];
+
+    let fixture_path = vectors_dir.join(filename);
+    let bytes = fs::read(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to read fixture from {:?}: {}", fixture_path, e));
+
+    assert_eq!(
+        bytes.len(),
+        expected_byte_len,
+        "Fixture byte length mismatch"
+    );
+    assert_eq!(to_hex(&bytes), expected_hex, "Fixture hex mismatch");
+
+    let decoded: SruiMessage =
+        decode_framed(&bytes[..]).expect("Decode framed ClientModelRangeRequest");
+    match decoded.msg {
+        Some(srui_message::Msg::ClientModelRangeRequest(ref request)) => {
+            assert_eq!(request.node_id, expected["node_id"].as_u64().unwrap());
+            assert_eq!(request.model_id, expected["model_id"].as_u64().unwrap());
+            assert_eq!(
+                request.start_index,
+                expected["start_index"].as_u64().unwrap()
+            );
+            assert_eq!(request.count, expected["count"].as_u64().unwrap());
+            assert_eq!(
+                request.observed_revision,
+                expected["observed_revision"].as_u64().unwrap()
+            );
+        }
+        other => panic!(
+            "Expected ClientModelRangeRequest in framed message, got {:?}",
+            other
+        ),
+    }
+
+    let roundtrip = encode_framed(&decoded).expect("re-encode framed");
+    assert_eq!(roundtrip, bytes, "Roundtrip re-encode framed mismatch");
+}
+
+#[test]
+fn test_direct_encode_golden_client_model_range_request_matches_wire_bytes() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let range_spec = &spec["vectors"]["golden_client_model_range_request"];
+    let filename = range_spec["file"].as_str().unwrap();
+    let expected_hex = range_spec["hex"].as_str().unwrap();
+    let fixture_bytes = fs::read(vectors_dir.join(filename)).unwrap();
+
+    let encoded =
+        encode_framed(&create_authored_client_model_range_request()).expect("encode framed");
 
     assert_eq!(to_hex(&encoded), expected_hex);
     assert_eq!(encoded, fixture_bytes);

@@ -52,7 +52,7 @@ async fn connect_client(
 
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: client_instance_id.to_vec(),

@@ -294,6 +294,7 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
     vectors = spec["vectors"]
     assert "golden_node_record" in vectors
     assert "golden_transaction" in vectors
+    assert "golden_client_model_range_request" in vectors
 
     for key, vector in vectors.items():
         filename = vector["file"]

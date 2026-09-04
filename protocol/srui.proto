@@ -606,6 +606,22 @@ message ResourceChunk {
 }
 
 // -----------------------------------------------------------------------------
+// Collection range request (§8, §22.7)
+// -----------------------------------------------------------------------------
+
+// Client → server request for a missing cached window of a sparse collection
+// model. Idempotent and replaceable: not journaled, not replayed, and not an
+// Event. The server answers with an authoritative Transaction containing
+// MODEL_RESET_RANGE (§12.1). Viewport geometry remains EVENT_VIEWPORT_CHANGED.
+message ClientModelRangeRequest {
+  uint64 node_id = 1;
+  uint64 model_id = 2;
+  uint64 start_index = 3;
+  uint64 count = 4;
+  uint64 observed_revision = 5;
+}
+
+// -----------------------------------------------------------------------------
 // Top-Level Message Envelope
 // -----------------------------------------------------------------------------
 
@@ -621,5 +637,6 @@ message SruiMessage {
     ServerEventAck server_event_ack = 8;
     ResourceMetadata resource_metadata = 9;
     ResourceChunk resource_chunk = 10;
+    ClientModelRangeRequest client_model_range_request = 11;
   }
 }

@@ -193,4 +193,27 @@ fn main() {
         "Wrote malformed_truncated_frame.bin ({} bytes)",
         truncated_frame_bytes.len()
     );
+
+    // 7. Construct golden framed ClientModelRangeRequest (§8, §22.7)
+    let range_request = SruiMessage {
+        msg: Some(srui_message::Msg::ClientModelRangeRequest(
+            ClientModelRangeRequest {
+                node_id: 7,
+                model_id: 11,
+                start_index: 128,
+                count: 64,
+                observed_revision: 5,
+            },
+        )),
+    };
+    let range_bytes = encode_framed(&range_request).expect("encode framed ClientModelRangeRequest");
+    fs::write(
+        out_dir.join("golden_client_model_range_request.bin"),
+        &range_bytes,
+    )
+    .expect("write golden_client_model_range_request.bin");
+    println!(
+        "Wrote golden_client_model_range_request.bin ({} bytes)",
+        range_bytes.len()
+    );
 }

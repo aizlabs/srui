@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+@testable import Collections
 
 @MainActor
 struct CollectionAdaptersTests {
@@ -92,7 +93,7 @@ struct CollectionAdaptersTests {
 
     @Test
     func tableAdapterSelectionModesBehavior() throws {
-        var interactions: [SemanticInteraction] = []
+        var selections: [(NodeId, ItemId)] = []
         let adapter = TableCollectionAdapter(
             nodeID: 30,
             rows: [
@@ -101,7 +102,7 @@ struct CollectionAdaptersTests {
                 TableCollectionAdapter.TableRow(itemID: nil, cells: ["Inline Item (No ID)"]),
             ],
             selectionMode: .none,
-            onInteraction: { interactions.append($0) }
+            onSelectionChanged: { nodeID, itemID in selections.append((nodeID, itemID)) }
         )
 
         let tableView = NSTableView()
@@ -112,40 +113,37 @@ struct CollectionAdaptersTests {
         #expect(adapter.tableView(tableView, shouldSelectRow: 0) == false)
         #expect(adapter.tableView(tableView, shouldSelectRow: 1) == false)
         adapter.tableViewSelectionDidChange(Notification(name: NSTableView.selectionDidChangeNotification, object: tableView))
-        #expect(interactions.isEmpty)
+        #expect(selections.isEmpty)
 
         // 2. Single selection mode
         adapter.selectionMode = .single
         #expect(adapter.tableView(tableView, shouldSelectRow: 0) == true)
 
         tableView.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
-        #expect(interactions == [.selectionChanged(nodeID: 30, itemID: ItemId(100))])
-        interactions.removeAll()
+        #expect(selections.map(\.1) == [ItemId(100)])
+        selections.removeAll()
 
         tableView.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
-        #expect(interactions == [.selectionChanged(nodeID: 30, itemID: ItemId(200))])
-        interactions.removeAll()
+        #expect(selections.map(\.1) == [ItemId(200)])
+        selections.removeAll()
 
         // Selecting row with nil itemID (inline item) emits no interaction
         tableView.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
-        #expect(interactions.isEmpty)
+        #expect(selections.isEmpty)
 
         // Deselection (no row selected) emits no interaction
         tableView.deselectAll(nil)
-        #expect(interactions.isEmpty)
+        #expect(selections.isEmpty)
 
         // 3. Multiple selection mode emits one event per selected item ID
         adapter.selectionMode = .multiple
         tableView.selectRowIndexes(IndexSet([0, 1]), byExtendingSelection: false)
-        #expect(interactions == [
-            .selectionChanged(nodeID: 30, itemID: ItemId(100)),
-            .selectionChanged(nodeID: 30, itemID: ItemId(200)),
-        ])
+        #expect(selections.map(\.1) == [ItemId(100), ItemId(200)])
     }
 
     @Test
     func tableAdapterPreservesSelectionAcrossComplexUpdates() throws {
-        var interactions: [SemanticInteraction] = []
+        var selections: [(NodeId, ItemId)] = []
         let adapter = TableCollectionAdapter(
             nodeID: 40,
             rows: [
@@ -155,7 +153,7 @@ struct CollectionAdaptersTests {
                 TableCollectionAdapter.TableRow(itemID: ItemId(4), cells: ["Row 4"]),
             ],
             selectionMode: .single,
-            onInteraction: { interactions.append($0) }
+            onSelectionChanged: { nodeID, itemID in selections.append((nodeID, itemID)) }
         )
 
         let tableView = NSTableView()
@@ -165,8 +163,8 @@ struct CollectionAdaptersTests {
         // Select row index 2 (ItemId 3)
         tableView.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
         #expect(tableView.selectedRow == 2)
-        #expect(interactions == [.selectionChanged(nodeID: 40, itemID: ItemId(3))])
-        interactions.removeAll()
+        #expect(selections.map(\.1) == [ItemId(3)])
+        selections.removeAll()
 
         // Update rows: ItemId 3 moved to index 0, ItemId 2 deleted, ItemId 5 inserted
         let updatedRows = [
@@ -180,7 +178,7 @@ struct CollectionAdaptersTests {
         // Selection should follow ItemId 3 to index 0
         #expect(tableView.selectedRow == 0)
         // No spurious interaction event fired during reload / selection restore
-        #expect(interactions.isEmpty)
+        #expect(selections.isEmpty)
 
         // Update rows where the selected item (ItemId 3) is removed
         let withoutItem3 = [
@@ -192,7 +190,7 @@ struct CollectionAdaptersTests {
 
         // Selection should be empty
         #expect(tableView.selectedRow == -1)
-        #expect(interactions.isEmpty)
+        #expect(selections.isEmpty)
     }
 
     @Test
@@ -319,4 +317,167 @@ struct CollectionAdaptersTests {
         #expect(adapter.items[2] !== first)
         #expect(adapter.items[2] !== second)
     }
+
+    @Test
+    func sparseModelReportsLogicalRowCountWithoutDensifyingCache() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(70)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 500_000)
+        try store.modelResetRange(
+            id: modelID,
+            startIndex: 0,
+            items: [
+                ModelItem(itemID: ItemId(1), value: .list([.string("0"), .string("Row 0")])),
+            ],
+            totalCount: 500_000
+        )
+        let model = try #require(store.getModel(modelID))
+        #expect(model.itemCount == 500_000)
+        #expect(model.iterCachedItems().count == 1)
+
+        var requests: [CollectionRangeRequest] = []
+        let adapter = TableCollectionAdapter(
+            nodeID: NodeId(2),
+            model: model,
+            modelID: modelID,
+            onRangeRequest: { requests.append($0) }
+        )
+        let tableView = NSTableView()
+        TableCollectionAdapter.reconcileColumns(in: tableView, columns: ["Index", "Label"], fallbackTitle: "Table")
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+
+        #expect(adapter.numberOfRows(in: tableView) == 500_000)
+        #expect(adapter.rows.count == 1)
+        #expect(adapter.rowContent(at: 0)?.cells.first == "0")
+
+        let loading = try #require(
+            adapter.tableView(tableView, viewFor: tableView.tableColumns[0], row: 250_000) as? NSTextField
+        )
+        #expect(loading.stringValue == CollectionCells.loadingPlaceholder)
+        #expect(adapter.tableView(tableView, shouldSelectRow: 250_000) == false)
+
+        adapter.noteVisibleRange(start: 250_000, count: 20)
+        adapter.noteVisibleRange(start: 250_000, count: 20)
+        #expect(requests.count == 1)
+        #expect(requests[0].nodeID == NodeId(2))
+        #expect(requests[0].modelID == modelID)
+        #expect(requests[0].count > 0)
+        #expect(requests[0].startIndex % CollectionRangeTracker.pageSize == 0)
+    }
+
+    @Test
+    func modelRangeArrivalPaintsWithoutReplacingTable() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(71)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 500_000)
+        let model = try #require(store.getModel(modelID))
+        let adapter = TableCollectionAdapter(nodeID: NodeId(3), model: model, modelID: modelID)
+        let tableView = NSTableView()
+        TableCollectionAdapter.reconcileColumns(in: tableView, columns: ["Label"], fallbackTitle: "List")
+        tableView.dataSource = adapter
+        tableView.delegate = adapter
+        let tableIdentity = ObjectIdentifier(tableView)
+
+        try store.modelResetRange(
+            id: modelID,
+            startIndex: 10,
+            items: [ModelItem(itemID: ItemId(11), value: .string("hydrated"))],
+            totalCount: 500_000
+        )
+        adapter.update(model: store.getModel(modelID), modelID: modelID, tableView: tableView)
+        #expect(ObjectIdentifier(tableView) == tableIdentity)
+        #expect(adapter.rowContent(at: 10)?.cells == ["hydrated"])
+        #expect(adapter.rowContent(at: 10)?.itemID == ItemId(11))
+        #expect(adapter.numberOfRows(in: tableView) == 500_000)
+    }
+
+    @Test
+    func modelBackedOutlineIsFlatRootLeaves() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(72)
+        try store.createModel(id: modelID, modelType: .tree, itemCount: 500_000)
+        let model = try #require(store.getModel(modelID))
+        var requests: [CollectionRangeRequest] = []
+        let adapter = OutlineCollectionAdapter(
+            nodeID: NodeId(4),
+            model: model,
+            modelID: modelID,
+            onRangeRequest: { requests.append($0) }
+        )
+        let outlineView = NSOutlineView()
+        outlineView.dataSource = adapter
+        outlineView.delegate = adapter
+        #expect(adapter.outlineView(outlineView, numberOfChildrenOfItem: nil) == 500_000)
+        let leaf = adapter.outlineView(outlineView, child: 99, ofItem: nil) as? OutlineCollectionAdapter.Item
+        #expect(leaf?.title == CollectionCells.loadingPlaceholder)
+        #expect(adapter.outlineView(outlineView, isItemExpandable: leaf as Any) == false)
+        adapter.noteVisibleRange(start: 0, count: 8)
+        adapter.noteVisibleRange(start: 0, count: 8)
+        #expect(requests.count == 1)
+    }
+
+    @Test
+    func listAndTableUseExactNSTableViewTreeUsesExactNSOutlineView() throws {
+        let factory = ControlFactory()
+        var store = SemanticStore()
+        let modelID = ModelId(73)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 500_000)
+
+        let list = try factory.makeHandle(
+            for: Node(
+                id: 1,
+                nodeType: .list,
+                properties: [.modelRef: .unsignedInt(modelID.value)]
+            ),
+            store: store
+        )
+        let table = try factory.makeHandle(
+            for: Node(
+                id: 2,
+                nodeType: .table,
+                properties: [.modelRef: .unsignedInt(modelID.value)]
+            ),
+            store: store
+        )
+        let tree = try factory.makeHandle(
+            for: Node(
+                id: 3,
+                nodeType: .tree,
+                properties: [.modelRef: .unsignedInt(modelID.value)]
+            ),
+            store: store
+        )
+
+        let listTable = try #require((list.view as? NSScrollView)?.documentView as? NSTableView)
+        let tableTable = try #require((table.view as? NSScrollView)?.documentView as? NSTableView)
+        let treeOutline = try #require((tree.view as? NSScrollView)?.documentView as? NSOutlineView)
+
+        #expect(type(of: listTable) == NSTableView.self)
+        #expect(type(of: tableTable) == NSTableView.self)
+        #expect(type(of: treeOutline) == NSOutlineView.self)
+        #expect(exactViewCount(NSTableView.self, in: list.view) == 1)
+        #expect(exactViewCount(NSOutlineView.self, in: list.view) == 0)
+        #expect(exactViewCount(NSTableView.self, in: table.view) == 1)
+        #expect(exactViewCount(NSOutlineView.self, in: table.view) == 0)
+        #expect(exactViewCount(NSOutlineView.self, in: tree.view) == 1)
+        #expect(exactViewCount(NSTableView.self, in: tree.view) == 0)
+        #expect(listTable.numberOfRows == 500_000)
+        #expect(tableTable.numberOfRows == 500_000)
+        #expect(treeOutline.numberOfRows == 500_000)
+        #expect(listTable.tableColumns.count == 1)
+        #expect(listTable.headerView == nil)
+        #expect(tableTable.headerView != nil)
+    }
+}
+
+private func exactViewCount<T: NSView>(_ type: T.Type, in root: NSView) -> Int {
+    var count = 0
+    if ObjectIdentifier(Swift.type(of: root)) == ObjectIdentifier(type) {
+        count += 1
+    }
+    for child in root.subviews {
+        count += exactViewCount(type, in: child)
+    }
+    return count
 }

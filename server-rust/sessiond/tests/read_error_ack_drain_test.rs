@@ -200,7 +200,7 @@ async fn framing_error_drains_an_already_accepted_event_ack() {
     write
         .send(SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(ClientHello {
-                core_version: "0.4.0".into(),
+                core_version: "0.5.0".into(),
                 profiles: vec!["org.srui.standard-widgets/1".into()],
                 limits: None,
                 client_instance_id: CLIENT_ID.to_vec(),
@@ -300,7 +300,7 @@ async fn framing_error_drains_an_accepted_ack_after_outbound_lag() {
     write
         .send(SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(ClientHello {
-                core_version: "0.4.0".into(),
+                core_version: "0.5.0".into(),
                 profiles: vec!["org.srui.standard-widgets/1".into()],
                 limits: None,
                 client_instance_id: CLIENT_ID.to_vec(),

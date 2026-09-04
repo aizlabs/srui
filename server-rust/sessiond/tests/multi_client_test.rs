@@ -51,7 +51,7 @@ impl ClientConnection {
 
         let hello = SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(ClientHello {
-                core_version: "0.4.0".to_string(),
+                core_version: "0.5.0".to_string(),
                 profiles: vec!["org.srui.standard-widgets/1".to_string()],
                 limits: None,
                 client_instance_id: vec![1, 2, 3, 4],
@@ -219,7 +219,7 @@ async fn test_lagged_broadcast_closes_connection_for_resync() {
 
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![9, 8, 7, 6],

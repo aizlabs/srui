@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+@testable import Collections
 import CoreGraphics
 
 @MainActor

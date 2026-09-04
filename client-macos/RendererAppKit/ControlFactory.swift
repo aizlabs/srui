@@ -1,5 +1,6 @@
 import AppKit
 import SemanticModel
+import Collections
 
 public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
@@ -38,6 +39,9 @@ public final class ActionTrampoline: NSObject {
 public final class ControlFactory {
     /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
+
+    /// Primitive cache-miss callback. Session encodes this as `ClientModelRangeRequest` (§8, §22.7).
+    public var onCollectionRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
 
     /// Synchronous main-actor resolver from content hash to a retained `NSImage` (§14).
     ///
@@ -201,7 +205,7 @@ public final class ControlFactory {
             result = (table.0, table.1, table.2, nil)
 
         case .tree:
-            let outline = makeOutline(for: node)
+            let outline = makeOutline(for: node, store: store)
             result = (outline.0, outline.1, outline.2, nil)
 
         default:
@@ -238,7 +242,7 @@ public final class ControlFactory {
         for (property, value) in Self.orderedPropertyEntries(of: node) {
             apply(property: property, value: value, to: handle, store: store)
         }
-        if handle.nodeType == .table || handle.nodeType == .list {
+        if handle.nodeType == .table || handle.nodeType == .list || handle.nodeType == .tree {
             refreshCollection(in: handle, for: node, store: store ?? SemanticStore())
         }
     }
@@ -358,15 +362,10 @@ public final class ControlFactory {
                     applySelectionMode(mode, to: tableView)
                 } else if property == .modelRef {
                     let modelID = value?.asUnsignedInt.map { ModelId($0) }
-                    if let modelID, let store, let model = store.getModel(modelID) {
-                        let rows = model.iterCachedItems().map { (_, item) in
-                            TableCollectionAdapter.TableRow(itemID: item.itemID, cells: cells(from: item.value))
-                        }
-                        adapter.update(rows: rows, tableView: tableView)
-                    } else {
-                        adapter.update(rows: [], tableView: tableView)
-                    }
+                    let model = modelID.flatMap { store?.getModel($0) }
+                    adapter.update(model: model, modelID: modelID, tableView: tableView)
                 } else if property == .items {
+                    if adapter.isModelBacked { break }
                     let rows = (value?.asList ?? []).map { val in
                         TableCollectionAdapter.TableRow(itemID: nil, cells: cells(from: val))
                     }
@@ -374,8 +373,18 @@ public final class ControlFactory {
                 }
             } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
                       let outlineView = outlineView(in: handle) {
-                let rows = inlineOutlineRows(from: value)
-                adapter.update(rows: rows, outlineView: outlineView)
+                if property == .modelRef {
+                    let modelID = value?.asUnsignedInt.map { ModelId($0) }
+                    let model = modelID.flatMap { store?.getModel($0) }
+                    adapter.update(model: model, modelID: modelID, outlineView: outlineView)
+                } else if property == .selectionMode {
+                    adapter.selectionMode = value?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+                    applySelectionMode(adapter.selectionMode, to: outlineView)
+                } else if property == .items {
+                    if adapter.isModelBacked { break }
+                    let rows = inlineOutlineRows(from: value)
+                    adapter.update(rows: rows, outlineView: outlineView)
+                }
             }
 
         case .horizontalAlignment:
@@ -462,10 +471,10 @@ public final class ControlFactory {
     func configureCollectionScrolling(nested: Bool, handle: RenderHandle) {
         guard let scrollView = handle.view as? NSScrollView else { return }
         if let adapter = handle.modelAdapter as? TableCollectionAdapter,
-           let tableView = scrollView.documentView as? NSTableView {
+           let tableView = tableView(in: handle) {
             adapter.setNestedInScroll(nested, scrollView: scrollView, tableView: tableView)
         } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
-                  let outlineView = scrollView.documentView as? NSOutlineView {
+                  let outlineView = outlineView(in: handle) {
             adapter.setNestedInScroll(nested, scrollView: scrollView, outlineView: outlineView)
         }
     }
@@ -487,11 +496,22 @@ public final class ControlFactory {
             applySelectionMode(mode, to: tableView)
 
             let newRows = tableRows(for: node, store: store)
-            adapter.update(rows: newRows, tableView: tableView)
+            if let modelID = node.modelRef {
+                adapter.update(model: store.getModel(modelID), modelID: modelID, tableView: tableView)
+            } else {
+                adapter.update(rows: newRows, tableView: tableView)
+            }
         } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
                   let outlineView = outlineView(in: handle) {
-            let rows = inlineOutlineRows(from: node.getProperty(.items))
-            adapter.update(rows: rows, outlineView: outlineView)
+            if let modelID = node.modelRef {
+                adapter.update(model: store.getModel(modelID), modelID: modelID, outlineView: outlineView)
+            } else {
+                let rows = inlineOutlineRows(from: node.getProperty(.items))
+                adapter.update(rows: rows, outlineView: outlineView)
+            }
+            let mode = node.getProperty(.selectionMode)?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+            adapter.selectionMode = mode
+            applySelectionMode(mode, to: outlineView)
         }
     }
 
@@ -542,14 +562,21 @@ public final class ControlFactory {
         let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
         applySelectionMode(selectionMode, to: tableView)
 
-        let rows = tableRows(for: node, store: store)
+        let modelID = node.modelRef
+        let model = modelID.flatMap { store?.getModel($0) }
+        let rows = modelID == nil ? tableRows(for: node, store: store) : []
         let adapter = TableCollectionAdapter(
             nodeID: node.id,
             rows: rows,
+            model: model,
+            modelID: modelID,
             hasExplicitColumns: columnValues?.isEmpty == false,
             selectionMode: selectionMode,
-            onInteraction: { [weak self] interaction in
-                self?.onInteraction?(interaction)
+            onSelectionChanged: { [weak self] nodeID, itemID in
+                self?.onInteraction?(.selectionChanged(nodeID: nodeID, itemID: itemID))
+            },
+            onRangeRequest: { [weak self] request in
+                self?.onCollectionRangeRequest?(request)
             }
         )
         tableView.dataSource = adapter
@@ -559,10 +586,11 @@ public final class ControlFactory {
         let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
         minHeight.isActive = true
         adapter.minHeightConstraint = minHeight
+        adapter.attachViewportObservation(scrollView: scrollView, tableView: tableView)
         return (scrollView, nil, adapter)
     }
 
-    private func makeOutline(for node: Node) -> (NSView, NSWindow?, AnyObject?) {
+    private func makeOutline(for node: Node, store: SemanticStore?) -> (NSView, NSWindow?, AnyObject?) {
         let scrollView = NSScrollView(frame: .zero)
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
@@ -575,8 +603,25 @@ public final class ControlFactory {
         outlineView.outlineTableColumn = column
         outlineView.headerView = nil
 
-        let rows = inlineOutlineRows(from: node.getProperty(.items))
-        let adapter = OutlineCollectionAdapter(rows: rows)
+        let modelID = node.modelRef
+        let model = modelID.flatMap { store?.getModel($0) }
+        let modeToken = node.getProperty(.selectionMode)?.asEnumToken
+        let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+        TableCollectionAdapter.applySelectionMode(selectionMode, to: outlineView)
+        let rows = modelID == nil ? inlineOutlineRows(from: node.getProperty(.items)) : []
+        let adapter = OutlineCollectionAdapter(
+            nodeID: node.id,
+            rows: rows,
+            model: model,
+            modelID: modelID,
+            selectionMode: selectionMode,
+            onSelectionChanged: { [weak self] nodeID, itemID in
+                self?.onInteraction?(.selectionChanged(nodeID: nodeID, itemID: itemID))
+            },
+            onRangeRequest: { [weak self] request in
+                self?.onCollectionRangeRequest?(request)
+            }
+        )
         outlineView.dataSource = adapter
         outlineView.delegate = adapter
         scrollView.documentView = outlineView
@@ -584,20 +629,12 @@ public final class ControlFactory {
         let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
         minHeight.isActive = true
         adapter.minHeightConstraint = minHeight
+        adapter.attachViewportObservation(scrollView: scrollView, outlineView: outlineView)
         return (scrollView, nil, adapter)
     }
 
-    private func cellString(from value: Value) -> String {
-        if let str = value.asString { return str }
-        if value == .null { return "" }
-        return value.description
-    }
-
     private func cells(from value: Value) -> [String] {
-        if case .list(let items) = value {
-            return items.map(cellString(from:))
-        }
-        return [cellString(from: value)]
+        CollectionCells.cells(from: value)
     }
 
     public func tableRows(for node: Node, store: SemanticStore?) -> [TableCollectionAdapter.TableRow] {
@@ -626,7 +663,11 @@ public final class ControlFactory {
     }
 
     private func tableView(in handle: RenderHandle) -> NSTableView? {
-        (handle.view as? NSScrollView)?.documentView as? NSTableView
+        guard let table = (handle.view as? NSScrollView)?.documentView as? NSTableView,
+              !(table is NSOutlineView) else {
+            return nil
+        }
+        return table
     }
 
     private func outlineView(in handle: RenderHandle) -> NSOutlineView? {

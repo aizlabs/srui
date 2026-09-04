@@ -48,7 +48,7 @@ async fn test_throttled_1000_updates_coalesce_with_structural_barrier() {
     // Phase 1: Complete initial handshake
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![1, 2, 3, 4],
@@ -205,7 +205,7 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
     // Complete fresh handshake
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: client_instance.clone(),

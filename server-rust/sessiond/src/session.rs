@@ -9,11 +9,16 @@
 //! per-connection outbound transaction queues are strictly bounded.
 
 mod handshake;
+mod model_range;
 mod snapshot;
 
 pub use handshake::{
     FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION,
     MAX_CLIENT_INSTANCE_ID_BYTES,
+};
+pub use model_range::{
+    run_model_range_worker, ModelRangeError, ModelRangeFulfillment, ModelRangeProvider,
+    ModelRangeQuery, ModelRangeRequestInbox,
 };
 
 use std::collections::HashMap;
@@ -223,6 +228,8 @@ pub(crate) struct SessionInner {
     /// Retained so ClientResume (which carries no limits) can reuse the last negotiated value.
     pub(crate) client_resource_ceilings: HashMap<Vec<u8>, u64>,
     pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
+    /// Sparse-collection window providers keyed by [`srui_semantic_tree::ModelId`] (§8, §22.7).
+    pub(crate) model_range_providers: HashMap<srui_semantic_tree::ModelId, ModelRangeProvider>,
 }
 
 impl std::fmt::Debug for SessionInner {
@@ -242,6 +249,10 @@ impl std::fmt::Debug for SessionInner {
                 &self.client_resource_ceilings.len(),
             )
             .field("handler_count", &self.handlers.len())
+            .field(
+                "model_range_provider_count",
+                &self.model_range_providers.len(),
+            )
             .finish()
     }
 }
@@ -399,6 +410,7 @@ impl Session {
             resources: ResourceStore::new(),
             client_resource_ceilings: HashMap::new(),
             handlers: HashMap::new(),
+            model_range_providers: HashMap::new(),
         };
 
         Self {
@@ -715,7 +727,7 @@ impl Session {
     /// This adds no `await`: [`OutboundHub::publish`] is synchronous and never blocks — a full
     /// queue marks the subscriber stale for forced resync rather than waiting — so holding `inner`
     /// across it does not violate `async-no-lock-await`.
-    fn publish_committed(&self, tx: &Transaction) {
+    pub(crate) fn publish_committed(&self, tx: &Transaction) {
         self.outbound_hub.publish(tx);
     }
 
@@ -1092,7 +1104,7 @@ mod tests {
     fn test_bootstrap_fresh_client_accepts_empty_client_instance_id() {
         let session = Session::new("empty-instance-id");
         let hello = srui_protocol::ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: Vec::new(),
@@ -1116,7 +1128,7 @@ mod tests {
 
         let session = Session::new("oversized-instance-id");
         let hello = srui_protocol::ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![7u8; MAX_CLIENT_INSTANCE_ID_BYTES + 1],

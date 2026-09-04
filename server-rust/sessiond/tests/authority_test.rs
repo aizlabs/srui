@@ -153,7 +153,7 @@ async fn test_client_transaction_rejected_without_mutating_authority() {
     assert_eq!(baseline_node_count, 1);
     assert_eq!(baseline_journal.len(), 1);
     broadcast_rx
-        .recv()
+        .recv_class(srui_sessiond::LogicalChannelClass::Ui)
         .await
         .expect("baseline transaction broadcast");
 
@@ -199,7 +199,12 @@ async fn test_client_transaction_rejected_without_mutating_authority() {
             .expect("journal replay still available"),
         baseline_journal
     );
-    assert_eq!(broadcast_rx.try_recv().unwrap(), None);
+    assert_eq!(
+        broadcast_rx
+            .try_recv_class(srui_sessiond::LogicalChannelClass::Ui)
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -246,7 +251,12 @@ async fn test_client_transaction_on_pristine_session_rejected() {
             .expect("journal replay still available"),
         baseline_journal
     );
-    assert_eq!(broadcast_rx.try_recv().unwrap(), None);
+    assert_eq!(
+        broadcast_rx
+            .try_recv_class(srui_sessiond::LogicalChannelClass::Ui)
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

@@ -40,6 +40,9 @@ struct ServerWriteGate {
     accepting_writes: AtomicBool,
     blocked: Notify,
     writer_waker: AtomicWaker,
+    inbound_readable: AtomicBool,
+    release_inbound_on_write: AtomicBool,
+    reader_waker: AtomicWaker,
 }
 
 impl ServerWriteGate {
@@ -48,11 +51,20 @@ impl ServerWriteGate {
             accepting_writes: AtomicBool::new(true),
             blocked: Notify::new(),
             writer_waker: AtomicWaker::new(),
+            inbound_readable: AtomicBool::new(true),
+            release_inbound_on_write: AtomicBool::new(false),
+            reader_waker: AtomicWaker::new(),
         }
     }
 
     fn block(&self) {
         self.accepting_writes.store(false, Ordering::Release);
+    }
+
+    fn block_with_staged_inbound(&self) {
+        self.inbound_readable.store(false, Ordering::Release);
+        self.release_inbound_on_write.store(true, Ordering::Release);
+        self.block();
     }
 
     fn release(&self) {
@@ -66,7 +78,7 @@ impl ServerWriteGate {
             .expect("server never attempted the gated resource write");
     }
 
-    fn poll_permission(&self, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll_write_permission(&self, cx: &mut Context<'_>) -> Poll<()> {
         if self.accepting_writes.load(Ordering::Acquire) {
             return Poll::Ready(());
         }
@@ -77,6 +89,26 @@ impl ServerWriteGate {
         } else {
             self.blocked.notify_one();
             Poll::Pending
+        }
+    }
+
+    fn poll_read_permission(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.inbound_readable.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        self.reader_waker.register(cx.waker());
+        if self.inbound_readable.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn release_staged_inbound_after_write(&self) {
+        if self.release_inbound_on_write.swap(false, Ordering::AcqRel) {
+            self.inbound_readable.store(true, Ordering::Release);
+            self.reader_waker.wake();
         }
     }
 }
@@ -92,6 +124,9 @@ impl AsyncRead for WriteGatedStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if self.gate.poll_read_permission(cx).is_pending() {
+            return Poll::Pending;
+        }
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -102,10 +137,15 @@ impl AsyncWrite for WriteGatedStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.gate.poll_permission(cx).is_pending() {
+        if self.gate.poll_write_permission(cx).is_pending() {
             return Poll::Pending;
         }
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(&result, Poll::Ready(Ok(written)) if *written > 0) {
+            self.gate.release_staged_inbound_after_write();
+        }
+        result
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -126,7 +166,7 @@ async fn recv_frame(read: &mut ClientRead) -> SruiMessage {
 }
 
 fn classify(msg: &SruiMessage) -> LogicalChannelClass {
-    logical_class_for_server_envelope(msg)
+    logical_class_for_server_envelope(msg).expect("server envelope must have a scheduled class")
 }
 
 async fn connect(
@@ -385,7 +425,7 @@ async fn resource_backlog_yields_to_control_input_and_ui_on_the_wire() {
                 frames_after_inflight.push(class);
                 assert_eq!(
                     logical_class_for_server_envelope(&msg),
-                    LogicalChannelClass::Control
+                    Some(LogicalChannelClass::Control)
                 );
                 acks.push(ack.clone());
             }
@@ -733,4 +773,100 @@ async fn ui_transaction_interleaves_ahead_of_remaining_resource_chunks() {
 
     shutdown.cancel();
     let _ = timeout(DEADLOCK, server_task).await;
+}
+
+/// An always-writable socket must still give the sibling reader a poll between UI frames. The gate
+/// makes the event readable only after the first backlog write succeeds, so the ACK cannot predate
+/// the flood and cannot rely on socket backpressure to yield the writer.
+#[tokio::test(flavor = "current_thread")]
+async fn immediately_ready_ui_writer_yields_for_staged_event_ack() {
+    const UI_BACKLOG: u64 = 48;
+
+    let session = Arc::new(Session::new("scheduler-ui-read-fairness"));
+    let button = NodeId::new(20);
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            Button::builder(button)
+                .parent(1)
+                .label("fairness")
+                .create(ui)?;
+            Ok(())
+        })
+        .expect("create fairness fixture");
+
+    let invocations = Arc::new(AtomicU64::new(0));
+    let invocation_counter = Arc::clone(&invocations);
+    session.on(button, ACTIVATE, move |_, _| {
+        invocation_counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    // The duplex buffer holds the entire UI flood, keeping every server send immediately ready.
+    let (mut write, mut read, shutdown, server_task, write_gate) =
+        connect_with_write_gate(Arc::clone(&session), 1024 * 1024, CLIENT_ID).await;
+    drain_handshake_snapshot(&mut read, session.current_revision()).await;
+
+    write_gate.block_with_staged_inbound();
+    for i in 0..UI_BACKLOG {
+        session
+            .transaction(|ui| {
+                Text::builder(20_000 + i)
+                    .parent(1)
+                    .text(format!("fairness-ui-{i}"))
+                    .create(ui)?;
+                Ok(())
+            })
+            .expect("commit structural fairness transaction");
+    }
+
+    write
+        .send(wire_activate(
+            CLIENT_ID,
+            1,
+            "fairness-event",
+            session.current_revision(),
+            button,
+        ))
+        .await
+        .expect("stage fairness event");
+
+    write_gate.wait_until_blocked().await;
+    write_gate.release();
+
+    let mut ui_before_ack = 0u64;
+    loop {
+        let msg = recv_frame(&mut read).await;
+        match msg.msg {
+            Some(srui_message::Msg::Transaction(_)) => {
+                ui_before_ack += 1;
+                assert!(
+                    ui_before_ack <= UI_BACKLOG,
+                    "received more UI transactions than were queued"
+                );
+            }
+            Some(srui_message::Msg::ServerEventAck(ack)) => {
+                assert_eq!(ack.event_id, b"fairness-event");
+                assert_eq!(ack.status(), EventAckStatus::Processed);
+                assert_eq!(ack.last_processed_event_seq, 1);
+                break;
+            }
+            other => panic!("unexpected fairness envelope {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "the staged event handler must run exactly once"
+    );
+    assert!(
+        ui_before_ack < UI_BACKLOG,
+        "the writer drained all {UI_BACKLOG} queued UI frames before polling inbound input"
+    );
+
+    shutdown.cancel();
+    timeout(DEADLOCK, server_task)
+        .await
+        .expect("fairness server task did not stop")
+        .expect("fairness server task panicked");
 }

@@ -114,43 +114,81 @@ async fn send_message<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    send_message_with_read_state(
+        framed_write,
+        envelope,
+        logical_class,
+        shutdown,
+        outbound,
+        None,
+    )
+    .await
+}
+
+async fn send_message_with_read_state<W>(
+    framed_write: &mut FramedWrite<W, SruiCodec>,
+    envelope: SruiMessage,
+    logical_class: LogicalChannelClass,
+    shutdown: &CancellationToken,
+    outbound: &OutboundReceiver,
+    read_finished: Option<&CancellationToken>,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWrite + Unpin,
+{
     debug_assert_eq!(
         logical_class_for_server_envelope(&envelope),
         logical_class,
         "envelope class must match the annotated write class"
     );
     debug!(?logical_class, "sending outbound frame");
-    tokio::select! {
-        biased;
-        // Bounded: a client that stops reading its socket parks this write in the kernel, where
-        // neither the shutdown token nor the outbound queue can observe it (§20.2).
-        res = tokio::time::timeout(WRITE_TIMEOUT, framed_write.send(envelope)) => {
-            match res {
-                Ok(sent) => {
-                    sent?;
-                    Ok(true)
+
+    // Keep the same send future across state changes. Once the read side finishes, aborting an
+    // in-flight frame is not cancellation-safe and could also discard accepted control frames
+    // behind it, so outbound close/lag stops preempting this bounded write.
+    let send = tokio::time::timeout(WRITE_TIMEOUT, framed_write.send(envelope));
+    tokio::pin!(send);
+    let mut draining_after_read = read_finished.is_some_and(CancellationToken::is_cancelled);
+
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut send => {
+                return match res {
+                    Ok(sent) => {
+                        sent?;
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        warn!(timeout = ?WRITE_TIMEOUT, "Client did not accept an outbound frame; detaching for resync");
+                        Err(ConnectionError::WriteTimeout(WRITE_TIMEOUT))
+                    }
+                };
+            }
+            _ = shutdown.cancelled() => return Ok(false),
+            _ = async {
+                if let Some(read_finished) = read_finished {
+                    read_finished.cancelled().await;
                 }
-                Err(_) => {
-                    warn!(timeout = ?WRITE_TIMEOUT, "Client did not accept an outbound frame; detaching for resync");
-                    Err(ConnectionError::WriteTimeout(WRITE_TIMEOUT))
-                }
+            }, if !draining_after_read && read_finished.is_some() => {
+                draining_after_read = true;
+            }
+            _ = outbound.disconnect_token().cancelled(), if !draining_after_read => {
+                return match outbound.termination() {
+                    Some(OutboundRecvError::Closed) => Ok(false),
+                    Some(OutboundRecvError::Lagged(reason)) => {
+                        warn!(%reason, "Client outbound queue overflowed during send; closing connection to force resync");
+                        Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
+                    }
+                    None => {
+                        warn!("Client outbound subscriber disconnected during send; closing connection to force resync");
+                        Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
+                    }
+                };
             }
         }
-        _ = shutdown.cancelled() => Ok(false),
-        _ = outbound.disconnect_token().cancelled() => match outbound.termination() {
-            Some(OutboundRecvError::Closed) => Ok(false),
-            Some(OutboundRecvError::Lagged(reason)) => {
-                warn!(%reason, "Client outbound queue overflowed during send; closing connection to force resync");
-                Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
-            }
-            None => {
-                warn!("Client outbound subscriber disconnected during send; closing connection to force resync");
-                Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
-            }
-        },
     }
 }
-
 fn outbound_item_to_message(item: OutboundItem) -> SruiMessage {
     match item {
         OutboundItem::Transaction(tx) => SruiMessage {
@@ -377,6 +415,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let session_cancel = CancellationToken::new();
+    let read_finished = CancellationToken::new();
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
 
     let read = read_loop(
@@ -393,6 +432,7 @@ where
         control_rx,
         shutdown,
         session_cancel.clone(),
+        read_finished.clone(),
     );
 
     tokio::pin!(read);
@@ -400,12 +440,22 @@ where
     tokio::select! {
         biased;
         result = &mut read => {
+            // Stop selecting new low-priority work while the closed control sender is drained.
+            read_finished.cancel();
             match result {
                 // The completed reader has dropped control_tx. Drain queued acknowledgements
                 // rather than cancelling the writer on a clean inbound half-close.
                 Ok(()) => write.await,
                 Err(error) => {
-                    session_cancel.cancel();
+                    // The reader has dropped control_tx even on failure. Preserve its error as
+                    // the connection result, but first give already accepted acknowledgements the
+                    // same bounded drain opportunity as a clean inbound half-close.
+                    if let Err(drain_error) = write.await {
+                        warn!(
+                            error = %drain_error,
+                            "Connection writer failed while draining acknowledgements after read error"
+                        );
+                    }
                     Err(error)
                 }
             }
@@ -479,6 +529,7 @@ async fn write_loop<W>(
     mut control_rx: mpsc::Receiver<SruiMessage>,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
+    read_finished: CancellationToken,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWrite + Unpin,
@@ -492,12 +543,14 @@ where
         if session_cancel.is_cancelled() || shutdown.is_cancelled() {
             return Ok(());
         }
-        match outbound.termination() {
-            Some(OutboundRecvError::Lagged(reason)) => {
-                warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
-                return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
+        if !read_finished.is_cancelled() {
+            match outbound.termination() {
+                Some(OutboundRecvError::Lagged(reason)) => {
+                    warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
+                    return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
+                }
+                Some(OutboundRecvError::Closed) | None => {}
             }
-            Some(OutboundRecvError::Closed) | None => {}
         }
 
         if pending_control.is_none() && !control_closed {
@@ -520,8 +573,12 @@ where
             LogicalChannelClass::Input
             | LogicalChannelClass::TerminalHigh
             | LogicalChannelClass::TerminalNormal => false,
-            LogicalChannelClass::Ui => outbound.class_ready(LogicalChannelClass::Ui),
-            LogicalChannelClass::Resource => outbound.class_ready(LogicalChannelClass::Resource),
+            LogicalChannelClass::Ui => {
+                !read_finished.is_cancelled() && outbound.class_ready(LogicalChannelClass::Ui)
+            }
+            LogicalChannelClass::Resource => {
+                !read_finished.is_cancelled() && outbound.class_ready(LogicalChannelClass::Resource)
+            }
         };
 
         if let Some(class) = scheduler.select_next(ready) {
@@ -550,7 +607,16 @@ where
                 | LogicalChannelClass::TerminalNormal => continue,
             };
             debug_assert_eq!(logical_class_for_server_envelope(&envelope), class);
-            if !send_message(&mut framed_write, envelope, class, &shutdown, &outbound).await? {
+            if !send_message_with_read_state(
+                &mut framed_write,
+                envelope,
+                class,
+                &shutdown,
+                &outbound,
+                Some(&read_finished),
+            )
+            .await?
+            {
                 return Ok(());
             }
             if class == LogicalChannelClass::Resource {
@@ -559,7 +625,8 @@ where
             continue;
         }
 
-        if pending_control.is_none()
+        if !read_finished.is_cancelled()
+            && pending_control.is_none()
             && (outbound_idle || outbound.is_closed())
             && !outbound.class_ready(LogicalChannelClass::Ui)
             && !outbound.class_ready(LogicalChannelClass::Resource)
@@ -574,7 +641,8 @@ where
             biased;
             _ = session_cancel.cancelled() => return Ok(()),
             _ = shutdown.cancelled() => return Ok(()),
-            _ = disconnect.cancelled(), if !outbound_idle => match outbound.termination() {
+            _ = read_finished.cancelled() => {}
+            _ = disconnect.cancelled(), if !outbound_idle && !read_finished.is_cancelled() => match outbound.termination() {
                 Some(OutboundRecvError::Lagged(reason)) => {
                     warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
                     return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
@@ -594,7 +662,7 @@ where
                     None => control_closed = true,
                 }
             }
-            result = outbound.wait_for_work(), if !outbound_idle => {
+            result = outbound.wait_for_work(), if !outbound_idle && !read_finished.is_cancelled() => {
                 match result {
                     Ok(()) => tokio::task::yield_now().await,
                     Err(OutboundRecvError::Lagged(reason)) => {

@@ -15,6 +15,7 @@ import Darwin
 #elseif canImport(Glibc)
 import Glibc
 #endif
+@_exported import LogicalChannelScheduling
 
 /// Errors produced during transport operations.
 public enum TransportError: Error, CustomStringConvertible, Sendable {

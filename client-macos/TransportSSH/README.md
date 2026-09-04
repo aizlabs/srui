@@ -6,6 +6,10 @@ This module provides the secure transport binding for the macOS SRUI client as s
 
 ## Logical channel scheduler (§19.2)
 
+The algorithm lives in the nested `LogicalChannelScheduling` package so Linux CI can compile and
+test it without AppKit or the rest of `TransportSSH`. `TransportSSH` imports that module; there is
+no second copy of the cycle or selector.
+
 Outbound frames are classified independently of protobuf/Core semantics. SSH and TCP serialize
 whichever frame the scheduler selects onto **one** byte stream. A future QUIC binding may map the
 same classes to independent streams without changing Core messages. This module does not implement

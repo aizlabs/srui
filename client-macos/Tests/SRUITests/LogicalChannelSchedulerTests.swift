@@ -2,7 +2,9 @@
 // LogicalChannelSchedulerTests.swift
 // SRUITests
 //
-// Deterministic saturation, fairness, and call-site classification tests (§18.2, §19.2).
+// SocketWriter drain and Session/EventOutbox classification tests (§18.2, §19.2).
+//
+// Pure scheduler algorithm tests live in LogicalChannelSchedulingTests and run on Linux.
 //
 
 import Testing
@@ -123,81 +125,8 @@ private actor RecordingTransport: Transport {
     }
 }
 
-@Suite("Logical Channel Scheduler (§19.2)")
-struct LogicalChannelSchedulerTests {
-
-    @Test("Service cycle matches the documented 24-slot sequence")
-    func serviceCycleMatchesDocumentedSequence() {
-        #expect(LogicalChannelScheduler.serviceCycle == [
-            .control, .input, .ui,
-            .control, .input, .terminalHigh,
-            .control, .input, .ui,
-            .control, .input, .terminalNormal,
-            .control, .input, .ui,
-            .control, .input, .terminalHigh,
-            .ui, .control, .input,
-            .terminalNormal, .terminalHigh, .resource,
-        ])
-        #expect(LogicalChannelScheduler.serviceCycle.count == 24)
-    }
-
-    @Test("Saturated cycle preserves FIFO and documented service gaps")
-    func saturatedCyclePreservesFIFOAndBounds() throws {
-        var queues: [LogicalChannelClass: [UInt32]] = Dictionary(
-            uniqueKeysWithValues: LogicalChannelClass.allCases.map { ($0, []) }
-        )
-        for logicalClass in LogicalChannelClass.allCases {
-            queues[logicalClass] = Array(0..<12)
-        }
-
-        var scheduler = LogicalChannelScheduler()
-        var lastIndex: [LogicalChannelClass: Int] = [:]
-        var nextExpected: [LogicalChannelClass: UInt32] = Dictionary(
-            uniqueKeysWithValues: LogicalChannelClass.allCases.map { ($0, 0) }
-        )
-
-        for index in 0..<(LogicalChannelScheduler.serviceCycle.count * 6) {
-            for logicalClass in LogicalChannelClass.allCases {
-                if queues[logicalClass]?.isEmpty == true {
-                    queues[logicalClass, default: []].append(nextExpected[logicalClass] ?? 0)
-                }
-            }
-            let selected = scheduler.selectNext { candidate in
-                !(queues[candidate] ?? []).isEmpty
-            }
-            let logicalClass = try #require(selected)
-            let token = queues[logicalClass]!.removeFirst()
-            #expect(token == nextExpected[logicalClass])
-            nextExpected[logicalClass, default: 0] += 1
-            if let previous = lastIndex[logicalClass] {
-                #expect(index - previous <= logicalClass.maxServiceGap)
-            }
-            lastIndex[logicalClass] = index
-        }
-    }
-
-    @Test("Empty lanes are skipped without consuming a write")
-    func emptyLanesAreSkipped() {
-        var resource = [UInt32]([1, 2])
-        var scheduler = LogicalChannelScheduler()
-        let first = scheduler.selectNext { $0 == .resource && !resource.isEmpty }
-        #expect(first == .resource)
-        #expect(resource.removeFirst() == 1)
-        let second = scheduler.selectNext { $0 == .resource && !resource.isEmpty }
-        #expect(second == .resource)
-        #expect(resource.removeFirst() == 2)
-        #expect(scheduler.selectNext { $0 == .resource && !resource.isEmpty } == nil)
-    }
-
-    @Test("Two control tokens remain separate and FIFO")
-    func twoControlTokensRemainSeparateAndFIFO() {
-        var control = [UInt32]([1, 2])
-        var scheduler = LogicalChannelScheduler()
-        #expect(scheduler.selectNext { $0 == .control && !control.isEmpty } == .control)
-        #expect(control.removeFirst() == 1)
-        #expect(scheduler.selectNext { $0 == .control && !control.isEmpty } == .control)
-        #expect(control.removeFirst() == 2)
-    }
+@Suite("Logical Channel Transport Classification (§19.2)")
+struct LogicalChannelTransportTests {
 
     @Test("Resource backlog yields to newly ready control, input, and UI")
     func resourceBacklogYieldsToHigherClasses() async throws {

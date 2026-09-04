@@ -21,10 +21,14 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.2"),
+        .package(path: "LogicalChannelScheduling"),
     ],
     targets: [
         .target(
             name: "TransportSSH",
+            dependencies: [
+                .product(name: "LogicalChannelScheduling", package: "LogicalChannelScheduling"),
+            ],
             path: "TransportSSH"
         ),
         .target(

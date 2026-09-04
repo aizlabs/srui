@@ -1,16 +1,18 @@
 //
 // LogicalChannelScheduler.swift
-// TransportSSH
+// LogicalChannelScheduling
 //
 // Weighted logical-channel selector shared with the Rust sessiond writer (§18.2, §19.2).
 //
-// Logical classification is independent of protobuf/Core semantics: SSH and TCP serialize
-// selected frames onto one byte stream, while a future QUIC binding may map the same
-// classes to independent streams without changing Core messages. This module does not
-// implement QUIC.
+// This module is dependency-free Swift: no Foundation, Darwin, AppKit, Security,
+// Network, or other Apple-platform imports. Linux CI builds and tests it on
+// Ubuntu; TransportSSH imports it for production drain on macOS.
 //
-
-import Foundation
+// Logical classification is independent of protobuf/Core semantics: SSH and TCP
+// serialize selected frames onto one byte stream, while a future QUIC binding
+// may map the same classes to independent streams without changing Core
+// messages. This module does not implement QUIC.
+//
 
 /// Logical traffic class used by the outbound scheduler (§19.2).
 public enum LogicalChannelClass: Int, CaseIterable, Sendable, Hashable {

@@ -53,6 +53,7 @@ async fn connect_client(
             limits: None,
             client_instance_id: vec![1, 2, 3],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     framed_write.send(hello).await.expect("send hello");
@@ -196,6 +197,7 @@ async fn ui_transaction_interleaves_ahead_of_remaining_resource_chunks() {
                 limits: None,
                 client_instance_id: vec![9, 9, 9],
                 client_metadata: Default::default(),
+                known_resource_hashes: vec![],
             })),
         })
         .await
@@ -363,6 +365,7 @@ async fn oversized_for_client_ceiling_is_not_transferred() {
             }),
             client_instance_id: vec![9, 9, 9],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     framed_write.send(hello).await.expect("send hello");

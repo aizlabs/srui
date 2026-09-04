@@ -7,12 +7,14 @@
 
 import Testing
 import Foundation
+import CryptoKit
 import AppKit
 import SemanticModel
 import Protocol
 import Session
 import TransportSSH
 import RendererAppKit
+import Resources
 
 @Suite("SessionController Resync & Resilience Tests")
 struct SessionControllerResyncTests {
@@ -195,7 +197,7 @@ struct SessionControllerResyncTests {
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
         let controller = SessionController(
-            transport: await PipeTransport(),
+            transport: PipeTransport(),
             applier: applier,
             renderer: renderer
         )
@@ -258,5 +260,102 @@ struct SessionControllerResyncTests {
         // A diverged session must not keep applying the stream as though nothing happened.
         #expect(applier.lastAppliedRevision == .initial)
         #expect(renderer.registry.count == 0)
+    }
+
+    @Test("A replacement renderer hydrates images from the shared cache")
+    @MainActor
+    func replacementRendererHydratesSharedCache() async throws {
+        let bytes = Data([
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00,
+            0x0C, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60, 0x60, 0x60, 0x00,
+            0x00, 0x00, 0x04, 0x00, 0x01, 0xF6, 0x17, 0x38, 0x55, 0x00, 0x00, 0x00,
+            0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ])
+        let hash = try ResourceHash(rawBytes: Array(SHA256.hash(data: bytes)))
+        let cache = ResourceCache()
+        _ = try await cache.ingestMetadata(
+            ResourceMetadataInput(
+                resourceHash: hash,
+                mediaType: "image/png",
+                encodedLength: UInt64(bytes.count),
+                decodedWidth: 1,
+                decodedHeight: 1
+            )
+        )
+        _ = try #require(
+            try await cache.ingestChunk(
+                ResourceChunkInput(resourceHash: hash, byteOffset: 0, data: bytes)
+            )
+        )
+
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer,
+            resourceCache: cache
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        let serverStream = serverTransport.receiveStream()
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var receivedHello: SRUIClientHello?
+        for try await chunk in serverStream {
+            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .clientHello(let hello) = message.msg {
+                    receivedHello = hello
+                    break
+                }
+            }
+            if receivedHello != nil { break }
+        }
+        let hello = try #require(receivedHello)
+        #expect(hello.knownResourceHashes == [hash.bytes])
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "cached-image-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 1
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+
+        let imageID = NodeId(2)
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: NodeId(1), nodeType: .surface),
+                .createNode(
+                    id: imageID,
+                    nodeType: .image,
+                    parentID: NodeId(1),
+                    properties: [
+                        Property(property: .resource, value: .resourceHash(hash)),
+                    ]
+                ),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        try await AsyncTestSupport.eventually(description: "cached image hydration") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.resolveResourceImage(hash) != nil
+                && renderer.registry.handle(for: imageID)?.view is NSImageView
+        }
+        let imageHandle = try #require(renderer.registry.handle(for: imageID))
+        let imageView = try #require(imageHandle.view as? NSImageView)
+        #expect(imageView.image != nil)
+
+        await controller.stop()
+        await serverTransport.close()
     }
 }

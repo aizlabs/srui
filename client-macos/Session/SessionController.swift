@@ -307,6 +307,8 @@ public final class SessionController: @unchecked Sendable {
         let requestedId = withStateLock {
             currentSessionId ?? requestedSessionId
         }
+        let limits = makeClientLimits()
+        let knownResourceHashes = await resourceCache.knownHashes().map(\.bytes)
 
         if let requestedId {
             let resumeGeneration = await outbox.beginResumeAttempt()
@@ -319,6 +321,8 @@ public final class SessionController: @unchecked Sendable {
             resume.clientInstanceID = clientInstanceId.bytes
             resume.lastAppliedRevision = applier.lastAppliedRevision.value
             resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
+            resume.limits = limits
+            resume.knownResourceHashes = knownResourceHashes
 
             var envelope = SRUIMessage()
             envelope.clientResume = resume
@@ -332,16 +336,8 @@ public final class SessionController: @unchecked Sendable {
             hello.coreVersion = SRUICoreVersion
             hello.profiles = clientCapabilities.toStringArray()
             hello.clientInstanceID = clientInstanceId.bytes
-            // Advertise the cache's encoded-byte ceiling so the server can clip transfers (§15, §26).
-            var limits = Srui_Protocol_ClientLimits()
-            limits.maxFrameSize = UInt32(clamping: defaultMaxFrameSize)
-            limits.maxTransactionOperations = UInt32(clamping: applier.currentSnapshot.store.limits.maxTransactionOperations)
-            limits.maxTreeDepth = UInt32(clamping: applier.currentSnapshot.store.limits.maxTreeDepth)
-            limits.maxNodeCount = UInt32(clamping: applier.currentSnapshot.store.limits.maxNodeCount)
-            limits.maxStringLength = UInt32(clamping: applier.currentSnapshot.store.limits.maxStringLength)
-            let maxResource = resourceCache.limits.maxEncodedBytes
-            limits.maxResourceSize = UInt32(clamping: maxResource)
             hello.limits = limits
+            hello.knownResourceHashes = knownResourceHashes
 
             var envelope = SRUIMessage()
             envelope.clientHello = hello
@@ -370,6 +366,21 @@ public final class SessionController: @unchecked Sendable {
             return
         }
         didStart = true
+    }
+
+    private func makeClientLimits() -> Srui_Protocol_ClientLimits {
+        var limits = Srui_Protocol_ClientLimits()
+        limits.maxFrameSize = UInt32(clamping: defaultMaxFrameSize)
+        limits.maxTransactionOperations = UInt32(
+            clamping: applier.currentSnapshot.store.limits.maxTransactionOperations
+        )
+        limits.maxTreeDepth = UInt32(clamping: applier.currentSnapshot.store.limits.maxTreeDepth)
+        limits.maxNodeCount = UInt32(clamping: applier.currentSnapshot.store.limits.maxNodeCount)
+        limits.maxStringLength = UInt32(
+            clamping: applier.currentSnapshot.store.limits.maxStringLength
+        )
+        limits.maxResourceSize = UInt32(clamping: resourceCache.limits.maxEncodedBytes)
+        return limits
     }
 
     /// Dispatches a manual activation event for the given node ID (§7.7).
@@ -1234,6 +1245,7 @@ public final class SessionController: @unchecked Sendable {
         snapshot: TransactionSnapshot,
         forceRemount: Bool
     ) async {
+        await hydrateCachedResources(snapshot.store.referencedResourceHashes())
         await MainActor.run {
             guard let renderer = self.renderer else { return }
             do {
@@ -1254,6 +1266,18 @@ public final class SessionController: @unchecked Sendable {
             }
         }
         await syncLiveResourceReferences()
+    }
+
+    /// Pins and installs verified shared-cache images before a renderer mounts a new snapshot.
+    private func hydrateCachedResources(_ hashes: Set<ResourceHash>) async {
+        let cached = await resourceCache.setLiveReferencesAndLookup(hashes)
+        guard !cached.isEmpty else { return }
+        await MainActor.run {
+            for image in cached
+            where self.renderer?.resolveResourceImage(image.hash) == nil {
+                self.renderer?.commitResourceImage(image)
+            }
+        }
     }
 
     /// How long `stop()` lets the receive loop drain closed-transport frames before cancelling it.
@@ -1311,8 +1335,8 @@ public final class SessionController: @unchecked Sendable {
         }
 
         // Disconnect drops in-flight assemblies. Committed CAS entries persist on this
-        // `resourceCache` instance — inject the same cache into a replacement controller to keep
-        // them across reconnect (§14, §18). Task 26 still re-seeds retained server resources.
+        // `resourceCache` instance — inject the same cache into a replacement controller to
+        // advertise verified hashes and hydrate its renderer without retransferring bytes (§14, §18).
         await resourceCache.clearPartials()
         rejectedResourceHashes.removeAll(keepingCapacity: false)
 

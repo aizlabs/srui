@@ -146,6 +146,37 @@ fn eviction_skips_protected_hashes() {
 }
 
 #[test]
+fn failed_protected_publish_does_not_partially_evict() {
+    use std::collections::HashSet;
+
+    let limits = ResourceLimits {
+        max_resource_bytes: 8,
+        max_entries: 3,
+        max_total_bytes: 10,
+    };
+    let mut store = ResourceStore::with_limits(limits);
+    let oldest = store.publish_resource(b"one").unwrap().hash;
+    let locked = store.publish_resource(b"locked").unwrap().hash;
+    let protected = HashSet::from([locked]);
+
+    assert!(matches!(
+        store.publish_resource_protecting(b"new-new", &protected),
+        Err(ResourceError::TotalBytesLimitExceeded { limit: 10 })
+    ));
+    assert!(store.contains(&oldest));
+    assert!(store.contains(&locked));
+    assert_eq!(store.total_bytes(), 9);
+    assert_eq!(
+        store
+            .retained_entries()
+            .into_iter()
+            .map(|entry| entry.hash)
+            .collect::<Vec<_>>(),
+        vec![oldest, locked]
+    );
+}
+
+#[test]
 fn multi_chunk_reconstruction_matches_source() {
     let len = CHUNK_PAYLOAD_SIZE * 3 + 7;
     let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();

@@ -71,6 +71,7 @@ async fn test_sessiond_connection_handshake_and_transaction_broadcast() {
             limits: None,
             client_instance_id: vec![1, 2, 3, 4],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
 
@@ -165,6 +166,8 @@ async fn test_sessiond_connection_resume_replay() {
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         })),
     };
 
@@ -238,6 +241,7 @@ async fn test_connection_fresh_hello_backpressured_snapshot_and_concurrent_commi
             limits: None,
             client_instance_id: vec![42],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     client_framed_write.send(hello).await.expect("send hello");
@@ -331,6 +335,8 @@ async fn test_connection_resume_resync_backpressured_snapshot_and_concurrent_com
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         })),
     };
     client_framed_write.send(resume).await.expect("send resume");

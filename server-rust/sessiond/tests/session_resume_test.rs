@@ -35,6 +35,8 @@ fn client_resume(session_id: &str, last_applied: u64) -> SruiMessage {
             last_applied_revision: last_applied,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         })),
     }
 }

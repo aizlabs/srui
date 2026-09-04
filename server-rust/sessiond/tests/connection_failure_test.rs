@@ -63,6 +63,7 @@ fn sample_client_hello(profiles: &[&str]) -> ClientHello {
         limits: None,
         client_instance_id: vec![1, 2, 3],
         client_metadata: Default::default(),
+        known_resource_hashes: vec![],
     }
 }
 

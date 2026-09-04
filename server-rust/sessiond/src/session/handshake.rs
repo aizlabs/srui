@@ -9,12 +9,14 @@
 //! itself nests `subscribers -> SubscriberState -> stale_clients`. Nothing may take a hub lock
 //! before the session lock, or the two orders deadlock.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::outbound::OutboundReceiver;
 use srui_protocol::{
     ClientHello, ClientLimits, ClientResume, ExtensionNamespaceMapping, ServerResumeOk,
     ServerResyncRequired, ServerWelcome, SessionContinuity, Transaction,
 };
-use srui_semantic_tree::{CapabilitySet, Profile, SemanticStore};
+use srui_semantic_tree::{CapabilitySet, Profile, ResourceHash, SemanticStore};
 
 use super::snapshot::export_snapshot_transaction;
 use super::{Session, SessionError};
@@ -143,11 +145,25 @@ fn negotiated_max_resource_size(server: u32, client_limits: Option<&ClientLimits
     }
 }
 
+/// Parses a bounded set of verified client CAS hashes.
+///
+/// Malformed values are ignored so an advisory optimization cannot fail the handshake.
+fn known_resource_hashes(raw_hashes: &[Vec<u8>], limit: usize) -> HashSet<ResourceHash> {
+    raw_hashes
+        .iter()
+        .take(limit)
+        .filter_map(|raw| {
+            let bytes: [u8; 32] = raw.as_slice().try_into().ok()?;
+            Some(ResourceHash::new(bytes))
+        })
+        .collect()
+}
+
 /// Bounds remembered per-client ceilings; `client_instance_id` is client-supplied (§15, §26).
 const MAX_CLIENT_RESOURCE_CEILINGS: usize = 256;
 
 fn remember_client_resource_ceiling(
-    ceilings: &mut std::collections::HashMap<Vec<u8>, u64>,
+    ceilings: &mut HashMap<Vec<u8>, u64>,
     client_instance_id: &[u8],
     max_resource_size: u64,
 ) {
@@ -236,6 +252,10 @@ impl Session {
             &hello.client_instance_id,
             max_resource_size,
         );
+        let known_hashes = known_resource_hashes(
+            &hello.known_resource_hashes,
+            inner_guard.resources.limits().max_entries,
+        );
         let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
             hello.client_instance_id.clone(),
@@ -246,9 +266,11 @@ impl Session {
         )?;
         // Seed while still holding SessionInner so a resource published between snapshot
         // creation and live subscription cannot be missed (SessionInner -> OutboundHub order).
-        // Task 26 re-sends the retained CAS on every attach (no client known-hash protocol yet).
-        self.outbound_hub
-            .seed_resources(&transactions, &retained_resources);
+        self.outbound_hub.seed_resources_excluding(
+            &transactions,
+            &retained_resources,
+            &known_hashes,
+        );
         drop(inner_guard);
 
         // Fails the handshake rather than emitting a catch-up transaction the client must reject
@@ -306,7 +328,7 @@ impl Session {
             },
         }
 
-        let inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let last_processed_event_seq = inner_guard
             .dedupe
             .last_contiguous_processed_seq(&resume.client_instance_id);
@@ -357,13 +379,30 @@ impl Session {
 
         let max_ops = inner_guard.limits.max_transaction_operations as usize;
         let max_frame_size = inner_guard.limits.max_frame_size as usize;
-        // ClientResume carries no limits; reuse the last negotiated ceiling for this
-        // client_instance_id, falling back to the server default (§15, §26).
-        let max_resource_size = inner_guard
-            .client_resource_ceilings
-            .get(&resume.client_instance_id)
-            .copied()
-            .unwrap_or_else(|| u64::from(inner_guard.limits.max_resource_size));
+        // Modern clients re-advertise limits on every resume because this server's remembered
+        // compatibility table is deliberately bounded. Old clients still use the remembered
+        // value when available, then fall back to the server ceiling (§15, §26).
+        let max_resource_size = if resume.limits.is_some() {
+            negotiated_max_resource_size(
+                inner_guard.limits.max_resource_size,
+                resume.limits.as_ref(),
+            )
+        } else {
+            inner_guard
+                .client_resource_ceilings
+                .get(&resume.client_instance_id)
+                .copied()
+                .unwrap_or_else(|| u64::from(inner_guard.limits.max_resource_size))
+        };
+        remember_client_resource_ceiling(
+            &mut inner_guard.client_resource_ceilings,
+            &resume.client_instance_id,
+            max_resource_size,
+        );
+        let known_hashes = known_resource_hashes(
+            &resume.known_resource_hashes,
+            inner_guard.resources.limits().max_entries,
+        );
         let retained_resources = inner_guard.resources.retained_entries();
         let transactions = self.outbound_hub.subscribe(
             resume.client_instance_id.clone(),
@@ -372,10 +411,11 @@ impl Session {
             max_frame_size,
             max_resource_size,
         )?;
-        // Re-seed retained resources on resume; clients should share one ResourceCache across
-        // controller generations so duplicate transfers stay cheap (§14, §18).
-        self.outbound_hub
-            .seed_resources(&transactions, &retained_resources);
+        self.outbound_hub.seed_resources_excluding(
+            &transactions,
+            &retained_resources,
+            &known_hashes,
+        );
         drop(inner_guard);
 
         let outcome = match plan {
@@ -431,6 +471,7 @@ mod tests {
             limits: None,
             client_instance_id: vec![1, 2],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         }
     }
 
@@ -441,6 +482,56 @@ mod tests {
             priority: 1,
             operations: vec![],
         }
+    }
+
+    #[test]
+    fn fresh_bootstrap_skips_verified_client_resources() {
+        let session = Session::new("known-fresh");
+        let published = session.publish_resource(b"already-cached").unwrap();
+        let mut hello = sample_hello();
+        hello.known_resource_hashes = vec![published.hash.0.to_vec()];
+
+        let mut bootstrap = session.bootstrap_fresh_client(&hello).unwrap();
+        assert!(bootstrap.transactions.try_recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn resume_bootstrap_skips_verified_client_resources() {
+        let session = Session::new("known-resume");
+        let published = session.publish_resource(b"already-cached").unwrap();
+        let resume = ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: vec![3, 4],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![published.hash.0.to_vec()],
+        };
+
+        let mut bootstrap = session.bootstrap_resume(&resume).unwrap();
+        assert!(bootstrap.transactions.try_recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn resume_bootstrap_uses_readvertised_resource_limit() {
+        let session = Session::new("limited-resume");
+        session.publish_resource(b"larger-than-eight").unwrap();
+        let resume = ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: vec![5, 6],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: Some(ClientLimits {
+                max_resource_size: 8,
+                ..ClientLimits::default()
+            }),
+            known_resource_hashes: vec![],
+        };
+
+        let mut bootstrap = session.bootstrap_resume(&resume).unwrap();
+        assert!(bootstrap.transactions.try_recv().unwrap().is_none());
     }
 
     #[test]
@@ -465,6 +556,8 @@ mod tests {
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         };
         let bootstrap = session.bootstrap_resume(&resume).expect("resume");
         match bootstrap.outcome {
@@ -501,6 +594,8 @@ mod tests {
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         };
         let bootstrap = session.bootstrap_resume(&resume).expect("resume");
         match bootstrap.outcome {
@@ -562,6 +657,8 @@ mod tests {
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         };
 
         match session
@@ -603,6 +700,8 @@ mod tests {
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         };
 
         match session
@@ -687,6 +786,7 @@ mod tests {
             limits: None,
             client_instance_id: vec![7, 8],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         };
 
         let snapshot_captured = Arc::new(Barrier::new(2));
@@ -765,6 +865,8 @@ mod tests {
             last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         };
 
         let catch_up_captured = Arc::new(Barrier::new(2));

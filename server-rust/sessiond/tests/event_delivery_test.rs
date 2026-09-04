@@ -57,6 +57,7 @@ async fn connect_client(
             limits: None,
             client_instance_id: client_instance_id.to_vec(),
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     client_framed_write.send(hello).await.expect("send hello");
@@ -126,6 +127,8 @@ async fn resume_client(
             last_applied_revision,
             last_acked_event_seq,
             terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
         })),
     };
     client_framed_write.send(resume).await.expect("send resume");

@@ -24,6 +24,7 @@ fn client_hello_message() -> SruiMessage {
             limits: None,
             client_instance_id: vec![1, 2, 3, 4],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     }
 }

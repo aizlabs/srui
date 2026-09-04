@@ -132,7 +132,10 @@ impl ResourceStore {
     ///
     /// Oversized payloads are rejected before hashing or copying into store-owned
     /// memory. Identical content is deduplicated and never overwrites an existing
-    /// hash. Eviction never removes hashes in `protected` (live semantic references).
+    /// hash.
+    ///
+    /// # Errors
+    /// Returns a [`ResourceError`] when the payload or retained CAS would exceed a limit.
     pub fn publish_resource(
         &mut self,
         bytes: impl AsRef<[u8]>,
@@ -141,6 +144,10 @@ impl ResourceStore {
     }
 
     /// Like [`Self::publish_resource`], but refuses to evict hashes in `protected` (§14).
+    ///
+    /// # Errors
+    /// Returns a [`ResourceError`] when the payload cannot fit without evicting a protected
+    /// resource. A failed publication leaves the store unchanged.
     pub fn publish_resource_protecting(
         &mut self,
         bytes: impl AsRef<[u8]>,
@@ -163,31 +170,51 @@ impl ResourceStore {
             });
         }
 
-        // Evict oldest unprotected entries until the new payload fits (§14).
-        while self.entries.len() >= self.limits.max_entries {
-            if !self.evict_oldest(protected) {
-                return Err(ResourceError::EntryLimitExceeded {
-                    limit: self.limits.max_entries,
-                });
-            }
-        }
-
-        let mut next_total = self.total_bytes.checked_add(slice.len()).ok_or(
-            ResourceError::TotalBytesLimitExceeded {
-                limit: self.limits.max_total_bytes,
-            },
-        )?;
-        while next_total > self.limits.max_total_bytes {
-            if !self.evict_oldest(protected) {
-                return Err(ResourceError::TotalBytesLimitExceeded {
-                    limit: self.limits.max_total_bytes,
-                });
-            }
-            next_total = self.total_bytes.checked_add(slice.len()).ok_or(
+        // Plan every eviction before mutating the store. A protected resource can make the
+        // request impossible only after several older entries have been considered; failing
+        // at that point must not discard otherwise-valid retained content (§14, §26).
+        let mut evictions = Vec::new();
+        let mut retained_entries = self.entries.len();
+        let mut retained_bytes = self.total_bytes;
+        for candidate in self.order.iter().filter(|hash| !protected.contains(hash)) {
+            let next_total = retained_bytes.checked_add(slice.len()).ok_or(
                 ResourceError::TotalBytesLimitExceeded {
                     limit: self.limits.max_total_bytes,
                 },
             )?;
+            if retained_entries < self.limits.max_entries
+                && next_total <= self.limits.max_total_bytes
+            {
+                break;
+            }
+
+            let entry = self
+                .entries
+                .get(candidate)
+                .expect("ordered resource hash must exist in store");
+            evictions.push(*candidate);
+            retained_entries = retained_entries.saturating_sub(1);
+            retained_bytes = retained_bytes.saturating_sub(entry.bytes.len());
+        }
+
+        if retained_entries >= self.limits.max_entries {
+            return Err(ResourceError::EntryLimitExceeded {
+                limit: self.limits.max_entries,
+            });
+        }
+        let next_total = retained_bytes.checked_add(slice.len()).ok_or(
+            ResourceError::TotalBytesLimitExceeded {
+                limit: self.limits.max_total_bytes,
+            },
+        )?;
+        if next_total > self.limits.max_total_bytes {
+            return Err(ResourceError::TotalBytesLimitExceeded {
+                limit: self.limits.max_total_bytes,
+            });
+        }
+
+        for hash in evictions {
+            self.remove(&hash);
         }
 
         let owned: Arc<[u8]> = Arc::from(slice.to_vec().into_boxed_slice());
@@ -207,16 +234,14 @@ impl ResourceStore {
         })
     }
 
-    /// Removes the oldest retained entry that is not in `protected`. Returns `false` when none.
-    fn evict_oldest(&mut self, protected: &HashSet<ResourceHash>) -> bool {
-        let Some(idx) = self.order.iter().position(|hash| !protected.contains(hash)) else {
-            return false;
-        };
-        let oldest = self.order.remove(idx);
-        if let Some(entry) = self.entries.remove(&oldest) {
+    /// Removes one retained entry selected by a completed eviction plan.
+    fn remove(&mut self, hash: &ResourceHash) {
+        if let Some(index) = self.order.iter().position(|candidate| candidate == hash) {
+            self.order.remove(index);
+        }
+        if let Some(entry) = self.entries.remove(hash) {
             self.total_bytes = self.total_bytes.saturating_sub(entry.bytes.len());
         }
-        true
     }
 
     /// Looks up a retained resource by hash.

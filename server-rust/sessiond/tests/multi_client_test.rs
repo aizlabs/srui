@@ -56,6 +56,7 @@ impl ClientConnection {
                 limits: None,
                 client_instance_id: vec![1, 2, 3, 4],
                 client_metadata: Default::default(),
+                known_resource_hashes: vec![],
             })),
         };
         write.send(hello).await.expect("send ClientHello");
@@ -223,6 +224,7 @@ async fn test_lagged_broadcast_closes_connection_for_resync() {
             limits: None,
             client_instance_id: vec![9, 8, 7, 6],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     framed_write.send(hello).await.expect("send ClientHello");

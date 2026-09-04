@@ -39,32 +39,29 @@ impl ActiveTransfer {
         }
     }
 
-    fn next_frame(&mut self) -> Option<ResourceOutboundFrame> {
+    fn next_frame(&mut self) -> ResourceOutboundFrame {
         if !self.metadata_sent {
             self.metadata_sent = true;
-            return Some(ResourceOutboundFrame::Metadata(ResourceMetadata {
+            return ResourceOutboundFrame::Metadata(ResourceMetadata {
                 resource_hash: self.hash.0.to_vec(),
                 media_type: self.media_type.clone(),
                 encoded_length: self.bytes.len() as u64,
                 decoded_width: 0,
                 decoded_height: 0,
                 priority: ResourcePriority::Normal as i32,
-            }));
+            });
         }
 
-        if self.next_offset >= self.bytes.len() {
-            return None;
-        }
-
+        debug_assert!(self.next_offset < self.bytes.len());
         let start = self.next_offset;
         let end = (start + CHUNK_PAYLOAD_SIZE).min(self.bytes.len());
         let data = self.bytes[start..end].to_vec();
         self.next_offset = end;
-        Some(ResourceOutboundFrame::Chunk(ResourceChunk {
+        ResourceOutboundFrame::Chunk(ResourceChunk {
             resource_hash: self.hash.0.to_vec(),
             byte_offset: start as u64,
             data,
-        }))
+        })
     }
 
     fn is_complete(&self) -> bool {
@@ -108,25 +105,17 @@ impl ResourceTransferQueue {
 
     /// Emits the next metadata or chunk frame, advancing the cursor by at most one frame.
     pub(crate) fn pop_frame(&mut self) -> Option<ResourceOutboundFrame> {
-        loop {
-            if self.active.is_none() {
-                let next = self.pending.pop_front()?;
-                self.active = Some(ActiveTransfer::from_entry(next));
-            }
-
-            let active = self.active.as_mut()?;
-            let Some(frame) = active.next_frame() else {
-                // `next_frame` returns `None` only when metadata is sent and no bytes remain.
-                // `is_complete()` already clears `active` after that last `Some` frame, so this
-                // branch is defensive against the two predicates drifting apart.
-                self.active = None;
-                continue;
-            };
-            if active.is_complete() {
-                self.active = None;
-            }
-            return Some(frame);
+        if self.active.is_none() {
+            let next = self.pending.pop_front()?;
+            self.active = Some(ActiveTransfer::from_entry(next));
         }
+
+        let active = self.active.as_mut()?;
+        let frame = active.next_frame();
+        if active.is_complete() {
+            self.active = None;
+        }
+        Some(frame)
     }
 }
 

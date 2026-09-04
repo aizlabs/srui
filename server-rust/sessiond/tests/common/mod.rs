@@ -102,6 +102,7 @@ impl TestClientConnection {
                 limits: None,
                 client_instance_id: client_instance_id.to_vec(),
                 client_metadata: Default::default(),
+                known_resource_hashes: vec![],
             })),
         };
         write.send(hello).await.expect("send ClientHello");
@@ -221,6 +222,7 @@ pub async fn read_session_id_from_counter_sessiond(socket_path: &std::path::Path
             limits: None,
             client_instance_id: vec![7, 7],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     write.send(hello).await.expect("send ClientHello");

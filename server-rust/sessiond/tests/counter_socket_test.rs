@@ -158,6 +158,7 @@ impl CounterConnection {
                 limits: None,
                 client_instance_id: client_instance_id.to_vec(),
                 client_metadata: Default::default(),
+                known_resource_hashes: vec![],
             })),
         };
         write.send(hello).await.expect("send ClientHello");
@@ -220,6 +221,8 @@ impl CounterConnection {
                 last_applied_revision,
                 last_acked_event_seq: 0,
                 terminal_stream_offsets: Default::default(),
+                limits: None,
+                known_resource_hashes: vec![],
             })),
         };
         write.send(resume).await.expect("send ClientResume");
@@ -453,6 +456,7 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
             limits: None,
             client_instance_id: vec![10, 20, 30, 40],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     framed_write
@@ -668,6 +672,7 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
             limits: None,
             client_instance_id: vec![1, 2, 3, 4],
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         })),
     };
     framed_write
@@ -1020,6 +1025,7 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
                 limits: None,
                 client_instance_id: client_id.to_vec(),
                 client_metadata: Default::default(),
+                known_resource_hashes: vec![],
             })),
         };
         framed_write.send(hello).await.expect("send ClientHello");

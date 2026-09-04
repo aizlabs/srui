@@ -1068,6 +1068,7 @@ mod tests {
             limits: None,
             client_instance_id: Vec::new(),
             client_metadata: Default::default(),
+            known_resource_hashes: vec![],
         };
 
         let bootstrap = session

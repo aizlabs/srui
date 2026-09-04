@@ -12,7 +12,7 @@
 mod coalesce;
 mod resource;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use srui_protocol::{ResourceChunk, ResourceMetadata, Transaction};
 use srui_resources::ResourceEntry;
-use srui_semantic_tree::Transaction as DomainTxn;
+use srui_semantic_tree::{ResourceHash, Transaction as DomainTxn};
 
 use crate::session::{lock_or_recover, SessionError};
 
@@ -589,14 +589,20 @@ impl OutboundHub {
     }
 
     /// Seeds one subscriber with retained resources during handshake bootstrap (§14, §18, §20.2).
+    pub fn seed_resources(&self, receiver: &OutboundReceiver, entries: &[ResourceEntry]) {
+        self.seed_resources_excluding(receiver, entries, &HashSet::new());
+    }
+
+    /// Seeds retained resources except hashes the client has already verified (§14, §18).
     ///
     /// Called while the session lock is held, immediately after [`OutboundHub::subscribe`], so a
     /// resource published between snapshot creation and live subscription cannot be missed.
-    ///
-    /// Task 26 has no client "already have hash" signal, so retained resources are re-queued on
-    /// every attach; sharing a client `ResourceCache` across controller generations makes the
-    /// duplicate decode path cheap.
-    pub fn seed_resources(&self, receiver: &OutboundReceiver, entries: &[ResourceEntry]) {
+    pub fn seed_resources_excluding(
+        &self,
+        receiver: &OutboundReceiver,
+        entries: &[ResourceEntry],
+        known_hashes: &HashSet<ResourceHash>,
+    ) {
         if entries.is_empty() {
             return;
         }
@@ -608,16 +614,23 @@ impl OutboundHub {
         else {
             return;
         };
+        let mut enqueued = false;
         {
             let mut guard = lock_or_recover(&sub.state);
             if guard.is_closed {
                 return;
             }
             for entry in entries {
+                if known_hashes.contains(&entry.hash) {
+                    continue;
+                }
                 guard.maybe_enqueue_resource(entry.clone());
+                enqueued = true;
             }
         }
-        let _ = sub.notify_tx.try_send(());
+        if enqueued {
+            let _ = sub.notify_tx.try_send(());
+        }
     }
 
     pub fn is_client_stale(&self, client_instance_id: &[u8]) -> bool {

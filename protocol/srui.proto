@@ -518,6 +518,8 @@ message ClientHello {
   ClientLimits limits = 3;
   bytes client_instance_id = 4;
   map<string, string> client_metadata = 5;
+  // Verified committed CAS entries the server need not transfer again (§14, §18).
+  repeated bytes known_resource_hashes = 6;
 }
 
 message ServerWelcome {
@@ -537,6 +539,10 @@ message ClientResume {
   uint64 last_applied_revision = 3;
   uint64 last_acked_event_seq = 4;
   map<uint64, uint64> terminal_stream_offsets = 5;
+  // Re-advertised because server-side per-client negotiation state is bounded (§15, §26).
+  ClientLimits limits = 6;
+  // Verified committed CAS entries the server need not transfer again (§14, §18).
+  repeated bytes known_resource_hashes = 7;
 }
 
 // Machine-readable session identity continuity for a full snapshot response.

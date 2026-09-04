@@ -72,6 +72,34 @@ private func ingestPNG(_ cache: ResourceCache, bytes: [UInt8]) async throws -> R
     )
 }
 
+private func makeFixturePNG(width: Int, marker: UInt8) throws -> [UInt8] {
+    let bytesPerRow = width * 4
+    let pixels = Data(repeating: marker, count: bytesPerRow)
+    let provider = try #require(CGDataProvider(data: pixels as CFData))
+    let image = try #require(
+        CGImage(
+            width: width,
+            height: 1,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: bytesPerRow,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )
+    )
+    let output = NSMutableData()
+    let destination = try #require(
+        CGImageDestinationCreateWithData(output, "public.png" as CFString, 1, nil)
+    )
+    CGImageDestinationAddImage(destination, image, nil)
+    #expect(CGImageDestinationFinalize(destination))
+    return [UInt8](output as Data)
+}
+
 @Suite("ResourceCache")
 struct ResourceCacheTests {
     @Test
@@ -388,12 +416,56 @@ struct ResourceCacheTests {
     }
 
     @Test
+    func failedLiveReferenceInsertionDoesNotPartiallyEvict() async throws {
+        let largeBytes = try makeFixturePNG(width: 3, marker: 0x7F)
+        let probe = ResourceCache()
+        let smallProbe = try await ingestPNG(probe, bytes: FixturePNG.bytes)
+        let largeProbe = try await ingestPNG(probe, bytes: largeBytes)
+        let smallBackingBytes = smallProbe.image.cgImage.bytesPerRow
+        let largeBackingBytes = largeProbe.image.cgImage.bytesPerRow
+        #expect(largeBackingBytes > smallBackingBytes)
+
+        let cache = ResourceCache(
+            limits: ResourceLimits(
+                maxCommittedEntries: 4,
+                maxCommittedDecodedBytes: smallBackingBytes * 3
+            )
+        )
+        let first = try await ingestPNG(cache, bytes: FixturePNG.bytes)
+        let second = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)
+        let third = try await ingestPNG(cache, bytes: FixturePNG.blueBytes)
+        await cache.setLiveReferences([second.image.hash, third.image.hash])
+
+        await #expect(throws: ResourceCacheError.self) {
+            _ = try await ingestPNG(cache, bytes: largeBytes)
+        }
+        #expect(await cache.contains(first.image.hash))
+        #expect(await cache.contains(second.image.hash))
+        #expect(await cache.contains(third.image.hash))
+        #expect(await cache.committedCount() == 3)
+    }
+
+    @Test
+    func committedBudgetUsesDecodedBackingStoreBytes() async throws {
+        let cache = ResourceCache(
+            limits: ResourceLimits(maxCommittedDecodedBytes: 3)
+        )
+
+        await #expect(throws: ResourceCacheError.self) {
+            _ = try await ingestPNG(cache, bytes: FixturePNG.bytes)
+        }
+        #expect(await cache.committedCount() == 0)
+    }
+
+    @Test
     func liveReferencesAreNotEvicted() async throws {
         let cache = ResourceCache(
             limits: ResourceLimits(maxCommittedEntries: 1, maxCommittedDecodedBytes: 1_048_576)
         )
         let first = try await ingestPNG(cache, bytes: FixturePNG.bytes)
-        await cache.setLiveReferences([first.image.hash])
+        #expect(await cache.knownHashes() == [first.image.hash])
+        let hydrated = await cache.setLiveReferencesAndLookup([first.image.hash])
+        #expect(hydrated.map(\.hash) == [first.image.hash])
 
         await #expect(throws: ResourceCacheError.self) {
             _ = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)

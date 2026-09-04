@@ -2240,6 +2240,9 @@ public nonisolated struct Srui_Protocol_ClientHello: Sendable {
 
   public var clientMetadata: Dictionary<String,String> = [:]
 
+  /// Verified committed CAS entries the server need not transfer again (§14, §18).
+  public var knownResourceHashes: [Data] = []
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2296,9 +2299,24 @@ public nonisolated struct Srui_Protocol_ClientResume: Sendable {
 
   public var terminalStreamOffsets: Dictionary<UInt64,UInt64> = [:]
 
+  /// Re-advertised because server-side per-client negotiation state is bounded (§15, §26).
+  public var limits: Srui_Protocol_ClientLimits {
+    get {_limits ?? Srui_Protocol_ClientLimits()}
+    set {_limits = newValue}
+  }
+  /// Returns true if `limits` has been explicitly set.
+  public var hasLimits: Bool {self._limits != nil}
+  /// Clears the value of `limits`. Subsequent reads from it will return its default value.
+  public mutating func clearLimits() {self._limits = nil}
+
+  /// Verified committed CAS entries the server need not transfer again (§14, §18).
+  public var knownResourceHashes: [Data] = []
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
+
+  fileprivate var _limits: Srui_Protocol_ClientLimits? = nil
 }
 
 public nonisolated struct Srui_Protocol_ServerResumeOk: Sendable {
@@ -4434,7 +4452,7 @@ nonisolated extension Srui_Protocol_ExtensionNamespaceMapping: SwiftProtobuf.Mes
 
 nonisolated extension Srui_Protocol_ClientHello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ClientHello"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}core_version\0\u{1}profiles\0\u{1}limits\0\u{3}client_instance_id\0\u{3}client_metadata\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}core_version\0\u{1}profiles\0\u{1}limits\0\u{3}client_instance_id\0\u{3}client_metadata\0\u{3}known_resource_hashes\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4447,6 +4465,7 @@ nonisolated extension Srui_Protocol_ClientHello: SwiftProtobuf.Message, SwiftPro
       case 3: try { try decoder.decodeSingularMessageField(value: &self._limits) }()
       case 4: try { try decoder.decodeSingularBytesField(value: &self.clientInstanceID) }()
       case 5: try { try decoder.decodeMapField(fieldType: SwiftProtobuf._ProtobufMap<SwiftProtobuf.ProtobufString,SwiftProtobuf.ProtobufString>.self, value: &self.clientMetadata) }()
+      case 6: try { try decoder.decodeRepeatedBytesField(value: &self.knownResourceHashes) }()
       default: break
       }
     }
@@ -4472,6 +4491,9 @@ nonisolated extension Srui_Protocol_ClientHello: SwiftProtobuf.Message, SwiftPro
     if !self.clientMetadata.isEmpty {
       try visitor.visitMapField(fieldType: SwiftProtobuf._ProtobufMap<SwiftProtobuf.ProtobufString,SwiftProtobuf.ProtobufString>.self, value: self.clientMetadata, fieldNumber: 5)
     }
+    if !self.knownResourceHashes.isEmpty {
+      try visitor.visitRepeatedBytesField(value: self.knownResourceHashes, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4481,6 +4503,7 @@ nonisolated extension Srui_Protocol_ClientHello: SwiftProtobuf.Message, SwiftPro
     if lhs._limits != rhs._limits {return false}
     if lhs.clientInstanceID != rhs.clientInstanceID {return false}
     if lhs.clientMetadata != rhs.clientMetadata {return false}
+    if lhs.knownResourceHashes != rhs.knownResourceHashes {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4552,7 +4575,7 @@ nonisolated extension Srui_Protocol_ServerWelcome: SwiftProtobuf.Message, SwiftP
 
 nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ClientResume"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}client_instance_id\0\u{3}last_applied_revision\0\u{3}last_acked_event_seq\0\u{3}terminal_stream_offsets\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}client_instance_id\0\u{3}last_applied_revision\0\u{3}last_acked_event_seq\0\u{3}terminal_stream_offsets\0\u{1}limits\0\u{3}known_resource_hashes\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4565,12 +4588,18 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
       case 3: try { try decoder.decodeSingularUInt64Field(value: &self.lastAppliedRevision) }()
       case 4: try { try decoder.decodeSingularUInt64Field(value: &self.lastAckedEventSeq) }()
       case 5: try { try decoder.decodeMapField(fieldType: SwiftProtobuf._ProtobufMap<SwiftProtobuf.ProtobufUInt64,SwiftProtobuf.ProtobufUInt64>.self, value: &self.terminalStreamOffsets) }()
+      case 6: try { try decoder.decodeSingularMessageField(value: &self._limits) }()
+      case 7: try { try decoder.decodeRepeatedBytesField(value: &self.knownResourceHashes) }()
       default: break
       }
     }
   }
 
   public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    // The use of inline closures is to circumvent an issue where the compiler
+    // allocates stack space for every if/case branch local when no optimizations
+    // are enabled. https://github.com/apple/swift-protobuf/issues/1034 and
+    // https://github.com/apple/swift-protobuf/issues/1182
     if !self.sessionID.isEmpty {
       try visitor.visitSingularStringField(value: self.sessionID, fieldNumber: 1)
     }
@@ -4586,6 +4615,12 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
     if !self.terminalStreamOffsets.isEmpty {
       try visitor.visitMapField(fieldType: SwiftProtobuf._ProtobufMap<SwiftProtobuf.ProtobufUInt64,SwiftProtobuf.ProtobufUInt64>.self, value: self.terminalStreamOffsets, fieldNumber: 5)
     }
+    try { if let v = self._limits {
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 6)
+    } }()
+    if !self.knownResourceHashes.isEmpty {
+      try visitor.visitRepeatedBytesField(value: self.knownResourceHashes, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4595,6 +4630,8 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
     if lhs.lastAppliedRevision != rhs.lastAppliedRevision {return false}
     if lhs.lastAckedEventSeq != rhs.lastAckedEventSeq {return false}
     if lhs.terminalStreamOffsets != rhs.terminalStreamOffsets {return false}
+    if lhs._limits != rhs._limits {return false}
+    if lhs.knownResourceHashes != rhs.knownResourceHashes {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

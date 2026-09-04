@@ -41,7 +41,7 @@ public struct ResourceLimits: Sendable, Equatable {
     public var maxInFlightBytes: Int
     /// Maximum number of committed decoded images retained in the CAS.
     public var maxCommittedEntries: Int
-    /// Maximum aggregate decoded RGBA bytes (`width × height × 4`) across committed images.
+    /// Maximum aggregate decoded backing-store bytes (`bytesPerRow × height`) across committed images.
     public var maxCommittedDecodedBytes: Int
 
     public init(
@@ -273,6 +273,26 @@ public actor ResourceCache {
         committed.count
     }
 
+    /// Verified committed hashes suitable for reconnect negotiation (§14, §18).
+    public func knownHashes() -> [ResourceHash] {
+        committedOrder
+    }
+
+    /// Pins `hashes` and returns matching verified images in cache-recency order.
+    ///
+    /// This single actor operation prevents a reconnecting renderer from looking up entries
+    /// before they are protected from eviction (§14, §18, §26).
+    public func setLiveReferencesAndLookup(
+        _ hashes: Set<ResourceHash>
+    ) -> [ValidatedDecodedImage] {
+        liveReferences = hashes
+        let hits = committedOrder.filter { hashes.contains($0) }
+        for hash in hits {
+            touchCommitted(hash)
+        }
+        return hits.compactMap { committed[$0] }
+    }
+
     /// Discards all in-flight assemblies while retaining the committed CAS (§14, §18).
     public func clearPartials() {
         partials.removeAll(keepingCapacity: false)
@@ -474,10 +494,7 @@ public actor ResourceCache {
             return []
         }
 
-        let decodedBytes = Self.estimatedDecodedBytes(
-            width: image.pixelWidth,
-            height: image.pixelHeight
-        )
+        let decodedBytes = Self.estimatedDecodedBytes(image.cgImage)
         // A single image larger than the committed budget must be rejected, not force-inserted
         // after emptying the CAS (§26).
         if decodedBytes > limits.maxCommittedDecodedBytes {
@@ -487,29 +504,48 @@ public actor ResourceCache {
             )
         }
 
+        // Plan every eviction before mutating the cache. If live entries make the insertion
+        // impossible, a failure must not discard unrelated verified content (§14, §26).
         var evicted: [ResourceHash] = []
-        while committed.count >= limits.maxCommittedEntries {
-            guard let oldest = evictOldestCommitted(excluding: liveReferences) else {
-                throw ResourceCacheError.committedEntryLimit(
-                    count: committed.count + 1,
-                    limit: limits.maxCommittedEntries
-                )
+        var projectedCount = committed.count
+        var projectedBytes = committedDecodedBytes
+        for candidate in committedOrder where !liveReferences.contains(candidate) {
+            let next = projectedBytes.addingReportingOverflow(decodedBytes)
+            if projectedCount < limits.maxCommittedEntries
+                && !next.overflow
+                && next.partialValue <= limits.maxCommittedDecodedBytes {
+                break
             }
-            evicted.append(oldest)
-        }
-        while committedDecodedBytes + decodedBytes > limits.maxCommittedDecodedBytes {
-            guard let oldest = evictOldestCommitted(excluding: liveReferences) else {
-                throw ResourceCacheError.committedBytesLimit(
-                    requested: committedDecodedBytes + decodedBytes,
-                    limit: limits.maxCommittedDecodedBytes
-                )
-            }
-            evicted.append(oldest)
+
+            guard let existing = committed[candidate] else { continue }
+            evicted.append(candidate)
+            projectedCount = max(0, projectedCount - 1)
+            projectedBytes = max(
+                0,
+                projectedBytes - Self.estimatedDecodedBytes(existing.cgImage)
+            )
         }
 
+        if projectedCount >= limits.maxCommittedEntries {
+            throw ResourceCacheError.committedEntryLimit(
+                count: projectedCount + 1,
+                limit: limits.maxCommittedEntries
+            )
+        }
+        let next = projectedBytes.addingReportingOverflow(decodedBytes)
+        if next.overflow || next.partialValue > limits.maxCommittedDecodedBytes {
+            throw ResourceCacheError.committedBytesLimit(
+                requested: next.overflow ? Int.max : next.partialValue,
+                limit: limits.maxCommittedDecodedBytes
+            )
+        }
+
+        for hash in evicted {
+            removeCommitted(hash)
+        }
         committed[image.hash] = image
         committedOrder.append(image.hash)
-        committedDecodedBytes += decodedBytes
+        committedDecodedBytes = next.partialValue
         return evicted
     }
 
@@ -520,29 +556,21 @@ public actor ResourceCache {
         }
     }
 
-    private func evictOldestCommitted(excluding protected: Set<ResourceHash>) -> ResourceHash? {
-        guard let idx = committedOrder.firstIndex(where: { !protected.contains($0) }) else {
-            return nil
+    private func removeCommitted(_ hash: ResourceHash) {
+        if let index = committedOrder.firstIndex(of: hash) {
+            committedOrder.remove(at: index)
         }
-        let oldest = committedOrder.remove(at: idx)
-        if let removed = committed.removeValue(forKey: oldest) {
+        if let removed = committed.removeValue(forKey: hash) {
             committedDecodedBytes = max(
                 0,
-                committedDecodedBytes - Self.estimatedDecodedBytes(
-                    width: removed.pixelWidth,
-                    height: removed.pixelHeight
-                )
+                committedDecodedBytes - Self.estimatedDecodedBytes(removed.cgImage)
             )
         }
-        return oldest
     }
 
-    private static func estimatedDecodedBytes(width: Int, height: Int) -> Int {
-        let pixels = width.multipliedReportingOverflow(by: height)
-        if pixels.overflow { return Int.max / 4 }
-        let bytes = pixels.partialValue.multipliedReportingOverflow(by: 4)
-        if bytes.overflow { return Int.max }
-        return bytes.partialValue
+    private static func estimatedDecodedBytes(_ image: CGImage) -> Int {
+        let bytes = image.bytesPerRow.multipliedReportingOverflow(by: image.height)
+        return bytes.overflow ? Int.max : bytes.partialValue
     }
 
     private func decodeRasterImage(bytes: Data, mediaType: String) throws -> CGImage {

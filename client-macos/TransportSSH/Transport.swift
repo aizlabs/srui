@@ -2,7 +2,11 @@
 // Transport.swift
 // TransportSSH
 //
-// Transport protocol abstraction for SRUI network and IPC channels (§19, §20.2, §22).
+// Transport protocol abstraction for SRUI network and IPC channels (§19, §19.2, §20.2, §22).
+//
+// Logical classes are a transport scheduling concern, not Core message semantics. SSH/TCP
+// serialize selected frames onto one byte stream; a future QUIC binding may map the same
+// classes to independent streams without changing protobuf messages.
 //
 
 import Foundation
@@ -154,7 +158,10 @@ func readAvailable(from latch: SocketReadLatch, into buffer: inout [UInt8]) -> S
 /// is queued behind the very write it is supposed to abort. Moving the write here keeps the actor
 /// free, so `close()` runs, shuts the descriptor down, and the parked write fails out.
 ///
-/// Ordering is preserved by the serial queue, which matches `EventOutbox`'s own FIFO write chain.
+/// Concurrent `write` calls enter per-class FIFO queues. The serial queue drains them through
+/// [`LogicalChannelScheduler`] without holding `NSLock` during `write(2)`, `poll(2)`, or an
+/// async suspension (§19.2, §22.2). `EventOutbox.sendTail` still serializes event allocation
+/// order into the input lane; the scheduler does not replace that §18.2 guarantee.
 final class SocketWriter: @unchecked Sendable {
     /// How long one payload may stay unwritable before the peer is treated as unreachable.
     static let defaultTimeout: TimeInterval = 30
@@ -162,23 +169,56 @@ final class SocketWriter: @unchecked Sendable {
     /// Largest single `write(2)` issued between writability polls.
     private static let chunkSize = 64 * 1024
 
+    fileprivate struct PendingWrite {
+        let data: Data
+        let continuation: CheckedContinuation<Void, any Error>
+    }
+
     private let queue: DispatchQueue
     private let timeout: TimeInterval
     private let label: String
     private let lock = NSLock()
     private var stopped = false
+    private var drainScheduled = false
+    private var scheduler = LogicalChannelScheduler()
+    private var queues: [LogicalChannelClass: [PendingWrite]] = Dictionary(
+        uniqueKeysWithValues: LogicalChannelClass.allCases.map { ($0, []) }
+    )
+    /// Optional test sink; when set, the drain loop calls this instead of `write(2)`.
+    private let testSink: ((Data) throws -> Void)?
 
     init(label: String, timeout: TimeInterval = SocketWriter.defaultTimeout) {
         self.label = label
         self.queue = DispatchQueue(label: label)
         self.timeout = timeout
+        self.testSink = nil
     }
 
-    /// Refuses further writes. Already-parked writes unblock when the descriptor is shut down.
+    /// Test-only writer that drains through `sink` instead of a socket descriptor.
+    init(
+        label: String,
+        timeout: TimeInterval = SocketWriter.defaultTimeout,
+        testSink: @escaping (Data) throws -> Void
+    ) {
+        self.label = label
+        self.queue = DispatchQueue(label: label)
+        self.timeout = timeout
+        self.testSink = testSink
+    }
+
+    /// Refuses further writes and resumes every queued continuation exactly once.
     func stop() {
+        let pending = takeAllAndStop()
+        resumeAll(pending, throwing: TransportError.closed)
+    }
+
+    /// Frames waiting in per-class queues, excluding a write already popped for I/O.
+    func queuedCount() -> Int {
         lock.lock()
-        stopped = true
-        lock.unlock()
+        defer { lock.unlock() }
+        return LogicalChannelClass.allCases.reduce(0) { partial, logicalClass in
+            partial + (queues[logicalClass]?.count ?? 0)
+        }
     }
 
     private var isStopped: Bool {
@@ -187,17 +227,103 @@ final class SocketWriter: @unchecked Sendable {
         return stopped
     }
 
-    /// Writes `data` in full, claiming the descriptor from `latch` for the duration.
+    /// Writes `data` as control-class traffic. Compatibility path for unclassified callers.
     func write(_ data: Data, claiming latch: SocketReadLatch) async throws {
+        try await write(data, logicalClass: .control, claiming: latch)
+    }
+
+    /// Enqueues `data` on `logicalClass` and resumes when the scheduler drains it.
+    func write(
+        _ data: Data,
+        logicalClass: LogicalChannelClass,
+        claiming latch: SocketReadLatch
+    ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-            queue.async {
-                do {
-                    try self.writeSynchronously(data, claiming: latch)
-                    continuation.resume()
-                } catch {
-                    continuation.resume(throwing: error)
+            lock.lock()
+            if stopped {
+                lock.unlock()
+                continuation.resume(throwing: TransportError.closed)
+                return
+            }
+            var lane = queues[logicalClass] ?? []
+            lane.append(PendingWrite(data: data, continuation: continuation))
+            queues[logicalClass] = lane
+            let shouldSchedule = !drainScheduled
+            if shouldSchedule {
+                drainScheduled = true
+            }
+            lock.unlock()
+            if shouldSchedule {
+                queue.async {
+                    self.drain(claiming: latch)
                 }
             }
+        }
+    }
+
+    private func drain(claiming latch: SocketReadLatch) {
+        while true {
+            lock.lock()
+            if stopped {
+                let pending = takeAllLocked()
+                drainScheduled = false
+                lock.unlock()
+                resumeAll(pending, throwing: TransportError.closed)
+                return
+            }
+            guard let logicalClass = scheduler.selectNext(ready: { class in
+                !(self.queues[class] ?? []).isEmpty
+            }) else {
+                drainScheduled = false
+                lock.unlock()
+                return
+            }
+            var lane = queues[logicalClass] ?? []
+            let item = lane.removeFirst()
+            queues[logicalClass] = lane
+            lock.unlock()
+
+            do {
+                if let testSink {
+                    try testSink(item.data)
+                } else {
+                    try writeSynchronously(item.data, claiming: latch)
+                }
+                item.continuation.resume()
+            } catch {
+                lock.lock()
+                stopped = true
+                let rest = takeAllLocked()
+                drainScheduled = false
+                lock.unlock()
+                item.continuation.resume(throwing: error)
+                resumeAll(rest, throwing: error)
+                return
+            }
+        }
+    }
+
+    private func takeAllAndStop() -> [PendingWrite] {
+        lock.lock()
+        stopped = true
+        let pending = takeAllLocked()
+        drainScheduled = false
+        lock.unlock()
+        return pending
+    }
+
+    private func takeAllLocked() -> [PendingWrite] {
+        var pending: [PendingWrite] = []
+        for logicalClass in LogicalChannelClass.allCases {
+            pending.append(contentsOf: queues[logicalClass] ?? [])
+            queues[logicalClass] = []
+        }
+        return pending
+    }
+
+    private func resumeAll(_ items: [PendingWrite], throwing error: Error) {
+        for item in items {
+            item.continuation.resume(throwing: error)
         }
     }
 
@@ -274,8 +400,14 @@ final class SocketWriter: @unchecked Sendable {
 /// Abstract stream transport interface decoupling the protocol and session layers
 /// from the underlying socket or SSH channel implementation (§19, §20.2, §22).
 public protocol Transport: Sendable {
-    /// Transmits raw framed bytes over the transport connection.
+    /// Transmits raw framed bytes over the transport connection as control-class traffic.
     func send(data: Data) async throws
+
+    /// Transmits raw framed bytes on an explicit logical class (§19.2).
+    ///
+    /// Production transports must implement this overload. The default calls `send(data:)` so
+    /// unrelated test doubles that only implement the compatibility path keep compiling.
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws
 
     /// Returns an asynchronous throwing stream of incoming raw byte chunks from the remote peer.
     func receiveStream() -> AsyncThrowingStream<Data, Error>
@@ -293,6 +425,12 @@ public protocol Transport: Sendable {
 }
 
 extension Transport {
+    /// Compatibility path: unclassified writes are treated as `send(data:)` by test doubles.
+    public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        _ = logicalClass
+        try await send(data: data)
+    }
+
     /// In-memory transports have no socket to throttle, so acknowledgement is a no-op for them.
     public func acknowledgeReceived(byteCount: Int) async {}
 }

@@ -166,6 +166,58 @@ struct TransportBackpressureTests {
         )
     }
 
+    /// Queued writes across classes each resume exactly once on teardown.
+    @Test("Stopping the writer resumes every queued continuation exactly once")
+    func stopResumesEveryQueuedContinuationOnce() async throws {
+        let sink = GatedFailingSink()
+        let writer = SocketWriter(label: "test.multi-class-stop", testSink: { try sink.write($0) })
+        let latch = SocketReadLatch()
+
+        let classes: [LogicalChannelClass] = [.control, .input, .ui, .resource, .terminalHigh, .terminalNormal]
+        let tasks = classes.map { logicalClass in
+            Task {
+                try await writer.write(Data("\(logicalClass)".utf8), logicalClass: logicalClass, claiming: latch)
+            }
+        }
+
+        sink.waitUntilEntered(1)
+        writer.stop()
+        sink.fail(TransportError.closed)
+        latch.stop()
+
+        var finished = 0
+        for task in tasks {
+            let result = await task.result
+            #expect((try? result.get()) == nil)
+            finished += 1
+        }
+        #expect(finished == classes.count)
+    }
+
+    /// A write failure fails every queued class continuation once; no hang after teardown.
+    @Test("A write failure resumes queued continuations exactly once")
+    func writeFailureResumesQueuedContinuationsOnce() async throws {
+        let sink = GatedFailingSink()
+        let writer = SocketWriter(label: "test.multi-class-fail", testSink: { try sink.write($0) })
+        let latch = SocketReadLatch()
+
+        let classes: [LogicalChannelClass] = [.resource, .control, .input, .ui]
+        let tasks = classes.map { logicalClass in
+            Task {
+                try await writer.write(Data("\(logicalClass)".utf8), logicalClass: logicalClass, claiming: latch)
+            }
+        }
+
+        sink.waitUntilEntered(1)
+        sink.fail(TransportError.ioError("injected failure"))
+
+        for task in tasks {
+            let result = await task.result
+            #expect((try? result.get()) == nil)
+        }
+        latch.stop()
+    }
+
     /// The latch must not release a descriptor number while an I/O call still holds it, or the
     /// kernel can recycle it under a parked `read`/`write`.
     @Test("A stop during an outstanding claim defers the close to the claim holder")
@@ -187,5 +239,39 @@ struct TransportBackpressureTests {
         latch.endIO()
         #expect(fcntl(writable, F_GETFD) == -1, "the last claim release must perform the close")
         #expect(latch.beginIO() == nil, "a stopped latch hands out no further claims")
+    }
+}
+
+private final class GatedFailingSink: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var entered = 0
+    private var failure: (any Error)?
+
+    func write(_ data: Data) throws {
+        _ = data
+        condition.lock()
+        entered += 1
+        condition.broadcast()
+        while failure == nil {
+            condition.wait()
+        }
+        let error = failure!
+        condition.unlock()
+        throw error
+    }
+
+    func waitUntilEntered(_ count: Int) {
+        condition.lock()
+        while entered < count {
+            condition.wait()
+        }
+        condition.unlock()
+    }
+
+    func fail(_ error: any Error) {
+        condition.lock()
+        failure = error
+        condition.broadcast()
+        condition.unlock()
     }
 }

@@ -7,21 +7,33 @@
 //! a retry can read the settled result. Validation refusals are acknowledged as `REJECTED` rather
 //! than closing the stream; only protocol violations are fatal.
 //!
+//! Post-handshake, reading and writing are concurrently driven futures over the already-split
+//! socket halves: the read future consumes semantic events independently of resource output, and
+//! the write future selects exactly one frame through [`LogicalChannelScheduler`]. Acks are
+//! enqueued one-at-a-time on a bounded control channel (`send().await`) rather than dropped.
+//!
 //! Conforms strictly to:
 //! - [`async-cancel-safety`](rules/async-cancel-safety.md): uses [`SruiCodec`] with `tokio_util::codec::FramedRead`
 //!   inside `tokio::select!` so mid-frame cancellations do not corrupt stream buffers.
-//! - [`async-bounded-channel`](rules/async-bounded-channel.md): all transaction and event flows use bounded queues.
-//! - [`async-cancellation-token`](rules/async-cancellation-token.md): uses [`CancellationToken`] for clean disconnection.
+//! - [`async-bounded-channel`](rules/async-bounded-channel.md): all transaction, control, and event flows use bounded queues.
+//! - [`async-cancellation-token`](rules/async-cancellation-token.md): uses a connection-local [`CancellationToken`] for clean disconnection.
+//! - [`async-no-lock-await`](rules/async-no-lock-await.md): no locks are held across `.await`.
 
 use futures::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::outbound::{OutboundItem, OutboundReceiver, OutboundRecvError};
+use crate::outbound::{
+    logical_class_for_server_envelope, LogicalChannelClass, LogicalChannelScheduler, OutboundItem,
+    OutboundReceiver, OutboundRecvError,
+};
 use crate::session::{EventOutcome, ResumeOutcome, Session, SessionError};
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
@@ -38,6 +50,11 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the queue nor the disconnect token ever fires because nothing else is trying to publish to it.
 /// The deadline turns that indefinite park into a detach, after which the client resyncs (§20.2).
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded per-connection queue of control-class frames (`SERVER EVENT_ACK`, §18.2, §19.2).
+///
+/// `send().await` applies backpressure into the read future instead of dropping acks.
+const CONTROL_CHANNEL_CAPACITY: usize = 64;
 
 /// Errors occurring during connection lifecycle.
 #[derive(Debug, Error)]
@@ -75,6 +92,11 @@ pub enum ConnectionError {
 /// Returns `Ok(true)` if the frame was written, `Ok(false)` if the connection should
 /// unwind cleanly (shutdown or hub close). A lagged queue is a hard resync error.
 ///
+/// `logical_class` documents the [`LogicalChannelClass`] of this write. Handshake writes
+/// keep their original order; the active-session writer selects classes through the
+/// scheduler. WELCOME/resume responses are control; snapshots and replayed transactions
+/// are UI (§19.2).
+///
 /// # Cancellation
 ///
 /// The write is polled first (`biased`), so a frame the socket can accept immediately is always
@@ -86,12 +108,19 @@ pub enum ConnectionError {
 async fn send_message<W>(
     framed_write: &mut FramedWrite<W, SruiCodec>,
     envelope: SruiMessage,
+    logical_class: LogicalChannelClass,
     shutdown: &CancellationToken,
     outbound: &OutboundReceiver,
 ) -> Result<bool, ConnectionError>
 where
     W: AsyncWrite + Unpin,
 {
+    debug_assert_eq!(
+        logical_class_for_server_envelope(&envelope),
+        logical_class,
+        "envelope class must match the annotated write class"
+    );
+    debug!(?logical_class, "sending outbound frame");
     tokio::select! {
         biased;
         // Bounded: a client that stops reading its socket parks this write in the kernel, where
@@ -119,6 +148,20 @@ where
                 warn!("Client outbound subscriber disconnected during send; closing connection to force resync");
                 Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
             }
+        },
+    }
+}
+
+fn outbound_item_to_message(item: OutboundItem) -> SruiMessage {
+    match item {
+        OutboundItem::Transaction(tx) => SruiMessage {
+            msg: Some(srui_message::Msg::Transaction(tx)),
+        },
+        OutboundItem::ResourceMetadata(meta) => SruiMessage {
+            msg: Some(srui_message::Msg::ResourceMetadata(meta)),
+        },
+        OutboundItem::ResourceChunk(chunk) => SruiMessage {
+            msg: Some(srui_message::Msg::ResourceChunk(chunk)),
         },
     }
 }
@@ -175,7 +218,7 @@ where
         }
     };
 
-    let (client_instance_id, mut tx_rx) = match handshake_msg.msg {
+    let (client_instance_id, tx_rx) = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
                 client_instance_id = ?hello.client_instance_id,
@@ -188,6 +231,7 @@ where
             if !send_message(
                 &mut framed_write,
                 welcome_envelope,
+                LogicalChannelClass::Control,
                 &shutdown,
                 &bootstrap.transactions,
             )
@@ -202,6 +246,7 @@ where
                 if !send_message(
                     &mut framed_write,
                     snapshot_envelope,
+                    LogicalChannelClass::Ui,
                     &shutdown,
                     &bootstrap.transactions,
                 )
@@ -231,6 +276,7 @@ where
                     if !send_message(
                         &mut framed_write,
                         envelope,
+                        LogicalChannelClass::Control,
                         &shutdown,
                         &bootstrap.transactions,
                     )
@@ -245,6 +291,7 @@ where
                         if !send_message(
                             &mut framed_write,
                             tx_env,
+                            LogicalChannelClass::Ui,
                             &shutdown,
                             &bootstrap.transactions,
                         )
@@ -264,6 +311,7 @@ where
                     if !send_message(
                         &mut framed_write,
                         envelope,
+                        LogicalChannelClass::Control,
                         &shutdown,
                         &bootstrap.transactions,
                     )
@@ -277,6 +325,7 @@ where
                     if !send_message(
                         &mut framed_write,
                         snapshot_env,
+                        LogicalChannelClass::Ui,
                         &shutdown,
                         &bootstrap.transactions,
                     )
@@ -300,36 +349,141 @@ where
         }
     };
 
-    // -------------------------------------------------------------------------
-    // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
-    // -------------------------------------------------------------------------
-    //
-    // Fair select: a pipelined burst of inbound events must not starve outbound
-    // delivery (bounded queue → LaggedResyncRequired). Within outbound selection,
-    // transactions usually precede one resource frame, with aging so continuous UI
-    // traffic cannot starve resource progress entirely (§19.2).
+    run_active_session(
+        framed_read,
+        framed_write,
+        session,
+        client_instance_id,
+        tx_rx,
+        shutdown,
+    )
+    .await
+}
 
+/// Concurrently drives inbound events and scheduled outbound writes (§18.2, §19.2, §20).
+///
+/// The two futures share a connection-local cancellation token and are not detached: completing
+/// either one cancels the other by dropping it. Locks are never held across `.await`.
+async fn run_active_session<R, W>(
+    framed_read: FramedRead<R, SruiCodec>,
+    framed_write: FramedWrite<W, SruiCodec>,
+    session: Arc<Session>,
+    client_instance_id: Vec<u8>,
+    outbound: OutboundReceiver,
+    shutdown: CancellationToken,
+) -> Result<(), ConnectionError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let session_cancel = CancellationToken::new();
+    // While an event is being processed (and until its SERVER EVENT_ACK is enqueued), UI and
+    // resource frames are not selectable so the ack can occupy the control lane first (§18.2).
+    let ack_hold = Arc::new(AtomicUsize::new(0));
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+
+    let read = read_loop(
+        framed_read,
+        session,
+        client_instance_id,
+        control_tx,
+        shutdown.clone(),
+        session_cancel.clone(),
+        Arc::clone(&ack_hold),
+    );
+    let write = write_loop(
+        framed_write,
+        outbound,
+        control_rx,
+        shutdown,
+        session_cancel.clone(),
+        ack_hold,
+    );
+
+    tokio::pin!(read);
+    tokio::pin!(write);
+    tokio::select! {
+        biased;
+        result = &mut read => {
+            session_cancel.cancel();
+            result
+        }
+        result = &mut write => {
+            session_cancel.cancel();
+            result
+        }
+    }
+}
+
+async fn read_loop<R>(
+    mut framed_read: FramedRead<R, SruiCodec>,
+    session: Arc<Session>,
+    client_instance_id: Vec<u8>,
+    control_tx: mpsc::Sender<SruiMessage>,
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+    ack_hold: Arc<AtomicUsize>,
+) -> Result<(), ConnectionError>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
         tokio::select! {
-            // Cancel-safe incoming message receiver (async-cancel-safety)
+            biased;
+            _ = session_cancel.cancelled() => return Ok(()),
+            _ = shutdown.cancelled() => {
+                debug!("Connection read loop terminating due to shutdown signal");
+                return Ok(());
+            }
             incoming = framed_read.next() => {
                 match incoming {
                     Some(Ok(msg)) => {
-                        // Acks are control-class traffic (§19.2): emitted on the same connection,
-                        // in order, never coalesced or dropped.
-                        if let Some(response) =
-                            handle_incoming_message(msg, &session, &client_instance_id).await?
-                        {
-                            if !send_message(
-                                &mut framed_write,
-                                response,
-                                &shutdown,
-                                &tx_rx,
-                            )
-                            .await?
-                            {
-                                break;
+                        let is_event = matches!(msg.msg, Some(srui_message::Msg::Event(_)));
+                        if is_event {
+                            ack_hold.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let result = handle_incoming_message(msg, &session, &client_instance_id).await;
+                        let response = match result {
+                            Ok(response) => response,
+                            Err(error) => {
+                                if is_event {
+                                    ack_hold.fetch_sub(1, Ordering::SeqCst);
+                                }
+                                return Err(error);
                             }
+                        };
+                        if let Some(response) = response {
+                            debug_assert_eq!(
+                                logical_class_for_server_envelope(&response),
+                                LogicalChannelClass::Control,
+                                "SERVER EVENT_ACK must remain control-class"
+                            );
+                            tokio::select! {
+                                biased;
+                                sent = control_tx.send(response) => {
+                                    if sent.is_err() {
+                                        if is_event {
+                                            ack_hold.fetch_sub(1, Ordering::SeqCst);
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                                _ = session_cancel.cancelled() => {
+                                    if is_event {
+                                        ack_hold.fetch_sub(1, Ordering::SeqCst);
+                                    }
+                                    return Ok(());
+                                }
+                                _ = shutdown.cancelled() => {
+                                    if is_event {
+                                        ack_hold.fetch_sub(1, Ordering::SeqCst);
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        if is_event {
+                            ack_hold.fetch_sub(1, Ordering::SeqCst);
                         }
                     }
                     Some(Err(e)) => {
@@ -338,56 +492,166 @@ where
                     }
                     None => {
                         info!("Client disconnected normally");
-                        break;
+                        return Ok(());
                     }
                 }
             }
+        }
+    }
+}
 
-            // Outgoing selector: UI transaction first, else exactly one resource frame (§14, §19.2)
-            outbound_item = tx_rx.recv() => {
-                match outbound_item {
-                    Ok(item) => {
-                        let envelope = match item {
-                            OutboundItem::Transaction(tx) => SruiMessage {
-                                msg: Some(srui_message::Msg::Transaction(tx)),
-                            },
-                            OutboundItem::ResourceMetadata(meta) => SruiMessage {
-                                msg: Some(srui_message::Msg::ResourceMetadata(meta)),
-                            },
-                            OutboundItem::ResourceChunk(chunk) => SruiMessage {
-                                msg: Some(srui_message::Msg::ResourceChunk(chunk)),
-                            },
-                        };
-                        if !send_message(
-                            &mut framed_write,
-                            envelope,
-                            &shutdown,
-                            &tx_rx,
-                        )
-                        .await?
-                        {
-                            break;
+async fn write_loop<W>(
+    mut framed_write: FramedWrite<W, SruiCodec>,
+    mut outbound: OutboundReceiver,
+    mut control_rx: mpsc::Receiver<SruiMessage>,
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+    ack_hold: Arc<AtomicUsize>,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut scheduler = LogicalChannelScheduler::new();
+    let mut pending_control: Option<SruiMessage> = None;
+    let mut control_closed = false;
+    let mut outbound_idle = false;
+
+    loop {
+        if session_cancel.is_cancelled() || shutdown.is_cancelled() {
+            return Ok(());
+        }
+        match outbound.termination() {
+            Some(OutboundRecvError::Lagged(reason)) => {
+                warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
+                return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
+            }
+            Some(OutboundRecvError::Closed) | None => {}
+        }
+
+        if pending_control.is_none() && !control_closed {
+            match control_rx.try_recv() {
+                Ok(msg) => pending_control = Some(msg),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => control_closed = true,
+            }
+        }
+
+        let hold_non_control = ack_hold.load(Ordering::SeqCst) > 0 && !control_closed;
+        let ready = |class: LogicalChannelClass| match class {
+            LogicalChannelClass::Control => pending_control.is_some(),
+            LogicalChannelClass::Input
+            | LogicalChannelClass::TerminalHigh
+            | LogicalChannelClass::TerminalNormal => false,
+            LogicalChannelClass::Ui => {
+                !hold_non_control && outbound.class_ready(LogicalChannelClass::Ui)
+            }
+            LogicalChannelClass::Resource => {
+                !hold_non_control && outbound.class_ready(LogicalChannelClass::Resource)
+            }
+        };
+
+        if let Some(class) = scheduler.select_next(ready) {
+            let envelope = match class {
+                LogicalChannelClass::Control => pending_control
+                    .take()
+                    .expect("control selected only when a frame is pending"),
+                LogicalChannelClass::Ui | LogicalChannelClass::Resource => {
+                    match outbound.pop_class(class) {
+                        Ok(Some(item)) => outbound_item_to_message(item),
+                        Ok(None) => continue,
+                        Err(OutboundRecvError::Lagged(reason)) => {
+                            warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
+                            return Err(ConnectionError::Session(
+                                SessionError::LaggedResyncRequired,
+                            ));
+                        }
+                        Err(OutboundRecvError::Closed) => {
+                            outbound_idle = true;
+                            continue;
                         }
                     }
+                }
+                LogicalChannelClass::Input
+                | LogicalChannelClass::TerminalHigh
+                | LogicalChannelClass::TerminalNormal => continue,
+            };
+            debug_assert_eq!(logical_class_for_server_envelope(&envelope), class);
+            if !send_message(&mut framed_write, envelope, class, &shutdown, &outbound).await? {
+                return Ok(());
+            }
+            if class == LogicalChannelClass::Resource {
+                tokio::task::yield_now().await;
+            }
+            continue;
+        }
+
+        if pending_control.is_none()
+            && (outbound_idle || outbound.is_closed())
+            && !outbound.class_ready(LogicalChannelClass::Ui)
+            && !outbound.class_ready(LogicalChannelClass::Resource)
+        {
+            // Hub close ends the writer even while the read future is still attached; the
+            // connection-local token then cancels the reader (§20.2).
+            return Ok(());
+        }
+
+        if hold_non_control {
+            tokio::select! {
+                biased;
+                _ = session_cancel.cancelled() => return Ok(()),
+                _ = shutdown.cancelled() => return Ok(()),
+                msg = control_rx.recv(), if pending_control.is_none() && !control_closed => {
+                    match msg {
+                        Some(message) => pending_control = Some(message),
+                        None => control_closed = true,
+                    }
+                }
+                // Re-check `ack_hold` after the read future can run. A settled event with no
+                // ack (`Pending`) must not park this loop on `control_rx` forever.
+                _ = tokio::task::yield_now() => {}
+            }
+            continue;
+        }
+
+        let disconnect = outbound.disconnect_token().clone();
+        tokio::select! {
+            biased;
+            _ = session_cancel.cancelled() => return Ok(()),
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = disconnect.cancelled(), if !outbound_idle => match outbound.termination() {
+                Some(OutboundRecvError::Lagged(reason)) => {
+                    warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
+                    return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
+                }
+                Some(OutboundRecvError::Closed) => {
+                    outbound_idle = !outbound.class_ready(LogicalChannelClass::Ui)
+                        && !outbound.class_ready(LogicalChannelClass::Resource);
+                }
+                None => {
+                    warn!("Client outbound subscriber disconnected during wait; closing connection to force resync");
+                    return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
+                }
+            },
+            msg = control_rx.recv(), if pending_control.is_none() && !control_closed => {
+                match msg {
+                    Some(message) => pending_control = Some(message),
+                    None => control_closed = true,
+                }
+            }
+            result = outbound.wait_for_work(), if !outbound_idle => {
+                match result {
+                    Ok(()) => tokio::task::yield_now().await,
                     Err(OutboundRecvError::Lagged(reason)) => {
                         warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
                         return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
                     }
                     Err(OutboundRecvError::Closed) => {
-                        break;
+                        outbound_idle = true;
                     }
                 }
             }
-
-            // Clean shutdown signal (async-cancellation-token)
-            _ = shutdown.cancelled() => {
-                debug!("Connection loop terminating due to shutdown signal");
-                break;
-            }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_incoming_message(
@@ -574,9 +838,15 @@ mod tests {
         let mut framed_read = FramedRead::new(client_io, SruiCodec::new());
 
         for seq in 0..FRAMES {
-            let sent = send_message(&mut framed_write, ack_envelope(seq), &shutdown, &outbound)
-                .await
-                .expect("send must not fail on a writable sink");
+            let sent = send_message(
+                &mut framed_write,
+                ack_envelope(seq),
+                LogicalChannelClass::Control,
+                &shutdown,
+                &outbound,
+            )
+            .await
+            .expect("send must not fail on a writable sink");
             assert!(
                 sent,
                 "frame {seq} was abandoned even though the sink could accept it immediately"
@@ -643,5 +913,18 @@ mod tests {
             !session.outbound_hub.is_client_stale(&client),
             "a settled catch-up write must clear the overflow marker"
         );
+    }
+
+    #[test]
+    fn server_event_ack_is_control_class() {
+        let ack = ack_envelope(3);
+        assert_eq!(
+            logical_class_for_server_envelope(&ack),
+            LogicalChannelClass::Control
+        );
+        match ack.msg {
+            Some(srui_message::Msg::ServerEventAck(_)) => {}
+            other => panic!("fixture must stay an individual ServerEventAck, got {other:?}"),
+        }
     }
 }

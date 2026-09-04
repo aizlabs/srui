@@ -1,19 +1,18 @@
-//! Resource delivery, corruption, and UI-before-resource scheduling tests (§14, §19.2).
+//! Resource delivery and corruption tests (§14, §19.2).
+//!
+//! UI-before-resource scheduling coverage lives in `logical_channel_scheduler_test.rs`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::duplex;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 
-use srui_protocol::{
-    operation::Op, srui_message, value::Value as WireValInner, SruiCodec, SruiMessage, Transaction,
-};
+use srui_protocol::{srui_message, SruiCodec, SruiMessage, Transaction};
 use srui_resources::CHUNK_PAYLOAD_SIZE;
-use srui_sdk::*;
 use srui_sessiond::{handle_connection, Session};
 
 /// Deterministic valid 1×1 RGB PNG (69 bytes); shared with Swift ResourceCacheTests.
@@ -163,133 +162,6 @@ async fn corruption_fixture_preserves_advertised_hash_on_wire() {
     chunk.data[0] ^= 0xFF;
     assert_ne!(chunk.data.as_slice(), &bytes[..chunk.data.len()]);
     assert_eq!(chunk.resource_hash, hash);
-
-    shutdown.cancel();
-    let _ = server_task.await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ui_transaction_interleaves_ahead_of_remaining_resource_chunks() {
-    let session = Arc::new(Session::new("resource-latency"));
-
-    // Multi-chunk payload so a full transfer at 10 ms/frame exceeds one second.
-    let chunk_count = 120usize;
-
-    // Small duplex so framed writes backpressure: a newly queued SET_PROPERTY then waits
-    // behind at most the resource chunk whose socket write has already begun (§19.2).
-    let (client, server) = duplex(512);
-    let shutdown = CancellationToken::new();
-    let shutdown_server = shutdown.clone();
-    let session_server = Arc::clone(&session);
-    let server_task = tokio::spawn(async move {
-        let _ = handle_connection(server, session_server, shutdown_server).await;
-    });
-
-    let (read_half, write_half) = tokio::io::split(client);
-    let mut framed_read = FramedRead::new(read_half, SruiCodec::new());
-    let mut framed_write = FramedWrite::new(write_half, SruiCodec::new());
-
-    framed_write
-        .send(SruiMessage {
-            msg: Some(srui_message::Msg::ClientHello(srui_protocol::ClientHello {
-                core_version: "0.4.0".into(),
-                profiles: vec!["org.srui.standard-widgets/1".into()],
-                limits: None,
-                client_instance_id: vec![9, 9, 9],
-                client_metadata: Default::default(),
-                known_resource_hashes: vec![],
-            })),
-        })
-        .await
-        .unwrap();
-    let _ = framed_read.next().await; // welcome
-
-    // Seed UI before the resource transfer begins.
-    session
-        .transaction(|ui| {
-            Surface::builder(1).create(ui)?;
-            Text::builder(2).parent(1).text("before").create(ui)?;
-            Ok(())
-        })
-        .unwrap();
-    // Drain the UI snapshot/transaction frames.
-    for _ in 0..4 {
-        let _ = timeout(Duration::from_millis(200), framed_read.next()).await;
-    }
-
-    let mut payload = vec![0u8; CHUNK_PAYLOAD_SIZE * chunk_count];
-    payload[0..8].copy_from_slice(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']);
-    session.publish_resource(&payload).expect("publish large");
-
-    let mut saw_first_chunk = false;
-    let mut resource_frames_after_first_before_tx = 0usize;
-    let mut set_prop_at: Option<Instant> = None;
-    let mut tx_latency = None;
-
-    loop {
-        let msg = timeout(Duration::from_secs(5), framed_read.next())
-            .await
-            .expect("frame timeout")
-            .expect("eof")
-            .expect("decode");
-
-        // Throttle client draining by 10 ms per frame.
-        sleep(Duration::from_millis(10)).await;
-
-        match msg.msg {
-            Some(srui_message::Msg::ResourceChunk(_)) => {
-                if !saw_first_chunk {
-                    saw_first_chunk = true;
-                    set_prop_at = Some(Instant::now());
-                    session
-                        .transaction(|ui| {
-                            ui.set(2, TEXT, "after-first-chunk")?;
-                            Ok(())
-                        })
-                        .unwrap();
-                } else if tx_latency.is_none() {
-                    resource_frames_after_first_before_tx += 1;
-                }
-            }
-            Some(srui_message::Msg::Transaction(tx)) => {
-                let is_text_update = tx.operations.iter().any(|op| {
-                    matches!(
-                        &op.op,
-                        Some(Op::SetProperty(sp)) if {
-                            let prop = sp.property.as_ref().map(|p| p.local_id);
-                            let val = sp.value.as_ref().and_then(|v| match &v.value {
-                                Some(WireValInner::StringValue(s)) => Some(s.as_str()),
-                                _ => None,
-                            });
-                            prop == Some(PropertyRef::TEXT.local_id)
-                                && val == Some("after-first-chunk")
-                        }
-                    )
-                });
-                if is_text_update {
-                    tx_latency = Some(set_prop_at.expect("set prop time").elapsed());
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let latency = tx_latency.expect("SET_PROPERTY transaction must arrive");
-    assert!(
-        resource_frames_after_first_before_tx <= 1,
-        "at most one further resource chunk may precede the transaction, got {resource_frames_after_first_before_tx}"
-    );
-    assert!(
-        latency < Duration::from_millis(250),
-        "UI latency under resource load must stay below 250 ms, got {latency:?}"
-    );
-
-    let full_transfer_estimate = Duration::from_millis(10 * (1 + chunk_count as u64));
-    assert!(
-        full_transfer_estimate > Duration::from_secs(1),
-        "fixture must be large enough that a full drain exceeds 1s ({full_transfer_estimate:?})"
-    );
 
     shutdown.cancel();
     let _ = server_task.await;

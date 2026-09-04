@@ -327,7 +327,7 @@ public final class SessionController: @unchecked Sendable {
             var envelope = SRUIMessage()
             envelope.clientResume = resume
             guard withStateLock({ isRunning }) else { return }
-            try await transport.send(data: SRUIFraming.encodeFramed(envelope))
+            try await transport.send(data: SRUIFraming.encodeFramed(envelope), logicalClass: .control)
             withStateLock {
                 self.phase = .awaitingResume(sessionId: requestedId, generation: resumeGeneration)
             }
@@ -342,7 +342,7 @@ public final class SessionController: @unchecked Sendable {
             var envelope = SRUIMessage()
             envelope.clientHello = hello
             guard withStateLock({ isRunning }) else { return }
-            try await transport.send(data: SRUIFraming.encodeFramed(envelope))
+            try await transport.send(data: SRUIFraming.encodeFramed(envelope), logicalClass: .control)
             withStateLock {
                 self.phase = .awaitingWelcome
             }

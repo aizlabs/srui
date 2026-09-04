@@ -29,6 +29,11 @@ swift test
 swift test --filter FramingStreamDecoderTests            # one XCTest class
 swift test --filter DirtyClassifierTests                 # one swift-testing suite
 
+# Portable logical-channel scheduler (Linux-safe nested package; no AppKit)
+swift test --package-path client-macos/LogicalChannelScheduling
+bash scripts/parse-changed-swift.sh                      # syntax-only; no type checking
+bash scripts/check-logical-channel-scheduling-imports.sh
+
 # Python registry tooling — from repo root (uv, per uv.lock)
 uv sync --extra dev
 uv run python protocol/validate_registry.py
@@ -76,8 +81,9 @@ Layering is enforced by CI, not just convention:
 
 - **`SemanticModel` must never `import AppKit` or `Cocoa`.** CI greps for it and fails the build. It holds `SemanticStore`, `TransactionApplier` (all-or-nothing apply, monotonic `Revision`, §26 limit pre-checks), `Model`, `Value`, `Ids`, and generated `RegistryTables.swift`.
 - `Protocol` — `srui.pb.swift`, `WireConversions.swift` (protobuf ↔ SemanticModel), `Framing.swift`/`Decoder.swift` (streaming frame decode with the same limits as Rust).
+- `LogicalChannelScheduling` — nested Swift package with the platform-neutral weighted scheduler (`LogicalChannelClass`, 24-slot cycle). Linux CI builds and tests this package alone; `TransportSSH` depends on it.
 - `RendererAppKit` — the only AppKit-touching layer. `DirtyClassifier` splits each operation into content / appearance / layout / a11y / resource / structure-affecting classes (§23) so scalar property sets mutate views in place and only structural ops rebuild; `RenderRegistry` maps NodeId → view handles; `ControlFactory`/`LayoutRenderer` build the native tree.
-- `TransportSSH`, `Session`, `Collections`, `Text`, `Terminal`, `Resources`, `Accessibility` — declared targets, currently placeholders.
+- `TransportSSH`, `Session`, `Collections`, `Text`, `Terminal`, `Resources`, `Accessibility` — declared targets. `TransportSSH` owns sockets/SSH; it imports `LogicalChannelScheduling` rather than duplicating the scheduler.
 - Tests mix XCTest (`SemanticModelTests`, `SRUITests`) and swift-testing (`RendererAppKitTests`, `TransactionApplierConcurrencyTests`). Follow whichever framework the file you're editing already uses.
 
 ### Invariants worth internalizing

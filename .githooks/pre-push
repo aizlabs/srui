@@ -1,5 +1,6 @@
 #!/bin/sh
-# Pre-push gate: runs the same checks as .github/workflows/ci.yml, in CI's order.
+# Pre-push gate: registry + rust match `.github/workflows/ci.yml`; Swift matches that file's
+# macOS job on Darwin and `.github/workflows/swift-linux.yml` on Linux.
 #
 # Enable with:
 #     git config core.hooksPath .githooks
@@ -41,27 +42,45 @@ run "rust: cargo clippy" cargo clippy --manifest-path server-rust/Cargo.toml --w
 run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
 run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
 
-# --- Swift Build (CI: job `swift`) -------------------------------------------
-# The integration tests drive a real sessiond and counter server, so both must be built first,
-# exactly as CI does.
-run "swift: build server binaries" cargo build --manifest-path server-rust/Cargo.toml
-run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
-
+# --- Swift (Linux: `swift-linux.yml`; macOS: `ci.yml` job `swift`) ------------
 printf '\n\033[1m== swift: SemanticModel must not import AppKit or Cocoa (§1)\033[0m\n'
 if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then
 	printf '\033[31mFAILED: SemanticModel must never import AppKit or Cocoa\033[0m\n'
 	fail=1
 fi
 
-run "swift: swift test" swift test --package-path client-macos
+if command -v swiftc >/dev/null 2>&1; then
+	run "swift: parse changed sources (syntax-only)" bash scripts/parse-changed-swift.sh
+	run "swift: LogicalChannelScheduling imports" bash scripts/check-logical-channel-scheduling-imports.sh
+else
+	printf '\nskipping Swift parse gate (swiftc not on PATH)\n'
+fi
 
-# --- Generated-file freshness (CI: job `swift`, final step) -------------------
-# The committed Swift bindings are generated output; CI fails on any diff after regeneration.
-# Checked last because it rewrites files in the working tree.
-run "protocol: regenerate bindings" ./protocol/generate_proto.sh
-run "protocol: committed bindings are fresh" git diff --exit-code \
-	client-macos/Protocol/srui.pb.swift \
-	client-macos/SemanticModel/RegistryTables.swift
+if command -v swift >/dev/null 2>&1; then
+	run "swift: LogicalChannelScheduling tests" \
+		swift test --package-path client-macos/LogicalChannelScheduling
+else
+	printf '\nskipping LogicalChannelScheduling tests (swift not on PATH)\n'
+fi
+
+# Full client + proto regeneration need AppKit and protoc-gen-swift (macOS CI).
+if [ "$(uname -s)" = Darwin ]; then
+	# The integration tests drive a real sessiond and counter server, so both must be built first,
+	# exactly as CI does.
+	run "swift: build server binaries" cargo build --manifest-path server-rust/Cargo.toml
+	run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
+	run "swift: swift test" swift test --package-path client-macos
+
+	# --- Generated-file freshness (CI: job `swift`, final step) -------------------
+	# The committed Swift bindings are generated output; CI fails on any diff after regeneration.
+	# Checked last because it rewrites files in the working tree.
+	run "protocol: regenerate bindings" ./protocol/generate_proto.sh
+	run "protocol: committed bindings are fresh" git diff --exit-code \
+		client-macos/Protocol/srui.pb.swift \
+		client-macos/SemanticModel/RegistryTables.swift
+else
+	printf '\nskipping macOS client tests and proto regen on %s\n' "$(uname -s)"
+fi
 
 if [ "$fail" -ne 0 ]; then
 	printf '\n\033[31mpre-push checks failed; push aborted.\033[0m\n'

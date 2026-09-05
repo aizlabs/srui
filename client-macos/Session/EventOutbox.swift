@@ -273,6 +273,9 @@ public actor EventOutbox {
         if laneEpoch < minimumEpoch {
             return nil
         }
+        if let existing = textDrafts[nodeId], existing.editSeq >= editSeq {
+            return try await promoteTextDraft(nodeId: nodeId, via: transport)
+        }
         textDrafts[nodeId] = TextEditDraft(
             nodeId: nodeId,
             text: text,
@@ -564,7 +567,7 @@ public actor EventOutbox {
             )
         }
         activeSessionId = id
-        acknowledgeEvents(throughSeq: lastProcessedEventSeq)
+        acknowledgeEvents(throughSeq: lastProcessedEventSeq, retainTextEdits: true)
         try await resendPendingEvents(via: transport)
         guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
@@ -606,7 +609,7 @@ public actor EventOutbox {
     /// advances the frontier (§18.2).
     func applyLiveResyncFrontier(lastProcessedEventSeq: UInt64) {
         acceptsNewEvents = false
-        acknowledgeEvents(throughSeq: lastProcessedEventSeq)
+        acknowledgeEvents(throughSeq: lastProcessedEventSeq, retainTextEdits: true)
     }
 
     /// Abandons pending intents and binds a replacement incarnation without a resume attempt (§18).
@@ -689,14 +692,19 @@ public actor EventOutbox {
     /// Private for the same reason as `acknowledgeEvent(id:)`: reachable from the wire only
     /// through the identity-checked `settleAcknowledgement`, and internally only from a resume or
     /// resync decision the generation latch already bound to this outbox (§18, §18.2).
+    ///
+    /// `retainTextEdits` keeps assigned `TEXT_EDIT` events in the retry set so a lost rejection
+    /// ack can still be recovered as a duplicate after `RESUME_OK` / live resync (§18.3, §22.6).
     @discardableResult
-    private func acknowledgeEvents(throughSeq seq: UInt64) -> [Event] {
+    private func acknowledgeEvents(throughSeq seq: UInt64, retainTextEdits: Bool = false) -> [Event] {
         guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return [] }
 
         _lastAckedEventSeq = seq
         acknowledgedOutOfOrder = Set(acknowledgedOutOfOrder.filter { $0 > seq })
         let settled = pendingEvents.values
-            .filter { $0.eventSeq <= seq }
+            .filter { event in
+                event.eventSeq <= seq && !(retainTextEdits && event.eventType == .EVENT_TEXT_EDIT)
+            }
             .sorted { $0.eventSeq < $1.eventSeq }
         for event in settled {
             pendingEvents.removeValue(forKey: event.eventId)

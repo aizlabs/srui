@@ -866,4 +866,106 @@ struct EventOutboxTests {
         await seedClient.close()
         await seedServer.close()
     }
+
+    @Test("A later TEXT_EDIT draft is not replaced by an older edit_seq")
+    func queueTextEditIgnoresOlderDraft() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-order"))
+        let first = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "a",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: client
+        ))
+        let newer = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "abc",
+            editSeq: try #require(EditSeq(3)),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(newer == nil)
+        let older = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "ab",
+            editSeq: try #require(EditSeq(2)),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(older == nil)
+        #expect(await outbox.unsentTextDraftCount == 1)
+
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: first.eventSeq,
+            sessionId: "session-order"
+        ).bound)
+        let promoted = try await outbox.promoteReadyTextDrafts(via: client)
+        #expect(promoted.count == 1)
+        #expect(promoted[0].textArg == "abc")
+        #expect(promoted[0].editSeq?.rawValue == 3)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("RESUME_OK frontier does not drop a TEXT_EDIT before its acknowledgement")
+    func resumeFrontierRetainsTextEditUntilSelectiveAck() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-retain"))
+        let textEvent = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: seedClient
+        ))
+        let activate = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(1),
+            via: seedClient
+        )
+        #expect(textEvent.eventSeq == 1)
+        #expect(activate.eventSeq == 2)
+        #expect(await outbox.pendingCount == 2)
+
+        let (client, server) = await PipeTransport.createPair()
+        let generation = await outbox.beginResumeAttempt()
+        let serverStream = server.receiveStream()
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-retain",
+            lastProcessedEventSeq: 2,
+            generation: generation,
+            via: client,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+        #expect(await outbox.assignedTextEditDescriptors().count == 1)
+        #expect(await outbox.assignedTextEditDescriptors()[0].eventId == textEvent.eventId)
+        #expect(await outbox.pendingCount == 1)
+
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var replayed: [Event] = []
+        for try await chunk in serverStream {
+            for msg in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .event(let wireEvent) = msg.msg {
+                    replayed.append(try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent))
+                }
+            }
+            if !replayed.isEmpty {
+                break
+            }
+        }
+        #expect(replayed.map(\.eventId) == [textEvent.eventId])
+
+        await outbox.stopResumeWork(generation: generation)
+        await client.close()
+        await server.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
 }

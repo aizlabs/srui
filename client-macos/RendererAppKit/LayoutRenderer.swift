@@ -30,16 +30,18 @@ public final class LayoutRenderer {
         RendererDiagnostics.log(
             "mount begin revision=\(store.revision) roots=\(store.rootIDs.count)"
         )
-        tearDown()
-        let rebuild: () throws -> Void = {
+        let remount: () throws -> Void = {
+            // Window close emits end-editing synchronously. That callback must not flush
+            // pending drafts before rebuild, or the new adapter reapplies the stale store string (§22.6).
+            self.tearDown()
             for rootID in store.rootIDs {
                 try self.mount(nodeID: rootID, from: store)
             }
         }
         if preserveLocalText {
-            try controlFactory.textEditingSession.withPreservedLocalText(rebuild)
+            try controlFactory.textEditingSession.withPreservedLocalText(remount)
         } else {
-            try rebuild()
+            try remount()
         }
         // tearDown() closed the previous surfaces; a remount must not leave the UI invisible.
         if surfacesShown {

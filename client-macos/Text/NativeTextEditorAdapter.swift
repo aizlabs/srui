@@ -166,6 +166,10 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
 
     private func emitEndEditing() {
         guard !applyingAuthoritative else { return }
+        if session?.isPreservingLocalTextAcrossRemount == true {
+            lastKnownComposing = false
+            return
+        }
         lastKnownComposing = false
         if let applied = session?.setComposing(false, nodeID: nodeID) {
             assignNativeString(applied)

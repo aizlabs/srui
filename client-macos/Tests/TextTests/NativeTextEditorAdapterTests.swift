@@ -130,4 +130,23 @@ struct NativeTextEditorAdapterTests {
         #expect(commits == ["area"])
         #expect(adapter.currentString == "area")
     }
+
+    @Test("End-editing during remount preservation does not flush")
+    func endEditingDuringRemountPreserveDoesNotFlush() {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 180, height: 24))
+        let adapter = NativeTextEditorAdapter(nodeID: NodeId(12), session: session, textField: field)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        #expect(session.applyPublishedValue(nodeID: NodeId(12), published: "hello") == .apply)
+        field.stringValue = "hello!"
+        adapter.notifyTextDidChangeForTests()
+
+        session.withPreservedLocalText {
+            adapter.notifyEndEditingForTests()
+        }
+        #expect(commits.isEmpty)
+        #expect(session.localValue(for: NodeId(12)) == "hello!")
+    }
 }

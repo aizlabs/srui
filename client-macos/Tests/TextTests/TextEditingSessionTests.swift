@@ -194,6 +194,25 @@ struct TextEditingSessionTests {
         #expect(session.localValue(for: nodeID) == "hello")
     }
 
+    @Test("End-editing inside a remount preserve scope does not flush the draft")
+    func remountPreserveDoesNotFlushPendingDraft() {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
+        session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: false)
+
+        let resolution = session.withPreservedLocalText {
+            session.endEditing(nodeID: nodeID)
+            session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: true)
+            return session.applyPublishedValue(nodeID: nodeID, published: "hello")
+        }
+        #expect(resolution == .keepLocal)
+        #expect(session.localValue(for: nodeID) == "hello!")
+        #expect(commits.isEmpty)
+    }
+
     @Test("A remount after a non-publishing acknowledgement applies the store string")
     func remountAfterAcknowledgedRejectApplies() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)

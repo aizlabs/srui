@@ -128,6 +128,12 @@ public final class TextEditingSession {
         return try body()
     }
 
+    /// True while `LayoutRenderer` is tearing down and rebuilding under `withPreservedLocalText`.
+    /// AppKit end-editing callbacks must not flush in this window.
+    public var isPreservingLocalTextAcrossRemount: Bool {
+        preservingLocalTextAcrossRemount
+    }
+
     public func invalidateDraft(for nodeID: NodeId) {
         guard var state = nodes[nodeID] else { return }
         state.pendingValue = nil
@@ -140,6 +146,16 @@ public final class TextEditingSession {
     /// Records a committed local string. While composition is active, remote emission is suppressed.
     public func noteLocalValue(_ value: String, nodeID: NodeId, composing: Bool, flushImmediately: Bool) {
         guard !suppressingLocalEditsForResync else { return }
+        if preservingLocalTextAcrossRemount {
+            var state = nodes[nodeID] ?? NodeState()
+            state.localValue = value
+            state.composing = composing
+            if !composing, state.pendingValue != nil || value != state.lastKnownAuthoritative {
+                state.pendingValue = value
+            }
+            nodes[nodeID] = state
+            return
+        }
         var state = nodes[nodeID] ?? NodeState()
         state.localValue = value
         state.composing = composing
@@ -176,13 +192,14 @@ public final class TextEditingSession {
     }
 
     public func endEditing(nodeID: NodeId) {
-        guard !suppressingLocalEditsForResync else { return }
+        guard !preservingLocalTextAcrossRemount, !suppressingLocalEditsForResync else { return }
         nodes[nodeID]?.debounceTask?.cancel()
         nodes[nodeID]?.debounceTask = nil
         flushPending(nodeID: nodeID)
     }
 
     public func flushPending(nodeID: NodeId) {
+        guard !preservingLocalTextAcrossRemount, !suppressingLocalEditsForResync else { return }
         guard var state = nodes[nodeID], let value = state.pendingValue else { return }
         state.pendingValue = nil
         state.debounceTask?.cancel()

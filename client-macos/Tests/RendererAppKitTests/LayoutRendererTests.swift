@@ -1,6 +1,7 @@
 import AppKit
 import SemanticModel
 import Testing
+import Text
 @testable import RendererAppKit
 @testable import Collections
 
@@ -39,6 +40,45 @@ struct LayoutRendererTests {
 
         #expect(renderer.registry.surfaceHandles.count == 1)
         #expect(renderer.registry.surfaceHandles.allSatisfy { $0.window?.isVisible == true })
+    }
+
+    @Test
+    func structuralRemountKeepsUnflushedTextInputDraft() throws {
+        let renderer = LayoutRenderer()
+        renderer.controlFactory.textEditingSession.debounceNanoseconds = 1_000_000_000
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .textInput,
+                parentID: 1,
+                properties: [(.value, .string("hello"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        #expect(field.stringValue == "hello")
+
+        field.stringValue = "hello!"
+        adapter.notifyTextDidChangeForTests()
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+
+        let structural = SemanticModel.Operation.createNode(id: 3, nodeType: .text, parentID: 1)
+        let newStore = try makeStore(base + [structural])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [structural]),
+            newStore: newStore
+        )
+
+        let after = try #require(renderer.registry.handle(for: editorID))
+        let fieldAfter = try #require(after.view as? NSTextField)
+        #expect(fieldAfter.stringValue == "hello!")
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
     }
 
     @Test

@@ -301,6 +301,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::spec::TerminalSpec;
+    use srui_protocol::TerminalResyncReason;
 
     fn retained_bytes(manager: &PTYManager, id: NodeId) -> Vec<u8> {
         let Some((start, end)) = manager.offsets(id) else {

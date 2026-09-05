@@ -12,7 +12,6 @@ use srui_protocol::{
     TERMINAL_PROFILE_URI,
 };
 use srui_sdk::*;
-use srui_semantic_tree::ServerCapabilities;
 use srui_sessiond::{handle_connection, Session, SessionError, TerminalSpec};
 use tokio::io::duplex;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -67,7 +66,7 @@ async fn connect(
             async move { handle_connection(server_io, session_clone, shutdown_clone).await },
         );
     let (read_half, write_half) = tokio::io::split(client_io);
-    let mut read = FramedRead::new(read_half, SruiCodec::new());
+    let read = FramedRead::new(read_half, SruiCodec::new());
     let mut write = FramedWrite::new(write_half, SruiCodec::new());
     let hello = match resume {
         Some(resume) => SruiMessage {
@@ -136,10 +135,13 @@ async fn snapshot_contains_extension_typeref() {
         other => panic!("expected snapshot, got {other:?}"),
     };
     let created = snapshot.operations.iter().find_map(|op| match &op.op {
-        Some(srui_protocol::operation::Op::CreateNode(create)) => create.node.as_ref(),
+        Some(srui_protocol::operation::Op::CreateNode(create)) => create
+            .node
+            .as_ref()
+            .filter(|node| node.node_id == term.get()),
         _ => None,
     });
-    let node = created.expect("create node");
+    let node = created.expect("terminal create node");
     assert_eq!(node.node_id, term.get());
     let ty = node.r#type.as_ref().expect("type");
     assert_eq!(ty.namespace_id, namespace);
@@ -263,22 +265,27 @@ async fn reconnect_within_retention_replays_without_duplicate_gap() {
         other => panic!("expected resume ok, got {other:?}"),
     }
     let mut replayed = Vec::new();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(Ok(msg))) =
             tokio::time::timeout(Duration::from_millis(200), read.next()).await
         {
             if let Some(srui_message::Msg::TerminalData(data)) = msg.msg {
+                let end = data.byte_offset + data.data.len() as u64;
+                for &(start, stop) in &ranges {
+                    assert!(
+                        end <= start || data.byte_offset >= stop,
+                        "overlapping replay frames [{start},{stop}) and [{}, {end})",
+                        data.byte_offset
+                    );
+                }
+                ranges.push((data.byte_offset, end));
                 replayed.extend_from_slice(&data.data);
                 if replayed
                     .windows(b"SRUI_REPLAY_UNIQUE".len())
                     .any(|window| window == b"SRUI_REPLAY_UNIQUE")
                 {
-                    let count = replayed
-                        .windows(b"SRUI_REPLAY_UNIQUE".len())
-                        .filter(|window| *window == b"SRUI_REPLAY_UNIQUE")
-                        .count();
-                    assert_eq!(count, 1, "replay must not duplicate");
                     return;
                 }
             }

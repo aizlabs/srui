@@ -14,33 +14,21 @@ use crate::outbound::{
 use crate::session::SessionError;
 use srui_protocol::{srui_message, ServerEventAck, SruiCodec, SruiMessage};
 
-use super::{send_message_with_read_state, ConnectionError};
+use super::{send_message_with_read_state, ConnectionError, TerminalLanes, WriterCancel};
 
 pub(super) async fn write_loop<W>(
     framed_write: FramedWrite<W, SruiCodec>,
     outbound: OutboundReceiver,
     control_rx: mpsc::Receiver<ServerEventAck>,
-    terminal_high_rx: mpsc::Receiver<SruiMessage>,
-    terminal_normal_rx: mpsc::Receiver<SruiMessage>,
-    shutdown: CancellationToken,
-    session_cancel: CancellationToken,
-    read_finished: CancellationToken,
+    terminal_lanes: TerminalLanes,
+    cancel: WriterCancel,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWrite + Unpin,
 {
-    Writer::new(
-        framed_write,
-        outbound,
-        control_rx,
-        terminal_high_rx,
-        terminal_normal_rx,
-        shutdown,
-        session_cancel,
-        read_finished,
-    )
-    .run()
-    .await
+    Writer::new(framed_write, outbound, control_rx, terminal_lanes, cancel)
+        .run()
+        .await
 }
 
 /// Owns the active connection's sole scheduler and every piece of outbound writer state.
@@ -71,18 +59,15 @@ where
         framed_write: FramedWrite<W, SruiCodec>,
         outbound: OutboundReceiver,
         control_rx: mpsc::Receiver<ServerEventAck>,
-        terminal_high_rx: mpsc::Receiver<SruiMessage>,
-        terminal_normal_rx: mpsc::Receiver<SruiMessage>,
-        shutdown: CancellationToken,
-        session_cancel: CancellationToken,
-        read_finished: CancellationToken,
+        terminal_lanes: TerminalLanes,
+        cancel: WriterCancel,
     ) -> Self {
         Self {
             framed_write,
             outbound,
             control_rx,
-            terminal_high_rx,
-            terminal_normal_rx,
+            terminal_high_rx: terminal_lanes.high_rx,
+            terminal_normal_rx: terminal_lanes.normal_rx,
             scheduler: LogicalChannelScheduler::new(),
             pending_ack: None,
             pending_terminal_high: None,
@@ -91,9 +76,9 @@ where
             terminal_high_closed: false,
             terminal_normal_closed: false,
             outbound_idle: false,
-            shutdown,
-            session_cancel,
-            read_finished,
+            shutdown: cancel.shutdown,
+            session_cancel: cancel.session_cancel,
+            read_finished: cancel.read_finished,
         }
     }
 

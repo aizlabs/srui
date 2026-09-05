@@ -249,7 +249,7 @@ where
         }
     };
 
-    let (client_instance_id, tx_rx, terminal_negotiated, terminal_live) = match handshake_msg.msg {
+    let (client_instance_id, tx_rx, terminal) = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
                 client_instance_id = ?hello.client_instance_id,
@@ -300,8 +300,10 @@ where
             (
                 hello.client_instance_id,
                 bootstrap.transactions,
-                bootstrap.terminal_negotiated,
-                bootstrap.terminal.live,
+                TerminalConnection {
+                    negotiated: bootstrap.terminal_negotiated,
+                    live: bootstrap.terminal.live,
+                },
             )
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
@@ -399,8 +401,10 @@ where
             (
                 resume.client_instance_id,
                 bootstrap.transactions,
-                bootstrap.terminal_negotiated,
-                bootstrap.terminal.live,
+                TerminalConnection {
+                    negotiated: bootstrap.terminal_negotiated,
+                    live: bootstrap.terminal.live,
+                },
             )
         }
         _ => {
@@ -416,8 +420,7 @@ where
         session,
         client_instance_id,
         tx_rx,
-        terminal_negotiated,
-        terminal_live,
+        terminal,
         shutdown,
     )
     .await
@@ -442,15 +445,27 @@ where
 
 const TERMINAL_LANE_CAPACITY: usize = 64;
 
+struct TerminalConnection {
+    negotiated: bool,
+    live: Vec<TerminalSubscription>,
+}
+
+pub(super) struct TerminalLanes {
+    high_rx: mpsc::Receiver<SruiMessage>,
+    normal_rx: mpsc::Receiver<SruiMessage>,
+}
+
+pub(super) struct WriterCancel {
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+    read_finished: CancellationToken,
+}
+
 fn spawn_terminal_live_pumps(
     live: Vec<TerminalSubscription>,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
-) -> (
-    mpsc::Receiver<SruiMessage>,
-    mpsc::Receiver<SruiMessage>,
-    Vec<tokio::task::JoinHandle<()>>,
-) {
+) -> (TerminalLanes, Vec<tokio::task::JoinHandle<()>>) {
     let (high_tx, high_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
     let (_normal_tx, normal_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
     let mut tasks = Vec::new();
@@ -480,7 +495,7 @@ fn spawn_terminal_live_pumps(
         }));
     }
     drop(high_tx);
-    (high_rx, normal_rx, tasks)
+    (TerminalLanes { high_rx, normal_rx }, tasks)
 }
 
 /// Concurrently drives inbound events and scheduled outbound writes (§18.2, §19.2, §20).
@@ -494,8 +509,7 @@ async fn run_active_session<R, W>(
     session: Arc<Session>,
     client_instance_id: Vec<u8>,
     outbound: OutboundReceiver,
-    terminal_negotiated: bool,
-    terminal_live: Vec<TerminalSubscription>,
+    terminal: TerminalConnection,
     shutdown: CancellationToken,
 ) -> Result<(), ConnectionError>
 where
@@ -516,27 +530,31 @@ where
         })
     };
 
-    let (terminal_high_rx, terminal_normal_rx, terminal_pumps) =
-        spawn_terminal_live_pumps(terminal_live, shutdown.clone(), session_cancel.clone());
+    let (terminal_lanes, terminal_pumps) =
+        spawn_terminal_live_pumps(terminal.live, shutdown.clone(), session_cancel.clone());
     let read = read_loop(
         framed_read,
         session,
         client_instance_id,
         control_tx,
         range_inbox.clone(),
-        terminal_negotiated,
-        shutdown.clone(),
-        session_cancel.clone(),
+        terminal.negotiated,
+        WriterCancel {
+            shutdown: shutdown.clone(),
+            session_cancel: session_cancel.clone(),
+            read_finished: read_finished.clone(),
+        },
     );
     let write = write_loop(
         framed_write,
         outbound,
         control_rx,
-        terminal_high_rx,
-        terminal_normal_rx,
-        shutdown,
-        session_cancel.clone(),
-        read_finished.clone(),
+        terminal_lanes,
+        WriterCancel {
+            shutdown,
+            session_cancel: session_cancel.clone(),
+            read_finished: read_finished.clone(),
+        },
     );
 
     tokio::pin!(read);
@@ -585,8 +603,7 @@ async fn read_loop<R>(
     control_tx: mpsc::Sender<ServerEventAck>,
     range_inbox: ModelRangeRequestInbox,
     terminal_negotiated: bool,
-    shutdown: CancellationToken,
-    session_cancel: CancellationToken,
+    cancel: WriterCancel,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncRead + Unpin,
@@ -594,8 +611,8 @@ where
     loop {
         tokio::select! {
             biased;
-            _ = session_cancel.cancelled() => return Ok(()),
-            _ = shutdown.cancelled() => {
+            _ = cancel.session_cancel.cancelled() => return Ok(()),
+            _ = cancel.shutdown.cancelled() => {
                 debug!("Connection read loop terminating due to shutdown signal");
                 return Ok(());
             }
@@ -619,8 +636,8 @@ where
                                         return Ok(());
                                     }
                                 }
-                                _ = session_cancel.cancelled() => return Ok(()),
-                                _ = shutdown.cancelled() => return Ok(()),
+                                _ = cancel.session_cancel.cancelled() => return Ok(()),
+                                _ = cancel.shutdown.cancelled() => return Ok(()),
                             }
                         }
                     }

@@ -863,24 +863,14 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
-                    try await applyResyncTextCancellation(resync, requireExactMatch: true)
-                } catch let error as EventOutboxError where error == .textEditDiscardMismatch {
-                    await reportFailure(.protocolViolation(
-                        "same-session resync discarded_text_edits did not match assigned TEXT_EDIT identities"
-                    ))
-                    return
-                } catch {
-                    await failReplayError(generation, error)
-                    return
-                }
-                await noteCanceledTextEdits(resync.discardedTextEdits)
-                do {
                     let accepted = try await outbox.completeSameSessionResume(
                         id: resync.sessionID,
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
                         generation: generation,
                         via: transport,
                         enableNewEventsAfterReplay: false,
+                        discardedTextEdits: resync.discardedTextEdits,
+                        requireExactTextMatch: true,
                         onReplayFailure: { [weak self] error in
                             await self?.handlePendingEventReplayFailure(error)
                         }
@@ -892,6 +882,12 @@ public final class SessionController: @unchecked Sendable {
                         )
                         return
                     }
+                    await noteCanceledTextEdits(resync.discardedTextEdits)
+                } catch let error as EventOutboxError where error == .textEditDiscardMismatch {
+                    await reportFailure(.protocolViolation(
+                        "same-session resync discarded_text_edits did not match assigned TEXT_EDIT identities"
+                    ))
+                    return
                 } catch {
                     await failReplayError(generation, error)
                     return
@@ -944,8 +940,14 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
-                    try await applyResyncTextCancellation(resync, requireExactMatch: true)
-                    await noteCanceledTextEdits(resync.discardedTextEdits)
+                    let canceled = try await applyResyncTextCancellation(
+                        resync,
+                        requireExactMatch: true,
+                        onlyIfResumeGeneration: nil
+                    )
+                    if canceled {
+                        await noteCanceledTextEdits(resync.discardedTextEdits)
+                    }
                 } catch {
                     await reportFailure(.protocolViolation(
                         "same-session live resync discarded-text confirmation failed: \(error)"
@@ -1165,26 +1167,47 @@ public final class SessionController: @unchecked Sendable {
 
         if let event = settlement.event, event.eventType == .EVENT_TEXT_EDIT {
             await renderer?.textEditingSession.noteAcknowledged(event)
-            if ack.status == .rejected {
-                // Authoritative string arrives on the transaction stream; `handleTransaction`
-                // promotes drafts after apply. Promoting here races a delayed reject/revert.
+            if ack.revisionAfterEffect > applier.lastAppliedRevision.value {
+                // Control-lane ack can overtake the UI-lane transaction. Promoting the
+                // successor now would replace `lastSubmittedValue` before the delayed
+                // echo is classified (§22.6). `handleTransaction` promotes after apply.
                 return
+            }
+            if ack.status == .rejected {
+                // No forthcoming transaction: revert unless a newer local draft must be kept.
+                await revertRejectedTextEditIfNoSuccessor(event.nodeId)
             }
         }
         await promoteReadyTextDrafts()
     }
 
+    /// A rejected `TEXT_EDIT` whose `revision_after_effect` is already applied will not be
+    /// followed by a correction transaction. Revert the native string unless a newer coalesced
+    /// draft should be promoted instead (§22.6).
+    private func revertRejectedTextEditIfNoSuccessor(_ nodeID: NodeId) async {
+        guard let renderer else { return }
+        await MainActor.run {
+            let session = renderer.textEditingSession
+            guard !session.hasUnsentSuccessorDraft(for: nodeID) else { return }
+            guard let published = session.lastKnownAuthoritative(for: nodeID) else { return }
+            if let adapter = renderer.registry.handle(for: nodeID)?.textAdapter {
+                adapter.applyAuthoritativeString(published)
+            } else {
+                _ = session.applyPublishedValue(nodeID: nodeID, published: published)
+            }
+        }
+    }
+
+    @discardableResult
     private func applyResyncTextCancellation(
         _ resync: SRUIServerResyncRequired,
-        requireExactMatch: Bool
-    ) async throws {
-        let confirming = resync.discardedTextEdits.compactMap(PendingTextEditDescriptor.init(wire:))
-        if requireExactMatch, confirming.count != resync.discardedTextEdits.count {
-            throw EventOutboxError.textEditDiscardMismatch
-        }
+        requireExactMatch: Bool,
+        onlyIfResumeGeneration generation: UInt64?
+    ) async throws -> Bool {
         try await outbox.cancelAssignedTextEdits(
-            confirming: confirming,
-            requireExactMatch: requireExactMatch
+            confirming: resync.discardedTextEdits,
+            requireExactMatch: requireExactMatch,
+            onlyIfResumeGeneration: generation
         )
     }
 
@@ -1289,6 +1312,11 @@ public final class SessionController: @unchecked Sendable {
                 snapshot: snapshot,
                 forceRemount: isResyncSnapshot
             )
+            if !isResyncSnapshot {
+                // Promote after apply so a delayed echo is classified against the submit
+                // that produced this transaction, not a successor assigned from an earlier ack.
+                await promoteReadyTextDrafts()
+            }
 
         case .failure(let err):
             await handleTransactionRejection(err, isResyncSnapshot: isResyncSnapshot)

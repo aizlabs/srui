@@ -701,4 +701,110 @@ struct EventOutboxTests {
         await client.close()
         await server.close()
     }
+
+    @Test("TEXT_EDIT cancel is a no-op when the resume generation no longer owns the latch")
+    func cancelAssignedTextEditsRespectsResumeGeneration() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-gen"))
+        let assigned = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: client
+        ))
+        let discarded = [assigned].compactMap { event -> SRUIPendingTextEditRef? in
+            guard let seq = event.editSeq else { return nil }
+            return PendingTextEditDescriptor(
+                eventId: event.eventId,
+                eventSeq: event.eventSeq,
+                nodeId: event.nodeId,
+                editSeq: seq
+            ).toWire()
+        }
+
+        let stale = await outbox.beginResumeAttempt()
+        let current = await outbox.beginResumeAttempt()
+
+        let skipped = try await outbox.cancelAssignedTextEdits(
+            confirming: discarded,
+            requireExactMatch: true,
+            onlyIfResumeGeneration: stale
+        )
+        #expect(!skipped)
+        #expect(await outbox.assignedTextEditDescriptors().count == 1)
+
+        let liveSkipped = try await outbox.cancelAssignedTextEdits(
+            confirming: discarded,
+            requireExactMatch: true,
+            onlyIfResumeGeneration: nil
+        )
+        #expect(!liveSkipped)
+        #expect(await outbox.assignedTextEditDescriptors().count == 1)
+
+        let canceled = try await outbox.cancelAssignedTextEdits(
+            confirming: discarded,
+            requireExactMatch: true,
+            onlyIfResumeGeneration: current
+        )
+        #expect(canceled)
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("completeSameSessionResume cancels TEXT_EDITs only for the owning generation")
+    func completeSameSessionResumeBindsTextCancelToGeneration() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-bind"))
+        let assigned = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: seedClient
+        ))
+        let discarded = [
+            PendingTextEditDescriptor(
+                eventId: assigned.eventId,
+                eventSeq: assigned.eventSeq,
+                nodeId: assigned.nodeId,
+                editSeq: try #require(assigned.editSeq)
+            ).toWire()
+        ]
+
+        let stale = await outbox.beginResumeAttempt()
+        let current = await outbox.beginResumeAttempt()
+
+        let (client, server) = await PipeTransport.createPair()
+        let refused = try await outbox.completeSameSessionResume(
+            id: "session-bind",
+            lastProcessedEventSeq: 0,
+            generation: stale,
+            via: client,
+            enableNewEventsAfterReplay: false,
+            discardedTextEdits: discarded
+        )
+        #expect(!refused)
+        #expect(await outbox.assignedTextEditDescriptors().count == 1)
+
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-bind",
+            lastProcessedEventSeq: 0,
+            generation: current,
+            via: client,
+            enableNewEventsAfterReplay: false,
+            discardedTextEdits: discarded
+        )
+        #expect(accepted)
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+
+        await client.close()
+        await server.close()
+        await seedClient.close()
+        await seedServer.close()
+    }
 }

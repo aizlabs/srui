@@ -340,6 +340,28 @@ public actor EventOutbox {
         cancelReplayRetryLoopIfSettled()
     }
 
+    /// Cancels assigned `TEXT_EDIT` events only while `generation` still owns the reconnect latch.
+    ///
+    /// `nil` is the live-resync generation: it matches only when no controller holds the latch.
+    /// A stale `SERVER RESYNC_REQUIRED` whose echoed descriptors still match the shared pending
+    /// set must not cancel a newer attempt's in-flight edits (§18, §18.3). Returns `false`
+    /// without mutation when the latch does not match, including before decoding the refs so a
+    /// superseded attempt cannot fail the session closed on a discard mismatch.
+    @discardableResult
+    public func cancelAssignedTextEdits(
+        confirming refs: [SRUIPendingTextEditRef],
+        requireExactMatch: Bool,
+        onlyIfResumeGeneration generation: UInt64?
+    ) throws -> Bool {
+        guard activeResumeGeneration == generation else { return false }
+        let confirming = refs.compactMap(PendingTextEditDescriptor.init(wire:))
+        if requireExactMatch, confirming.count != refs.count {
+            throw EventOutboxError.textEditDiscardMismatch
+        }
+        try cancelAssignedTextEdits(confirming: confirming, requireExactMatch: requireExactMatch)
+        return true
+    }
+
     public func discardUnsentTextDrafts() {
         textDrafts.removeAll(keepingCapacity: true)
     }
@@ -473,15 +495,30 @@ public actor EventOutbox {
     }
 
     /// Completes a same-session decision only if no newer controller superseded this attempt.
+    ///
+    /// When `discardedTextEdits` is non-`nil`, assigned `TEXT_EDIT` cancellation shares this
+    /// generation check so a stale resync cannot drain a newer attempt's pending set (§18.3).
     func completeSameSessionResume(
         id: String,
         lastProcessedEventSeq: UInt64,
         generation: UInt64,
         via transport: any Transport,
         enableNewEventsAfterReplay: Bool,
+        discardedTextEdits: [SRUIPendingTextEditRef]? = nil,
+        requireExactTextMatch: Bool = true,
         onReplayFailure: (@Sendable (String) async -> Void)? = nil
     ) async throws -> Bool {
         guard activeResumeGeneration == generation else { return false }
+        if let discardedTextEdits {
+            let confirming = discardedTextEdits.compactMap(PendingTextEditDescriptor.init(wire:))
+            if requireExactTextMatch, confirming.count != discardedTextEdits.count {
+                throw EventOutboxError.textEditDiscardMismatch
+            }
+            try cancelAssignedTextEdits(
+                confirming: confirming,
+                requireExactMatch: requireExactTextMatch
+            )
+        }
         activeSessionId = id
         acknowledgeEvents(throughSeq: lastProcessedEventSeq)
         try await resendPendingEvents(via: transport)

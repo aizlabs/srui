@@ -851,6 +851,72 @@ struct SessionResumeContinuityTests {
         await server.close()
     }
 
+    @Test("A superseded same-session resync does not cancel a newer attempt's TEXT_EDITs")
+    func supersededSameSessionResyncDoesNotCancelTextEdits() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let textEvent = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(3),
+            via: seedClient
+        ))
+
+        let (firstClient, firstServer) = await PipeTransport.createPair()
+        let firstCollector = ResumeWireCollector()
+        await firstCollector.start(draining: firstServer)
+        let firstController = SessionController(
+            transport: firstClient,
+            outbox: outbox,
+            sessionId: "session-live"
+        )
+        try await firstController.start()
+        _ = await firstCollector.wait(forAtLeast: 1)
+
+        let (secondClient, secondServer) = await PipeTransport.createPair()
+        let secondCollector = ResumeWireCollector()
+        await secondCollector.start(draining: secondServer)
+        let secondController = SessionController(
+            transport: secondClient,
+            outbox: outbox,
+            sessionId: "session-live"
+        )
+        try await secondController.start()
+        _ = await secondCollector.wait(forAtLeast: 1)
+
+        let discarded = [
+            PendingTextEditDescriptor(
+                eventId: textEvent.eventId,
+                eventSeq: textEvent.eventSeq,
+                nodeId: textEvent.nodeId,
+                editSeq: try #require(textEvent.editSeq)
+            ).toWire()
+        ]
+        await firstController.handleIncomingMessage(
+            resyncMessage(
+                sessionId: "session-live",
+                continuity: .sameSession,
+                lastProcessedEventSeq: 0,
+                discardedTextEdits: discarded
+            )
+        )
+
+        #expect(await outbox.assignedTextEditDescriptors().count == 1)
+        #expect(await outbox.pendingCount == 1)
+        #expect(try events(in: await firstCollector.collected()).isEmpty)
+
+        await firstController.stop()
+        await secondController.stop()
+        await firstCollector.stop()
+        await secondCollector.stop()
+        await seedClient.close()
+        await seedServer.close()
+        await firstServer.close()
+        await secondServer.close()
+    }
+
     @Test("A mismatched discarded_text_edits confirmation fails closed")
     func mismatchedTextDiscardConfirmationFailsClosed() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()

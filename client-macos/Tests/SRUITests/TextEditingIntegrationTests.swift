@@ -151,6 +151,209 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
+    @Test("Rejected ack without a transaction reverts native text when there is no successor")
+    @MainActor
+    func rejectedAckWithoutTransactionRevertsNative() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let outbox = EventOutbox()
+        let controller = SessionController(
+            transport: clientPipe,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+        try await handshakeAndMount(
+            controller: controller,
+            server: serverTransport,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "text-reject-no-tx"
+        )
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        let collector = EventCollector()
+        await collector.start(draining: serverTransport)
+
+        field.stringValue = "nope"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+
+        let submitted = try await waitForTextEvent(collector)
+        #expect(submitted.textArg == "nope")
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = submitted.eventId.bytes
+        ack.lastProcessedEventSeq = submitted.eventSeq
+        ack.status = .rejected
+        ack.revisionAfterEffect = 1
+        ack.rejectReason = "not allowed"
+        ack.sessionID = "text-reject-no-tx"
+        var ackMessage = SRUIMessage()
+        ackMessage.serverEventAck = ack
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(ackMessage))
+
+        try await AsyncTestSupport.eventually(description: "native reverts without a transaction") {
+            field.stringValue == ""
+        }
+        #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
+
+        await controller.stop()
+        await collector.stop()
+        await clientPipe.close()
+        await serverTransport.close()
+    }
+
+    @Test("Rejected ack without a transaction keeps a successor draft and promotes it")
+    @MainActor
+    func rejectedAckWithoutTransactionPromotesSuccessor() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let outbox = EventOutbox()
+        let controller = SessionController(
+            transport: clientPipe,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+        try await handshakeAndMount(
+            controller: controller,
+            server: serverTransport,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "text-reject-promote"
+        )
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        let collector = EventCollector()
+        await collector.start(draining: serverTransport)
+
+        field.stringValue = "foo"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+        let first = try await waitForTextEvent(collector)
+        #expect(first.textArg == "foo")
+
+        field.stringValue = "food"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+        try await waitUntil(description: "successor draft queued") {
+            await outbox.unsentTextDraftCount == 1
+        }
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = first.eventId.bytes
+        ack.lastProcessedEventSeq = first.eventSeq
+        ack.status = .rejected
+        ack.revisionAfterEffect = 1
+        ack.rejectReason = "not allowed"
+        ack.sessionID = "text-reject-promote"
+        var ackMessage = SRUIMessage()
+        ackMessage.serverEventAck = ack
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(ackMessage))
+
+        let second = try await waitForTextEvent(collector, matching: { $0.eventId != first.eventId })
+        #expect(second.textArg == "food")
+        #expect(field.stringValue == "food")
+
+        await controller.stop()
+        await collector.stop()
+        await clientPipe.close()
+        await serverTransport.close()
+    }
+
+    @Test("Processed ack waits for its transaction before promoting a successor")
+    @MainActor
+    func processedAckWaitsForTransactionBeforePromotingSuccessor() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let outbox = EventOutbox()
+        let controller = SessionController(
+            transport: clientPipe,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+        try await handshakeAndMount(
+            controller: controller,
+            server: serverTransport,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "text-ack-wait"
+        )
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        let collector = EventCollector()
+        await collector.start(draining: serverTransport)
+
+        field.stringValue = "foo"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+        let first = try await waitForTextEvent(collector)
+        #expect(first.textArg == "foo")
+
+        field.stringValue = "food"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+        try await waitUntil(description: "successor draft queued") {
+            await outbox.unsentTextDraftCount == 1
+        }
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = first.eventId.bytes
+        ack.lastProcessedEventSeq = first.eventSeq
+        ack.status = .processed
+        ack.revisionAfterEffect = 2
+        ack.sessionID = "text-ack-wait"
+        var ackMessage = SRUIMessage()
+        ackMessage.serverEventAck = ack
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(ackMessage))
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
+        #expect(field.stringValue == "food")
+
+        var echo = SRUIMessage()
+        echo.transaction = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(id: editorID, property: .value, value: .string("foo")),
+            ]
+        ).toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(echo))
+
+        let second = try await waitForTextEvent(collector, matching: { $0.eventId != first.eventId })
+        #expect(second.textArg == "food")
+        #expect(field.stringValue == "food")
+
+        await controller.stop()
+        await collector.stop()
+        await clientPipe.close()
+        await serverTransport.close()
+    }
+
     @Test("Replacement resync resets the text-editing session sequence space")
     @MainActor
     func replacementResyncResetsTextSession() async throws {
@@ -234,10 +437,27 @@ struct TextEditingIntegrationTests {
         #expect(controller.isEventDispatchEnabled)
     }
 
-    private func waitForTextEvent(_ collector: EventCollector, timeout: Double = 2.0) async throws -> Event {
+    private func waitUntil(
+        timeout: Double = 2.0,
+        description: String,
+        condition: () async -> Bool
+    ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if let event = await collector.events().first(where: { $0.eventType == .EVENT_TEXT_EDIT }) {
+            if await condition() { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        throw AsyncTestTimeout(description: "timed out waiting for \(description)")
+    }
+
+    private func waitForTextEvent(
+        _ collector: EventCollector,
+        timeout: Double = 2.0,
+        matching predicate: @Sendable (Event) -> Bool = { $0.eventType == .EVENT_TEXT_EDIT }
+    ) async throws -> Event {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let event = await collector.events().first(where: { $0.eventType == .EVENT_TEXT_EDIT && predicate($0) }) {
                 return event
             }
             try await Task.sleep(nanoseconds: 10_000_000)

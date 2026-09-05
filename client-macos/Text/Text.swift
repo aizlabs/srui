@@ -229,6 +229,9 @@ public final class TextEditingSession {
         state.lastSubmittedValue = nil
         state.lastKnownAuthoritative = published
         state.localValue = published
+        // Authoritative replace is a new baseline: reset `lastFlushedValue` so retyping the
+        // previous submit is not treated as a no-op echo of the old flush (§22.6).
+        state.lastFlushedValue = published
         nodes[nodeID] = state
         if hadDraft {
             onInvalidateOutboxDraft?(nodeID, bumpLaneEpoch(nodeID: nodeID))
@@ -238,6 +241,26 @@ public final class TextEditingSession {
 
     public func localValue(for nodeID: NodeId) -> String? {
         nodes[nodeID]?.localValue
+    }
+
+    /// Last store string applied or echoed for this editor; `nil` if none has been published.
+    public func lastKnownAuthoritative(for nodeID: NodeId) -> String? {
+        nodes[nodeID]?.lastKnownAuthoritative
+    }
+
+    /// True when a coalesced draft newer than the in-flight submit is waiting locally.
+    ///
+    /// A rejected ack that will not be followed by a transaction must keep this typing
+    /// and promote it; only a submit with no successor reverts to the last store string.
+    public func hasUnsentSuccessorDraft(for nodeID: NodeId) -> Bool {
+        guard let state = nodes[nodeID] else { return false }
+        if state.pendingValue != nil {
+            return true
+        }
+        if let flushed = state.lastFlushedValue, flushed != state.lastSubmittedValue {
+            return true
+        }
+        return false
     }
 
     public func nextEditSeqValue(for nodeID: NodeId) -> UInt64 {

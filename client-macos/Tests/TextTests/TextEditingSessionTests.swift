@@ -281,6 +281,101 @@ struct TextEditingSessionTests {
         #expect(invalidated == [nodeID])
     }
 
+    @Test("Authoritative apply resets lastFlushedValue so retyping the previous submit commits")
+    func applyResetsLastFlushedValue() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "foo") == .apply)
+        session.noteLocalValue("foo", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteAssigned(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "foo",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+        let commitsBeforeCorrection = commits.count
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "bar") == .apply)
+        #expect(session.localValue(for: nodeID) == "bar")
+        #expect(session.lastKnownAuthoritative(for: nodeID) == "bar")
+
+        session.noteLocalValue("foo", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(commits.count == commitsBeforeCorrection + 1)
+        #expect(commits.last == "foo")
+    }
+
+    @Test("Echo keepLocal does not reset lastFlushedValue")
+    func echoKeepLocalLeavesFlushedBaseline() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        session.noteLocalValue("foo", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteAssigned(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "foo",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+        #expect(commits == ["foo"])
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "foo") == .keepLocal)
+
+        session.noteLocalValue("foo", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(commits == ["foo"])
+    }
+
+    @Test("A pending successor is an unsent draft; a lone submit is not")
+    func hasUnsentSuccessorDraftDetectsNewerTyping() throws {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "bar") == .apply)
+        session.noteLocalValue("foo", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteAssigned(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "foo",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+        #expect(!session.hasUnsentSuccessorDraft(for: nodeID))
+        #expect(session.lastKnownAuthoritative(for: nodeID) == "bar")
+
+        session.noteLocalValue("food", nodeID: nodeID, composing: false, flushImmediately: false)
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID))
+        #expect(session.localValue(for: nodeID) == "food")
+    }
+
+    @Test("A flushed successor is an unsent draft until it is assigned")
+    func flushedSuccessorCountsAsUnsentDraft() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "bar") == .apply)
+        session.noteLocalValue("foo", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteAssigned(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "foo",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+        session.noteLocalValue("food", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID))
+    }
+
     @Test("Composition end does not flush the previous marked string")
     func compositionEndDoesNotFlushMarkedValue() {
         let session = TextEditingSession(debounceNanoseconds: 0)

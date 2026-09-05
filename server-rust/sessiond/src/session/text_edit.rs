@@ -72,7 +72,10 @@ struct EditorStream {
 /// Bounded per-`(client_instance_id, node_id)` editor sequence table (§18.3, §26).
 #[derive(Debug, Clone)]
 pub struct TextEditTracker {
-    streams: HashMap<(Vec<u8>, u64), EditorStream>,
+    /// Grouping by client lets all hot-path probes borrow `&[u8]`; the peer-selected identifier is
+    /// cloned only when that client's first editor stream is admitted.
+    streams: HashMap<Vec<u8>, HashMap<u64, EditorStream>>,
+    stream_count: usize,
     max_streams: usize,
 }
 
@@ -87,6 +90,7 @@ impl TextEditTracker {
     pub fn new(max_streams: usize) -> Self {
         Self {
             streams: HashMap::new(),
+            stream_count: 0,
             max_streams: max_streams.max(1),
         }
     }
@@ -94,17 +98,17 @@ impl TextEditTracker {
     /// Client-controlled identifier bytes retained as map keys (§15, §26).
     #[must_use]
     pub fn retained_client_id_bytes(&self) -> usize {
-        self.streams.keys().map(|(client, _)| client.len()).sum()
+        self.streams.keys().map(Vec::len).sum()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.streams.len()
+        self.stream_count
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.streams.is_empty()
+        self.stream_count == 0
     }
 
     /// Reserves a generation for a sequence strictly above the terminal watermark.
@@ -114,8 +118,11 @@ impl TextEditTracker {
         node_id: NodeId,
         edit_seq: EditSeq,
     ) -> Result<u64, EventValidationError> {
-        let key = (client_instance_id.to_vec(), node_id.get());
-        if let Some(stream) = self.streams.get_mut(&key) {
+        if let Some(stream) = self
+            .streams
+            .get_mut(client_instance_id)
+            .and_then(|client| client.get_mut(&node_id.get()))
+        {
             if edit_seq.get() <= stream.last_terminal_edit_seq {
                 return Err(EventValidationError::StaleEditSeq {
                     observed: edit_seq.get(),
@@ -128,47 +135,61 @@ impl TextEditTracker {
                 .ok_or(EventValidationError::GenerationOverflow)?;
             return Ok(stream.generation);
         }
-        if self.streams.len() >= self.max_streams {
+        if self.stream_count >= self.max_streams {
             return Err(EventValidationError::TextTrackerFull {
                 limit: self.max_streams,
             });
         }
-        self.streams.insert(
-            key,
-            EditorStream {
-                last_terminal_edit_seq: 0,
-                generation: 1,
-            },
-        );
+        self.streams
+            .entry(client_instance_id.to_vec())
+            .or_default()
+            .insert(
+                node_id.get(),
+                EditorStream {
+                    last_terminal_edit_seq: 0,
+                    generation: 1,
+                },
+            );
+        self.stream_count += 1;
         Ok(1)
     }
 
     #[must_use]
     pub fn last_terminal_of(&self, client_instance_id: &[u8], node_id: NodeId) -> Option<u64> {
         self.streams
-            .get(&(client_instance_id.to_vec(), node_id.get()))
-            .map(|s| s.last_terminal_edit_seq)
+            .get(client_instance_id)
+            .and_then(|client| client.get(&node_id.get()))
+            .map(|stream| stream.last_terminal_edit_seq)
     }
 
     #[must_use]
     pub fn generation_of(&self, client_instance_id: &[u8], node_id: NodeId) -> Option<u64> {
         self.streams
-            .get(&(client_instance_id.to_vec(), node_id.get()))
-            .map(|s| s.generation)
+            .get(client_instance_id)
+            .and_then(|client| client.get(&node_id.get()))
+            .map(|stream| stream.generation)
     }
 
     /// Raises the terminal watermark for an existing stream. Does not insert new keys:
     /// canceled-edit refs for unknown or deleted nodes must not consume tracker capacity (§18.3, §26).
     pub fn mark_terminal(&mut self, client_instance_id: &[u8], node_id: NodeId, edit_seq: EditSeq) {
-        let key = (client_instance_id.to_vec(), node_id.get());
-        if let Some(stream) = self.streams.get_mut(&key) {
+        if let Some(stream) = self
+            .streams
+            .get_mut(client_instance_id)
+            .and_then(|client| client.get_mut(&node_id.get()))
+        {
             stream.last_terminal_edit_seq = stream.last_terminal_edit_seq.max(edit_seq.get());
         }
     }
 
     pub fn reclaim_node(&mut self, node_id: NodeId) {
-        let nid = node_id.get();
-        self.streams.retain(|(_, stored), _| *stored != nid);
+        let node_id = node_id.get();
+        let mut removed = 0;
+        self.streams.retain(|_, client| {
+            removed += usize::from(client.remove(&node_id).is_some());
+            !client.is_empty()
+        });
+        self.stream_count -= removed;
     }
 
     pub fn reclaim_nodes<I>(&mut self, node_ids: I)
@@ -180,15 +201,15 @@ impl TextEditTracker {
         if doomed.is_empty() {
             return;
         }
-        self.streams.retain(|(_, nid), _| !doomed.contains(nid));
+        let mut removed = 0;
+        self.streams.retain(|_, client| {
+            let before = client.len();
+            client.retain(|node_id, _| !doomed.contains(node_id));
+            removed += before - client.len();
+            !client.is_empty()
+        });
+        self.stream_count -= removed;
     }
-}
-
-pub(crate) fn is_standard_text_edit(event: &WireEvent) -> bool {
-    event
-        .event_type
-        .as_ref()
-        .is_some_and(|ty| ty.namespace_id == 0 && ty.local_id == TypeRef::EVENT_TEXT_EDIT.local_id)
 }
 
 pub(crate) fn is_editor_type(ty: TypeRef) -> bool {
@@ -216,10 +237,8 @@ impl Session {
     pub(crate) fn process_text_edit(
         &self,
         event: &WireEvent,
+        domain: DomainEvent,
     ) -> Result<EventOutcome, SessionError> {
-        let domain = DomainEvent::try_from(event.clone())
-            .map_err(|err| SessionError::InvalidInput(format!("malformed TEXT_EDIT: {err}")))?;
-
         let prepared = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
@@ -478,23 +497,31 @@ impl Session {
             ),
         };
 
-        // Validate-then-settle so a malformed later ref cannot leave a prefix settled.
-        // `settle_canceled_text_event` itself remains idempotent if handshake is retried.
+        // Stage the bounded receive-window and editor-watermark changes together. A later
+        // identity conflict must not leave an earlier ref settled when the handshake fails.
+        let mut staged_dedupe = inner.dedupe.clone();
+        let mut staged_tracker = inner.text_edit_tracker.clone();
         let mut discarded = Vec::with_capacity(validated.len());
         for (reference, edit_seq) in validated {
-            inner.dedupe.settle_canceled_text_event(
-                client_instance_id,
-                &reference.event_id,
-                reference.event_seq,
-                outcome.clone(),
-            )?;
-            inner.text_edit_tracker.mark_terminal(
+            let placeholder = WireEvent {
+                client_instance_id: client_instance_id.to_vec(),
+                event_seq: reference.event_seq,
+                event_id: reference.event_id.clone(),
+                node_id: reference.node_id,
+                event_type: Some(TypeRef::EVENT_TEXT_EDIT.into()),
+                edit_seq: edit_seq.get(),
+                ..Default::default()
+            };
+            staged_dedupe.admit_and_settle(&placeholder, outcome.clone())?;
+            staged_tracker.mark_terminal(
                 client_instance_id,
                 NodeId::new(reference.node_id),
                 edit_seq,
             );
             discarded.push(reference.clone());
         }
+        inner.dedupe = staged_dedupe;
+        inner.text_edit_tracker = staged_tracker;
         Ok(discarded)
     }
 }
@@ -600,51 +627,6 @@ fn reject_admitted(
     }
 }
 
-pub(crate) fn deleted_subtree_ids(
-    store: &srui_semantic_tree::SemanticStore,
-    ops: &[srui_semantic_tree::Operation],
-) -> Vec<NodeId> {
-    let mut ids = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for op in ops {
-        if let srui_semantic_tree::Operation::DeleteNode { id } = op {
-            collect_subtree(store, *id, &mut ids, &mut seen);
-        }
-    }
-    ids
-}
-
-pub(crate) fn deleted_subtree_ids_from_wire(
-    store: &srui_semantic_tree::SemanticStore,
-    tx: &srui_protocol::Transaction,
-) -> Vec<NodeId> {
-    let mut ids = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for op in &tx.operations {
-        if let Some(srui_protocol::operation::Op::DeleteNode(ref del)) = op.op {
-            collect_subtree(store, NodeId::new(del.node_id), &mut ids, &mut seen);
-        }
-    }
-    ids
-}
-
-fn collect_subtree(
-    store: &srui_semantic_tree::SemanticStore,
-    id: NodeId,
-    out: &mut Vec<NodeId>,
-    seen: &mut std::collections::HashSet<u64>,
-) {
-    if !seen.insert(id.get()) {
-        return;
-    }
-    out.push(id);
-    if let Some(node) = store.get_node(id) {
-        for child in node.ordered_children.iter().copied() {
-            collect_subtree(store, child, out, seen);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,7 +691,7 @@ mod tests {
         tracker.reserve(b"bob", node(1), seq(1)).unwrap();
         tracker.reserve(b"alice", node(2), seq(1)).unwrap();
         assert_eq!(tracker.len(), 3);
-        assert_eq!(tracker.retained_client_id_bytes(), 5 + 3 + 5);
+        assert_eq!(tracker.retained_client_id_bytes(), 5 + 3);
         tracker.reclaim_node(node(1));
         assert_eq!(tracker.len(), 1);
         assert_eq!(tracker.retained_client_id_bytes(), 5);
@@ -719,11 +701,54 @@ mod tests {
     fn tracker_refuses_generation_overflow() {
         let mut tracker = TextEditTracker::new(8);
         tracker.reserve(b"c", node(1), seq(1)).unwrap();
-        let key = (b"c".to_vec(), 1u64);
-        tracker.streams.get_mut(&key).unwrap().generation = u64::MAX;
+        tracker
+            .streams
+            .get_mut(&b"c"[..])
+            .unwrap()
+            .get_mut(&1u64)
+            .unwrap()
+            .generation = u64::MAX;
         assert!(matches!(
             tracker.reserve(b"c", node(1), seq(2)),
             Err(EventValidationError::GenerationOverflow)
         ));
+    }
+
+    #[test]
+    fn cancel_pending_text_edits_is_atomic_on_identity_conflict() {
+        let session = Session::new("cancel-atomic");
+        let client = b"client";
+        let activate = WireEvent {
+            client_instance_id: client.to_vec(),
+            event_seq: 2,
+            event_id: b"shared".to_vec(),
+            event_type: Some(TypeRef::EVENT_ACTIVATE.into()),
+            ..Default::default()
+        };
+
+        let mut inner = session.inner.lock().unwrap();
+        assert!(matches!(
+            inner.dedupe.admit_event(&activate).unwrap(),
+            RecordOutcome::Fresh { .. }
+        ));
+        let refs = vec![
+            srui_protocol::PendingTextEditRef {
+                event_id: b"text-1".to_vec(),
+                event_seq: 1,
+                node_id: 1,
+                edit_seq: 1,
+            },
+            srui_protocol::PendingTextEditRef {
+                event_id: activate.event_id.clone(),
+                event_seq: activate.event_seq,
+                node_id: 1,
+                edit_seq: 2,
+            },
+        ];
+
+        assert!(Session::cancel_pending_text_edits(&mut inner, client, &refs).is_err());
+        assert!(!inner.dedupe.is_duplicate(client, b"text-1"));
+        assert!(inner.dedupe.is_in_flight(client, b"shared"));
+        assert_eq!(inner.dedupe.last_contiguous_processed_seq(client), 0);
     }
 }

@@ -10,7 +10,7 @@ use srui_semantic_tree::{
     EditSeq, Event as DomainEvent, EventValidationError, NodeId, PropertyRef,
     StandardValidationState, Value,
 };
-use srui_sessiond::{EventOutcome, Session, TextEditDecision, MAX_TEXT_EDIT_STREAMS};
+use srui_sessiond::{EventOutcome, Session, SessionError, TextEditDecision, MAX_TEXT_EDIT_STREAMS};
 
 const CLIENT: &[u8] = b"text-client";
 const EDITOR: u64 = 2;
@@ -354,22 +354,16 @@ fn tracker_full_refuses_a_new_editor_stream() {
 }
 
 #[test]
-fn non_text_event_with_edit_seq_is_rejected() {
+fn non_text_event_with_edit_seq_is_rejected_at_the_wire_boundary() {
     let session = Session::new("text-invalid-seq");
     seed_editor(&session);
     let mut activate =
         DomainEvent::activate(1, "act", 0u64, EDITOR).with_client_instance_id(CLIENT.to_vec());
     activate.edit_seq = Some(edit_seq(1));
-    match session
+    let error = session
         .process_event(&activate.to_wire())
-        .expect("activate")
-    {
-        EventOutcome::Rejected {
-            error: EventValidationError::InvalidEditSeq,
-            ..
-        } => {}
-        other => panic!("expected InvalidEditSeq, got {other:?}"),
-    }
+        .expect_err("non-text edit_seq must fail domain parsing");
+    assert!(matches!(error, SessionError::InvalidInput(_)));
 }
 
 #[test]
@@ -441,6 +435,37 @@ fn deleted_editor_during_policy_settles_instead_of_stranding() {
         } => {}
         other => panic!("replay must be answered from the result cache, got {other:?}"),
     }
+}
+
+#[test]
+fn nested_text_edit_supersedes_the_outer_policy_generation() {
+    let session = Session::new("text-reentrant-policy");
+    seed_editor(&session);
+
+    session.on_text_edit(|session, request| {
+        if request.edit_seq == edit_seq(1) {
+            match session
+                .process_event(&text_edit(2, "nested", "inner", 2))
+                .expect("nested edit")
+            {
+                EventOutcome::Processed { .. } => {}
+                other => panic!("nested edit must process, got {other:?}"),
+            }
+        }
+        TextEditDecision::Accept
+    });
+
+    match session
+        .process_event(&text_edit(1, "outer", "outer", 1))
+        .expect("outer settles")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::SupersededGeneration,
+            ..
+        } => {}
+        other => panic!("outer edit must be superseded, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "inner");
 }
 
 #[test]

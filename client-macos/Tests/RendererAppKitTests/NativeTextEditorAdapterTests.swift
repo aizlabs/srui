@@ -1,6 +1,6 @@
 //
 // NativeTextEditorAdapterTests.swift
-// TextTests
+// RendererAppKitTests
 //
 // Observer-only AppKit adapters: local feedback, IME suppression, programmatic
 // writes, and validation decoration (§22.6).
@@ -9,7 +9,8 @@
 import AppKit
 import SemanticModel
 import Testing
-@testable import Text
+import Text
+@testable import RendererAppKit
 
 @Suite("NativeTextEditorAdapter")
 @MainActor

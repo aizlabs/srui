@@ -21,6 +21,7 @@ use crate::transaction::Revision;
 use crate::value::{Size, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU64;
 
 /// Globally unique event identifier for deduplication and retry-safety (§7.7, §16, §18.2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -185,28 +186,27 @@ impl From<String> for ClientInstanceId {
         Self(s.into_bytes())
     }
 }
-
 /// Positive per-editor sequence for `TEXT_EDIT` events (§18.3, §22.6).
 ///
-/// Zero is unrepresentable: the wire treats `edit_seq == 0` as absent.
+/// Zero is unrepresentable, and the non-zero representation lets `Option<EditSeq>` retain the
+/// same one-word layout as the wire `u64` whose zero value means absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EditSeq(u64);
+pub struct EditSeq(NonZeroU64);
 
 impl EditSeq {
     /// Constructs a positive editor sequence. `0` is absent on the wire.
     #[must_use]
     pub const fn new(value: u64) -> Option<Self> {
-        if value == 0 {
-            None
-        } else {
-            Some(Self(value))
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
         }
     }
 
     /// Returns the positive integer carried on the wire.
     #[must_use]
     pub const fn get(self) -> u64 {
-        self.0
+        self.0.get()
     }
 }
 

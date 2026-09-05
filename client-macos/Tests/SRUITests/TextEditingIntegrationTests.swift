@@ -21,6 +21,32 @@ struct TextEditingIntegrationTests {
     private let surfaceID = NodeId(1)
     private let editorID = NodeId(12)
 
+    @Test("Teardown end-editing cannot consume a structural-remount draft")
+    @MainActor
+    func teardownEndEditingPreservesRemountDraft() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var committedValues: [String] = []
+        session.onCommit = { _, value, _, _ in
+            committedValues.append(value)
+        }
+
+        #expect(session.applyPublishedValue(nodeID: editorID, published: "server") == .apply)
+        let resolution = session.withPreservedLocalText {
+            session.noteLocalValue(
+                "local",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: false
+            )
+            session.endEditing(nodeID: editorID)
+            return session.applyPublishedValue(nodeID: editorID, published: "server")
+        }
+
+        #expect(resolution == .keepLocal)
+        #expect(session.localValue(for: editorID) == "local")
+        #expect(committedValues.isEmpty)
+    }
+
     @Test("Delayed input lane: native text changes before any network delivery")
     @MainActor
     func delayedTransportKeepsEditingLocal() async throws {

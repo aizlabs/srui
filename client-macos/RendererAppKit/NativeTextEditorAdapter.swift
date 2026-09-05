@@ -1,6 +1,6 @@
 //
 // NativeTextEditorAdapter.swift
-// Text
+// RendererAppKit
 //
 // Observes AppKit text controls without taking over keyboard, selection, caret,
 // clipboard, or text-input-client behavior (§22.6). Immediate editing feedback
@@ -9,6 +9,7 @@
 
 import AppKit
 import SemanticModel
+import Text
 
 /// `@MainActor` observer for `NSTextField` / `NSTextView` editors (§22.6).
 @MainActor

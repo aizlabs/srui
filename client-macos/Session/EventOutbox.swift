@@ -79,6 +79,60 @@ struct TextEditAcknowledgementBarrier: Equatable, Sendable {
     var rejected: Bool
 }
 
+/// A committed snapshot must own the synchronous native render before its text boundary may apply.
+struct ResyncSnapshotCommit<Value: Sendable>: Sendable {
+    var result: Value
+    var renderToken: UUID?
+}
+
+/// Serializes snapshot rendering against reconnect supersession without holding an actor across
+/// the synchronous MainActor remount.
+final class ResyncRenderFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeToken: UUID?
+
+    func activate() -> UUID {
+        lock.lock()
+        defer { lock.unlock() }
+        let token = UUID()
+        activeToken = token
+        return token
+    }
+
+    func invalidate() {
+        lock.lock()
+        activeToken = nil
+        lock.unlock()
+    }
+
+    func invalidate(_ token: UUID) {
+        lock.lock()
+        if activeToken == token {
+            activeToken = nil
+        }
+        lock.unlock()
+    }
+
+    func isActive(_ token: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeToken == token
+    }
+
+    @MainActor
+    func performIfActive<Value>(_ token: UUID, _ body: () -> Value) -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeToken == token else { return nil }
+        return body()
+    }
+}
+
+private struct ResyncRenderOwnership: Sendable {
+    var generation: UInt64?
+    var token: UUID
+}
+
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
 ///
 /// Retry safety (§18.2): every application-side-effect event carries a stable `event_id` and
@@ -90,6 +144,8 @@ public actor EventOutbox {
     public static let defaultMaxPendingEvents = 256
 
     public nonisolated let clientInstanceId: ClientInstanceId
+    nonisolated let resyncRenderFence = ResyncRenderFence()
+    private var resyncRenderOwnership: ResyncRenderOwnership?
     private let maxPendingEvents: Int
     private var pendingEventReplayLoop: PendingEventReplayLoop
     private var replayLease: PendingEventReplayLoop.Lease?
@@ -120,8 +176,6 @@ public actor EventOutbox {
     /// (§18.2).
     private var sendTail: Task<Void, any Error>?
     private var textDrafts: [NodeId: TextEditDraft] = [:]
-    private var assignedTextByNode: [NodeId: EventId] = [:]
-    private var assignedTextByEventId: [EventId: NodeId] = [:]
     /// Highest correction/cancel epoch observed per node. Stale `queueTextEdit` Tasks
     /// with a lower epoch are dropped so unordered hops cannot resurrect a rejected draft.
     private var textLaneEpoch: [NodeId: UInt64] = [:]
@@ -131,6 +185,9 @@ public actor EventOutbox {
     /// A successor for a node cannot be promoted until this acknowledgement's authoritative
     /// revision has reached the rendered replica.
     private var textAcknowledgementBarriers: [NodeId: TextEditAcknowledgementBarrier] = [:]
+    /// Resume frontiers prove processing but not a text edit's rejection/correction outcome.
+    /// These identities remain replayable until their own cached acknowledgement arrives.
+    private var textEventsAwaitingOutcome: Set<EventId> = []
 
     private struct TextEditDraft: Equatable, Sendable {
         var nodeId: NodeId
@@ -270,12 +327,17 @@ public actor EventOutbox {
         laneEpoch: UInt64 = 0
     ) async throws -> Event? {
         let minimumEpoch = max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0)
-        if laneEpoch < minimumEpoch {
+        guard laneEpoch >= minimumEpoch else { return nil }
+
+        if let assignedEditSeq = assignedTextEvent(for: nodeId)?.editSeq,
+           editSeq <= assignedEditSeq {
             return nil
         }
-        if let existing = textDrafts[nodeId], existing.editSeq >= editSeq {
-            return try await promoteTextDraft(nodeId: nodeId, via: transport)
+        if let retainedDraft = textDrafts[nodeId], editSeq <= retainedDraft.editSeq {
+            return nil
         }
+
+        textLaneEpoch[nodeId] = max(textLaneEpoch[nodeId] ?? 0, laneEpoch)
         textDrafts[nodeId] = TextEditDraft(
             nodeId: nodeId,
             text: text,
@@ -310,10 +372,13 @@ public actor EventOutbox {
     }
 
     public func invalidateTextDraft(nodeId: NodeId, laneEpoch: UInt64 = 0) {
-        if laneEpoch >= (textLaneEpoch[nodeId] ?? 0) {
-            textLaneEpoch[nodeId] = laneEpoch
+        let minimumEpoch = max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0)
+        guard laneEpoch >= minimumEpoch else { return }
+
+        textLaneEpoch[nodeId] = laneEpoch
+        if let draft = textDrafts[nodeId], draft.laneEpoch <= laneEpoch {
+            textDrafts.removeValue(forKey: nodeId)
         }
-        textDrafts.removeValue(forKey: nodeId)
     }
 
     public func assignedTextEditDescriptors() -> [PendingTextEditDescriptor] {
@@ -353,7 +418,7 @@ public actor EventOutbox {
         let condemned = requireExactMatch ? refs : assigned
         textDrafts.removeAll(keepingCapacity: true)
         for ref in condemned {
-            forgetAssignedText(eventId: ref.eventId)
+            textEventsAwaitingOutcome.remove(ref.eventId)
             if let event = pendingEvents.removeValue(forKey: ref.eventId) {
                 pendingOrder.removeAll { $0 == ref.eventId }
                 recordSelectiveAcknowledgement(event.eventSeq)
@@ -393,18 +458,35 @@ public actor EventOutbox {
     /// Applies a hard full-resync boundary. Drafts from native controls that existed before the
     /// snapshot are discarded; callbacks from newly mounted controls carry laneEpoch (or later)
     /// and survive this actor hop. A snapshot is authoritative for every outstanding ack.
-    func applyFullResyncTextBoundary(laneEpoch: UInt64?) {
+    @discardableResult
+    func applyFullResyncTextBoundary(
+        laneEpoch: UInt64?,
+        generation: UInt64?,
+        renderToken: UUID
+    ) -> Bool {
+        guard activeResumeGeneration == generation,
+              let ownership = resyncRenderOwnership,
+              ownership.generation == generation,
+              ownership.token == renderToken,
+              resyncRenderFence.isActive(renderToken) else {
+            return false
+        }
+
         textAcknowledgementBarriers.removeAll(keepingCapacity: true)
-        guard let laneEpoch else {
-            textDrafts.removeAll(keepingCapacity: true)
-            return
-        }
-        textLaneEpochFloor = max(textLaneEpochFloor, laneEpoch)
-        for nodeID in Array(textDrafts.keys) {
-            if let draft = textDrafts[nodeID], draft.laneEpoch < textLaneEpochFloor {
-                textDrafts.removeValue(forKey: nodeID)
+        if let laneEpoch {
+            textLaneEpochFloor = max(textLaneEpochFloor, laneEpoch)
+            for nodeID in Array(textDrafts.keys) {
+                if let draft = textDrafts[nodeID], draft.laneEpoch < textLaneEpochFloor {
+                    textDrafts.removeValue(forKey: nodeID)
+                }
             }
+        } else {
+            textDrafts.removeAll(keepingCapacity: true)
         }
+
+        resyncRenderFence.invalidate(renderToken)
+        resyncRenderOwnership = nil
+        return true
     }
 
     /// Releases acknowledgements only after their authoritative revision has rendered.
@@ -424,7 +506,7 @@ public actor EventOutbox {
 
     private func promoteTextDraft(nodeId: NodeId, via transport: any Transport) async throws -> Event? {
         guard acceptsNewEvents else { return nil }
-        guard assignedTextByNode[nodeId] == nil else { return nil }
+        guard assignedTextEvent(for: nodeId) == nil else { return nil }
         guard textAcknowledgementBarriers[nodeId] == nil else { return nil }
         guard let draft = textDrafts[nodeId] else { return nil }
         if draft.laneEpoch < max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0) {
@@ -441,15 +523,13 @@ public actor EventOutbox {
                 editSeq: draft.editSeq
             )
             self.textDrafts.removeValue(forKey: nodeId)
-            self.assignedTextByNode[nodeId] = event.eventId
-            self.assignedTextByEventId[event.eventId] = nodeId
             return event
         }
     }
 
-    private func forgetAssignedText(eventId: EventId) {
-        if let nodeId = assignedTextByEventId.removeValue(forKey: eventId) {
-            assignedTextByNode.removeValue(forKey: nodeId)
+    private func assignedTextEvent(for nodeId: NodeId) -> Event? {
+        pendingEvents.values.first {
+            $0.eventType == .EVENT_TEXT_EDIT && $0.nodeId == nodeId
         }
     }
 
@@ -479,9 +559,9 @@ public actor EventOutbox {
     /// Private: settling an intent mutates state whose ownership depends on wire identity, so
     /// `settleAcknowledgement` is the only way in from the wire (§18.2).
     private func acknowledgeEvent(id: EventId) {
+        textEventsAwaitingOutcome.remove(id)
         guard let event = pendingEvents.removeValue(forKey: id) else { return }
         pendingOrder.removeAll { $0 == id }
-        forgetAssignedText(eventId: id)
         recordSelectiveAcknowledgement(event.eventSeq)
         cancelReplayRetryLoopIfSettled()
     }
@@ -492,6 +572,7 @@ public actor EventOutbox {
     /// Issuing a generation immediately supersedes every older attempt, so a delayed response
     /// from an abandoned connection is discarded rather than replayed (§18).
     func beginResumeAttempt() -> UInt64 {
+        invalidateResyncRenderOwnership()
         cancelReplayRetryLoop()
         cancelPendingWrites()
         pendingResumeFinalizationGeneration = nil
@@ -532,13 +613,22 @@ public actor EventOutbox {
         generation: UInt64?,
         publish: @Sendable () -> T,
         committed: @Sendable (T) -> Bool
-    ) -> T? {
+    ) -> ResyncSnapshotCommit<T>? {
         guard activeResumeGeneration == generation else { return nil }
         let result = publish()
         // A rejected snapshot keeps the latch so the server can send another one. A committed
         // snapshot also keeps it until AppKit has mounted the authoritative state.
-        guard committed(result) else { return result }
-        return result
+        guard committed(result) else {
+            return ResyncSnapshotCommit(result: result, renderToken: nil)
+        }
+
+        invalidateResyncRenderOwnership()
+        let renderToken = resyncRenderFence.activate()
+        resyncRenderOwnership = ResyncRenderOwnership(
+            generation: generation,
+            token: renderToken
+        )
+        return ResyncSnapshotCommit(result: result, renderToken: renderToken)
     }
 
     /// Completes a same-session decision only if no newer controller superseded this attempt.
@@ -567,7 +657,10 @@ public actor EventOutbox {
             )
         }
         activeSessionId = id
-        acknowledgeEvents(throughSeq: lastProcessedEventSeq, retainTextEdits: true)
+        acknowledgeEvents(
+            throughSeq: lastProcessedEventSeq,
+            retainingTextEditsForOutcome: true
+        )
         try await resendPendingEvents(via: transport)
         guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
@@ -608,12 +701,17 @@ public actor EventOutbox {
     /// Does not cancel the replay retry loop: unsettled events keep retrying until settlement
     /// advances the frontier (§18.2).
     func applyLiveResyncFrontier(lastProcessedEventSeq: UInt64) {
+        invalidateResyncRenderOwnership()
         acceptsNewEvents = false
-        acknowledgeEvents(throughSeq: lastProcessedEventSeq, retainTextEdits: true)
+        acknowledgeEvents(
+            throughSeq: lastProcessedEventSeq,
+            retainingTextEditsForOutcome: true
+        )
     }
 
     /// Abandons pending intents and binds a replacement incarnation without a resume attempt (§18).
     func applyReplacementFrontier(id: String, lastProcessedEventSeq: UInt64) {
+        invalidateResyncRenderOwnership()
         cancelReplayRetryLoop()
         pendingResumeFinalizationGeneration = nil
         activeSessionId = id
@@ -624,11 +722,10 @@ public actor EventOutbox {
         pendingOrder.removeAll(keepingCapacity: true)
         acknowledgedOutOfOrder.removeAll(keepingCapacity: true)
         textDrafts.removeAll(keepingCapacity: true)
-        assignedTextByNode.removeAll(keepingCapacity: true)
-        assignedTextByEventId.removeAll(keepingCapacity: true)
         textLaneEpoch.removeAll(keepingCapacity: true)
         textLaneEpochFloor = 0
         textAcknowledgementBarriers.removeAll(keepingCapacity: true)
+        textEventsAwaitingOutcome.removeAll(keepingCapacity: true)
         cancelPendingWrites()
     }
 
@@ -696,19 +793,28 @@ public actor EventOutbox {
     /// `retainTextEdits` keeps assigned `TEXT_EDIT` events in the retry set so a lost rejection
     /// ack can still be recovered as a duplicate after `RESUME_OK` / live resync (§18.3, §22.6).
     @discardableResult
-    private func acknowledgeEvents(throughSeq seq: UInt64, retainTextEdits: Bool = false) -> [Event] {
+    private func acknowledgeEvents(
+        throughSeq seq: UInt64,
+        retainingTextEditsForOutcome: Bool = false
+    ) -> [Event] {
         guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return [] }
 
         _lastAckedEventSeq = seq
         acknowledgedOutOfOrder = Set(acknowledgedOutOfOrder.filter { $0 > seq })
+        if retainingTextEditsForOutcome {
+            for event in pendingEvents.values
+            where event.eventSeq <= seq && event.eventType == .EVENT_TEXT_EDIT {
+                textEventsAwaitingOutcome.insert(event.eventId)
+            }
+        }
         let settled = pendingEvents.values
-            .filter { event in
-                event.eventSeq <= seq && !(retainTextEdits && event.eventType == .EVENT_TEXT_EDIT)
+            .filter {
+                $0.eventSeq <= seq
+                    && !textEventsAwaitingOutcome.contains($0.eventId)
             }
             .sorted { $0.eventSeq < $1.eventSeq }
         for event in settled {
             pendingEvents.removeValue(forKey: event.eventId)
-            forgetAssignedText(eventId: event.eventId)
         }
         pendingOrder.removeAll { pendingEvents[$0] == nil }
         advanceContiguousAcknowledgement()
@@ -735,14 +841,16 @@ public actor EventOutbox {
     /// and re-opening it from an unrelated catch-up would bypass it (§18).
     @discardableResult
     func allowNewEvents() -> Bool {
-        guard activeResumeGeneration == nil else { return false }
+        guard activeResumeGeneration == nil, resyncRenderOwnership == nil else { return false }
         acceptsNewEvents = true
         return true
     }
 
     /// Enables new events only after the snapshot for the current reconnect generation commits.
     func finishResync(generation: UInt64) -> Bool {
-        guard activeResumeGeneration == generation else { return false }
+        guard activeResumeGeneration == generation, resyncRenderOwnership == nil else {
+            return false
+        }
         acceptsNewEvents = true
         activeResumeGeneration = nil
         pendingResumeFinalizationGeneration = generation
@@ -772,6 +880,10 @@ public actor EventOutbox {
     /// a newer attempt holds and strand it with every decision rejected (§18).
     func stopResumeWork(generation: UInt64) {
         guard ownsResumeWork(generation: generation) else { return }
+        if let ownership = resyncRenderOwnership, ownership.generation == generation {
+            resyncRenderFence.invalidate(ownership.token)
+            resyncRenderOwnership = nil
+        }
         if activeResumeGeneration == generation {
             activeResumeGeneration = nil
         }
@@ -788,6 +900,12 @@ public actor EventOutbox {
         activeResumeGeneration == generation
             || pendingResumeFinalizationGeneration == generation
             || replayLease?.resumeScope == generation
+    }
+
+    private func invalidateResyncRenderOwnership() {
+        guard let ownership = resyncRenderOwnership else { return }
+        resyncRenderFence.invalidate(ownership.token)
+        resyncRenderOwnership = nil
     }
 
     private func startReplayRetryLoop(
@@ -881,7 +999,8 @@ public actor EventOutbox {
     private func ensureSequenceWindowCapacity() throws {
         let outstandingSpan = currentEventSeq - _lastAckedEventSeq
         guard currentEventSeq < UInt64.max,
-              outstandingSpan < UInt64(maxPendingEvents) else {
+              outstandingSpan < UInt64(maxPendingEvents),
+              pendingEvents.count < maxPendingEvents else {
             throw EventOutboxError.sequenceWindowExhausted(limit: maxPendingEvents)
         }
     }

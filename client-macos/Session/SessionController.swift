@@ -106,6 +106,7 @@ private enum ProtocolPhase: Equatable {
 private struct RendererUpdateResult: Sendable {
     var didRender: Bool
     var resyncLaneEpoch: UInt64?
+    var wasSuperseded: Bool = false
 }
 
 /// Central coordinator managing client session lifecycle, message decoding, store application,
@@ -1274,6 +1275,7 @@ public final class SessionController: @unchecked Sendable {
         // Apply and capture the committed snapshot in a single critical section so the renderer is
         // handed exactly the store produced by this transaction (§22.2).
         let applyResult: Result<TransactionSnapshot, TxnError>
+        let resyncRenderToken: UUID?
         if isResyncSnapshot {
             // A snapshot replaces the entire replica, so the supersession check and publish run
             // inside one outbox critical section. The latch remains closed until the snapshot has
@@ -1304,32 +1306,64 @@ public final class SessionController: @unchecked Sendable {
                 }
                 return
             }
-            applyResult = published
+            applyResult = published.result
+            resyncRenderToken = published.renderToken
         } else {
             // Live-stream frames are deliveries: either a committed transaction verbatim, or a
             // coalesced scalar delta standing in for a run of them (§12.1, §20.4).
             applyResult = applier.applyDelivered(record: domainTx)
+            resyncRenderToken = nil
         }
 
         switch applyResult {
         case .success(let snapshot):
+            if isResyncSnapshot, resyncRenderToken == nil {
+                await reportFailure(.protocolViolation(
+                    "committed resync snapshot did not produce a renderer ownership token"
+                ))
+                return
+            }
+
             let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,
                 snapshot: snapshot,
                 forceRemount: isResyncSnapshot,
-                discardTextEditsForResync: isResyncSnapshot
+                discardTextEditsForResync: isResyncSnapshot,
+                resyncRenderToken: resyncRenderToken
             )
+
+            guard rendererUpdate.didRender else {
+                if rendererUpdate.wasSuperseded {
+                    let context = "resync snapshot render was superseded by a newer reconnect attempt"
+                    if let outstandingGeneration {
+                        await failRefusedResumeDecision(outstandingGeneration, context)
+                    } else {
+                        await reportFailure(.superseded(context))
+                    }
+                }
+                return
+            }
 
             if isResyncSnapshot {
                 // This actor hop occurs after the native remount. Old callbacks carry a lower
                 // epoch and are discarded; genuinely post-mount edits carry the new epoch and
                 // remain queued while dispatch is still closed.
-                await outbox.applyFullResyncTextBoundary(
-                    laneEpoch: rendererUpdate.resyncLaneEpoch
-                )
+                guard let renderToken = resyncRenderToken,
+                      await outbox.applyFullResyncTextBoundary(
+                        laneEpoch: rendererUpdate.resyncLaneEpoch,
+                        generation: outstandingGeneration,
+                        renderToken: renderToken
+                      ) else {
+                    let context = "resync snapshot boundary was superseded after rendering"
+                    if let outstandingGeneration {
+                        await failRefusedResumeDecision(outstandingGeneration, context)
+                    } else {
+                        await reportFailure(.superseded(context))
+                    }
+                    return
+                }
             }
 
-            guard rendererUpdate.didRender else { return }
             withStateLock { lastRenderedRevision = snapshot.revision.value }
             await resolveRenderedTextAcknowledgements(through: snapshot.revision.value)
 
@@ -1497,41 +1531,55 @@ public final class SessionController: @unchecked Sendable {
         transaction: Transaction?,
         snapshot: TransactionSnapshot,
         forceRemount: Bool,
-        discardTextEditsForResync: Bool = false
+        discardTextEditsForResync: Bool = false,
+        resyncRenderToken: UUID? = nil
     ) async -> RendererUpdateResult {
         await hydrateCachedResources(snapshot.store.referencedResourceHashes())
         let result = await MainActor.run { () -> RendererUpdateResult in
-            guard let renderer = self.renderer else {
-                return RendererUpdateResult(didRender: true, resyncLaneEpoch: nil)
-            }
-            let epoch = discardTextEditsForResync
-                ? renderer.textEditingSession.discardUnresolvedEditsForResync()
-                : nil
-            defer {
-                if discardTextEditsForResync {
-                    renderer.textEditingSession.finishResyncTextBoundary()
+            let update: () -> RendererUpdateResult = {
+                guard let renderer = self.renderer else {
+                    return RendererUpdateResult(didRender: true, resyncLaneEpoch: nil)
+                }
+                let epoch = discardTextEditsForResync
+                    ? renderer.textEditingSession.discardUnresolvedEditsForResync()
+                    : nil
+                defer {
+                    if discardTextEditsForResync {
+                        renderer.textEditingSession.finishResyncTextBoundary()
+                    }
+                }
+                do {
+                    if forceRemount || !self.hasMountedInitialTree {
+                        try renderer.attach(store: snapshot.store)
+                        renderer.showWindows()
+                        self.hasMountedInitialTree = true
+                    } else if let transaction {
+                        try renderer.apply(transaction: transaction, newStore: snapshot.store)
+                    }
+                    return RendererUpdateResult(didRender: true, resyncLaneEpoch: epoch)
+                } catch {
+                    SessionDiagnostics.error("Renderer update failed: \(error)")
+                    // Any renderer failure may have left a partially torn-down view tree: the
+                    // incremental path remounts internally for structural transactions, so a throw
+                    // can mean every surface window was closed. Force a full re-attach from the
+                    // committed store on the next transaction rather than mutating a tree we no
+                    // longer trust.
+                    self.hasMountedInitialTree = false
+                    return RendererUpdateResult(didRender: false, resyncLaneEpoch: epoch)
                 }
             }
-            do {
-                if forceRemount || !self.hasMountedInitialTree {
-                    try renderer.attach(store: snapshot.store)
-                    renderer.showWindows()
-                    self.hasMountedInitialTree = true
-                } else if let transaction {
-                    try renderer.apply(transaction: transaction, newStore: snapshot.store)
-                }
-                return RendererUpdateResult(didRender: true, resyncLaneEpoch: epoch)
-            } catch {
-                SessionDiagnostics.error("Renderer update failed: \(error)")
-                // Any renderer failure may have left a partially torn-down view tree: the
-                // incremental path remounts internally for structural transactions, so a throw can
-                // mean every surface window was closed. Force a full re-attach from the committed
-                // store on the next transaction rather than mutating a tree we no longer trust.
-                self.hasMountedInitialTree = false
-                return RendererUpdateResult(didRender: false, resyncLaneEpoch: epoch)
-            }
+
+            guard let resyncRenderToken else { return update() }
+            return self.outbox.resyncRenderFence.performIfActive(resyncRenderToken, update)
+                ?? RendererUpdateResult(
+                    didRender: false,
+                    resyncLaneEpoch: nil,
+                    wasSuperseded: true
+                )
         }
-        await syncLiveResourceReferences()
+        if result.didRender {
+            await syncLiveResourceReferences()
+        }
         return result
     }
 

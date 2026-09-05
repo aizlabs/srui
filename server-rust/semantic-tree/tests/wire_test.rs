@@ -521,6 +521,21 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
     let back = decode_event(&encode_event(&with_edit)).unwrap();
     assert_eq!(with_edit, back);
     assert_eq!(back.edit_seq, EditSeq::new(3));
+
+    let mut missing_text_seq: srui_protocol::Event = (&with_edit).into();
+    missing_text_seq.edit_seq = 0;
+    assert!(matches!(
+        Event::try_from(missing_text_seq),
+        Err(WireError::Event(_))
+    ));
+
+    let activate = Event::activate(10, "bad-edit-seq", 100, 14);
+    let mut unexpected_seq: srui_protocol::Event = (&activate).into();
+    unexpected_seq.edit_seq = 1;
+    assert!(matches!(
+        Event::try_from(unexpected_seq),
+        Err(WireError::Event(_))
+    ));
 }
 
 // =============================================================================

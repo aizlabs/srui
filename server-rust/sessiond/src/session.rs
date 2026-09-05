@@ -23,7 +23,7 @@ pub use model_range::{
 };
 pub use text_edit::{TextEditDecision, TextEditRequest, TextEditTracker, MAX_TEXT_EDIT_STREAMS};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::outbound::{OutboundHub, OutboundReceiver, DEFAULT_OUTBOUND_QUEUE_CAPACITY};
@@ -96,10 +96,10 @@ use srui_protocol::{Event, ServerLimits, Transaction};
 use srui_resources::{PublishOutcome, ResourceEntry, ResourceStore};
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
-    AuthoritativeCommit, EventValidationError, NegotiationError, NodeId, PropertyRef, ResourceHash,
-    SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef, Value,
-    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
-    DEFAULT_MAX_TREE_DEPTH,
+    AuthoritativeCommit, Event as DomainEvent, EventValidationError, NegotiationError, NodeId,
+    Operation, PropertyRef, ResourceHash, SemanticStore, ServerCapabilities, StoreError, TxnError,
+    TypeRef, Value, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
+    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 use thiserror::Error;
 
@@ -183,6 +183,45 @@ pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> Stri
     }
     value.truncate(end);
     value
+}
+
+fn deleted_subtree_ids(store: &SemanticStore, ops: &[Operation]) -> Vec<NodeId> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for op in ops {
+        if let Operation::DeleteNode { id } = op {
+            collect_deleted_subtree(store, *id, &mut ids, &mut seen);
+        }
+    }
+    ids
+}
+
+fn deleted_subtree_ids_from_wire(store: &SemanticStore, tx: &Transaction) -> Vec<NodeId> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for op in &tx.operations {
+        if let Some(srui_protocol::operation::Op::DeleteNode(ref deletion)) = op.op {
+            collect_deleted_subtree(store, NodeId::new(deletion.node_id), &mut ids, &mut seen);
+        }
+    }
+    ids
+}
+
+fn collect_deleted_subtree(
+    store: &SemanticStore,
+    id: NodeId,
+    out: &mut Vec<NodeId>,
+    seen: &mut HashSet<u64>,
+) {
+    if !seen.insert(id.get()) {
+        return;
+    }
+    out.push(id);
+    if let Some(node) = store.get_node(id) {
+        for child in node.ordered_children.iter().copied() {
+            collect_deleted_subtree(store, child, out, seen);
+        }
+    }
 }
 
 /// Outcome of one client event (§18.2).
@@ -692,7 +731,7 @@ impl Session {
             match result {
                 Ok(Ok(val)) => {
                     let (staged, ops) = ui.into_staged_and_ops();
-                    let deleted = text_edit::deleted_subtree_ids(&guard.store, &ops);
+                    let deleted = deleted_subtree_ids(&guard.store, &ops);
                     let commit = AuthoritativeCommit::new(base_revision, ops);
 
                     // Journal admission is decided before the store mutates: `append` below cannot
@@ -764,7 +803,7 @@ impl Session {
             let staged = guard.store.prepare_commit(&commit)?;
             let permit = guard.journal.prepare(&commit)?;
             let tx_wire = permit.transaction().clone();
-            let deleted = text_edit::deleted_subtree_ids_from_wire(&guard.store, &tx_wire);
+            let deleted = deleted_subtree_ids_from_wire(&guard.store, &tx_wire);
 
             guard.store.commit_prepared(staged);
             guard.journal.append(permit);
@@ -786,8 +825,10 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
-        if text_edit::is_standard_text_edit(event) {
-            return self.process_text_edit(event);
+        let domain = DomainEvent::try_from(event.clone())
+            .map_err(|error| SessionError::InvalidInput(format!("malformed event: {error}")))?;
+        if domain.event_type == TypeRef::EVENT_TEXT_EDIT {
+            return self.process_text_edit(event, domain);
         }
 
         let matching_handlers = {
@@ -822,9 +863,7 @@ impl Session {
             let obs_rev = srui_semantic_tree::Revision::new(event.observed_revision);
             let current_rev = guard.store.revision();
 
-            let validation = if event.edit_seq != 0 {
-                Err(EventValidationError::InvalidEditSeq)
-            } else if obs_rev > current_rev {
+            let validation = if obs_rev > current_rev {
                 Err(EventValidationError::FutureRevision {
                     observed: obs_rev,
                     current: current_rev,

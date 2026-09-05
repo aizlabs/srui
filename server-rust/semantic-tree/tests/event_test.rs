@@ -262,6 +262,10 @@ fn test_event_type_ref_resolution_and_constants() {
 
 #[test]
 fn test_edit_seq_is_nonzero_and_required_on_text_edit() {
+    assert_eq!(
+        std::mem::size_of::<Option<EditSeq>>(),
+        std::mem::size_of::<u64>()
+    );
     assert!(EditSeq::new(0).is_none());
     let seq = EditSeq::new(7).expect("positive");
     assert_eq!(seq.get(), 7);

@@ -40,7 +40,6 @@ public final class TextEditingSession {
         var lastSubmittedValue: String?
         /// Last string known to be the store's `.value` (echo or applied correction).
         var lastKnownAuthoritative: String?
-        var assignedEditSeq: EditSeq?
         var assignedEventId: EventId?
         var localValue: String = ""
         var deferredAuthoritative: String?
@@ -89,7 +88,6 @@ public final class TextEditingSession {
         guard event.eventType == .EVENT_TEXT_EDIT else { return }
         var state = nodes[event.nodeId] ?? NodeState()
         state.lastSubmittedValue = event.textArg
-        state.assignedEditSeq = event.editSeq
         state.assignedEventId = event.eventId
         nodes[event.nodeId] = state
     }
@@ -97,8 +95,7 @@ public final class TextEditingSession {
     public func noteAcknowledged(_ event: Event) {
         guard event.eventType == .EVENT_TEXT_EDIT else { return }
         guard var state = nodes[event.nodeId] else { return }
-        if state.assignedEventId == event.eventId || state.assignedEditSeq == event.editSeq {
-            state.assignedEditSeq = nil
+        if state.assignedEventId == event.eventId {
             state.assignedEventId = nil
         }
         nodes[event.nodeId] = state
@@ -109,7 +106,6 @@ public final class TextEditingSession {
     public func noteCanceled(nodeID: NodeId, eventId: EventId) {
         guard var state = nodes[nodeID] else { return }
         guard state.assignedEventId == eventId else { return }
-        state.assignedEditSeq = nil
         state.assignedEventId = nil
         state.lastSubmittedValue = nil
         state.pendingValue = nil
@@ -176,7 +172,8 @@ public final class TextEditingSession {
         }
         state.pendingValue = value
         state.debounceTask?.cancel()
-        if flushImmediately || debounceNanoseconds == 0 {
+        if !preservingLocalTextAcrossRemount,
+           flushImmediately || debounceNanoseconds == 0 {
             state.debounceTask = nil
             nodes[nodeID] = state
             flushPending(nodeID: nodeID)
@@ -192,7 +189,10 @@ public final class TextEditingSession {
     }
 
     public func endEditing(nodeID: NodeId) {
-        guard !preservingLocalTextAcrossRemount, !suppressingLocalEditsForResync else { return }
+        guard !suppressingLocalEditsForResync,
+              !preservingLocalTextAcrossRemount else {
+            return
+        }
         nodes[nodeID]?.debounceTask?.cancel()
         nodes[nodeID]?.debounceTask = nil
         flushPending(nodeID: nodeID)
@@ -221,7 +221,7 @@ public final class TextEditingSession {
         state.lastFlushedValue = value
         state.localValue = value
         nodes[nodeID] = state
-        onCommit?(nodeID, value, seq, max(resyncLaneEpoch, laneEpoch[nodeID] ?? 0))
+        onCommit?(nodeID, value, seq, bumpLaneEpoch(nodeID: nodeID))
     }
 
     /// Echo of a submitted value must not overwrite newer local typing; any other published
@@ -313,7 +313,6 @@ public final class TextEditingSession {
             state.pendingValue = nil
             state.lastFlushedValue = nil
             state.lastSubmittedValue = nil
-            state.assignedEditSeq = nil
             state.assignedEventId = nil
             state.deferredAuthoritative = nil
             state.composing = false

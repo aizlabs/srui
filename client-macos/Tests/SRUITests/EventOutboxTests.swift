@@ -867,35 +867,39 @@ struct EventOutboxTests {
         await seedServer.close()
     }
 
-    @Test("A later TEXT_EDIT draft is not replaced by an older edit_seq")
-    func queueTextEditIgnoresOlderDraft() async throws {
+    @Test("Older text callbacks cannot replace a newer coalesced draft")
+    func olderTextCallbackCannotReplaceNewerDraft() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         #expect(await outbox.confirmFreshSession(id: "session-order"))
+
+        let firstEditSeq = try #require(EditSeq(1))
+        let staleEditSeq = try #require(EditSeq(2))
+        let newestEditSeq = try #require(EditSeq(3))
         let first = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
             text: "a",
-            editSeq: try #require(EditSeq(1)),
+            editSeq: firstEditSeq,
             observedRevision: Revision(1),
-            via: client
+            via: client,
+            laneEpoch: 1
         ))
-        let newer = try await outbox.queueTextEdit(
+        _ = try await outbox.queueTextEdit(
             nodeId: NodeId(12),
-            text: "abc",
-            editSeq: try #require(EditSeq(3)),
+            text: "newest",
+            editSeq: newestEditSeq,
             observedRevision: Revision(1),
-            via: client
+            via: client,
+            laneEpoch: 3
         )
-        #expect(newer == nil)
-        let older = try await outbox.queueTextEdit(
+        _ = try await outbox.queueTextEdit(
             nodeId: NodeId(12),
-            text: "ab",
-            editSeq: try #require(EditSeq(2)),
+            text: "stale",
+            editSeq: staleEditSeq,
             observedRevision: Revision(1),
-            via: client
+            via: client,
+            laneEpoch: 3
         )
-        #expect(older == nil)
-        #expect(await outbox.unsentTextDraftCount == 1)
 
         #expect(await outbox.settleAcknowledgement(
             clientInstanceId: outbox.clientInstanceId,
@@ -905,67 +909,167 @@ struct EventOutboxTests {
         ).bound)
         let promoted = try await outbox.promoteReadyTextDrafts(via: client)
         #expect(promoted.count == 1)
-        #expect(promoted[0].textArg == "abc")
+        #expect(promoted[0].textArg == "newest")
         #expect(promoted[0].editSeq?.rawValue == 3)
 
         await client.close()
         await server.close()
     }
 
-    @Test("RESUME_OK frontier does not drop a TEXT_EDIT before its acknowledgement")
-    func resumeFrontierRetainsTextEditUntilSelectiveAck() async throws {
-        let (seedClient, seedServer) = await PipeTransport.createPair()
-        let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-retain"))
-        let textEvent = try #require(try await outbox.queueTextEdit(
-            nodeId: NodeId(12),
-            text: "typed",
-            editSeq: try #require(EditSeq(1)),
-            observedRevision: Revision(1),
-            via: seedClient
-        ))
-        let activate = try await outbox.sendActivate(
-            nodeId: NodeId(7),
-            observedRevision: Revision(1),
-            via: seedClient
-        )
-        #expect(textEvent.eventSeq == 1)
-        #expect(activate.eventSeq == 2)
-        #expect(await outbox.pendingCount == 2)
-
+    @Test("An older invalidation cannot discard a newer text draft")
+    func olderInvalidationCannotDiscardNewerDraft() async throws {
         let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-invalidate"))
         let generation = await outbox.beginResumeAttempt()
-        let serverStream = server.receiveStream()
-        let accepted = try await outbox.completeSameSessionResume(
-            id: "session-retain",
-            lastProcessedEventSeq: 2,
+
+        let newestEditSeq = try #require(EditSeq(3))
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "newest",
+            editSeq: newestEditSeq,
+            observedRevision: Revision(1),
+            via: client,
+            laneEpoch: 3
+        )
+        await outbox.invalidateTextDraft(nodeId: NodeId(12), laneEpoch: 2)
+        #expect(await outbox.unsentTextDraftCount == 1)
+
+        let resumed = try await outbox.completeSameSessionResume(
+            id: "session-invalidate",
+            lastProcessedEventSeq: 0,
             generation: generation,
             via: client,
             enableNewEventsAfterReplay: true
         )
-        #expect(accepted)
-        #expect(await outbox.assignedTextEditDescriptors().count == 1)
-        #expect(await outbox.assignedTextEditDescriptors()[0].eventId == textEvent.eventId)
+        #expect(resumed)
+        let assigned = await outbox.assignedTextEditDescriptors()
+        #expect(assigned.count == 1)
+        #expect(assigned[0].editSeq.rawValue == 3)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Resume frontier replays text until its cached outcome is acknowledged")
+    func resumeFrontierRetainsTextUntilOutcomeAck() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-outcome"))
+        let editSeq = try #require(EditSeq(1))
+        let pending = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "invalid",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            via: seedClient
+        ))
+
+        let generation = await outbox.beginResumeAttempt()
+        let (client, server) = await PipeTransport.createPair()
+        let serverStream = server.receiveStream()
+        let resumed = try await outbox.completeSameSessionResume(
+            id: "session-outcome",
+            lastProcessedEventSeq: pending.eventSeq,
+            generation: generation,
+            via: client,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(resumed)
+
+        #expect(await outbox.lastAckedEventSeq == pending.eventSeq)
         #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [pending.eventId])
 
         var streamDecoder = SRUIMessageStreamDecoder()
-        var replayed: [Event] = []
+        var replayedEvent: Event?
         for try await chunk in serverStream {
-            for msg in try streamDecoder.appendAndExtract(incoming: chunk) {
-                if case .event(let wireEvent) = msg.msg {
-                    replayed.append(try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent))
+            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .event(let wireEvent) = message.msg {
+                    replayedEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+                    break
                 }
             }
-            if !replayed.isEmpty {
+            if replayedEvent != nil {
                 break
             }
         }
-        #expect(replayed.map(\.eventId) == [textEvent.eventId])
+        #expect(replayedEvent?.eventId == pending.eventId)
+        #expect(replayedEvent?.eventSeq == pending.eventSeq)
+        #expect(replayedEvent?.editSeq == pending.editSeq)
 
-        await outbox.stopResumeWork(generation: generation)
+        let later = try await outbox.sendActivate(
+            nodeId: NodeId(13),
+            observedRevision: Revision(2),
+            via: client
+        )
+        let laterSettlement = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: later.eventId,
+            throughSeq: later.eventSeq,
+            sessionId: "session-outcome",
+            revisionAfterEffect: 2
+        )
+        #expect(laterSettlement.bound)
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [pending.eventId])
+
+        let settlement = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: pending.eventId,
+            throughSeq: later.eventSeq,
+            sessionId: "session-outcome",
+            revisionAfterEffect: 2,
+            textEditRejected: true
+        )
+        #expect(settlement.bound)
+        #expect(settlement.event?.eventId == pending.eventId)
+        #expect(settlement.settledEvents.map(\.eventId) == [pending.eventId])
+        #expect(await outbox.pendingCount == 0)
+
         await client.close()
         await server.close()
         await seedClient.close()
         await seedServer.close()
+    }
+
+    @Test("A newer resume generation invalidates a stale snapshot render and boundary")
+    func newerResumeInvalidatesStaleSnapshotRender() async throws {
+        let outbox = EventOutbox()
+        let staleGeneration = await outbox.beginResumeAttempt()
+        let committed = try #require(await outbox.commitResyncSnapshot(
+            generation: staleGeneration,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(committed.renderToken)
+
+        let currentGeneration = await outbox.beginResumeAttempt()
+        let (client, server) = await PipeTransport.createPair()
+        let editSeq = try #require(EditSeq(1))
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "new generation",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            via: client,
+            laneEpoch: 2
+        )
+
+        let rendered = await MainActor.run {
+            outbox.resyncRenderFence.performIfActive(renderToken) { true }
+        }
+        #expect(rendered == nil)
+        let applied = await outbox.applyFullResyncTextBoundary(
+            laneEpoch: 2,
+            generation: staleGeneration,
+            renderToken: renderToken
+        )
+        #expect(!applied)
+        #expect(await outbox.unsentTextDraftCount == 1)
+
+        await outbox.stopResumeWork(generation: currentGeneration)
+        await client.close()
+        await server.close()
     }
 }

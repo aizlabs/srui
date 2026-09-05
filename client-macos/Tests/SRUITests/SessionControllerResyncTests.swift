@@ -62,7 +62,12 @@ struct SessionControllerResyncTests {
         var initialMsg = SRUIMessage()
         initialMsg.transaction = initialTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(initialMsg))
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "initial transaction applied"
+        ) {
+            applier.lastAppliedRevision == Revision(1)
+        }
 
         #expect(applier.lastAppliedRevision == Revision(1))
 
@@ -92,7 +97,15 @@ struct SessionControllerResyncTests {
         var snapshotMsg = SRUIMessage()
         snapshotMsg.transaction = snapshotTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMsg))
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // The applier commits ahead of the renderer: the mount is a separate main-actor
+        // hop, so poll the painted value instead of sleeping a fixed interval.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "resync snapshot painted"
+        ) {
+            (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue
+                == "After resync"
+        }
 
         #expect(applier.lastAppliedRevision == Revision(2))
         let textHandle = try #require(renderer.registry.handle(for: textID))
@@ -146,7 +159,12 @@ struct SessionControllerResyncTests {
         var initialMsg = SRUIMessage()
         initialMsg.transaction = initialTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(initialMsg))
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "initial transaction applied"
+        ) {
+            applier.lastAppliedRevision == Revision(1)
+        }
         #expect(applier.lastAppliedRevision == Revision(1))
 
         let staleTx = Transaction(
@@ -174,7 +192,13 @@ struct SessionControllerResyncTests {
         var validMsg = SRUIMessage()
         validMsg.transaction = validTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(validMsg))
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "follow-up transaction painted"
+        ) {
+            (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue
+                == "Count: 1"
+        }
 
         #expect(applier.lastAppliedRevision == Revision(2))
         let textHandle = try #require(renderer.registry.handle(for: textID))

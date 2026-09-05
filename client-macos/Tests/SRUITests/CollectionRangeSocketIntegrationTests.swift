@@ -69,6 +69,14 @@ struct CollectionRangeSocketIntegrationTests {
         try await Self.waitForRevision(applier, atLeast: Revision(3), timeoutSeconds: 8)
 
         let tableID = NodeId(10)
+        // The applier commits ahead of the renderer: the mount is a separate main-actor
+        // hop, so poll for the handle instead of assuming it landed with the revision.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(8),
+            description: "table node mounted"
+        ) {
+            renderer.registry.handle(for: tableID) != nil
+        }
         let handle = try #require(renderer.registry.handle(for: tableID))
         let scroll = try #require(handle.view as? NSScrollView)
         let tableView = try #require(scroll.documentView as? NSTableView)

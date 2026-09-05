@@ -267,8 +267,18 @@ public final class SessionController: @unchecked Sendable {
             }
         }
 
-        renderer.onCollectionRangeRequest = { [weak self] request in
-            self?.rangeRequestContinuation?.yield(request)
+        renderer.onCollectionRangeRequest = { [weak self, weak renderer] request in
+            guard let self else { return }
+            // A request emitted while the pump is torn down (between sessions) would
+            // otherwise stay marked in-flight in the adapter's tracker and suppress the
+            // re-request after reconnect. Give the coverage straight back (§8, §22.7).
+            guard let continuation = self.rangeRequestContinuation else {
+                renderer?.noteDroppedCollectionRange(request)
+                return
+            }
+            if case .terminated = continuation.yield(request) {
+                renderer?.noteDroppedCollectionRange(request)
+            }
         }
     }
 

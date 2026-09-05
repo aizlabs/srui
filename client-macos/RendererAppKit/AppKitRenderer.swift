@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Resources
 import Text
+import Terminal
 @_exported import Collections
 
 /// Public main-actor entry point for mounting committed semantic state and applying render deltas.
@@ -28,10 +29,25 @@ public final class AppKitRenderer {
         controlFactory.textEditingSession
     }
 
+    public var terminalSession: TerminalSession {
+        controlFactory.terminalSession
+    }
+
+    public var onTerminalInput: (@MainActor (NodeId, Data) -> Void)? {
+        get { controlFactory.onTerminalInput }
+        set { controlFactory.onTerminalInput = newValue }
+    }
+
+    public var onTerminalResize: (@MainActor (NodeId, UInt32, UInt32, UInt32, UInt32) -> Void)? {
+        get { controlFactory.onTerminalResize }
+        set { controlFactory.onTerminalResize = newValue }
+    }
+
     public init() {
         let registry = RenderRegistry()
         let session = TextEditingSession()
-        let controlFactory = ControlFactory(textEditingSession: session)
+        let terminals = TerminalSession()
+        let controlFactory = ControlFactory(textEditingSession: session, terminalSession: terminals)
         self.registry = registry
         self.controlFactory = controlFactory
         self.layoutRenderer = LayoutRenderer(
@@ -42,6 +58,14 @@ public final class AppKitRenderer {
         self.controlFactory.resolveResourceImage = { [weak self] hash in
             self?.imagesByHash[hash]
         }
+    }
+
+    public func registerTerminalType(_ typeRef: TypeRef) throws {
+        try controlFactory.registerExtension(typeRef: typeRef, kind: .terminal)
+    }
+
+    public func resetExtensionRegistry() {
+        controlFactory.resetExtensionRegistry()
     }
 
     public func attach(store: SemanticStore) throws {

@@ -624,6 +624,71 @@ message ResourceChunk {
 }
 
 // -----------------------------------------------------------------------------
+// Terminal compatibility profile (§21, §21.2)
+// -----------------------------------------------------------------------------
+//
+// These envelopes are legal only after successful negotiation of
+// `org.srui.terminal/1`. Wrong-direction use is a protocol error:
+// TerminalData and TerminalResyncRequired are server → client;
+// TerminalInput and TerminalResize are client → server.
+//
+// Offset contract:
+//   - TerminalData.byte_offset is the absolute offset of data[0].
+//   - The client's resumable next offset is byte_offset + data.size()
+//     using checked uint64 arithmetic (overflow is a protocol error).
+//   - Empty TerminalData frames are forbidden.
+//   - TerminalResyncRequired.resume_at_offset is where subsequent live
+//     data begins after the abandoned gap.
+//
+// Limits (enforced by both peers; §21, §26):
+//   - TerminalInput.data                    ≤ 65536 bytes
+//   - TerminalData.data                     ≤ 16384 bytes and non-empty
+//   - ClientResume.terminal_stream_offsets  ≤ 256 entries
+//   - TerminalResize.columns / rows         in [1, 512]
+//   - TerminalResize.pixel_width / height   in [0, 16384]
+//
+// Local type ID 1 within the negotiated `org.srui.terminal/1` namespace
+// is Terminal. Clients MUST use the session-assigned namespace_id from
+// ServerWelcome.extension_namespaces and MUST NOT assume it is 1.
+
+enum TerminalResyncReason {
+  TERMINAL_RESYNC_REASON_UNSPECIFIED = 0;
+  // The requested next offset is older than the ring's retained start.
+  TERMINAL_RESYNC_REASON_RETENTION_LOSS = 1;
+  // The client advertised a next offset ahead of the server's next_offset.
+  TERMINAL_RESYNC_REASON_OFFSET_AHEAD = 2;
+  // A connected subscriber's cursor fell behind ring eviction.
+  TERMINAL_RESYNC_REASON_SUBSCRIBER_FALLBEHIND = 3;
+}
+
+message TerminalData {
+  uint64 stream_id = 1;
+  uint64 byte_offset = 2;
+  bytes data = 3;
+}
+
+message TerminalInput {
+  uint64 stream_id = 1;
+  bytes data = 2;
+}
+
+message TerminalResize {
+  uint64 stream_id = 1;
+  uint32 columns = 2;
+  uint32 rows = 3;
+  uint32 pixel_width = 4;
+  uint32 pixel_height = 5;
+}
+
+message TerminalResyncRequired {
+  uint64 stream_id = 1;
+  uint64 requested_offset = 2;
+  uint64 retained_from_offset = 3;
+  uint64 resume_at_offset = 4;
+  TerminalResyncReason reason = 5;
+}
+
+// -----------------------------------------------------------------------------
 // Collection range request (§8, §22.7)
 // -----------------------------------------------------------------------------
 
@@ -656,5 +721,9 @@ message SruiMessage {
     ResourceMetadata resource_metadata = 9;
     ResourceChunk resource_chunk = 10;
     ClientModelRangeRequest client_model_range_request = 11;
+    TerminalData terminal_data = 12;
+    TerminalInput terminal_input = 13;
+    TerminalResize terminal_resize = 14;
+    TerminalResyncRequired terminal_resync_required = 15;
   }
 }

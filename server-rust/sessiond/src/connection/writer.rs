@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::outbound::{
-    logical_class_for_server_envelope, LogicalChannelClass, LogicalChannelScheduler, OutboundItem,
+    server_envelope_matches_class, LogicalChannelClass, LogicalChannelScheduler, OutboundItem,
     OutboundReceiver, OutboundRecvError,
 };
 use crate::session::SessionError;
@@ -20,6 +20,8 @@ pub(super) async fn write_loop<W>(
     framed_write: FramedWrite<W, SruiCodec>,
     outbound: OutboundReceiver,
     control_rx: mpsc::Receiver<ServerEventAck>,
+    terminal_high_rx: mpsc::Receiver<SruiMessage>,
+    terminal_normal_rx: mpsc::Receiver<SruiMessage>,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
     read_finished: CancellationToken,
@@ -31,6 +33,8 @@ where
         framed_write,
         outbound,
         control_rx,
+        terminal_high_rx,
+        terminal_normal_rx,
         shutdown,
         session_cancel,
         read_finished,
@@ -44,9 +48,15 @@ struct Writer<W> {
     framed_write: FramedWrite<W, SruiCodec>,
     outbound: OutboundReceiver,
     control_rx: mpsc::Receiver<ServerEventAck>,
+    terminal_high_rx: mpsc::Receiver<SruiMessage>,
+    terminal_normal_rx: mpsc::Receiver<SruiMessage>,
     scheduler: LogicalChannelScheduler,
     pending_ack: Option<ServerEventAck>,
+    pending_terminal_high: Option<SruiMessage>,
+    pending_terminal_normal: Option<SruiMessage>,
     control_closed: bool,
+    terminal_high_closed: bool,
+    terminal_normal_closed: bool,
     outbound_idle: bool,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
@@ -61,6 +71,8 @@ where
         framed_write: FramedWrite<W, SruiCodec>,
         outbound: OutboundReceiver,
         control_rx: mpsc::Receiver<ServerEventAck>,
+        terminal_high_rx: mpsc::Receiver<SruiMessage>,
+        terminal_normal_rx: mpsc::Receiver<SruiMessage>,
         shutdown: CancellationToken,
         session_cancel: CancellationToken,
         read_finished: CancellationToken,
@@ -69,9 +81,15 @@ where
             framed_write,
             outbound,
             control_rx,
+            terminal_high_rx,
+            terminal_normal_rx,
             scheduler: LogicalChannelScheduler::new(),
             pending_ack: None,
+            pending_terminal_high: None,
+            pending_terminal_normal: None,
             control_closed: false,
+            terminal_high_closed: false,
+            terminal_normal_closed: false,
             outbound_idle: false,
             shutdown,
             session_cancel,
@@ -101,6 +119,20 @@ where
                     Err(TryRecvError::Disconnected) => self.control_closed = true,
                 }
             }
+            if self.pending_terminal_high.is_none() && !self.terminal_high_closed {
+                match self.terminal_high_rx.try_recv() {
+                    Ok(msg) => self.pending_terminal_high = Some(msg),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => self.terminal_high_closed = true,
+                }
+            }
+            if self.pending_terminal_normal.is_none() && !self.terminal_normal_closed {
+                match self.terminal_normal_rx.try_recv() {
+                    Ok(msg) => self.pending_terminal_normal = Some(msg),
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => self.terminal_normal_closed = true,
+                }
+            }
 
             // A closed control channel means the completed reader cannot produce more
             // acknowledgements. Once its bounded queue is empty, finish without streaming
@@ -111,12 +143,14 @@ where
 
             let read_finished = self.read_finished.is_cancelled();
             let control_ready = self.pending_ack.is_some();
+            let terminal_high_ready = self.pending_terminal_high.is_some();
+            let terminal_normal_ready = self.pending_terminal_normal.is_some();
             let outbound = &self.outbound;
             let class = self.scheduler.select_next(|class| match class {
                 LogicalChannelClass::Control => control_ready,
-                LogicalChannelClass::Input
-                | LogicalChannelClass::TerminalHigh
-                | LogicalChannelClass::TerminalNormal => false,
+                LogicalChannelClass::Input => false,
+                LogicalChannelClass::TerminalHigh => !read_finished && terminal_high_ready,
+                LogicalChannelClass::TerminalNormal => !read_finished && terminal_normal_ready,
                 LogicalChannelClass::Ui => {
                     !read_finished && outbound.class_ready(LogicalChannelClass::Ui)
                 }
@@ -150,11 +184,20 @@ where
                             }
                         }
                     }
-                    LogicalChannelClass::Input
-                    | LogicalChannelClass::TerminalHigh
-                    | LogicalChannelClass::TerminalNormal => continue,
+                    LogicalChannelClass::TerminalHigh => self
+                        .pending_terminal_high
+                        .take()
+                        .expect("terminalHigh selected only when a live/resync frame is pending"),
+                    LogicalChannelClass::TerminalNormal => self
+                        .pending_terminal_normal
+                        .take()
+                        .expect("terminalNormal selected only when a replay frame is pending"),
+                    LogicalChannelClass::Input => continue,
                 };
-                debug_assert_eq!(logical_class_for_server_envelope(&envelope), Some(class));
+                debug_assert!(
+                    server_envelope_matches_class(&envelope, class),
+                    "envelope {envelope:?} is not legal on {class:?}"
+                );
                 if !send_message_with_read_state(
                     &mut self.framed_write,
                     envelope,
@@ -209,6 +252,18 @@ where
                     match ack {
                         Some(ack) => self.pending_ack = Some(ack),
                         None => self.control_closed = true,
+                    }
+                }
+                msg = self.terminal_high_rx.recv(), if self.pending_terminal_high.is_none() && !self.terminal_high_closed && !self.read_finished.is_cancelled() => {
+                    match msg {
+                        Some(msg) => self.pending_terminal_high = Some(msg),
+                        None => self.terminal_high_closed = true,
+                    }
+                }
+                msg = self.terminal_normal_rx.recv(), if self.pending_terminal_normal.is_none() && !self.terminal_normal_closed && !self.read_finished.is_cancelled() => {
+                    match msg {
+                        Some(msg) => self.pending_terminal_normal = Some(msg),
+                        None => self.terminal_normal_closed = true,
                     }
                 }
                 result = self.outbound.wait_for_work(), if !self.outbound_idle && !self.read_finished.is_cancelled() => {

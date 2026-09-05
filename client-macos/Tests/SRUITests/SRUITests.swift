@@ -603,6 +603,174 @@ final class SRUITests: XCTestCase {
         XCTAssertEqual(encodedData, fixtureData, "Authored Swift Framed ClientModelRangeRequest byte mismatch against golden fixture")
     }
 
+    private func createAuthoredTerminalData() -> Srui_Protocol_SruiMessage {
+        var data = Srui_Protocol_TerminalData()
+        data.streamID = 7
+        data.byteOffset = 4096
+        data.data = Data("pty-ok".utf8)
+        var msg = Srui_Protocol_SruiMessage()
+        msg.terminalData = data
+        return msg
+    }
+
+    private func createAuthoredTerminalInput() -> Srui_Protocol_SruiMessage {
+        var input = Srui_Protocol_TerminalInput()
+        input.streamID = 7
+        input.data = Data("ls\n".utf8)
+        var msg = Srui_Protocol_SruiMessage()
+        msg.terminalInput = input
+        return msg
+    }
+
+    private func createAuthoredTerminalResize() -> Srui_Protocol_SruiMessage {
+        var resize = Srui_Protocol_TerminalResize()
+        resize.streamID = 7
+        resize.columns = 80
+        resize.rows = 24
+        resize.pixelWidth = 1280
+        resize.pixelHeight = 720
+        var msg = Srui_Protocol_SruiMessage()
+        msg.terminalResize = resize
+        return msg
+    }
+
+    private func createAuthoredTerminalResyncRequired() -> Srui_Protocol_SruiMessage {
+        var resync = Srui_Protocol_TerminalResyncRequired()
+        resync.streamID = 7
+        resync.requestedOffset = 100
+        resync.retainedFromOffset = 64
+        resync.resumeAtOffset = 240
+        resync.reason = .retentionLoss
+        var msg = Srui_Protocol_SruiMessage()
+        msg.terminalResyncRequired = resync
+        return msg
+    }
+
+    func testDecodeGoldenTerminalDataAgainstExpectedJSON() throws {
+        try assertFramedTerminalVector(
+            key: "golden_terminal_data",
+            authored: createAuthoredTerminalData()
+        ) { decoded in
+            guard case .terminalData(let data)? = decoded.msg else {
+                XCTFail("Expected terminalData, got \(String(describing: decoded.msg))")
+                return
+            }
+            XCTAssertEqual(data.streamID, 7)
+            XCTAssertEqual(data.byteOffset, 4096)
+            XCTAssertEqual(data.data, Data("pty-ok".utf8))
+        }
+    }
+
+    func testDirectEncodeGoldenTerminalDataMatchesWireBytes() throws {
+        try assertAuthoredTerminalMatchesFixture("golden_terminal_data", createAuthoredTerminalData())
+    }
+
+    func testDecodeGoldenTerminalInputAgainstExpectedJSON() throws {
+        try assertFramedTerminalVector(
+            key: "golden_terminal_input",
+            authored: createAuthoredTerminalInput()
+        ) { decoded in
+            guard case .terminalInput(let input)? = decoded.msg else {
+                XCTFail("Expected terminalInput, got \(String(describing: decoded.msg))")
+                return
+            }
+            XCTAssertEqual(input.streamID, 7)
+            XCTAssertEqual(input.data, Data("ls\n".utf8))
+        }
+    }
+
+    func testDirectEncodeGoldenTerminalInputMatchesWireBytes() throws {
+        try assertAuthoredTerminalMatchesFixture("golden_terminal_input", createAuthoredTerminalInput())
+    }
+
+    func testDecodeGoldenTerminalResizeAgainstExpectedJSON() throws {
+        try assertFramedTerminalVector(
+            key: "golden_terminal_resize",
+            authored: createAuthoredTerminalResize()
+        ) { decoded in
+            guard case .terminalResize(let resize)? = decoded.msg else {
+                XCTFail("Expected terminalResize, got \(String(describing: decoded.msg))")
+                return
+            }
+            XCTAssertEqual(resize.streamID, 7)
+            XCTAssertEqual(resize.columns, 80)
+            XCTAssertEqual(resize.rows, 24)
+            XCTAssertEqual(resize.pixelWidth, 1280)
+            XCTAssertEqual(resize.pixelHeight, 720)
+        }
+    }
+
+    func testDirectEncodeGoldenTerminalResizeMatchesWireBytes() throws {
+        try assertAuthoredTerminalMatchesFixture("golden_terminal_resize", createAuthoredTerminalResize())
+    }
+
+    func testDecodeGoldenTerminalResyncRequiredAgainstExpectedJSON() throws {
+        try assertFramedTerminalVector(
+            key: "golden_terminal_resync_required",
+            authored: createAuthoredTerminalResyncRequired()
+        ) { decoded in
+            guard case .terminalResyncRequired(let resync)? = decoded.msg else {
+                XCTFail("Expected terminalResyncRequired, got \(String(describing: decoded.msg))")
+                return
+            }
+            XCTAssertEqual(resync.streamID, 7)
+            XCTAssertEqual(resync.requestedOffset, 100)
+            XCTAssertEqual(resync.retainedFromOffset, 64)
+            XCTAssertEqual(resync.resumeAtOffset, 240)
+            XCTAssertEqual(resync.reason, .retentionLoss)
+        }
+    }
+
+    func testDirectEncodeGoldenTerminalResyncRequiredMatchesWireBytes() throws {
+        try assertAuthoredTerminalMatchesFixture(
+            "golden_terminal_resync_required",
+            createAuthoredTerminalResyncRequired()
+        )
+    }
+
+    private func assertFramedTerminalVector(
+        key: String,
+        authored: Srui_Protocol_SruiMessage,
+        check: (Srui_Protocol_SruiMessage) -> Void
+    ) throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let vector = vectors[key] as? [String: Any],
+              let filename = vector["file"] as? String,
+              let expectedHex = vector["hex"] as? String,
+              let expectedSHA256 = vector["sha256"] as? String,
+              let expectedByteLen = vector["byte_length"] as? Int else {
+            XCTFail("Malformed expected.json structure for \(key)")
+            return
+        }
+        let data = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+        XCTAssertEqual(data.count, expectedByteLen)
+        XCTAssertEqual(hexString(from: data), expectedHex)
+        XCTAssertEqual(sha256String(from: data), expectedSHA256)
+        let decoded = try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: data)
+        check(decoded)
+        XCTAssertEqual(try SRUIFraming.encodeFramed(decoded), data)
+        _ = authored
+    }
+
+    private func assertAuthoredTerminalMatchesFixture(
+        _ key: String,
+        _ authored: Srui_Protocol_SruiMessage
+    ) throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let vector = vectors[key] as? [String: Any],
+              let filename = vector["file"] as? String,
+              let expectedHex = vector["hex"] as? String else {
+            XCTFail("Malformed expected.json structure for \(key)")
+            return
+        }
+        let fixture = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+        let encoded = try SRUIFraming.encodeFramed(authored)
+        XCTAssertEqual(hexString(from: encoded), expectedHex)
+        XCTAssertEqual(encoded, fixture)
+    }
+
     func testLengthDelimitedFraming() throws {
         var msg = Srui_Protocol_SruiMessage()
         msg.transaction = createAuthoredTransaction()

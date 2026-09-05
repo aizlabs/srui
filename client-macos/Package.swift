@@ -57,6 +57,7 @@ let package = Package(
                 "Resources",
                 "Collections",
                 "Text",
+                "Terminal",
             ],
             path: "RendererAppKit"
         ),
@@ -70,6 +71,7 @@ let package = Package(
                 "Resources",
                 "Collections",
                 "Text",
+                "Terminal",
             ],
             path: "Session"
         ),
@@ -101,6 +103,9 @@ let package = Package(
         ),
         .target(
             name: "Terminal",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "Terminal"
         ),
         .target(
@@ -123,8 +128,17 @@ let package = Package(
                 "Resources",
                 "Collections",
                 "Text",
+                "Terminal",
             ],
             path: "Tests/RendererAppKitTests"
+        ),
+        .testTarget(
+            name: "TerminalTests",
+            dependencies: [
+                "Terminal",
+                "SemanticModel",
+            ],
+            path: "Tests/TerminalTests"
         ),
         .testTarget(
             name: "TextTests",

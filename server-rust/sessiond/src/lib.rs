@@ -8,13 +8,17 @@ pub mod session;
 
 pub use connection::{handle_connection, ConnectionError, HANDSHAKE_TIMEOUT, WRITE_TIMEOUT};
 pub use outbound::{
-    logical_class_for_server_envelope, LogicalChannelClass, LogicalChannelScheduler, OutboundItem,
-    OutboundReceiver, OutboundRecvError, DEFAULT_OUTBOUND_QUEUE_CAPACITY, SERVICE_CYCLE,
+    logical_class_for_server_envelope, server_envelope_matches_class, LogicalChannelClass,
+    LogicalChannelScheduler, OutboundItem, OutboundReceiver, OutboundRecvError,
+    DEFAULT_OUTBOUND_QUEUE_CAPACITY, SERVICE_CYCLE,
 };
 pub use session::{
     mint_session_id, run_model_range_worker, AttachmentGuard, EventOutcome, FreshClientBootstrap,
     ModelRangeError, ModelRangeFulfillment, ModelRangeProvider, ModelRangeQuery,
     ModelRangeRequestInbox, ResumeClientBootstrap, ResumeOutcome, Session, SessionConfig,
-    SessionError, SessionState, TextEditDecision, TextEditRequest, TextEditTracker, CORE_VERSION,
-    MAX_CLIENT_INSTANCE_ID_BYTES, MAX_RETAINED_CLIENT_STATE_BYTES, MAX_TEXT_EDIT_STREAMS,
+    SessionError, SessionState, TerminalAttach, TextEditDecision, TextEditRequest, TextEditTracker,
+    CORE_VERSION, MAX_CLIENT_INSTANCE_ID_BYTES, MAX_RETAINED_CLIENT_STATE_BYTES,
+    MAX_TEXT_EDIT_STREAMS,
 };
+
+pub use srui_pty::{PTYManager, PTYManagerConfig, TerminalSpec};

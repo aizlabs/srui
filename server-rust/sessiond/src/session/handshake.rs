@@ -13,10 +13,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::outbound::OutboundReceiver;
 use srui_protocol::{
-    ClientHello, ClientLimits, ClientResume, ExtensionNamespaceMapping, ServerResumeOk,
-    ServerResyncRequired, ServerWelcome, SessionContinuity, Transaction,
+    ClientHello, ClientLimits, ClientResume, ServerResumeOk, ServerResyncRequired, ServerWelcome,
+    SessionContinuity, Transaction, MAX_TERMINAL_RESUME_MAP_ENTRIES,
 };
 use srui_semantic_tree::{CapabilitySet, Profile, ResourceHash, SemanticStore};
+
+use super::terminal::TerminalAttach;
 
 use super::snapshot::export_snapshot_transaction;
 use super::{Session, SessionError};
@@ -54,6 +56,10 @@ pub struct FreshClientBootstrap {
     pub snapshot: Option<Transaction>,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
+    /// Whether this client negotiated `org.srui.terminal/1`.
+    pub terminal_negotiated: bool,
+    /// Terminal catch-up captured before welcome so live bytes cannot fall through (§21.2).
+    pub terminal: TerminalAttach,
 }
 
 /// Result of an atomic resume handshake bootstrap (§20.2, §21, §32.5).
@@ -63,6 +69,10 @@ pub struct ResumeClientBootstrap {
     pub outcome: ResumeOutcome,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
+    /// Whether this client may send terminal input/resize (prior negotiation or required profile).
+    pub terminal_negotiated: bool,
+    /// Terminal catch-up captured before resume so live bytes cannot fall through (§21.2).
+    pub terminal: TerminalAttach,
 }
 
 /// Outcome of a [`ClientResume`] handshake request.
@@ -83,7 +93,7 @@ pub enum ResumeOutcome {
 fn negotiate_hello(
     inner: &super::SessionInner,
     hello: &ClientHello,
-) -> Result<(ServerWelcome, Option<SemanticStore>), SessionError> {
+) -> Result<(ServerWelcome, Option<SemanticStore>, bool), SessionError> {
     // Refuse an unretainable identity before any per-client table copies it (§15, §26).
     validate_client_instance_id(&hello.client_instance_id)?;
 
@@ -104,7 +114,8 @@ fn negotiate_hello(
         }
     }
 
-    let _negotiated = inner.capabilities.negotiate(&client_caps)?;
+    let negotiated = inner.capabilities.negotiate(&client_caps)?;
+    let terminal_negotiated = negotiated.contains(&Profile::terminal_v1());
 
     let initial_revision = inner.store.revision().get();
     // Advertise the effective (server ∩ client) resource ceiling so peers agree on §15/§26 limits.
@@ -117,10 +128,7 @@ fn negotiate_hello(
         optional_profiles: inner.capabilities.optional.to_string_vec(),
         session_id: inner.session_id.clone(),
         initial_revision,
-        extension_namespaces: vec![ExtensionNamespaceMapping {
-            extension_uri: "org.srui.standard-widgets".to_string(),
-            namespace_id: 0,
-        }],
+        extension_namespaces: inner.extension_namespaces.clone(),
         limits: Some(limits),
     };
 
@@ -130,7 +138,7 @@ fn negotiate_hello(
         None
     };
 
-    Ok((welcome, store_clone))
+    Ok((welcome, store_clone, terminal_negotiated))
 }
 
 /// Intersects the client's advertised `max_resource_size` with the server ceiling (§15, §26).
@@ -261,7 +269,7 @@ impl Session {
         F: FnOnce(),
     {
         let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-        let (welcome, store_clone) = negotiate_hello(&inner_guard, hello)?;
+        let (welcome, store_clone, terminal_negotiated) = negotiate_hello(&inner_guard, hello)?;
 
         before_subscribe();
 
@@ -297,6 +305,9 @@ impl Session {
         );
         drop(inner_guard);
 
+        // Subscribe terminals before welcome so output produced during snapshot send is live, not lost.
+        let terminal = self.attach_terminals(&HashMap::new(), false)?;
+
         // Fails the handshake rather than emitting a catch-up transaction the client must reject
         // and would then re-request forever (§18, §26).
         let snapshot = match store_clone {
@@ -310,6 +321,8 @@ impl Session {
             welcome,
             snapshot,
             transactions,
+            terminal_negotiated,
+            terminal,
         })
     }
 
@@ -355,6 +368,12 @@ impl Session {
 
         // Refuse an unretainable identity before any per-client table copies it (§15, §26).
         validate_client_instance_id(&resume.client_instance_id)?;
+        if resume.terminal_stream_offsets.len() > MAX_TERMINAL_RESUME_MAP_ENTRIES {
+            return Err(SessionError::InvalidInput(format!(
+                "terminal_stream_offsets has {} entries; at most {MAX_TERMINAL_RESUME_MAP_ENTRIES} are accepted (§21, §26)",
+                resume.terminal_stream_offsets.len()
+            )));
+        }
 
         let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
@@ -462,7 +481,18 @@ impl Session {
             &retained_resources,
             &known_hashes,
         );
+        let replaced = matches!(resync_cause, Some(ResyncCause::ReplacedIncarnation));
+        let terminal_negotiated = inner_guard
+            .capabilities
+            .required
+            .contains(&Profile::terminal_v1())
+            || inner_guard
+                .extension_namespaces
+                .iter()
+                .any(|mapping| mapping.extension_uri == srui_protocol::TERMINAL_PROFILE_URI);
         drop(inner_guard);
+
+        let terminal = self.attach_terminals(&resume.terminal_stream_offsets, replaced)?;
 
         let outcome = match plan {
             ResumePlan::Replay {
@@ -502,6 +532,8 @@ impl Session {
         Ok(ResumeClientBootstrap {
             outcome,
             transactions,
+            terminal_negotiated,
+            terminal,
         })
     }
 }

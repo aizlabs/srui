@@ -32,15 +32,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::outbound::{
-    logical_class_for_server_envelope, LogicalChannelClass, OutboundReceiver, OutboundRecvError,
+    server_envelope_matches_class, LogicalChannelClass, OutboundReceiver, OutboundRecvError,
 };
+use crate::session::terminal::{event_to_message, live_class_for_event};
 use crate::session::{
     run_model_range_worker, EventOutcome, ModelRangeRequestInbox, ResumeOutcome, Session,
     SessionError,
 };
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
+    MAX_TERMINAL_INPUT_BYTES,
 };
+use srui_pty::TerminalSubscription;
+use srui_semantic_tree::NodeId;
 use thiserror::Error;
 
 /// Handshake timeout in seconds (5 seconds, §18.1).
@@ -140,9 +144,8 @@ async fn send_message_with_read_state<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    debug_assert_eq!(
-        logical_class_for_server_envelope(&envelope),
-        Some(logical_class),
+    debug_assert!(
+        server_envelope_matches_class(&envelope, logical_class),
         "envelope class must match the annotated write class"
     );
     debug!(?logical_class, "sending outbound frame");
@@ -246,7 +249,7 @@ where
         }
     };
 
-    let (client_instance_id, tx_rx) = match handshake_msg.msg {
+    let (client_instance_id, tx_rx, terminal_negotiated, terminal_live) = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
                 client_instance_id = ?hello.client_instance_id,
@@ -284,7 +287,22 @@ where
                 }
             }
             clear_stale_if_settled(&session, &hello.client_instance_id, &bootstrap.transactions);
-            (hello.client_instance_id, bootstrap.transactions)
+            if !send_terminal_catch_up(
+                &mut framed_write,
+                bootstrap.terminal.catch_up,
+                &shutdown,
+                &bootstrap.transactions,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            (
+                hello.client_instance_id,
+                bootstrap.transactions,
+                bootstrap.terminal_negotiated,
+                bootstrap.terminal.live,
+            )
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
             info!(
@@ -368,7 +386,22 @@ where
                     );
                 }
             }
-            (resume.client_instance_id, bootstrap.transactions)
+            if !send_terminal_catch_up(
+                &mut framed_write,
+                bootstrap.terminal.catch_up,
+                &shutdown,
+                &bootstrap.transactions,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            (
+                resume.client_instance_id,
+                bootstrap.transactions,
+                bootstrap.terminal_negotiated,
+                bootstrap.terminal.live,
+            )
         }
         _ => {
             return Err(ConnectionError::UnexpectedMessage(
@@ -383,9 +416,71 @@ where
         session,
         client_instance_id,
         tx_rx,
+        terminal_negotiated,
+        terminal_live,
         shutdown,
     )
     .await
+}
+
+async fn send_terminal_catch_up<W>(
+    framed_write: &mut FramedWrite<W, SruiCodec>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+    shutdown: &CancellationToken,
+    outbound: &OutboundReceiver,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    for (class, envelope) in catch_up {
+        if !send_message(framed_write, envelope, class, shutdown, outbound).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+const TERMINAL_LANE_CAPACITY: usize = 64;
+
+fn spawn_terminal_live_pumps(
+    live: Vec<TerminalSubscription>,
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+) -> (
+    mpsc::Receiver<SruiMessage>,
+    mpsc::Receiver<SruiMessage>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    let (high_tx, high_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let (_normal_tx, normal_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let mut tasks = Vec::new();
+    for mut subscription in live {
+        let high_tx = high_tx.clone();
+        let shutdown = shutdown.clone();
+        let session_cancel = session_cancel.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = session_cancel.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
+                    events = subscription.recv() => {
+                        if events.is_empty() {
+                            return;
+                        }
+                        for event in events {
+                            let _ = live_class_for_event(&event);
+                            if high_tx.send(event_to_message(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    drop(high_tx);
+    (high_rx, normal_rx, tasks)
 }
 
 /// Concurrently drives inbound events and scheduled outbound writes (§18.2, §19.2, §20).
@@ -399,6 +494,8 @@ async fn run_active_session<R, W>(
     session: Arc<Session>,
     client_instance_id: Vec<u8>,
     outbound: OutboundReceiver,
+    terminal_negotiated: bool,
+    terminal_live: Vec<TerminalSubscription>,
     shutdown: CancellationToken,
 ) -> Result<(), ConnectionError>
 where
@@ -419,12 +516,15 @@ where
         })
     };
 
+    let (terminal_high_rx, terminal_normal_rx, terminal_pumps) =
+        spawn_terminal_live_pumps(terminal_live, shutdown.clone(), session_cancel.clone());
     let read = read_loop(
         framed_read,
         session,
         client_instance_id,
         control_tx,
         range_inbox.clone(),
+        terminal_negotiated,
         shutdown.clone(),
         session_cancel.clone(),
     );
@@ -432,6 +532,8 @@ where
         framed_write,
         outbound,
         control_rx,
+        terminal_high_rx,
+        terminal_normal_rx,
         shutdown,
         session_cancel.clone(),
         read_finished.clone(),
@@ -469,6 +571,9 @@ where
     };
     range_inbox.close();
     session_cancel.cancel();
+    for task in terminal_pumps {
+        let _ = task.await;
+    }
     let _ = range_worker.await;
     result
 }
@@ -479,6 +584,7 @@ async fn read_loop<R>(
     client_instance_id: Vec<u8>,
     control_tx: mpsc::Sender<ServerEventAck>,
     range_inbox: ModelRangeRequestInbox,
+    terminal_negotiated: bool,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
 ) -> Result<(), ConnectionError>
@@ -497,7 +603,14 @@ where
                 match incoming {
                     Some(Ok(msg)) => {
                         if let Some(ack) =
-                            handle_incoming_message(msg, &session, &client_instance_id, &range_inbox).await?
+                            handle_incoming_message(
+                                msg,
+                                &session,
+                                &client_instance_id,
+                                &range_inbox,
+                                terminal_negotiated,
+                            )
+                            .await?
                         {
                             tokio::select! {
                                 biased;
@@ -530,6 +643,7 @@ async fn handle_incoming_message(
     session: &Session,
     client_instance_id: &[u8],
     range_inbox: &ModelRangeRequestInbox,
+    terminal_negotiated: bool,
 ) -> Result<Option<ServerEventAck>, ConnectionError> {
     match msg.msg {
         Some(srui_message::Msg::Event(event)) => {
@@ -588,12 +702,24 @@ async fn handle_incoming_message(
             );
             Err(ConnectionError::ClientTransactionRejected)
         }
+        Some(srui_message::Msg::TerminalInput(input)) => {
+            handle_terminal_input(session, terminal_negotiated, input)?;
+            Ok(None)
+        }
+        Some(srui_message::Msg::TerminalResize(resize)) => {
+            handle_terminal_resize(session, terminal_negotiated, resize)?;
+            Ok(None)
+        }
         Some(srui_message::Msg::ClientHello(_)) => Err(ConnectionError::UnexpectedMessage(
             "ClientHello is valid only during handshake",
         )),
         Some(srui_message::Msg::ClientResume(_)) => Err(ConnectionError::UnexpectedMessage(
             "ClientResume is valid only during handshake",
         )),
+        Some(srui_message::Msg::TerminalData(_))
+        | Some(srui_message::Msg::TerminalResyncRequired(_)) => Err(
+            ConnectionError::UnexpectedMessage("server-only terminal message received from client"),
+        ),
         Some(_) => Err(ConnectionError::UnexpectedMessage(
             "server-only or unsupported message during active session",
         )),
@@ -605,6 +731,78 @@ async fn handle_incoming_message(
             warn!("Ignoring empty or unrecognized active-session envelope");
             Ok(None)
         }
+    }
+}
+
+fn handle_terminal_input(
+    session: &Session,
+    terminal_negotiated: bool,
+    input: srui_protocol::TerminalInput,
+) -> Result<(), ConnectionError> {
+    if !terminal_negotiated {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalInput is legal only after org.srui.terminal/1 negotiation",
+        ));
+    }
+    if input.data.is_empty() {
+        return Err(ConnectionError::UnexpectedMessage(
+            "empty TerminalInput is forbidden",
+        ));
+    }
+    if input.data.len() > MAX_TERMINAL_INPUT_BYTES {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalInput exceeds MAX_TERMINAL_INPUT_BYTES",
+        ));
+    }
+    let stream_id = NodeId::new(input.stream_id);
+    if !session.pty().contains(stream_id) {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalInput targeted an unknown or unnegotiated stream",
+        ));
+    }
+    match session.pty().input(stream_id, input.data) {
+        Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
+            warn!("dropping TerminalInput because the PTY command queue is full");
+            Ok(())
+        }
+        Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
+            error.to_string(),
+        ))),
+    }
+}
+
+fn handle_terminal_resize(
+    session: &Session,
+    terminal_negotiated: bool,
+    resize: srui_protocol::TerminalResize,
+) -> Result<(), ConnectionError> {
+    if !terminal_negotiated {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalResize is legal only after org.srui.terminal/1 negotiation",
+        ));
+    }
+    let stream_id = NodeId::new(resize.stream_id);
+    if !session.pty().contains(stream_id) {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalResize targeted an unknown or unnegotiated stream",
+        ));
+    }
+    match session.pty().resize(
+        stream_id,
+        resize.columns,
+        resize.rows,
+        resize.pixel_width,
+        resize.pixel_height,
+    ) {
+        Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
+            warn!("dropping TerminalResize because the PTY command queue is full");
+            Ok(())
+        }
+        Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
+            error.to_string(),
+        ))),
     }
 }
 
@@ -670,6 +868,7 @@ fn build_event_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbound::logical_class_for_server_envelope;
     use srui_sdk::{NodeId, Surface};
     use tokio::io::duplex;
 

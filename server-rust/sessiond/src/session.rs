@@ -11,6 +11,7 @@
 mod handshake;
 mod model_range;
 mod snapshot;
+pub(crate) mod terminal;
 mod text_edit;
 
 pub use handshake::{
@@ -21,6 +22,7 @@ pub use model_range::{
     run_model_range_worker, ModelRangeError, ModelRangeFulfillment, ModelRangeProvider,
     ModelRangeQuery, ModelRangeRequestInbox,
 };
+pub use terminal::TerminalAttach;
 pub use text_edit::{TextEditDecision, TextEditRequest, TextEditTracker, MAX_TEXT_EDIT_STREAMS};
 
 use std::collections::HashMap;
@@ -235,6 +237,8 @@ pub(crate) struct SessionInner {
     pub(crate) model_range_providers: HashMap<srui_semantic_tree::ModelId, ModelRangeProvider>,
     pub(crate) text_edit_tracker: text_edit::TextEditTracker,
     pub(crate) text_edit_policy: Option<text_edit::TextEditPolicy>,
+    /// Session-stable extension URI → namespace_id table advertised on every welcome (§15, §21).
+    pub(crate) extension_namespaces: Vec<srui_protocol::ExtensionNamespaceMapping>,
 }
 
 impl std::fmt::Debug for SessionInner {
@@ -259,6 +263,7 @@ impl std::fmt::Debug for SessionInner {
                 &self.model_range_providers.len(),
             )
             .field("text_edit_streams", &self.text_edit_tracker.len())
+            .field("extension_namespaces", &self.extension_namespaces)
             .finish()
     }
 }
@@ -322,6 +327,8 @@ pub struct Session {
     pub(crate) inner: Arc<Mutex<SessionInner>>,
     pub(crate) outbound_hub: Arc<OutboundHub>,
     pub(crate) outbound_queue_capacity: usize,
+    /// PTY streams live outside `SessionInner` so blocking I/O never holds the semantic mutex (§21).
+    pub(crate) pty: Arc<srui_pty::PTYManager>,
 }
 
 impl Default for Session {
@@ -419,12 +426,14 @@ impl Session {
             model_range_providers: HashMap::new(),
             text_edit_tracker: text_edit::TextEditTracker::default(),
             text_edit_policy: None,
+            extension_namespaces: vec![terminal::standard_namespace_mapping()],
         };
 
         Self {
             inner: Arc::new(Mutex::new(inner)),
             outbound_hub: Arc::new(OutboundHub::new()),
             outbound_queue_capacity: config.outbound_queue_capacity,
+            pty: Arc::new(srui_pty::PTYManager::default()),
         }
     }
 
@@ -525,6 +534,8 @@ impl Session {
         let mut guard = lock_or_recover(&self.inner);
         guard.state = SessionState::Terminating;
         tracing::info!(session_id = %guard.session_id, "Session marked as TERMINATING");
+        drop(guard);
+        self.shutdown_terminals();
     }
 
     /// Marks the session as expired (§17; triggering policy stubbed in Task 22).
@@ -532,6 +543,8 @@ impl Session {
         let mut guard = lock_or_recover(&self.inner);
         guard.state = SessionState::Expired;
         tracing::info!(session_id = %guard.session_id, "Session marked as EXPIRED");
+        drop(guard);
+        self.shutdown_terminals();
     }
 
     /// Publishes immutable `bytes` into the session resource CAS and, when newly
@@ -702,11 +715,13 @@ impl Session {
                     let tx_wire = permit.transaction().clone();
                     guard.store.commit_staging(staged, commit.new_revision());
                     guard.journal.append(permit);
-                    guard.text_edit_tracker.reclaim_nodes(deleted);
+                    guard.text_edit_tracker.reclaim_nodes(deleted.clone());
                     // Published under `inner` so delivery order equals commit order (§12.1);
                     // see `publish_committed` for why this is not an `async-no-lock-await`
                     // violation.
                     self.publish_committed(&tx_wire);
+                    drop(guard);
+                    self.close_terminals_for_deleted_nodes(&deleted);
                     val
                 }
                 Ok(Err(store_err)) => return Err(SessionError::Store(store_err)),
@@ -768,9 +783,11 @@ impl Session {
 
             guard.store.commit_prepared(staged);
             guard.journal.append(permit);
-            guard.text_edit_tracker.reclaim_nodes(deleted);
+            guard.text_edit_tracker.reclaim_nodes(deleted.clone());
             // Published under `inner` so delivery order equals commit order (§12.1).
             self.publish_committed(&tx_wire);
+            drop(guard);
+            self.close_terminals_for_deleted_nodes(&deleted);
             tx_wire
         };
 

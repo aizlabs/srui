@@ -925,7 +925,7 @@ mod tests {
         inbox.submit(request(node_a, model, 0, 8, 1));
         inbox.submit(request(node_b, model, 0, 8, 1));
         inbox.submit(request(node_b, model, 10_000, 8, 1));
-        let mut popped = vec![
+        let mut popped = [
             inbox.try_pop().expect("first"),
             inbox.try_pop().expect("second"),
         ];

@@ -58,7 +58,7 @@ async fn spawn_unreadable_client(
 
 fn sample_client_hello(profiles: &[&str]) -> ClientHello {
     ClientHello {
-        core_version: "0.4.0".to_string(),
+        core_version: "0.5.0".to_string(),
         profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
         limits: None,
         client_instance_id: vec![1, 2, 3],
@@ -267,7 +267,7 @@ async fn server_welcome_contains_session_metadata() {
 
     match welcome_msg.msg {
         Some(srui_message::Msg::ServerWelcome(w)) => {
-            assert_eq!(w.core_version, "0.4.0");
+            assert_eq!(w.core_version, "0.5.0");
             assert_eq!(w.session_id, "welcome-fields");
             assert_eq!(w.initial_revision, 1);
             assert_eq!(
@@ -533,7 +533,7 @@ async fn a_client_that_never_reads_is_detached_by_the_write_deadline() {
 
 #[tokio::test]
 async fn an_incompatible_core_version_fails_the_handshake() {
-    for requested in ["", "1.0.0", "0.5.0", "garbage", "0"] {
+    for requested in ["", "1.0.0", "0.4.0", "garbage", "0"] {
         let session = Arc::new(Session::new("core-version"));
         let shutdown = CancellationToken::new();
         let (client_io, server_io) = duplex(4096);
@@ -581,7 +581,7 @@ async fn a_compatible_patch_level_is_accepted() {
     let mut framed_write = FramedWrite::new(client_write, SruiCodec::new());
 
     let mut hello = sample_client_hello(&["org.srui.standard-widgets/1"]);
-    hello.core_version = "0.4.99".to_string();
+    hello.core_version = "0.5.99".to_string();
     framed_write
         .send(SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(hello)),

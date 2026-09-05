@@ -537,6 +537,72 @@ final class SRUITests: XCTestCase {
         XCTAssertEqual(encodedData, fixtureData, "Authored Swift Framed ServerEventAck byte mismatch against golden fixture")
     }
 
+    /// Authors the golden `ClientModelRangeRequest` envelope from scratch (§8, §22.7).
+    private func createAuthoredClientModelRangeRequest() -> Srui_Protocol_SruiMessage {
+        var request = Srui_Protocol_ClientModelRangeRequest()
+        request.nodeID = 7
+        request.modelID = 11
+        request.startIndex = 128
+        request.count = 64
+        request.observedRevision = 5
+
+        var msg = Srui_Protocol_SruiMessage()
+        msg.clientModelRangeRequest = request
+        return msg
+    }
+
+    func testDecodeGoldenClientModelRangeRequestAgainstExpectedJSON() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let rangeSpec = vectors["golden_client_model_range_request"] as? [String: Any],
+              let filename = rangeSpec["file"] as? String,
+              let expectedHex = rangeSpec["hex"] as? String,
+              let expectedSHA256 = rangeSpec["sha256"] as? String,
+              let expectedByteLen = rangeSpec["byte_length"] as? Int,
+              let expected = rangeSpec["expected"] as? [String: Any] else {
+            XCTFail("Malformed expected.json structure for golden_client_model_range_request")
+            return
+        }
+
+        let fileURL = conformanceVectorsDir.appendingPathComponent(filename)
+        let data = try Data(contentsOf: fileURL)
+
+        XCTAssertEqual(data.count, expectedByteLen, "Fixture byte length mismatch")
+        XCTAssertEqual(hexString(from: data), expectedHex, "Fixture hex mismatch")
+        XCTAssertEqual(sha256String(from: data), expectedSHA256, "Fixture SHA256 mismatch")
+
+        let decoded = try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: data)
+        guard case .clientModelRangeRequest(let request)? = decoded.msg else {
+            XCTFail("Expected clientModelRangeRequest in framed message, got \(String(describing: decoded.msg))")
+            return
+        }
+        XCTAssertEqual(request.nodeID, UInt64(expected["node_id"] as? Int ?? -1))
+        XCTAssertEqual(request.modelID, UInt64(expected["model_id"] as? Int ?? -1))
+        XCTAssertEqual(request.startIndex, UInt64(expected["start_index"] as? Int ?? -1))
+        XCTAssertEqual(request.count, UInt64(expected["count"] as? Int ?? -1))
+        XCTAssertEqual(request.observedRevision, UInt64(expected["observed_revision"] as? Int ?? -1))
+
+        let roundtripData = try SRUIFraming.encodeFramed(decoded)
+        XCTAssertEqual(roundtripData, data, "Roundtrip re-encode framed mismatch")
+    }
+
+    func testDirectEncodeGoldenClientModelRangeRequestMatchesWireBytes() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let rangeSpec = vectors["golden_client_model_range_request"] as? [String: Any],
+              let filename = rangeSpec["file"] as? String,
+              let expectedHex = rangeSpec["hex"] as? String else {
+            XCTFail("Malformed expected.json structure for golden_client_model_range_request")
+            return
+        }
+
+        let fixtureData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+        let encodedData = try SRUIFraming.encodeFramed(createAuthoredClientModelRangeRequest())
+
+        XCTAssertEqual(hexString(from: encodedData), expectedHex, "Authored Swift Framed ClientModelRangeRequest hex mismatch")
+        XCTAssertEqual(encodedData, fixtureData, "Authored Swift Framed ClientModelRangeRequest byte mismatch against golden fixture")
+    }
+
     func testLengthDelimitedFraming() throws {
         var msg = Srui_Protocol_SruiMessage()
         msg.transaction = createAuthoredTransaction()

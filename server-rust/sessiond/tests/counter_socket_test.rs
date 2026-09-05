@@ -153,7 +153,7 @@ impl CounterConnection {
 
         let hello = SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(ClientHello {
-                core_version: "0.4.0".to_string(),
+                core_version: "0.5.0".to_string(),
                 profiles: vec!["org.srui.standard-widgets/1".to_string()],
                 limits: None,
                 client_instance_id: client_instance_id.to_vec(),
@@ -451,7 +451,7 @@ async fn test_sessiond_socket_hosts_counter_and_streams_transactions() {
     // 4. Protocol Handshake: Send ClientHello, receive ServerWelcome (§15, §18)
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![10, 20, 30, 40],
@@ -667,7 +667,7 @@ async fn test_sessiond_in_memory_duplex_hosts_counter_and_streams_transactions()
     // Protocol Handshake
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![1, 2, 3, 4],
@@ -1020,7 +1020,7 @@ async fn test_malformed_frame_closes_one_counter_client_only() {
     ] {
         let hello = SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(ClientHello {
-                core_version: "0.4.0".to_string(),
+                core_version: "0.5.0".to_string(),
                 profiles: vec!["org.srui.standard-widgets/1".to_string()],
                 limits: None,
                 client_instance_id: client_id.to_vec(),

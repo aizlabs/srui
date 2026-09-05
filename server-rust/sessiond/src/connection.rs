@@ -34,7 +34,10 @@ use tracing::{debug, error, info, warn};
 use crate::outbound::{
     logical_class_for_server_envelope, LogicalChannelClass, OutboundReceiver, OutboundRecvError,
 };
-use crate::session::{EventOutcome, ResumeOutcome, Session, SessionError};
+use crate::session::{
+    run_model_range_worker, EventOutcome, ModelRangeRequestInbox, ResumeOutcome, Session,
+    SessionError,
+};
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
 };
@@ -405,12 +408,23 @@ where
     let session_cancel = CancellationToken::new();
     let read_finished = CancellationToken::new();
     let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+    let range_inbox = ModelRangeRequestInbox::new();
+    let range_worker = {
+        let session = Arc::clone(&session);
+        let inbox = range_inbox.clone();
+        let shutdown = shutdown.clone();
+        let session_cancel = session_cancel.clone();
+        tokio::spawn(async move {
+            run_model_range_worker(session, inbox, shutdown, session_cancel).await;
+        })
+    };
 
     let read = read_loop(
         framed_read,
         session,
         client_instance_id,
         control_tx,
+        range_inbox.clone(),
         shutdown.clone(),
         session_cancel.clone(),
     );
@@ -425,7 +439,7 @@ where
 
     tokio::pin!(read);
     tokio::pin!(write);
-    tokio::select! {
+    let result = tokio::select! {
         biased;
         result = &mut read => {
             // Stop selecting new low-priority work while the closed control sender is drained.
@@ -452,7 +466,11 @@ where
             session_cancel.cancel();
             result
         }
-    }
+    };
+    range_inbox.close();
+    session_cancel.cancel();
+    let _ = range_worker.await;
+    result
 }
 
 async fn read_loop<R>(
@@ -460,6 +478,7 @@ async fn read_loop<R>(
     session: Arc<Session>,
     client_instance_id: Vec<u8>,
     control_tx: mpsc::Sender<ServerEventAck>,
+    range_inbox: ModelRangeRequestInbox,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
 ) -> Result<(), ConnectionError>
@@ -478,7 +497,7 @@ where
                 match incoming {
                     Some(Ok(msg)) => {
                         if let Some(ack) =
-                            handle_incoming_message(msg, &session, &client_instance_id).await?
+                            handle_incoming_message(msg, &session, &client_instance_id, &range_inbox).await?
                         {
                             tokio::select! {
                                 biased;
@@ -510,6 +529,7 @@ async fn handle_incoming_message(
     msg: SruiMessage,
     session: &Session,
     client_instance_id: &[u8],
+    range_inbox: &ModelRangeRequestInbox,
 ) -> Result<Option<ServerEventAck>, ConnectionError> {
     match msg.msg {
         Some(srui_message::Msg::Event(event)) => {
@@ -556,6 +576,10 @@ async fn handle_incoming_message(
                 session.max_string_length(),
                 session.session_id(),
             ))
+        }
+        Some(srui_message::Msg::ClientModelRangeRequest(request)) => {
+            range_inbox.submit(request);
+            Ok(None)
         }
         Some(srui_message::Msg::Transaction(tx)) => {
             warn!(

@@ -19,6 +19,8 @@
 //   per-event acknowledgements selectively drain the outbox's retry set.
 // - §22.2 Threading: network IO and protobuf decoding run off the main actor; AppKit mutations
 //   are dispatched to `MainActor`.
+// - §8 / §22.7 Sparse collections: `ClientModelRangeRequest` is sent on the `.ui` lane and is
+//   not an Event. A copy arriving from the server is a protocol violation.
 // - §4 inv. 13: unrecoverable divergence fails explicitly instead of degrading silently.
 //
 
@@ -28,6 +30,7 @@ import Protocol
 import TransportSSH
 import RendererAppKit
 import Resources
+import Collections
 
 /// Reason a session stopped tracking the authoritative semantic stream (§4 inv. 13, §18).
 public enum SessionFailure: Error, Sendable, CustomStringConvertible {
@@ -62,7 +65,7 @@ public enum SessionDispatchError: Error, Equatable, Sendable {
 }
 
 /// Core protocol version this build speaks (§15).
-public let SRUICoreVersion = "0.4.0"
+public let SRUICoreVersion = "0.5.0"
 
 /// Whether `advertised` names a core version this build can talk to (§15, §4 inv. 13).
 ///
@@ -133,6 +136,8 @@ public final class SessionController: @unchecked Sendable {
     private var retainedCapabilities: CapabilitySet?
     /// Hashes whose transfer was already rejected; suppress per-chunk log spam (§14, §26).
     private var rejectedResourceHashes: Set<ResourceHash> = []
+    private var rangeRequestContinuation: AsyncStream<CollectionRangeRequest>.Continuation?
+    private var rangeRequestTask: Task<Void, Never>?
 
     public init(
         transport: any Transport,
@@ -261,12 +266,92 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
         }
+
+        renderer.onCollectionRangeRequest = { [weak self, weak renderer] request in
+            guard let self else { return }
+            // A request emitted while the pump is torn down (between sessions) would
+            // otherwise stay marked in-flight in the adapter's tracker and suppress the
+            // re-request after reconnect. Give the coverage straight back (§8, §22.7).
+            guard let continuation = self.rangeRequestContinuation else {
+                renderer?.noteDroppedCollectionRange(request)
+                return
+            }
+            if case .terminated = continuation.yield(request) {
+                renderer?.noteDroppedCollectionRange(request)
+            }
+        }
     }
 
     @MainActor
     private func ensureActionHandlerWired() {
         guard let renderer else { return }
         wireActionHandler(for: renderer)
+    }
+
+    private func startRangeRequestPump() {
+        stopRangeRequestPump()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: CollectionRangeRequest.self
+        )
+        rangeRequestContinuation = continuation
+        rangeRequestTask = Task { [weak self] in
+            for await request in stream {
+                guard let self, !Task.isCancelled else { break }
+                await self.sendCollectionRangeRequest(request)
+            }
+        }
+    }
+
+    private func stopRangeRequestPump() {
+        rangeRequestContinuation?.finish()
+        rangeRequestContinuation = nil
+        rangeRequestTask?.cancel()
+        rangeRequestTask = nil
+    }
+
+    private func sendCollectionRangeRequest(_ request: CollectionRangeRequest) async {
+        let allowed = withStateLock { allowsDataPlane(phase) && isRunning && !_isDiverged }
+        guard allowed else {
+            await noteDroppedCollectionRange(request)
+            return
+        }
+
+        var envelope = SRUIClientModelRangeRequest()
+        envelope.nodeID = request.nodeID.value
+        envelope.modelID = request.modelID.value
+        envelope.startIndex = request.startIndex
+        envelope.count = request.count
+        envelope.observedRevision = applier.lastAppliedRevision.value
+
+        var message = SRUIMessage()
+        message.clientModelRangeRequest = envelope
+        do {
+            try await transport.send(
+                data: try SRUIFraming.encodeFramed(message),
+                logicalClass: .ui
+            )
+        } catch {
+            await noteDroppedCollectionRange(request)
+            SessionDiagnostics.error("Collection range request send failed: \(error)")
+        }
+    }
+
+    private func noteDroppedCollectionRange(_ request: CollectionRangeRequest) async {
+        await MainActor.run {
+            self.renderer?.noteDroppedCollectionRange(request)
+        }
+    }
+
+    /// Re-request each collection's last viewport once the `.ui` lane can send.
+    /// Must not run from `stop()` (the pump is already gone) or from a failed
+    /// send (that storms every adapter). Handshake start is still
+    /// `.awaitingWelcome`, so this waits until the session becomes `.active`.
+    private func reissueCollectionRangeRequestsIfAllowed() async {
+        let allowed = withStateLock { allowsDataPlane(phase) && isRunning && !_isDiverged }
+        guard allowed else { return }
+        await MainActor.run {
+            self.renderer?.reissueCollectionRangeRequests()
+        }
     }
 
     /// Starts the session by sending a handshake request and launching the receive loop (§15, §18, §22.2).
@@ -283,9 +368,12 @@ public final class SessionController: @unchecked Sendable {
         }
         guard shouldStart else { return }
 
+        startRangeRequestPump()
+
         var didStart = false
         defer {
             if !didStart {
+                stopRangeRequestPump()
                 withStateLock {
                     self.isRunning = false
                     self.requestedSessionId = nil
@@ -578,6 +666,11 @@ public final class SessionController: @unchecked Sendable {
             }
             await handleResourceChunk(chunk)
 
+        case .clientModelRangeRequest:
+            await reportFailure(.protocolViolation(
+                "Received client-originated model range request from server"
+            ))
+
         case .clientHello, .clientResume:
             await reportFailure(.protocolViolation(
                 "Received client-originated handshake message from server"
@@ -663,6 +756,8 @@ public final class SessionController: @unchecked Sendable {
         }
         if welcome.initialRevision > 0 {
             await outbox.suspendNewEvents()
+        } else {
+            await reissueCollectionRangeRequestsIfAllowed()
         }
         SessionDiagnostics.log(
             "Handshake completed successfully with session \(welcome.sessionID), negotiated: \(negotiated)"
@@ -717,6 +812,7 @@ public final class SessionController: @unchecked Sendable {
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = !self._isDiverged
         }
+        await reissueCollectionRangeRequestsIfAllowed()
     }
 
     private func handleResyncRequired(_ resync: SRUIServerResyncRequired, phase: ProtocolPhase) async {
@@ -1185,6 +1281,7 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
         }
+        await reissueCollectionRangeRequestsIfAllowed()
     }
 
     /// Classifies a rejected transaction as a benign duplicate or as replica divergence (§12.1, §18).
@@ -1296,6 +1393,11 @@ public final class SessionController: @unchecked Sendable {
         }
 
         guard stoppedState.shouldStop else { return }
+
+        stopRangeRequestPump()
+        await MainActor.run {
+            self.renderer?.clearCollectionRangeTrackers()
+        }
 
         // Close the transport first so the receive loop drains any buffered catch-up frames
         // (welcome snapshot, replay) while handshake phase is still valid. Resetting `phase` or

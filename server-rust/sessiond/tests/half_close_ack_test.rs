@@ -51,7 +51,7 @@ async fn clean_inbound_eof_flushes_settled_event_ack() {
     write
         .send(SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(ClientHello {
-                core_version: "0.4.0".into(),
+                core_version: "0.5.0".into(),
                 profiles: vec!["org.srui.standard-widgets/1".into()],
                 limits: None,
                 client_instance_id: CLIENT_ID.to_vec(),

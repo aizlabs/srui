@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+@testable import Collections
 
 private let controlFactoryRequiredTierTypes: [TypeRef] = [
     .surface, .row, .column, .grid, .spacer, .separator, .scroll,
@@ -311,29 +312,46 @@ struct ControlFactoryTests {
     }
 
     @Test
-    func modelRefPresentWithAbsentOrUncachedModelRendersEmptyRowsWithoutInlineFallback() throws {
+    func modelRefPresentWithAbsentOrUncachedModelDoesNotFallBackToInlineItems() throws {
         var store = SemanticStore()
         let absentModelID = ModelId(999)
         let uncachedModelID = ModelId(998)
         try store.createModel(id: uncachedModelID, modelType: .table, itemCount: 2)
 
         let factory = ControlFactory()
-        for modelID in [absentModelID, uncachedModelID] {
-            let node = Node(
-                id: 1,
-                nodeType: .table,
-                properties: [
-                    .modelRef: .unsignedInt(modelID.value),
-                    .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
-                ]
-            )
+        let absentNode = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .modelRef: .unsignedInt(absentModelID.value),
+                .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
+            ]
+        )
+        let absentHandle = try factory.makeHandle(for: absentNode, store: store)
+        let absentAdapter = try #require(absentHandle.modelAdapter as? TableCollectionAdapter)
+        let absentTable = try #require((absentHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        #expect(absentAdapter.rows.isEmpty)
+        #expect(absentAdapter.numberOfRows(in: absentTable) == 0)
 
-            let handle = try factory.makeHandle(for: node, store: store)
-            let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
-
-            // A present MODEL_REF is authoritative even when the model is absent or uncached.
-            #expect(adapter.rows.isEmpty)
-        }
+        let uncachedNode = Node(
+            id: 2,
+            nodeType: .table,
+            properties: [
+                .modelRef: .unsignedInt(uncachedModelID.value),
+                .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
+            ]
+        )
+        let uncachedHandle = try factory.makeHandle(for: uncachedNode, store: store)
+        let uncachedAdapter = try #require(uncachedHandle.modelAdapter as? TableCollectionAdapter)
+        let uncachedTable = try #require((uncachedHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        TableCollectionAdapter.reconcileColumns(in: uncachedTable, columns: nil, fallbackTitle: "Table")
+        #expect(uncachedAdapter.rows.isEmpty)
+        #expect(uncachedAdapter.numberOfRows(in: uncachedTable) == 2)
+        let loading = try #require(
+            uncachedAdapter.tableView(uncachedTable, viewFor: uncachedTable.tableColumns[0], row: 1) as? NSTextField
+        )
+        #expect(loading.stringValue == CollectionCells.loadingPlaceholder)
+        #expect(uncachedAdapter.tableView(uncachedTable, shouldSelectRow: 1) == false)
     }
 
     @Test

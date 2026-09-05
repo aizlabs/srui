@@ -97,7 +97,7 @@ impl TestClientConnection {
 
         let hello = SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(ClientHello {
-                core_version: "0.4.0".to_string(),
+                core_version: "0.5.0".to_string(),
                 profiles: vec!["org.srui.standard-widgets/1".to_string()],
                 limits: None,
                 client_instance_id: client_instance_id.to_vec(),
@@ -217,7 +217,7 @@ pub async fn read_session_id_from_counter_sessiond(socket_path: &std::path::Path
 
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![7, 7],

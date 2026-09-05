@@ -38,6 +38,7 @@ public typealias SRUIModelResetRangeOp = Srui_Protocol_ModelResetRangeOp
 public typealias SRUIResourceMetadata = Srui_Protocol_ResourceMetadata
 public typealias SRUIResourceChunk = Srui_Protocol_ResourceChunk
 public typealias SRUIResourcePriority = Srui_Protocol_ResourcePriority
+public typealias SRUIClientModelRangeRequest = Srui_Protocol_ClientModelRangeRequest
 
 public struct ProtocolPlaceholder {
     public init() {}

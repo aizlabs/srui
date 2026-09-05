@@ -55,6 +55,7 @@ let package = Package(
             dependencies: [
                 "SemanticModel",
                 "Resources",
+                "Collections",
             ],
             path: "RendererAppKit"
         ),
@@ -66,6 +67,7 @@ let package = Package(
                 "SemanticModel",
                 "RendererAppKit",
                 "Resources",
+                "Collections",
             ],
             path: "Session"
         ),
@@ -83,6 +85,9 @@ let package = Package(
         ),
         .target(
             name: "Collections",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "Collections"
         ),
         .target(
@@ -111,6 +116,7 @@ let package = Package(
                 "RendererAppKit",
                 "SemanticModel",
                 "Resources",
+                "Collections",
             ],
             path: "Tests/RendererAppKitTests"
         ),

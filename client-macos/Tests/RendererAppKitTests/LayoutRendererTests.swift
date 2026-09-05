@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+@testable import Collections
 
 @MainActor
 struct LayoutRendererTests {
@@ -686,6 +687,83 @@ struct LayoutRendererTests {
         #expect(listAdapter.isNestedInScroll)
         #expect(treeScroll.hasVerticalScroller == false)
         #expect(treeAdapter.isNestedInScroll)
+    }
+
+    @Test
+    func nestedModelBackedCollectionKeepsBoundedScroller() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(7)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 500_000)
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(id: 2, nodeType: .scroll, parentID: 1)
+        try store.createNode(
+            id: 3,
+            nodeType: .table,
+            parentID: 2,
+            properties: [
+                Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+            ]
+        )
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let tableScroll = try #require(renderer.registry.view(for: 3) as? NSScrollView)
+        let adapter = try #require(renderer.registry.handle(for: 3)?.modelAdapter as? TableCollectionAdapter)
+        let table = try #require(tableScroll.documentView as? NSTableView)
+
+        #expect(adapter.isModelBacked)
+        #expect(adapter.isNestedInScroll)
+        #expect(tableScroll.hasVerticalScroller)
+        #expect(tableScroll.borderType == .bezelBorder)
+        #expect(adapter.fitHeightConstraint?.isActive != true)
+        #expect(adapter.minHeightConstraint?.isActive == true)
+        #expect(table.numberOfRows == 500_000)
+        #expect(type(of: table) == NSTableView.self)
+    }
+
+    @Test
+    func modelBackedTreeRefreshesWithoutReplacingOutline() throws {
+        let modelID = ModelId(8)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .tree, itemCount: 0)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [ModelItem(itemID: ItemId(1), value: .string("Root A"))]
+        )
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(
+            id: 2,
+            nodeType: .tree,
+            parentID: 1,
+            properties: [
+                Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+            ]
+        )
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+        let outlineBefore = try #require(
+            (renderer.registry.view(for: 2) as? NSScrollView)?.documentView as? NSOutlineView
+        )
+        #expect(type(of: outlineBefore) == NSOutlineView.self)
+        #expect(outlineBefore.numberOfRows == 1)
+
+        let insertOp = Operation.modelInsert(
+            id: modelID,
+            index: 1,
+            items: [ModelItem(itemID: ItemId(2), value: .string("Root B"))]
+        )
+        var newStore = store
+        try insertOp.apply(to: &newStore)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [insertOp]),
+            newStore: newStore
+        )
+        let outlineAfter = try #require(
+            (renderer.registry.view(for: 2) as? NSScrollView)?.documentView as? NSOutlineView
+        )
+        #expect(outlineAfter === outlineBefore)
+        #expect(outlineAfter.numberOfRows == 2)
     }
 
     @Test

@@ -790,11 +790,19 @@ impl SemanticStore {
             .get_mut(&id)
             .ok_or(StoreError::ModelNotFound(id))?;
         let end_index = start_index.saturating_add(items.len() as u64);
-        let removed_in_range = model
-            .iter_cached_items()
-            .filter(|(idx, _)| **idx >= start_index && **idx < end_index)
-            .count();
-        let projected_cached = model.cached_item_count() - removed_in_range + items.len();
+        let overlap = |model: &Model| {
+            model
+                .iter_cached_items()
+                .filter(|(idx, _)| **idx >= start_index && **idx < end_index)
+                .count()
+        };
+        let projected = |model: &Model| model.cached_item_count() - overlap(model) + items.len();
+        let mut projected_cached = projected(model);
+        if projected_cached > self.limits.max_cached_items_per_model {
+            let need = projected_cached - self.limits.max_cached_items_per_model;
+            model.evict_farthest_outside(start_index, end_index, need);
+            projected_cached = projected(model);
+        }
         if projected_cached > self.limits.max_cached_items_per_model {
             return Err(StoreError::MaxCachedItemsPerModelExceeded {
                 limit: self.limits.max_cached_items_per_model,

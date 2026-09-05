@@ -197,6 +197,34 @@ impl Model {
         self.items.contains_key(&index)
     }
 
+    /// Drops up to `count` cached items whose indices lie outside `[keep_start, keep_end)`.
+    ///
+    /// Farthest from the keep-window midpoint are removed first; equal distances prefer the
+    /// lower index so server and replica eviction stays deterministic (§8, §26).
+    pub fn evict_farthest_outside(&mut self, keep_start: u64, keep_end: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let keep_end = keep_end.max(keep_start);
+        let mid = keep_start.saturating_add(keep_end.saturating_sub(keep_start) / 2);
+        let mut candidates: Vec<u64> = self
+            .items
+            .keys()
+            .copied()
+            .filter(|&index| index < keep_start || index >= keep_end)
+            .collect();
+        candidates.sort_by(|a, b| {
+            let da = a.abs_diff(mid);
+            let db = b.abs_diff(mid);
+            db.cmp(&da).then(a.cmp(b))
+        });
+        for index in candidates.into_iter().take(count) {
+            if let Some(item) = self.items.remove(&index) {
+                self.id_to_index.remove(&item.item_id);
+            }
+        }
+    }
+
     /// Returns the current index for a cached `ItemId`, if present.
     pub fn index_of(&self, item_id: ItemId) -> Option<u64> {
         self.id_to_index.get(&item_id).copied()

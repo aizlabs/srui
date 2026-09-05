@@ -22,7 +22,7 @@ use super::snapshot::export_snapshot_transaction;
 use super::{Session, SessionError};
 
 /// Core protocol version this build speaks (§15).
-pub const CORE_VERSION: &str = "0.4.0";
+pub const CORE_VERSION: &str = "0.5.0";
 
 /// Whether `requested` names a core version this build can serve (§15, §4 inv. 13).
 ///
@@ -493,7 +493,7 @@ mod tests {
 
     fn sample_hello() -> ClientHello {
         ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![1, 2],
@@ -820,7 +820,7 @@ mod tests {
         seed_revision_one(&session);
 
         let hello = ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![7, 8],

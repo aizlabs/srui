@@ -58,6 +58,7 @@ pub fn logical_class_for_server_envelope(message: &SruiMessage) -> Option<Logica
         Some(srui_message::Msg::ClientHello(_))
         | Some(srui_message::Msg::ClientResume(_))
         | Some(srui_message::Msg::Event(_))
+        | Some(srui_message::Msg::ClientModelRangeRequest(_))
         | None => None,
     }
 }
@@ -370,6 +371,9 @@ mod tests {
             envelope(srui_message::Msg::ClientHello(Default::default())),
             envelope(srui_message::Msg::ClientResume(Default::default())),
             envelope(srui_message::Msg::Event(Default::default())),
+            envelope(srui_message::Msg::ClientModelRangeRequest(
+                Default::default(),
+            )),
         ] {
             assert_eq!(
                 logical_class_for_server_envelope(&unschedulable),

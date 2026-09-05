@@ -19,7 +19,7 @@ use srui_sessiond::{handle_connection, ConnectionError, Session};
 fn client_hello_message() -> SruiMessage {
     SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: vec![1, 2, 3, 4],

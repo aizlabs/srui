@@ -2404,6 +2404,30 @@ public nonisolated struct Srui_Protocol_ResourceChunk: Sendable {
   public init() {}
 }
 
+/// Client → server request for a missing cached window of a sparse collection
+/// model. Idempotent and replaceable: not journaled, not replayed, and not an
+/// Event. The server answers with an authoritative Transaction containing
+/// MODEL_RESET_RANGE (§12.1). Viewport geometry remains EVENT_VIEWPORT_CHANGED.
+public nonisolated struct Srui_Protocol_ClientModelRangeRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var nodeID: UInt64 = 0
+
+  public var modelID: UInt64 = 0
+
+  public var startIndex: UInt64 = 0
+
+  public var count: UInt64 = 0
+
+  public var observedRevision: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2491,6 +2515,14 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     set {msg = .resourceChunk(newValue)}
   }
 
+  public var clientModelRangeRequest: Srui_Protocol_ClientModelRangeRequest {
+    get {
+      if case .clientModelRangeRequest(let v)? = msg {return v}
+      return Srui_Protocol_ClientModelRangeRequest()
+    }
+    set {msg = .clientModelRangeRequest(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Msg: Equatable, Sendable {
@@ -2504,6 +2536,7 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     case serverEventAck(Srui_Protocol_ServerEventAck)
     case resourceMetadata(Srui_Protocol_ResourceMetadata)
     case resourceChunk(Srui_Protocol_ResourceChunk)
+    case clientModelRangeRequest(Srui_Protocol_ClientModelRangeRequest)
 
   }
 
@@ -4822,9 +4855,59 @@ nonisolated extension Srui_Protocol_ResourceChunk: SwiftProtobuf.Message, SwiftP
   }
 }
 
+nonisolated extension Srui_Protocol_ClientModelRangeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ClientModelRangeRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{3}model_id\0\u{3}start_index\0\u{1}count\0\u{3}observed_revision\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.modelID) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.startIndex) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.count) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.observedRevision) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.nodeID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
+    }
+    if self.modelID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.modelID, fieldNumber: 2)
+    }
+    if self.startIndex != 0 {
+      try visitor.visitSingularUInt64Field(value: self.startIndex, fieldNumber: 3)
+    }
+    if self.count != 0 {
+      try visitor.visitSingularUInt64Field(value: self.count, fieldNumber: 4)
+    }
+    if self.observedRevision != 0 {
+      try visitor.visitSingularUInt64Field(value: self.observedRevision, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ClientModelRangeRequest, rhs: Srui_Protocol_ClientModelRangeRequest) -> Bool {
+    if lhs.nodeID != rhs.nodeID {return false}
+    if lhs.modelID != rhs.modelID {return false}
+    if lhs.startIndex != rhs.startIndex {return false}
+    if lhs.count != rhs.count {return false}
+    if lhs.observedRevision != rhs.observedRevision {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
 nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SruiMessage"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0\u{3}resource_metadata\0\u{3}resource_chunk\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0\u{3}resource_metadata\0\u{3}resource_chunk\0\u{3}client_model_range_request\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4962,6 +5045,19 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
           self.msg = .resourceChunk(v)
         }
       }()
+      case 11: try {
+        var v: Srui_Protocol_ClientModelRangeRequest?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .clientModelRangeRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .clientModelRangeRequest(v)
+        }
+      }()
       default: break
       }
     }
@@ -5012,6 +5108,10 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
     case .resourceChunk?: try {
       guard case .resourceChunk(let v)? = self.msg else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
+    }()
+    case .clientModelRangeRequest?: try {
+      guard case .clientModelRangeRequest(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
     }()
     case nil: break
     }

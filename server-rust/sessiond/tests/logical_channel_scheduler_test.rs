@@ -193,7 +193,7 @@ async fn connect(
     write
         .send(SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(srui_protocol::ClientHello {
-                core_version: "0.4.0".into(),
+                core_version: "0.5.0".into(),
                 profiles: vec!["org.srui.standard-widgets/1".into()],
                 limits: None,
                 client_instance_id: client_instance_id.to_vec(),
@@ -246,7 +246,7 @@ async fn connect_with_write_gate(
     write
         .send(SruiMessage {
             msg: Some(srui_message::Msg::ClientHello(srui_protocol::ClientHello {
-                core_version: "0.4.0".into(),
+                core_version: "0.5.0".into(),
                 profiles: vec!["org.srui.standard-widgets/1".into()],
                 limits: None,
                 client_instance_id: client_instance_id.to_vec(),

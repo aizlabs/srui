@@ -23,6 +23,8 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
     private weak var textView: NSTextView?
     private var applyingAuthoritative = false
     private var lastKnownComposing = false
+    private var readOnly = false
+    private var enabled = true
 
     public init(nodeID: NodeId, session: TextEditingSession, textField: NSTextField) {
         self.nodeID = nodeID
@@ -82,8 +84,21 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
     }
 
     public func applyReadOnly(_ readOnly: Bool) {
-        textField?.isEditable = !readOnly
-        textView?.isEditable = !readOnly
+        self.readOnly = readOnly
+        applyEditability()
+    }
+
+    public func applyEnabled(_ enabled: Bool) {
+        self.enabled = enabled
+        textField?.isEnabled = enabled
+        applyEditability()
+    }
+
+    private func applyEditability() {
+        let editable = enabled && !readOnly
+        textField?.isEditable = editable
+        textView?.isEditable = editable
+        textView?.isSelectable = enabled
     }
 
     public func applyValidation(_ value: Value?) {

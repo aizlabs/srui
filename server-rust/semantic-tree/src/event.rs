@@ -518,6 +518,10 @@ pub enum EventValidationError {
     InvalidEditSeq,
     /// `edit_seq` is at or behind the terminal watermark for this editor stream (§18.3).
     StaleEditSeq { observed: u64, watermark: u64 },
+    /// A newer reservation superseded this in-flight policy before commit (§18.3, §22.6).
+    SupersededGeneration,
+    /// Per-stream generation counter exhausted; refuse rather than alias concurrent validators.
+    GenerationOverflow,
     /// Target node has `read_only = true` and cannot accept `TEXT_EDIT` (§7.4, §22.6).
     NodeReadOnly(NodeId),
     /// Target node is not a `TextInput` or `TextArea` (§7.2, §22.6).
@@ -556,6 +560,12 @@ impl fmt::Display for EventValidationError {
                 f,
                 "edit_seq {observed} is not above terminal watermark {watermark}"
             ),
+            Self::SupersededGeneration => {
+                write!(f, "TEXT_EDIT superseded by a newer in-flight reservation")
+            }
+            Self::GenerationOverflow => {
+                write!(f, "text-edit stream generation counter overflowed")
+            }
             Self::NodeReadOnly(id) => write!(f, "event target node {id} is read-only"),
             Self::UnsupportedNodeType(ty) => {
                 write!(f, "TEXT_EDIT target node type {ty} is not an editor")

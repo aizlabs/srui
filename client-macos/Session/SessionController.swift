@@ -231,8 +231,8 @@ public final class SessionController: @unchecked Sendable {
         guard !actionHandlerWired else { return }
         actionHandlerWired = true
 
-        renderer.textEditingSession.onInvalidateOutboxDraft = { [weak self] nodeID in
-            Task { await self?.outbox.invalidateTextDraft(nodeId: nodeID) }
+        renderer.textEditingSession.onInvalidateOutboxDraft = { [weak self] nodeID, epoch in
+            Task { await self?.outbox.invalidateTextDraft(nodeId: nodeID, laneEpoch: epoch) }
         }
 
         renderer.onInteraction = { [weak self] interaction in
@@ -265,7 +265,7 @@ public final class SessionController: @unchecked Sendable {
                             observedRevision: observedRev,
                             itemId: itemID
                         )
-                    case .textEdit(let nodeID, let text, let editSeq):
+                    case .textEdit(let nodeID, let text, let editSeq, let laneEpoch):
                         // Drafts are retained even while dispatch is suspended; promotion waits
                         // for an active EventOutbox (§18.3).
                         if let event = try await self.outbox.queueTextEdit(
@@ -273,7 +273,8 @@ public final class SessionController: @unchecked Sendable {
                             text: text,
                             editSeq: editSeq,
                             observedRevision: observedRev,
-                            via: self.transport
+                            via: self.transport,
+                            laneEpoch: laneEpoch
                         ) {
                             await self.renderer?.textEditingSession.noteAssigned(event)
                         }
@@ -943,7 +944,7 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
-                    try await applyResyncTextCancellation(resync, requireExactMatch: false)
+                    try await applyResyncTextCancellation(resync, requireExactMatch: true)
                     await noteCanceledTextEdits(resync.discardedTextEdits)
                 } catch {
                     await reportFailure(.protocolViolation(
@@ -1165,20 +1166,12 @@ public final class SessionController: @unchecked Sendable {
         if let event = settlement.event, event.eventType == .EVENT_TEXT_EDIT {
             await renderer?.textEditingSession.noteAcknowledged(event)
             if ack.status == .rejected {
-                await waitUntilAppliedRevision(ack.revisionAfterEffect)
+                // Authoritative string arrives on the transaction stream; `handleTransaction`
+                // promotes drafts after apply. Promoting here races a delayed reject/revert.
+                return
             }
         }
         await promoteReadyTextDrafts()
-    }
-
-    /// Waits until the local replica has applied `revision_after_effect` so a rejected text
-    /// acknowledgement can converge on the authoritative value the server already published.
-    private func waitUntilAppliedRevision(_ target: UInt64) async {
-        guard target > 0 else { return }
-        for _ in 0..<100 {
-            if applier.lastAppliedRevision.value >= target { return }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
     }
 
     private func applyResyncTextCancellation(

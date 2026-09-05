@@ -20,7 +20,7 @@ struct TextEditingSessionTests {
     func debounceCoalescesToNewestValue() async throws {
         let session = TextEditingSession(debounceNanoseconds: 40_000_000)
         var commits: [(String, EditSeq)] = []
-        session.onCommit = { _, text, seq in
+        session.onCommit = { _, text, seq, _ in
             commits.append((text, seq))
         }
 
@@ -39,7 +39,7 @@ struct TextEditingSessionTests {
     func committedFlushesIncrementEditSeq() {
         let session = TextEditingSession(debounceNanoseconds: 0)
         var seqs: [UInt64] = []
-        session.onCommit = { _, _, seq in
+        session.onCommit = { _, _, seq, _ in
             seqs.append(seq.rawValue)
         }
         session.noteLocalValue("one", nodeID: nodeID, composing: false, flushImmediately: true)
@@ -76,7 +76,7 @@ struct TextEditingSessionTests {
     func acceptedEchoDoesNotOverwriteNewerTyping() throws {
         let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
         var commits: [String] = []
-        session.onCommit = { _, text, _ in commits.append(text) }
+        session.onCommit = { _, text, _, _ in commits.append(text) }
 
         session.noteLocalValue("hello", nodeID: nodeID, composing: false, flushImmediately: true)
         let assigned = Event.textEdit(
@@ -99,7 +99,7 @@ struct TextEditingSessionTests {
     func correctionReplacesNativeAndInvalidatesDrafts() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)
         var invalidated: [NodeId] = []
-        session.onInvalidateOutboxDraft = { invalidated.append($0) }
+        session.onInvalidateOutboxDraft = { id, _ in invalidated.append(id) }
         session.noteLocalValue("nope", nodeID: nodeID, composing: false, flushImmediately: true)
         session.noteAssigned(
             Event.textEdit(
@@ -135,8 +135,8 @@ struct TextEditingSessionTests {
         let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
         var invalidated: [NodeId] = []
         var commits: [String] = []
-        session.onInvalidateOutboxDraft = { invalidated.append($0) }
-        session.onCommit = { _, text, _ in commits.append(text) }
+        session.onInvalidateOutboxDraft = { id, _ in invalidated.append(id) }
+        session.onCommit = { _, text, _, _ in commits.append(text) }
 
         #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
         session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: false)
@@ -251,7 +251,7 @@ struct TextEditingSessionTests {
     func rejectionRevertingToLastKnownApplies() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)
         var invalidated: [NodeId] = []
-        session.onInvalidateOutboxDraft = { invalidated.append($0) }
+        session.onInvalidateOutboxDraft = { id, _ in invalidated.append(id) }
 
         #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
         session.noteLocalValue("abcd", nodeID: nodeID, composing: false, flushImmediately: true)
@@ -275,7 +275,7 @@ struct TextEditingSessionTests {
     func compositionEndDoesNotFlushMarkedValue() {
         let session = TextEditingSession(debounceNanoseconds: 0)
         var commits: [String] = []
-        session.onCommit = { _, text, _ in commits.append(text) }
+        session.onCommit = { _, text, _, _ in commits.append(text) }
 
         _ = session.setComposing(true, nodeID: nodeID)
         session.noteLocalValue("hel", nodeID: nodeID, composing: true, flushImmediately: false)
@@ -290,7 +290,7 @@ struct TextEditingSessionTests {
     func composingSuppressesRemoteEmission() {
         let session = TextEditingSession(debounceNanoseconds: 0)
         var commits = 0
-        session.onCommit = { _, _, _ in commits += 1 }
+        session.onCommit = { _, _, _, _ in commits += 1 }
         session.noteLocalValue("á", nodeID: nodeID, composing: true, flushImmediately: true)
         #expect(commits == 0)
         session.endEditing(nodeID: nodeID)

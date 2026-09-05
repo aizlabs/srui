@@ -27,8 +27,10 @@ public enum AuthoritativeResolution: Equatable, Sendable {
 @MainActor
 public final class TextEditingSession {
     public var debounceNanoseconds: UInt64
-    public var onCommit: (@MainActor (NodeId, String, EditSeq) -> Void)?
-    public var onInvalidateOutboxDraft: (@MainActor (NodeId) -> Void)?
+    public var onCommit: (@MainActor (NodeId, String, EditSeq, UInt64) -> Void)?
+    public var onInvalidateOutboxDraft: (@MainActor (NodeId, UInt64) -> Void)?
+    /// Surfaced when `edit_seq` cannot increment; the pending value is kept (§18.3).
+    public var onEditSeqOverflow: (@MainActor (NodeId) -> Void)?
 
     private struct NodeState {
         var nextEditSeq: UInt64 = 1
@@ -48,6 +50,9 @@ public final class TextEditingSession {
     private var nodes: [NodeId: NodeState] = [:]
     /// Structural remounts reapply unchanged store strings; live corrections must not.
     private var preservingLocalTextAcrossRemount = false
+    /// Bumped when a correction/cancel invalidates drafts so unordered outbox Tasks cannot
+    /// re-queue a rejected string after `invalidateTextDraft` (§22.6).
+    private var laneEpoch: [NodeId: UInt64] = [:]
 
     public init(debounceNanoseconds: UInt64 = defaultTextEditDebounceNanoseconds) {
         self.debounceNanoseconds = debounceNanoseconds
@@ -58,6 +63,7 @@ public final class TextEditingSession {
             state.debounceTask?.cancel()
         }
         nodes.removeAll()
+        laneEpoch.removeAll()
     }
 
     /// Drops sequence state for nodes that no longer exist after a committed delete.
@@ -67,6 +73,7 @@ public final class TextEditingSession {
         for nodeID in stale {
             nodes[nodeID]?.debounceTask?.cancel()
             nodes.removeValue(forKey: nodeID)
+            laneEpoch.removeValue(forKey: nodeID)
         }
     }
 
@@ -100,7 +107,9 @@ public final class TextEditingSession {
         state.pendingValue = nil
         state.debounceTask?.cancel()
         state.debounceTask = nil
+        let epoch = bumpLaneEpoch(nodeID: nodeID)
         nodes[nodeID] = state
+        onInvalidateOutboxDraft?(nodeID, epoch)
     }
 
     /// Structural remounts re-apply the current store string for every editor. That is not a
@@ -117,7 +126,7 @@ public final class TextEditingSession {
         state.debounceTask?.cancel()
         state.debounceTask = nil
         nodes[nodeID] = state
-        onInvalidateOutboxDraft?(nodeID)
+        onInvalidateOutboxDraft?(nodeID, bumpLaneEpoch(nodeID: nodeID))
     }
 
     /// Records a committed local string. While composition is active, remote emission is suppressed.
@@ -177,6 +186,7 @@ public final class TextEditingSession {
             // Exhausted `edit_seq` must not wrap; restore the pending value so it is not dropped (§18.3).
             state.pendingValue = value
             nodes[nodeID] = state
+            onEditSeqOverflow?(nodeID)
             return
         }
         let next = seqValue + 1
@@ -184,7 +194,7 @@ public final class TextEditingSession {
         state.lastFlushedValue = value
         state.localValue = value
         nodes[nodeID] = state
-        onCommit?(nodeID, value, seq)
+        onCommit?(nodeID, value, seq, laneEpoch[nodeID] ?? 0)
     }
 
     /// Echo of a submitted value must not overwrite newer local typing; any other published
@@ -221,7 +231,7 @@ public final class TextEditingSession {
         state.localValue = published
         nodes[nodeID] = state
         if hadDraft {
-            onInvalidateOutboxDraft?(nodeID)
+            onInvalidateOutboxDraft?(nodeID, bumpLaneEpoch(nodeID: nodeID))
         }
         return .apply
     }
@@ -253,5 +263,13 @@ public final class TextEditingSession {
             }
         }
         return nil
+    }
+
+    @discardableResult
+    private func bumpLaneEpoch(nodeID: NodeId) -> UInt64 {
+        let next = (laneEpoch[nodeID] ?? 0) &+ 1
+        let epoch = next == 0 ? UInt64.max : next
+        laneEpoch[nodeID] = epoch
+        return epoch
     }
 }

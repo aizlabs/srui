@@ -137,7 +137,7 @@ fn older_validation_cannot_publish_after_newer_generation() {
     let older = old.join().expect("old thread").expect("old result");
     match older {
         EventOutcome::Rejected {
-            error: EventValidationError::StaleEditSeq { .. },
+            error: EventValidationError::SupersededGeneration,
             ..
         } => {}
         other => panic!("expected older generation rejected, got {other:?}"),

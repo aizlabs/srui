@@ -108,12 +108,16 @@ public actor EventOutbox {
     private var textDrafts: [NodeId: TextEditDraft] = [:]
     private var assignedTextByNode: [NodeId: EventId] = [:]
     private var assignedTextByEventId: [EventId: NodeId] = [:]
+    /// Highest correction/cancel epoch observed per node. Stale `queueTextEdit` Tasks
+    /// with a lower epoch are dropped so unordered hops cannot resurrect a rejected draft.
+    private var textLaneEpoch: [NodeId: UInt64] = [:]
 
     private struct TextEditDraft: Equatable, Sendable {
         var nodeId: NodeId
         var text: String
         var editSeq: EditSeq
         var observedRevision: Revision
+        var laneEpoch: UInt64
     }
 
     public init(
@@ -242,13 +246,18 @@ public actor EventOutbox {
         text: String,
         editSeq: EditSeq,
         observedRevision: Revision,
-        via transport: any Transport
+        via transport: any Transport,
+        laneEpoch: UInt64 = 0
     ) async throws -> Event? {
+        if laneEpoch < (textLaneEpoch[nodeId] ?? 0) {
+            return nil
+        }
         textDrafts[nodeId] = TextEditDraft(
             nodeId: nodeId,
             text: text,
             editSeq: editSeq,
-            observedRevision: observedRevision
+            observedRevision: observedRevision,
+            laneEpoch: laneEpoch
         )
         return try await promoteTextDraft(nodeId: nodeId, via: transport)
     }
@@ -276,7 +285,10 @@ public actor EventOutbox {
         }
     }
 
-    public func invalidateTextDraft(nodeId: NodeId) {
+    public func invalidateTextDraft(nodeId: NodeId, laneEpoch: UInt64 = 0) {
+        if laneEpoch >= (textLaneEpoch[nodeId] ?? 0) {
+            textLaneEpoch[nodeId] = laneEpoch
+        }
         textDrafts.removeValue(forKey: nodeId)
     }
 
@@ -339,22 +351,25 @@ public actor EventOutbox {
     private func promoteTextDraft(nodeId: NodeId, via transport: any Transport) async throws -> Event? {
         guard acceptsNewEvents else { return nil }
         guard assignedTextByNode[nodeId] == nil else { return nil }
-        guard textDrafts[nodeId] != nil else { return nil }
-        try ensureSequenceWindowCapacity()
-        guard let draft = textDrafts.removeValue(forKey: nodeId) else { return nil }
-        currentEventSeq += 1
-        let event = Event.textEdit(
-            eventSeq: currentEventSeq,
-            eventId: generateEventId(),
-            observedRevision: draft.observedRevision,
-            nodeId: draft.nodeId,
-            text: draft.text,
-            editSeq: draft.editSeq
-        ).withClientInstanceId(clientInstanceId)
-        assignedTextByNode[nodeId] = event.eventId
-        assignedTextByEventId[event.eventId] = nodeId
-        try await sendEvent(event, via: transport)
-        return event
+        guard let draft = textDrafts[nodeId] else { return nil }
+        if draft.laneEpoch < (textLaneEpoch[nodeId] ?? 0) {
+            textDrafts.removeValue(forKey: nodeId)
+            return nil
+        }
+        return try await allocateAndSend(via: transport) { eventSeq, eventId in
+            let event = Event.textEdit(
+                eventSeq: eventSeq,
+                eventId: eventId,
+                observedRevision: draft.observedRevision,
+                nodeId: draft.nodeId,
+                text: draft.text,
+                editSeq: draft.editSeq
+            )
+            self.textDrafts.removeValue(forKey: nodeId)
+            self.assignedTextByNode[nodeId] = event.eventId
+            self.assignedTextByEventId[event.eventId] = nodeId
+            return event
+        }
     }
 
     private func forgetAssignedText(eventId: EventId) {
@@ -527,6 +542,7 @@ public actor EventOutbox {
         textDrafts.removeAll(keepingCapacity: true)
         assignedTextByNode.removeAll(keepingCapacity: true)
         assignedTextByEventId.removeAll(keepingCapacity: true)
+        textLaneEpoch.removeAll(keepingCapacity: true)
         cancelPendingWrites()
     }
 

@@ -105,6 +105,28 @@ struct ControlFactoryPropertyTests {
         #expect(editable() == true)
     }
 
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func enabledSetAndClearOnEditors(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        let editable: () -> Bool? = {
+            if let field = handle.view as? NSTextField { return field.isEditable }
+            return ((handle.view as? NSScrollView)?.documentView as? NSTextView)?.isEditable
+        }
+
+        factory.apply(property: .enabled, value: .bool(false), to: handle)
+        #expect(editable() == false)
+        if let field = handle.view as? NSTextField {
+            #expect(field.isEnabled == false)
+        }
+
+        factory.apply(property: .enabled, value: nil, to: handle)
+        #expect(editable() == true)
+        if let field = handle.view as? NSTextField {
+            #expect(field.isEnabled == true)
+        }
+    }
+
     @Test(arguments: [TypeRef.text, .richText, .textInput, .textArea])
     func textSetAndClear(nodeType: TypeRef) throws {
         let factory = ControlFactory()

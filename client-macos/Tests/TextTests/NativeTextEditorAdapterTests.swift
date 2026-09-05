@@ -25,7 +25,7 @@ struct NativeTextEditorAdapterTests {
     func typingUpdatesNativeFieldImmediately() {
         let (session, adapter, field) = makeField()
         var commits: [String] = []
-        session.onCommit = { _, text, _ in commits.append(text) }
+        session.onCommit = { _, text, _, _ in commits.append(text) }
 
         field.stringValue = "hello"
         adapter.notifyTextDidChangeForTests()
@@ -39,7 +39,7 @@ struct NativeTextEditorAdapterTests {
     func markedTextSelectionCaretAndCopyProduceNoEdit() {
         let (session, adapter, field) = makeField()
         var commits = 0
-        session.onCommit = { _, _, _ in commits += 1 }
+        session.onCommit = { _, _, _, _ in commits += 1 }
 
         adapter.compositionOverride = true
         field.stringValue = "hel"
@@ -62,7 +62,7 @@ struct NativeTextEditorAdapterTests {
     func compositionEndFlushesCommittedCandidate() {
         let (session, adapter, field) = makeField()
         var commits: [String] = []
-        session.onCommit = { _, text, _ in commits.append(text) }
+        session.onCommit = { _, text, _, _ in commits.append(text) }
 
         adapter.compositionOverride = true
         field.stringValue = "hel"
@@ -79,7 +79,7 @@ struct NativeTextEditorAdapterTests {
     func programmaticWriteDoesNotEmitEdit() {
         let (session, adapter, field) = makeField()
         var commits = 0
-        session.onCommit = { _, _, _ in commits += 1 }
+        session.onCommit = { _, _, _, _ in commits += 1 }
 
         adapter.applyAuthoritativeString("from-server")
         #expect(field.stringValue == "from-server")
@@ -94,7 +94,7 @@ struct NativeTextEditorAdapterTests {
     func pasteEmitsWholeValue() {
         let (session, adapter, field) = makeField()
         var commits: [String] = []
-        session.onCommit = { _, text, _ in commits.append(text) }
+        session.onCommit = { _, text, _, _ in commits.append(text) }
 
         field.stringValue = "pasted"
         adapter.notifyTextDidChangeForTests()
@@ -122,7 +122,7 @@ struct NativeTextEditorAdapterTests {
         let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 280, height: 88))
         let adapter = NativeTextEditorAdapter(nodeID: NodeId(14), session: session, textView: view)
         var commits: [String] = []
-        session.onCommit = { _, text, _ in commits.append(text) }
+        session.onCommit = { _, text, _, _ in commits.append(text) }
 
         view.string = "area"
         adapter.notifyTextDidChangeForTests()

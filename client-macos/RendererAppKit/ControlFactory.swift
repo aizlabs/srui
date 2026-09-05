@@ -54,8 +54,8 @@ public final class ControlFactory {
 
     public init(textEditingSession: TextEditingSession = TextEditingSession()) {
         self.textEditingSession = textEditingSession
-        self.textEditingSession.onCommit = { [weak self] nodeID, text, seq in
-            self?.onInteraction?(.textEdit(nodeID: nodeID, text: text, editSeq: seq))
+        self.textEditingSession.onCommit = { [weak self] nodeID, text, seq, epoch in
+            self?.onInteraction?(.textEdit(nodeID: nodeID, text: text, editSeq: seq, laneEpoch: epoch))
         }
     }
 
@@ -160,7 +160,7 @@ public final class ControlFactory {
                 textField: field
             )
             textAdapter = adapter
-            result = (field, nil, nil, adapter)
+            result = (field, nil, nil, nil)
 
         case .textArea:
             let scrollView = NSScrollView(frame: .zero)
@@ -180,7 +180,7 @@ public final class ControlFactory {
                 textView: textView
             )
             textAdapter = adapter
-            result = (scrollView, nil, nil, adapter)
+            result = (scrollView, nil, nil, nil)
 
         case .progress:
             let progress = NSProgressIndicator(frame: .zero)
@@ -260,11 +260,15 @@ public final class ControlFactory {
         node.propertyEntries.sorted { $0.0 < $1.0 }
     }
 
+    /// Editors with a canonical `.value` ignore `.text` so incremental and full applies agree.
+    public static func shouldSkipTextFallback(for handle: RenderHandle, node: Node) -> Bool {
+        handle.textAdapter != nil && node.getProperty(.value) != nil
+    }
+
     public func apply(node: Node, to handle: RenderHandle, store: SemanticStore? = nil) {
         let entries = Self.orderedPropertyEntries(of: node)
-        let hasValue = entries.contains { $0.0 == .value }
         for (property, value) in entries {
-            if handle.textAdapter != nil, property == .text, hasValue {
+            if property == .text, Self.shouldSkipTextFallback(for: handle, node: node) {
                 continue
             }
             apply(property: property, value: value, to: handle, store: store)
@@ -322,6 +326,9 @@ public final class ControlFactory {
 
         case .enabled:
             let enabled = value?.asBool ?? true
+            if let adapter = handle.textAdapter {
+                adapter.applyEnabled(enabled)
+            }
             if let control = handle.view as? NSControl {
                 control.isEnabled = enabled
             }

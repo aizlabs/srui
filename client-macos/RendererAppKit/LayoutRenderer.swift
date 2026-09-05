@@ -201,7 +201,7 @@ public final class LayoutRenderer {
         guard let node = store.getNode(nodeID) else {
             throw LayoutRendererError.missingSemanticNode(nodeID)
         }
-        if handle.textAdapter != nil, property == .text, node.getProperty(.value) != nil {
+        if property == .text, ControlFactory.shouldSkipTextFallback(for: handle, node: node) {
             return
         }
         controlFactory.apply(

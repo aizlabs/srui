@@ -54,6 +54,12 @@ pub enum TextEditDecision {
     },
 }
 
+/// Application decision callback for one `TEXT_EDIT` (§22.6).
+///
+/// Invoked with the session mutex released (`async-no-lock-await`). The callback may read or
+/// commit through `&Session` (for example to disable the editor). Nested `TEXT_EDIT` on the
+/// same `(client, node)` bumps the stream generation; the outer in-flight commit then settles
+/// as [`EventValidationError::SupersededGeneration`] instead of publishing.
 pub type TextEditPolicy =
     Arc<dyn Fn(&Session, &TextEditRequest) -> TextEditDecision + Send + Sync + 'static>;
 
@@ -116,7 +122,10 @@ impl TextEditTracker {
                     watermark: stream.last_terminal_edit_seq,
                 });
             }
-            stream.generation = stream.generation.saturating_add(1);
+            stream.generation = stream
+                .generation
+                .checked_add(1)
+                .ok_or(EventValidationError::GenerationOverflow)?;
             return Ok(stream.generation);
         }
         if self.streams.len() >= self.max_streams {
@@ -331,13 +340,7 @@ impl Session {
             .generation_of(&event.client_instance_id, request.node_id)
             .unwrap_or(0);
         if current_generation != reserved_generation {
-            let error = EventValidationError::StaleEditSeq {
-                observed: request.edit_seq.get(),
-                watermark: guard
-                    .text_edit_tracker
-                    .last_terminal_of(&event.client_instance_id, request.node_id)
-                    .unwrap_or(0),
-            };
+            let error = EventValidationError::SupersededGeneration;
             return Ok(reject_admitted(&mut guard, event, error));
         }
 
@@ -710,5 +713,17 @@ mod tests {
         tracker.reclaim_node(node(1));
         assert_eq!(tracker.len(), 1);
         assert_eq!(tracker.retained_client_id_bytes(), 5);
+    }
+
+    #[test]
+    fn tracker_refuses_generation_overflow() {
+        let mut tracker = TextEditTracker::new(8);
+        tracker.reserve(b"c", node(1), seq(1)).unwrap();
+        let key = (b"c".to_vec(), 1u64);
+        tracker.streams.get_mut(&key).unwrap().generation = u64::MAX;
+        assert!(matches!(
+            tracker.reserve(b"c", node(1), seq(2)),
+            Err(EventValidationError::GenerationOverflow)
+        ));
     }
 }

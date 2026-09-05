@@ -335,16 +335,16 @@ impl Session {
             });
         }
 
+        if let Err(error) = revalidate_editor_for_commit(&guard, request.node_id) {
+            return Ok(reject_admitted(&mut guard, event, error));
+        }
+
         let current_generation = guard
             .text_edit_tracker
             .generation_of(&event.client_instance_id, request.node_id)
             .unwrap_or(0);
         if current_generation != reserved_generation {
             let error = EventValidationError::SupersededGeneration;
-            return Ok(reject_admitted(&mut guard, event, error));
-        }
-
-        if let Err(error) = revalidate_editor_for_commit(&guard, request.node_id) {
             return Ok(reject_admitted(&mut guard, event, error));
         }
 

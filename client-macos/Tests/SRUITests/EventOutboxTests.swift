@@ -612,6 +612,63 @@ struct EventOutboxTests {
         await server.close()
     }
 
+    @Test("A cumulative ack blocks every retired text lane until its effect revision")
+    func cumulativeAckInstallsBarriersForAllTextLanes() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-barriers"))
+        let edit1 = try #require(EditSeq(1))
+        let edit2 = try #require(EditSeq(2))
+
+        let first = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "left-1",
+            editSeq: edit1,
+            observedRevision: Revision(1),
+            via: client
+        ))
+        let second = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(13),
+            text: "right-1",
+            editSeq: edit1,
+            observedRevision: Revision(1),
+            via: client
+        ))
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "left-2",
+            editSeq: edit2,
+            observedRevision: Revision(1),
+            via: client
+        )
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(13),
+            text: "right-2",
+            editSeq: edit2,
+            observedRevision: Revision(1),
+            via: client
+        )
+
+        let settlement = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: second.eventId,
+            throughSeq: second.eventSeq,
+            sessionId: "session-barriers",
+            revisionAfterEffect: 5
+        )
+        #expect(Set(settlement.settledEvents.map(\.eventId)) == Set([first.eventId, second.eventId]))
+        #expect(try await outbox.promoteReadyTextDrafts(via: client).isEmpty)
+        #expect(await outbox.releaseTextAcknowledgements(through: 4).isEmpty)
+        #expect(try await outbox.promoteReadyTextDrafts(via: client).isEmpty)
+
+        #expect(await outbox.releaseTextAcknowledgements(through: 5).count == 2)
+        let promoted = try await outbox.promoteReadyTextDrafts(via: client)
+        #expect(Set(promoted.compactMap(\.textArg)) == Set(["left-2", "right-2"]))
+
+        await client.close()
+        await server.close()
+    }
+
     @Test("queueTextEdit retains a draft while dispatch is suspended")
     func queueTextEditWhileSuspendedKeepsNewestDraft() async throws {
         let (client, server) = await PipeTransport.createPair()
@@ -707,10 +764,11 @@ struct EventOutboxTests {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         #expect(await outbox.confirmFreshSession(id: "session-gen"))
+        let editSeq = try #require(EditSeq(1))
         let assigned = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
             text: "typed",
-            editSeq: try #require(EditSeq(1)),
+            editSeq: editSeq,
             observedRevision: Revision(1),
             via: client
         ))
@@ -760,10 +818,11 @@ struct EventOutboxTests {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         #expect(await outbox.confirmFreshSession(id: "session-bind"))
+        let editSeq = try #require(EditSeq(1))
         let assigned = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
             text: "typed",
-            editSeq: try #require(EditSeq(1)),
+            editSeq: editSeq,
             observedRevision: Revision(1),
             via: seedClient
         ))

@@ -60,9 +60,23 @@ public struct PendingTextEditDescriptor: Hashable, Equatable, Sendable {
 /// Outcome of one identity-checked acknowledgement (§18.2, §22.6).
 public struct EventAcknowledgementSettlement: Equatable, Sendable {
     public var bound: Bool
+    /// Event named by event_id, when it was still retained.
     public var event: Event?
+    /// Every event retired by the cumulative frontier or the selective event_id.
+    public var settledEvents: [Event]
 
-    public static let unbound = EventAcknowledgementSettlement(bound: false, event: nil)
+    public static let unbound = EventAcknowledgementSettlement(
+        bound: false,
+        event: nil,
+        settledEvents: []
+    )
+}
+
+/// A terminal text acknowledgement whose authoritative revision has not necessarily rendered yet.
+struct TextEditAcknowledgementBarrier: Equatable, Sendable {
+    var nodeId: NodeId
+    var revisionAfterEffect: UInt64
+    var rejected: Bool
 }
 
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
@@ -111,6 +125,12 @@ public actor EventOutbox {
     /// Highest correction/cancel epoch observed per node. Stale `queueTextEdit` Tasks
     /// with a lower epoch are dropped so unordered hops cannot resurrect a rejected draft.
     private var textLaneEpoch: [NodeId: UInt64] = [:]
+    /// Session-wide floor advanced by an authoritative full resync. It also fences edits from
+    /// newly mounted nodes whose IDs did not exist before the snapshot.
+    private var textLaneEpochFloor: UInt64 = 0
+    /// A successor for a node cannot be promoted until this acknowledgement's authoritative
+    /// revision has reached the rendered replica.
+    private var textAcknowledgementBarriers: [NodeId: TextEditAcknowledgementBarrier] = [:]
 
     private struct TextEditDraft: Equatable, Sendable {
         var nodeId: NodeId
@@ -249,7 +269,8 @@ public actor EventOutbox {
         via transport: any Transport,
         laneEpoch: UInt64 = 0
     ) async throws -> Event? {
-        if laneEpoch < (textLaneEpoch[nodeId] ?? 0) {
+        let minimumEpoch = max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0)
+        if laneEpoch < minimumEpoch {
             return nil
         }
         textDrafts[nodeId] = TextEditDraft(
@@ -366,6 +387,34 @@ public actor EventOutbox {
         textDrafts.removeAll(keepingCapacity: true)
     }
 
+    /// Applies a hard full-resync boundary. Drafts from native controls that existed before the
+    /// snapshot are discarded; callbacks from newly mounted controls carry laneEpoch (or later)
+    /// and survive this actor hop. A snapshot is authoritative for every outstanding ack.
+    func applyFullResyncTextBoundary(laneEpoch: UInt64?) {
+        textAcknowledgementBarriers.removeAll(keepingCapacity: true)
+        guard let laneEpoch else {
+            textDrafts.removeAll(keepingCapacity: true)
+            return
+        }
+        textLaneEpochFloor = max(textLaneEpochFloor, laneEpoch)
+        for nodeID in Array(textDrafts.keys) {
+            if let draft = textDrafts[nodeID], draft.laneEpoch < textLaneEpochFloor {
+                textDrafts.removeValue(forKey: nodeID)
+            }
+        }
+    }
+
+    /// Releases acknowledgements only after their authoritative revision has rendered.
+    func releaseTextAcknowledgements(through revision: UInt64) -> [TextEditAcknowledgementBarrier] {
+        let ready = textAcknowledgementBarriers.values
+            .filter { $0.revisionAfterEffect <= revision }
+            .sorted { $0.nodeId.value < $1.nodeId.value }
+        for barrier in ready {
+            textAcknowledgementBarriers.removeValue(forKey: barrier.nodeId)
+        }
+        return ready
+    }
+
     private static func identityKey(_ ref: PendingTextEditDescriptor) -> String {
         "\(ref.eventId.toHex()):\(ref.eventSeq):\(ref.nodeId.value):\(ref.editSeq.rawValue)"
     }
@@ -373,8 +422,9 @@ public actor EventOutbox {
     private func promoteTextDraft(nodeId: NodeId, via transport: any Transport) async throws -> Event? {
         guard acceptsNewEvents else { return nil }
         guard assignedTextByNode[nodeId] == nil else { return nil }
+        guard textAcknowledgementBarriers[nodeId] == nil else { return nil }
         guard let draft = textDrafts[nodeId] else { return nil }
-        if draft.laneEpoch < (textLaneEpoch[nodeId] ?? 0) {
+        if draft.laneEpoch < max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0) {
             textDrafts.removeValue(forKey: nodeId)
             return nil
         }
@@ -462,12 +512,11 @@ public actor EventOutbox {
         generation >= 1 && generation <= lastIssuedResumeGeneration
     }
 
-    /// Publishes a resync snapshot under the reconnect latch and releases it in the same step (§18).
+    /// Publishes a resync snapshot while the reconnect latch still blocks event allocation (§18).
     ///
-    /// The supersession check, `publish`, and the latch release share this single actor-isolated
-    /// critical section, so a concurrent `beginResumeAttempt()` cannot slip between them: a caller
-    /// that published first and released the latch after a suspension would leave the shared
-    /// replica advanced while its own resync decision was refused (§18, §22.2).
+    /// The supersession check and publish share this single actor-isolated critical section.
+    /// The controller releases the latch only after the snapshot has also mounted and the text
+    /// resync boundary has reached this actor, preventing stale drafts from escaping in between.
     ///
     /// `publish` must be the swap alone — build the snapshot with
     /// `TransactionApplier.prepareResyncSnapshot(record:)` before calling, so the rebuild never
@@ -483,14 +532,9 @@ public actor EventOutbox {
     ) -> T? {
         guard activeResumeGeneration == generation else { return nil }
         let result = publish()
-        // A rejected snapshot keeps the latch: the server can still send another one, and
-        // re-enabling allocation here would let events race a replica that was never rebuilt (§18).
+        // A rejected snapshot keeps the latch so the server can send another one. A committed
+        // snapshot also keeps it until AppKit has mounted the authoritative state.
         guard committed(result) else { return result }
-        if let generation {
-            _ = finishResync(generation: generation)
-        } else {
-            allowNewEvents()
-        }
         return result
     }
 
@@ -580,6 +624,8 @@ public actor EventOutbox {
         assignedTextByNode.removeAll(keepingCapacity: true)
         assignedTextByEventId.removeAll(keepingCapacity: true)
         textLaneEpoch.removeAll(keepingCapacity: true)
+        textLaneEpochFloor = 0
+        textAcknowledgementBarriers.removeAll(keepingCapacity: true)
         cancelPendingWrites()
     }
 
@@ -594,7 +640,9 @@ public actor EventOutbox {
         clientInstanceId ackClientInstanceId: ClientInstanceId,
         eventId: EventId,
         throughSeq seq: UInt64,
-        sessionId: String
+        sessionId: String,
+        revisionAfterEffect: UInt64? = nil,
+        textEditRejected: Bool = false
     ) -> EventAcknowledgementSettlement {
         guard ackClientInstanceId == clientInstanceId else { return .unbound }
         // `session_id` is required on every ack (§18.2): an empty one proves nothing about which
@@ -605,9 +653,35 @@ public actor EventOutbox {
             return .unbound
         }
         let event = pendingEvents[eventId]
-        acknowledgeEvents(throughSeq: seq)
+        var settledEvents = acknowledgeEvents(throughSeq: seq)
+        if let event, !settledEvents.contains(where: { $0.eventId == event.eventId }) {
+            settledEvents.append(event)
+            settledEvents.sort { $0.eventSeq < $1.eventSeq }
+        }
+
+        if let revisionAfterEffect {
+            for settled in settledEvents where settled.eventType == .EVENT_TEXT_EDIT {
+                let barrier = TextEditAcknowledgementBarrier(
+                    nodeId: settled.nodeId,
+                    revisionAfterEffect: revisionAfterEffect,
+                    rejected: textEditRejected && settled.eventId == eventId
+                )
+                if let current = textAcknowledgementBarriers[settled.nodeId] {
+                    if current.revisionAfterEffect <= revisionAfterEffect {
+                        textAcknowledgementBarriers[settled.nodeId] = barrier
+                    }
+                } else {
+                    textAcknowledgementBarriers[settled.nodeId] = barrier
+                }
+            }
+        }
+
         acknowledgeEvent(id: eventId)
-        return EventAcknowledgementSettlement(bound: true, event: event)
+        return EventAcknowledgementSettlement(
+            bound: true,
+            event: event,
+            settledEvents: settledEvents
+        )
     }
 
     /// Acknowledges every event through the server's highest contiguous settled sequence.
@@ -615,18 +689,23 @@ public actor EventOutbox {
     /// Private for the same reason as `acknowledgeEvent(id:)`: reachable from the wire only
     /// through the identity-checked `settleAcknowledgement`, and internally only from a resume or
     /// resync decision the generation latch already bound to this outbox (§18, §18.2).
-    private func acknowledgeEvents(throughSeq seq: UInt64) {
-        guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return }
+    @discardableResult
+    private func acknowledgeEvents(throughSeq seq: UInt64) -> [Event] {
+        guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return [] }
 
         _lastAckedEventSeq = seq
         acknowledgedOutOfOrder = Set(acknowledgedOutOfOrder.filter { $0 > seq })
-        for (id, event) in pendingEvents where event.eventSeq <= seq {
-            pendingEvents.removeValue(forKey: id)
-            forgetAssignedText(eventId: id)
+        let settled = pendingEvents.values
+            .filter { $0.eventSeq <= seq }
+            .sorted { $0.eventSeq < $1.eventSeq }
+        for event in settled {
+            pendingEvents.removeValue(forKey: event.eventId)
+            forgetAssignedText(eventId: event.eventId)
         }
         pendingOrder.removeAll { pendingEvents[$0] == nil }
         advanceContiguousAcknowledgement()
         cancelReplayRetryLoopIfSettled()
+        return settled
     }
 
     /// Abandons every intent from an expired session and aligns sequencing with the

@@ -53,6 +53,12 @@ public final class TextEditingSession {
     /// Bumped when a correction/cancel invalidates drafts so unordered outbox Tasks cannot
     /// re-queue a rejected string after `invalidateTextDraft` (§22.6).
     private var laneEpoch: [NodeId: UInt64] = [:]
+    /// Session-wide floor used to fence delayed local callbacks across an authoritative full
+    /// resync. Per-node edit sequences intentionally survive a same-session resync (§18.3).
+    private var resyncLaneEpoch: UInt64 = 0
+    /// True only while old native controls are torn down and snapshot controls are mounted.
+    /// AppKit may emit end-editing notifications during teardown; those are pre-snapshot intent.
+    private var suppressingLocalEditsForResync = false
 
     public init(debounceNanoseconds: UInt64 = defaultTextEditDebounceNanoseconds) {
         self.debounceNanoseconds = debounceNanoseconds
@@ -64,6 +70,8 @@ public final class TextEditingSession {
         }
         nodes.removeAll()
         laneEpoch.removeAll()
+        resyncLaneEpoch = 0
+        suppressingLocalEditsForResync = false
     }
 
     /// Drops sequence state for nodes that no longer exist after a committed delete.
@@ -131,6 +139,7 @@ public final class TextEditingSession {
 
     /// Records a committed local string. While composition is active, remote emission is suppressed.
     public func noteLocalValue(_ value: String, nodeID: NodeId, composing: Bool, flushImmediately: Bool) {
+        guard !suppressingLocalEditsForResync else { return }
         var state = nodes[nodeID] ?? NodeState()
         state.localValue = value
         state.composing = composing
@@ -167,6 +176,7 @@ public final class TextEditingSession {
     }
 
     public func endEditing(nodeID: NodeId) {
+        guard !suppressingLocalEditsForResync else { return }
         nodes[nodeID]?.debounceTask?.cancel()
         nodes[nodeID]?.debounceTask = nil
         flushPending(nodeID: nodeID)
@@ -194,7 +204,7 @@ public final class TextEditingSession {
         state.lastFlushedValue = value
         state.localValue = value
         nodes[nodeID] = state
-        onCommit?(nodeID, value, seq, laneEpoch[nodeID] ?? 0)
+        onCommit?(nodeID, value, seq, max(resyncLaneEpoch, laneEpoch[nodeID] ?? 0))
     }
 
     /// Echo of a submitted value must not overwrite newer local typing; any other published
@@ -268,6 +278,40 @@ public final class TextEditingSession {
         nodes[nodeID]?.nextEditSeq ?? 1
     }
 
+    /// Establishes the authoritative full-resync boundary without resetting edit_seq.
+    ///
+    /// The returned epoch fences callbacks already queued by the old native controls. State
+    /// created by controls mounted from the snapshot inherits the same floor, so edits genuinely
+    /// made after the snapshot remain eligible for synchronization (§18.3).
+    @discardableResult
+    public func discardUnresolvedEditsForResync() -> UInt64 {
+        suppressingLocalEditsForResync = true
+        let highest = max(resyncLaneEpoch, laneEpoch.values.max() ?? 0)
+        resyncLaneEpoch = highest == .max ? .max : highest + 1
+
+        for nodeID in Array(nodes.keys) {
+            guard var state = nodes[nodeID] else { continue }
+            state.debounceTask?.cancel()
+            state.debounceTask = nil
+            state.pendingValue = nil
+            state.lastFlushedValue = nil
+            state.lastSubmittedValue = nil
+            state.assignedEditSeq = nil
+            state.assignedEventId = nil
+            state.deferredAuthoritative = nil
+            state.composing = false
+            state.localValue = state.lastKnownAuthoritative ?? ""
+            nodes[nodeID] = state
+            laneEpoch[nodeID] = resyncLaneEpoch
+        }
+        return resyncLaneEpoch
+    }
+
+    /// Ends the synchronous native remount begun by discardUnresolvedEditsForResync.
+    public func finishResyncTextBoundary() {
+        suppressingLocalEditsForResync = false
+    }
+
     /// Updates composition state. Returns a deferred authoritative string that the adapter
     /// must apply now that marked text has ended.
     ///
@@ -275,6 +319,7 @@ public final class TextEditingSession {
     /// string through `noteLocalValue` so an intermediate marked value is not emitted (§22.6).
     @discardableResult
     public func setComposing(_ composing: Bool, nodeID: NodeId) -> String? {
+        guard !suppressingLocalEditsForResync else { return nil }
         var state = nodes[nodeID] ?? NodeState()
         let ending = state.composing && !composing
         state.composing = composing
@@ -291,8 +336,8 @@ public final class TextEditingSession {
 
     @discardableResult
     private func bumpLaneEpoch(nodeID: NodeId) -> UInt64 {
-        let next = (laneEpoch[nodeID] ?? 0) &+ 1
-        let epoch = next == 0 ? UInt64.max : next
+        let current = max(resyncLaneEpoch, laneEpoch[nodeID] ?? 0)
+        let epoch = current == .max ? .max : current + 1
         laneEpoch[nodeID] = epoch
         return epoch
     }

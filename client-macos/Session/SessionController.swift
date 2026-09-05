@@ -103,6 +103,11 @@ private enum ProtocolPhase: Equatable {
     case failed
 }
 
+private struct RendererUpdateResult: Sendable {
+    var didRender: Bool
+    var resyncLaneEpoch: UInt64?
+}
+
 /// Central coordinator managing client session lifecycle, message decoding, store application,
 /// outbox event dispatch, resource assembly, and UI rendering (§22, §22.2).
 public final class SessionController: @unchecked Sendable {
@@ -121,6 +126,8 @@ public final class SessionController: @unchecked Sendable {
     private var isRunning = false
     private var hasMountedInitialTree = false
     private var pendingResync = false
+    /// Highest revision whose committed value has finished applying to the native renderer.
+    private var lastRenderedRevision: UInt64 = 0
     private var currentSessionId: String?
     private var actionHandlerWired = false
     private var _isDiverged = false
@@ -1138,7 +1145,9 @@ public final class SessionController: @unchecked Sendable {
             clientInstanceId: ClientInstanceId(ack.clientInstanceID),
             eventId: eventId,
             throughSeq: ack.lastProcessedEventSeq,
-            sessionId: ack.sessionID
+            sessionId: ack.sessionID,
+            revisionAfterEffect: ack.revisionAfterEffect,
+            textEditRejected: ack.status == .rejected
         )
         guard settlement.bound else {
             SessionDiagnostics.error(
@@ -1165,19 +1174,15 @@ public final class SessionController: @unchecked Sendable {
             )
         }
 
-        if let event = settlement.event, event.eventType == .EVENT_TEXT_EDIT {
+        for event in settlement.settledEvents where event.eventType == .EVENT_TEXT_EDIT {
             await renderer?.textEditingSession.noteAcknowledged(event)
-            if ack.revisionAfterEffect > applier.lastAppliedRevision.value {
-                // Control-lane ack can overtake the UI-lane transaction. Promoting the
-                // successor now would replace `lastSubmittedValue` before the delayed
-                // echo is classified (§22.6). `handleTransaction` promotes after apply.
-                return
-            }
-            if ack.status == .rejected {
-                // No forthcoming transaction: revert unless a newer local draft must be kept.
-                await revertRejectedTextEditIfNoSuccessor(event.nodeId)
-            }
         }
+
+        // Control-lane acknowledgements can overtake multiple UI-lane transactions. The outbox
+        // keeps each editor blocked until the exact-or-later authoritative revision has rendered,
+        // so an unrelated intervening transaction cannot promote the successor (§22.6).
+        let renderedRevision = withStateLock { lastRenderedRevision }
+        await resolveRenderedTextAcknowledgements(through: renderedRevision)
         await promoteReadyTextDrafts()
     }
 
@@ -1195,6 +1200,15 @@ public final class SessionController: @unchecked Sendable {
             } else {
                 _ = session.applyPublishedValue(nodeID: nodeID, published: published)
             }
+        }
+    }
+
+    private func resolveRenderedTextAcknowledgements(through revision: UInt64) async {
+        let resolved = await outbox.releaseTextAcknowledgements(through: revision)
+        for acknowledgement in resolved where acknowledgement.rejected {
+            // A rejection with no correcting transaction reverts to the last published value.
+            // When a correction did render, applying that same baseline again is a no-op.
+            await revertRejectedTextEditIfNoSuccessor(acknowledgement.nodeId)
         }
     }
 
@@ -1261,13 +1275,11 @@ public final class SessionController: @unchecked Sendable {
         // handed exactly the store produced by this transaction (§22.2).
         let applyResult: Result<TransactionSnapshot, TxnError>
         if isResyncSnapshot {
-            // A snapshot replaces the entire replica, so the supersession check, the publish, and
-            // the latch release run inside one outbox critical section: checking here and
-            // publishing after a suspension would let a newer attempt open in between and the
-            // stale snapshot still land on the shared applier (§18). The rebuild happens before
-            // that section so it never occupies the outbox actor while acknowledgements wait
-            // (§22.2). A live resync carries no generation and is checked the same way — another
-            // controller's outstanding attempt must block it too.
+            // A snapshot replaces the entire replica, so the supersession check and publish run
+            // inside one outbox critical section. The latch remains closed until the snapshot has
+            // also mounted and the text boundary has discarded every pre-snapshot draft (§18.3).
+            // Rebuilding happens before that section so it never occupies the outbox actor while
+            // acknowledgements wait (§22.2).
             let prepared: PreparedResyncSnapshot
             switch applier.prepareResyncSnapshot(record: domainTx) {
             case .success(let snapshot):
@@ -1301,20 +1313,31 @@ public final class SessionController: @unchecked Sendable {
 
         switch applyResult {
         case .success(let snapshot):
-            if isResyncSnapshot {
-                // Enable dispatch before the renderer mounts so the first click after catch-up
-                // is accepted. Clearing the latch only after a successful apply keeps a rejected
-                // snapshot from stranding the client with no path back to a usable tree (§18).
-                await completeSnapshotCatchUp()
-            }
-            await updateRenderer(
+            let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,
                 snapshot: snapshot,
-                forceRemount: isResyncSnapshot
+                forceRemount: isResyncSnapshot,
+                discardTextEditsForResync: isResyncSnapshot
             )
-            if !isResyncSnapshot {
-                // Promote after apply so a delayed echo is classified against the submit
-                // that produced this transaction, not a successor assigned from an earlier ack.
+
+            if isResyncSnapshot {
+                // This actor hop occurs after the native remount. Old callbacks carry a lower
+                // epoch and are discarded; genuinely post-mount edits carry the new epoch and
+                // remain queued while dispatch is still closed.
+                await outbox.applyFullResyncTextBoundary(
+                    laneEpoch: rendererUpdate.resyncLaneEpoch
+                )
+            }
+
+            guard rendererUpdate.didRender else { return }
+            withStateLock { lastRenderedRevision = snapshot.revision.value }
+            await resolveRenderedTextAcknowledgements(through: snapshot.revision.value)
+
+            if isResyncSnapshot {
+                // Only now may the outbox release the reconnect latch and promote post-snapshot
+                // intent. No unresolved pre-snapshot edit is silently merged (§18.3).
+                await completeSnapshotCatchUp()
+            } else {
                 await promoteReadyTextDrafts()
             }
 
@@ -1375,15 +1398,28 @@ public final class SessionController: @unchecked Sendable {
         await reportFailure(.transportEnded("pending event replay failed: \(error)"))
     }
 
-    /// Commits controller state after a catch-up or resync snapshot committed under the latch.
-    ///
-    /// The outbox latch was already released inside the critical section that published the
-    /// snapshot (`commitResyncSnapshot`), so there is no second supersession decision to lose
-    /// here: an attempt that opens now supersedes this controller the ordinary way, and
-    /// `finalizeResumeAttempt` hands the generation back if teardown or divergence raced it.
+    /// Releases the snapshot latch only after authoritative state has rendered and the full-resync
+    /// text boundary has reached the outbox.
     private func completeSnapshotCatchUp() async {
-        withStateLock { self.pendingResync = false }
         let generation = withStateLock { self.resumeGeneration }
+        let released: Bool
+        if let generation {
+            released = await outbox.finishResync(generation: generation)
+        } else {
+            released = await outbox.allowNewEvents()
+        }
+
+        guard released else {
+            let context = "resync snapshot was superseded before renderer finalization"
+            if let generation {
+                await failRefusedResumeDecision(generation, context)
+            } else {
+                await reportFailure(.superseded(context))
+            }
+            return
+        }
+
+        withStateLock { self.pendingResync = false }
         if let generation {
             await finalizeResumeAttempt(generation) {
                 self.resumeGeneration = nil
@@ -1460,11 +1496,22 @@ public final class SessionController: @unchecked Sendable {
     private func updateRenderer(
         transaction: Transaction?,
         snapshot: TransactionSnapshot,
-        forceRemount: Bool
-    ) async {
+        forceRemount: Bool,
+        discardTextEditsForResync: Bool = false
+    ) async -> RendererUpdateResult {
         await hydrateCachedResources(snapshot.store.referencedResourceHashes())
-        await MainActor.run {
-            guard let renderer = self.renderer else { return }
+        let result = await MainActor.run { () -> RendererUpdateResult in
+            guard let renderer = self.renderer else {
+                return RendererUpdateResult(didRender: true, resyncLaneEpoch: nil)
+            }
+            let epoch = discardTextEditsForResync
+                ? renderer.textEditingSession.discardUnresolvedEditsForResync()
+                : nil
+            defer {
+                if discardTextEditsForResync {
+                    renderer.textEditingSession.finishResyncTextBoundary()
+                }
+            }
             do {
                 if forceRemount || !self.hasMountedInitialTree {
                     try renderer.attach(store: snapshot.store)
@@ -1473,6 +1520,7 @@ public final class SessionController: @unchecked Sendable {
                 } else if let transaction {
                     try renderer.apply(transaction: transaction, newStore: snapshot.store)
                 }
+                return RendererUpdateResult(didRender: true, resyncLaneEpoch: epoch)
             } catch {
                 SessionDiagnostics.error("Renderer update failed: \(error)")
                 // Any renderer failure may have left a partially torn-down view tree: the
@@ -1480,9 +1528,11 @@ public final class SessionController: @unchecked Sendable {
                 // mean every surface window was closed. Force a full re-attach from the committed
                 // store on the next transaction rather than mutating a tree we no longer trust.
                 self.hasMountedInitialTree = false
+                return RendererUpdateResult(didRender: false, resyncLaneEpoch: epoch)
             }
         }
         await syncLiveResourceReferences()
+        return result
     }
 
     /// Pins and installs verified shared-cache images before a renderer mounts a new snapshot.

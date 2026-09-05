@@ -44,17 +44,39 @@ struct TextEditingIntegrationTests {
         let collector = EventCollector()
         await collector.start(draining: serverTransport)
 
-        field.stringValue = "glyphs"
-        field.currentEditor()?.selectedRange = NSRange(location: 2, length: 2)
-        adapter.compositionOverride = true
-        adapter.notifyTextDidChangeForTests()
-        #expect(field.stringValue == "glyphs")
+        let window = try #require(field.window)
+        #expect(window.makeFirstResponder(field))
+        let editor = try #require(field.currentEditor() as? NSTextView)
+
+        // Glyphs, caret movement, and selection are all mutations of AppKit's live field editor.
+        editor.string = "glyphs"
+        #expect(editor.string == "glyphs")
+        editor.setSelectedRange(NSRange(location: 2, length: 0))
+        #expect(editor.selectedRange == NSRange(location: 2, length: 0))
+        editor.setSelectedRange(NSRange(location: 2, length: 2))
+        #expect(editor.selectedRange == NSRange(location: 2, length: 2))
+
+        // Exercise NSTextInputClient's real marked range rather than the adapter test override.
+        editor.setMarkedText(
+            "かな",
+            selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: editor.selectedRange
+        )
+        #expect(editor.hasMarkedText())
+        let markedRange = editor.markedRange()
+        #expect(markedRange.location != NSNotFound)
+        #expect(editor.selectedRange.location == NSMaxRange(markedRange))
         #expect(adapter.isComposing)
+        adapter.notifyTextDidChangeForTests()
         #expect(await collector.eventCount() == 0)
 
-        adapter.compositionOverride = false
+        editor.unmarkText()
+        #expect(!editor.hasMarkedText())
+        adapter.notifyTextDidChangeForTests()
+        _ = window.makeFirstResponder(nil)
         adapter.notifyEndEditingForTests()
-        #expect(field.stringValue == "glyphs")
+        let committed = field.stringValue
+        #expect(!committed.isEmpty)
         #expect(await collector.eventCount() == 0)
 
         try await Task.sleep(nanoseconds: 80_000_000)
@@ -64,7 +86,7 @@ struct TextEditingIntegrationTests {
         let events = await collector.events()
         #expect(events.count == 1)
         #expect(events[0].eventType == .EVENT_TEXT_EDIT)
-        #expect(events[0].textArg == "glyphs")
+        #expect(events[0].textArg == committed)
         #expect(events[0].editSeq?.rawValue == 1)
 
         await controller.stop()
@@ -276,9 +298,9 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
-    @Test("Processed ack waits for its transaction before promoting a successor")
+    @Test("Processed ack waits through intervening transactions before promoting a successor")
     @MainActor
-    func processedAckWaitsForTransactionBeforePromotingSuccessor() async throws {
+    func processedAckWaitsForEffectRevisionBeforePromotingSuccessor() async throws {
         let (clientPipe, serverTransport) = await PipeTransport.createPair()
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
@@ -324,7 +346,7 @@ struct TextEditingIntegrationTests {
         ack.eventID = first.eventId.bytes
         ack.lastProcessedEventSeq = first.eventSeq
         ack.status = .processed
-        ack.revisionAfterEffect = 2
+        ack.revisionAfterEffect = 3
         ack.sessionID = "text-ack-wait"
         var ackMessage = SRUIMessage()
         ackMessage.serverEventAck = ack
@@ -334,10 +356,29 @@ struct TextEditingIntegrationTests {
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
         #expect(field.stringValue == "food")
 
-        var echo = SRUIMessage()
-        echo.transaction = Transaction(
+        var intervening = SRUIMessage()
+        intervening.transaction = Transaction(
             baseRevision: Revision(1),
             newRevision: Revision(2),
+            operations: [
+                .setProperty(
+                    id: editorID,
+                    property: .validationState,
+                    value: .enumToken(StandardValidationState.warning.enumToken)
+                ),
+            ]
+        ).toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(intervening))
+        try await AsyncTestSupport.eventually(description: "intervening revision rendered") {
+            adapter.validationState == .warning
+        }
+        #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
+        #expect(field.stringValue == "food")
+
+        var echo = SRUIMessage()
+        echo.transaction = Transaction(
+            baseRevision: Revision(2),
+            newRevision: Revision(3),
             operations: [
                 .setProperty(id: editorID, property: .value, value: .string("foo")),
             ]
@@ -347,6 +388,105 @@ struct TextEditingIntegrationTests {
         let second = try await waitForTextEvent(collector, matching: { $0.eventId != first.eventId })
         #expect(second.textArg == "food")
         #expect(field.stringValue == "food")
+
+        await controller.stop()
+        await collector.stop()
+        await clientPipe.close()
+        await serverTransport.close()
+    }
+
+    @Test("Forced same-session resync discards pre-snapshot drafts without resetting edit_seq")
+    @MainActor
+    func forcedResyncDiscardsOnlyPreSnapshotDrafts() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let outbox = EventOutbox()
+        let controller = SessionController(
+            transport: clientPipe,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+        try await handshakeAndMount(
+            controller: controller,
+            server: serverTransport,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "text-resync"
+        )
+
+        let oldHandle = try #require(renderer.registry.handle(for: editorID))
+        let oldAdapter = try #require(oldHandle.textAdapter)
+        let oldField = try #require(oldHandle.view as? NSTextField)
+        let collector = EventCollector()
+        await collector.start(draining: serverTransport)
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = "text-resync"
+        resync.snapshotRevision = 2
+        resync.reason = "forced test resync"
+        resync.continuity = .sameSession
+        resync.lastProcessedEventSeq = 0
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMessage))
+
+        try await waitUntil(description: "dispatch suspended for snapshot") {
+            !controller.isEventDispatchEnabled
+        }
+
+        oldField.stringValue = "stale local"
+        oldAdapter.notifyTextDidChangeForTests()
+        oldAdapter.notifyEndEditingForTests()
+        try await waitUntil(description: "pre-snapshot draft queued") {
+            await outbox.unsentTextDraftCount == 1
+        }
+        #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 2)
+
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(
+                    id: editorID,
+                    nodeType: .textInput,
+                    parentID: surfaceID,
+                    properties: [
+                        Property(property: .value, value: .string("authoritative")),
+                    ]
+                ),
+            ]
+        ).toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        try await waitUntil(description: "authoritative snapshot mounted") {
+            guard controller.isEventDispatchEnabled,
+                  let handle = renderer.registry.handle(for: editorID),
+                  let field = handle.view as? NSTextField else {
+                return false
+            }
+            return field.stringValue == "authoritative"
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.isEmpty)
+
+        let newHandle = try #require(renderer.registry.handle(for: editorID))
+        let newAdapter = try #require(newHandle.textAdapter)
+        let newField = try #require(newHandle.view as? NSTextField)
+        newField.stringValue = "fresh local"
+        newAdapter.notifyTextDidChangeForTests()
+        newAdapter.notifyEndEditingForTests()
+
+        let fresh = try await waitForTextEvent(collector)
+        #expect(fresh.textArg == "fresh local")
+        #expect(fresh.editSeq?.rawValue == 2)
 
         await controller.stop()
         await collector.stop()
@@ -437,10 +577,11 @@ struct TextEditingIntegrationTests {
         #expect(controller.isEventDispatchEnabled)
     }
 
+    @MainActor
     private func waitUntil(
         timeout: Double = 2.0,
         description: String,
-        condition: () async -> Bool
+        condition: @MainActor () async -> Bool
     ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {

@@ -856,14 +856,14 @@ struct SessionResumeContinuityTests {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let editSeq = try #require(EditSeq(1))
         let textEvent = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
             text: "typed",
-            editSeq: try #require(EditSeq(1)),
+            editSeq: editSeq,
             observedRevision: Revision(3),
             via: seedClient
         ))
-
         let (firstClient, firstServer) = await PipeTransport.createPair()
         let firstCollector = ResumeWireCollector()
         await firstCollector.start(draining: firstServer)

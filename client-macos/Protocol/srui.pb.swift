@@ -2118,7 +2118,6 @@ public nonisolated struct Srui_Protocol_Event: Sendable {
   public var arguments: [Srui_Protocol_Property] = []
 
   /// Positive per-(session_id, client_instance_id, node_id) editor sequence for TEXT_EDIT (§18.3, §22.6).
-  ///
   /// Zero is absent: TEXT_EDIT requires a positive value; every other event type MUST send zero.
   public var editSeq: UInt64 = 0
 
@@ -2383,7 +2382,6 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
   public var lastProcessedEventSeq: UInt64 = 0
 
   /// Confirmed discarded TEXT_EDIT identities for a same-session forced resync (§18.3).
-  ///
   /// MUST echo the client's declared pending_text_edits; a mismatch fails closed.
   public var discardedTextEdits: [Srui_Protocol_PendingTextEditRef] = []
 

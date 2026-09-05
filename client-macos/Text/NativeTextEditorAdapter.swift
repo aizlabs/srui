@@ -113,10 +113,7 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
     }
 
     public func notifyEndEditingForTests() {
-        if let applied = session?.setComposing(false, nodeID: nodeID) {
-            assignNativeString(applied)
-        }
-        session?.endEditing(nodeID: nodeID)
+        emitEndEditing()
     }
 
     public func controlTextDidChange(_ obj: Notification) {
@@ -124,10 +121,7 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
     }
 
     public func controlTextDidEndEditing(_ obj: Notification) {
-        if let applied = session?.setComposing(false, nodeID: nodeID) {
-            assignNativeString(applied)
-        }
-        session?.endEditing(nodeID: nodeID)
+        emitEndEditing()
     }
 
     public func textDidChange(_ notification: Notification) {
@@ -135,10 +129,7 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
     }
 
     public func textDidEndEditing(_ notification: Notification) {
-        if let applied = session?.setComposing(false, nodeID: nodeID) {
-            assignNativeString(applied)
-        }
-        session?.endEditing(nodeID: nodeID)
+        emitEndEditing()
     }
 
     private func emitLocalChange(flushImmediately: Bool) {
@@ -156,6 +147,22 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
             composing: composing,
             flushImmediately: (flushImmediately || endedComposition) && !composing
         )
+    }
+
+    private func emitEndEditing() {
+        guard !applyingAuthoritative else { return }
+        lastKnownComposing = false
+        if let applied = session?.setComposing(false, nodeID: nodeID) {
+            assignNativeString(applied)
+            return
+        }
+        session?.noteLocalValue(
+            currentString,
+            nodeID: nodeID,
+            composing: false,
+            flushImmediately: false
+        )
+        session?.endEditing(nodeID: nodeID)
     }
 
     private func assignNativeString(_ string: String) {

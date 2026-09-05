@@ -830,6 +830,7 @@ public final class SessionController: @unchecked Sendable {
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = !self._isDiverged
         }
+        await noteAssignedTextEdits(await outbox.assignedTextEditEvents())
         await reissueCollectionRangeRequestsIfAllowed()
     }
 
@@ -1204,9 +1205,16 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    private func noteAssignedTextEdits(_ events: [Event]) async {
+        for event in events {
+            await renderer?.textEditingSession.noteAssigned(event)
+        }
+    }
+
     private func promoteReadyTextDrafts() async {
         do {
-            try await outbox.promoteReadyTextDrafts(via: transport)
+            let promoted = try await outbox.promoteReadyTextDrafts(via: transport)
+            await noteAssignedTextEdits(promoted)
         } catch {
             SessionDiagnostics.error("Failed to promote coalesced text drafts: \(error)")
         }

@@ -58,6 +58,23 @@ struct NativeTextEditorAdapterTests {
         #expect(commits == 1)
     }
 
+    @Test("Committed IME candidate is flushed instead of the previous marked string")
+    func compositionEndFlushesCommittedCandidate() {
+        let (session, adapter, field) = makeField()
+        var commits: [String] = []
+        session.onCommit = { _, text, _ in commits.append(text) }
+
+        adapter.compositionOverride = true
+        field.stringValue = "hel"
+        adapter.notifyTextDidChangeForTests()
+        #expect(commits.isEmpty)
+
+        adapter.compositionOverride = false
+        field.stringValue = "hello"
+        adapter.notifyTextDidChangeForTests()
+        #expect(commits == ["hello"])
+    }
+
     @Test("Programmatic authoritative writes do not emit another edit")
     func programmaticWriteDoesNotEmitEdit() {
         let (session, adapter, field) = makeField()

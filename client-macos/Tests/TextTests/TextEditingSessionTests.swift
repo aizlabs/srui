@@ -130,6 +130,38 @@ struct TextEditingSessionTests {
         #expect(session.localValue(for: nodeID) == "server")
     }
 
+    @Test("Reapplying the last known store value keeps a local draft")
+    func remountOfUnchangedValueKeepsLocalDraft() {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        var invalidated: [NodeId] = []
+        var commits: [String] = []
+        session.onInvalidateOutboxDraft = { invalidated.append($0) }
+        session.onCommit = { _, text, _ in commits.append(text) }
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
+        session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: false)
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .keepLocal)
+        #expect(session.localValue(for: nodeID) == "hello!")
+        #expect(invalidated.isEmpty)
+        #expect(commits.isEmpty)
+    }
+
+    @Test("Composition end does not flush the previous marked string")
+    func compositionEndDoesNotFlushMarkedValue() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var commits: [String] = []
+        session.onCommit = { _, text, _ in commits.append(text) }
+
+        _ = session.setComposing(true, nodeID: nodeID)
+        session.noteLocalValue("hel", nodeID: nodeID, composing: true, flushImmediately: false)
+        #expect(session.setComposing(false, nodeID: nodeID) == nil)
+        #expect(commits.isEmpty)
+
+        session.noteLocalValue("hello", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(commits == ["hello"])
+    }
+
     @Test("Marked text does not emit an edit")
     func composingSuppressesRemoteEmission() {
         let session = TextEditingSession(debounceNanoseconds: 0)

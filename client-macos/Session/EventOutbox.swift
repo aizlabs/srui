@@ -254,9 +254,25 @@ public actor EventOutbox {
     }
 
     /// Promotes every coalesced draft that can enter the contiguous send window.
-    public func promoteReadyTextDrafts(via transport: any Transport) async throws {
+    /// Returns each newly allocated `TEXT_EDIT` so the text coordinator can record it as assigned.
+    @discardableResult
+    public func promoteReadyTextDrafts(via transport: any Transport) async throws -> [Event] {
+        var promoted: [Event] = []
         for nodeId in Array(textDrafts.keys) {
-            _ = try await promoteTextDraft(nodeId: nodeId, via: transport)
+            if let event = try await promoteTextDraft(nodeId: nodeId, via: transport) {
+                promoted.append(event)
+            }
+        }
+        return promoted
+    }
+
+    /// Assigned, unacknowledged `TEXT_EDIT` events in send order (§18.3).
+    public func assignedTextEditEvents() -> [Event] {
+        pendingOrder.compactMap { id in
+            guard let event = pendingEvents[id], event.eventType == .EVENT_TEXT_EDIT else {
+                return nil
+            }
+            return event
         }
     }
 

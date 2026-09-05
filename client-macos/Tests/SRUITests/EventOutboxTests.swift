@@ -595,7 +595,11 @@ struct EventOutboxTests {
             throughSeq: 1,
             sessionId: "session-coalesce"
         ).bound)
-        try await outbox.promoteReadyTextDrafts(via: client)
+        let promoted = try await outbox.promoteReadyTextDrafts(via: client)
+        #expect(promoted.count == 1)
+        #expect(promoted[0].textArg == "abc")
+        #expect(promoted[0].eventSeq == 2)
+        #expect(promoted[0].editSeq?.rawValue == 3)
 
         #expect(await outbox.eventSeq == 2)
         let assigned = await outbox.assignedTextEditDescriptors()

@@ -393,3 +393,52 @@ fn correct_policy_publishes_supplied_value() {
         Some(StandardValidationState::Warning)
     );
 }
+
+#[test]
+fn deleted_editor_during_policy_settles_instead_of_stranding() {
+    let session = Session::new("text-delete-during-policy");
+    seed_editor(&session);
+
+    let first_entered = Arc::new(Barrier::new(2));
+    let release_old = Arc::new(Barrier::new(2));
+
+    session.on_text_edit({
+        let first_entered = Arc::clone(&first_entered);
+        let release_old = Arc::clone(&release_old);
+        move |_, _| {
+            first_entered.wait();
+            release_old.wait();
+            TextEditDecision::Accept
+        }
+    });
+
+    let event = text_edit(1, "doomed", "gone", 1);
+    let session_old = session.clone();
+    let event_for_thread = event.clone();
+    let worker = thread::spawn(move || session_old.process_event(&event_for_thread));
+
+    first_entered.wait();
+    session
+        .transaction(|ui| {
+            ui.delete(NodeId::new(EDITOR))?;
+            Ok(())
+        })
+        .expect("delete editor while policy runs");
+    release_old.wait();
+
+    let outcome = worker.join().expect("worker").expect("settled outcome");
+    match outcome {
+        EventOutcome::Rejected {
+            error: EventValidationError::NodeNotFound(_) | EventValidationError::StaleEditSeq { .. },
+            ..
+        } => {}
+        other => panic!("expected settled rejection, got {other:?}"),
+    }
+
+    match session.process_event(&event).expect("replay after settle") {
+        EventOutcome::Duplicate {
+            accepted: false, ..
+        } => {}
+        other => panic!("replay must be answered from the result cache, got {other:?}"),
+    }
+}

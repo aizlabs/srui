@@ -40,6 +40,9 @@ public final class TextEditingSession {
         var debounceTask: Task<Void, Never>?
         var lastFlushedValue: String?
         var lastSubmittedValue: String?
+        /// Last string known to be the store's `.value` (echo or applied correction).
+        /// Reapplying this same string — a structural remount — must not clobber local typing.
+        var lastKnownAuthoritative: String?
         var assignedEditSeq: EditSeq?
         var assignedEventId: EventId?
         var localValue: String = ""
@@ -127,6 +130,11 @@ public final class TextEditingSession {
             _ = applyPublishedValue(nodeID: nodeID, published: deferred)
             return
         }
+        if state.lastFlushedValue == value, state.pendingValue == nil {
+            state.localValue = value
+            nodes[nodeID] = state
+            return
+        }
         state.pendingValue = value
         state.debounceTask?.cancel()
         if flushImmediately || debounceNanoseconds == 0 {
@@ -170,8 +178,9 @@ public final class TextEditingSession {
         onCommit?(nodeID, value, seq)
     }
 
-    /// Echo of a submitted value must not overwrite newer local typing; any other published
-    /// string is a normalization/correction and replaces native text (§22.6).
+    /// Echo of a submitted value must not overwrite newer local typing; any other *new*
+    /// published string is a normalization/correction and replaces native text (§22.6).
+    /// Reapplying the last known store value (structural remount) keeps local drafts.
     @discardableResult
     public func applyPublishedValue(nodeID: NodeId, published: String) -> AuthoritativeResolution {
         var state = nodes[nodeID] ?? NodeState()
@@ -181,6 +190,11 @@ public final class TextEditingSession {
             return .deferred
         }
         if let submitted = state.lastSubmittedValue, submitted == published {
+            state.lastKnownAuthoritative = published
+            nodes[nodeID] = state
+            return .keepLocal
+        }
+        if state.lastKnownAuthoritative == published {
             nodes[nodeID] = state
             return .keepLocal
         }
@@ -189,6 +203,7 @@ public final class TextEditingSession {
         state.debounceTask?.cancel()
         state.debounceTask = nil
         state.lastSubmittedValue = nil
+        state.lastKnownAuthoritative = published
         state.localValue = published
         nodes[nodeID] = state
         if hadDraft {
@@ -207,25 +222,20 @@ public final class TextEditingSession {
 
     /// Updates composition state. Returns a deferred authoritative string that the adapter
     /// must apply now that marked text has ended.
+    ///
+    /// Does not flush on composition end: the adapter must pass the control's committed
+    /// string through `noteLocalValue` so an intermediate marked value is not emitted (§22.6).
     @discardableResult
     public func setComposing(_ composing: Bool, nodeID: NodeId) -> String? {
         var state = nodes[nodeID] ?? NodeState()
         let ending = state.composing && !composing
         state.composing = composing
         nodes[nodeID] = state
-        if ending {
-            if let deferred = state.deferredAuthoritative {
-                state.deferredAuthoritative = nil
-                nodes[nodeID] = state
-                if applyPublishedValue(nodeID: nodeID, published: deferred) == .apply {
-                    return deferred
-                }
-            } else {
-                if state.pendingValue == nil {
-                    state.pendingValue = state.localValue
-                    nodes[nodeID] = state
-                }
-                flushPending(nodeID: nodeID)
+        if ending, let deferred = state.deferredAuthoritative {
+            state.deferredAuthoritative = nil
+            nodes[nodeID] = state
+            if applyPublishedValue(nodeID: nodeID, published: deferred) == .apply {
+                return deferred
             }
         }
         return nil

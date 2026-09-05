@@ -12,7 +12,8 @@ use srui_protocol::Event as WireEvent;
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     AuthoritativeCommit, ClientInstanceId, EditSeq, Event as DomainEvent, EventId,
-    EventValidationError, NodeId, PropertyRef, Revision, StandardValidationState, TypeRef, Value,
+    EventValidationError, NodeId, PropertyRef, Revision, StandardValidationState, StoreError,
+    TypeRef, Value,
 };
 
 use super::{
@@ -143,22 +144,13 @@ impl TextEditTracker {
             .map(|s| s.generation)
     }
 
+    /// Raises the terminal watermark for an existing stream. Does not insert new keys:
+    /// canceled-edit refs for unknown or deleted nodes must not consume tracker capacity (§18.3, §26).
     pub fn mark_terminal(&mut self, client_instance_id: &[u8], node_id: NodeId, edit_seq: EditSeq) {
         let key = (client_instance_id.to_vec(), node_id.get());
         if let Some(stream) = self.streams.get_mut(&key) {
             stream.last_terminal_edit_seq = stream.last_terminal_edit_seq.max(edit_seq.get());
-            return;
         }
-        if self.streams.len() >= self.max_streams {
-            return;
-        }
-        self.streams.insert(
-            key,
-            EditorStream {
-                last_terminal_edit_seq: edit_seq.get(),
-                generation: 0,
-            },
-        );
     }
 
     pub fn reclaim_node(&mut self, node_id: NodeId) {
@@ -343,6 +335,10 @@ impl Session {
             return Ok(reject_admitted(&mut guard, event, error));
         }
 
+        if let Err(error) = revalidate_editor_for_commit(&guard, request.node_id) {
+            return Ok(reject_admitted(&mut guard, event, error));
+        }
+
         let current_value = current_editor_value(&guard, request.node_id);
         let (publish_value, validation, accepted, reject_reason) = match decision {
             TextEditDecision::Accept => (
@@ -375,21 +371,32 @@ impl Session {
         let base_revision = guard.store.revision();
         let max_ops = guard.store.limits().max_transaction_operations;
         let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
-        ui.set(
+        if let Err(error) = ui.set(
             request.node_id,
             PropertyRef::VALUE,
             Value::String(publish_value),
-        )
-        .map_err(SessionError::Store)?;
-        ui.set(
+        ) {
+            return Ok(reject_store(&mut guard, event, error));
+        }
+        if let Err(error) = ui.set(
             request.node_id,
             PropertyRef::VALIDATION_STATE,
             Value::EnumToken(validation.into()),
-        )
-        .map_err(SessionError::Store)?;
+        ) {
+            return Ok(reject_store(&mut guard, event, error));
+        }
         let (staged, ops) = ui.into_staged_and_ops();
         let commit = AuthoritativeCommit::new(base_revision, ops);
-        let permit = guard.journal.prepare(&commit)?;
+        let permit = match guard.journal.prepare(&commit) {
+            Ok(permit) => permit,
+            Err(error) => {
+                return Ok(reject_admitted(
+                    &mut guard,
+                    event,
+                    EventValidationError::PolicyRejected(error.to_string()),
+                ));
+            }
+        };
         let tx_wire = permit.transaction().clone();
         guard.store.commit_staging(staged, commit.new_revision());
         guard.journal.append(permit);
@@ -502,6 +509,31 @@ fn validate_text_edit(
         });
     }
     Ok(())
+}
+
+fn revalidate_editor_for_commit(
+    inner: &SessionInner,
+    node_id: NodeId,
+) -> Result<(), EventValidationError> {
+    let node = inner
+        .store
+        .get_node(node_id)
+        .ok_or(EventValidationError::NodeNotFound(node_id))?;
+    if !is_editor_type(node.node_type) {
+        return Err(EventValidationError::UnsupportedNodeType(node.node_type));
+    }
+    if let Some(Value::Bool(true)) = node.get_property(PropertyRef::READ_ONLY) {
+        return Err(EventValidationError::NodeReadOnly(node_id));
+    }
+    Ok(())
+}
+
+fn reject_store(inner: &mut SessionInner, event: &WireEvent, error: StoreError) -> EventOutcome {
+    let mapped = match error {
+        StoreError::NodeNotFound(id) => EventValidationError::NodeNotFound(id),
+        other => EventValidationError::PolicyRejected(other.to_string()),
+    };
+    reject_admitted(inner, event, mapped)
 }
 
 fn current_editor_value(inner: &SessionInner, node_id: NodeId) -> String {
@@ -626,6 +658,23 @@ mod tests {
             Err(EventValidationError::TextTrackerFull { limit: 2 })
         ));
         assert!(tracker.reserve(b"c", node(1), seq(2)).is_ok());
+    }
+
+    #[test]
+    fn mark_terminal_does_not_insert_a_new_stream() {
+        let mut tracker = TextEditTracker::new(8);
+        tracker.mark_terminal(b"c", node(99), seq(4));
+        assert!(tracker.is_empty());
+        tracker.reserve(b"c", node(1), seq(1)).unwrap();
+        tracker.mark_terminal(b"c", node(1), seq(3));
+        assert_eq!(tracker.len(), 1);
+        assert!(matches!(
+            tracker.reserve(b"c", node(1), seq(2)),
+            Err(EventValidationError::StaleEditSeq {
+                observed: 2,
+                watermark: 3
+            })
+        ));
     }
 
     #[test]

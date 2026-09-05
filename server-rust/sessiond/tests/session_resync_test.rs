@@ -690,3 +690,80 @@ fn replacement_resync_ignores_pending_text_edit_refs() {
         other => panic!("expected replacement resync, got {other:?}"),
     }
 }
+
+#[test]
+fn same_session_resync_does_not_track_canceled_refs_for_missing_nodes() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_semantic_tree::{EditSeq, Event as DomainEvent};
+    use srui_sessiond::{EventOutcome, SessionConfig, MAX_TEXT_EDIT_STREAMS};
+
+    let session = Session::with_config(
+        "resync-cancel-missing",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let pending: Vec<PendingTextEditRef> = (0..MAX_TEXT_EDIT_STREAMS)
+        .map(|i| PendingTextEditRef {
+            event_id: format!("ghost-{i}").into_bytes(),
+            event_seq: i as u64 + 1,
+            node_id: 1_000 + i as u64,
+            edit_seq: 1,
+        })
+        .collect();
+    let resume = ClientResume {
+        session_id: "resync-cancel-missing".to_string(),
+        client_instance_id: b"client-ghost".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: pending.clone(),
+    };
+
+    match session.bootstrap_resume(&resume).expect("resume").outcome {
+        ResumeOutcome::Resync { resync_msg, .. } => {
+            assert_eq!(resync_msg.discarded_text_edits.len(), MAX_TEXT_EDIT_STREAMS);
+            assert_eq!(
+                resync_msg.last_processed_event_seq,
+                MAX_TEXT_EDIT_STREAMS as u64
+            );
+        }
+        other => panic!("expected same-session resync, got {other:?}"),
+    }
+
+    let live = DomainEvent::text_edit(
+        (MAX_TEXT_EDIT_STREAMS as u64) + 1,
+        "live-editor",
+        0u64,
+        2,
+        "ok",
+        EditSeq::new(1).unwrap(),
+    )
+    .with_client_instance_id(b"client-ghost".as_slice())
+    .to_wire();
+    match session.process_event(&live).expect("live editor") {
+        EventOutcome::Processed { .. } => {}
+        other => {
+            panic!("canceled missing-node refs must not exhaust the text tracker, got {other:?}")
+        }
+    }
+}

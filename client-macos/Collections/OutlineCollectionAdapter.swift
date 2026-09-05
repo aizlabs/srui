@@ -33,9 +33,11 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
     public var onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)?
     public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
 
-    var minHeightConstraint: NSLayoutConstraint?
-    var fitHeightConstraint: NSLayoutConstraint?
-    private(set) var isNestedInScroll = false
+    /// Nested-scroll chrome. Public so `ControlFactory` (RendererAppKit) can
+    /// wire collections that now live in a separate module.
+    public var minHeightConstraint: NSLayoutConstraint?
+    public var fitHeightConstraint: NSLayoutConstraint?
+    public private(set) var isNestedInScroll = false
     private(set) var rangeTracker = CollectionRangeTracker()
 
     private var outlineLeaves: [Int: Item] = [:]
@@ -114,6 +116,12 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         rangeTracker.reset()
     }
 
+    /// Forget an in-flight window that never reached the server so the next
+    /// viewport update can re-emit it.
+    public func noteDropped(start: UInt64, count: UInt64) {
+        rangeTracker.noteDropped(start: start, count: count)
+    }
+
     /// Re-emits cache-miss requests for the last known visible window (§8, §22.7).
     public func reissueVisibleRangeRequests() {
         if lastVisibleCount > 0 {
@@ -127,7 +135,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         emitRequests(visibleStart: start, visibleCount: count)
     }
 
-    func setNestedInScroll(_ nested: Bool, scrollView: NSScrollView, outlineView: NSOutlineView) {
+    public func setNestedInScroll(_ nested: Bool, scrollView: NSScrollView, outlineView: NSOutlineView) {
         isNestedInScroll = nested
         CollectionScrollEmbedding.apply(
             nested: nested,
@@ -273,7 +281,7 @@ public final class OutlineCollectionAdapter: NSObject, NSOutlineViewDataSource, 
         let outlineView = outlineView ?? observedOutlineView
         guard let outlineView else { return }
         let rows = outlineView.rows(in: outlineView.visibleRect)
-        guard rows.length > 0 else { return }
+        guard rows.location != NSNotFound, rows.length > 0 else { return }
         emitRequests(visibleStart: UInt64(rows.location), visibleCount: UInt64(rows.length))
     }
 

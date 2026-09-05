@@ -54,16 +54,51 @@ public final class AppKitRenderer {
         layoutRenderer.showWindows()
     }
 
-    /// Drops in-flight visible-range requests after reconnect or a failed send, then
-    /// immediately re-requests each adapter's last known viewport (§8, §22.7).
+    /// Drops in-flight coverage without emitting. Used by `stop()` so a torn-down
+    /// pump cannot record phantom pending windows (§8, §22.7).
+    public func clearCollectionRangeTrackers() {
+        forEachCollectionAdapter { $0.resetRangeTracker() } outline: { $0.resetRangeTracker() }
+    }
+
+    /// Re-emits each adapter's last known viewport. Call after the range-request
+    /// pump is running *and* the data plane is open (handshake `.active`).
+    public func reissueCollectionRangeRequests() {
+        forEachCollectionAdapter { $0.reissueVisibleRangeRequests() } outline: { $0.reissueVisibleRangeRequests() }
+    }
+
+    /// Forget one dropped in-flight window so a later viewport update re-emits it.
+    public func noteDroppedCollectionRange(_ request: CollectionRangeRequest) {
+        for handle in registry.allHandles {
+            if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+               adapter.nodeID == request.nodeID {
+                adapter.noteDropped(start: request.startIndex, count: request.count)
+                return
+            }
+            if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
+               adapter.nodeID == request.nodeID {
+                adapter.noteDropped(start: request.startIndex, count: request.count)
+                return
+            }
+        }
+    }
+
+    /// Reset then reissue. Prefer `clearCollectionRangeTrackers` /
+    /// `reissueCollectionRangeRequests` / `noteDroppedCollectionRange` for
+    /// session lifecycle so a failed send cannot storm every collection.
     public func resetCollectionRangeTrackers() {
+        clearCollectionRangeTrackers()
+        reissueCollectionRangeRequests()
+    }
+
+    private func forEachCollectionAdapter(
+        _ table: (TableCollectionAdapter) -> Void,
+        outline: (OutlineCollectionAdapter) -> Void
+    ) {
         for handle in registry.allHandles {
             if let adapter = handle.modelAdapter as? TableCollectionAdapter {
-                adapter.resetRangeTracker()
-                adapter.reissueVisibleRangeRequests()
+                table(adapter)
             } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter {
-                adapter.resetRangeTracker()
-                adapter.reissueVisibleRangeRequests()
+                outline(adapter)
             }
         }
     }

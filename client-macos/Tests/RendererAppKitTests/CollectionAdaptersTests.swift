@@ -364,6 +364,12 @@ struct CollectionAdaptersTests {
         #expect(requests[0].modelID == modelID)
         #expect(requests[0].count > 0)
         #expect(requests[0].startIndex % CollectionRangeTracker.pageSize == 0)
+
+        adapter.noteDropped(start: requests[0].startIndex, count: requests[0].count)
+        adapter.noteVisibleRange(start: 250_000, count: 20)
+        #expect(requests.count == 2)
+        #expect(requests[1].startIndex == requests[0].startIndex)
+        #expect(requests[1].count == requests[0].count)
     }
 
     @Test

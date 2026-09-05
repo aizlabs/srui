@@ -50,7 +50,8 @@ struct CollectionRangeTrackerTests {
             itemCount: 500_000,
             model: model,
             nodeID: nodeID,
-            modelID: modelID
+            modelID: modelID,
+            nowNanos: 0
         )
         #expect(first == [
             CollectionRangeRequest(nodeID: nodeID, modelID: modelID, startIndex: 0, count: 128)
@@ -61,9 +62,22 @@ struct CollectionRangeTrackerTests {
             itemCount: 500_000,
             model: model,
             nodeID: nodeID,
-            modelID: modelID
+            modelID: modelID,
+            nowNanos: 1
         )
         #expect(second.isEmpty)
+
+        tracker.noteDropped(start: 0, count: 128)
+        let afterDrop = tracker.requests(
+            visibleStart: 10,
+            visibleCount: 5,
+            itemCount: 500_000,
+            model: model,
+            nodeID: nodeID,
+            modelID: modelID,
+            nowNanos: 2
+        )
+        #expect(afterDrop == first)
 
         tracker.noteArrived(start: 0, count: 128)
         try store.modelResetRange(
@@ -157,5 +171,45 @@ struct CollectionRangeTrackerTests {
         #expect(requests.count == 1)
         #expect(requests[0].startIndex == 32)
         #expect(requests[0].count == 96)
+    }
+
+    @Test
+    func stalePendingExpiresAndCanBeReissued() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(6)
+        let nodeID = NodeId(7)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 500_000)
+        let model = try #require(store.getModel(modelID))
+        var tracker = CollectionRangeTracker()
+        let first = tracker.requests(
+            visibleStart: 0,
+            visibleCount: 8,
+            itemCount: 500_000,
+            model: model,
+            nodeID: nodeID,
+            modelID: modelID,
+            nowNanos: 0
+        )
+        #expect(first.count == 1)
+        let beforeTTL = tracker.requests(
+            visibleStart: 0,
+            visibleCount: 8,
+            itemCount: 500_000,
+            model: model,
+            nodeID: nodeID,
+            modelID: modelID,
+            nowNanos: CollectionRangeTracker.pendingTTLNanoseconds - 1
+        )
+        #expect(beforeTTL.isEmpty)
+        let afterTTL = tracker.requests(
+            visibleStart: 0,
+            visibleCount: 8,
+            itemCount: 500_000,
+            model: model,
+            nodeID: nodeID,
+            modelID: modelID,
+            nowNanos: CollectionRangeTracker.pendingTTLNanoseconds
+        )
+        #expect(afterTTL == first)
     }
 }

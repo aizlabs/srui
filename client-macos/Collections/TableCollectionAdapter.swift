@@ -33,9 +33,11 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
     public var onSelectionChanged: (@MainActor (NodeId, ItemId) -> Void)?
     public var onRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
 
-    var minHeightConstraint: NSLayoutConstraint?
-    var fitHeightConstraint: NSLayoutConstraint?
-    private(set) var isNestedInScroll = false
+    /// Nested-scroll chrome. Public so `ControlFactory` (RendererAppKit) can
+    /// wire collections that now live in a separate module.
+    public var minHeightConstraint: NSLayoutConstraint?
+    public var fitHeightConstraint: NSLayoutConstraint?
+    public private(set) var isNestedInScroll = false
     private(set) var lastRowUpdate: TableRowUpdate = .none
     private(set) var rangeTracker = CollectionRangeTracker()
 
@@ -193,7 +195,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         }
     }
 
-    func setNestedInScroll(_ nested: Bool, scrollView: NSScrollView, tableView: NSTableView) {
+    public func setNestedInScroll(_ nested: Bool, scrollView: NSScrollView, tableView: NSTableView) {
         isNestedInScroll = nested
         CollectionScrollEmbedding.apply(
             nested: nested,
@@ -233,6 +235,12 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
 
     public func resetRangeTracker() {
         rangeTracker.reset()
+    }
+
+    /// Forget an in-flight window that never reached the server so the next
+    /// viewport update can re-emit it.
+    public func noteDropped(start: UInt64, count: UInt64) {
+        rangeTracker.noteDropped(start: start, count: count)
     }
 
     /// Re-emits cache-miss requests for the last known visible window (§8, §22.7).
@@ -290,7 +298,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
             lastRowUpdate = .fullReload
         } else {
             reloadVisibleRows(in: tableView)
-            lastRowUpdate = .contentReload(IndexSet(integersIn: tableView.rows(in: tableView.visibleRect)))
+            lastRowUpdate = .contentReload(visibleRowIndexes(in: tableView))
         }
 
         restoreSelection(selectedItemIDs, in: tableView)
@@ -402,7 +410,7 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         let tableView = tableView ?? observedTableView
         guard let tableView else { return }
         let rows = tableView.rows(in: tableView.visibleRect)
-        guard rows.length > 0 else { return }
+        guard rows.location != NSNotFound, rows.length > 0 else { return }
         emitRequests(visibleStart: UInt64(rows.location), visibleCount: UInt64(rows.length))
     }
 
@@ -466,16 +474,19 @@ public final class TableCollectionAdapter: NSObject, NSTableViewDataSource, NSTa
         lastRowUpdate = .fullReload
     }
 
-    private func reloadVisibleRows(in tableView: NSTableView) {
+    private func visibleRowIndexes(in tableView: NSTableView) -> IndexSet {
         let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.location != NSNotFound, visible.length > 0 else { return IndexSet() }
+        let start = visible.location
+        let end = start + visible.length
+        return IndexSet(integersIn: start..<end)
+    }
+
+    private func reloadVisibleRows(in tableView: NSTableView) {
+        let indexes = visibleRowIndexes(in: tableView)
         let columnIndexes = IndexSet(integersIn: 0..<tableView.numberOfColumns)
-        if visible.location != NSNotFound, visible.length > 0, !columnIndexes.isEmpty {
-            let start = visible.location
-            let end = start + visible.length
-            tableView.reloadData(
-                forRowIndexes: IndexSet(integersIn: start..<end),
-                columnIndexes: columnIndexes
-            )
+        if !indexes.isEmpty, !columnIndexes.isEmpty {
+            tableView.reloadData(forRowIndexes: indexes, columnIndexes: columnIndexes)
         } else {
             tableView.reloadData()
         }

@@ -2,8 +2,9 @@
 //!
 //! Clients request missing model windows with `ClientModelRangeRequest` on the `.ui` lane.
 //! The request is idempotent: it is not journaled, not replayed, and not an Event.
-//! Nearby pending windows for one model merge; a far jump replaces older pending
-//! windows. `observed_revision` in the future is refused; a behind revision is
+//! Nearby pending windows for one *(node, model)* pair merge; a far jump replaces
+//! older pending windows for that node only. Distinct in-flight models are capped.
+//! `observed_revision` in the future is refused; a behind revision is
 //! fulfilled against current store state. Successful fulfillment is an authoritative
 //! `MODEL_RESET_RANGE` transaction, which is revisioned, journaled, broadcast, and
 //! replayable. Server-initiated hydration uses the same commit path via
@@ -310,10 +311,13 @@ fn commit_ops_locked(
 
 /// Per-connection coalescing inbox for [`ClientModelRangeRequest`].
 ///
-/// Nearby or overlapping windows for one model merge into a single pending span so a
-/// fragmented viewport is not dropped. A far jump replaces older pending windows (scroll).
+/// Nearby or overlapping windows for one *(node, model)* pair merge into a single pending
+/// span so a fragmented viewport is not dropped. A far jump replaces older pending
+/// windows for that node only; other nodes sharing the model keep their holes.
 /// A single worker drains the inbox so scroll traffic cannot spawn unbounded tasks.
 const MAX_PENDING_RANGES_PER_MODEL: usize = 8;
+/// Distinct in-flight `ModelId` keys. `submit` is unbounded by the read loop otherwise.
+const MAX_INFLIGHT_MODELS: usize = 32;
 /// Merge pending windows when the bounding span is at most two tracker pages.
 const COALESCE_SPAN: u64 = 256;
 const MAX_MERGED_COUNT: u64 = 10_000;
@@ -328,6 +332,18 @@ struct CoalescingState {
     order: VecDeque<ModelId>,
     pending: HashMap<ModelId, Vec<ClientModelRangeRequest>>,
     closed: bool,
+}
+
+fn evict_oldest_models_over_cap(state: &mut CoalescingState) {
+    while state.pending.len() > MAX_INFLIGHT_MODELS {
+        let Some(oldest) = state.order.pop_front() else {
+            break;
+        };
+        if state.pending.remove(&oldest).is_none() {
+            continue;
+        }
+        state.order.retain(|id| *id != oldest);
+    }
 }
 
 fn request_end(request: &ClientModelRangeRequest) -> Option<u64> {
@@ -383,14 +399,26 @@ fn integrate_pending(list: &mut Vec<ClientModelRangeRequest>, incoming: ClientMo
         }
         true
     });
-    if !absorbed && !list.is_empty() {
-        // Far jump: the new window replaces older pending holes for this model.
-        list.clear();
+    if !absorbed {
+        // Far jump: replace older pending holes for this node only. Other collection
+        // nodes that share the model keep their in-flight windows.
+        list.retain(|existing| existing.node_id != merged.node_id);
     }
     list.push(merged);
-    if list.len() > MAX_PENDING_RANGES_PER_MODEL {
-        let drop = list.len() - MAX_PENDING_RANGES_PER_MODEL;
-        list.drain(..drop);
+    trim_pending_to_cap(list, merged.node_id);
+}
+
+/// Drops oldest windows of `incoming_node` first; if the model is still over cap,
+/// drops the oldest remaining window that is not the just-pushed request.
+fn trim_pending_to_cap(list: &mut Vec<ClientModelRangeRequest>, incoming_node: u64) {
+    while list.len() > MAX_PENDING_RANGES_PER_MODEL {
+        let last = list.len() - 1;
+        let drop_at = list
+            .iter()
+            .take(last)
+            .position(|existing| existing.node_id == incoming_node)
+            .unwrap_or(0);
+        list.remove(drop_at);
     }
 }
 
@@ -409,17 +437,23 @@ impl ModelRangeRequestInbox {
 
     /// Queues `request`, merging nearby windows and replacing far jumps. Never blocks the read loop.
     pub fn submit(&self, request: ClientModelRangeRequest) {
+        if request.node_id == 0 || request.model_id == 0 || request.count == 0 {
+            return;
+        }
         let model_id = ModelId::new(request.model_id);
         let mut guard = lock_or_recover(&self.inner);
         if guard.closed {
             return;
         }
-        let list = guard.pending.entry(model_id).or_default();
-        let was_empty = list.is_empty();
-        integrate_pending(list, request);
-        if was_empty && !list.is_empty() {
-            guard.order.push_back(model_id);
+        {
+            let list = guard.pending.entry(model_id).or_default();
+            let was_empty = list.is_empty();
+            integrate_pending(list, request);
+            if was_empty && !list.is_empty() {
+                guard.order.push_back(model_id);
+            }
         }
+        evict_oldest_models_over_cap(&mut guard);
         drop(guard);
         self.waker.wake();
     }
@@ -880,6 +914,52 @@ mod tests {
         assert_eq!(jumped.start_index, 10_000);
         assert_eq!(jumped.count, 8);
         assert!(inbox.try_pop().is_none());
+    }
+
+    #[test]
+    fn far_jump_keeps_other_nodes_on_a_shared_model() {
+        let inbox = ModelRangeRequestInbox::new();
+        let model = ModelId::new(7);
+        let node_a = NodeId::new(1);
+        let node_b = NodeId::new(2);
+        inbox.submit(request(node_a, model, 0, 8, 1));
+        inbox.submit(request(node_b, model, 0, 8, 1));
+        inbox.submit(request(node_b, model, 10_000, 8, 1));
+        let mut popped = vec![
+            inbox.try_pop().expect("first"),
+            inbox.try_pop().expect("second"),
+        ];
+        popped.sort_by_key(|r| (r.node_id, r.start_index));
+        assert_eq!(popped[0].node_id, 1);
+        assert_eq!(popped[0].start_index, 0);
+        assert_eq!(popped[1].node_id, 2);
+        assert_eq!(popped[1].start_index, 10_000);
+        assert!(inbox.try_pop().is_none());
+    }
+
+    #[test]
+    fn submit_rejects_zero_ids_and_caps_distinct_models() {
+        let inbox = ModelRangeRequestInbox::new();
+        inbox.submit(request(NodeId::new(0), ModelId::new(3), 0, 8, 1));
+        inbox.submit(request(NodeId::new(1), ModelId::new(0), 0, 8, 1));
+        let mut zero_count = request(NodeId::new(1), ModelId::new(3), 0, 8, 1);
+        zero_count.count = 0;
+        inbox.submit(zero_count);
+        assert!(inbox.try_pop().is_none());
+
+        for index in 1..=MAX_INFLIGHT_MODELS + 1 {
+            inbox.submit(request(NodeId::new(1), ModelId::new(index as u64), 0, 8, 1));
+        }
+        {
+            let guard = lock_or_recover(&inbox.inner);
+            assert_eq!(guard.pending.len(), MAX_INFLIGHT_MODELS);
+            assert!(!guard.pending.contains_key(&ModelId::new(1)));
+            assert!(guard
+                .pending
+                .contains_key(&ModelId::new((MAX_INFLIGHT_MODELS + 1) as u64)));
+        }
+        let first = inbox.try_pop().expect("oldest surviving model");
+        assert_eq!(first.model_id, 2);
     }
 
     #[tokio::test]

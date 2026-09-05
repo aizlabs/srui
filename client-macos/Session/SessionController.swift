@@ -301,7 +301,10 @@ public final class SessionController: @unchecked Sendable {
 
     private func sendCollectionRangeRequest(_ request: CollectionRangeRequest) async {
         let allowed = withStateLock { allowsDataPlane(phase) && isRunning && !_isDiverged }
-        guard allowed else { return }
+        guard allowed else {
+            await noteDroppedCollectionRange(request)
+            return
+        }
 
         var envelope = SRUIClientModelRangeRequest()
         envelope.nodeID = request.nodeID.value
@@ -318,10 +321,26 @@ public final class SessionController: @unchecked Sendable {
                 logicalClass: .ui
             )
         } catch {
-            await MainActor.run {
-                self.renderer?.resetCollectionRangeTrackers()
-            }
+            await noteDroppedCollectionRange(request)
             SessionDiagnostics.error("Collection range request send failed: \(error)")
+        }
+    }
+
+    private func noteDroppedCollectionRange(_ request: CollectionRangeRequest) async {
+        await MainActor.run {
+            self.renderer?.noteDroppedCollectionRange(request)
+        }
+    }
+
+    /// Re-request each collection's last viewport once the `.ui` lane can send.
+    /// Must not run from `stop()` (the pump is already gone) or from a failed
+    /// send (that storms every adapter). Handshake start is still
+    /// `.awaitingWelcome`, so this waits until the session becomes `.active`.
+    private func reissueCollectionRangeRequestsIfAllowed() async {
+        let allowed = withStateLock { allowsDataPlane(phase) && isRunning && !_isDiverged }
+        guard allowed else { return }
+        await MainActor.run {
+            self.renderer?.reissueCollectionRangeRequests()
         }
     }
 
@@ -727,6 +746,8 @@ public final class SessionController: @unchecked Sendable {
         }
         if welcome.initialRevision > 0 {
             await outbox.suspendNewEvents()
+        } else {
+            await reissueCollectionRangeRequestsIfAllowed()
         }
         SessionDiagnostics.log(
             "Handshake completed successfully with session \(welcome.sessionID), negotiated: \(negotiated)"
@@ -781,6 +802,7 @@ public final class SessionController: @unchecked Sendable {
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = !self._isDiverged
         }
+        await reissueCollectionRangeRequestsIfAllowed()
     }
 
     private func handleResyncRequired(_ resync: SRUIServerResyncRequired, phase: ProtocolPhase) async {
@@ -1249,6 +1271,7 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
         }
+        await reissueCollectionRangeRequestsIfAllowed()
     }
 
     /// Classifies a rejected transaction as a benign duplicate or as replica divergence (§12.1, §18).
@@ -1363,7 +1386,7 @@ public final class SessionController: @unchecked Sendable {
 
         stopRangeRequestPump()
         await MainActor.run {
-            self.renderer?.resetCollectionRangeTrackers()
+            self.renderer?.clearCollectionRangeTrackers()
         }
 
         // Close the transport first so the receive loop drains any buffered catch-up frames

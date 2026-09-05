@@ -113,6 +113,7 @@ public struct TerminalSnapshot: Equatable, Sendable {
     public var nextOffset: UInt64
     public var needsRedraw: Bool
     public var bracketedPaste: Bool
+    public var applicationCursorKeys: Bool
 
     public init(
         streamID: NodeId,
@@ -125,7 +126,8 @@ public struct TerminalSnapshot: Equatable, Sendable {
         title: String,
         nextOffset: UInt64,
         needsRedraw: Bool,
-        bracketedPaste: Bool
+        bracketedPaste: Bool,
+        applicationCursorKeys: Bool
     ) {
         self.streamID = streamID
         self.columns = columns
@@ -138,6 +140,7 @@ public struct TerminalSnapshot: Equatable, Sendable {
         self.nextOffset = nextOffset
         self.needsRedraw = needsRedraw
         self.bracketedPaste = bracketedPaste
+        self.applicationCursorKeys = applicationCursorKeys
     }
 
     public func plainText() -> String {
@@ -206,7 +209,8 @@ public final class TerminalGrid {
             title: title,
             nextOffset: nextOffset,
             needsRedraw: needsRedraw,
-            bracketedPaste: bracketedPaste
+            bracketedPaste: bracketedPaste,
+            applicationCursorKeys: applicationCursorKeys
         )
     }
 

@@ -135,12 +135,10 @@ struct TerminalSessionTests {
         let updates = await session.snapshots(for: stream)
         _ = try await session.applyData(streamID: stream, byteOffset: 0, data: Data("1".utf8))
         _ = try await session.applyData(streamID: stream, byteOffset: 1, data: Data("2".utf8))
-        var iterator = updates.makeAsyncIterator()
         var last: TerminalSnapshot?
-        for _ in 0..<4 {
-            if let next = await iterator.next() {
-                last = next
-            }
+        for await snapshot in updates {
+            last = snapshot
+            if snapshot.nextOffset >= 2 { break }
         }
         #expect(last?.nextOffset == 2)
     }

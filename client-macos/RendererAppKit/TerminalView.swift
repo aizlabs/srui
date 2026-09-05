@@ -108,8 +108,10 @@ public final class TerminalView: NSView, NSTextInputClient {
             return
         }
         if let special = Self.specialKey(from: event) {
-            let app = snapshot.map { _ in false } ?? false
-            emit(TerminalInputEncoder.encode(key: special, applicationCursorKeys: app))
+            emit(TerminalInputEncoder.encode(
+                key: special,
+                applicationCursorKeys: snapshot?.applicationCursorKeys ?? false
+            ))
             return
         }
         interpretKeyEvents([event])
@@ -165,7 +167,7 @@ public final class TerminalView: NSView, NSTextInputClient {
         emit(TerminalInputEncoder.encodePaste(text, bracketed: snapshot?.bracketedPaste ?? false))
     }
 
-    public override var acceptsFirstMouse: Bool { true }
+    public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     public override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)

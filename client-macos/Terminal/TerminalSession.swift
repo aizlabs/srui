@@ -59,7 +59,8 @@ public actor TerminalSession {
             map[id.value] = state.nextOffset
         }
         if map.count > maxTerminalResumeMapEntries {
-            return Dictionary(uniqueKeysWithValues: map.sorted { $0.key < $1.key }.prefix(maxTerminalResumeMapEntries))
+            let trimmed = map.sorted { $0.key < $1.key }.prefix(maxTerminalResumeMapEntries)
+            return Dictionary(uniqueKeysWithValues: trimmed.map { ($0.key, $0.value) })
         }
         return map
     }
@@ -104,7 +105,7 @@ public actor TerminalSession {
     }
 
     public func resize(streamID: NodeId, columns: Int, rows: Int) {
-        var state = streams[streamID] ?? StreamState(
+        let state = streams[streamID] ?? StreamState(
             grid: TerminalGrid(columns: columns, rows: rows),
             parser: VTParser(),
             nextOffset: 0,
@@ -204,7 +205,9 @@ public actor TerminalSession {
     }
 
     public func acknowledgeRedraw(streamID: NodeId) {
-        streams[streamID]?.needsRedraw = false
+        guard var state = streams[streamID] else { return }
+        state.needsRedraw = false
+        streams[streamID] = state
     }
 
     private func publish(_ streamID: NodeId) {

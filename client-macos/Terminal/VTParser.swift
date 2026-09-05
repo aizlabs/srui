@@ -383,7 +383,7 @@ public struct VTParser: Sendable {
         }
     }
 
-    private func parseParams(_ bytes: ArraySlice<UInt8>) -> [Int] {
+    private func parseParams(_ bytes: [UInt8]) -> [Int] {
         if bytes.isEmpty { return [] }
         var values: [Int] = []
         var current = 0

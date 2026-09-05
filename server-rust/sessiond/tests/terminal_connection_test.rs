@@ -1,5 +1,6 @@
 //! Terminal profile handshake, PTY I/O, and reconnect independence from semantic resume (§21, §21.2).
 
+#[allow(dead_code)]
 mod common;
 
 use std::collections::HashMap;

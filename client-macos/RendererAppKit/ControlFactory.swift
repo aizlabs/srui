@@ -265,6 +265,14 @@ public final class ControlFactory {
         handle.textAdapter != nil && node.getProperty(.value) != nil
     }
 
+    /// Displayed editor string: canonical `.value` when present, otherwise `.text`.
+    ///
+    /// Incremental clears of `.value` must reapply this so they match a remount, which
+    /// stops skipping `.text` once `.value` is gone.
+    public static func displayedEditorText(for node: Node) -> Value? {
+        node.getProperty(.value) ?? node.getProperty(.text)
+    }
+
     public func apply(node: Node, to handle: RenderHandle, store: SemanticStore? = nil) {
         let entries = Self.orderedPropertyEntries(of: node)
         for (property, value) in entries {
@@ -380,7 +388,7 @@ public final class ControlFactory {
 
         case .value:
             if let adapter = handle.textAdapter {
-                adapter.applyAuthoritative(value)
+                adapter.applyAuthoritative(resolvedEditorValue(value, handle: handle, store: store))
             } else {
                 applyValue(value, to: handle)
             }
@@ -728,6 +736,21 @@ public final class ControlFactory {
             return textView
         }
         return (handle.view as? NSScrollView)?.documentView as? NSTextView
+    }
+
+    /// When canonical `.value` is cleared, reapply remaining `.text` from the updated node.
+    private func resolvedEditorValue(
+        _ value: Value?,
+        handle: RenderHandle,
+        store: SemanticStore?
+    ) -> Value? {
+        if value != nil {
+            return value
+        }
+        guard let node = store?.getNode(handle.nodeID) else {
+            return nil
+        }
+        return Self.displayedEditorText(for: node)
     }
 
     private func applyValue(_ value: Value?, to handle: RenderHandle) {

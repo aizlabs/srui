@@ -206,9 +206,15 @@ public final class LayoutRenderer {
         if property == .text, ControlFactory.shouldSkipTextFallback(for: handle, node: node) {
             return
         }
+        let appliedValue: Value?
+        if property == .value, handle.textAdapter != nil {
+            appliedValue = ControlFactory.displayedEditorText(for: node)
+        } else {
+            appliedValue = node.getProperty(property)
+        }
         controlFactory.apply(
             property: property,
-            value: node.getProperty(property),
+            value: appliedValue,
             to: handle,
             store: store
         )

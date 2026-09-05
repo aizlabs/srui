@@ -119,6 +119,45 @@ struct LayoutRendererTests {
         #expect((textAfter as? NSTextField)?.stringValue == "After")
     }
 
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func clearingValueRestoresTextFallbackWithoutRemount(nodeType: TypeRef) throws {
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: nodeType,
+                parentID: 1,
+                properties: [
+                    (.text, .string("from-text")),
+                    (.value, .string("from-value")),
+                ]
+            ),
+        ]
+        let store = try makeStore(base)
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let handleBefore = try #require(renderer.registry.handle(for: editorID))
+        #expect(renderedEditorText(in: handleBefore) == "from-value")
+        let viewBefore = handleBefore.view
+
+        let clear = SemanticModel.Operation.clearProperty(id: editorID, property: .value)
+        let newStore = try makeStore(base + [clear])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [clear]),
+            newStore: newStore
+        )
+
+        let handleAfter = try #require(renderer.registry.handle(for: editorID))
+        #expect(handleAfter.view === viewBefore)
+        #expect(renderedEditorText(in: handleAfter) == "from-text")
+
+        try renderer.mount(store: newStore)
+        let remounted = try #require(renderer.registry.handle(for: editorID))
+        #expect(renderedEditorText(in: remounted) == "from-text")
+    }
+
     @Test
     func reorderChildrenRemountsWithoutOrphanSubviews() throws {
         let base: [SemanticModel.Operation] = [
@@ -836,6 +875,12 @@ struct LayoutRendererTests {
             try operation.apply(to: &store)
         }
         return store
+    }
+
+    private func renderedEditorText(in handle: RenderHandle) -> String? {
+        if let field = handle.view as? NSTextField { return field.stringValue }
+        if let textView = handle.view as? NSTextView { return textView.string }
+        return ((handle.view as? NSScrollView)?.documentView as? NSTextView)?.string
     }
 
     private func assertEveryHandleIsMounted(in renderer: LayoutRenderer) {

@@ -60,6 +60,10 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
         return textView?.hasMarkedText() ?? false
     }
 
+    /// Applies an authoritative published string.
+    ///
+    /// `nil` is the empty string. Callers that know the updated node must pass
+    /// `ControlFactory.displayedEditorText` so a cleared `.value` still shows `.text`.
     public func applyAuthoritative(_ value: Value?) {
         if let value, value.asString == nil {
             return

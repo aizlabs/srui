@@ -313,6 +313,36 @@ struct ControlFactoryPropertyTests {
     }
 
     @Test(arguments: [TypeRef.textInput, .textArea])
+    func clearingValueRestoresTextFallback(nodeType: TypeRef) throws {
+        var store = SemanticStore()
+        try store.createNode(
+            id: 1,
+            nodeType: nodeType,
+            properties: [
+                (.text, .string("from-text")),
+                (.value, .string("from-value")),
+            ]
+        )
+        let factory = ControlFactory()
+        let node = try #require(store.getNode(1))
+        let handle = try factory.makeHandle(for: node, store: store)
+        #expect(renderedText(in: handle) == "from-value")
+        #expect(ControlFactory.shouldSkipTextFallback(for: handle, node: node))
+        #expect(ControlFactory.displayedEditorText(for: node) == .string("from-value"))
+
+        try store.clearProperty(nodeID: 1, property: .value)
+        let withoutValue = try #require(store.getNode(1))
+        #expect(ControlFactory.shouldSkipTextFallback(for: handle, node: withoutValue) == false)
+        #expect(ControlFactory.displayedEditorText(for: withoutValue) == .string("from-text"))
+
+        factory.apply(property: .value, value: nil, to: handle, store: store)
+        #expect(renderedText(in: handle) == "from-text")
+
+        factory.apply(node: withoutValue, to: handle, store: store)
+        #expect(renderedText(in: handle) == "from-text")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
     func identicalAuthoritativeStringDoesNotResetNativeText(nodeType: TypeRef) throws {
         let factory = ControlFactory()
         let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))

@@ -560,11 +560,11 @@ struct EventOutboxTests {
         let outbox = EventOutbox()
         #expect(await outbox.confirmFreshSession(id: "session-coalesce"))
         let nodeId = NodeId(12)
-
+        let seq1 = try #require(EditSeq(1))
         let first = try #require(try await outbox.queueTextEdit(
             nodeId: nodeId,
             text: "a",
-            editSeq: try #require(EditSeq(1)),
+            editSeq: seq1,
             observedRevision: Revision(1),
             via: client
         ))
@@ -660,10 +660,11 @@ struct EventOutboxTests {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         #expect(await outbox.confirmFreshSession(id: "session-cancel"))
+        let seq1 = try #require(EditSeq(1))
         let textEvent = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
             text: "typed",
-            editSeq: try #require(EditSeq(1)),
+            editSeq: seq1,
             observedRevision: Revision(1),
             via: client
         ))

@@ -51,10 +51,10 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
         if let compositionOverride {
             return compositionOverride
         }
-        if let editor = textField?.currentEditor() {
-            return editor.hasMarkedText
+        if let editor = textField?.currentEditor() as? NSTextView {
+            return editor.hasMarkedText()
         }
-        return textView?.hasMarkedText ?? false
+        return textView?.hasMarkedText() ?? false
     }
 
     public func applyAuthoritative(_ value: Value?) {

@@ -117,9 +117,6 @@ impl TextEditTracker {
                 });
             }
             stream.generation = stream.generation.saturating_add(1);
-            if stream.generation == 0 {
-                stream.generation = u64::MAX;
-            }
             return Ok(stream.generation);
         }
         if self.streams.len() >= self.max_streams {
@@ -135,6 +132,13 @@ impl TextEditTracker {
             },
         );
         Ok(1)
+    }
+
+    #[must_use]
+    pub fn last_terminal_of(&self, client_instance_id: &[u8], node_id: NodeId) -> Option<u64> {
+        self.streams
+            .get(&(client_instance_id.to_vec(), node_id.get()))
+            .map(|s| s.last_terminal_edit_seq)
     }
 
     #[must_use]
@@ -232,11 +236,10 @@ impl Session {
                 RecordOutcome::Fresh { .. } => {}
             }
 
-            if let Err(error) = validate_text_edit(&guard, &domain) {
-                return Ok(reject_admitted(&mut guard, event, error));
-            }
-
-            let edit_seq = domain.edit_seq.expect("validated");
+            let edit_seq = match validate_text_edit(&guard, &domain) {
+                Ok(seq) => seq,
+                Err(error) => return Ok(reject_admitted(&mut guard, event, error)),
+            };
             let client_bytes = event.client_instance_id.clone();
             match guard
                 .text_edit_tracker
@@ -330,7 +333,10 @@ impl Session {
         if current_generation != reserved_generation {
             let error = EventValidationError::StaleEditSeq {
                 observed: request.edit_seq.get(),
-                watermark: current_generation,
+                watermark: guard
+                    .text_edit_tracker
+                    .last_terminal_of(&event.client_instance_id, request.node_id)
+                    .unwrap_or(0),
             };
             return Ok(reject_admitted(&mut guard, event, error));
         }
@@ -436,18 +442,14 @@ impl Session {
         client_instance_id: &[u8],
         refs: &[srui_protocol::PendingTextEditRef],
     ) -> Result<Vec<srui_protocol::PendingTextEditRef>, SessionError> {
-        let revision_after_effect = inner.store.revision().get();
-        let max_string_length = inner.store.limits().max_string_length;
-        let outcome = EventOutcomeRecord {
-            accepted: false,
-            revision_after_effect,
-            reject_reason: bound_diagnostic_string(
-                "canceled on same-session resync".to_string(),
-                max_string_length,
-            ),
-        };
+        if refs.len() > MAX_TEXT_EDIT_STREAMS {
+            return Err(SessionError::InvalidInput(format!(
+                "pending_text_edits has {} entries; at most {MAX_TEXT_EDIT_STREAMS} are accepted (§18.3, §26)",
+                refs.len()
+            )));
+        }
 
-        let mut discarded = Vec::with_capacity(refs.len());
+        let mut validated = Vec::with_capacity(refs.len());
         for reference in refs {
             if reference.event_id.is_empty() || reference.event_seq == 0 {
                 return Err(SessionError::InvalidInput(
@@ -459,6 +461,24 @@ impl Session {
                     "pending TEXT_EDIT ref requires a positive edit_seq".into(),
                 ));
             };
+            validated.push((reference, edit_seq));
+        }
+
+        let revision_after_effect = inner.store.revision().get();
+        let max_string_length = inner.store.limits().max_string_length;
+        let outcome = EventOutcomeRecord {
+            accepted: false,
+            revision_after_effect,
+            reject_reason: bound_diagnostic_string(
+                "canceled on same-session resync".to_string(),
+                max_string_length,
+            ),
+        };
+
+        // Validate-then-settle so a malformed later ref cannot leave a prefix settled.
+        // `settle_canceled_text_event` itself remains idempotent if handshake is retried.
+        let mut discarded = Vec::with_capacity(validated.len());
+        for (reference, edit_seq) in validated {
             inner.dedupe.settle_canceled_text_event(
                 client_instance_id,
                 &reference.event_id,
@@ -485,8 +505,8 @@ struct PreparedTextEdit {
 fn validate_text_edit(
     inner: &SessionInner,
     event: &DomainEvent,
-) -> Result<(), EventValidationError> {
-    let Some(_edit_seq) = event.edit_seq else {
+) -> Result<EditSeq, EventValidationError> {
+    let Some(edit_seq) = event.edit_seq else {
         return Err(EventValidationError::InvalidEditSeq);
     };
 
@@ -508,7 +528,7 @@ fn validate_text_edit(
             limit,
         });
     }
-    Ok(())
+    Ok(edit_seq)
 }
 
 fn revalidate_editor_for_commit(
@@ -521,6 +541,9 @@ fn revalidate_editor_for_commit(
         .ok_or(EventValidationError::NodeNotFound(node_id))?;
     if !is_editor_type(node.node_type) {
         return Err(EventValidationError::UnsupportedNodeType(node.node_type));
+    }
+    if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
+        return Err(EventValidationError::NodeDisabled(node_id));
     }
     if let Some(Value::Bool(true)) = node.get_property(PropertyRef::READ_ONLY) {
         return Err(EventValidationError::NodeReadOnly(node_id));
@@ -613,8 +636,7 @@ fn collect_subtree(
     }
     out.push(id);
     if let Some(node) = store.get_node(id) {
-        let children = node.ordered_children.clone();
-        for child in children {
+        for child in node.ordered_children.iter().copied() {
             collect_subtree(store, child, out, seen);
         }
     }

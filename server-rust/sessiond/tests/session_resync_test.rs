@@ -767,3 +767,136 @@ fn same_session_resync_does_not_track_canceled_refs_for_missing_nodes() {
         }
     }
 }
+
+#[test]
+fn same_session_resync_refuses_oversized_pending_text_edits() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_sessiond::{SessionConfig, SessionError, MAX_TEXT_EDIT_STREAMS};
+
+    let session = Session::with_config(
+        "resync-pending-overflow",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let pending: Vec<PendingTextEditRef> = (0..=MAX_TEXT_EDIT_STREAMS)
+        .map(|i| PendingTextEditRef {
+            event_id: format!("overflow-{i}").into_bytes(),
+            event_seq: i as u64 + 1,
+            node_id: 2,
+            edit_seq: 1,
+        })
+        .collect();
+    let resume = ClientResume {
+        session_id: "resync-pending-overflow".to_string(),
+        client_instance_id: b"client-overflow".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: pending,
+    };
+
+    match session.bootstrap_resume(&resume) {
+        Err(SessionError::InvalidInput(message)) => {
+            assert!(
+                message.contains("pending_text_edits"),
+                "diagnostic must name the field, got {message:?}"
+            );
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn same_session_resync_validates_pending_text_edits_before_settling() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_sessiond::{SessionConfig, SessionError};
+
+    let session = Session::with_config(
+        "resync-pending-partial",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let resume = ClientResume {
+        session_id: "resync-pending-partial".to_string(),
+        client_instance_id: b"client-partial".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![
+            PendingTextEditRef {
+                event_id: b"ok".to_vec(),
+                event_seq: 1,
+                node_id: 2,
+                edit_seq: 1,
+            },
+            PendingTextEditRef {
+                event_id: b"bad".to_vec(),
+                event_seq: 2,
+                node_id: 2,
+                edit_seq: 0,
+            },
+        ],
+    };
+
+    match session.bootstrap_resume(&resume) {
+        Err(SessionError::InvalidInput(message)) => {
+            assert!(
+                message.contains("edit_seq"),
+                "diagnostic must name edit_seq, got {message:?}"
+            );
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+
+    let retry = ClientResume {
+        pending_text_edits: vec![],
+        ..resume
+    };
+    match session.bootstrap_resume(&retry).expect("retry").outcome {
+        ResumeOutcome::Resync { resync_msg, .. } => {
+            assert_eq!(resync_msg.last_processed_event_seq, 0);
+            assert!(resync_msg.discarded_text_edits.is_empty());
+        }
+        other => panic!("expected same-session resync, got {other:?}"),
+    }
+}

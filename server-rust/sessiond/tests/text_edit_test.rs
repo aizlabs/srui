@@ -442,3 +442,31 @@ fn deleted_editor_during_policy_settles_instead_of_stranding() {
         other => panic!("replay must be answered from the result cache, got {other:?}"),
     }
 }
+
+#[test]
+fn disabling_editor_during_policy_rejects_without_publishing() {
+    let session = Session::new("text-disable-during-policy");
+    seed_editor(&session);
+
+    session.on_text_edit(|session, request| {
+        session
+            .transaction(|ui| {
+                ui.set(request.node_id, PropertyRef::ENABLED, Value::Bool(false))?;
+                Ok(())
+            })
+            .expect("disable editor while policy runs");
+        TextEditDecision::Accept
+    });
+
+    match session
+        .process_event(&text_edit(1, "disabled", "should-not-land", 1))
+        .expect("settled")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::NodeDisabled(id),
+            ..
+        } => assert_eq!(id, NodeId::new(EDITOR)),
+        other => panic!("expected NodeDisabled, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "");
+}

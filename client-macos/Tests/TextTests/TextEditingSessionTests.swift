@@ -131,7 +131,7 @@ struct TextEditingSessionTests {
     }
 
     @Test("Reapplying the last known store value keeps a local draft")
-    func remountOfUnchangedValueKeepsLocalDraft() {
+    func remountOfUnchangedValueKeepsLocalDraft() throws {
         let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
         var invalidated: [NodeId] = []
         var commits: [String] = []
@@ -141,10 +141,134 @@ struct TextEditingSessionTests {
         #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
         session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: false)
 
-        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .keepLocal)
+        let resolution = try session.withPreservedLocalText {
+            session.applyPublishedValue(nodeID: nodeID, published: "hello")
+        }
+        #expect(resolution == .keepLocal)
         #expect(session.localValue(for: nodeID) == "hello!")
         #expect(invalidated.isEmpty)
         #expect(commits.isEmpty)
+    }
+
+    @Test("A remount while an assigned edit is in flight keeps local text")
+    func remountWithAssignedEditKeepsLocal() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
+        session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteAssigned(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "hello!",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+
+        let resolution = session.withPreservedLocalText {
+            session.applyPublishedValue(nodeID: nodeID, published: "hello")
+        }
+        #expect(resolution == .keepLocal)
+        #expect(session.localValue(for: nodeID) == "hello!")
+    }
+
+    @Test("A remount with no local draft reapplies the store string")
+    func remountWithoutDraftApplies() {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
+        let resolution = session.withPreservedLocalText {
+            session.applyPublishedValue(nodeID: nodeID, published: "hello")
+        }
+        #expect(resolution == .apply)
+        #expect(session.localValue(for: nodeID) == "hello")
+    }
+
+    @Test("A remount after a non-publishing acknowledgement applies the store string")
+    func remountAfterAcknowledgedRejectApplies() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "bar") == .apply)
+        session.noteLocalValue("foo", nodeID: nodeID, composing: false, flushImmediately: true)
+        let assigned = Event.textEdit(
+            eventSeq: 1,
+            eventId: EventId(string: "e1"),
+            observedRevision: Revision(1),
+            nodeId: nodeID,
+            text: "foo",
+            editSeq: try #require(EditSeq(1))
+        )
+        session.noteAssigned(assigned)
+        session.noteAcknowledged(assigned)
+
+        let resolution = session.withPreservedLocalText {
+            session.applyPublishedValue(nodeID: nodeID, published: "bar")
+        }
+        #expect(resolution == .apply)
+        #expect(session.localValue(for: nodeID) == "bar")
+    }
+
+    @Test("Cancel matching the assigned event drops in-flight identity")
+    func noteCanceledMatchingAssignedClearsSubmit() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
+        session.noteLocalValue("abcd", nodeID: nodeID, composing: false, flushImmediately: true)
+        let assigned = Event.textEdit(
+            eventSeq: 1,
+            eventId: EventId(string: "e1"),
+            observedRevision: Revision(1),
+            nodeId: nodeID,
+            text: "abcd",
+            editSeq: try #require(EditSeq(1))
+        )
+        session.noteAssigned(assigned)
+        session.noteCanceled(nodeID: nodeID, eventId: assigned.eventId)
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
+        #expect(session.localValue(for: nodeID) == "abc")
+    }
+
+    @Test("Cancel for a different event id leaves the assigned edit in place")
+    func noteCanceledMismatchLeavesAssigned() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
+        session.noteLocalValue("abcd", nodeID: nodeID, composing: false, flushImmediately: true)
+        let assigned = Event.textEdit(
+            eventSeq: 1,
+            eventId: EventId(string: "e1"),
+            observedRevision: Revision(1),
+            nodeId: nodeID,
+            text: "abcd",
+            editSeq: try #require(EditSeq(1))
+        )
+        session.noteAssigned(assigned)
+        session.noteCanceled(nodeID: nodeID, eventId: EventId(string: "other"))
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "abcd") == .keepLocal)
+        #expect(session.localValue(for: nodeID) == "abcd")
+    }
+
+    @Test("A rejection that republishes the previous value replaces local text")
+    func rejectionRevertingToLastKnownApplies() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var invalidated: [NodeId] = []
+        session.onInvalidateOutboxDraft = { invalidated.append($0) }
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
+        session.noteLocalValue("abcd", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteAssigned(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "abcd",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
+        #expect(session.localValue(for: nodeID) == "abc")
+        #expect(invalidated == [nodeID])
     }
 
     @Test("Composition end does not flush the previous marked string")

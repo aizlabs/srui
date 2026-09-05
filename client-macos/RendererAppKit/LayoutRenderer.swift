@@ -26,13 +26,20 @@ public final class LayoutRenderer {
         self.controlFactory = controlFactory
     }
 
-    public func mount(store: SemanticStore) throws {
+    public func mount(store: SemanticStore, preserveLocalText: Bool = false) throws {
         RendererDiagnostics.log(
             "mount begin revision=\(store.revision) roots=\(store.rootIDs.count)"
         )
         tearDown()
-        for rootID in store.rootIDs {
-            try mount(nodeID: rootID, from: store)
+        let rebuild: () throws -> Void = {
+            for rootID in store.rootIDs {
+                try self.mount(nodeID: rootID, from: store)
+            }
+        }
+        if preserveLocalText {
+            try controlFactory.textEditingSession.withPreservedLocalText(rebuild)
+        } else {
+            try rebuild()
         }
         // tearDown() closed the previous surfaces; a remount must not leave the UI invisible.
         if surfacesShown {
@@ -52,7 +59,7 @@ public final class LayoutRenderer {
             RendererDiagnostics.log(
                 "transaction revision=\(transaction.newRevision) structural; remounting"
             )
-            try mount(store: newStore)
+            try mount(store: newStore, preserveLocalText: true)
             return classifications
         }
 

@@ -26,10 +26,6 @@ public enum AuthoritativeResolution: Equatable, Sendable {
 /// Shared coordinator for native text editors in one semantic session (§18.3, §22.6).
 @MainActor
 public final class TextEditingSession {
-    public struct OverflowError: Error, Equatable, Sendable {
-        public let nodeID: NodeId
-    }
-
     public var debounceNanoseconds: UInt64
     public var onCommit: (@MainActor (NodeId, String, EditSeq) -> Void)?
     public var onInvalidateOutboxDraft: (@MainActor (NodeId) -> Void)?
@@ -41,7 +37,6 @@ public final class TextEditingSession {
         var lastFlushedValue: String?
         var lastSubmittedValue: String?
         /// Last string known to be the store's `.value` (echo or applied correction).
-        /// Reapplying this same string — a structural remount — must not clobber local typing.
         var lastKnownAuthoritative: String?
         var assignedEditSeq: EditSeq?
         var assignedEventId: EventId?
@@ -51,6 +46,8 @@ public final class TextEditingSession {
     }
 
     private var nodes: [NodeId: NodeState] = [:]
+    /// Structural remounts reapply unchanged store strings; live corrections must not.
+    private var preservingLocalTextAcrossRemount = false
 
     public init(debounceNanoseconds: UInt64 = defaultTextEditDebounceNanoseconds) {
         self.debounceNanoseconds = debounceNanoseconds
@@ -93,17 +90,25 @@ public final class TextEditingSession {
     }
 
     /// Drops in-flight identity after a same-session forced resync cancelled the assigned edit.
+    /// Only the matching assigned event is cleared; a mismatched id leaves the node untouched.
     public func noteCanceled(nodeID: NodeId, eventId: EventId) {
         guard var state = nodes[nodeID] else { return }
-        if state.assignedEventId == eventId || state.assignedEventId != nil {
-            state.assignedEditSeq = nil
-            state.assignedEventId = nil
-        }
+        guard state.assignedEventId == eventId else { return }
+        state.assignedEditSeq = nil
+        state.assignedEventId = nil
         state.lastSubmittedValue = nil
         state.pendingValue = nil
         state.debounceTask?.cancel()
         state.debounceTask = nil
         nodes[nodeID] = state
+    }
+
+    /// Structural remounts re-apply the current store string for every editor. That is not a
+    /// correction: keep local typing while the published value is still the last known store value.
+    public func withPreservedLocalText<T>(_ body: () throws -> T) rethrows -> T {
+        preservingLocalTextAcrossRemount = true
+        defer { preservingLocalTextAcrossRemount = false }
+        return try body()
     }
 
     public func invalidateDraft(for nodeID: NodeId) {
@@ -168,9 +173,13 @@ public final class TextEditingSession {
             return
         }
         let seqValue = state.nextEditSeq
-        guard seqValue > 0, let seq = EditSeq(seqValue) else { return }
-        let next = seqValue &+ 1
-        guard next > seqValue else { return }
+        guard seqValue > 0, let seq = EditSeq(seqValue), seqValue < .max else {
+            // Exhausted `edit_seq` must not wrap; restore the pending value so it is not dropped (§18.3).
+            state.pendingValue = value
+            nodes[nodeID] = state
+            return
+        }
+        let next = seqValue + 1
         state.nextEditSeq = next
         state.lastFlushedValue = value
         state.localValue = value
@@ -178,9 +187,13 @@ public final class TextEditingSession {
         onCommit?(nodeID, value, seq)
     }
 
-    /// Echo of a submitted value must not overwrite newer local typing; any other *new*
-    /// published string is a normalization/correction and replaces native text (§22.6).
-    /// Reapplying the last known store value (structural remount) keeps local drafts.
+    /// Echo of a submitted value must not overwrite newer local typing; any other published
+    /// string is a normalization/correction and replaces native text (§22.6).
+    ///
+    /// An unchanged store string is kept only during an explicit structural remount
+    /// (`withPreservedLocalText`) that still has a debounce draft or assigned in-flight
+    /// edit. A live transaction that republishes the previous authoritative value —
+    /// reject/revert or trim — must still apply. A remount with no local work also applies.
     @discardableResult
     public func applyPublishedValue(nodeID: NodeId, published: String) -> AuthoritativeResolution {
         var state = nodes[nodeID] ?? NodeState()
@@ -194,7 +207,8 @@ public final class TextEditingSession {
             nodes[nodeID] = state
             return .keepLocal
         }
-        if state.lastKnownAuthoritative == published {
+        let hasLocalWork = state.pendingValue != nil || state.assignedEventId != nil
+        if preservingLocalTextAcrossRemount, hasLocalWork, state.lastKnownAuthoritative == published {
             nodes[nodeID] = state
             return .keepLocal
         }

@@ -27,11 +27,21 @@ struct TextEditingSessionTests {
         session.noteLocalValue("a", nodeID: nodeID, composing: false, flushImmediately: false)
         session.noteLocalValue("ab", nodeID: nodeID, composing: false, flushImmediately: false)
         session.noteLocalValue("abc", nodeID: nodeID, composing: false, flushImmediately: false)
-        try await Task.sleep(nanoseconds: 80_000_000)
 
+        // The debounce timer is a main-actor task competing with every other @MainActor suite
+        // in the run, so wait for the commit to land rather than for one debounce period to
+        // elapse: under a saturated actor the timer misses a fixed 80 ms budget and the test
+        // reports "coalesced to zero commits".
+        for _ in 0..<200 where commits.isEmpty {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        // `#require`, not a bare subscript. A missed commit must fail this test; `commits[0]`
+        // on an empty array traps and takes the whole `swift test` process down with it.
+        let commit = try #require(commits.first)
         #expect(commits.count == 1)
-        #expect(commits[0].0 == "abc")
-        #expect(commits[0].1.rawValue == 1)
+        #expect(commit.0 == "abc")
+        #expect(commit.1.rawValue == 1)
         #expect(session.nextEditSeqValue(for: nodeID) == 2)
     }
 

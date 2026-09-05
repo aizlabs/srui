@@ -249,7 +249,7 @@ fn initialize_terminal_fixture(session: &Arc<Session>, spec: TerminalSpec) {
     info!(
         "Terminal fixture ready: node={} command={} ring_bytes={} (v1 has no redraw backend / tmux integration)",
         terminal_id.get(),
-        spec.executable,
+        spec.executable.display(),
         spec.ring_capacity
     );
 }

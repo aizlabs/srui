@@ -1,5 +1,6 @@
 import AppKit
 import SemanticModel
+import Text
 
 public enum LayoutRendererError: Error, Equatable, Sendable {
     case missingSemanticNode(NodeId)
@@ -37,6 +38,7 @@ public final class LayoutRenderer {
         if surfacesShown {
             showWindows()
         }
+        controlFactory.textEditingSession.syncPresentNodes(Set(registry.allHandles.map(\.nodeID)))
         RendererDiagnostics.log("mount complete handles=\(registry.count)")
     }
 
@@ -191,6 +193,9 @@ public final class LayoutRenderer {
         }
         guard let node = store.getNode(nodeID) else {
             throw LayoutRendererError.missingSemanticNode(nodeID)
+        }
+        if handle.textAdapter != nil, property == .text, node.getProperty(.value) != nil {
+            return
         }
         controlFactory.apply(
             property: property,

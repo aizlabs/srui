@@ -1,0 +1,143 @@
+//
+// TextEditingSessionTests.swift
+// TextTests
+//
+// Per-node edit sequencing, debounce coalescing, remount retention, and
+// authoritative echo/correction resolution (§18.3, §22.6).
+//
+
+import Foundation
+import SemanticModel
+import Testing
+@testable import Text
+
+@Suite("TextEditingSession")
+@MainActor
+struct TextEditingSessionTests {
+    private let nodeID = NodeId(12)
+
+    @Test("Quiet-period debounce coalesces to the newest whole value")
+    func debounceCoalescesToNewestValue() async throws {
+        let session = TextEditingSession(debounceNanoseconds: 40_000_000)
+        var commits: [(String, EditSeq)] = []
+        session.onCommit = { _, text, seq in
+            commits.append((text, seq))
+        }
+
+        session.noteLocalValue("a", nodeID: nodeID, composing: false, flushImmediately: false)
+        session.noteLocalValue("ab", nodeID: nodeID, composing: false, flushImmediately: false)
+        session.noteLocalValue("abc", nodeID: nodeID, composing: false, flushImmediately: false)
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        #expect(commits.count == 1)
+        #expect(commits[0].0 == "abc")
+        #expect(commits[0].1.rawValue == 1)
+        #expect(session.nextEditSeqValue(for: nodeID) == 2)
+    }
+
+    @Test("Each committed flush increments edit_seq without wrapping")
+    func committedFlushesIncrementEditSeq() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var seqs: [UInt64] = []
+        session.onCommit = { _, _, seq in
+            seqs.append(seq.rawValue)
+        }
+        session.noteLocalValue("one", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteLocalValue("two", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteLocalValue("three", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(seqs == [1, 2, 3])
+        #expect(session.nextEditSeqValue(for: nodeID) == 4)
+    }
+
+    @Test("Same-session remounts keep sequence state; deletes drop it")
+    func remountKeepsSequenceStateAndDeleteDropsIt() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        session.noteLocalValue("typed", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(session.nextEditSeqValue(for: nodeID) == 2)
+
+        session.syncPresentNodes([nodeID, NodeId(99)])
+        #expect(session.nextEditSeqValue(for: nodeID) == 2)
+
+        session.syncPresentNodes([NodeId(99)])
+        #expect(session.nextEditSeqValue(for: nodeID) == 1)
+        #expect(session.localValue(for: nodeID) == nil)
+    }
+
+    @Test("Replacement reset clears both sequence spaces for the old incarnation")
+    func replacementResetClearsNodeState() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        session.noteLocalValue("typed", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.resetForReplacementSession()
+        #expect(session.nextEditSeqValue(for: nodeID) == 1)
+        #expect(session.localValue(for: nodeID) == nil)
+    }
+
+    @Test("Accepted echo matching the submitted value keeps newer local typing")
+    func acceptedEchoDoesNotOverwriteNewerTyping() throws {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        var commits: [String] = []
+        session.onCommit = { _, text, _ in commits.append(text) }
+
+        session.noteLocalValue("hello", nodeID: nodeID, composing: false, flushImmediately: true)
+        let assigned = Event.textEdit(
+            eventSeq: 1,
+            eventId: EventId(string: "e1"),
+            observedRevision: Revision(1),
+            nodeId: nodeID,
+            text: "hello",
+            editSeq: try #require(EditSeq(1))
+        )
+        session.noteAssigned(assigned)
+        session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: false)
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .keepLocal)
+        #expect(session.localValue(for: nodeID) == "hello!")
+        #expect(commits == ["hello"])
+    }
+
+    @Test("A different published value is a correction and invalidates drafts")
+    func correctionReplacesNativeAndInvalidatesDrafts() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var invalidated: [NodeId] = []
+        session.onInvalidateOutboxDraft = { invalidated.append($0) }
+        session.noteLocalValue("nope", nodeID: nodeID, composing: false, flushImmediately: true)
+        session.noteAssigned(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "nope",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "corrected") == .apply)
+        #expect(session.localValue(for: nodeID) == "corrected")
+        #expect(invalidated == [nodeID])
+    }
+
+    @Test("Conflicting authoritative updates wait until marked text ends")
+    func deferredAuthoritativeAppliesAfterComposition() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        _ = session.setComposing(true, nodeID: nodeID)
+        session.noteLocalValue("composing", nodeID: nodeID, composing: true, flushImmediately: false)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "server") == .deferred)
+        #expect(session.localValue(for: nodeID) == "composing")
+
+        let applied = session.setComposing(false, nodeID: nodeID)
+        #expect(applied == "server")
+        #expect(session.localValue(for: nodeID) == "server")
+    }
+
+    @Test("Marked text does not emit an edit")
+    func composingSuppressesRemoteEmission() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var commits = 0
+        session.onCommit = { _, _, _ in commits += 1 }
+        session.noteLocalValue("á", nodeID: nodeID, composing: true, flushImmediately: true)
+        #expect(commits == 0)
+        session.endEditing(nodeID: nodeID)
+        #expect(commits == 0)
+    }
+}

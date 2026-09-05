@@ -2,7 +2,7 @@
 // EventOutbox.swift
 // Session
 //
-// Outbound semantic event queue, monotonic sequence tracking, and retry-safe event dispatch (§7.7, §16, §18.2, §22, §26).
+// Outbound semantic event queue, monotonic sequence tracking, and retry-safe event dispatch (§7.7, §16, §18.2, §18.3, §22, §22.6, §26).
 //
 
 import Foundation
@@ -17,6 +17,52 @@ public enum EventOutboxError: Error, Equatable, Sendable {
     case resumeNotConfirmed
     /// A retained `event_id` was reused for a different sequence or payload (§18.2).
     case pendingEventIdentityConflict(eventId: EventId)
+    /// Same-session resync discard list did not match assigned TEXT_EDIT identities (§18.3).
+    case textEditDiscardMismatch
+}
+
+/// Assigned, unacknowledged `TEXT_EDIT` identity declared on resume (§18.3).
+public struct PendingTextEditDescriptor: Hashable, Equatable, Sendable {
+    public var eventId: EventId
+    public var eventSeq: UInt64
+    public var nodeId: NodeId
+    public var editSeq: EditSeq
+
+    public init(eventId: EventId, eventSeq: UInt64, nodeId: NodeId, editSeq: EditSeq) {
+        self.eventId = eventId
+        self.eventSeq = eventSeq
+        self.nodeId = nodeId
+        self.editSeq = editSeq
+    }
+
+    public func toWire() -> SRUIPendingTextEditRef {
+        var ref = SRUIPendingTextEditRef()
+        ref.eventID = eventId.bytes
+        ref.eventSeq = eventSeq
+        ref.nodeID = nodeId.value
+        ref.editSeq = editSeq.rawValue
+        return ref
+    }
+
+    public init?(wire: SRUIPendingTextEditRef) {
+        guard let seq = EditSeq(wire.editSeq), !wire.eventID.isEmpty, wire.eventSeq > 0 else {
+            return nil
+        }
+        self.init(
+            eventId: EventId(wire.eventID),
+            eventSeq: wire.eventSeq,
+            nodeId: NodeId(wire.nodeID),
+            editSeq: seq
+        )
+    }
+}
+
+/// Outcome of one identity-checked acknowledgement (§18.2, §22.6).
+public struct EventAcknowledgementSettlement: Equatable, Sendable {
+    public var bound: Bool
+    public var event: Event?
+
+    public static let unbound = EventAcknowledgementSettlement(bound: false, event: nil)
 }
 
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
@@ -59,6 +105,16 @@ public actor EventOutbox {
     /// does not replace this: increasing `event_seq` must reach the transport in allocation order
     /// (§18.2).
     private var sendTail: Task<Void, any Error>?
+    private var textDrafts: [NodeId: TextEditDraft] = [:]
+    private var assignedTextByNode: [NodeId: EventId] = [:]
+    private var assignedTextByEventId: [EventId: NodeId] = [:]
+
+    private struct TextEditDraft: Equatable, Sendable {
+        var nodeId: NodeId
+        var text: String
+        var editSeq: EditSeq
+        var observedRevision: Revision
+    }
 
     public init(
         clientInstanceId: ClientInstanceId = ClientInstanceId(string: UUID().uuidString),
@@ -178,6 +234,119 @@ public actor EventOutbox {
         }
     }
 
+    /// Queues a whole-value `TEXT_EDIT`. Drafts are retained while dispatch is suspended or
+    /// another edit for the same node is already assigned (§18.3, §22.6).
+    @discardableResult
+    public func queueTextEdit(
+        nodeId: NodeId,
+        text: String,
+        editSeq: EditSeq,
+        observedRevision: Revision,
+        via transport: any Transport
+    ) async throws -> Event? {
+        textDrafts[nodeId] = TextEditDraft(
+            nodeId: nodeId,
+            text: text,
+            editSeq: editSeq,
+            observedRevision: observedRevision
+        )
+        return try await promoteTextDraft(nodeId: nodeId, via: transport)
+    }
+
+    /// Promotes every coalesced draft that can enter the contiguous send window.
+    public func promoteReadyTextDrafts(via transport: any Transport) async throws {
+        for nodeId in Array(textDrafts.keys) {
+            _ = try await promoteTextDraft(nodeId: nodeId, via: transport)
+        }
+    }
+
+    public func invalidateTextDraft(nodeId: NodeId) {
+        textDrafts.removeValue(forKey: nodeId)
+    }
+
+    public func assignedTextEditDescriptors() -> [PendingTextEditDescriptor] {
+        pendingOrder.compactMap { id in
+            guard let event = pendingEvents[id],
+                  event.eventType == .EVENT_TEXT_EDIT,
+                  let editSeq = event.editSeq else {
+                return nil
+            }
+            return PendingTextEditDescriptor(
+                eventId: event.eventId,
+                eventSeq: event.eventSeq,
+                nodeId: event.nodeId,
+                editSeq: editSeq
+            )
+        }
+    }
+
+    /// Count of coalesced whole-value drafts that have not yet been allocated an `event_seq`.
+    public var unsentTextDraftCount: Int {
+        textDrafts.count
+    }
+
+    /// Selectively cancels assigned `TEXT_EDIT` events. A required exact match fails closed (§18.3).
+    public func cancelAssignedTextEdits(
+        confirming refs: [PendingTextEditDescriptor],
+        requireExactMatch: Bool
+    ) throws {
+        let assigned = assignedTextEditDescriptors()
+        if requireExactMatch {
+            let assignedKeys = Set(assigned.map(Self.identityKey))
+            let echoKeys = Set(refs.map(Self.identityKey))
+            guard assignedKeys == echoKeys else {
+                throw EventOutboxError.textEditDiscardMismatch
+            }
+        }
+        let condemned = requireExactMatch ? refs : assigned
+        textDrafts.removeAll(keepingCapacity: true)
+        for ref in condemned {
+            forgetAssignedText(eventId: ref.eventId)
+            if let event = pendingEvents.removeValue(forKey: ref.eventId) {
+                pendingOrder.removeAll { $0 == ref.eventId }
+                recordSelectiveAcknowledgement(event.eventSeq)
+            } else {
+                recordSelectiveAcknowledgement(ref.eventSeq)
+            }
+        }
+        cancelReplayRetryLoopIfSettled()
+    }
+
+    public func discardUnsentTextDrafts() {
+        textDrafts.removeAll(keepingCapacity: true)
+    }
+
+    private static func identityKey(_ ref: PendingTextEditDescriptor) -> String {
+        "\(ref.eventId.toHex()):\(ref.eventSeq):\(ref.nodeId.value):\(ref.editSeq.rawValue)"
+    }
+
+    private func promoteTextDraft(nodeId: NodeId, via transport: any Transport) async throws -> Event? {
+        guard acceptsNewEvents else { return nil }
+        guard assignedTextByNode[nodeId] == nil else { return nil }
+        guard textDrafts[nodeId] != nil else { return nil }
+        try ensureSequenceWindowCapacity()
+        guard let draft = textDrafts.removeValue(forKey: nodeId) else { return nil }
+        currentEventSeq += 1
+        let event = Event.textEdit(
+            eventSeq: currentEventSeq,
+            eventId: generateEventId(),
+            observedRevision: draft.observedRevision,
+            nodeId: draft.nodeId,
+            text: draft.text,
+            editSeq: draft.editSeq
+        ).withClientInstanceId(clientInstanceId)
+        assignedTextByNode[nodeId] = event.eventId
+        assignedTextByEventId[event.eventId] = nodeId
+        try await sendEvent(event, via: transport)
+        return event
+    }
+
+    private func forgetAssignedText(eventId: EventId) {
+        if let nodeId = assignedTextByEventId.removeValue(forKey: eventId) {
+            assignedTextByNode.removeValue(forKey: nodeId)
+        }
+    }
+
     /// Replays every unacknowledged event in original send order with its original identity.
     ///
     /// Failures propagate to the caller so resume cannot enable new events until every retained
@@ -206,6 +375,7 @@ public actor EventOutbox {
     private func acknowledgeEvent(id: EventId) {
         guard let event = pendingEvents.removeValue(forKey: id) else { return }
         pendingOrder.removeAll { $0 == id }
+        forgetAssignedText(eventId: id)
         recordSelectiveAcknowledgement(event.eventSeq)
         cancelReplayRetryLoopIfSettled()
     }
@@ -286,6 +456,9 @@ public actor EventOutbox {
         try await resendPendingEvents(via: transport)
         guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
+        if enableNewEventsAfterReplay {
+            try await promoteReadyTextDrafts(via: transport)
+        }
         startReplayRetryLoop(
             generation: generation,
             via: transport,
@@ -335,6 +508,9 @@ public actor EventOutbox {
         pendingEvents.removeAll(keepingCapacity: true)
         pendingOrder.removeAll(keepingCapacity: true)
         acknowledgedOutOfOrder.removeAll(keepingCapacity: true)
+        textDrafts.removeAll(keepingCapacity: true)
+        assignedTextByNode.removeAll(keepingCapacity: true)
+        assignedTextByEventId.removeAll(keepingCapacity: true)
         cancelPendingWrites()
     }
 
@@ -350,18 +526,19 @@ public actor EventOutbox {
         eventId: EventId,
         throughSeq seq: UInt64,
         sessionId: String
-    ) -> Bool {
-        guard ackClientInstanceId == clientInstanceId else { return false }
+    ) -> EventAcknowledgementSettlement {
+        guard ackClientInstanceId == clientInstanceId else { return .unbound }
         // `session_id` is required on every ack (§18.2): an empty one proves nothing about which
         // incarnation settled the event, so it can never retire an intent.
         guard !sessionId.isEmpty,
               let activeSessionId,
               sessionId == activeSessionId else {
-            return false
+            return .unbound
         }
+        let event = pendingEvents[eventId]
         acknowledgeEvents(throughSeq: seq)
         acknowledgeEvent(id: eventId)
-        return true
+        return EventAcknowledgementSettlement(bound: true, event: event)
     }
 
     /// Acknowledges every event through the server's highest contiguous settled sequence.
@@ -376,6 +553,7 @@ public actor EventOutbox {
         acknowledgedOutOfOrder = Set(acknowledgedOutOfOrder.filter { $0 > seq })
         for (id, event) in pendingEvents where event.eventSeq <= seq {
             pendingEvents.removeValue(forKey: id)
+            forgetAssignedText(eventId: id)
         }
         pendingOrder.removeAll { pendingEvents[$0] == nil }
         advanceContiguousAcknowledgement()

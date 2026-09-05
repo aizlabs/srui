@@ -461,13 +461,13 @@ struct EventOutboxTests {
             eventId: first.eventId,
             throughSeq: 0,
             sessionId: "session-window"
-        ))
+        ).bound)
         #expect(await outbox.settleAcknowledgement(
             clientInstanceId: outbox.clientInstanceId,
             eventId: second.eventId,
             throughSeq: 0,
             sessionId: "session-window"
-        ))
+        ).bound)
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == 2)
 
@@ -489,7 +489,7 @@ struct EventOutboxTests {
             eventId: second.eventId,
             throughSeq: 0,
             sessionId: "session-gap"
-        ))
+        ).bound)
         #expect(await outbox.pendingCount == 1)
         // Sequence 1 is still unsettled, so the cumulative frontier cannot cross it.
         #expect(await outbox.lastAckedEventSeq == 0)
@@ -506,12 +506,192 @@ struct EventOutboxTests {
             eventId: first.eventId,
             throughSeq: 0,
             sessionId: "session-gap"
-        ))
+        ).bound)
         #expect(await outbox.lastAckedEventSeq == 2)
 
         let third = try await outbox.sendActivate(nodeId: NodeId(3), observedRevision: Revision(1), via: client)
         #expect(third.eventSeq == 3)
         #expect(await outbox.pendingCount == 1)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("TEXT_EDIT serializes edit_seq and the whole-value TEXT argument")
+    func textEditEventSerialization() async throws {
+        let clientInstanceId = ClientInstanceId(string: "client-test-text")
+        let outbox = EventOutbox(clientInstanceId: clientInstanceId)
+        let (client, server) = await PipeTransport.createPair()
+        #expect(await outbox.confirmFreshSession(id: "session-text"))
+
+        let nodeId = NodeId(12)
+        let seq = try #require(EditSeq(7))
+        let event = try #require(try await outbox.queueTextEdit(
+            nodeId: nodeId,
+            text: "whole-value",
+            editSeq: seq,
+            observedRevision: Revision(4),
+            via: client
+        ))
+        #expect(event.eventType == .EVENT_TEXT_EDIT)
+        #expect(event.editSeq == seq)
+        #expect(event.textArg == "whole-value")
+        #expect(event.eventSeq == 1)
+
+        var msg = SRUIMessage()
+        msg.event = event.toWire()
+        let decodedMsg = try decodeFramedMessage(from: try SRUIFraming.encodeFramed(msg))
+        guard case .event(let wireEvent) = decodedMsg.msg else {
+            Issue.record("Expected event message payload")
+            return
+        }
+        let decodedEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        #expect(decodedEvent.editSeq == seq)
+        #expect(decodedEvent.textArg == "whole-value")
+        #expect(decodedEvent.eventType == .EVENT_TEXT_EDIT)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Coalesced drafts keep event_seq contiguous while edit_seq may skip")
+    func coalescedTextEditsSkipEditSeqButKeepEventSeqContiguous() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-coalesce"))
+        let nodeId = NodeId(12)
+
+        let first = try #require(try await outbox.queueTextEdit(
+            nodeId: nodeId,
+            text: "a",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: client
+        ))
+        #expect(first.eventSeq == 1)
+
+        let second = try await outbox.queueTextEdit(
+            nodeId: nodeId,
+            text: "ab",
+            editSeq: try #require(EditSeq(2)),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(second == nil)
+        let third = try await outbox.queueTextEdit(
+            nodeId: nodeId,
+            text: "abc",
+            editSeq: try #require(EditSeq(3)),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(third == nil)
+        #expect(await outbox.unsentTextDraftCount == 1)
+        #expect(await outbox.eventSeq == 1)
+
+        #expect(await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: 1,
+            sessionId: "session-coalesce"
+        ).bound)
+        try await outbox.promoteReadyTextDrafts(via: client)
+
+        #expect(await outbox.eventSeq == 2)
+        let assigned = await outbox.assignedTextEditDescriptors()
+        #expect(assigned.count == 1)
+        #expect(assigned[0].eventSeq == 2)
+        #expect(assigned[0].editSeq.rawValue == 3)
+        #expect(await outbox.unsentTextDraftCount == 0)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("queueTextEdit retains a draft while dispatch is suspended")
+    func queueTextEditWhileSuspendedKeepsNewestDraft() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-suspend"))
+        let generation = await outbox.beginResumeAttempt()
+
+        let promoted = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "first",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(promoted == nil)
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "newest",
+            editSeq: try #require(EditSeq(3)),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(await outbox.unsentTextDraftCount == 1)
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+        #expect(await outbox.eventSeq == 0)
+
+        let accepted = try await outbox.completeSameSessionResume(
+            id: "session-suspend",
+            lastProcessedEventSeq: 0,
+            generation: generation,
+            via: client,
+            enableNewEventsAfterReplay: true
+        )
+        #expect(accepted)
+        #expect(await outbox.eventSeq == 1)
+        let assigned = await outbox.assignedTextEditDescriptors()
+        #expect(assigned.count == 1)
+        #expect(assigned[0].editSeq.rawValue == 3)
+
+        await client.close()
+        await server.close()
+    }
+
+    @Test("Selective TEXT_EDIT cancellation preserves ordinary pending events")
+    func cancelAssignedTextEditsPreservesOrdinaryEvents() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-cancel"))
+        let textEvent = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: client
+        ))
+        let activate = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(1),
+            via: client
+        )
+        #expect(await outbox.pendingCount == 2)
+
+        try await outbox.cancelAssignedTextEdits(
+            confirming: await outbox.assignedTextEditDescriptors(),
+            requireExactMatch: true
+        )
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+        #expect(activate.eventSeq == 2)
+        #expect(textEvent.eventSeq == 1)
+
+        await #expect(throws: EventOutboxError.textEditDiscardMismatch) {
+        try await outbox.cancelAssignedTextEdits(
+            confirming: [
+                PendingTextEditDescriptor(
+                    eventId: textEvent.eventId,
+                    eventSeq: textEvent.eventSeq,
+                    nodeId: textEvent.nodeId,
+                    editSeq: textEvent.editSeq ?? EditSeq(1)!
+                )
+            ],
+            requireExactMatch: true
+        )
+        }
 
         await client.close()
         await server.close()

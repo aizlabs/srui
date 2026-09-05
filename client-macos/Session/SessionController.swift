@@ -31,6 +31,7 @@ import TransportSSH
 import RendererAppKit
 import Resources
 import Collections
+import Text
 
 /// Reason a session stopped tracking the authoritative semantic stream (§4 inv. 13, §18).
 public enum SessionFailure: Error, Sendable, CustomStringConvertible {
@@ -230,6 +231,10 @@ public final class SessionController: @unchecked Sendable {
         guard !actionHandlerWired else { return }
         actionHandlerWired = true
 
+        renderer.textEditingSession.onInvalidateOutboxDraft = { [weak self] nodeID in
+            Task { await self?.outbox.invalidateTextDraft(nodeId: nodeID) }
+        }
+
         renderer.onInteraction = { [weak self] interaction in
             guard let self else { return }
 
@@ -260,6 +265,18 @@ public final class SessionController: @unchecked Sendable {
                             observedRevision: observedRev,
                             itemId: itemID
                         )
+                    case .textEdit(let nodeID, let text, let editSeq):
+                        // Drafts are retained even while dispatch is suspended; promotion waits
+                        // for an active EventOutbox (§18.3).
+                        if let event = try await self.outbox.queueTextEdit(
+                            nodeId: nodeID,
+                            text: text,
+                            editSeq: editSeq,
+                            observedRevision: observedRev,
+                            via: self.transport
+                        ) {
+                            await self.renderer?.textEditingSession.noteAssigned(event)
+                        }
                     }
                 } catch {
                     SessionDiagnostics.error("Interaction dispatch failed: \(error)")
@@ -411,6 +428,7 @@ public final class SessionController: @unchecked Sendable {
             resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
             resume.limits = limits
             resume.knownResourceHashes = knownResourceHashes
+            resume.pendingTextEdits = await outbox.assignedTextEditDescriptors().map { $0.toWire() }
 
             var envelope = SRUIMessage()
             envelope.clientResume = resume
@@ -843,6 +861,18 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
+                    try await applyResyncTextCancellation(resync, requireExactMatch: true)
+                } catch let error as EventOutboxError where error == .textEditDiscardMismatch {
+                    await reportFailure(.protocolViolation(
+                        "same-session resync discarded_text_edits did not match assigned TEXT_EDIT identities"
+                    ))
+                    return
+                } catch {
+                    await failReplayError(generation, error)
+                    return
+                }
+                await noteCanceledTextEdits(resync.discardedTextEdits)
+                do {
                     let accepted = try await outbox.completeSameSessionResume(
                         id: resync.sessionID,
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
@@ -887,6 +917,7 @@ public final class SessionController: @unchecked Sendable {
                 }
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
                 await resourceCache.clearPartials()
+                await renderer?.textEditingSession.resetForReplacementSession()
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
@@ -910,6 +941,15 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                do {
+                    try await applyResyncTextCancellation(resync, requireExactMatch: false)
+                    await noteCanceledTextEdits(resync.discardedTextEdits)
+                } catch {
+                    await reportFailure(.protocolViolation(
+                        "same-session live resync discarded-text confirmation failed: \(error)"
+                    ))
+                    return
+                }
                 await outbox.applyLiveResyncFrontier(
                     lastProcessedEventSeq: resync.lastProcessedEventSeq
                 )
@@ -928,6 +968,7 @@ public final class SessionController: @unchecked Sendable {
                     lastProcessedEventSeq: resync.lastProcessedEventSeq
                 )
                 await resourceCache.clearPartials()
+                await renderer?.textEditingSession.resetForReplacementSession()
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
@@ -1089,13 +1130,13 @@ public final class SessionController: @unchecked Sendable {
 
         // The full wire identity is handed to the outbox so the identity check and the mutation it
         // guards share one actor-isolated step (§18.2).
-        let settled = await outbox.settleAcknowledgement(
+        let settlement = await outbox.settleAcknowledgement(
             clientInstanceId: ClientInstanceId(ack.clientInstanceID),
             eventId: eventId,
             throughSeq: ack.lastProcessedEventSeq,
             sessionId: ack.sessionID
         )
-        guard settled else {
+        guard settlement.bound else {
             SessionDiagnostics.error(
                 "Ignoring event acknowledgement with unbound identity (session \(ack.sessionID))"
             )
@@ -1120,6 +1161,55 @@ public final class SessionController: @unchecked Sendable {
             )
         }
 
+        if let event = settlement.event, event.eventType == .EVENT_TEXT_EDIT {
+            await renderer?.textEditingSession.noteAcknowledged(event)
+            if ack.status == .rejected {
+                await waitUntilAppliedRevision(ack.revisionAfterEffect)
+            }
+        }
+        await promoteReadyTextDrafts()
+    }
+
+    /// Waits until the local replica has applied `revision_after_effect` so a rejected text
+    /// acknowledgement can converge on the authoritative value the server already published.
+    private func waitUntilAppliedRevision(_ target: UInt64) async {
+        guard target > 0 else { return }
+        for _ in 0..<100 {
+            if applier.lastAppliedRevision.value >= target { return }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func applyResyncTextCancellation(
+        _ resync: SRUIServerResyncRequired,
+        requireExactMatch: Bool
+    ) async throws {
+        let confirming = resync.discardedTextEdits.compactMap(PendingTextEditDescriptor.init(wire:))
+        if requireExactMatch, confirming.count != resync.discardedTextEdits.count {
+            throw EventOutboxError.textEditDiscardMismatch
+        }
+        try await outbox.cancelAssignedTextEdits(
+            confirming: confirming,
+            requireExactMatch: requireExactMatch
+        )
+    }
+
+    private func noteCanceledTextEdits(_ refs: [SRUIPendingTextEditRef]) async {
+        for ref in refs {
+            guard let descriptor = PendingTextEditDescriptor(wire: ref) else { continue }
+            await renderer?.textEditingSession.noteCanceled(
+                nodeID: descriptor.nodeId,
+                eventId: descriptor.eventId
+            )
+        }
+    }
+
+    private func promoteReadyTextDrafts() async {
+        do {
+            try await outbox.promoteReadyTextDrafts(via: transport)
+        } catch {
+            SessionDiagnostics.error("Failed to promote coalesced text drafts: \(error)")
+        }
     }
 
     private func handleTransaction(_ wireTx: SRUITransaction) async {
@@ -1282,6 +1372,7 @@ public final class SessionController: @unchecked Sendable {
             }
         }
         await reissueCollectionRangeRequestsIfAllowed()
+        await promoteReadyTextDrafts()
     }
 
     /// Classifies a rejected transaction as a benign duplicate or as replica divergence (§12.1, §18).

@@ -1,6 +1,6 @@
 use srui_semantic_tree::{
-    resolve_standard_event, ClientInstanceId, Event, EventId, EventValidationError, ItemId, NodeId,
-    PropertyRef, Revision, SemanticStore, Size, TypeRef, Value,
+    resolve_standard_event, ClientInstanceId, EditSeq, Event, EventId, EventValidationError,
+    ItemId, NodeId, PropertyRef, Revision, SemanticStore, Size, TypeRef, Value,
 };
 
 #[test]
@@ -66,7 +66,7 @@ fn test_standard_event_factories() {
     assert_eq!(sel_event.item_id_arg(), Some(ItemId::new(500)));
 
     // 4. TEXT_EDIT
-    let text_event = Event::text_edit(5, "txt-1", 10, 104, "hello world");
+    let text_event = Event::text_edit(5, "txt-1", 10, 104, "hello world", EditSeq::new(1).unwrap());
     assert_eq!(text_event.event_type, TypeRef::EVENT_TEXT_EDIT);
     assert_eq!(text_event.text_arg(), Some("hello world"));
 
@@ -258,4 +258,18 @@ fn test_event_type_ref_resolution_and_constants() {
 
     let unknown = resolve_standard_event("NON_EXISTENT");
     assert!(unknown.is_err());
+}
+
+#[test]
+fn test_edit_seq_is_nonzero_and_required_on_text_edit() {
+    assert!(EditSeq::new(0).is_none());
+    let seq = EditSeq::new(7).expect("positive");
+    assert_eq!(seq.get(), 7);
+
+    let event = Event::text_edit(1, "txt-seq", 0, 10, "typed", seq);
+    assert_eq!(event.edit_seq, Some(seq));
+    assert_eq!(event.text_arg(), Some("typed"));
+
+    let activate = Event::activate(1, "act", 0, 10);
+    assert_eq!(activate.edit_seq, None);
 }

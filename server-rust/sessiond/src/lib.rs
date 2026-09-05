@@ -15,6 +15,6 @@ pub use session::{
     mint_session_id, run_model_range_worker, AttachmentGuard, EventOutcome, FreshClientBootstrap,
     ModelRangeError, ModelRangeFulfillment, ModelRangeProvider, ModelRangeQuery,
     ModelRangeRequestInbox, ResumeClientBootstrap, ResumeOutcome, Session, SessionConfig,
-    SessionError, SessionState, CORE_VERSION, MAX_CLIENT_INSTANCE_ID_BYTES,
-    MAX_RETAINED_CLIENT_STATE_BYTES,
+    SessionError, SessionState, TextEditDecision, TextEditRequest, TextEditTracker, CORE_VERSION,
+    MAX_CLIENT_INSTANCE_ID_BYTES, MAX_RETAINED_CLIENT_STATE_BYTES, MAX_TEXT_EDIT_STREAMS,
 };

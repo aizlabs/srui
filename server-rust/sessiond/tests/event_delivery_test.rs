@@ -129,6 +129,7 @@ async fn resume_client(
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         })),
     };
     client_framed_write.send(resume).await.expect("send resume");

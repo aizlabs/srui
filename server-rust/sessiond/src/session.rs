@@ -11,6 +11,7 @@
 mod handshake;
 mod model_range;
 mod snapshot;
+mod text_edit;
 
 pub use handshake::{
     FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION,
@@ -20,6 +21,7 @@ pub use model_range::{
     run_model_range_worker, ModelRangeError, ModelRangeFulfillment, ModelRangeProvider,
     ModelRangeQuery, ModelRangeRequestInbox,
 };
+pub use text_edit::{TextEditDecision, TextEditRequest, TextEditTracker, MAX_TEXT_EDIT_STREAMS};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -66,7 +68,8 @@ impl std::fmt::Display for SessionState {
 /// literal, so that raising any one of the three moves the budget with it instead of silently
 /// invalidating the invariant test.
 pub const MAX_RETAINED_CLIENT_STATE_BYTES: usize = (handshake::MAX_CLIENT_RESOURCE_CEILINGS
-    + crate::outbound::MAX_TRACKED_STALE_CLIENTS)
+    + crate::outbound::MAX_TRACKED_STALE_CLIENTS
+    + text_edit::MAX_TEXT_EDIT_STREAMS)
     * handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
@@ -230,6 +233,8 @@ pub(crate) struct SessionInner {
     pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
     /// Sparse-collection window providers keyed by [`srui_semantic_tree::ModelId`] (§8, §22.7).
     pub(crate) model_range_providers: HashMap<srui_semantic_tree::ModelId, ModelRangeProvider>,
+    pub(crate) text_edit_tracker: text_edit::TextEditTracker,
+    pub(crate) text_edit_policy: Option<text_edit::TextEditPolicy>,
 }
 
 impl std::fmt::Debug for SessionInner {
@@ -253,6 +258,7 @@ impl std::fmt::Debug for SessionInner {
                 "model_range_provider_count",
                 &self.model_range_providers.len(),
             )
+            .field("text_edit_streams", &self.text_edit_tracker.len())
             .finish()
     }
 }
@@ -411,6 +417,8 @@ impl Session {
             client_resource_ceilings: HashMap::new(),
             handlers: HashMap::new(),
             model_range_providers: HashMap::new(),
+            text_edit_tracker: text_edit::TextEditTracker::default(),
+            text_edit_policy: None,
         };
 
         Self {
@@ -603,8 +611,11 @@ impl Session {
     pub fn retained_client_state_bytes(&self) -> Result<usize, SessionError> {
         let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let ceiling_key_bytes: usize = guard.client_resource_ceilings.keys().map(Vec::len).sum();
+        let text_edit_key_bytes = guard.text_edit_tracker.retained_client_id_bytes();
         drop(guard);
-        Ok(ceiling_key_bytes + self.outbound_hub.retained_stale_client_bytes())
+        Ok(ceiling_key_bytes
+            + text_edit_key_bytes
+            + self.outbound_hub.retained_stale_client_bytes())
     }
 
     /// Returns a reference to the session's outbound transaction hub.
@@ -681,6 +692,7 @@ impl Session {
             match result {
                 Ok(Ok(val)) => {
                     let (staged, ops) = ui.into_staged_and_ops();
+                    let deleted = text_edit::deleted_subtree_ids(&guard.store, &ops);
                     let commit = AuthoritativeCommit::new(base_revision, ops);
 
                     // Journal admission is decided before the store mutates: `append` below cannot
@@ -690,6 +702,7 @@ impl Session {
                     let tx_wire = permit.transaction().clone();
                     guard.store.commit_staging(staged, commit.new_revision());
                     guard.journal.append(permit);
+                    guard.text_edit_tracker.reclaim_nodes(deleted);
                     // Published under `inner` so delivery order equals commit order (§12.1);
                     // see `publish_committed` for why this is not an `async-no-lock-await`
                     // violation.
@@ -751,9 +764,11 @@ impl Session {
             let staged = guard.store.prepare_commit(&commit)?;
             let permit = guard.journal.prepare(&commit)?;
             let tx_wire = permit.transaction().clone();
+            let deleted = text_edit::deleted_subtree_ids_from_wire(&guard.store, &tx_wire);
 
             guard.store.commit_prepared(staged);
             guard.journal.append(permit);
+            guard.text_edit_tracker.reclaim_nodes(deleted);
             // Published under `inner` so delivery order equals commit order (§12.1).
             self.publish_committed(&tx_wire);
             tx_wire
@@ -771,6 +786,10 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
+        if text_edit::is_standard_text_edit(event) {
+            return self.process_text_edit(event);
+        }
+
         let matching_handlers = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
@@ -803,7 +822,9 @@ impl Session {
             let obs_rev = srui_semantic_tree::Revision::new(event.observed_revision);
             let current_rev = guard.store.revision();
 
-            let validation = if obs_rev > current_rev {
+            let validation = if event.edit_seq != 0 {
+                Err(EventValidationError::InvalidEditSeq)
+            } else if obs_rev > current_rev {
                 Err(EventValidationError::FutureRevision {
                     observed: obs_rev,
                     current: current_rev,
@@ -1161,6 +1182,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
 
         match session.bootstrap_resume(&resume) {

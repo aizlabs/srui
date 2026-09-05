@@ -592,7 +592,8 @@ extension Event {
             observedRevision: Revision(wire.observedRevision),
             nodeId: NodeId(wire.nodeID),
             eventType: eventType,
-            arguments: args
+            arguments: args,
+            editSeq: EditSeq(wire.editSeq)
         )
     }
 
@@ -612,6 +613,7 @@ extension Event {
             wireProp.value = v.toWire()
             return wireProp
         }
+        wire.editSeq = editSeq?.rawValue ?? 0
         return wire
     }
 }

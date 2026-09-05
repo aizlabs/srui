@@ -458,6 +458,18 @@ message Event {
   uint64 node_id = 5;
   TypeRef event_type = 6;
   repeated Property arguments = 7;
+  // Positive per-(session_id, client_instance_id, node_id) editor sequence for TEXT_EDIT (§18.3, §22.6).
+  // Zero is absent: TEXT_EDIT requires a positive value; every other event type MUST send zero.
+  uint64 edit_seq = 8;
+}
+
+// Assigned, unacknowledged TEXT_EDIT identity declared on resume and echoed on same-session
+// forced resync so those events can be settled without opening a global event_seq gap (§18.3).
+message PendingTextEditRef {
+  bytes event_id = 1;
+  uint64 event_seq = 2;
+  uint64 node_id = 3;
+  uint64 edit_seq = 4;
 }
 
 // Settlement status of a single client event (§18.2, Appendix B).
@@ -543,6 +555,9 @@ message ClientResume {
   ClientLimits limits = 6;
   // Verified committed CAS entries the server need not transfer again (§14, §18).
   repeated bytes known_resource_hashes = 7;
+  // Assigned, unacknowledged TEXT_EDIT events. Ignored on RESUME_OK; settled and echoed
+  // on same-session RESYNC_REQUIRED so canceling them cannot open an event_seq gap (§18.3).
+  repeated PendingTextEditRef pending_text_edits = 8;
 }
 
 // Machine-readable session identity continuity for a full snapshot response.
@@ -569,6 +584,9 @@ message ServerResyncRequired {
   SessionContinuity continuity = 4;
   // Highest contiguous settled event sequence for this client in session_id.
   uint64 last_processed_event_seq = 5;
+  // Confirmed discarded TEXT_EDIT identities for a same-session forced resync (§18.3).
+  // MUST echo the client's declared pending_text_edits; a mismatch fails closed.
+  repeated PendingTextEditRef discarded_text_edits = 6;
 }
 
 // -----------------------------------------------------------------------------

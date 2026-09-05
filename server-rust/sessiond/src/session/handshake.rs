@@ -349,6 +349,7 @@ impl Session {
                 continuity: SessionContinuity,
                 reason: String,
                 last_processed_event_seq: u64,
+                discarded_text_edits: Vec<srui_protocol::PendingTextEditRef>,
             },
         }
 
@@ -356,9 +357,6 @@ impl Session {
         validate_client_instance_id(&resume.client_instance_id)?;
 
         let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-        let last_processed_event_seq = inner_guard
-            .dedupe
-            .last_contiguous_processed_seq(&resume.client_instance_id);
 
         // Evaluate cause: replaced incarnation takes precedence, then outbound overflow, then journal gap
         let resync_cause = if resume.session_id != inner_guard.session_id {
@@ -379,6 +377,23 @@ impl Session {
         };
 
         let plan = if let Some(cause) = resync_cause {
+            // Same-session forced resync settles declared TEXT_EDIT identities before the
+            // snapshot is captured so canceling them cannot open an `event_seq` gap (§18.3).
+            let discarded_text_edits = if matches!(
+                cause,
+                ResyncCause::OutboundQueueOverflow | ResyncCause::JournalGap
+            ) {
+                Session::cancel_pending_text_edits(
+                    &mut inner_guard,
+                    &resume.client_instance_id,
+                    &resume.pending_text_edits,
+                )?
+            } else {
+                Vec::new()
+            };
+            let last_processed_event_seq = inner_guard
+                .dedupe
+                .last_contiguous_processed_seq(&resume.client_instance_id);
             ResumePlan::Resync {
                 session_id: inner_guard.session_id.clone(),
                 snapshot_revision: inner_guard.store.revision().get(),
@@ -386,8 +401,12 @@ impl Session {
                 continuity: cause.continuity(),
                 reason: cause.reason().to_string(),
                 last_processed_event_seq,
+                discarded_text_edits,
             }
         } else {
+            let last_processed_event_seq = inner_guard
+                .dedupe
+                .last_contiguous_processed_seq(&resume.client_instance_id);
             let iter = inner_guard
                 .journal
                 .iter_from(resume.last_applied_revision)
@@ -460,6 +479,7 @@ impl Session {
                 continuity,
                 reason,
                 last_processed_event_seq,
+                discarded_text_edits,
             } => ResumeOutcome::Resync {
                 resync_msg: ServerResyncRequired {
                     session_id,
@@ -467,6 +487,7 @@ impl Session {
                     reason,
                     continuity: continuity as i32,
                     last_processed_event_seq,
+                    discarded_text_edits,
                 },
                 // A resync the client cannot decode is worse than a refused resume: it strands the
                 // client awaiting a snapshot that every retry reproduces byte-for-byte (§18, §26).
@@ -538,6 +559,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![published.hash.0.to_vec()],
+            pending_text_edits: vec![],
         };
 
         let mut bootstrap = session.bootstrap_resume(&resume).unwrap();
@@ -563,6 +585,7 @@ mod tests {
                 ..ClientLimits::default()
             }),
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
 
         let mut bootstrap = session.bootstrap_resume(&resume).unwrap();
@@ -597,6 +620,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
         let bootstrap = session.bootstrap_resume(&resume).expect("resume");
         match bootstrap.outcome {
@@ -635,6 +659,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
         let bootstrap = session.bootstrap_resume(&resume).expect("resume");
         match bootstrap.outcome {
@@ -698,6 +723,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
 
         match session
@@ -741,6 +767,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
 
         match session
@@ -906,6 +933,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
 
         let catch_up_captured = Arc::new(Barrier::new(2));

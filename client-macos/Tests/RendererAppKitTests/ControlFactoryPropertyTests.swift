@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+import Text
 
 @MainActor
 struct ControlFactoryPropertyTests {
@@ -262,6 +263,61 @@ struct ControlFactoryPropertyTests {
         } else {
             Issue.record("unexpected view for \(nodeType)")
         }
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func textEditorsRetainANativeAdapter(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        #expect(handle.textAdapter != nil)
+        #expect(handle.textAdapter?.nodeID == NodeId(1))
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func valueWinsOverTextOnEditors(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(
+            for: Node(
+                id: 1,
+                nodeType: nodeType,
+                properties: [
+                    (.text, .string("from-text")),
+                    (.value, .string("from-value")),
+                ]
+            )
+        )
+        #expect(renderedText(in: handle) == "from-value")
+        #expect(factory.textEditingSession.localValue(for: 1) == "from-value")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func identicalAuthoritativeStringDoesNotResetNativeText(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        factory.apply(property: .value, value: .string("stable"), to: handle)
+        let before = renderedText(in: handle)
+        factory.apply(property: .value, value: .string("stable"), to: handle)
+        #expect(renderedText(in: handle) == before)
+        #expect(renderedText(in: handle) == "stable")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func validationStateDecoratesEditors(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        let adapter = try #require(handle.textAdapter)
+
+        factory.apply(property: .validationState, value: .enumToken(StandardValidationState.valid.enumToken), to: handle)
+        #expect(adapter.validationState == .valid)
+
+        factory.apply(property: .validationState, value: .enumToken(StandardValidationState.warning.enumToken), to: handle)
+        #expect(adapter.validationState == .warning)
+
+        factory.apply(property: .validationState, value: .enumToken(StandardValidationState.error.enumToken), to: handle)
+        #expect(adapter.validationState == .error)
+
+        factory.apply(property: .validationState, value: nil, to: handle)
+        #expect(adapter.validationState == nil)
     }
 
     @Test

@@ -94,7 +94,8 @@ struct SessionResumeContinuityTests {
         sessionId: String,
         continuity: Srui_Protocol_SessionContinuity,
         snapshotRevision: UInt64 = 5,
-        lastProcessedEventSeq: UInt64 = 0
+        lastProcessedEventSeq: UInt64 = 0,
+        discardedTextEdits: [SRUIPendingTextEditRef] = []
     ) -> SRUIMessage {
         var resync = SRUIServerResyncRequired()
         resync.sessionID = sessionId
@@ -102,6 +103,7 @@ struct SessionResumeContinuityTests {
         resync.reason = "test"
         resync.continuity = continuity
         resync.lastProcessedEventSeq = lastProcessedEventSeq
+        resync.discardedTextEdits = discardedTextEdits
         var message = SRUIMessage()
         message.serverResyncRequired = resync
         return message
@@ -680,6 +682,228 @@ struct SessionResumeContinuityTests {
         }
 
         await controller.stop()
+        await server.close()
+    }
+
+    @Test("RESUME_OK replays an assigned TEXT_EDIT byte-for-byte")
+    func resumeOkReplaysAssignedTextEditUnchanged() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let seq = try #require(EditSeq(4))
+        let pending = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: seq,
+            observedRevision: Revision(3),
+            via: seedClient
+        ))
+
+        let (client, server) = await PipeTransport.createPair()
+        let collector = ResumeWireCollector()
+        await collector.start(draining: server)
+        let controller = SessionController(
+            transport: client,
+            outbox: outbox,
+            sessionId: "session-live"
+        )
+        try await controller.start()
+
+        let resumeMessages = await collector.wait(forAtLeast: 1)
+        let resume = try #require(resumeMessages.compactMap { message -> SRUIClientResume? in
+            if case .clientResume(let resume) = message.msg { return resume }
+            return nil
+        }.first)
+        #expect(resume.pendingTextEdits.count == 1)
+        #expect(resume.pendingTextEdits[0].eventID == pending.eventId.bytes)
+        #expect(resume.pendingTextEdits[0].eventSeq == pending.eventSeq)
+        #expect(resume.pendingTextEdits[0].editSeq == seq.rawValue)
+
+        var resumeOk = SRUIServerResumeOk()
+        resumeOk.sessionID = "session-live"
+        resumeOk.lastProcessedEventSeq = 0
+        var response = SRUIMessage()
+        response.serverResumeOk = resumeOk
+        await controller.handleIncomingMessage(response)
+
+        let after = await collector.wait(forAtLeast: 2)
+        let replayed = try #require(try events(in: after).last)
+        #expect(replayed.eventId == pending.eventId)
+        #expect(replayed.eventSeq == pending.eventSeq)
+        #expect(replayed.editSeq == seq)
+        #expect(replayed.textArg == "typed")
+        #expect(replayed.eventType == .EVENT_TEXT_EDIT)
+
+        await controller.stop()
+        await collector.stop()
+        await seedClient.close()
+        await seedServer.close()
+        await server.close()
+    }
+
+    @Test("Same-session resync cancels TEXT_EDIT and replays an interleaved ordinary event")
+    func sameSessionResyncCancelsTextAndReplaysOrdinaryEvent() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let seq = try #require(EditSeq(2))
+        let textEvent = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "draft",
+            editSeq: seq,
+            observedRevision: Revision(3),
+            via: seedClient
+        ))
+        let activate = try await outbox.sendActivate(
+            nodeId: NodeId(7),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+        #expect(textEvent.eventSeq == 1)
+        #expect(activate.eventSeq == 2)
+
+        let (client, server) = await PipeTransport.createPair()
+        let collector = ResumeWireCollector()
+        await collector.start(draining: server)
+        let applier = TransactionApplier()
+        let controller = SessionController(
+            transport: client,
+            applier: applier,
+            outbox: outbox,
+            sessionId: "session-live"
+        )
+        try await controller.start()
+        _ = await collector.wait(forAtLeast: 1)
+
+        let discarded = await outbox.assignedTextEditDescriptors().map { $0.toWire() }
+        #expect(discarded.count == 1)
+        await controller.handleIncomingMessage(
+            resyncMessage(
+                sessionId: "session-live",
+                continuity: .sameSession,
+                lastProcessedEventSeq: 1,
+                discardedTextEdits: discarded
+            )
+        )
+
+        let afterDecision = await collector.wait(forAtLeast: 2)
+        let replayed = try events(in: afterDecision)
+        #expect(replayed.map(\.eventId) == [activate.eventId])
+        #expect(await outbox.pendingCount == 1)
+
+        await controller.handleIncomingMessage(snapshot(revision: 5, text: "snapshot-wins"))
+        #expect(applier.lastAppliedRevision == Revision(5))
+        #expect(controller.isEventDispatchEnabled)
+
+        await controller.stop()
+        await collector.stop()
+        await seedClient.close()
+        await seedServer.close()
+        await server.close()
+    }
+
+    @Test("Replacement resync discards assigned TEXT_EDIT state from the old incarnation")
+    func replacementResyncDiscardsTextEditState() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-old"))
+        let seq = try #require(EditSeq(9))
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "old",
+            editSeq: seq,
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "newer-draft",
+            editSeq: try #require(EditSeq(10)),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+        #expect(await outbox.unsentTextDraftCount == 1)
+
+        let (client, server) = await PipeTransport.createPair()
+        let collector = ResumeWireCollector()
+        await collector.start(draining: server)
+        let controller = SessionController(
+            transport: client,
+            outbox: outbox,
+            sessionId: "session-old"
+        )
+        try await controller.start()
+        _ = await collector.wait(forAtLeast: 1)
+
+        await controller.handleIncomingMessage(
+            resyncMessage(sessionId: "session-new", continuity: .replaced)
+        )
+
+        #expect(try events(in: await collector.collected()).isEmpty)
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+
+        await controller.stop()
+        await collector.stop()
+        await seedClient.close()
+        await seedServer.close()
+        await server.close()
+    }
+
+    @Test("A mismatched discarded_text_edits confirmation fails closed")
+    func mismatchedTextDiscardConfirmationFailsClosed() async throws {
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(3),
+            via: seedClient
+        )
+
+        let (client, server) = await PipeTransport.createPair()
+        let collector = ResumeWireCollector()
+        await collector.start(draining: server)
+        let controller = SessionController(
+            transport: client,
+            outbox: outbox,
+            sessionId: "session-live"
+        )
+        let failures = FailureRecorder()
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+        try await controller.start()
+        _ = await collector.wait(forAtLeast: 1)
+
+        var bogus = SRUIPendingTextEditRef()
+        bogus.eventID = Data("not-the-assigned-id".utf8)
+        bogus.eventSeq = 99
+        bogus.nodeID = 12
+        bogus.editSeq = 1
+        await controller.handleIncomingMessage(
+            resyncMessage(
+                sessionId: "session-live",
+                continuity: .sameSession,
+                discardedTextEdits: [bogus]
+            )
+        )
+
+        let failure = try #require(await failures.wait())
+        guard case .protocolViolation = failure else {
+            Issue.record("Expected a protocol violation, got \(failure)")
+            return
+        }
+        #expect(await outbox.pendingCount == 1)
+        #expect(try events(in: await collector.collected()).isEmpty)
+
+        await controller.stop()
+        await collector.stop()
+        await seedClient.close()
+        await seedServer.close()
         await server.close()
     }
 }

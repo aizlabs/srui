@@ -464,7 +464,14 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
         // 4. SELECTION_CHANGED (ItemId)
         Event::selection_changed(4, "sel-1", 100, 13, ItemId::new(500)),
         // 5. TEXT_EDIT
-        Event::text_edit(5, "txt-1", 100, 14, "New input text"),
+        Event::text_edit(
+            5,
+            "txt-1",
+            100,
+            14,
+            "New input text",
+            EditSeq::new(1).unwrap(),
+        ),
         // 6. EXPANSION_CHANGED
         Event::expansion_changed(6, "exp-1", 100, 15, true),
         // 7. VIEWPORT_CHANGED
@@ -508,6 +515,12 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
 
         assert_eq!(event, back, "Roundtrip mismatch on event #{}", idx + 1);
     }
+
+    let with_edit = Event::text_edit(9, "txt-seq", 100, 14, "coalesced", EditSeq::new(3).unwrap())
+        .with_client_instance_id(client_id);
+    let back = decode_event(&encode_event(&with_edit)).unwrap();
+    assert_eq!(with_edit, back);
+    assert_eq!(back.edit_seq, EditSeq::new(3));
 }
 
 // =============================================================================
@@ -688,6 +701,7 @@ fn test_malformed_protobuf_bytes_rejected_cleanly() {
         node_id: 10,
         event_type: None, // Missing required type
         arguments: vec![],
+        edit_seq: 0,
     };
     let err = Event::try_from(wire_event_missing_type).expect_err("must fail without event_type");
     assert!(matches!(err, WireError::MissingField("Event.event_type")));

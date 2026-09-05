@@ -15,7 +15,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::event::{ClientInstanceId, Event, EventId};
+use crate::event::{ClientInstanceId, EditSeq, Event, EventId};
 use crate::ids::{NodeId, PropertyRef, TypeRef};
 use crate::store::node::Node;
 use crate::transaction::error::TxnError;
@@ -315,6 +315,7 @@ impl From<&Event> for srui_protocol::Event {
             node_id: event.node_id.get(),
             event_type: Some(event.event_type.into()),
             arguments,
+            edit_seq: event.edit_seq.map(EditSeq::get).unwrap_or(0),
         }
     }
 }
@@ -354,6 +355,7 @@ impl TryFrom<srui_protocol::Event> for Event {
             node_id: NodeId::new(wire.node_id),
             event_type,
             arguments,
+            edit_seq: EditSeq::new(wire.edit_seq),
         })
     }
 }

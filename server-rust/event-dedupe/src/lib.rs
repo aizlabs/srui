@@ -1,6 +1,6 @@
 //! # SRUI Event Deduplication
 //!
-//! Provides sliding-window deduplication for incoming client events (§18.2, §20.2, §21, §32.4).
+//! Provides sliding-window deduplication for incoming client events (§18.2, §18.3, §20.2, §21, §32.4).
 //! Enforces bounded memory limits per client to prevent memory exhaustion.
 //!
 //! The window doubles as the bounded **event result cache** of Appendix B:
@@ -608,6 +608,66 @@ impl EventDeduplicator {
         window.abandon(&event.event_id);
     }
 
+    /// Whether this event identity is currently admitted and not yet terminal (§18.2).
+    #[must_use]
+    pub fn is_in_flight(&self, client_instance_id: &[u8], event_id: &[u8]) -> bool {
+        self.clients
+            .get(client_instance_id)
+            .and_then(|window| window.seen_ids.get(event_id))
+            .is_some_and(|record| matches!(record, EventRecord::InFlight { .. }))
+    }
+
+    /// Cached terminal outcome for a settled `event_id`, if any.
+    #[must_use]
+    pub fn settled_outcome(
+        &self,
+        client_instance_id: &[u8],
+        event_id: &[u8],
+    ) -> Option<EventOutcomeRecord> {
+        self.clients
+            .get(client_instance_id)
+            .and_then(|window| window.seen_ids.get(event_id))
+            .and_then(|record| match record {
+                EventRecord::Settled { outcome, .. } => Some(outcome.clone()),
+                EventRecord::InFlight { .. } => None,
+            })
+    }
+
+    /// Admits (if needed) and settles a canceled text-event identity so removing it cannot open
+    /// a hole in the contiguous `event_seq` frontier (§18.2, §18.3).
+    ///
+    /// An already-settled identity is left unchanged and answered from the result cache. An
+    /// in-flight identity is settled with `outcome`. A never-seen identity is admitted then
+    /// settled so later ordinary events can still advance the frontier through this sequence.
+    pub fn settle_canceled_text_event(
+        &mut self,
+        client_instance_id: &[u8],
+        event_id: &[u8],
+        event_seq: u64,
+        outcome: EventOutcomeRecord,
+    ) -> Result<u64, EventSequenceError> {
+        if event_id.is_empty() {
+            return Err(EventSequenceError::MissingEventId);
+        }
+
+        let event = Event {
+            client_instance_id: client_instance_id.to_vec(),
+            event_seq,
+            event_id: event_id.to_vec(),
+            ..Default::default()
+        };
+
+        match self.admit_event(&event)? {
+            RecordOutcome::Duplicate {
+                last_processed_event_seq,
+                ..
+            } => Ok(last_processed_event_seq),
+            RecordOutcome::Pending { .. } | RecordOutcome::Fresh { .. } => {
+                Ok(self.settle_event(&event, outcome))
+            }
+        }
+    }
+
     /// Highest contiguous event sequence settled for a client instance (§18.2).
     #[must_use]
     /// Falls back to the frontier retained when the client's window was evicted, so a resume
@@ -1201,5 +1261,61 @@ mod tests {
         assert!(dedupe.is_duplicate(client, b"e2"));
         assert!(dedupe.is_duplicate(client, b"e3"));
         assert!(dedupe.is_duplicate(client, b"e4"));
+    }
+
+    #[test]
+    fn test_canceled_text_event_fills_a_frontier_gap() {
+        let mut dedupe = EventDeduplicator::new(16);
+        let client = b"client-text";
+
+        let first = wire_event(client, b"ordinary-1", 1);
+        assert!(matches!(
+            dedupe.admit_event(&first).expect("admit 1"),
+            RecordOutcome::Fresh { .. }
+        ));
+
+        let canceled = EventOutcomeRecord {
+            accepted: false,
+            revision_after_effect: 4,
+            reject_reason: "canceled on same-session resync".into(),
+        };
+        assert_eq!(
+            dedupe
+                .settle_canceled_text_event(client, b"text-2", 2, canceled.clone())
+                .expect("cancel seq 2"),
+            0,
+            "sequence 1 is still in flight, so the frontier must not jump"
+        );
+        assert!(!dedupe.is_in_flight(client, b"text-2"));
+        assert_eq!(
+            dedupe.settled_outcome(client, b"text-2"),
+            Some(canceled.clone())
+        );
+
+        assert_eq!(
+            dedupe.settle_event(
+                &first,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 1,
+                    reject_reason: String::new(),
+                }
+            ),
+            2,
+            "settling sequence 1 must advance through the canceled gap"
+        );
+
+        // A replay of the canceled identity is answered from the cache, not admitted as fresh.
+        let replay = wire_event(client, b"text-2", 2);
+        match dedupe.admit_event(&replay).expect("replay") {
+            RecordOutcome::Duplicate {
+                prior,
+                last_processed_event_seq,
+            } => {
+                assert_eq!(prior, canceled);
+                assert_eq!(last_processed_event_seq, 2);
+            }
+            other => panic!("expected duplicate, got {other:?}"),
+        }
     }
 }

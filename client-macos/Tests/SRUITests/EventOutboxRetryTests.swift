@@ -217,7 +217,7 @@ struct EventOutboxRetryTests {
             eventId: event.eventId,
             throughSeq: 0,
             sessionId: "session-ack"
-        ))
+        ).bound)
 
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == event.eventSeq)
@@ -870,7 +870,7 @@ struct EventOutboxRetryTests {
             eventId: EventId(string: "event-from-a-prior-incarnation"),
             throughSeq: 5_000,
             sessionId: "session-stale"
-        ))
+        ).bound)
 
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
@@ -1027,7 +1027,7 @@ struct EventOutboxRetryTests {
             eventId: event.eventId,
             throughSeq: 0,
             sessionId: "session-7"
-        ))
+        ).bound)
 
         let controller = SessionController(
             transport: client,
@@ -1069,20 +1069,20 @@ struct EventOutboxRetryTests {
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: "session-expired"
-        ) == false)
+        ) == .unbound)
         // An empty session_id proves nothing about which incarnation settled the event.
         #expect(await outbox.settleAcknowledgement(
             clientInstanceId: outbox.clientInstanceId,
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: ""
-        ) == false)
+        ) == .unbound)
         #expect(await outbox.settleAcknowledgement(
             clientInstanceId: ClientInstanceId(string: "client-b"),
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: "session-live"
-        ) == false)
+        ) == .unbound)
 
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
@@ -1092,7 +1092,7 @@ struct EventOutboxRetryTests {
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: "session-live"
-        ))
+        ).bound)
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == event.eventSeq)
 

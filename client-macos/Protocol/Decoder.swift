@@ -473,7 +473,8 @@ public struct ProtocolDecoder: Sendable {
             observedRevision: Revision(wire.observedRevision),
             nodeId: NodeId(wire.nodeID),
             eventType: eventType,
-            arguments: args
+            arguments: args,
+            editSeq: EditSeq(wire.editSeq)
         )
     }
 

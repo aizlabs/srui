@@ -1,6 +1,7 @@
 import AppKit
 import SemanticModel
 import Resources
+import Text
 @_exported import Collections
 
 /// Public main-actor entry point for mounting committed semantic state and applying render deltas.
@@ -23,9 +24,14 @@ public final class AppKitRenderer {
         set { controlFactory.onCollectionRangeRequest = newValue }
     }
 
+    public var textEditingSession: TextEditingSession {
+        controlFactory.textEditingSession
+    }
+
     public init() {
         let registry = RenderRegistry()
-        let controlFactory = ControlFactory()
+        let session = TextEditingSession()
+        let controlFactory = ControlFactory(textEditingSession: session)
         self.registry = registry
         self.controlFactory = controlFactory
         self.layoutRenderer = LayoutRenderer(

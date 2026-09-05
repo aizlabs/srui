@@ -274,18 +274,19 @@ public final class SessionController: @unchecked Sendable {
                             itemId: itemID
                         )
                     case .textEdit(let nodeID, let text, let editSeq, let laneEpoch):
-                        // Drafts are retained even while dispatch is suspended; promotion waits
-                        // for an active EventOutbox (§18.3).
-                        if let event = try await self.outbox.queueTextEdit(
+                        // Retain and record assignment before awaiting the transport. A write may
+                        // reach the server and still report an error locally (§18.2, §22.6).
+                        _ = try await self.outbox.queueTextEdit(
                             nodeId: nodeID,
                             text: text,
                             editSeq: editSeq,
                             observedRevision: observedRev,
                             via: self.transport,
-                            laneEpoch: laneEpoch
-                        ) {
-                            await self.renderer?.textEditingSession.noteAssigned(event)
-                        }
+                            laneEpoch: laneEpoch,
+                            onAssigned: { [weak self] event in
+                                await self?.noteAssignedTextEdits([event])
+                            }
+                        )
                     }
                 } catch {
                     SessionDiagnostics.error("Interaction dispatch failed: \(error)")
@@ -815,6 +816,9 @@ public final class SessionController: @unchecked Sendable {
                 generation: generation,
                 via: transport,
                 enableNewEventsAfterReplay: true,
+                onTextEditAssigned: { [weak self] event in
+                    await self?.noteAssignedTextEdits([event])
+                },
                 onReplayFailure: { [weak self] error in
                     await self?.handlePendingEventReplayFailure(error)
                 }
@@ -879,6 +883,9 @@ public final class SessionController: @unchecked Sendable {
                         enableNewEventsAfterReplay: false,
                         discardedTextEdits: resync.discardedTextEdits,
                         requireExactTextMatch: true,
+                        onTextEditAssigned: { [weak self] event in
+                            await self?.noteAssignedTextEdits([event])
+                        },
                         onReplayFailure: { [weak self] error in
                             await self?.handlePendingEventReplayFailure(error)
                         }
@@ -948,23 +955,23 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
-                    let canceled = try await applyResyncTextCancellation(
-                        resync,
-                        requireExactMatch: true,
-                        onlyIfResumeGeneration: nil
+                    let applied = try await outbox.applyLiveSameSessionResync(
+                        lastProcessedEventSeq: resync.lastProcessedEventSeq,
+                        discardedTextEdits: resync.discardedTextEdits
                     )
-                    if canceled {
-                        await noteCanceledTextEdits(resync.discardedTextEdits)
+                    guard applied else {
+                        SessionDiagnostics.log(
+                            "Ignoring live same-session resync superseded by a reconnect generation"
+                        )
+                        return
                     }
+                    await noteCanceledTextEdits(resync.discardedTextEdits)
                 } catch {
                     await reportFailure(.protocolViolation(
                         "same-session live resync discarded-text confirmation failed: \(error)"
                     ))
                     return
                 }
-                await outbox.applyLiveResyncFrontier(
-                    lastProcessedEventSeq: resync.lastProcessedEventSeq
-                )
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .replaced:
@@ -1175,9 +1182,9 @@ public final class SessionController: @unchecked Sendable {
             )
         }
 
-        for event in settlement.settledEvents where event.eventType == .EVENT_TEXT_EDIT {
-            await renderer?.textEditingSession.noteAcknowledged(event)
-        }
+        // Native assignment identity is cleared by `resolveRenderedTextAcknowledgements`,
+        // after the named edit's authoritative revision has rendered. Clearing it here would let
+        // an intervening structural transaction remount the stale store value over local text.
 
         // Control-lane acknowledgements can overtake multiple UI-lane transactions. The outbox
         // keeps each editor blocked until the exact-or-later authoritative revision has rendered,
@@ -1206,10 +1213,16 @@ public final class SessionController: @unchecked Sendable {
 
     private func resolveRenderedTextAcknowledgements(through revision: UInt64) async {
         let resolved = await outbox.releaseTextAcknowledgements(through: revision)
-        for acknowledgement in resolved where acknowledgement.rejected {
-            // A rejection with no correcting transaction reverts to the last published value.
-            // When a correction did render, applying that same baseline again is a no-op.
-            await revertRejectedTextEditIfNoSuccessor(acknowledgement.nodeId)
+        for acknowledgement in resolved {
+            await renderer?.textEditingSession.noteAcknowledged(
+                nodeID: acknowledgement.nodeId,
+                eventId: acknowledgement.eventId
+            )
+            if acknowledgement.rejected {
+                // A rejection with no correcting transaction reverts to the last published value.
+                // When a correction did render, applying that same baseline again is a no-op.
+                await revertRejectedTextEditIfNoSuccessor(acknowledgement.nodeId)
+            }
         }
     }
 
@@ -1244,8 +1257,12 @@ public final class SessionController: @unchecked Sendable {
 
     private func promoteReadyTextDrafts() async {
         do {
-            let promoted = try await outbox.promoteReadyTextDrafts(via: transport)
-            await noteAssignedTextEdits(promoted)
+            _ = try await outbox.promoteReadyTextDrafts(
+                via: transport,
+                onAssigned: { [weak self] event in
+                    await self?.noteAssignedTextEdits([event])
+                }
+            )
         } catch {
             SessionDiagnostics.error("Failed to promote coalesced text drafts: \(error)")
         }

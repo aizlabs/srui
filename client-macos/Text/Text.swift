@@ -94,11 +94,17 @@ public final class TextEditingSession {
 
     public func noteAcknowledged(_ event: Event) {
         guard event.eventType == .EVENT_TEXT_EDIT else { return }
-        guard var state = nodes[event.nodeId] else { return }
-        if state.assignedEventId == event.eventId {
+        noteAcknowledged(nodeID: event.nodeId, eventId: event.eventId)
+    }
+
+    /// Clears native assignment identity only after that event's authoritative effect revision
+    /// has rendered. Keeping it until then protects local text across intervening remounts.
+    public func noteAcknowledged(nodeID: NodeId, eventId: EventId) {
+        guard var state = nodes[nodeID] else { return }
+        if state.assignedEventId == eventId {
             state.assignedEventId = nil
         }
-        nodes[event.nodeId] = state
+        nodes[nodeID] = state
     }
 
     /// Drops in-flight identity after a same-session forced resync cancelled the assigned edit.

@@ -21,6 +21,11 @@ public enum EventOutboxError: Error, Equatable, Sendable {
     case textEditDiscardMismatch
 }
 
+/// Called after a `TEXT_EDIT` has a retained wire identity but before its first transmission.
+/// This closes the ambiguous-send window: native state knows which value is assigned even when
+/// the transport delivers the frame and then reports an error (§18.2, §22.6).
+public typealias TextEditAssignmentHandler = @Sendable (Event) async -> Void
+
 /// Assigned, unacknowledged `TEXT_EDIT` identity declared on resume (§18.3).
 public struct PendingTextEditDescriptor: Hashable, Equatable, Sendable {
     public var eventId: EventId
@@ -75,6 +80,7 @@ public struct EventAcknowledgementSettlement: Equatable, Sendable {
 /// A terminal text acknowledgement whose authoritative revision has not necessarily rendered yet.
 struct TextEditAcknowledgementBarrier: Equatable, Sendable {
     var nodeId: NodeId
+    var eventId: EventId
     var revisionAfterEffect: UInt64
     var rejected: Bool
 }
@@ -243,6 +249,7 @@ public actor EventOutbox {
     /// window that the server would then refuse to settle past.
     private func allocateAndSend(
         via transport: any Transport,
+        onRetained: TextEditAssignmentHandler? = nil,
         _ makeEvent: (UInt64, EventId) -> Event
     ) async throws -> Event {
         guard acceptsNewEvents else {
@@ -252,7 +259,7 @@ public actor EventOutbox {
         currentEventSeq += 1
         let event = makeEvent(currentEventSeq, generateEventId())
             .withClientInstanceId(clientInstanceId)
-        try await sendEvent(event, via: transport)
+        try await sendEvent(event, via: transport, onRetained: onRetained)
         return event
     }
 
@@ -260,7 +267,11 @@ public actor EventOutbox {
     ///
     /// Internal because it accepts an already-allocated identity: only `allocateAndSend` may mint
     /// one, so allocation, retention, and transmission stay a single actor-isolated step.
-    func sendEvent(_ event: Event, via transport: any Transport) async throws {
+    func sendEvent(
+        _ event: Event,
+        via transport: any Transport,
+        onRetained: TextEditAssignmentHandler? = nil
+    ) async throws {
         var msg = SRUIMessage()
         msg.event = event.toWire()
         let framedBytes = try SRUIFraming.encodeFramed(msg)
@@ -268,6 +279,20 @@ public actor EventOutbox {
         // Retain before the first suspension: a fast acknowledgement may arrive while send is
         // awaiting transport completion and must be able to remove this entry exactly once.
         try retainPending(event)
+        let retainedResumeEpoch = lastIssuedResumeGeneration
+        let retainedSessionId = activeSessionId
+        if let onRetained {
+            await onRetained(event)
+            // The assignment callback is an actor hop. If reconnect/resync superseded this send
+            // while it ran, leave the retained intent for the owning replay path instead of
+            // leaking it onto the obsolete transport.
+            guard pendingEvents[event.eventId] == event,
+                  lastIssuedResumeGeneration == retainedResumeEpoch,
+                  activeSessionId == retainedSessionId,
+                  acceptsNewEvents else {
+                return
+            }
+        }
         let send = enqueueSend {
             try await transport.send(data: framedBytes, logicalClass: .input)
         }
@@ -324,7 +349,8 @@ public actor EventOutbox {
         editSeq: EditSeq,
         observedRevision: Revision,
         via transport: any Transport,
-        laneEpoch: UInt64 = 0
+        laneEpoch: UInt64 = 0,
+        onAssigned: TextEditAssignmentHandler? = nil
     ) async throws -> Event? {
         let minimumEpoch = max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0)
         guard laneEpoch >= minimumEpoch else { return nil }
@@ -345,16 +371,28 @@ public actor EventOutbox {
             observedRevision: observedRevision,
             laneEpoch: laneEpoch
         )
-        return try await promoteTextDraft(nodeId: nodeId, via: transport)
+        return try await promoteTextDraft(
+            nodeId: nodeId,
+            via: transport,
+            onAssigned: onAssigned
+        )
     }
 
     /// Promotes every coalesced draft that can enter the contiguous send window.
-    /// Returns each newly allocated `TEXT_EDIT` so the text coordinator can record it as assigned.
+    /// Returns each newly allocated `TEXT_EDIT`; `onAssigned` runs after retention and before the
+    /// first transport suspension so native coordination cannot miss an ambiguous send.
     @discardableResult
-    public func promoteReadyTextDrafts(via transport: any Transport) async throws -> [Event] {
+    public func promoteReadyTextDrafts(
+        via transport: any Transport,
+        onAssigned: TextEditAssignmentHandler? = nil
+    ) async throws -> [Event] {
         var promoted: [Event] = []
         for nodeId in Array(textDrafts.keys) {
-            if let event = try await promoteTextDraft(nodeId: nodeId, via: transport) {
+            if let event = try await promoteTextDraft(
+                nodeId: nodeId,
+                via: transport,
+                onAssigned: onAssigned
+            ) {
                 promoted.append(event)
             }
         }
@@ -504,7 +542,11 @@ public actor EventOutbox {
         "\(ref.eventId.toHex()):\(ref.eventSeq):\(ref.nodeId.value):\(ref.editSeq.rawValue)"
     }
 
-    private func promoteTextDraft(nodeId: NodeId, via transport: any Transport) async throws -> Event? {
+    private func promoteTextDraft(
+        nodeId: NodeId,
+        via transport: any Transport,
+        onAssigned: TextEditAssignmentHandler? = nil
+    ) async throws -> Event? {
         guard acceptsNewEvents else { return nil }
         guard assignedTextEvent(for: nodeId) == nil else { return nil }
         guard textAcknowledgementBarriers[nodeId] == nil else { return nil }
@@ -513,7 +555,10 @@ public actor EventOutbox {
             textDrafts.removeValue(forKey: nodeId)
             return nil
         }
-        return try await allocateAndSend(via: transport) { eventSeq, eventId in
+        return try await allocateAndSend(
+            via: transport,
+            onRetained: onAssigned
+        ) { eventSeq, eventId in
             let event = Event.textEdit(
                 eventSeq: eventSeq,
                 eventId: eventId,
@@ -643,6 +688,7 @@ public actor EventOutbox {
         enableNewEventsAfterReplay: Bool,
         discardedTextEdits: [SRUIPendingTextEditRef]? = nil,
         requireExactTextMatch: Bool = true,
+        onTextEditAssigned: TextEditAssignmentHandler? = nil,
         onReplayFailure: (@Sendable (String) async -> Void)? = nil
     ) async throws -> Bool {
         guard activeResumeGeneration == generation else { return false }
@@ -661,11 +707,20 @@ public actor EventOutbox {
             throughSeq: lastProcessedEventSeq,
             retainingTextEditsForOutcome: true
         )
+        if let onTextEditAssigned {
+            for event in assignedTextEditEvents() {
+                await onTextEditAssigned(event)
+            }
+            guard activeResumeGeneration == generation else { return false }
+        }
         try await resendPendingEvents(via: transport)
         guard activeResumeGeneration == generation else { return false }
         acceptsNewEvents = enableNewEventsAfterReplay
         if enableNewEventsAfterReplay {
-            try await promoteReadyTextDrafts(via: transport)
+            try await promoteReadyTextDrafts(
+                via: transport,
+                onAssigned: onTextEditAssigned
+            )
         }
         startReplayRetryLoop(
             generation: generation,
@@ -707,6 +762,24 @@ public actor EventOutbox {
             throughSeq: lastProcessedEventSeq,
             retainingTextEditsForOutcome: true
         )
+    }
+
+    /// Atomically validates/cancels the declared text identities and applies a live same-session
+    /// frontier. A reconnect generation that already superseded this live controller refuses the
+    /// whole transition without partially mutating the newer attempt (§18, §18.3).
+    @discardableResult
+    func applyLiveSameSessionResync(
+        lastProcessedEventSeq: UInt64,
+        discardedTextEdits: [SRUIPendingTextEditRef]
+    ) throws -> Bool {
+        guard activeResumeGeneration == nil else { return false }
+        let confirming = discardedTextEdits.compactMap(PendingTextEditDescriptor.init(wire:))
+        guard confirming.count == discardedTextEdits.count else {
+            throw EventOutboxError.textEditDiscardMismatch
+        }
+        try cancelAssignedTextEdits(confirming: confirming, requireExactMatch: true)
+        applyLiveResyncFrontier(lastProcessedEventSeq: lastProcessedEventSeq)
+        return true
     }
 
     /// Abandons pending intents and binds a replacement incarnation without a resume attempt (§18).
@@ -753,26 +826,33 @@ public actor EventOutbox {
             return .unbound
         }
         let event = pendingEvents[eventId]
-        var settledEvents = acknowledgeEvents(throughSeq: seq)
+        // A cumulative frontier proves that earlier events were processed, but only the named
+        // text event carries this acknowledgement's accept/reject outcome and effect revision.
+        // Keep every other covered TEXT_EDIT replayable until its own cached outcome arrives.
+        var settledEvents = acknowledgeEvents(
+            throughSeq: seq,
+            retainingTextEditsForOutcome: true
+        )
         if let event, !settledEvents.contains(where: { $0.eventId == event.eventId }) {
             settledEvents.append(event)
             settledEvents.sort { $0.eventSeq < $1.eventSeq }
         }
 
-        if let revisionAfterEffect {
-            for settled in settledEvents where settled.eventType == .EVENT_TEXT_EDIT {
-                let barrier = TextEditAcknowledgementBarrier(
-                    nodeId: settled.nodeId,
-                    revisionAfterEffect: revisionAfterEffect,
-                    rejected: textEditRejected && settled.eventId == eventId
-                )
-                if let current = textAcknowledgementBarriers[settled.nodeId] {
-                    if current.revisionAfterEffect <= revisionAfterEffect {
-                        textAcknowledgementBarriers[settled.nodeId] = barrier
-                    }
-                } else {
-                    textAcknowledgementBarriers[settled.nodeId] = barrier
+        if let revisionAfterEffect,
+           let event,
+           event.eventType == .EVENT_TEXT_EDIT {
+            let barrier = TextEditAcknowledgementBarrier(
+                nodeId: event.nodeId,
+                eventId: event.eventId,
+                revisionAfterEffect: revisionAfterEffect,
+                rejected: textEditRejected
+            )
+            if let current = textAcknowledgementBarriers[event.nodeId] {
+                if current.revisionAfterEffect <= revisionAfterEffect {
+                    textAcknowledgementBarriers[event.nodeId] = barrier
                 }
+            } else {
+                textAcknowledgementBarriers[event.nodeId] = barrier
             }
         }
 

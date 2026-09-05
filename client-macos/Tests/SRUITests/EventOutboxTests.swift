@@ -612,8 +612,8 @@ struct EventOutboxTests {
         await server.close()
     }
 
-    @Test("A cumulative ack blocks every retired text lane until its effect revision")
-    func cumulativeAckInstallsBarriersForAllTextLanes() async throws {
+    @Test("A cumulative ack retains earlier text lanes until each outcome is known")
+    func cumulativeAckRetainsEarlierTextOutcomes() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         #expect(await outbox.confirmFreshSession(id: "session-barriers"))
@@ -649,21 +649,37 @@ struct EventOutboxTests {
             via: client
         )
 
-        let settlement = await outbox.settleAcknowledgement(
+        let secondSettlement = await outbox.settleAcknowledgement(
             clientInstanceId: outbox.clientInstanceId,
             eventId: second.eventId,
             throughSeq: second.eventSeq,
             sessionId: "session-barriers",
             revisionAfterEffect: 5
         )
-        #expect(Set(settlement.settledEvents.map(\.eventId)) == Set([first.eventId, second.eventId]))
+        #expect(secondSettlement.settledEvents.map(\.eventId) == [second.eventId])
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [first.eventId])
         #expect(try await outbox.promoteReadyTextDrafts(via: client).isEmpty)
         #expect(await outbox.releaseTextAcknowledgements(through: 4).isEmpty)
-        #expect(try await outbox.promoteReadyTextDrafts(via: client).isEmpty)
 
-        #expect(await outbox.releaseTextAcknowledgements(through: 5).count == 2)
-        let promoted = try await outbox.promoteReadyTextDrafts(via: client)
-        #expect(Set(promoted.compactMap(\.textArg)) == Set(["left-2", "right-2"]))
+        let secondBarrier = await outbox.releaseTextAcknowledgements(through: 5)
+        #expect(secondBarrier.map(\.eventId) == [second.eventId])
+        let rightPromoted = try await outbox.promoteReadyTextDrafts(via: client)
+        #expect(rightPromoted.compactMap(\.textArg) == ["right-2"])
+
+        let firstSettlement = await outbox.settleAcknowledgement(
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: second.eventSeq,
+            sessionId: "session-barriers",
+            revisionAfterEffect: 4,
+            textEditRejected: true
+        )
+        #expect(firstSettlement.settledEvents.map(\.eventId) == [first.eventId])
+        let firstBarrier = await outbox.releaseTextAcknowledgements(through: 5)
+        #expect(firstBarrier.map(\.eventId) == [first.eventId])
+        #expect(firstBarrier.first?.rejected == true)
+        let leftPromoted = try await outbox.promoteReadyTextDrafts(via: client)
+        #expect(leftPromoted.compactMap(\.textArg) == ["left-2"])
 
         await client.close()
         await server.close()
@@ -1031,6 +1047,35 @@ struct EventOutboxTests {
         await server.close()
         await seedClient.close()
         await seedServer.close()
+    }
+
+    @Test("A reconnect generation makes live same-session resync an atomic no-op")
+    func reconnectSupersedesLiveSameSessionResyncAtomically() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let outbox = EventOutbox()
+        #expect(await outbox.confirmFreshSession(id: "session-live-race"))
+        let editSeq = try #require(EditSeq(1))
+        let edit = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "pending",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            via: client
+        ))
+        let descriptor = try #require(await outbox.assignedTextEditDescriptors().first)
+        let generation = await outbox.beginResumeAttempt()
+
+        let applied = try await outbox.applyLiveSameSessionResync(
+            lastProcessedEventSeq: edit.eventSeq,
+            discardedTextEdits: [descriptor.toWire()]
+        )
+        #expect(!applied)
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [edit.eventId])
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        await outbox.stopResumeWork(generation: generation)
+        await client.close()
+        await server.close()
     }
 
     @Test("A newer resume generation invalidates a stale snapshot render and boundary")

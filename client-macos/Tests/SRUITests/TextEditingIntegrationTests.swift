@@ -108,16 +108,96 @@ struct TextEditingIntegrationTests {
         try await Task.sleep(nanoseconds: 80_000_000)
         #expect(await collector.eventCount() == 0)
 
-        try await Task.sleep(nanoseconds: 500_000_000)
-        let events = await collector.events()
-        #expect(events.count == 1)
-        #expect(events[0].eventType == .EVENT_TEXT_EDIT)
-        #expect(events[0].textArg == committed)
-        #expect(events[0].editSeq?.rawValue == 1)
+        let delivered = try await waitForTextEvent(collector)
+        #expect(delivered.eventType == .EVENT_TEXT_EDIT)
+        #expect(delivered.textArg == committed)
+        #expect(delivered.editSeq?.rawValue == 1)
+        #expect(await collector.eventCount() == 1)
 
         await controller.stop()
         await collector.stop()
         await delayed.close()
+        await serverTransport.close()
+    }
+
+    @Test("Assignment is recorded before an ambiguous input send failure")
+    @MainActor
+    func ambiguousSendCannotMisclassifyEchoAsCorrection() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let ambiguous = DeliverThenThrowInputTransport(inner: clientPipe)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let outbox = EventOutbox()
+        let controller = SessionController(
+            transport: ambiguous,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+        try await handshakeAndMount(
+            controller: controller,
+            server: serverTransport,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "text-ambiguous-send"
+        )
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        let collector = EventCollector()
+        await collector.start(draining: serverTransport)
+
+        field.stringValue = "foo"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+        let first = try await waitForTextEvent(collector)
+
+        field.stringValue = "food"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+        try await waitUntil(description: "successor retained after ambiguous send") {
+            await outbox.unsentTextDraftCount == 1
+        }
+
+        var echo = SRUIMessage()
+        echo.transaction = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(id: editorID, property: .value, value: .string("foo")),
+            ]
+        ).toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(echo))
+        try await waitUntil(description: "echo renders without replacing successor") {
+            applier.lastAppliedRevision == Revision(2)
+        }
+        #expect(field.stringValue == "food")
+        #expect(await collector.eventCount() == 1)
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = first.eventId.bytes
+        ack.lastProcessedEventSeq = first.eventSeq
+        ack.status = .processed
+        ack.revisionAfterEffect = 2
+        ack.sessionID = "text-ambiguous-send"
+        var ackMessage = SRUIMessage()
+        ackMessage.serverEventAck = ack
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(ackMessage))
+
+        let successor = try await waitForTextEvent(
+            collector,
+            matching: { $0.eventId != first.eventId }
+        )
+        #expect(successor.textArg == "food")
+
+        await controller.stop()
+        await collector.stop()
+        await ambiguous.close()
         await serverTransport.close()
     }
 
@@ -387,19 +467,24 @@ struct TextEditingIntegrationTests {
             baseRevision: Revision(1),
             newRevision: Revision(2),
             operations: [
-                .setProperty(
-                    id: editorID,
-                    property: .validationState,
-                    value: .enumToken(StandardValidationState.warning.enumToken)
+                .createNode(
+                    id: NodeId(99),
+                    nodeType: .text,
+                    parentID: surfaceID,
+                    properties: [Property(property: .text, value: .string("structural"))]
                 ),
             ]
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(intervening))
-        try await AsyncTestSupport.eventually(description: "intervening revision rendered") {
-            adapter.validationState == .warning
+        try await AsyncTestSupport.eventually(description: "intervening structural revision remounted") {
+            applier.lastAppliedRevision == Revision(2)
+                && renderer.registry.handle(for: NodeId(99)) != nil
         }
+        let remountedHandle = try #require(renderer.registry.handle(for: editorID))
+        let remountedField = try #require(remountedHandle.view as? NSTextField)
+        #expect(remountedField !== field)
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
-        #expect(field.stringValue == "food")
+        #expect(remountedField.stringValue == "food")
 
         var echo = SRUIMessage()
         echo.transaction = Transaction(
@@ -413,7 +498,7 @@ struct TextEditingIntegrationTests {
 
         let second = try await waitForTextEvent(collector, matching: { $0.eventId != first.eventId })
         #expect(second.textArg == "food")
-        #expect(field.stringValue == "food")
+        #expect(remountedField.stringValue == "food")
 
         await controller.stop()
         await collector.stop()
@@ -649,6 +734,33 @@ private actor DelayedInputTransport: Transport {
             try await Task.sleep(nanoseconds: delayNanoseconds)
         }
         try await inner.send(data: data, logicalClass: logicalClass)
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        await inner.close()
+    }
+}
+
+private actor DeliverThenThrowInputTransport: Transport {
+    let inner: PipeTransport
+    private let stream: AsyncThrowingStream<Data, Error>
+    private var shouldThrow = true
+
+    init(inner: PipeTransport) {
+        self.inner = inner
+        self.stream = inner.receiveStream()
+    }
+
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        try await inner.send(data: data, logicalClass: logicalClass)
+        if logicalClass == .input, shouldThrow {
+            shouldThrow = false
+            throw TransportError.ioError("ambiguous send after delivery")
+        }
     }
 
     nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {

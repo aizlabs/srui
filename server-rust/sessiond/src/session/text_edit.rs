@@ -4,7 +4,7 @@
 //! Policy runs *outside* the session mutex. A per-node generation reserved before the policy call
 //! is rechecked before commit so an older concurrent validator cannot overwrite a newer edit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use srui_event_dedupe::{EventOutcomeRecord, RecordOutcome};
@@ -66,6 +66,9 @@ pub type TextEditPolicy =
 #[derive(Debug, Clone)]
 struct EditorStream {
     last_terminal_edit_seq: u64,
+    /// Reservations remain ordered so a policy panic can abandon one attempt without lowering
+    /// the watermark below another concurrent in-flight edit (§18.3).
+    in_flight_edit_seqs: BTreeSet<u64>,
     generation: u64,
 }
 
@@ -123,16 +126,23 @@ impl TextEditTracker {
             .get_mut(client_instance_id)
             .and_then(|client| client.get_mut(&node_id.get()))
         {
-            if edit_seq.get() <= stream.last_terminal_edit_seq {
+            let watermark = stream
+                .in_flight_edit_seqs
+                .last()
+                .copied()
+                .unwrap_or(stream.last_terminal_edit_seq)
+                .max(stream.last_terminal_edit_seq);
+            if edit_seq.get() <= watermark {
                 return Err(EventValidationError::StaleEditSeq {
                     observed: edit_seq.get(),
-                    watermark: stream.last_terminal_edit_seq,
+                    watermark,
                 });
             }
             stream.generation = stream
                 .generation
                 .checked_add(1)
                 .ok_or(EventValidationError::GenerationOverflow)?;
+            stream.in_flight_edit_seqs.insert(edit_seq.get());
             return Ok(stream.generation);
         }
         if self.stream_count >= self.max_streams {
@@ -147,6 +157,7 @@ impl TextEditTracker {
                 node_id.get(),
                 EditorStream {
                     last_terminal_edit_seq: 0,
+                    in_flight_edit_seqs: BTreeSet::from([edit_seq.get()]),
                     generation: 1,
                 },
             );
@@ -178,7 +189,25 @@ impl TextEditTracker {
             .get_mut(client_instance_id)
             .and_then(|client| client.get_mut(&node_id.get()))
         {
+            stream.in_flight_edit_seqs.remove(&edit_seq.get());
             stream.last_terminal_edit_seq = stream.last_terminal_edit_seq.max(edit_seq.get());
+        }
+    }
+
+    /// Releases a reservation whose policy panicked without making that edit terminal. Other
+    /// concurrent reservations remain in the watermark, and generation numbers are never reused.
+    pub fn abandon_reservation(
+        &mut self,
+        client_instance_id: &[u8],
+        node_id: NodeId,
+        edit_seq: EditSeq,
+    ) {
+        if let Some(stream) = self
+            .streams
+            .get_mut(client_instance_id)
+            .and_then(|client| client.get_mut(&node_id.get()))
+        {
+            stream.in_flight_edit_seqs.remove(&edit_seq.get());
         }
     }
 
@@ -301,6 +330,11 @@ impl Session {
                 Ok(decision) => decision,
                 Err(panic_payload) => {
                     let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+                    guard.text_edit_tracker.abandon_reservation(
+                        &event.client_instance_id,
+                        prepared.request.node_id,
+                        prepared.request.edit_seq,
+                    );
                     guard.dedupe.abandon_event(event);
                     drop(guard);
                     let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
@@ -355,7 +389,7 @@ impl Session {
         }
 
         if let Err(error) = revalidate_editor_for_commit(&guard, request.node_id) {
-            return Ok(reject_admitted(&mut guard, event, error));
+            return Ok(reject_reserved(&mut guard, event, request, error));
         }
 
         let current_generation = guard
@@ -364,7 +398,7 @@ impl Session {
             .unwrap_or(0);
         if current_generation != reserved_generation {
             let error = EventValidationError::SupersededGeneration;
-            return Ok(reject_admitted(&mut guard, event, error));
+            return Ok(reject_reserved(&mut guard, event, request, error));
         }
 
         let current_value = current_editor_value(&guard, request.node_id);
@@ -392,7 +426,7 @@ impl Session {
                 length: publish_value.len(),
                 limit: max_string_length,
             };
-            return Ok(reject_admitted(&mut guard, event, error));
+            return Ok(reject_reserved(&mut guard, event, request, error));
         }
 
         let reject_reason = bound_diagnostic_string(reject_reason, max_string_length);
@@ -404,23 +438,24 @@ impl Session {
             PropertyRef::VALUE,
             Value::String(publish_value),
         ) {
-            return Ok(reject_store(&mut guard, event, error));
+            return Ok(reject_reserved_store(&mut guard, event, request, error));
         }
         if let Err(error) = ui.set(
             request.node_id,
             PropertyRef::VALIDATION_STATE,
             Value::EnumToken(validation.into()),
         ) {
-            return Ok(reject_store(&mut guard, event, error));
+            return Ok(reject_reserved_store(&mut guard, event, request, error));
         }
         let (staged, ops) = ui.into_staged_and_ops();
         let commit = AuthoritativeCommit::new(base_revision, ops);
         let permit = match guard.journal.prepare(&commit) {
             Ok(permit) => permit,
             Err(error) => {
-                return Ok(reject_admitted(
+                return Ok(reject_reserved(
                     &mut guard,
                     event,
+                    request,
                     EventValidationError::PolicyRejected(error.to_string()),
                 ));
             }
@@ -459,32 +494,44 @@ impl Session {
         }
     }
 
-    pub(crate) fn cancel_pending_text_edits(
-        inner: &mut SessionInner,
-        client_instance_id: &[u8],
+    pub(crate) fn validate_pending_text_edit_refs(
         refs: &[srui_protocol::PendingTextEditRef],
-    ) -> Result<Vec<srui_protocol::PendingTextEditRef>, SessionError> {
+    ) -> Result<(), SessionError> {
         if refs.len() > MAX_TEXT_EDIT_STREAMS {
             return Err(SessionError::InvalidInput(format!(
                 "pending_text_edits has {} entries; at most {MAX_TEXT_EDIT_STREAMS} are accepted (§18.3, §26)",
                 refs.len()
             )));
         }
-
-        let mut validated = Vec::with_capacity(refs.len());
         for reference in refs {
             if reference.event_id.is_empty() || reference.event_seq == 0 {
                 return Err(SessionError::InvalidInput(
                     "pending TEXT_EDIT ref is missing event_id or event_seq".into(),
                 ));
             }
-            let Some(edit_seq) = EditSeq::new(reference.edit_seq) else {
+            if EditSeq::new(reference.edit_seq).is_none() {
                 return Err(SessionError::InvalidInput(
                     "pending TEXT_EDIT ref requires a positive edit_seq".into(),
                 ));
-            };
-            validated.push((reference, edit_seq));
+            }
         }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_pending_text_edits(
+        inner: &mut SessionInner,
+        client_instance_id: &[u8],
+        refs: &[srui_protocol::PendingTextEditRef],
+    ) -> Result<Vec<srui_protocol::PendingTextEditRef>, SessionError> {
+        Self::validate_pending_text_edit_refs(refs)?;
+        let validated: Vec<_> = refs
+            .iter()
+            .map(|reference| {
+                EditSeq::new(reference.edit_seq)
+                    .map(|edit_seq| (reference, edit_seq))
+                    .ok_or_else(|| SessionError::InvalidInput("invalid edit_seq".into()))
+            })
+            .collect::<Result<_, _>>()?;
 
         let revision_after_effect = inner.store.revision().get();
         let max_string_length = inner.store.limits().max_string_length;
@@ -581,12 +628,31 @@ fn revalidate_editor_for_commit(
     Ok(())
 }
 
-fn reject_store(inner: &mut SessionInner, event: &WireEvent, error: StoreError) -> EventOutcome {
+fn reject_reserved_store(
+    inner: &mut SessionInner,
+    event: &WireEvent,
+    request: &TextEditRequest,
+    error: StoreError,
+) -> EventOutcome {
     let mapped = match error {
         StoreError::NodeNotFound(id) => EventValidationError::NodeNotFound(id),
         other => EventValidationError::PolicyRejected(other.to_string()),
     };
-    reject_admitted(inner, event, mapped)
+    reject_reserved(inner, event, request, mapped)
+}
+
+fn reject_reserved(
+    inner: &mut SessionInner,
+    event: &WireEvent,
+    request: &TextEditRequest,
+    error: EventValidationError,
+) -> EventOutcome {
+    inner.text_edit_tracker.mark_terminal(
+        &event.client_instance_id,
+        request.node_id,
+        request.edit_seq,
+    );
+    reject_admitted(inner, event, error)
 }
 
 fn current_editor_value(inner: &SessionInner, node_id: NodeId) -> String {

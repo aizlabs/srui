@@ -262,6 +262,14 @@ impl Session {
     {
         let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let (welcome, store_clone) = negotiate_hello(&inner_guard, hello)?;
+        // Export is fallible. Complete it before subscription so a refused handshake cannot
+        // displace the healthy receiver already bound to this client identity (§18, §26).
+        let snapshot = match store_clone {
+            Some(store) => Some(export_snapshot_transaction(&store).inspect_err(|error| {
+                tracing::error!(%error, "refusing to send an unrepresentable catch-up snapshot");
+            })?),
+            None => None,
+        };
 
         before_subscribe();
 
@@ -296,15 +304,6 @@ impl Session {
             &known_hashes,
         );
         drop(inner_guard);
-
-        // Fails the handshake rather than emitting a catch-up transaction the client must reject
-        // and would then re-request forever (§18, §26).
-        let snapshot = match store_clone {
-            Some(store) => Some(export_snapshot_transaction(&store).inspect_err(|error| {
-                tracing::error!(%error, "refusing to send an unrepresentable catch-up snapshot");
-            })?),
-            None => None,
-        };
 
         Ok(FreshClientBootstrap {
             welcome,
@@ -345,7 +344,7 @@ impl Session {
             Resync {
                 session_id: String,
                 snapshot_revision: u64,
-                store_snapshot: SemanticStore,
+                snapshot_transaction: Transaction,
                 continuity: SessionContinuity,
                 reason: String,
                 last_processed_event_seq: u64,
@@ -353,8 +352,10 @@ impl Session {
             },
         }
 
-        // Refuse an unretainable identity before any per-client table copies it (§15, §26).
+        // Refuse unretainable identity data for every continuity outcome before any per-client
+        // table copies it. Replay/replaced resumes must not bypass the repeated-field bound.
         validate_client_instance_id(&resume.client_instance_id)?;
+        Session::validate_pending_text_edit_refs(&resume.pending_text_edits)?;
 
         let mut inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
@@ -377,8 +378,17 @@ impl Session {
         };
 
         let plan = if let Some(cause) = resync_cause {
+            let snapshot_revision = inner_guard.store.revision().get();
+            let store_snapshot = inner_guard.store.clone_staging();
+            // Export before canceling declared edits or replacing the receiver. A snapshot that
+            // cannot be represented must leave both authoritative event state and the existing
+            // subscriber untouched.
+            let snapshot_transaction =
+                export_snapshot_transaction(&store_snapshot).inspect_err(|error| {
+                    tracing::error!(%error, "refusing to send an unrepresentable resync snapshot");
+                })?;
             // Same-session forced resync settles declared TEXT_EDIT identities before the
-            // snapshot is captured so canceling them cannot open an `event_seq` gap (§18.3).
+            // snapshot is handed off so canceling them cannot open an `event_seq` gap (§18.3).
             let discarded_text_edits = if matches!(
                 cause,
                 ResyncCause::OutboundQueueOverflow | ResyncCause::JournalGap
@@ -396,8 +406,8 @@ impl Session {
                 .last_contiguous_processed_seq(&resume.client_instance_id);
             ResumePlan::Resync {
                 session_id: inner_guard.session_id.clone(),
-                snapshot_revision: inner_guard.store.revision().get(),
-                store_snapshot: inner_guard.store.clone_staging(),
+                snapshot_revision,
+                snapshot_transaction,
                 continuity: cause.continuity(),
                 reason: cause.reason().to_string(),
                 last_processed_event_seq,
@@ -475,7 +485,7 @@ impl Session {
             ResumePlan::Resync {
                 session_id,
                 snapshot_revision,
-                store_snapshot,
+                snapshot_transaction,
                 continuity,
                 reason,
                 last_processed_event_seq,
@@ -489,13 +499,7 @@ impl Session {
                     last_processed_event_seq,
                     discarded_text_edits,
                 },
-                // A resync the client cannot decode is worse than a refused resume: it strands the
-                // client awaiting a snapshot that every retry reproduces byte-for-byte (§18, §26).
-                snapshot_transaction: export_snapshot_transaction(&store_snapshot).inspect_err(
-                    |error| {
-                        tracing::error!(%error, "refusing to send an unrepresentable resync snapshot");
-                    },
-                )?,
+                snapshot_transaction,
             },
         };
 
@@ -509,6 +513,8 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use srui_semantic_tree::{NodeId, Revision, StoreLimits, TypeRef};
+    use std::cell::Cell;
     use std::sync::{Arc, Barrier, TryLockError};
     use std::thread;
 
@@ -530,6 +536,154 @@ mod tests {
             priority: 1,
             operations: vec![],
         }
+    }
+
+    fn pending_text_edit_ref() -> srui_protocol::PendingTextEditRef {
+        srui_protocol::PendingTextEditRef {
+            node_id: 2,
+            edit_seq: 1,
+            event_seq: 1,
+            event_id: "pending-edit".into(),
+        }
+    }
+
+    fn install_unrepresentable_snapshot(session: &Session) {
+        let limits = StoreLimits {
+            max_transaction_operations: 1,
+            ..StoreLimits::default()
+        };
+        let mut store = SemanticStore::with_limits_and_revision(limits, Revision::new(1));
+        let surface = TypeRef::new(0, 1);
+        store
+            .create_node(NodeId::new(1), surface, None, None, [])
+            .expect("first root");
+        store
+            .create_node(NodeId::new(2), surface, None, None, [])
+            .expect("second root");
+        session.inner.lock().expect("session lock").store = store;
+    }
+
+    #[test]
+    fn replay_resume_validates_pending_text_edit_refs() {
+        let session = Session::new("replay-pending-validation");
+        let mut invalid_ref = pending_text_edit_ref();
+        invalid_ref.event_id.clear();
+        let resume = ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: vec![8, 1],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![invalid_ref],
+        };
+
+        let Err(SessionError::InvalidInput(reason)) = session.bootstrap_resume(&resume) else {
+            panic!("replay resume must validate pending TEXT_EDIT refs");
+        };
+        assert!(reason.contains("missing event_id"));
+    }
+
+    #[test]
+    fn replaced_resume_validates_pending_text_edit_ref_bound() {
+        let session = Session::new("replacement-pending-validation");
+        let resume = ClientResume {
+            session_id: "replaced-session".into(),
+            client_instance_id: vec![8, 2],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![
+                pending_text_edit_ref();
+                crate::session::MAX_TEXT_EDIT_STREAMS + 1
+            ],
+        };
+
+        let Err(SessionError::InvalidInput(reason)) = session.bootstrap_resume(&resume) else {
+            panic!("replacement resume must enforce the pending TEXT_EDIT ref bound");
+        };
+        assert!(reason.contains("at most"));
+    }
+
+    #[test]
+    fn fresh_snapshot_failure_preserves_existing_subscriber() {
+        let session = Session::new("fresh-snapshot-failure");
+        let hello = sample_hello();
+        let mut existing = session
+            .subscribe_transactions(hello.client_instance_id.clone())
+            .expect("existing subscriber");
+        install_unrepresentable_snapshot(&session);
+
+        let callback_reached = Cell::new(false);
+        let result = session.bootstrap_fresh_client_with(&hello, || callback_reached.set(true));
+        assert!(matches!(
+            result,
+            Err(SessionError::SnapshotUnrepresentable {
+                limit: 1,
+                actual: 2
+            })
+        ));
+        assert!(
+            !callback_reached.get(),
+            "snapshot export must fail before the subscription boundary"
+        );
+        assert!(existing.termination().is_none());
+
+        session.outbound_hub.publish(&empty_tx(1, 2));
+        let received = existing
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
+            .expect("existing receiver remains healthy")
+            .expect("published transaction")
+            .into_transaction()
+            .expect("UI transaction");
+        assert_eq!(received, empty_tx(1, 2));
+    }
+
+    #[test]
+    fn replacement_snapshot_failure_preserves_existing_subscriber() {
+        let session = Session::new("replacement-snapshot-failure");
+        let client = vec![8, 3];
+        let mut existing = session
+            .subscribe_transactions(client.clone())
+            .expect("existing subscriber");
+        install_unrepresentable_snapshot(&session);
+        let resume = ClientResume {
+            session_id: "replaced-session".into(),
+            client_instance_id: client,
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![],
+        };
+
+        let callback_reached = Cell::new(false);
+        let result = session.bootstrap_resume_with(&resume, || callback_reached.set(true));
+        assert!(matches!(
+            result,
+            Err(SessionError::SnapshotUnrepresentable {
+                limit: 1,
+                actual: 2
+            })
+        ));
+        assert!(
+            !callback_reached.get(),
+            "snapshot export must fail before the subscription boundary"
+        );
+        assert!(existing.termination().is_none());
+
+        session.outbound_hub.publish(&empty_tx(1, 2));
+        let received = existing
+            .try_recv_class(crate::outbound::LogicalChannelClass::Ui)
+            .expect("existing receiver remains healthy")
+            .expect("published transaction")
+            .into_transaction()
+            .expect("UI transaction");
+        assert_eq!(received, empty_tx(1, 2));
     }
 
     #[test]

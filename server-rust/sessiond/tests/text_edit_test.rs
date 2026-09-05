@@ -1,16 +1,20 @@
 //! Authoritative `TEXT_EDIT` processing: sequence watermarks, policy, and generation barriers
 //! (§18.3, §22.6, §26, §27).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
 use srui_protocol::Event as WireEvent;
 use srui_sdk::{Surface, TextInput};
 use srui_semantic_tree::{
-    EditSeq, Event as DomainEvent, EventValidationError, NodeId, PropertyRef,
-    StandardValidationState, Value,
+    EditSeq, Event as DomainEvent, EventValidationError, NodeId, Operation, PropertyRef,
+    StandardValidationState, Transaction as DomainTransaction, Value,
 };
-use srui_sessiond::{EventOutcome, Session, SessionError, TextEditDecision, MAX_TEXT_EDIT_STREAMS};
+use srui_sessiond::{
+    EventOutcome, LogicalChannelClass, Session, SessionError, TextEditDecision,
+    MAX_TEXT_EDIT_STREAMS,
+};
 
 const CLIENT: &[u8] = b"text-client";
 const EDITOR: u64 = 2;
@@ -150,9 +154,58 @@ fn older_validation_cannot_publish_after_newer_generation() {
 }
 
 #[test]
+fn in_flight_higher_edit_sequence_rejects_lower_concurrent_edit() {
+    let session = Session::new("text-in-flight-watermark");
+    seed_editor(&session);
+
+    let high_entered = Arc::new(Barrier::new(2));
+    let release_high = Arc::new(Barrier::new(2));
+    session.on_text_edit({
+        let high_entered = Arc::clone(&high_entered);
+        let release_high = Arc::clone(&release_high);
+        move |_, request| {
+            if request.edit_seq == edit_seq(2) {
+                high_entered.wait();
+                release_high.wait();
+            }
+            TextEditDecision::Accept
+        }
+    });
+
+    let high_session = session.clone();
+    let high = thread::spawn(move || high_session.process_event(&text_edit(1, "high", "two", 2)));
+    high_entered.wait();
+
+    match session
+        .process_event(&text_edit(2, "lower", "one", 1))
+        .expect("lower edit settles")
+    {
+        EventOutcome::Rejected {
+            error:
+                EventValidationError::StaleEditSeq {
+                    observed: 1,
+                    watermark: 2,
+                },
+            ..
+        } => {}
+        other => panic!("expected in-flight watermark rejection, got {other:?}"),
+    }
+
+    release_high.wait();
+    match high.join().expect("high thread").expect("high edit") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("expected higher edit processed, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "two");
+}
+
+#[test]
 fn reject_publishes_error_validation_and_authoritative_value() {
     let session = Session::new("text-reject");
     seed_editor(&session);
+    let mut receiver = session
+        .subscribe_transactions(CLIENT.to_vec())
+        .expect("subscribe before rejection");
     session.on_text_edit(|_, _| TextEditDecision::Reject {
         value: Some("corrected".into()),
         reason: "not allowed".into(),
@@ -173,6 +226,58 @@ fn reject_publishes_error_validation_and_authoritative_value() {
         editor_validation(&session),
         Some(StandardValidationState::Error)
     );
+
+    let published = receiver
+        .try_recv_class(LogicalChannelClass::Ui)
+        .expect("receive correction")
+        .expect("published correction transaction")
+        .into_transaction()
+        .expect("UI transaction");
+    let published = DomainTransaction::try_from(published).expect("valid correction transaction");
+    assert_eq!(
+        published.operations,
+        vec![
+            Operation::SetProperty {
+                id: NodeId::new(EDITOR),
+                property: PropertyRef::VALUE,
+                value: Value::String("corrected".into()),
+            },
+            Operation::SetProperty {
+                id: NodeId::new(EDITOR),
+                property: PropertyRef::VALIDATION_STATE,
+                value: Value::EnumToken(StandardValidationState::Error.into()),
+            },
+        ],
+        "the authoritative correction and validation state must reach the outbound UI lane"
+    );
+}
+
+#[test]
+fn policy_panic_abandons_reservation_and_allows_identical_retry() {
+    let session = Session::new("text-policy-panic-retry");
+    seed_editor(&session);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    session.on_text_edit({
+        let attempts = Arc::clone(&attempts);
+        move |_, _| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("policy failed once");
+            }
+            TextEditDecision::Accept
+        }
+    });
+
+    let event = text_edit(1, "retry", "eventually accepted", 1);
+    match session.process_event(&event) {
+        Err(SessionError::Panicked(reason)) => assert_eq!(reason, "policy failed once"),
+        other => panic!("expected caught policy panic, got {other:?}"),
+    }
+    match session.process_event(&event).expect("identical retry") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("abandoned reservation must allow retry, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "eventually accepted");
 }
 
 #[test]
@@ -484,7 +589,7 @@ fn disabling_editor_during_policy_rejects_without_publishing() {
     });
 
     match session
-        .process_event(&text_edit(1, "disabled", "should-not-land", 1))
+        .process_event(&text_edit(1, "disabled", "should-not-land", 5))
         .expect("settled")
     {
         EventOutcome::Rejected {
@@ -492,6 +597,30 @@ fn disabling_editor_during_policy_rejects_without_publishing() {
             ..
         } => assert_eq!(id, NodeId::new(EDITOR)),
         other => panic!("expected NodeDisabled, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "");
+
+    session.clear_text_edit_policy();
+    session
+        .transaction(|ui| {
+            ui.set(NodeId::new(EDITOR), PropertyRef::ENABLED, Value::Bool(true))?;
+            Ok(())
+        })
+        .expect("re-enable editor");
+
+    match session
+        .process_event(&text_edit(2, "stale-after-reject", "must-not-land", 4))
+        .expect("stale edit settles")
+    {
+        EventOutcome::Rejected {
+            error:
+                EventValidationError::StaleEditSeq {
+                    observed: 4,
+                    watermark: 5,
+                },
+            ..
+        } => {}
+        other => panic!("rejected reservation must advance the terminal watermark, got {other:?}"),
     }
     assert_eq!(editor_value(&session), "");
 }

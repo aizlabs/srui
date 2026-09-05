@@ -151,6 +151,31 @@ struct ControlFactoryPropertyTests {
         #expect(renderedText(in: handle) == "")
     }
 
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func clearingValueFallsBackToText(nodeType: TypeRef) throws {
+        let nodeID = NodeId(1)
+        var store = SemanticStore()
+        try store.createNode(
+            id: nodeID,
+            nodeType: nodeType,
+            properties: [(.text, .string("fallback"))]
+        )
+        let node = try #require(store.getNode(nodeID))
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: node, store: store)
+
+        factory.apply(
+            property: .value,
+            value: .string("canonical"),
+            to: handle,
+            store: store
+        )
+        #expect(renderedText(in: handle) == "canonical")
+
+        factory.apply(property: .value, value: nil, to: handle, store: store)
+        #expect(renderedText(in: handle) == "fallback")
+    }
+
     @Test(arguments: [
         Value.float64(0.25), .signedInt(1), .unsignedInt(1),
     ])

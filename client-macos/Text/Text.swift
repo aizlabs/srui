@@ -257,7 +257,8 @@ public final class TextEditingSession {
         if state.pendingValue != nil {
             return true
         }
-        if let flushed = state.lastFlushedValue, flushed != state.lastSubmittedValue {
+        guard let submitted = state.lastSubmittedValue else { return false }
+        if let flushed = state.lastFlushedValue, flushed != submitted {
             return true
         }
         return false

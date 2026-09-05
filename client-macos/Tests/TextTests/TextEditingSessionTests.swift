@@ -374,6 +374,19 @@ struct TextEditingSessionTests {
         )
         session.noteLocalValue("food", nodeID: nodeID, composing: false, flushImmediately: true)
         #expect(session.hasUnsentSuccessorDraft(for: nodeID))
+        session.noteAcknowledged(
+            Event.textEdit(
+                eventSeq: 1,
+                eventId: EventId(string: "e1"),
+                observedRevision: Revision(1),
+                nodeId: nodeID,
+                text: "foo",
+                editSeq: try #require(EditSeq(1))
+            )
+        )
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID))
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "bar") == .apply)
+        #expect(!session.hasUnsentSuccessorDraft(for: nodeID))
     }
 
     @Test("Composition end does not flush the previous marked string")

@@ -252,6 +252,39 @@ private struct PartialAssembly {
     }
 }
 
+package typealias ResourceReferenceMutation = @MainActor @Sendable () -> Void
+
+/// Linearizes native cache mutation with connection-owner replacement on MainActor.
+///
+/// AppKit rendering is synchronous and MainActor-isolated, so owner activation and the complete
+/// native mutation form one actor order without holding a blocking lock across a remount.
+@MainActor
+private final class ResourceReferenceOwnerFence: Sendable {
+    private var activeOwnerEpoch: UInt64?
+
+    nonisolated init() {}
+
+    func activate(epoch: UInt64) -> Bool {
+        if let activeOwnerEpoch, epoch < activeOwnerEpoch { return false }
+        activeOwnerEpoch = epoch
+        return true
+    }
+
+    func performIfActive<Value: Sendable>(
+        epoch: UInt64,
+        _ body: @MainActor @Sendable () -> Value
+    ) -> Value? {
+        guard activeOwnerEpoch == epoch else { return nil }
+        return body()
+    }
+}
+
+private struct RenderReferenceLease {
+    var ownerEpoch: UInt64
+    var renderToken: UUID
+    var hashes: Set<ResourceHash>
+}
+
 // MARK: - ResourceCache actor
 
 /// Content-addressed resource cache with separate committed CAS and partial assemblies (§14, §26).
@@ -271,6 +304,12 @@ public actor ResourceCache {
     private var inFlightBytes: Int = 0
     /// Hashes currently shown by live Image nodes; never evicted while live (§14, §26).
     private var liveReferences: Set<ResourceHash> = []
+    /// Process-wide monotonic connection owner for every managed cache mutation.
+    private var activeReferenceOwnerEpoch: UInt64?
+    /// MainActor counterpart of `activeReferenceOwnerEpoch` for native commit dispatch.
+    private nonisolated let referenceOwnerFence = ResourceReferenceOwnerFence()
+    /// At most one renderer ownership token is active per bound EventOutbox connection.
+    private var renderReferenceLease: RenderReferenceLease?
 
     public init(limits: ResourceLimits = ResourceLimits()) {
         self.limits = limits
@@ -325,6 +364,7 @@ public actor ResourceCache {
     public func setLiveReferencesAndLookup(
         _ hashes: Set<ResourceHash>
     ) -> [ValidatedDecodedImage] {
+        guard activeReferenceOwnerEpoch == nil else { return [] }
         liveReferences = hashes
         let hits = committedOrder.filter { hashes.contains($0) }
         for hash in hits {
@@ -333,15 +373,159 @@ public actor ResourceCache {
         return hits.compactMap { committed[$0] }
     }
 
-    /// Discards all in-flight assemblies while retaining the committed CAS (§14, §18).
+    /// Returns matching verified images without changing pins or LRU order.
+    public func peekCommitted(_ hashes: Set<ResourceHash>) -> [ValidatedDecodedImage] {
+        committedOrder.compactMap { hash in
+            guard hashes.contains(hash) else { return nil }
+            return committed[hash]
+        }
+    }
+
+    /// Activates a globally newer renderer connection, retires its predecessor's partial
+    /// transfers, and replaces temporary pins with the exact renderer/store references observed
+    /// after the predecessor's render ownership was invalidated.
+    @discardableResult
+    package func activateReferenceOwner(
+        epoch: UInt64,
+        liveReferences: Set<ResourceHash>
+    ) async -> Bool {
+        if let activeReferenceOwnerEpoch {
+            guard epoch >= activeReferenceOwnerEpoch else { return false }
+            if epoch == activeReferenceOwnerEpoch {
+                guard await referenceOwnerFence.activate(epoch: epoch) else { return false }
+                return self.activeReferenceOwnerEpoch == epoch
+            }
+        }
+
+        // Publish actor ownership before the MainActor hop. A newer activation may supersede this
+        // one while it waits, so the post-hop equality check determines which caller may adopt.
+        activeReferenceOwnerEpoch = epoch
+        self.liveReferences = liveReferences
+        renderReferenceLease = nil
+        discardAllPartials()
+
+        guard await referenceOwnerFence.activate(epoch: epoch) else { return false }
+        return activeReferenceOwnerEpoch == epoch
+    }
+
+    /// Reports whether a managed connection still owns every scoped cache mutation.
+    package func isReferenceOwnerActive(ownerEpoch: UInt64) -> Bool {
+        activeReferenceOwnerEpoch == ownerEpoch
+    }
+
+    /// Runs one native resource commit only while the exact cache owner remains active.
+    package func performIfReferenceOwnerActive(
+        ownerEpoch: UInt64,
+        _ body: ResourceReferenceMutation
+    ) async -> Bool {
+        guard activeReferenceOwnerEpoch == ownerEpoch else { return false }
+        return await referenceOwnerFence.performIfActive(
+            epoch: ownerEpoch,
+            body
+        ) != nil
+    }
+
+    /// Runs a synchronous AppKit render only while both its cache owner and exact preload lease
+    /// remain active. The owner fence and EventOutbox's render-token fence are nested on MainActor,
+    /// so neither connection replacement nor same-connection render supersession can interleave
+    /// between authorization and native mutation.
+    package func performIfRenderReferenceOwnerActive<Value: Sendable>(
+        ownerEpoch: UInt64,
+        renderToken: UUID,
+        _ body: @MainActor @Sendable () -> Value
+    ) async -> Value? {
+        guard activeReferenceOwnerEpoch == ownerEpoch,
+              renderReferenceLease?.ownerEpoch == ownerEpoch,
+              renderReferenceLease?.renderToken == renderToken else {
+            return nil
+        }
+        return await referenceOwnerFence.performIfActive(
+            epoch: ownerEpoch,
+            body
+        )
+    }
+
+    /// Atomically pins a renderer snapshot and preloads its committed images.
+    ///
+    /// The exact connection epoch and render token prevent a stale same- or cross-connection
+    /// update from changing global pins. EventOutbox guarantees one active renderer token per
+    /// connection; a second distinct token fails closed.
+    package func beginRenderReferenceLease(
+        ownerEpoch: UInt64,
+        renderToken: UUID,
+        hashes: Set<ResourceHash>
+    ) -> [ValidatedDecodedImage]? {
+        guard ownerEpoch == activeReferenceOwnerEpoch else { return nil }
+        if let lease = renderReferenceLease,
+           lease.ownerEpoch != ownerEpoch || lease.renderToken != renderToken {
+            return nil
+        }
+        renderReferenceLease = RenderReferenceLease(
+            ownerEpoch: ownerEpoch,
+            renderToken: renderToken,
+            hashes: hashes
+        )
+        return peekCommitted(hashes)
+    }
+
+    /// Promotes a rendered token's exact current references and releases its temporary pins in one
+    /// actor operation, leaving no eviction window between the two states.
+    @discardableResult
+    package func finishRenderReferenceLease(
+        ownerEpoch: UInt64,
+        renderToken: UUID,
+        liveReferences: Set<ResourceHash>
+    ) -> Bool {
+        guard ownerEpoch == activeReferenceOwnerEpoch,
+              renderReferenceLease?.ownerEpoch == ownerEpoch,
+              renderReferenceLease?.renderToken == renderToken else {
+            return false
+        }
+        self.liveReferences = liveReferences
+        renderReferenceLease = nil
+        return true
+    }
+
+    /// Discards unmanaged in-flight assemblies while retaining the committed CAS (§14, §18).
+    /// Once connection ownership is activated, callers must use the scoped overload.
     public func clearPartials() {
+        guard activeReferenceOwnerEpoch == nil else { return }
+        discardAllPartials()
+    }
+
+    /// Discards in-flight assemblies only for the active managed connection.
+    @discardableResult
+    package func clearPartials(ownerEpoch: UInt64) -> Bool {
+        guard activeReferenceOwnerEpoch == ownerEpoch else { return false }
+        discardAllPartials()
+        return true
+    }
+
+    private func discardAllPartials() {
         partials.removeAll(keepingCapacity: false)
         inFlightBytes = 0
     }
 
-    /// Announces metadata for a forthcoming (or empty) resource transfer (§14).
+    /// Announces metadata before managed connection ownership has been activated.
     @discardableResult
     public func ingestMetadata(_ input: ResourceMetadataInput) throws -> ResourceCommit? {
+        guard activeReferenceOwnerEpoch == nil else { return nil }
+        return try ingestMetadataForActiveOwner(input)
+    }
+
+    /// Announces metadata only for the active managed connection.
+    @discardableResult
+    package func ingestMetadata(
+        _ input: ResourceMetadataInput,
+        ownerEpoch: UInt64
+    ) throws -> ResourceCommit? {
+        guard activeReferenceOwnerEpoch == ownerEpoch else { return nil }
+        return try ingestMetadataForActiveOwner(input)
+    }
+
+    private func ingestMetadataForActiveOwner(
+        _ input: ResourceMetadataInput
+    ) throws -> ResourceCommit? {
         if let existing = committed[input.resourceHash] {
             touchCommitted(input.resourceHash)
             return ResourceCommit(image: existing, newlyCommitted: false)
@@ -390,9 +574,26 @@ public actor ResourceCache {
         return nil
     }
 
-    /// Appends one contiguous chunk; may complete and commit the resource (§14, §19.2).
+    /// Appends one contiguous chunk before managed connection ownership has been activated.
     @discardableResult
     public func ingestChunk(_ input: ResourceChunkInput) throws -> ResourceCommit? {
+        guard activeReferenceOwnerEpoch == nil else { return nil }
+        return try ingestChunkForActiveOwner(input)
+    }
+
+    /// Appends one contiguous chunk only for the active managed connection.
+    @discardableResult
+    package func ingestChunk(
+        _ input: ResourceChunkInput,
+        ownerEpoch: UInt64
+    ) throws -> ResourceCommit? {
+        guard activeReferenceOwnerEpoch == ownerEpoch else { return nil }
+        return try ingestChunkForActiveOwner(input)
+    }
+
+    private func ingestChunkForActiveOwner(
+        _ input: ResourceChunkInput
+    ) throws -> ResourceCommit? {
         if let existing = committed[input.resourceHash] {
             // Idempotent: late/duplicate chunks for a committed hash are ignored.
             touchCommitted(input.resourceHash)
@@ -533,7 +734,23 @@ public actor ResourceCache {
     /// Updates the set of hashes currently referenced by live Image nodes. Eviction never drops
     /// these entries, so visible content is not permanently replaced with placeholders (§14, §26).
     public func setLiveReferences(_ hashes: Set<ResourceHash>) {
+        guard activeReferenceOwnerEpoch == nil else { return }
         liveReferences = hashes
+    }
+
+    /// Binding-scoped variant used by SessionController resource ingestion.
+    @discardableResult
+    package func setLiveReferences(
+        _ hashes: Set<ResourceHash>,
+        ownerEpoch: UInt64
+    ) -> Bool {
+        guard ownerEpoch == activeReferenceOwnerEpoch else { return false }
+        liveReferences = hashes
+        return true
+    }
+
+    private func isLiveReference(_ hash: ResourceHash) -> Bool {
+        liveReferences.contains(hash) || renderReferenceLease?.hashes.contains(hash) == true
     }
 
     /// Inserts into the committed CAS, evicting oldest *non-live* entries to honor bounds (§26).
@@ -558,7 +775,7 @@ public actor ResourceCache {
         var evicted: [ResourceHash] = []
         var projectedCount = committed.count
         var projectedBytes = committedDecodedBytes
-        for candidate in committedOrder where !liveReferences.contains(candidate) {
+        for candidate in committedOrder where !isLiveReference(candidate) {
             let next = projectedBytes.addingReportingOverflow(decodedBytes)
             if projectedCount < limits.maxCommittedEntries
                 && !next.overflow

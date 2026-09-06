@@ -5,15 +5,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use srui_protocol::Event as WireEvent;
-use srui_sdk::{Surface, TextInput};
+use srui_protocol::{ClientResume, Event as WireEvent};
+use srui_sdk::{Surface, TextInput, TEXT_EDIT};
 use srui_semantic_tree::{
     EditSeq, Event as DomainEvent, EventValidationError, NodeId, Operation, PropertyRef,
     StandardValidationState, Transaction as DomainTransaction, Value,
 };
 use srui_sessiond::{
-    EventOutcome, LogicalChannelClass, Session, SessionError, TextEditDecision,
-    MAX_TEXT_EDIT_STREAMS,
+    EventOutcome, LogicalChannelClass, ResumeOutcome, Session, SessionConfig, SessionError,
+    TextEditDecision, MAX_TEXT_EDIT_STREAMS,
 };
 
 const CLIENT: &[u8] = b"text-client";
@@ -465,10 +465,25 @@ fn non_text_event_with_edit_seq_is_rejected_at_the_wire_boundary() {
     let mut activate =
         DomainEvent::activate(1, "act", 0u64, EDITOR).with_client_instance_id(CLIENT.to_vec());
     activate.edit_seq = Some(edit_seq(1));
-    let error = session
-        .process_event(&activate.to_wire())
-        .expect_err("non-text edit_seq must fail domain parsing");
-    assert!(matches!(error, SessionError::InvalidInput(_)));
+    let wire = activate.to_wire();
+
+    match session
+        .process_event(&wire)
+        .expect("malformed event settles")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::PolicyRejected(reason),
+            ..
+        } => assert!(reason.contains("malformed event:")),
+        other => panic!("expected malformed rejection, got {other:?}"),
+    }
+    assert!(matches!(
+        session.process_event(&wire),
+        Ok(EventOutcome::Duplicate {
+            accepted: false,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -623,4 +638,271 @@ fn disabling_editor_during_policy_rejects_without_publishing() {
         other => panic!("rejected reservation must advance the terminal watermark, got {other:?}"),
     }
     assert_eq!(editor_value(&session), "");
+}
+
+#[test]
+fn registered_text_edit_handler_fires_once_for_an_accepted_edit() {
+    let session = Session::new("registered-text-handler");
+    seed_editor(&session);
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(NodeId::new(EDITOR), TEXT_EDIT, move |session, _| {
+        assert_eq!(
+            editor_value(session),
+            "accepted",
+            "registered handlers must observe the authoritative edit"
+        );
+        session
+            .transaction(|ui| {
+                ui.set(
+                    NodeId::new(EDITOR),
+                    PropertyRef::VALUE,
+                    Value::String("handler override".into()),
+                )?;
+                Ok(())
+            })
+            .expect("handler override");
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let event = text_edit(1, "registered-handler", "accepted", 1);
+    match session.process_event(&event) {
+        Ok(EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        }) => {
+            assert_eq!(
+                revision_after_effect, 3,
+                "the ACK includes the registered handler's transaction"
+            );
+            assert_eq!(last_processed_event_seq, 1);
+        }
+        other => panic!("expected processed edit, got {other:?}"),
+    }
+    assert_eq!(session.current_revision(), 3);
+    assert_eq!(editor_value(&session), "handler override");
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    match session
+        .process_event(&event)
+        .expect("replay reads the accepted result cache")
+    {
+        EventOutcome::Duplicate {
+            accepted: true,
+            revision_after_effect,
+            last_processed_event_seq,
+            reject_reason,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+            assert!(reject_reason.is_empty());
+        }
+        other => panic!("expected accepted duplicate, got {other:?}"),
+    }
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "a settled replay must not dispatch the registered handler again"
+    );
+}
+
+#[test]
+fn registered_text_edit_handler_panic_settles_the_already_committed_edit() {
+    let session = Session::new("registered-text-handler-panic");
+    seed_editor(&session);
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(NodeId::new(EDITOR), TEXT_EDIT, move |session, _| {
+        session
+            .transaction(|ui| {
+                ui.set(
+                    NodeId::new(EDITOR),
+                    PropertyRef::VALUE,
+                    Value::String("handler before panic".into()),
+                )?;
+                Ok(())
+            })
+            .expect("handler transaction before panic");
+        counter.fetch_add(1, Ordering::SeqCst);
+        panic!("registered handler failed");
+    });
+
+    let event = text_edit(1, "registered-handler-panic", "committed", 1);
+    assert!(matches!(
+        session.process_event(&event),
+        Err(SessionError::Panicked(message)) if message == "registered handler failed"
+    ));
+    assert_eq!(session.current_revision(), 3);
+    assert_eq!(editor_value(&session), "handler before panic");
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    session.clear_handlers();
+    match session
+        .process_event(&event)
+        .expect("replay reads the accepted result cache")
+    {
+        EventOutcome::Duplicate {
+            accepted: true,
+            revision_after_effect,
+            last_processed_event_seq,
+            reject_reason,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+            assert!(reject_reason.is_empty());
+        }
+        other => panic!("expected accepted duplicate after panic, got {other:?}"),
+    }
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "replay after post-commit panic must not run the handler or commit again"
+    );
+}
+
+#[test]
+fn committed_edit_survives_editor_reclamation_and_resume_until_handler_finishes() {
+    let session = Session::with_config(
+        "registered-handler-resume-race",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    seed_editor(&session);
+
+    let handler_entered = Arc::new(Barrier::new(2));
+    let release_handler = Arc::new(Barrier::new(2));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    session.on(NodeId::new(EDITOR), TEXT_EDIT, {
+        let handler_entered = Arc::clone(&handler_entered);
+        let release_handler = Arc::clone(&release_handler);
+        let invocations = Arc::clone(&invocations);
+        move |session, _| {
+            invocations.fetch_add(1, Ordering::SeqCst);
+            session
+                .transaction(|ui| {
+                    ui.delete(NodeId::new(EDITOR))?;
+                    Ok(())
+                })
+                .expect("handler deletes the editor");
+            handler_entered.wait();
+            release_handler.wait();
+        }
+    });
+
+    let event = text_edit(1, "resume-cancel-race", "committed-before-handler", 1);
+    let event_for_worker = event.clone();
+    let worker_session = session.clone();
+    let worker = thread::spawn(move || worker_session.process_event(&event_for_worker));
+
+    handler_entered.wait();
+    assert!(session.with_store(|store| store.get_node(NodeId::new(EDITOR)).is_none()));
+
+    let pending_ref = srui_protocol::PendingTextEditRef {
+        node_id: EDITOR,
+        edit_seq: 1,
+        event_seq: 1,
+        event_id: b"resume-cancel-race".to_vec(),
+    };
+    let make_resume = |pending_text_edits| ClientResume {
+        session_id: session.session_id(),
+        client_instance_id: CLIENT.to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits,
+    };
+
+    let mut wrong_sequence = pending_ref.clone();
+    wrong_sequence.event_seq = 2;
+    assert!(matches!(
+        session.bootstrap_resume(&make_resume(vec![wrong_sequence])),
+        Err(SessionError::EventSequence(_))
+    ));
+
+    let mut wrong_node = pending_ref.clone();
+    wrong_node.node_id = EDITOR + 1;
+    assert!(matches!(
+        session.bootstrap_resume(&make_resume(vec![wrong_node])),
+        Err(SessionError::InvalidInput(reason))
+            if reason.contains("does not match committed in-handler event identity")
+    ));
+    assert!(matches!(
+        session.process_event(&event),
+        Ok(EventOutcome::Pending {
+            last_processed_event_seq: 0
+        })
+    ));
+
+    let bootstrap = session
+        .bootstrap_resume(&make_resume(vec![pending_ref.clone()]))
+        .expect("same-session resync discards the client's exact pending identity");
+    match &bootstrap.outcome {
+        ResumeOutcome::Resync {
+            resync_msg,
+            snapshot_transaction,
+        } => {
+            assert_eq!(
+                resync_msg.discarded_text_edits,
+                vec![pending_ref],
+                "the client still discards its local copy during full resync"
+            );
+            assert_eq!(
+                resync_msg.last_processed_event_seq, 0,
+                "the receive frontier cannot advance before handlers finish"
+            );
+            assert_eq!(snapshot_transaction.new_revision, 3);
+        }
+        ResumeOutcome::Replay { .. } => panic!("journal gap must force resync"),
+    }
+    assert!(matches!(
+        session.process_event(&event),
+        Ok(EventOutcome::Pending {
+            last_processed_event_seq: 0
+        })
+    ));
+
+    release_handler.wait();
+    let original = worker.join().expect("worker").expect("terminal outcome");
+    match original {
+        EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+        }
+        other => panic!("authoritative commit must remain accepted, got {other:?}"),
+    }
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(session.current_revision(), 3);
+    assert!(session.with_store(|store| store.get_node(NodeId::new(EDITOR)).is_none()));
+
+    match session
+        .process_event(&event)
+        .expect("replay reads result cache")
+    {
+        EventOutcome::Duplicate {
+            accepted: true,
+            revision_after_effect,
+            last_processed_event_seq,
+            reject_reason,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+            assert!(reject_reason.is_empty());
+        }
+        other => panic!("replay must preserve cached acceptance, got {other:?}"),
+    }
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "replay must not dispatch the already-run notification"
+    );
 }

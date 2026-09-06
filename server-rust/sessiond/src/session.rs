@@ -825,8 +825,10 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
-        let domain = DomainEvent::try_from(event.clone())
-            .map_err(|error| SessionError::InvalidInput(format!("malformed event: {error}")))?;
+        let domain = match DomainEvent::try_from(event.clone()) {
+            Ok(domain) => domain,
+            Err(error) => return self.reject_malformed_event(event, error),
+        };
         if domain.event_type == TypeRef::EVENT_TEXT_EDIT {
             return self.process_text_edit(event, domain);
         }
@@ -951,6 +953,58 @@ impl Session {
         };
 
         Ok(EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        })
+    }
+
+    /// Settles a peer-controlled wire event that cannot be converted to the semantic model.
+    ///
+    /// Malformed events are still admitted to the dedupe window before rejection so a resumed
+    /// client receives the cached terminal result instead of replaying the same bad frame forever.
+    fn reject_malformed_event(
+        &self,
+        event: &Event,
+        wire_error: impl std::fmt::Display,
+    ) -> Result<EventOutcome, SessionError> {
+        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+
+        match guard.dedupe.admit_event(event)? {
+            RecordOutcome::Duplicate {
+                prior,
+                last_processed_event_seq,
+            } => {
+                return Ok(EventOutcome::Duplicate {
+                    accepted: prior.accepted,
+                    revision_after_effect: prior.revision_after_effect,
+                    last_processed_event_seq,
+                    reject_reason: prior.reject_reason,
+                });
+            }
+            RecordOutcome::Pending {
+                last_processed_event_seq,
+            } => {
+                return Ok(EventOutcome::Pending {
+                    last_processed_event_seq,
+                });
+            }
+            RecordOutcome::Fresh { .. } => {}
+        }
+
+        let error = EventValidationError::PolicyRejected(format!("malformed event: {wire_error}"));
+        let revision_after_effect = guard.store.revision().get();
+        let max_string_length = guard.store.limits().max_string_length;
+        let last_processed_event_seq = guard.dedupe.settle_event(
+            event,
+            EventOutcomeRecord {
+                accepted: false,
+                revision_after_effect,
+                reject_reason: bound_diagnostic_string(error.to_string(), max_string_length),
+            },
+        );
+
+        Ok(EventOutcome::Rejected {
+            error,
             revision_after_effect,
             last_processed_event_seq,
         })

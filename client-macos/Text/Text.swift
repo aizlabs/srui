@@ -37,6 +37,12 @@ public final class TextEditingSession {
         var pendingValue: String?
         var debounceTask: Task<Void, Never>?
         var lastFlushedValue: String?
+        /// Identity of the latest flushed callback which has not acquired a transport event ID.
+        ///
+        /// This is independent from `lastSubmittedValue`: retiring a rendered acknowledgement
+        /// must stop treating its value as an in-flight echo without hiding a newer flushed draft.
+        var unassignedFlushedEditSeq: EditSeq?
+        var unassignedFlushedValue: String?
         var lastSubmittedValue: String?
         /// Last string known to be the store's `.value` (echo or applied correction).
         var lastKnownAuthoritative: String?
@@ -89,6 +95,10 @@ public final class TextEditingSession {
         var state = nodes[event.nodeId] ?? NodeState()
         state.lastSubmittedValue = event.textArg
         state.assignedEventId = event.eventId
+        if state.unassignedFlushedEditSeq == event.editSeq {
+            state.unassignedFlushedEditSeq = nil
+            state.unassignedFlushedValue = nil
+        }
         nodes[event.nodeId] = state
     }
 
@@ -97,12 +107,13 @@ public final class TextEditingSession {
         noteAcknowledged(nodeID: event.nodeId, eventId: event.eventId)
     }
 
-    /// Clears native assignment identity only after that event's authoritative effect revision
-    /// has rendered. Keeping it until then protects local text across intervening remounts.
+    /// Retires both native assignment and echo identity after that event's authoritative effect
+    /// has rendered. A newer flushed-but-unassigned edit is tracked independently.
     public func noteAcknowledged(nodeID: NodeId, eventId: EventId) {
         guard var state = nodes[nodeID] else { return }
         if state.assignedEventId == eventId {
             state.assignedEventId = nil
+            state.lastSubmittedValue = nil
         }
         nodes[nodeID] = state
     }
@@ -115,6 +126,8 @@ public final class TextEditingSession {
         state.assignedEventId = nil
         state.lastSubmittedValue = nil
         state.pendingValue = nil
+        state.unassignedFlushedEditSeq = nil
+        state.unassignedFlushedValue = nil
         state.debounceTask?.cancel()
         state.debounceTask = nil
         let epoch = bumpLaneEpoch(nodeID: nodeID)
@@ -143,6 +156,8 @@ public final class TextEditingSession {
     public func invalidateDraft(for nodeID: NodeId) {
         guard var state = nodes[nodeID] else { return }
         state.pendingValue = nil
+        state.unassignedFlushedEditSeq = nil
+        state.unassignedFlushedValue = nil
         state.debounceTask?.cancel()
         state.debounceTask = nil
         nodes[nodeID] = state
@@ -150,7 +165,12 @@ public final class TextEditingSession {
     }
 
     /// Records a committed local string. While composition is active, remote emission is suppressed.
-    public func noteLocalValue(_ value: String, nodeID: NodeId, composing: Bool, flushImmediately: Bool) {
+    public func noteLocalValue(
+        _ value: String,
+        nodeID: NodeId,
+        composing: Bool,
+        flushImmediately: Bool
+    ) {
         guard !suppressingLocalEditsForResync else { return }
         if preservingLocalTextAcrossRemount {
             var state = nodes[nodeID] ?? NodeState()
@@ -238,9 +258,19 @@ public final class TextEditingSession {
         let next = seqValue + 1
         state.nextEditSeq = next
         state.lastFlushedValue = value
+        state.unassignedFlushedEditSeq = seq
+        state.unassignedFlushedValue = value
         state.localValue = value
         nodes[nodeID] = state
         onCommit?(nodeID, value, seq, bumpLaneEpoch(nodeID: nodeID))
+    }
+
+    /// Flushes every committed, non-composing native value before a non-text interaction is
+    /// admitted. Snapshotting the keys makes recursive commit callbacks safe.
+    public func flushAllPending() {
+        for nodeID in Array(nodes.keys) {
+            flushPending(nodeID: nodeID)
+        }
     }
 
     /// Echo of a submitted value must not overwrite newer local typing; any other published
@@ -253,36 +283,50 @@ public final class TextEditingSession {
     @discardableResult
     public func applyPublishedValue(nodeID: NodeId, published: String) -> AuthoritativeResolution {
         var state = nodes[nodeID] ?? NodeState()
-        if state.composing {
-            state.deferredAuthoritative = published
-            nodes[nodeID] = state
-            return .deferred
-        }
+
+        // Classify while composition is still active. An accepted echo is authoritative metadata,
+        // not a native replacement: recording it now prevents a later ACK from turning that same
+        // publication into a deferred correction that overwrites newer marked text.
         if let submitted = state.lastSubmittedValue, submitted == published {
             state.lastKnownAuthoritative = published
             nodes[nodeID] = state
             return .keepLocal
         }
-        let hasLocalWork = state.pendingValue != nil || state.assignedEventId != nil
+
+        let hasLocalWork = state.pendingValue != nil
+            || state.unassignedFlushedEditSeq != nil
+            || state.assignedEventId != nil
         if preservingLocalTextAcrossRemount, hasLocalWork, state.lastKnownAuthoritative == published {
             nodes[nodeID] = state
             return .keepLocal
         }
-        let hadDraft = state.pendingValue != nil || state.lastSubmittedValue != nil
+
+        // A non-echo publication is authoritative immediately even when marked text prevents its
+        // native assignment. Retire protocol-visible successors now so the acknowledgement for
+        // the corrected submit cannot promote stale E2 while E3 is still composing.
+        let hadDraft = state.pendingValue != nil
+            || state.unassignedFlushedEditSeq != nil
+            || state.lastSubmittedValue != nil
+        let deferNativeReplacement = state.composing
         state.pendingValue = nil
+        state.unassignedFlushedEditSeq = nil
+        state.unassignedFlushedValue = nil
         state.debounceTask?.cancel()
         state.debounceTask = nil
         state.lastSubmittedValue = nil
         state.lastKnownAuthoritative = published
-        state.localValue = published
-        // Authoritative replace is a new baseline: reset `lastFlushedValue` so retyping the
-        // previous submit is not treated as a no-op echo of the old flush (§22.6).
         state.lastFlushedValue = published
+        if deferNativeReplacement {
+            state.deferredAuthoritative = published
+        } else {
+            state.deferredAuthoritative = nil
+            state.localValue = published
+        }
         nodes[nodeID] = state
         if hadDraft {
             onInvalidateOutboxDraft?(nodeID, bumpLaneEpoch(nodeID: nodeID))
         }
-        return .apply
+        return deferNativeReplacement ? .deferred : .apply
     }
 
     public func localValue(for nodeID: NodeId) -> String? {
@@ -296,14 +340,20 @@ public final class TextEditingSession {
 
     /// Drops IME bookkeeping for a destroyed field editor without flushing a `TEXT_EDIT`.
     ///
-    /// A committed unflushed draft or in-flight submit is restored as `localValue` so a
-    /// remount `keepLocal` does not paint the intermediate marked string.
+    /// A deferred authoritative correction wins because the marked field editor is being
+    /// destroyed. Otherwise the newest committed local draft or in-flight submit is restored as
+    /// `localValue`, so a remount never paints an intermediate marked string.
     public func abandonComposition(nodeID: NodeId) {
         guard var state = nodes[nodeID] else { return }
+        let deferred = state.deferredAuthoritative
         state.composing = false
         state.deferredAuthoritative = nil
-        if let pending = state.pendingValue {
+        if let deferred = deferred {
+            state.localValue = deferred
+        } else if let pending = state.pendingValue {
             state.localValue = pending
+        } else if let unassigned = state.unassignedFlushedValue {
+            state.localValue = unassigned
         } else if let submitted = state.lastSubmittedValue {
             state.localValue = submitted
         }
@@ -321,16 +371,8 @@ public final class TextEditingSession {
     /// and promote it; only a submit with no successor reverts to the last store string.
     public func hasUnsentSuccessorDraft(for nodeID: NodeId) -> Bool {
         guard let state = nodes[nodeID] else { return false }
-        if state.pendingValue != nil {
-            return true
-        }
-        guard let submitted = state.lastSubmittedValue else { return false }
-        if let flushed = state.lastFlushedValue, flushed != submitted {
-            return true
-        }
-        return false
+        return state.pendingValue != nil || state.unassignedFlushedEditSeq != nil
     }
-
     public func nextEditSeqValue(for nodeID: NodeId) -> UInt64 {
         nodes[nodeID]?.nextEditSeq ?? 1
     }
@@ -352,6 +394,8 @@ public final class TextEditingSession {
             state.debounceTask = nil
             state.pendingValue = nil
             state.lastFlushedValue = nil
+            state.unassignedFlushedEditSeq = nil
+            state.unassignedFlushedValue = nil
             state.lastSubmittedValue = nil
             state.assignedEventId = nil
             state.deferredAuthoritative = nil

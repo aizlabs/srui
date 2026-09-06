@@ -43,6 +43,8 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
     case decodeFailed(String)
     /// A required handshake invariant was violated.
     case protocolViolation(String)
+    /// The committed semantic state could not be presented by the native renderer.
+    case rendererFailed(String)
     /// The transport stream ended or errored.
     case transportEnded(String)
     /// A newer reconnect attempt on the same outbox superseded this controller. Its handshake can
@@ -54,6 +56,7 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
         case .replicaDiverged(let err): return "local replica diverged: \(err)"
         case .decodeFailed(let msg): return "decode failed: \(msg)"
         case .protocolViolation(let msg): return "protocol violation: \(msg)"
+        case .rendererFailed(let msg): return "renderer failed: \(msg)"
         case .transportEnded(let msg): return "transport ended: \(msg)"
         case .superseded(let msg): return "superseded by a newer reconnect attempt: \(msg)"
         }
@@ -106,7 +109,74 @@ private enum ProtocolPhase: Equatable {
 private struct RendererUpdateResult: Sendable {
     var didRender: Bool
     var resyncLaneEpoch: UInt64?
+    var failureDescription: String? = nil
     var wasSuperseded: Bool = false
+}
+
+private struct BufferedNativeTextEdit: Sendable {
+    var nodeId: NodeId
+    var text: String
+    var editSeq: EditSeq
+    var observedRevision: Revision
+    var binding: EventOutboxConnectionBinding
+    var sessionIncarnation: EventOutboxSessionIncarnation
+    var laneEpoch: UInt64
+    var order: UInt64
+}
+
+private struct BufferedTextDraftInvalidationKey: Hashable, Sendable {
+    var nodeId: NodeId
+    var sessionIncarnation: EventOutboxSessionIncarnation
+}
+
+private struct BufferedTextDraftInvalidation: Equatable, Sendable {
+    var nodeId: NodeId
+    var laneEpoch: UInt64
+    var binding: EventOutboxConnectionBinding
+    var sessionIncarnation: EventOutboxSessionIncarnation
+    var order: UInt64
+}
+
+private struct PendingReplayFailureOwnership: Sendable {
+    var lifecycleGeneration: UInt64
+    var binding: EventOutboxConnectionBinding
+    var sessionIncarnation: EventOutboxSessionIncarnation
+    var resumeGeneration: UInt64
+}
+
+private struct SessionFailureTeardownState: Sendable {
+    var handler: @Sendable (SessionFailure) -> Void
+    var replayGeneration: UInt64?
+    var connectionBinding: EventOutboxConnectionBinding?
+    var lifecycleGeneration: UInt64
+}
+
+private actor ReceiveLoopStartGate {
+    private var isReleased = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            if isReleased {
+                continuation.resume()
+            } else {
+                waiter = continuation
+            }
+        }
+    }
+
+    func release() {
+        isReleased = true
+        waiter?.resume()
+        waiter = nil
+    }
+}
+
+private struct HandshakeSendOwnership {
+    var token: UUID
+    var lifecycleGeneration: UInt64
+    var task: Task<Void, Error>
 }
 
 /// Central coordinator managing client session lifecycle, message decoding, store application,
@@ -124,13 +194,110 @@ public final class SessionController: @unchecked Sendable {
     private let lock = NSLock()
     private var streamDecoder = SRUIMessageStreamDecoder()
     private var receiveTask: Task<Void, Never>?
+    /// The handshake send is published before it can enter Transport so stop() can cancel,
+    /// close, and await it before admitting a restarted lifecycle.
+    private var handshakeSendOwnership: HandshakeSendOwnership?
     private var isRunning = false
+    /// Keeps restart inadmissible until an in-progress stop has closed and drained the transport.
+    private var isStopping = false
+    /// Monotonic ownership for async start/stop/failure continuations.
+    private var lifecycleGeneration: UInt64 = 0
+    /// Allows only the synchronous native flush staged by terminal suspension.
+    private var isFlushingTextForDisconnect = false
     private var hasMountedInitialTree = false
     private var pendingResync = false
     /// Highest revision whose committed value has finished applying to the native renderer.
     private var lastRenderedRevision: UInt64 = 0
     private var currentSessionId: String?
+    /// Identifies this controller/transport attempt inside the shared outbox.
+    private var outboxConnectionBinding: EventOutboxConnectionBinding?
     private var actionHandlerWired = false
+    /// Serializes native callbacks so a synchronous text flush is admitted before the action
+    /// which caused editing to end (§18.2, §22.6).
+    @MainActor private var interactionDispatchTail: Task<Void, Never>?
+    /// Invalidates callbacks queued by an older authoritative text incarnation even when a
+    /// replacement session keeps the same outbox connection binding.
+    @MainActor private var interactionIncarnation: UInt64 = 0
+    /// Actor-validated session-incarnation authority carried by every interaction admission.
+    /// Protected by `lock` so public async send APIs can capture it before their first await.
+    private var outboxSessionIncarnation: EventOutboxSessionIncarnation?
+    /// Text intent is durable before its transport Task joins the serialized dispatch tail.
+    @MainActor private var bufferedNativeTextEdits: [NodeId: BufferedNativeTextEdit] = [:]
+    @MainActor private var nextBufferedNativeTextOrder: UInt64 = 0
+    /// Native correction invalidations are durable until the actor applies them. The tail keeps
+    /// ordinary callbacks ordered; acknowledgement resolution also drains them synchronously.
+    @MainActor private var bufferedTextDraftInvalidations:
+        [BufferedTextDraftInvalidationKey: BufferedTextDraftInvalidation] = [:]
+    @MainActor private var nextBufferedTextDraftInvalidationOrder: UInt64 = 0
+    @MainActor private var textDraftInvalidationTail: Task<Void, Never>?
+    @MainActor var bufferedNativeTextEditCountForTesting: Int {
+        bufferedNativeTextEdits.count
+    }
+    @MainActor var suspendsTextDraftInvalidationDispatchForTesting = false
+    /// Deterministic internal fault seams for renderer lifecycle regression tests.
+    @MainActor var rendererUpdateInterceptorForTesting: (() throws -> Void)?
+    private var _liveTransactionPublishedInterceptorForTesting: (@Sendable () async -> Void)?
+    var liveTransactionPublishedInterceptorForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _liveTransactionPublishedInterceptorForTesting } }
+        set { withStateLock { _liveTransactionPublishedInterceptorForTesting = newValue } }
+    }
+    private var _resumeRecoverySnapshotLoadedInterceptorForTesting: (@Sendable () async -> Void)?
+    var resumeRecoverySnapshotLoadedInterceptorForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _resumeRecoverySnapshotLoadedInterceptorForTesting } }
+        set { withStateLock { _resumeRecoverySnapshotLoadedInterceptorForTesting = newValue } }
+    }
+    private var _rendererResourcesPreloadedInterceptorForTesting: (@Sendable () async -> Void)?
+    var rendererResourcesPreloadedInterceptorForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _rendererResourcesPreloadedInterceptorForTesting } }
+        set { withStateLock { _rendererResourcesPreloadedInterceptorForTesting = newValue } }
+    }
+    private var _rendererDidRenderInterceptorForTesting: (@Sendable () async -> Void)?
+    var rendererDidRenderInterceptorForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _rendererDidRenderInterceptorForTesting } }
+        set { withStateLock { _rendererDidRenderInterceptorForTesting = newValue } }
+    }
+    private var _interactionWillEnterOutboxForTesting: (@Sendable () async -> Void)?
+    var interactionWillEnterOutboxForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _interactionWillEnterOutboxForTesting } }
+        set { withStateLock { _interactionWillEnterOutboxForTesting = newValue } }
+    }
+    private var _receiveLoopWillAdoptForTesting: (@Sendable () async -> Void)?
+    var receiveLoopWillAdoptForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _receiveLoopWillAdoptForTesting } }
+        set { withStateLock { _receiveLoopWillAdoptForTesting = newValue } }
+    }
+    private var _handshakeSendDidFinishForTesting: (@Sendable () async -> Void)?
+    var handshakeSendDidFinishForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _handshakeSendDidFinishForTesting } }
+        set { withStateLock { _handshakeSendDidFinishForTesting = newValue } }
+    }
+    private var _pendingReplayFailureWillReportForTesting: (@Sendable () async -> Void)?
+    var pendingReplayFailureWillReportForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _pendingReplayFailureWillReportForTesting } }
+        set { withStateLock { _pendingReplayFailureWillReportForTesting = newValue } }
+    }
+    private var _stopWillRetireMountForTesting: (@Sendable () async -> Void)?
+    var stopWillRetireMountForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _stopWillRetireMountForTesting } }
+        set { withStateLock { _stopWillRetireMountForTesting = newValue } }
+    }
+    private var _textDraftInvalidationWillEnterOutboxForTesting:
+        (@Sendable () async -> Void)?
+    var textDraftInvalidationWillEnterOutboxForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _textDraftInvalidationWillEnterOutboxForTesting } }
+        set { withStateLock { _textDraftInvalidationWillEnterOutboxForTesting = newValue } }
+    }
+    private var _resourceReferencesSynchronizedInterceptorForTesting:
+        (@Sendable () async -> Void)?
+    var resourceReferencesSynchronizedInterceptorForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _resourceReferencesSynchronizedInterceptorForTesting } }
+        set { withStateLock { _resourceReferencesSynchronizedInterceptorForTesting = newValue } }
+    }
+    private var _resourceCommitReadyInterceptorForTesting: (@Sendable () async -> Void)?
+    var resourceCommitReadyInterceptorForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _resourceCommitReadyInterceptorForTesting } }
+        set { withStateLock { _resourceCommitReadyInterceptorForTesting = newValue } }
+    }
     private var _isDiverged = false
     private var _onFailure: (@Sendable (SessionFailure) -> Void)?
     private var requestedSessionId: String?
@@ -240,38 +407,120 @@ public final class SessionController: @unchecked Sendable {
         actionHandlerWired = true
 
         renderer.textEditingSession.onInvalidateOutboxDraft = { [weak self] nodeID, epoch in
-            Task { await self?.outbox.invalidateTextDraft(nodeId: nodeID, laneEpoch: epoch) }
+            guard let self,
+                  let ownership = self.withStateLock({ () -> (
+                    EventOutboxConnectionBinding,
+                    EventOutboxSessionIncarnation
+                  )? in
+                      guard let binding = self.outboxConnectionBinding,
+                            let sessionIncarnation = self.outboxSessionIncarnation else {
+                          return nil
+                      }
+                      return (binding, sessionIncarnation)
+                  }) else {
+                return
+            }
+            guard self.outbox.stageTextDraftInvalidation(
+                nodeId: nodeID,
+                laneEpoch: epoch,
+                sessionIncarnation: ownership.1
+            ) else {
+                return
+            }
+            self.bufferTextDraftInvalidation(
+                nodeId: nodeID,
+                laneEpoch: epoch,
+                binding: ownership.0,
+                sessionIncarnation: ownership.1
+            )
         }
 
-        renderer.onInteraction = { [weak self] interaction in
+        renderer.onInteraction = { [weak self, weak renderer] interaction in
             guard let self else { return }
+            let acceptsInteraction = self.withStateLock {
+                (self.isRunning && !self.isStopping && !self._isDiverged)
+                    || self.isFlushingTextForDisconnect
+            }
+            guard acceptsInteraction else { return }
 
-            // §7.7: `observed_revision` is the revision the user was actually looking at when the
+            // §7.7: observed_revision is the revision the user was actually looking at when the
             // control was interacted with, and the server validates that the action is still enabled
             // and permitted at that revision. It must therefore be sampled synchronously here on the
             // MainActor — reading it after a suspension point would report a revision the user
             // never saw and defeat that staleness check.
             let observedRev = self.applier.currentSnapshot.revision
 
-            Task {
+            // AppKit can report the button/menu action before the editor's debounce fires. Flush
+            // every committed, non-composing native value synchronously; each recursive text-edit
+            // callback is appended to the same dispatch tail before this action is appended.
+            switch interaction {
+            case .textEdit:
+                break
+            case .activate, .valueChanged, .selectionChanged:
+                renderer?.textEditingSession.flushAllPending()
+            }
+
+            guard let ownership = self.withStateLock({ () -> (
+                EventOutboxConnectionBinding,
+                EventOutboxSessionIncarnation
+            )? in
+                guard let binding = self.outboxConnectionBinding,
+                      let sessionIncarnation = self.outboxSessionIncarnation else {
+                    return nil
+                }
+                return (binding, sessionIncarnation)
+            }) else {
+                SessionDiagnostics.error("Interaction dispatch skipped without outbox session ownership")
+                return
+            }
+            let (binding, sessionIncarnation) = ownership
+            if case .textEdit(let nodeID, let text, let editSeq, let laneEpoch) = interaction {
+                self.bufferNativeTextEdit(
+                    nodeId: nodeID,
+                    text: text,
+                    editSeq: editSeq,
+                    observedRevision: observedRev,
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation,
+                    laneEpoch: laneEpoch
+                )
+            }
+            let incarnation = self.interactionIncarnation
+            let predecessor = self.interactionDispatchTail
+            let dispatch = Task { [weak self] in
+                _ = await predecessor?.result
+                guard let self,
+                      !Task.isCancelled,
+                      self.interactionIncarnation == incarnation else {
+                    return
+                }
+                if let interceptor = self.interactionWillEnterOutboxForTesting {
+                    await interceptor()
+                }
                 do {
                     switch interaction {
                     case .activate(let nodeID):
                         try await self.sendActivate(
                             nodeId: nodeID,
-                            observedRevision: observedRev
+                            observedRevision: observedRev,
+                            binding: binding,
+                            sessionIncarnation: sessionIncarnation
                         )
                     case .valueChanged(let nodeID, let value):
                         try await self.sendValueChanged(
                             nodeId: nodeID,
                             observedRevision: observedRev,
-                            value: value
+                            value: value,
+                            binding: binding,
+                            sessionIncarnation: sessionIncarnation
                         )
                     case .selectionChanged(let nodeID, let itemID):
                         try await self.sendSelectionChanged(
                             nodeId: nodeID,
                             observedRevision: observedRev,
-                            itemId: itemID
+                            itemId: itemID,
+                            binding: binding,
+                            sessionIncarnation: sessionIncarnation
                         )
                     case .textEdit(let nodeID, let text, let editSeq, let laneEpoch):
                         // Retain and record assignment before awaiting the transport. A write may
@@ -281,17 +530,28 @@ public final class SessionController: @unchecked Sendable {
                             text: text,
                             editSeq: editSeq,
                             observedRevision: observedRev,
+                            binding: binding,
+                            sessionIncarnation: sessionIncarnation,
                             via: self.transport,
                             laneEpoch: laneEpoch,
                             onAssigned: { [weak self] event in
-                                await self?.noteAssignedTextEdits([event])
+                                self?.noteAssignedTextEdits([event])
                             }
+                        )
+                        self.clearBufferedNativeTextEdit(
+                            nodeId: nodeID,
+                            editSeq: editSeq,
+                            binding: binding,
+                            sessionIncarnation: sessionIncarnation
                         )
                     }
                 } catch {
+                    // Before-admission failures leave the synchronous bridge intact for terminal
+                    // handoff. A post-retention send failure is harmlessly re-staged by identity.
                     SessionDiagnostics.error("Interaction dispatch failed: \(error)")
                 }
             }
+            self.interactionDispatchTail = dispatch
         }
 
         renderer.onCollectionRangeRequest = { [weak self, weak renderer] request in
@@ -307,6 +567,184 @@ public final class SessionController: @unchecked Sendable {
                 renderer?.noteDroppedCollectionRange(request)
             }
         }
+    }
+
+    @MainActor
+    private func bufferNativeTextEdit(
+        nodeId: NodeId,
+        text: String,
+        editSeq: EditSeq,
+        observedRevision: Revision,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation,
+        laneEpoch: UInt64
+    ) {
+        if let existing = bufferedNativeTextEdits[nodeId],
+           existing.editSeq.rawValue >= editSeq.rawValue {
+            return
+        }
+        if nextBufferedNativeTextOrder < UInt64.max {
+            nextBufferedNativeTextOrder += 1
+        }
+        bufferedNativeTextEdits[nodeId] = BufferedNativeTextEdit(
+            nodeId: nodeId,
+            text: text,
+            editSeq: editSeq,
+            observedRevision: observedRevision,
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            laneEpoch: laneEpoch,
+            order: nextBufferedNativeTextOrder
+        )
+    }
+
+    @MainActor
+    private func clearBufferedNativeTextEdit(
+        nodeId: NodeId,
+        editSeq: EditSeq,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) {
+        guard let buffered = bufferedNativeTextEdits[nodeId],
+              buffered.editSeq == editSeq,
+              buffered.binding == binding,
+              buffered.sessionIncarnation == sessionIncarnation else {
+            return
+        }
+        bufferedNativeTextEdits[nodeId] = nil
+    }
+
+    @MainActor
+    private func bufferTextDraftInvalidation(
+        nodeId: NodeId,
+        laneEpoch: UInt64,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) {
+        if let buffered = bufferedNativeTextEdits[nodeId],
+           buffered.binding == binding,
+           buffered.sessionIncarnation == sessionIncarnation,
+           buffered.laneEpoch < laneEpoch {
+            bufferedNativeTextEdits[nodeId] = nil
+        }
+
+        let key = BufferedTextDraftInvalidationKey(
+            nodeId: nodeId,
+            sessionIncarnation: sessionIncarnation
+        )
+        if let existing = bufferedTextDraftInvalidations[key],
+           existing.laneEpoch >= laneEpoch {
+            return
+        }
+        if nextBufferedTextDraftInvalidationOrder < UInt64.max {
+            nextBufferedTextDraftInvalidationOrder += 1
+        }
+        let invalidation = BufferedTextDraftInvalidation(
+            nodeId: nodeId,
+            laneEpoch: laneEpoch,
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            order: nextBufferedTextDraftInvalidationOrder
+        )
+        bufferedTextDraftInvalidations[key] = invalidation
+        guard !suspendsTextDraftInvalidationDispatchForTesting else { return }
+
+        let predecessor = textDraftInvalidationTail
+        let dispatch = Task { [weak self] in
+            _ = await predecessor?.result
+            guard let self, !Task.isCancelled else { return }
+            await self.drainBufferedTextDraftInvalidations(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+        textDraftInvalidationTail = dispatch
+    }
+
+    private func drainBufferedTextDraftInvalidations(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async {
+        while true {
+            guard let invalidation = await MainActor.run(body: {
+                self.bufferedTextDraftInvalidations.values
+                    .filter {
+                        $0.binding == binding
+                            && $0.sessionIncarnation == sessionIncarnation
+                    }
+                    .min { $0.order < $1.order }
+            }) else {
+                return
+            }
+            if let interceptor = textDraftInvalidationWillEnterOutboxForTesting {
+                await interceptor()
+            }
+            _ = await outbox.invalidateTextDraft(
+                nodeId: invalidation.nodeId,
+                laneEpoch: invalidation.laneEpoch,
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+            await MainActor.run {
+                let key = BufferedTextDraftInvalidationKey(
+                    nodeId: invalidation.nodeId,
+                    sessionIncarnation: invalidation.sessionIncarnation
+                )
+                guard self.bufferedTextDraftInvalidations[key] == invalidation else {
+                    return
+                }
+                self.bufferedTextDraftInvalidations[key] = nil
+            }
+        }
+    }
+
+    @MainActor
+    private func takeBufferedTextDraftInvalidations(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) -> [TextDraftInvalidation] {
+        let owned = bufferedTextDraftInvalidations.values
+            .filter {
+                $0.binding == binding
+                    && $0.sessionIncarnation == sessionIncarnation
+            }
+            .sorted { $0.order < $1.order }
+        for invalidation in owned {
+            let key = BufferedTextDraftInvalidationKey(
+                nodeId: invalidation.nodeId,
+                sessionIncarnation: invalidation.sessionIncarnation
+            )
+            guard bufferedTextDraftInvalidations[key] == invalidation else { continue }
+            bufferedTextDraftInvalidations[key] = nil
+        }
+        return owned.map {
+            TextDraftInvalidation(nodeId: $0.nodeId, laneEpoch: $0.laneEpoch)
+        }
+    }
+
+    @MainActor
+    private func discardBufferedNativeTextEdits(before laneEpoch: UInt64) {
+        advanceInteractionIncarnation()
+        for nodeId in Array(bufferedNativeTextEdits.keys) {
+            guard let edit = bufferedNativeTextEdits[nodeId],
+                  edit.laneEpoch < laneEpoch else {
+                continue
+            }
+            bufferedNativeTextEdits[nodeId] = nil
+        }
+    }
+
+    @MainActor
+    private func advanceInteractionIncarnation() {
+        precondition(
+            interactionIncarnation < UInt64.max,
+            "SessionController interaction incarnation exhausted"
+        )
+        interactionIncarnation += 1
+        interactionDispatchTail?.cancel()
+        interactionDispatchTail = nil
+        textDraftInvalidationTail?.cancel()
+        textDraftInvalidationTail = nil
     }
 
     @MainActor
@@ -381,109 +819,331 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    private func sendHandshakeEnvelope(
+        _ envelope: SRUIMessage,
+        lifecycleGeneration: UInt64
+    ) async throws {
+        let framed = try SRUIFraming.encodeFramed(envelope)
+        let startGate = ReceiveLoopStartGate()
+        let token = UUID()
+        let transport = self.transport
+        let task = Task<Void, Error> {
+            await startGate.wait()
+            try Task.checkCancellation()
+            try await transport.send(data: framed, logicalClass: .control)
+        }
+        let adopted = withStateLock { () -> Bool in
+            guard self.lifecycleGeneration == lifecycleGeneration,
+                  isRunning,
+                  !isStopping,
+                  handshakeSendOwnership == nil else {
+                return false
+            }
+            handshakeSendOwnership = HandshakeSendOwnership(
+                token: token,
+                lifecycleGeneration: lifecycleGeneration,
+                task: task
+            )
+            return true
+        }
+        guard adopted else {
+            task.cancel()
+            await startGate.release()
+            _ = try? await task.value
+            throw SessionFailure.superseded(
+                "start lost lifecycle ownership before handshake send adoption"
+            )
+        }
+
+        defer {
+            withStateLock {
+                guard handshakeSendOwnership?.token == token,
+                      handshakeSendOwnership?.lifecycleGeneration == lifecycleGeneration else {
+                    return
+                }
+                handshakeSendOwnership = nil
+            }
+        }
+        await startGate.release()
+        do {
+            try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            if let interceptor = handshakeSendDidFinishForTesting {
+                await interceptor()
+            }
+        } catch {
+            if let interceptor = handshakeSendDidFinishForTesting {
+                await interceptor()
+            }
+            throw error
+        }
+    }
+
     /// Starts the session by sending a handshake request and launching the receive loop (§15, §18, §22.2).
     ///
     /// Fresh connections send `CLIENT_HELLO` with client capabilities (§15). Reconnections send `CLIENT_RESUME` (§18).
     /// The handshake must complete before any transaction or event traffic is permitted (§4 inv. 13, §15).
     public func start() async throws {
-        let shouldStart = withStateLock {
-            if isRunning { return false }
+        let lifecycleGeneration = withStateLock { () -> UInt64? in
+            guard !isRunning, !isStopping else { return nil }
+            precondition(
+                self.lifecycleGeneration < UInt64.max,
+                "SessionController lifecycle generation exhausted"
+            )
+            self.lifecycleGeneration += 1
             isRunning = true
             eventDispatchEnabled = false
             phase = .idle
-            return true
+            return self.lifecycleGeneration
         }
-        guard shouldStart else { return }
+        guard let lifecycleGeneration else { return }
 
         startRangeRequestPump()
 
-        var didStart = false
-        defer {
-            if !didStart {
-                stopRangeRequestPump()
-                withStateLock {
-                    self.isRunning = false
-                    self.requestedSessionId = nil
-                    self.resumeGeneration = nil
-                    self.eventDispatchEnabled = false
-                    self.phase = .idle
+        do {
+            let connectionBinding = await outbox.beginConnectionBinding()
+            guard ownsRunningLifecycle(lifecycleGeneration) else {
+                throw SessionFailure.superseded("start lost lifecycle ownership during binding")
+            }
+            let currentResourceReferences = await currentLiveResourceReferences()
+            guard await resourceCache.activateReferenceOwner(
+                epoch: connectionBinding.resourceOwnershipEpoch,
+                liveReferences: currentResourceReferences
+            ) else {
+                throw SessionFailure.superseded(
+                    "connection lost resource-cache ownership during binding"
+                )
+            }
+            guard ownsRunningLifecycle(lifecycleGeneration),
+                  let sessionIncarnation = await outbox.sessionIncarnation(
+                    binding: connectionBinding
+                  ) else {
+                throw SessionFailure.superseded("start lost lifecycle ownership during binding")
+            }
+            let adoptedBinding = withStateLock { () -> Bool in
+                guard self.lifecycleGeneration == lifecycleGeneration,
+                      isRunning,
+                      !isStopping else {
+                    return false
                 }
-                Task { [transport] in
-                    await transport.close()
+                outboxConnectionBinding = connectionBinding
+                outboxSessionIncarnation = sessionIncarnation
+                return true
+            }
+            guard adoptedBinding else {
+                throw SessionFailure.superseded("start lost lifecycle ownership during binding")
+            }
+
+            await MainActor.run {
+                ensureActionHandlerWired()
+            }
+            guard ownsRunningLifecycle(lifecycleGeneration) else {
+                throw SessionFailure.superseded("start lost lifecycle ownership before handshake")
+            }
+
+            let clientInstanceId = outbox.clientInstanceId
+            let requestedId = withStateLock {
+                currentSessionId ?? requestedSessionId
+            }
+            let limits = makeClientLimits()
+            let knownResourceHashes = await resourceCache.knownHashes().map(\.bytes)
+            guard ownsRunningLifecycle(lifecycleGeneration) else {
+                throw SessionFailure.superseded("start lost lifecycle ownership before handshake")
+            }
+
+            if let requestedId {
+                guard let resumeGeneration = await outbox.beginResumeAttempt(
+                    binding: connectionBinding
+                ) else {
+                    throw SessionFailure.superseded(
+                        "resume start lost its outbox connection binding"
+                    )
+                }
+                let adoptedResume = withStateLock { () -> Bool in
+                    guard self.lifecycleGeneration == lifecycleGeneration,
+                          isRunning,
+                          !isStopping else {
+                        return false
+                    }
+                    self.requestedSessionId = requestedId
+                    self.resumeGeneration = resumeGeneration
+                    return true
+                }
+                guard adoptedResume else {
+                    await outbox.stopResumeWork(generation: resumeGeneration)
+                    throw SessionFailure.superseded(
+                        "resume start lost lifecycle ownership"
+                    )
+                }
+                var resume = SRUIClientResume()
+                resume.sessionID = requestedId
+                resume.clientInstanceID = clientInstanceId.bytes
+                resume.lastAppliedRevision = applier.lastAppliedRevision.value
+                resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
+                resume.limits = limits
+                resume.knownResourceHashes = knownResourceHashes
+                resume.pendingTextEdits = await outbox.assignedTextEditDescriptors().map {
+                    $0.toWire()
+                }
+
+                var envelope = SRUIMessage()
+                envelope.clientResume = resume
+                guard ownsRunningLifecycle(lifecycleGeneration) else {
+                    await outbox.stopResumeWork(generation: resumeGeneration)
+                    throw SessionFailure.superseded(
+                        "resume start lost lifecycle ownership before send"
+                    )
+                }
+                try await sendHandshakeEnvelope(
+                    envelope,
+                    lifecycleGeneration: lifecycleGeneration
+                )
+                let adoptedPhase = withStateLock { () -> Bool in
+                    guard self.lifecycleGeneration == lifecycleGeneration,
+                          isRunning,
+                          !isStopping else {
+                        return false
+                    }
+                    phase = .awaitingResume(
+                        sessionId: requestedId,
+                        generation: resumeGeneration
+                    )
+                    return true
+                }
+                guard adoptedPhase else {
+                    await outbox.stopResumeWork(generation: resumeGeneration)
+                    throw SessionFailure.superseded(
+                        "resume start lost lifecycle ownership after send"
+                    )
+                }
+            } else {
+                var hello = SRUIClientHello()
+                hello.coreVersion = SRUICoreVersion
+                hello.profiles = clientCapabilities.toStringArray()
+                hello.clientInstanceID = clientInstanceId.bytes
+                hello.limits = limits
+                hello.knownResourceHashes = knownResourceHashes
+
+                var envelope = SRUIMessage()
+                envelope.clientHello = hello
+                guard ownsRunningLifecycle(lifecycleGeneration) else {
+                    throw SessionFailure.superseded(
+                        "fresh start lost lifecycle ownership before send"
+                    )
+                }
+                try await sendHandshakeEnvelope(
+                    envelope,
+                    lifecycleGeneration: lifecycleGeneration
+                )
+                let adoptedPhase = withStateLock { () -> Bool in
+                    guard self.lifecycleGeneration == lifecycleGeneration,
+                          isRunning,
+                          !isStopping else {
+                        return false
+                    }
+                    phase = .awaitingWelcome
+                    return true
+                }
+                guard adoptedPhase else {
+                    throw SessionFailure.superseded(
+                        "fresh start lost lifecycle ownership after send"
+                    )
                 }
             }
-        }
 
-        await MainActor.run {
-            ensureActionHandlerWired()
-        }
-
-        let clientInstanceId = outbox.clientInstanceId
-        let requestedId = withStateLock {
-            currentSessionId ?? requestedSessionId
-        }
-        let limits = makeClientLimits()
-        let knownResourceHashes = await resourceCache.knownHashes().map(\.bytes)
-
-        if let requestedId {
-            let resumeGeneration = await outbox.beginResumeAttempt()
-            withStateLock {
-                self.requestedSessionId = requestedId
-                self.resumeGeneration = resumeGeneration
+            guard ownsRunningLifecycle(lifecycleGeneration) else {
+                throw SessionFailure.superseded(
+                    "start lost lifecycle ownership before receive loop"
+                )
             }
-            var resume = SRUIClientResume()
-            resume.sessionID = requestedId
-            resume.clientInstanceID = clientInstanceId.bytes
-            resume.lastAppliedRevision = applier.lastAppliedRevision.value
-            resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
-            resume.limits = limits
-            resume.knownResourceHashes = knownResourceHashes
-            resume.pendingTextEdits = await outbox.assignedTextEditDescriptors().map { $0.toWire() }
 
-            var envelope = SRUIMessage()
-            envelope.clientResume = resume
-            guard withStateLock({ isRunning }) else { return }
-            try await transport.send(data: SRUIFraming.encodeFramed(envelope), logicalClass: .control)
-            withStateLock {
-                self.phase = .awaitingResume(sessionId: requestedId, generation: resumeGeneration)
+            // The detached loop waits behind this gate until its task is published under the
+            // lifecycle lock. A concurrent stop therefore either owns and awaits the task, or
+            // prevents it from ever entering message dispatch.
+            let receiveStartGate = ReceiveLoopStartGate()
+            let task = Task.detached { [weak self] in
+                await receiveStartGate.wait()
+                guard let self, !Task.isCancelled else { return }
+                await self.runReceiveLoop()
             }
-        } else {
-            var hello = SRUIClientHello()
-            hello.coreVersion = SRUICoreVersion
-            hello.profiles = clientCapabilities.toStringArray()
-            hello.clientInstanceID = clientInstanceId.bytes
-            hello.limits = limits
-            hello.knownResourceHashes = knownResourceHashes
-
-            var envelope = SRUIMessage()
-            envelope.clientHello = hello
-            guard withStateLock({ isRunning }) else { return }
-            try await transport.send(data: SRUIFraming.encodeFramed(envelope), logicalClass: .control)
-            withStateLock {
-                self.phase = .awaitingWelcome
+            if let interceptor = receiveLoopWillAdoptForTesting {
+                await interceptor()
             }
-        }
 
-        guard withStateLock({ isRunning }) else { return }
-
-        // Start receiving the handshake response before processing data.
-        let task = Task.detached { [weak self] in
-            guard let self else { return }
-            await self.runReceiveLoop()
+            let adopted = withStateLock { () -> Bool in
+                guard self.lifecycleGeneration == lifecycleGeneration,
+                      isRunning,
+                      !isStopping else {
+                    return false
+                }
+                receiveTask = task
+                return true
+            }
+            guard adopted else {
+                task.cancel()
+                await receiveStartGate.release()
+                await task.value
+                throw SessionFailure.superseded(
+                    "start lost lifecycle ownership before receive-loop adoption"
+                )
+            }
+            await receiveStartGate.release()
+        } catch {
+            await cleanUpFailedStart(generation: lifecycleGeneration)
+            throw error
         }
-
-        let adopted = withStateLock { () -> Bool in
-            guard isRunning else { return false }
-            self.receiveTask = task
-            return true
-        }
-        guard adopted else {
-            task.cancel()
-            return
-        }
-        didStart = true
     }
 
+    private func ownsRunningLifecycle(_ generation: UInt64) -> Bool {
+        withStateLock {
+            lifecycleGeneration == generation && isRunning && !isStopping
+        }
+    }
+
+    private func cleanUpFailedStart(generation: UInt64) async {
+        let cleanup: (
+            resumeGeneration: UInt64?,
+            connectionBinding: EventOutboxConnectionBinding?
+        )? = withStateLock {
+            guard lifecycleGeneration == generation, !isStopping else { return nil }
+            isStopping = true
+            eventDispatchEnabled = false
+            return (
+                resumeGeneration ?? activeReplayRetryGeneration,
+                outboxConnectionBinding
+            )
+        }
+        guard let cleanup else { return }
+
+        stopRangeRequestPump()
+        if let resumeGeneration = cleanup.resumeGeneration {
+            await outbox.stopResumeWork(generation: resumeGeneration)
+        }
+        await transport.close()
+        if let connectionBinding = cleanup.connectionBinding {
+            _ = await resourceCache.clearPartials(
+                ownerEpoch: connectionBinding.resourceOwnershipEpoch
+            )
+        }
+        withStateLock {
+            guard lifecycleGeneration == generation else { return }
+            handshakeSendOwnership = nil
+            receiveTask = nil
+            requestedSessionId = nil
+            resumeGeneration = nil
+            activeReplayRetryGeneration = nil
+            outboxConnectionBinding = nil
+            outboxSessionIncarnation = nil
+            isFlushingTextForDisconnect = false
+            eventDispatchEnabled = false
+            phase = .idle
+            isRunning = false
+            isStopping = false
+        }
+    }
     private func makeClientLimits() -> Srui_Protocol_ClientLimits {
         var limits = Srui_Protocol_ClientLimits()
         limits.maxFrameSize = UInt32(clamping: defaultMaxFrameSize)
@@ -502,14 +1162,47 @@ public final class SessionController: @unchecked Sendable {
     /// Dispatches a manual activation event for the given node ID (§7.7).
     @discardableResult
     public func sendActivate(nodeId: NodeId) async throws -> Event {
+        guard let ownership = withStateLock({ () -> (
+            EventOutboxConnectionBinding,
+            EventOutboxSessionIncarnation
+        )? in
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return (binding, sessionIncarnation)
+        }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
         let snapshot = applier.currentSnapshot
-        return try await sendActivate(nodeId: nodeId, observedRevision: snapshot.revision)
+        if let interceptor = interactionWillEnterOutboxForTesting {
+            await interceptor()
+        }
+        return try await sendActivate(
+            nodeId: nodeId,
+            observedRevision: snapshot.revision,
+            binding: ownership.0,
+            sessionIncarnation: ownership.1
+        )
     }
 
     @discardableResult
-    private func sendActivate(nodeId: NodeId, observedRevision: Revision) async throws -> Event {
+    private func sendActivate(
+        nodeId: NodeId,
+        observedRevision: Revision,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async throws -> Event {
+        await drainBufferedTextDraftInvalidations(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
         guard withStateLock({
-            guard eventDispatchEnabled else { return false }
+            guard eventDispatchEnabled,
+                  outboxConnectionBinding == binding,
+                  outboxSessionIncarnation == sessionIncarnation else {
+                return false
+            }
             if case .active = phase { return true }
             return false
         }) else {
@@ -518,21 +1211,61 @@ public final class SessionController: @unchecked Sendable {
         return try await outbox.sendActivate(
             nodeId: nodeId,
             observedRevision: observedRevision,
-            via: transport
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            via: transport,
+            onTextEditAssigned: { [weak self] event in
+                self?.noteAssignedTextEdits([event])
+            }
         )
     }
 
     /// Dispatches a manual value change event for the given node ID (§7.6).
     @discardableResult
     public func sendValueChanged(nodeId: NodeId, value: Value) async throws -> Event {
+        guard let ownership = withStateLock({ () -> (
+            EventOutboxConnectionBinding,
+            EventOutboxSessionIncarnation
+        )? in
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return (binding, sessionIncarnation)
+        }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
         let snapshot = applier.currentSnapshot
-        return try await sendValueChanged(nodeId: nodeId, observedRevision: snapshot.revision, value: value)
+        if let interceptor = interactionWillEnterOutboxForTesting {
+            await interceptor()
+        }
+        return try await sendValueChanged(
+            nodeId: nodeId,
+            observedRevision: snapshot.revision,
+            value: value,
+            binding: ownership.0,
+            sessionIncarnation: ownership.1
+        )
     }
 
     @discardableResult
-    private func sendValueChanged(nodeId: NodeId, observedRevision: Revision, value: Value) async throws -> Event {
+    private func sendValueChanged(
+        nodeId: NodeId,
+        observedRevision: Revision,
+        value: Value,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async throws -> Event {
+        await drainBufferedTextDraftInvalidations(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
         guard withStateLock({
-            guard eventDispatchEnabled else { return false }
+            guard eventDispatchEnabled,
+                  outboxConnectionBinding == binding,
+                  outboxSessionIncarnation == sessionIncarnation else {
+                return false
+            }
             if case .active = phase { return true }
             return false
         }) else {
@@ -542,21 +1275,61 @@ public final class SessionController: @unchecked Sendable {
             nodeId: nodeId,
             observedRevision: observedRevision,
             value: value,
-            via: transport
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            via: transport,
+            onTextEditAssigned: { [weak self] event in
+                self?.noteAssignedTextEdits([event])
+            }
         )
     }
 
     /// Dispatches a manual selection change event for the given node ID (§7.6).
     @discardableResult
     public func sendSelectionChanged(nodeId: NodeId, itemId: ItemId) async throws -> Event {
+        guard let ownership = withStateLock({ () -> (
+            EventOutboxConnectionBinding,
+            EventOutboxSessionIncarnation
+        )? in
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return (binding, sessionIncarnation)
+        }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
         let snapshot = applier.currentSnapshot
-        return try await sendSelectionChanged(nodeId: nodeId, observedRevision: snapshot.revision, itemId: itemId)
+        if let interceptor = interactionWillEnterOutboxForTesting {
+            await interceptor()
+        }
+        return try await sendSelectionChanged(
+            nodeId: nodeId,
+            observedRevision: snapshot.revision,
+            itemId: itemId,
+            binding: ownership.0,
+            sessionIncarnation: ownership.1
+        )
     }
 
     @discardableResult
-    private func sendSelectionChanged(nodeId: NodeId, observedRevision: Revision, itemId: ItemId) async throws -> Event {
+    private func sendSelectionChanged(
+        nodeId: NodeId,
+        observedRevision: Revision,
+        itemId: ItemId,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async throws -> Event {
+        await drainBufferedTextDraftInvalidations(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
         guard withStateLock({
-            guard eventDispatchEnabled else { return false }
+            guard eventDispatchEnabled,
+                  outboxConnectionBinding == binding,
+                  outboxSessionIncarnation == sessionIncarnation else {
+                return false
+            }
             if case .active = phase { return true }
             return false
         }) else {
@@ -566,7 +1339,12 @@ public final class SessionController: @unchecked Sendable {
             nodeId: nodeId,
             observedRevision: observedRevision,
             itemId: itemId,
-            via: transport
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            via: transport,
+            onTextEditAssigned: { [weak self] event in
+                self?.noteAssignedTextEdits([event])
+            }
         )
     }
 
@@ -760,7 +1538,16 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        let accepted = await outbox.confirmFreshSession(id: welcome.sessionID)
+        guard let connectionBinding = await connectionBindingForWelcome() else {
+            await reportFailure(.superseded(
+                "SERVER WELCOME lost resource-cache ownership"
+            ))
+            return
+        }
+        let accepted = await outbox.confirmFreshSession(
+            id: welcome.sessionID,
+            binding: connectionBinding
+        )
         guard accepted else {
             await reportFailure(.protocolViolation(
                 "SERVER WELCOME cannot replace an outstanding resume decision"
@@ -783,7 +1570,12 @@ public final class SessionController: @unchecked Sendable {
             }
         }
         if welcome.initialRevision > 0 {
-            await outbox.suspendNewEvents()
+            guard await outbox.suspendNewEvents(binding: connectionBinding) else {
+                await reportFailure(.superseded(
+                    "WELCOME snapshot catch-up lost its outbox connection binding"
+                ))
+                return
+            }
         } else {
             await reissueCollectionRangeRequestsIfAllowed()
         }
@@ -792,11 +1584,59 @@ public final class SessionController: @unchecked Sendable {
         )
     }
 
-    private func handleResumeOk(_ resumeOk: SRUIServerResumeOk) async {
-        let (requested, generation) = withStateLock {
-            (requestedSessionId, resumeGeneration)
+    /// Supplies a binding for direct message-injection tests that bypass `start()`. Production
+    /// connections always bind before sending their handshake.
+    private func connectionBindingForWelcome() async -> EventOutboxConnectionBinding? {
+        if let binding = withStateLock({ outboxConnectionBinding }) {
+            guard await resourceCache.isReferenceOwnerActive(
+                ownerEpoch: binding.resourceOwnershipEpoch
+            ),
+            let sessionIncarnation = await outbox.sessionIncarnation(binding: binding) else {
+                return nil
+            }
+            let adopted = withStateLock { () -> Bool in
+                guard outboxConnectionBinding == binding else { return false }
+                outboxSessionIncarnation = sessionIncarnation
+                return true
+            }
+            return adopted ? binding : nil
         }
-        guard let requested, let generation else {
+        let binding = await outbox.beginConnectionBinding()
+        let currentResourceReferences = await currentLiveResourceReferences()
+        guard await resourceCache.activateReferenceOwner(
+            epoch: binding.resourceOwnershipEpoch,
+            liveReferences: currentResourceReferences
+        ) else {
+            return nil
+        }
+        guard let sessionIncarnation = await outbox.sessionIncarnation(binding: binding) else {
+            return nil
+        }
+        withStateLock {
+            outboxConnectionBinding = binding
+            outboxSessionIncarnation = sessionIncarnation
+        }
+        return binding
+    }
+
+    private func handleResumeOk(_ resumeOk: SRUIServerResumeOk) async {
+        let (
+            requested,
+            generation,
+            connectionBinding,
+            sessionIncarnation,
+            lifecycleGeneration
+        ) = withStateLock {
+            (
+                requestedSessionId,
+                resumeGeneration,
+                outboxConnectionBinding,
+                outboxSessionIncarnation,
+                self.lifecycleGeneration
+            )
+        }
+        guard let requested, let generation, let connectionBinding,
+              let sessionIncarnation else {
             await reportFailure(.protocolViolation(
                 "Unexpected SERVER RESUME_OK without an outstanding resume"
             ))
@@ -814,13 +1654,22 @@ public final class SessionController: @unchecked Sendable {
                 id: resumeOk.sessionID,
                 lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
                 generation: generation,
+                binding: connectionBinding,
                 via: transport,
-                enableNewEventsAfterReplay: true,
+                enableNewEventsAfterReplay: false,
                 onTextEditAssigned: { [weak self] event in
-                    await self?.noteAssignedTextEdits([event])
+                    self?.noteAssignedTextEdits([event])
                 },
                 onReplayFailure: { [weak self] error in
-                    await self?.handlePendingEventReplayFailure(error)
+                    await self?.handlePendingEventReplayFailure(
+                        error,
+                        ownership: PendingReplayFailureOwnership(
+                            lifecycleGeneration: lifecycleGeneration,
+                            binding: connectionBinding,
+                            sessionIncarnation: sessionIncarnation,
+                            resumeGeneration: generation
+                        )
+                    )
                 }
             )
             guard accepted else {
@@ -834,6 +1683,20 @@ public final class SessionController: @unchecked Sendable {
             await failReplayError(generation, error)
             return
         }
+        guard await renderCommittedSnapshotBeforeResumeIfNeeded(
+            generation: generation,
+            binding: connectionBinding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return
+        }
+        guard await outbox.finishResync(generation: generation) else {
+            await failRefusedResumeDecision(
+                generation,
+                "SERVER RESUME_OK was superseded before renderer recovery completed"
+            )
+            return
+        }
         await finalizeResumeAttempt(generation) {
             let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
@@ -843,8 +1706,129 @@ public final class SessionController: @unchecked Sendable {
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = !self._isDiverged
         }
-        await noteAssignedTextEdits(await outbox.assignedTextEditEvents())
         await reissueCollectionRangeRequestsIfAllowed()
+        guard let resumedIncarnation = withStateLock({
+            outboxSessionIncarnation
+        }) else {
+            await reportFailure(.superseded(
+                "SERVER RESUME_OK lost its session-incarnation authority"
+            ))
+            return
+        }
+        await promoteReadyTextDrafts(
+            binding: connectionBinding,
+            sessionIncarnation: resumedIncarnation
+        )
+    }
+
+    /// A committed resync snapshot can outlive the connection whose AppKit mount failed. A
+    /// same-session RESUME_OK carries no replacement transaction, so remount that committed state
+    /// before either controller or outbox event dispatch is reopened.
+    private func renderCommittedSnapshotBeforeResumeIfNeeded(
+        generation: UInt64,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        let renderedRevision = withStateLock { lastRenderedRevision }
+        let ownsMountedTree = await MainActor.run { self.hasMountedInitialTree }
+        guard applier.lastAppliedRevision.value > renderedRevision || !ownsMountedTree else {
+            return true
+        }
+
+        // Reserve both the reconnect generation and AppKit render lane before loading the shared
+        // snapshot. A newer controller invalidates this lease before it can preload or remount.
+        guard let renderToken = await outbox.beginResumeRecoveryRender(
+            binding: binding,
+            generation: generation
+        ) else {
+            await failRefusedResumeDecision(
+                generation,
+                "resume recovery render was superseded before snapshot preload"
+            )
+            return false
+        }
+
+        let snapshot = applier.currentSnapshot
+        if let interceptor = resumeRecoverySnapshotLoadedInterceptorForTesting {
+            await interceptor()
+        }
+
+        // A concurrently completed render may have caught this controller up while it acquired
+        // ownership. Equal revision is still remounted when stop() retired native mount ownership.
+        let stillOwnsMountedTree = await MainActor.run { self.hasMountedInitialTree }
+        guard snapshot.revision.value > withStateLock({ lastRenderedRevision })
+                || !stillOwnsMountedTree else {
+            guard await outbox.completeResumeRecoveryRender(
+                binding: binding,
+                generation: generation,
+                renderToken: renderToken
+            ) else {
+                await failRefusedResumeDecision(
+                    generation,
+                    "resume recovery render was superseded before no-op completion"
+                )
+                return false
+            }
+            return true
+        }
+
+        let rendererUpdate = await updateRenderer(
+            transaction: nil,
+            snapshot: snapshot,
+            forceRemount: true,
+            preserveLocalTextForRemount: true,
+            binding: binding,
+            renderToken: renderToken
+        )
+        guard rendererUpdate.didRender else {
+            if rendererUpdate.wasSuperseded {
+                await failRefusedResumeDecision(
+                    generation,
+                    "resume recovery render was superseded by a newer reconnect attempt"
+                )
+                return false
+            }
+            guard await outbox.abortResumeRecoveryRender(
+                binding: binding,
+                generation: generation,
+                renderToken: renderToken
+            ) else {
+                await failRefusedResumeDecision(
+                    generation,
+                    "failed resume recovery render lost renderer ownership"
+                )
+                return false
+            }
+            await reportFailure(.rendererFailed(
+                "resume recovery mount failed: \(rendererUpdate.failureDescription ?? "unknown renderer error")"
+            ))
+            return false
+        }
+
+        guard await outbox.completeResumeRecoveryRender(
+            binding: binding,
+            generation: generation,
+            renderToken: renderToken
+        ) else {
+            await failRefusedResumeDecision(
+                generation,
+                "resume recovery render was superseded after mounting"
+            )
+            return false
+        }
+        withStateLock { lastRenderedRevision = snapshot.revision.value }
+        guard await resolveRenderedTextAcknowledgements(
+            through: snapshot.revision.value,
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            await failRefusedResumeDecision(
+                generation,
+                "resume recovery acknowledgement resolution was superseded"
+            )
+            return false
+        }
+        return true
     }
 
     private func handleResyncRequired(_ resync: SRUIServerResyncRequired, phase: ProtocolPhase) async {
@@ -861,8 +1845,26 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        let (requested, generation) = withStateLock {
-            (requestedSessionId, resumeGeneration)
+        let (
+            requested,
+            generation,
+            connectionBinding,
+            sessionIncarnation,
+            lifecycleGeneration
+        ) = withStateLock {
+            (
+                requestedSessionId,
+                resumeGeneration,
+                outboxConnectionBinding,
+                outboxSessionIncarnation,
+                self.lifecycleGeneration
+            )
+        }
+        guard let connectionBinding, let sessionIncarnation else {
+            await reportFailure(.protocolViolation(
+                "SERVER RESYNC_REQUIRED arrived without an outbox connection binding"
+            ))
+            return
         }
 
         if let requested, let generation {
@@ -879,15 +1881,27 @@ public final class SessionController: @unchecked Sendable {
                         id: resync.sessionID,
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
                         generation: generation,
+                        binding: connectionBinding,
                         via: transport,
                         enableNewEventsAfterReplay: false,
                         discardedTextEdits: resync.discardedTextEdits,
                         requireExactTextMatch: true,
                         onTextEditAssigned: { [weak self] event in
-                            await self?.noteAssignedTextEdits([event])
+                            self?.noteAssignedTextEdits([event])
+                        },
+                        onTextEditsCanceled: { [weak self] descriptors in
+                            self?.noteCanceledTextEdits(descriptors)
                         },
                         onReplayFailure: { [weak self] error in
-                            await self?.handlePendingEventReplayFailure(error)
+                            await self?.handlePendingEventReplayFailure(
+                                error,
+                                ownership: PendingReplayFailureOwnership(
+                                    lifecycleGeneration: lifecycleGeneration,
+                                    binding: connectionBinding,
+                                    sessionIncarnation: sessionIncarnation,
+                                    resumeGeneration: generation
+                                )
+                            )
                         }
                     )
                     guard accepted else {
@@ -897,7 +1911,6 @@ public final class SessionController: @unchecked Sendable {
                         )
                         return
                     }
-                    await noteCanceledTextEdits(resync.discardedTextEdits)
                 } catch let error as EventOutboxError where error == .textEditDiscardMismatch {
                     await reportFailure(.protocolViolation(
                         "same-session resync discarded_text_edits did not match assigned TEXT_EDIT identities"
@@ -919,7 +1932,13 @@ public final class SessionController: @unchecked Sendable {
                 let accepted = await outbox.prepareReplacedSession(
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                    generation: generation
+                    generation: generation,
+                    binding: connectionBinding,
+                    onTextEditingReset: { [weak self] sessionIncarnation in
+                        self?.resetTextEditingForReplacement(
+                            sessionIncarnation: sessionIncarnation
+                        )
+                    }
                 )
                 guard accepted else {
                     await failRefusedResumeDecision(
@@ -929,8 +1948,15 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
-                await resourceCache.clearPartials()
-                await renderer?.textEditingSession.resetForReplacementSession()
+                guard await resourceCache.clearPartials(
+                    ownerEpoch: connectionBinding.resourceOwnershipEpoch
+                ) else {
+                    await failRefusedResumeDecision(
+                        generation,
+                        "replacement resync lost resource-cache ownership"
+                    )
+                    return
+                }
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
@@ -955,24 +1981,34 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
-                    let applied = try await outbox.applyLiveSameSessionResync(
+                    switch try await outbox.applyLiveSameSessionResync(
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
-                        discardedTextEdits: resync.discardedTextEdits
-                    )
-                    guard applied else {
-                        SessionDiagnostics.log(
-                            "Ignoring live same-session resync superseded by a reconnect generation"
-                        )
+                        binding: connectionBinding,
+                        onTextEditsCanceled: { [weak self] descriptors in
+                            self?.noteCanceledTextEdits(descriptors)
+                        }
+                    ) {
+                    case .applied:
+                        enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
+
+                    case .resumeRequired:
+                        await reportFailure(.transportEnded(
+                            "live same-session resync requires reconnect to settle pending TEXT_EDIT identities"
+                        ))
+                        return
+
+                    case .superseded:
+                        await reportFailure(.superseded(
+                            "live same-session resync lost its outbox connection binding"
+                        ))
                         return
                     }
-                    await noteCanceledTextEdits(resync.discardedTextEdits)
                 } catch {
                     await reportFailure(.protocolViolation(
-                        "same-session live resync discarded-text confirmation failed: \(error)"
+                        "same-session live resync text-edit cancellation failed: \(error)"
                     ))
                     return
                 }
-                enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .replaced:
                 let currentId = withStateLock { currentSessionId }
@@ -982,12 +2018,29 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                await outbox.applyReplacementFrontier(
+                guard await outbox.applyReplacementFrontier(
                     id: resync.sessionID,
-                    lastProcessedEventSeq: resync.lastProcessedEventSeq
-                )
-                await resourceCache.clearPartials()
-                await renderer?.textEditingSession.resetForReplacementSession()
+                    lastProcessedEventSeq: resync.lastProcessedEventSeq,
+                    binding: connectionBinding,
+                    onTextEditingReset: { [weak self] sessionIncarnation in
+                        self?.resetTextEditingForReplacement(
+                            sessionIncarnation: sessionIncarnation
+                        )
+                    }
+                ) else {
+                    await reportFailure(.superseded(
+                        "live replacement resync lost its outbox connection binding"
+                    ))
+                    return
+                }
+                guard await resourceCache.clearPartials(
+                    ownerEpoch: connectionBinding.resourceOwnershipEpoch
+                ) else {
+                    await reportFailure(.superseded(
+                        "live replacement resync lost resource-cache ownership"
+                    ))
+                    return
+                }
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
 
             case .unspecified:
@@ -1029,11 +2082,18 @@ public final class SessionController: @unchecked Sendable {
             SessionDiagnostics.error("Ignoring malformed ResourceMetadata: \(error)")
             return
         }
+        guard let binding = withStateLock({ outboxConnectionBinding }) else { return }
+        guard await syncLiveResourceReferences(binding: binding) else { return }
 
-        await syncLiveResourceReferences()
         do {
-            if let commit = try await resourceCache.ingestMetadata(input) {
-                await dispatchResourceCommit(commit)
+            if let commit = try await resourceCache.ingestMetadata(
+                input,
+                ownerEpoch: binding.resourceOwnershipEpoch
+            ) {
+                if let interceptor = resourceCommitReadyInterceptorForTesting {
+                    await interceptor()
+                }
+                await dispatchResourceCommit(commit, binding: binding)
             }
         } catch {
             rejectedResourceHashes.insert(input.resourceHash)
@@ -1057,11 +2117,20 @@ public final class SessionController: @unchecked Sendable {
             // Already rejected (e.g. oversized metadata); do not flood diagnostics per chunk.
             return
         }
-
-        await syncLiveResourceReferences()
+        guard let binding = withStateLock({ outboxConnectionBinding }) else { return }
+        guard await syncLiveResourceReferences(binding: binding) else { return }
+        if let interceptor = resourceReferencesSynchronizedInterceptorForTesting {
+            await interceptor()
+        }
         do {
-            if let commit = try await resourceCache.ingestChunk(input) {
-                await dispatchResourceCommit(commit)
+            if let commit = try await resourceCache.ingestChunk(
+                input,
+                ownerEpoch: binding.resourceOwnershipEpoch
+            ) {
+                if let interceptor = resourceCommitReadyInterceptorForTesting {
+                    await interceptor()
+                }
+                await dispatchResourceCommit(commit, binding: binding)
             }
         } catch {
             rejectedResourceHashes.insert(input.resourceHash)
@@ -1073,22 +2142,37 @@ public final class SessionController: @unchecked Sendable {
 
     /// Pins hashes currently shown by Image nodes or referenced by the replica store so
     /// committed-CAS eviction cannot drop still-needed content (§26).
-    private func syncLiveResourceReferences() async {
-        let live = await MainActor.run { () -> Set<ResourceHash> in
+    private func currentLiveResourceReferences() async -> Set<ResourceHash> {
+        await MainActor.run {
             var hashes = self.renderer?.liveResourceHashes() ?? []
             hashes.formUnion(self.applier.currentSnapshot.store.referencedResourceHashes())
             return hashes
         }
-        await resourceCache.setLiveReferences(live)
+    }
+
+    private func syncLiveResourceReferences(
+        binding: EventOutboxConnectionBinding
+    ) async -> Bool {
+        guard withStateLock({ outboxConnectionBinding == binding }) else { return false }
+        let live = await currentLiveResourceReferences()
+        return await resourceCache.setLiveReferences(
+            live,
+            ownerEpoch: binding.resourceOwnershipEpoch
+        )
     }
 
     /// Pushes a newly committed decoded image onto AppKit on the main actor (§14, §22.2).
     ///
     /// Reconfirmed commits (`newlyCommitted == false`) still hydrate a replacement renderer that
     /// shares the cache but does not yet hold the `NSImage`.
-    private func dispatchResourceCommit(_ commit: ResourceCommit) async {
-        rejectedResourceHashes.remove(commit.image.hash)
-        await MainActor.run {
+    private func dispatchResourceCommit(
+        _ commit: ResourceCommit,
+        binding: EventOutboxConnectionBinding
+    ) async {
+        let dispatched = await resourceCache.performIfReferenceOwnerActive(
+            ownerEpoch: binding.resourceOwnershipEpoch
+        ) { [weak self] in
+            guard let self else { return }
             if !commit.evictedHashes.isEmpty {
                 self.renderer?.evictResourceImages(commit.evictedHashes)
             }
@@ -1097,6 +2181,8 @@ public final class SessionController: @unchecked Sendable {
                 self.renderer?.commitResourceImage(commit.image)
             }
         }
+        guard dispatched else { return }
+        rejectedResourceHashes.remove(commit.image.hash)
     }
 
     private static func mapResourceMetadata(_ wire: SRUIResourceMetadata) throws -> ResourceMetadataInput {
@@ -1136,6 +2222,22 @@ public final class SessionController: @unchecked Sendable {
     /// the server would refuse again, forever.
     private func handleEventAck(_ ack: SRUIServerEventAck) async {
         let eventId = EventId(ack.eventID)
+        guard let ownership = withStateLock({ () -> (
+            EventOutboxConnectionBinding,
+            EventOutboxSessionIncarnation
+        )? in
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return (binding, sessionIncarnation)
+        }) else {
+            await reportFailure(.protocolViolation(
+                "SERVER EVENT_ACK arrived without an outbox connection binding"
+            ))
+            return
+        }
+        let (connectionBinding, sessionIncarnation) = ownership
         // `session_id` is required on every ack (§18.2): it is the only proof of which incarnation
         // settled the event. Accepting an ack without it and logging would leave the event pending
         // forever — replayed on every retry, answered `duplicate`, never settled — until the
@@ -1150,6 +2252,8 @@ public final class SessionController: @unchecked Sendable {
         // The full wire identity is handed to the outbox so the identity check and the mutation it
         // guards share one actor-isolated step (§18.2).
         let settlement = await outbox.settleAcknowledgement(
+            binding: connectionBinding,
+            sessionIncarnation: sessionIncarnation,
             clientInstanceId: ClientInstanceId(ack.clientInstanceID),
             eventId: eventId,
             throughSeq: ack.lastProcessedEventSeq,
@@ -1157,6 +2261,12 @@ public final class SessionController: @unchecked Sendable {
             revisionAfterEffect: ack.revisionAfterEffect,
             textEditRejected: ack.status == .rejected
         )
+        guard settlement.connectionBound else {
+            await reportFailure(.superseded(
+                "SERVER EVENT_ACK arrived after a newer connection binding"
+            ))
+            return
+        }
         guard settlement.bound else {
             SessionDiagnostics.error(
                 "Ignoring event acknowledgement with unbound identity (session \(ack.sessionID))"
@@ -1190,40 +2300,76 @@ public final class SessionController: @unchecked Sendable {
         // keeps each editor blocked until the exact-or-later authoritative revision has rendered,
         // so an unrelated intervening transaction cannot promote the successor (§22.6).
         let renderedRevision = withStateLock { lastRenderedRevision }
-        await resolveRenderedTextAcknowledgements(through: renderedRevision)
-        await promoteReadyTextDrafts()
+        guard await resolveRenderedTextAcknowledgements(
+            through: renderedRevision,
+            binding: connectionBinding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            await reportFailure(.superseded(
+                "SERVER EVENT_ACK native resolution lost its connection binding"
+            ))
+            return
+        }
+        await promoteReadyTextDrafts(
+            binding: connectionBinding,
+            sessionIncarnation: sessionIncarnation
+        )
     }
 
-    /// A rejected `TEXT_EDIT` whose `revision_after_effect` is already applied will not be
-    /// followed by a correction transaction. Revert the native string unless a newer coalesced
-    /// draft should be promoted instead (§22.6).
-    private func revertRejectedTextEditIfNoSuccessor(_ nodeID: NodeId) async {
-        guard let renderer else { return }
-        await MainActor.run {
-            let session = renderer.textEditingSession
-            guard !session.hasUnsentSuccessorDraft(for: nodeID) else { return }
-            guard let published = session.lastKnownAuthoritative(for: nodeID) else { return }
-            if let adapter = renderer.registry.handle(for: nodeID)?.textAdapter {
-                adapter.applyAuthoritativeString(published)
-            } else {
-                _ = session.applyPublishedValue(nodeID: nodeID, published: published)
+    /// Resolves native assignment identity and any rejection revert in the same MainActor
+    /// lifecycle fence that owns the outbox barriers. A replacement binding can therefore win
+    /// before the callback or after the complete native transition, never between its two halves.
+    private func resolveRenderedTextAcknowledgements(
+        through revision: UInt64,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        await drainBufferedTextDraftInvalidations(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
+        return await outbox.releaseTextAcknowledgements(
+            through: revision,
+            binding: binding,
+            sessionIncarnation: sessionIncarnation,
+            onResolved: { [weak self] acknowledgements in
+                guard let self else { return [] }
+                guard let renderer = self.renderer else {
+                    return self.takeBufferedTextDraftInvalidations(
+                        binding: binding,
+                        sessionIncarnation: sessionIncarnation
+                    )
+                }
+                let session = renderer.textEditingSession
+                for acknowledgement in acknowledgements {
+                    session.noteAcknowledged(
+                        nodeID: acknowledgement.nodeId,
+                        eventId: acknowledgement.eventId
+                    )
+                    guard acknowledgement.rejected,
+                          !session.hasUnsentSuccessorDraft(for: acknowledgement.nodeId),
+                          let published = session.lastKnownAuthoritative(
+                            for: acknowledgement.nodeId
+                          ) else {
+                        continue
+                    }
+                    if let adapter = renderer.registry.handle(
+                        for: acknowledgement.nodeId
+                    )?.textAdapter {
+                        adapter.applyAuthoritativeString(published)
+                    } else {
+                        _ = session.applyPublishedValue(
+                            nodeID: acknowledgement.nodeId,
+                            published: published
+                        )
+                    }
+                }
+                return self.takeBufferedTextDraftInvalidations(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                )
             }
-        }
-    }
-
-    private func resolveRenderedTextAcknowledgements(through revision: UInt64) async {
-        let resolved = await outbox.releaseTextAcknowledgements(through: revision)
-        for acknowledgement in resolved {
-            await renderer?.textEditingSession.noteAcknowledged(
-                nodeID: acknowledgement.nodeId,
-                eventId: acknowledgement.eventId
-            )
-            if acknowledgement.rejected {
-                // A rejection with no correcting transaction reverts to the last published value.
-                // When a correction did render, applying that same baseline again is a no-op.
-                await revertRejectedTextEditIfNoSuccessor(acknowledgement.nodeId)
-            }
-        }
+        )
     }
 
     @discardableResult
@@ -1239,28 +2385,71 @@ public final class SessionController: @unchecked Sendable {
         )
     }
 
-    private func noteCanceledTextEdits(_ refs: [SRUIPendingTextEditRef]) async {
-        for ref in refs {
-            guard let descriptor = PendingTextEditDescriptor(wire: ref) else { continue }
-            await renderer?.textEditingSession.noteCanceled(
+    @MainActor
+    private func noteCanceledTextEdits(_ descriptors: [PendingTextEditDescriptor]) {
+        for descriptor in descriptors {
+            renderer?.textEditingSession.noteCanceled(
                 nodeID: descriptor.nodeId,
                 eventId: descriptor.eventId
             )
         }
     }
 
-    private func noteAssignedTextEdits(_ events: [Event]) async {
+    @MainActor
+    private func resetTextEditingForReplacement(
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) {
+        withStateLock {
+            outboxSessionIncarnation = sessionIncarnation
+        }
+        advanceInteractionIncarnation()
+        renderer?.textEditingSession.resetForReplacementSession()
+        bufferedNativeTextEdits.removeAll(keepingCapacity: true)
+        bufferedTextDraftInvalidations.removeAll(keepingCapacity: true)
+        nextBufferedNativeTextOrder = 0
+        nextBufferedTextDraftInvalidationOrder = 0
+    }
+
+    @MainActor
+    private func adoptFullResyncInteractionBoundary(
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) {
+        withStateLock {
+            outboxSessionIncarnation = sessionIncarnation
+        }
+        advanceInteractionIncarnation()
+        bufferedTextDraftInvalidations.removeAll(keepingCapacity: true)
+        nextBufferedTextDraftInvalidationOrder = 0
+    }
+
+    @MainActor
+    private func noteAssignedTextEdits(_ events: [Event]) {
         for event in events {
-            await renderer?.textEditingSession.noteAssigned(event)
+            renderer?.textEditingSession.noteAssigned(event)
         }
     }
 
-    private func promoteReadyTextDrafts() async {
+    private func promoteReadyTextDrafts(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async {
+        await drainBufferedTextDraftInvalidations(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
+        guard withStateLock({
+            outboxConnectionBinding == binding
+                && outboxSessionIncarnation == sessionIncarnation
+        }) else {
+            return
+        }
         do {
             _ = try await outbox.promoteReadyTextDrafts(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation,
                 via: transport,
                 onAssigned: { [weak self] event in
-                    await self?.noteAssignedTextEdits([event])
+                    self?.noteAssignedTextEdits([event])
                 }
             )
         } catch {
@@ -1271,6 +2460,22 @@ public final class SessionController: @unchecked Sendable {
     private func handleTransaction(_ wireTx: SRUITransaction) async {
         // A diverged replica cannot meaningfully apply anything until it resumes (§18).
         guard !isDiverged else { return }
+        guard let ownership = withStateLock({ () -> (
+            EventOutboxConnectionBinding,
+            EventOutboxSessionIncarnation
+        )? in
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return (binding, sessionIncarnation)
+        }) else {
+            await reportFailure(.protocolViolation(
+                "Transaction arrived without outbox session ownership"
+            ))
+            return
+        }
+        let (connectionBinding, deliveredIncarnation) = ownership
 
         let domainTx: Transaction
         do {
@@ -1289,10 +2494,11 @@ public final class SessionController: @unchecked Sendable {
             (pendingResync, resumeGeneration)
         }
 
-        // Apply and capture the committed snapshot in a single critical section so the renderer is
-        // handed exactly the store produced by this transaction (§22.2).
+        // Apply and capture the committed snapshot in the outbox's connection-ownership section so
+        // an older transport cannot mutate the shared replica after a replacement binds (§22.2).
         let applyResult: Result<TransactionSnapshot, TxnError>
-        let resyncRenderToken: UUID?
+        let renderToken: UUID?
+        let renderSessionIncarnation: EventOutboxSessionIncarnation
         if isResyncSnapshot {
             // A snapshot replaces the entire replica, so the supersession check and publish run
             // inside one outbox critical section. The latch remains closed until the snapshot has
@@ -1309,6 +2515,13 @@ public final class SessionController: @unchecked Sendable {
             }
             guard let published = await outbox.commitResyncSnapshot(
                 generation: outstandingGeneration,
+                binding: connectionBinding,
+                sessionIncarnation: deliveredIncarnation,
+                onSessionIncarnationAdvanced: { [weak self] sessionIncarnation in
+                    self?.adoptFullResyncInteractionBoundary(
+                        sessionIncarnation: sessionIncarnation
+                    )
+                },
                 publish: { self.applier.publishResyncSnapshot(prepared) },
                 committed: { result in
                     guard case .success = result else { return false }
@@ -1323,31 +2536,71 @@ public final class SessionController: @unchecked Sendable {
                 }
                 return
             }
+            guard let snapshotIncarnation = published.sessionIncarnation else {
+                await reportFailure(.protocolViolation(
+                    "committed resync snapshot did not advance interaction ownership"
+                ))
+                return
+            }
             applyResult = published.result
-            resyncRenderToken = published.renderToken
+            renderToken = published.renderToken
+            renderSessionIncarnation = snapshotIncarnation
         } else {
-            // Live-stream frames are deliveries: either a committed transaction verbatim, or a
-            // coalesced scalar delta standing in for a run of them (§12.1, §20.4).
-            applyResult = applier.applyDelivered(record: domainTx)
-            resyncRenderToken = nil
+            // Live deliveries use the same atomic bind check and reserve a MainActor render fence.
+            // Rebinding either happens after this render or invalidates it before AppKit mutation.
+            guard let published = await outbox.commitLiveRender(
+                binding: connectionBinding,
+                sessionIncarnation: deliveredIncarnation,
+                publish: { self.applier.applyDelivered(record: domainTx) },
+                committed: { result in
+                    guard case .success = result else { return false }
+                    return true
+                }
+            ) else {
+                await reportFailure(.superseded(
+                    "live transaction arrived after a newer connection binding"
+                ))
+                return
+            }
+            applyResult = published.result
+            renderToken = published.renderToken
+            renderSessionIncarnation = deliveredIncarnation
         }
 
         switch applyResult {
         case .success(let snapshot):
-            if isResyncSnapshot, resyncRenderToken == nil {
+            guard let renderToken else {
                 await reportFailure(.protocolViolation(
-                    "committed resync snapshot did not produce a renderer ownership token"
+                    "committed transaction did not produce a renderer ownership token"
                 ))
                 return
             }
 
+            if !isResyncSnapshot,
+               let interceptor = liveTransactionPublishedInterceptorForTesting {
+                await interceptor()
+            }
             let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,
                 snapshot: snapshot,
                 forceRemount: isResyncSnapshot,
                 discardTextEditsForResync: isResyncSnapshot,
-                resyncRenderToken: resyncRenderToken
+                binding: connectionBinding,
+                renderToken: renderToken
             )
+
+            if !isResyncSnapshot {
+                guard await outbox.completeLiveRender(
+                    binding: connectionBinding,
+                    sessionIncarnation: renderSessionIncarnation,
+                    renderToken: renderToken
+                ) else {
+                    await reportFailure(.superseded(
+                        "live transaction render was superseded by a newer connection binding"
+                    ))
+                    return
+                }
+            }
 
             guard rendererUpdate.didRender else {
                 if rendererUpdate.wasSuperseded {
@@ -1357,6 +2610,25 @@ public final class SessionController: @unchecked Sendable {
                     } else {
                         await reportFailure(.superseded(context))
                     }
+                } else if isResyncSnapshot {
+                    guard await outbox.abortResyncRender(
+                        laneEpoch: rendererUpdate.resyncLaneEpoch,
+                        generation: outstandingGeneration,
+                        binding: connectionBinding,
+                        renderToken: renderToken
+                    ) else {
+                        let context = "failed resync snapshot render lost renderer ownership"
+                        if let outstandingGeneration {
+                            await failRefusedResumeDecision(outstandingGeneration, context)
+                        } else {
+                            await reportFailure(.superseded(context))
+                        }
+                        return
+                    }
+                    withStateLock { self.pendingResync = false }
+                    await reportFailure(.rendererFailed(
+                        "resync snapshot update failed: \(rendererUpdate.failureDescription ?? "unknown renderer error")"
+                    ))
                 }
                 return
             }
@@ -1365,12 +2637,12 @@ public final class SessionController: @unchecked Sendable {
                 // This actor hop occurs after the native remount. Old callbacks carry a lower
                 // epoch and are discarded; genuinely post-mount edits carry the new epoch and
                 // remain queued while dispatch is still closed.
-                guard let renderToken = resyncRenderToken,
-                      await outbox.applyFullResyncTextBoundary(
-                        laneEpoch: rendererUpdate.resyncLaneEpoch,
-                        generation: outstandingGeneration,
-                        renderToken: renderToken
-                      ) else {
+                guard await outbox.applyFullResyncTextBoundary(
+                    laneEpoch: rendererUpdate.resyncLaneEpoch,
+                    generation: outstandingGeneration,
+                    binding: connectionBinding,
+                    renderToken: renderToken
+                ) else {
                     let context = "resync snapshot boundary was superseded after rendering"
                     if let outstandingGeneration {
                         await failRefusedResumeDecision(outstandingGeneration, context)
@@ -1382,14 +2654,29 @@ public final class SessionController: @unchecked Sendable {
             }
 
             withStateLock { lastRenderedRevision = snapshot.revision.value }
-            await resolveRenderedTextAcknowledgements(through: snapshot.revision.value)
+            guard await resolveRenderedTextAcknowledgements(
+                through: snapshot.revision.value,
+                binding: connectionBinding,
+                sessionIncarnation: renderSessionIncarnation
+            ) else {
+                let context = "transaction acknowledgement resolution lost its connection binding"
+                if let outstandingGeneration {
+                    await failRefusedResumeDecision(outstandingGeneration, context)
+                } else {
+                    await reportFailure(.superseded(context))
+                }
+                return
+            }
 
             if isResyncSnapshot {
                 // Only now may the outbox release the reconnect latch and promote post-snapshot
                 // intent. No unresolved pre-snapshot edit is silently merged (§18.3).
                 await completeSnapshotCatchUp()
             } else {
-                await promoteReadyTextDrafts()
+                await promoteReadyTextDrafts(
+                    binding: connectionBinding,
+                    sessionIncarnation: renderSessionIncarnation
+                )
             }
 
         case .failure(let err):
@@ -1397,8 +2684,26 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
-    private func handlePendingEventReplayFailure(_ error: String) async {
-        await reportFailure(.transportEnded("pending event replay retry failed: \(error)"))
+    private func handlePendingEventReplayFailure(
+        _ error: String,
+        ownership: PendingReplayFailureOwnership
+    ) async {
+        if let interceptor = pendingReplayFailureWillReportForTesting {
+            await interceptor()
+        }
+        let failure = SessionFailure.transportEnded(
+            "pending event replay retry failed: \(error)"
+        )
+        guard let authorized = await outbox.withActiveSessionIncarnation(
+            binding: ownership.binding,
+            sessionIncarnation: ownership.sessionIncarnation,
+            { [weak self] in
+                self?.markFailure(requiring: ownership)
+            }
+        ), let failureState = authorized else {
+            return
+        }
+        await finishFailureReport(failure, state: failureState)
     }
 
     /// Commits controller state after resume replay and abandons background retries when teardown raced completion.
@@ -1452,12 +2757,24 @@ public final class SessionController: @unchecked Sendable {
     /// Releases the snapshot latch only after authoritative state has rendered and the full-resync
     /// text boundary has reached the outbox.
     private func completeSnapshotCatchUp() async {
-        let generation = withStateLock { self.resumeGeneration }
+        let (generation, connectionBinding, sessionIncarnation) = withStateLock {
+            (
+                self.resumeGeneration,
+                self.outboxConnectionBinding,
+                self.outboxSessionIncarnation
+            )
+        }
+        guard let connectionBinding, let sessionIncarnation else {
+            await reportFailure(.protocolViolation(
+                "resync snapshot finalization lost its outbox connection binding"
+            ))
+            return
+        }
         let released: Bool
         if let generation {
             released = await outbox.finishResync(generation: generation)
         } else {
-            released = await outbox.allowNewEvents()
+            released = await outbox.allowNewEvents(binding: connectionBinding)
         }
 
         guard released else {
@@ -1488,7 +2805,10 @@ public final class SessionController: @unchecked Sendable {
             }
         }
         await reissueCollectionRangeRequestsIfAllowed()
-        await promoteReadyTextDrafts()
+        await promoteReadyTextDrafts(
+            binding: connectionBinding,
+            sessionIncarnation: sessionIncarnation
+        )
     }
 
     /// Classifies a rejected transaction as a benign duplicate or as replica divergence (§12.1, §18).
@@ -1513,61 +2833,127 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        // Anything else means the next transaction will fail for the same reason forever: we have
-        // missed committed state and cannot resynchronize by continuing to listen (§4 inv. 13).
         await reportFailure(.replicaDiverged(error))
     }
 
-    /// Reports a terminal session failure exactly once and tears the transport down so the caller
-    /// can reconnect and resume (§18, §4 inv. 13).
-    private func reportFailure(_ failure: SessionFailure) async {
-        let failureState: (
-            handler: (@Sendable (SessionFailure) -> Void)?,
-            replayGeneration: UInt64?
-        ) = withStateLock {
-            if _isDiverged { return (nil, nil) }
+    private func markFailure(
+        requiring ownership: PendingReplayFailureOwnership? = nil
+    ) -> SessionFailureTeardownState? {
+        withStateLock {
+            if let ownership {
+                guard lifecycleGeneration == ownership.lifecycleGeneration,
+                      isRunning,
+                      !isStopping,
+                      outboxConnectionBinding == ownership.binding,
+                      outboxSessionIncarnation == ownership.sessionIncarnation,
+                      resumeGeneration == ownership.resumeGeneration
+                        || activeReplayRetryGeneration == ownership.resumeGeneration else {
+                    return nil
+                }
+            }
+            guard !_isDiverged else { return nil }
             _isDiverged = true
             eventDispatchEnabled = false
             phase = .failed
             let replayGeneration = resumeGeneration ?? activeReplayRetryGeneration
             activeReplayRetryGeneration = nil
-            return (_onFailure ?? { _ in }, replayGeneration)
+            return SessionFailureTeardownState(
+                handler: _onFailure ?? { _ in },
+                replayGeneration: replayGeneration,
+                connectionBinding: outboxConnectionBinding,
+                lifecycleGeneration: lifecycleGeneration
+            )
         }
-        guard let handler = failureState.handler else { return }
-
-        if let replayGeneration = failureState.replayGeneration {
-            await outbox.stopResumeWork(generation: replayGeneration)
-        }
-        SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
-        handler(failure)
-        await transport.close()
     }
 
+    private func reportFailure(_ failure: SessionFailure) async {
+        guard let state = markFailure() else { return }
+        await finishFailureReport(failure, state: state)
+    }
+
+    private func finishFailureReport(
+        _ failure: SessionFailure,
+        state: SessionFailureTeardownState
+    ) async {
+        await retainNativeTextBeforeDisconnect(
+            binding: state.connectionBinding
+        )
+        guard ownsRunningLifecycle(state.lifecycleGeneration) else { return }
+        if let replayGeneration = state.replayGeneration {
+            await outbox.stopResumeWork(generation: replayGeneration)
+        }
+        guard ownsRunningLifecycle(state.lifecycleGeneration) else { return }
+        await MainActor.run {
+            guard self.ownsRunningLifecycle(state.lifecycleGeneration) else {
+                return
+            }
+            self.interactionDispatchTail?.cancel()
+            self.interactionDispatchTail = nil
+        }
+        guard ownsRunningLifecycle(state.lifecycleGeneration) else { return }
+        SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
+        state.handler(failure)
+        guard ownsRunningLifecycle(state.lifecycleGeneration) else { return }
+        await transport.close()
+    }
     /// Dispatches committed store state to AppKit on the main actor (§22.2).
     private func updateRenderer(
         transaction: Transaction?,
         snapshot: TransactionSnapshot,
         forceRemount: Bool,
         discardTextEditsForResync: Bool = false,
-        resyncRenderToken: UUID? = nil
+        preserveLocalTextForRemount: Bool = false,
+        binding: EventOutboxConnectionBinding,
+        renderToken: UUID
     ) async -> RendererUpdateResult {
-        await hydrateCachedResources(snapshot.store.referencedResourceHashes())
-        let result = await MainActor.run { () -> RendererUpdateResult in
+        guard let cachedResources = await resourceCache.beginRenderReferenceLease(
+            ownerEpoch: binding.resourceOwnershipEpoch,
+            renderToken: renderToken,
+            hashes: snapshot.store.referencedResourceHashes()
+        ) else {
+            return RendererUpdateResult(
+                didRender: false,
+                resyncLaneEpoch: nil,
+                wasSuperseded: true
+            )
+        }
+        if let interceptor = rendererResourcesPreloadedInterceptorForTesting {
+            await interceptor()
+        }
+        let guardedResult = await resourceCache.performIfRenderReferenceOwnerActive(
+            ownerEpoch: binding.resourceOwnershipEpoch,
+            renderToken: renderToken
+        ) { () -> RendererUpdateResult in
             let update: () -> RendererUpdateResult = {
                 guard let renderer = self.renderer else {
                     return RendererUpdateResult(didRender: true, resyncLaneEpoch: nil)
                 }
+                for image in cachedResources
+                where renderer.resolveResourceImage(image.hash) == nil {
+                    renderer.commitResourceImage(image)
+                }
                 let epoch = discardTextEditsForResync
                     ? renderer.textEditingSession.discardUnresolvedEditsForResync()
                     : nil
+                if let epoch {
+                    self.discardBufferedNativeTextEdits(before: epoch)
+                }
                 defer {
                     if discardTextEditsForResync {
                         renderer.textEditingSession.finishResyncTextBoundary()
                     }
                 }
                 do {
+                    try self.rendererUpdateInterceptorForTesting?()
                     if forceRemount || !self.hasMountedInitialTree {
-                        try renderer.attach(store: snapshot.store)
+                        if preserveLocalTextForRemount {
+                            try renderer.layoutRenderer.mount(
+                                store: snapshot.store,
+                                preserveLocalText: true
+                            )
+                        } else {
+                            try renderer.attach(store: snapshot.store)
+                        }
                         renderer.showWindows()
                         self.hasMountedInitialTree = true
                     } else if let transaction {
@@ -1582,32 +2968,98 @@ public final class SessionController: @unchecked Sendable {
                     // committed store on the next transaction rather than mutating a tree we no
                     // longer trust.
                     self.hasMountedInitialTree = false
-                    return RendererUpdateResult(didRender: false, resyncLaneEpoch: epoch)
+                    return RendererUpdateResult(
+                        didRender: false,
+                        resyncLaneEpoch: epoch,
+                        failureDescription: String(describing: error)
+                    )
                 }
             }
 
-            guard let resyncRenderToken else { return update() }
-            return self.outbox.resyncRenderFence.performIfActive(resyncRenderToken, update)
+            return self.outbox.resyncRenderFence.performIfActive(
+                renderToken,
+                boundaryEpoch: { $0.resyncLaneEpoch },
+                update
+            )
                 ?? RendererUpdateResult(
                     didRender: false,
                     resyncLaneEpoch: nil,
                     wasSuperseded: true
                 )
         }
-        if result.didRender {
-            await syncLiveResourceReferences()
+        guard let result = guardedResult else {
+            return RendererUpdateResult(
+                didRender: false,
+                resyncLaneEpoch: nil,
+                wasSuperseded: true
+            )
+        }
+        if let interceptor = rendererDidRenderInterceptorForTesting {
+            await interceptor()
+        }
+        let liveReferences = await currentLiveResourceReferences()
+        guard await resourceCache.finishRenderReferenceLease(
+            ownerEpoch: binding.resourceOwnershipEpoch,
+            renderToken: renderToken,
+            liveReferences: liveReferences
+        ) else {
+            return RendererUpdateResult(
+                didRender: false,
+                resyncLaneEpoch: result.resyncLaneEpoch,
+                wasSuperseded: true
+            )
         }
         return result
     }
 
-    /// Pins and installs verified shared-cache images before a renderer mounts a new snapshot.
-    private func hydrateCachedResources(_ hashes: Set<ResourceHash>) async {
-        let cached = await resourceCache.setLiveReferencesAndLookup(hashes)
-        guard !cached.isEmpty else { return }
-        await MainActor.run {
-            for image in cached
-            where self.renderer?.resolveResourceImage(image.hash) == nil {
-                self.renderer?.commitResourceImage(image)
+    /// Suspends allocation and its transport writer, then turns every committed non-composing
+    /// debounce value plus every already-emitted text callback into a durable outbox draft.
+    private func retainNativeTextBeforeDisconnect(
+        binding: EventOutboxConnectionBinding?
+    ) async {
+        guard let binding,
+              await outbox.suspendForTeardown(binding: binding) else {
+            return
+        }
+        if let sessionIncarnation = withStateLock({
+            outboxConnectionBinding == binding ? outboxSessionIncarnation : nil
+        }) {
+            await drainBufferedTextDraftInvalidations(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+        withStateLock { isFlushingTextForDisconnect = true }
+        let buffered = await MainActor.run { () -> [BufferedNativeTextEdit] in
+            self.renderer?.textEditingSession.flushAllPending()
+            self.withStateLock { self.isFlushingTextForDisconnect = false }
+            self.advanceInteractionIncarnation()
+            return self.bufferedNativeTextEdits.values
+                .filter { $0.binding == binding }
+                .sorted { $0.order < $1.order }
+        }
+        for edit in buffered {
+            do {
+                _ = try await outbox.queueTextEdit(
+                    nodeId: edit.nodeId,
+                    text: edit.text,
+                    editSeq: edit.editSeq,
+                    observedRevision: edit.observedRevision,
+                    binding: binding,
+                    sessionIncarnation: edit.sessionIncarnation,
+                    via: transport,
+                    laneEpoch: edit.laneEpoch
+                )
+                await clearBufferedNativeTextEdit(
+                    nodeId: edit.nodeId,
+                    editSeq: edit.editSeq,
+                    binding: binding,
+                    sessionIncarnation: edit.sessionIncarnation
+                )
+            } catch {
+                SessionDiagnostics.error(
+                    "Failed to retain native text during disconnect: \(error)"
+                )
             }
         }
     }
@@ -1619,34 +3071,55 @@ public final class SessionController: @unchecked Sendable {
     public func stop() async {
         let stoppedState: (
             receiveTask: Task<Void, Never>?,
+            handshakeSendTask: Task<Void, Error>?,
+            connectionBinding: EventOutboxConnectionBinding?,
+            sessionIncarnation: EventOutboxSessionIncarnation?,
+            lifecycleGeneration: UInt64,
             shouldStop: Bool
         ) = withStateLock {
-            guard isRunning else { return (nil, false) }
-            isRunning = false
+            guard isRunning, !isStopping else {
+                return (nil, nil, nil, nil, lifecycleGeneration, false)
+            }
+            precondition(
+                lifecycleGeneration < UInt64.max,
+                "SessionController lifecycle generation exhausted"
+            )
+            lifecycleGeneration += 1
+            isStopping = true
             eventDispatchEnabled = false
-            return (receiveTask, true)
+            return (
+                receiveTask,
+                handshakeSendOwnership?.task,
+                outboxConnectionBinding,
+                outboxSessionIncarnation,
+                lifecycleGeneration,
+                true
+            )
         }
 
         guard stoppedState.shouldStop else { return }
-
+        stoppedState.handshakeSendTask?.cancel()
+        await retainNativeTextBeforeDisconnect(
+            binding: stoppedState.connectionBinding
+        )
         stopRangeRequestPump()
         await MainActor.run {
+            self.interactionDispatchTail?.cancel()
+            self.interactionDispatchTail = nil
             self.renderer?.clearCollectionRangeTrackers()
         }
 
-        // Close the transport first so the receive loop drains any buffered catch-up frames
-        // (welcome snapshot, replay) while handshake phase is still valid. Resetting `phase` or
-        // cancelling the task before that completes rejects in-flight transactions as protocol
-        // violations even though the server sent them in order (§15, §18).
-        // When `stop()` races `start()` before `receiveTask` is assigned, closing the transport
-        // still tears down an in-progress handshake send (§22.2).
+        // Restart stays inadmissible until this close and receive drain complete, so the old
+        // teardown can never close a newly started attempt on the same Transport instance.
         await transport.close()
 
+        if let handshakeSendTask = stoppedState.handshakeSendTask {
+            _ = try? await handshakeSendTask.value
+        }
         if let receiveTask = stoppedState.receiveTask {
             // Bound the drain. `Transport` is a public protocol: a conformer whose `close()` never
             // finishes its stream continuation would otherwise hang `stop()` forever, with no
-            // cancellation to break it. Wait for the drain, but cancel it once the grace period
-            // elapses so teardown always completes (§22.2).
+            // cancellation to break it.
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await receiveTask.value }
                 group.addTask {
@@ -1660,32 +3133,65 @@ public final class SessionController: @unchecked Sendable {
             await receiveTask.value
         }
 
-        // Release the resume latch only after the drain: the frames the drain exists to consume
-        // are exactly the ones the latch guards — a buffered `SERVER RESUME_OK` would be refused
-        // and reported as supersession on a deliberate stop, and a buffered catch-up snapshot
-        // would be dropped instead of applied (§18). Allocation of new events is already blocked
-        // by `eventDispatchEnabled == false` above, so holding the latch across the drain admits
-        // nothing.
-        let replayGeneration = withStateLock { resumeGeneration ?? activeReplayRetryGeneration }
+        if let binding = stoppedState.connectionBinding,
+           let sessionIncarnation = stoppedState.sessionIncarnation {
+            await drainBufferedTextDraftInvalidations(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+        await MainActor.run {
+            self.textDraftInvalidationTail?.cancel()
+            self.textDraftInvalidationTail = nil
+            self.bufferedTextDraftInvalidations.removeAll(keepingCapacity: false)
+            self.nextBufferedTextDraftInvalidationOrder = 0
+        }
+
+        let replayGeneration = withStateLock {
+            resumeGeneration ?? activeReplayRetryGeneration
+        }
         if let replayGeneration {
             await outbox.stopResumeWork(generation: replayGeneration)
         }
 
-        // Disconnect drops in-flight assemblies. Committed CAS entries persist on this
-        // `resourceCache` instance — inject the same cache into a replacement controller to
-        // advertise verified hashes and hydrate its renderer without retransferring bytes (§14, §18).
-        await resourceCache.clearPartials()
+        // An active disconnect drops only its own in-flight assemblies. A stale controller
+        // cannot clear transfers already started by a replacement cache owner.
+        if let connectionBinding = stoppedState.connectionBinding {
+            _ = await resourceCache.clearPartials(
+                ownerEpoch: connectionBinding.resourceOwnershipEpoch
+            )
+        }
         rejectedResourceHashes.removeAll(keepingCapacity: false)
 
-        clearSessionStateAfterStop()
-
-        await MainActor.run {
-            self.hasMountedInitialTree = false
+        if let interceptor = stopWillRetireMountForTesting {
+            await interceptor()
         }
+        let mayRetireMount = withStateLock {
+            lifecycleGeneration == stoppedState.lifecycleGeneration && isStopping
+        }
+        if mayRetireMount {
+            await MainActor.run {
+                guard self.withStateLock({
+                    self.lifecycleGeneration == stoppedState.lifecycleGeneration
+                        && self.isStopping
+                }) else {
+                    return
+                }
+                self.hasMountedInitialTree = false
+            }
+        }
+        _ = clearSessionStateAfterStop(
+            generation: stoppedState.lifecycleGeneration
+        )
     }
 
-    private func clearSessionStateAfterStop() {
+    @discardableResult
+    private func clearSessionStateAfterStop(generation: UInt64) -> Bool {
         withStateLock {
+            guard lifecycleGeneration == generation, isStopping else {
+                return false
+            }
+            handshakeSendOwnership = nil
             receiveTask = nil
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
             // mount state may survive.
@@ -1700,8 +3206,14 @@ public final class SessionController: @unchecked Sendable {
             requestedSessionId = nil
             resumeGeneration = nil
             activeReplayRetryGeneration = nil
+            outboxConnectionBinding = nil
+            outboxSessionIncarnation = nil
+            isFlushingTextForDisconnect = false
             eventDispatchEnabled = false
             phase = .idle
+            isRunning = false
+            isStopping = false
+            return true
         }
     }
 }

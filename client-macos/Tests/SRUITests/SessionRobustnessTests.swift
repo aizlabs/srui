@@ -200,8 +200,14 @@ struct SessionRobustnessTests {
         )
         try await serverTransport.send(data: try Self.framed(mountTx))
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+        try await AsyncTestSupport.eventually(
+            description: "revision 1 button render completes"
+        ) {
+            renderer.registry.handle(for: buttonID) != nil
+        }
 
         let buttonHandle = try #require(renderer.registry.handle(for: buttonID))
+        #expect(buttonHandle.nodeID == buttonID)
         let trampoline = try #require(buttonHandle.actionTrampoline as? ActionTrampoline)
 
         // The user clicks while looking at revision 1.
@@ -399,7 +405,14 @@ struct SessionRobustnessTests {
                 )
             )
         )
-        #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+        #expect(await Self.waitUntil {
+            await MainActor.run {
+                applier.lastAppliedRevision == Revision(1)
+                    && renderer.registry.count == 2
+                    && (renderer.registry.handle(for: NodeId(2))?.view as? NSTextField)?
+                        .stringValue == "Count: 0"
+            }
+        })
         #expect(renderer.registry.count == 2)
 
         // Force the view tree out of sync with the committed store, so the next incremental apply
@@ -435,7 +448,13 @@ struct SessionRobustnessTests {
         )
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(3) })
 
-        #expect(await Self.waitUntil { await MainActor.run { renderer.registry.count == 2 } })
+        #expect(await Self.waitUntil {
+            await MainActor.run {
+                renderer.registry.count == 2
+                    && (renderer.registry.handle(for: NodeId(2))?.view as? NSTextField)?
+                        .stringValue == "Count: 2"
+            }
+        })
         let textHandle = try #require(renderer.registry.handle(for: NodeId(2)))
         let textField = try #require(textHandle.view as? NSTextField)
         #expect(textField.stringValue == "Count: 2")

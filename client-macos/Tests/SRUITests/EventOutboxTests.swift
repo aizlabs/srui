@@ -273,7 +273,8 @@ struct EventOutboxTests {
         #expect(await outbox.pendingCount == 3)
 
         // Settle ack through seq 1
-        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-live", binding: binding))
         _ = await outbox.settleAcknowledgement(
             clientInstanceId: outbox.clientInstanceId,
             eventId: ev1.eventId,
@@ -287,7 +288,10 @@ struct EventOutboxTests {
 
         // Reconnect on a fresh transport pair and complete same-session resume
         let (client2, server2) = await PipeTransport.createPair()
-        let generation = await outbox.beginResumeAttempt()
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
         let serverStream2 = server2.receiveStream()
 
         let accepted = try await outbox.completeSameSessionResume(
@@ -340,7 +344,8 @@ struct EventOutboxTests {
             via: client
         )
 
-        let generation = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
         let accepted = try await outbox.completeSameSessionResume(
             id: "session-123",
             lastProcessedEventSeq: 0,
@@ -349,57 +354,64 @@ struct EventOutboxTests {
             enableNewEventsAfterReplay: true
         )
         #expect(accepted)
-        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+        #expect(await outbox.confirmFreshSession(id: "fresh-session", binding: binding))
 
         await client.close()
         await server.close()
     }
 
     @Test("Finish resync clears the generation latch for a later fresh HELLO")
-    func finishResyncClearsGenerationLatch() async {
+    func finishResyncClearsGenerationLatch() async throws {
         let outbox = EventOutbox()
-        let generation = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
         #expect(await outbox.finishResync(generation: generation))
-        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+        #expect(await outbox.confirmFreshSession(id: "fresh-session", binding: binding))
     }
 
     @Test("Stopping resume work clears the generation latch for a later fresh HELLO")
-    func stopResumeWorkClearsGenerationLatch() async {
+    func stopResumeWorkClearsGenerationLatch() async throws {
         let outbox = EventOutbox()
-        let generation = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
         await outbox.stopResumeWork(generation: generation)
-        #expect(await outbox.confirmFreshSession(id: "fresh-session"))
+        #expect(await outbox.confirmFreshSession(id: "fresh-session", binding: binding))
     }
 
     @Test("A superseded generation cannot release the latch held by a newer attempt")
-    func supersededGenerationCannotReleaseNewerLatch() async {
+    func supersededGenerationCannotReleaseNewerLatch() async throws {
         let outbox = EventOutbox()
-        let superseded = await outbox.beginResumeAttempt()
-        let newest = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        let superseded = try #require(await outbox.beginResumeAttempt(binding: binding))
+        let newest = try #require(await outbox.beginResumeAttempt(binding: binding))
 
         await outbox.stopResumeWork(generation: superseded)
 
         // The newest attempt still owns the latch, so its own decision is still the only one
         // that can settle the outbox (§18).
-        let freshAccepted = await outbox.confirmFreshSession(id: "fresh-session")
+        let freshAccepted = await outbox.confirmFreshSession(
+            id: "fresh-session",
+            binding: binding
+        )
         #expect(freshAccepted == false)
         let newestAccepted = await outbox.finishResync(generation: newest)
         #expect(newestAccepted == true)
     }
 
     @Test("Catch-up cannot re-enable allocation while a reconnect generation is outstanding")
-    func allowNewEventsRefusesDuringOutstandingResume() async {
+    func allowNewEventsRefusesDuringOutstandingResume() async throws {
         let outbox = EventOutbox()
-        let idleAllowed = await outbox.allowNewEvents()
+        let binding = await outbox.beginConnectionBinding()
+        let idleAllowed = await outbox.allowNewEvents(binding: binding)
         #expect(idleAllowed == true)
 
-        let generation = await outbox.beginResumeAttempt()
-        let latchedAllowed = await outbox.allowNewEvents()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
+        let latchedAllowed = await outbox.allowNewEvents(binding: binding)
         #expect(latchedAllowed == false)
 
         let finished = await outbox.finishResync(generation: generation)
         #expect(finished == true)
-        let releasedAllowed = await outbox.allowNewEvents()
+        let releasedAllowed = await outbox.allowNewEvents(binding: binding)
         #expect(releasedAllowed == true)
     }
 
@@ -412,11 +424,13 @@ struct EventOutboxTests {
         _ = try await outbox.sendValueChanged(nodeId: NodeId(2), observedRevision: Revision(1), value: .bool(false), via: client)
         #expect(await outbox.pendingCount == 2)
 
-        let generation = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
         let accepted = await outbox.prepareReplacedSession(
             id: "new-incarnation",
             lastProcessedEventSeq: 0,
-            generation: generation
+            generation: generation,
+            binding: binding
         )
         #expect(accepted)
         #expect(await outbox.pendingCount == 0)
@@ -439,7 +453,8 @@ struct EventOutboxTests {
     func exhaustionLeavesSequenceAndRetentionUntouched() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox(maxPendingEvents: 2)
-        #expect(await outbox.confirmFreshSession(id: "session-window"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-window", binding: binding))
 
         let first = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
         let second = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client)
@@ -479,7 +494,8 @@ struct EventOutboxTests {
     func selectiveAckAcrossGapKeepsWindowClosed() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox(maxPendingEvents: 2)
-        #expect(await outbox.confirmFreshSession(id: "session-gap"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-gap", binding: binding))
 
         let first = try await outbox.sendActivate(nodeId: NodeId(1), observedRevision: Revision(1), via: client)
         let second = try await outbox.sendActivate(nodeId: NodeId(2), observedRevision: Revision(1), via: client)
@@ -517,12 +533,62 @@ struct EventOutboxTests {
         await server.close()
     }
 
+    @Test("A suspended TEXT_EDIT assignment cannot let a later event overtake it")
+    func textEditAssignmentPreservesAllocationOrder() async throws {
+        let transport = EventSequenceRecordingTransport()
+        let outbox = EventOutbox()
+        let gate = MainActorRenderBlocker()
+        let editSeq = try #require(EditSeq(1))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(
+            id: "session-assignment-order",
+            binding: binding
+        ))
+
+        let textTask = Task {
+            try await outbox.queueTextEdit(
+                nodeId: NodeId(12),
+                text: "typed",
+                editSeq: editSeq,
+                observedRevision: Revision(1),
+                via: transport,
+                onAssigned: { _ in gate.block() }
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let activateTask = Task {
+            try await outbox.sendActivate(
+                nodeId: NodeId(13),
+                observedRevision: Revision(1),
+                via: transport
+            )
+        }
+        while await outbox.eventSeq < 2 {
+            await Task.yield()
+        }
+
+        // Both identities have been allocated, but event 2 remains chained behind event 1 while
+        // its assignment callback is suspended.
+        #expect(await transport.sentEventSequences().isEmpty)
+        gate.releaseRender()
+
+        let text = try #require(try await textTask.value)
+        let activate = try await activateTask.value
+        #expect(text.eventSeq == 1)
+        #expect(activate.eventSeq == 2)
+        #expect(await transport.sentEventSequences() == [1, 2])
+
+        await transport.close()
+    }
+
     @Test("TEXT_EDIT serializes edit_seq and the whole-value TEXT argument")
     func textEditEventSerialization() async throws {
         let clientInstanceId = ClientInstanceId(string: "client-test-text")
         let outbox = EventOutbox(clientInstanceId: clientInstanceId)
         let (client, server) = await PipeTransport.createPair()
-        #expect(await outbox.confirmFreshSession(id: "session-text"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-text", binding: binding))
 
         let nodeId = NodeId(12)
         let seq = try #require(EditSeq(7))
@@ -558,7 +624,8 @@ struct EventOutboxTests {
     func coalescedTextEditsSkipEditSeqButKeepEventSeqContiguous() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-coalesce"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-coalesce", binding: binding))
         let nodeId = NodeId(12)
         let seq1 = try #require(EditSeq(1))
         let first = try #require(try await outbox.queueTextEdit(
@@ -616,7 +683,8 @@ struct EventOutboxTests {
     func cumulativeAckRetainsEarlierTextOutcomes() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-barriers"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-barriers", binding: binding))
         let edit1 = try #require(EditSeq(1))
         let edit2 = try #require(EditSeq(2))
 
@@ -689,8 +757,9 @@ struct EventOutboxTests {
     func queueTextEditWhileSuspendedKeepsNewestDraft() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-suspend"))
-        let generation = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-suspend", binding: binding))
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
 
         let promoted = try await outbox.queueTextEdit(
             nodeId: NodeId(12),
@@ -732,7 +801,8 @@ struct EventOutboxTests {
     func cancelAssignedTextEditsPreservesOrdinaryEvents() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-cancel"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-cancel", binding: binding))
         let seq1 = try #require(EditSeq(1))
         let textEvent = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
@@ -779,7 +849,8 @@ struct EventOutboxTests {
     func cancelAssignedTextEditsRespectsResumeGeneration() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-gen"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-gen", binding: binding))
         let editSeq = try #require(EditSeq(1))
         let assigned = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
@@ -833,7 +904,8 @@ struct EventOutboxTests {
     func completeSameSessionResumeBindsTextCancelToGeneration() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-bind"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-bind", binding: binding))
         let editSeq = try #require(EditSeq(1))
         let assigned = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
@@ -887,7 +959,8 @@ struct EventOutboxTests {
     func olderTextCallbackCannotReplaceNewerDraft() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-order"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-order", binding: binding))
 
         let firstEditSeq = try #require(EditSeq(1))
         let staleEditSeq = try #require(EditSeq(2))
@@ -936,8 +1009,9 @@ struct EventOutboxTests {
     func olderInvalidationCannotDiscardNewerDraft() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-invalidate"))
-        let generation = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-invalidate", binding: binding))
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
 
         let newestEditSeq = try #require(EditSeq(3))
         _ = try await outbox.queueTextEdit(
@@ -971,7 +1045,8 @@ struct EventOutboxTests {
     func resumeFrontierRetainsTextUntilOutcomeAck() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-outcome"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-outcome", binding: binding))
         let editSeq = try #require(EditSeq(1))
         let pending = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
@@ -981,7 +1056,7 @@ struct EventOutboxTests {
             via: seedClient
         ))
 
-        let generation = await outbox.beginResumeAttempt()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
         let (client, server) = await PipeTransport.createPair()
         let serverStream = server.receiveStream()
         let resumed = try await outbox.completeSameSessionResume(
@@ -1053,7 +1128,8 @@ struct EventOutboxTests {
     func reconnectSupersedesLiveSameSessionResyncAtomically() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-live-race"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-live-race", binding: binding))
         let editSeq = try #require(EditSeq(1))
         let edit = try #require(try await outbox.queueTextEdit(
             nodeId: NodeId(12),
@@ -1062,14 +1138,16 @@ struct EventOutboxTests {
             observedRevision: Revision(1),
             via: client
         ))
-        let descriptor = try #require(await outbox.assignedTextEditDescriptors().first)
-        let generation = await outbox.beginResumeAttempt()
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
 
-        let applied = try await outbox.applyLiveSameSessionResync(
+        let decision = try await outbox.applyLiveSameSessionResync(
             lastProcessedEventSeq: edit.eventSeq,
-            discardedTextEdits: [descriptor.toWire()]
+            binding: binding
         )
-        #expect(!applied)
+        guard case .superseded = decision else {
+            Issue.record("Expected the reconnect generation to supersede live resync")
+            return
+        }
         #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [edit.eventId])
         #expect(await outbox.lastAckedEventSeq == 0)
 
@@ -1078,18 +1156,309 @@ struct EventOutboxTests {
         await server.close()
     }
 
+    @Test("Live resync defers an edit above the server frontier to resume cancellation")
+    func liveResyncPreservesUndeliveredTextEditForResume() async throws {
+        let transport = EventSequenceRecordingTransport()
+        let outbox = EventOutbox()
+        let gate = MainActorRenderBlocker()
+        let editSeq = try #require(EditSeq(1))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-live-pending", binding: binding))
+
+        let textTask = Task {
+            try await outbox.queueTextEdit(
+                nodeId: NodeId(12),
+                text: "not delivered",
+                editSeq: editSeq,
+                observedRevision: Revision(1),
+                via: transport,
+                onAssigned: { _ in gate.block() }
+            )
+        }
+        await gate.waitUntilEntered()
+        let descriptor = try #require(await outbox.assignedTextEditDescriptors().first)
+
+        let decision = try await outbox.applyLiveSameSessionResync(
+            lastProcessedEventSeq: 0,
+            binding: binding
+        )
+        guard case .resumeRequired = decision else {
+            Issue.record("Expected resume cancellation for an edit above the server frontier")
+            return
+        }
+        #expect(await outbox.assignedTextEditDescriptors() == [descriptor])
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        gate.releaseRender()
+        _ = try #require(try await textTask.value)
+        #expect(await transport.sentEventSequences().isEmpty)
+
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
+        let resumed = try await outbox.completeSameSessionResume(
+            id: "session-live-pending",
+            lastProcessedEventSeq: 0,
+            generation: generation,
+            via: transport,
+            enableNewEventsAfterReplay: true,
+            discardedTextEdits: [descriptor.toWire()]
+        )
+        #expect(resumed)
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == 1)
+
+        let next = try await outbox.sendActivate(
+            nodeId: NodeId(13),
+            observedRevision: Revision(1),
+            via: transport
+        )
+        #expect(next.eventSeq == 2)
+        #expect(await transport.sentEventSequences() == [2])
+
+        await transport.close()
+    }
+
+    @Test("Live resync locally discards only text edits covered by the server frontier")
+    func liveResyncDiscardsDeliveredTextEditWithoutBreakingSequence() async throws {
+        let transport = EventSequenceRecordingTransport()
+        let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-live-covered", binding: binding))
+        let editSeq = try #require(EditSeq(1))
+
+        let edit = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "delivered",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            via: transport
+        ))
+        let decision = try await outbox.applyLiveSameSessionResync(
+            lastProcessedEventSeq: edit.eventSeq,
+            binding: binding
+        )
+        let canceled: [SRUIPendingTextEditRef]
+        guard case .applied(let refs) = decision else {
+            Issue.record("Expected the server frontier to authorize local cancellation")
+            return
+        }
+        canceled = refs
+        #expect(canceled.map(\.eventID) == [edit.eventId.bytes])
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.lastAckedEventSeq == 1)
+
+        let committed = try #require(await outbox.commitResyncSnapshot(
+            generation: nil,
+            binding: binding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(committed.renderToken)
+        let rendered = await MainActor.run {
+            outbox.resyncRenderFence.performIfActive(renderToken) { true }
+        }
+        #expect(rendered == true)
+        #expect(await outbox.applyFullResyncTextBoundary(
+            laneEpoch: nil,
+            generation: nil,
+            binding: binding,
+            renderToken: renderToken
+        ))
+        #expect(await outbox.allowNewEvents(binding: binding))
+
+        let next = try await outbox.sendActivate(
+            nodeId: NodeId(13),
+            observedRevision: Revision(2),
+            via: transport
+        )
+        #expect(next.eventSeq == 2)
+        #expect(await transport.sentEventSequences() == [1, 2])
+
+        await transport.close()
+    }
+
+    @Test("A failed snapshot render discards queued drafts before reconnect")
+    func abortFailedSnapshotRenderAppliesTextBoundary() async throws {
+        let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-render-failure", binding: binding))
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
+        let transport = EventSequenceRecordingTransport()
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "pre-snapshot draft",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            via: transport,
+            laneEpoch: 1
+        )
+        #expect(await outbox.unsentTextDraftCount == 1)
+
+        let committed = try #require(await outbox.commitResyncSnapshot(
+            generation: generation,
+            binding: binding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(committed.renderToken)
+        #expect(await outbox.abortResyncRender(
+            laneEpoch: 2,
+            generation: generation,
+            binding: binding,
+            renderToken: renderToken
+        ))
+        #expect(await outbox.unsentTextDraftCount == 0)
+        let rendered = await MainActor.run {
+            outbox.resyncRenderFence.performIfActive(renderToken) { true }
+        }
+        #expect(rendered == nil)
+
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let resumedGeneration = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
+        #expect(try await outbox.completeSameSessionResume(
+            id: "session-render-failure",
+            lastProcessedEventSeq: 0,
+            generation: resumedGeneration,
+            via: transport,
+            enableNewEventsAfterReplay: true
+        ))
+        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(await outbox.eventSeq == 0)
+        #expect(await transport.sentEventSequences().isEmpty)
+
+        await transport.close()
+    }
+
+    @Test("A stale connection binding cannot mutate a newly bound same-session controller")
+    func staleConnectionBindingCannotMutateNewSession() async throws {
+        let outbox = EventOutbox()
+        let staleBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: staleBinding))
+        #expect(await outbox.suspendNewEvents(binding: staleBinding))
+        let staleCommit = try #require(await outbox.commitResyncSnapshot(
+            generation: nil,
+            binding: staleBinding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let staleRenderToken = try #require(staleCommit.renderToken)
+
+        let currentBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: currentBinding))
+        let transport = EventSequenceRecordingTransport()
+        let editSeq = try #require(EditSeq(1))
+        let edit = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "new binding",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            via: transport
+        ))
+
+        let staleDecision = try await outbox.applyLiveSameSessionResync(
+            lastProcessedEventSeq: edit.eventSeq,
+            binding: staleBinding
+        )
+        guard case .superseded = staleDecision else {
+            Issue.record("Expected stale live resync to be superseded")
+            return
+        }
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [edit.eventId])
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        let stalePublished = await outbox.commitResyncSnapshot(
+            generation: nil,
+            binding: staleBinding,
+            publish: { true },
+            committed: { $0 }
+        )
+        #expect(stalePublished == nil)
+        #expect(await outbox.applyFullResyncTextBoundary(
+            laneEpoch: nil,
+            generation: nil,
+            binding: staleBinding,
+            renderToken: staleRenderToken
+        ) == false)
+        let staleRendered = await MainActor.run {
+            outbox.resyncRenderFence.performIfActive(staleRenderToken) { true }
+        }
+        #expect(staleRendered == nil)
+
+        await transport.close()
+    }
+
+    @Test("Rebinding after a completed snapshot render preserves only post-snapshot drafts")
+    func rebindingPreservesPostSnapshotDrafts() async throws {
+        let outbox = EventOutbox()
+        let staleBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: staleBinding))
+        #expect(await outbox.suspendNewEvents(binding: staleBinding))
+        let transport = EventSequenceRecordingTransport()
+        let editSeq = try #require(EditSeq(1))
+
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "pre-snapshot",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            via: transport,
+            laneEpoch: 1
+        )
+        let committed = try #require(await outbox.commitResyncSnapshot(
+            generation: nil,
+            binding: staleBinding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(committed.renderToken)
+        let renderedBoundary = await MainActor.run {
+            outbox.resyncRenderFence.performIfActive(
+                renderToken,
+                boundaryEpoch: { $0 }
+            ) {
+                UInt64(2)
+            }
+        }
+        #expect(renderedBoundary == 2)
+
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(13),
+            text: "post-snapshot",
+            editSeq: editSeq,
+            observedRevision: Revision(2),
+            via: transport,
+            laneEpoch: 3
+        )
+        #expect(await outbox.unsentTextDraftCount == 2)
+
+        let currentBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.unsentTextDraftCount == 1)
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: currentBinding))
+        let promoted = try await outbox.promoteReadyTextDrafts(via: transport)
+        #expect(promoted.map(\.nodeId) == [NodeId(13)])
+        #expect(promoted.map(\.textArg) == ["post-snapshot"])
+
+        await transport.close()
+    }
+
     @Test("A newer resume generation invalidates a stale snapshot render and boundary")
     func newerResumeInvalidatesStaleSnapshotRender() async throws {
         let outbox = EventOutbox()
-        let staleGeneration = await outbox.beginResumeAttempt()
+        let binding = await outbox.beginConnectionBinding()
+        let staleGeneration = try #require(await outbox.beginResumeAttempt(binding: binding))
         let committed = try #require(await outbox.commitResyncSnapshot(
             generation: staleGeneration,
+            binding: binding,
             publish: { true },
             committed: { $0 }
         ))
         let renderToken = try #require(committed.renderToken)
 
-        let currentGeneration = await outbox.beginResumeAttempt()
+        let currentGeneration = try #require(await outbox.beginResumeAttempt(binding: binding))
         let (client, server) = await PipeTransport.createPair()
         let editSeq = try #require(EditSeq(1))
         _ = try await outbox.queueTextEdit(
@@ -1108,6 +1477,7 @@ struct EventOutboxTests {
         let applied = await outbox.applyFullResyncTextBoundary(
             laneEpoch: 2,
             generation: staleGeneration,
+            binding: binding,
             renderToken: renderToken
         )
         #expect(!applied)
@@ -1116,5 +1486,1153 @@ struct EventOutboxTests {
         await outbox.stopResumeWork(generation: currentGeneration)
         await client.close()
         await server.close()
+    }
+
+    @Test("Stale bindings cannot send or settle current connection state")
+    func staleBindingGuardsDataPlaneAndAcknowledgement() async throws {
+        let outbox = EventOutbox()
+        let staleTransport = EventSequenceRecordingTransport()
+        let currentTransport = EventSequenceRecordingTransport()
+        let staleBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: staleBinding))
+        let retained = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            binding: staleBinding,
+            via: staleTransport
+        )
+
+        let currentBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: currentBinding))
+        do {
+            _ = try await outbox.sendActivate(
+                nodeId: NodeId(2),
+                observedRevision: Revision(1),
+                binding: staleBinding,
+                via: staleTransport
+            )
+            Issue.record("Expected the stale binding to reject ACTIVATE")
+        } catch let error as EventOutboxError {
+            #expect(error == .resumeNotConfirmed)
+        }
+
+        let staleSettlement = await outbox.settleAcknowledgement(
+            binding: staleBinding,
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: retained.eventId,
+            throughSeq: retained.eventSeq,
+            sessionId: "same-session"
+        )
+        #expect(!staleSettlement.connectionBound)
+        #expect(await outbox.pendingCount == 1)
+
+        let currentSettlement = await outbox.settleAcknowledgement(
+            binding: currentBinding,
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: retained.eventId,
+            throughSeq: retained.eventSeq,
+            sessionId: "same-session"
+        )
+        #expect(currentSettlement.connectionBound)
+        #expect(currentSettlement.bound)
+        let current = try await outbox.sendActivate(
+            nodeId: NodeId(3),
+            observedRevision: Revision(1),
+            binding: currentBinding,
+            via: currentTransport
+        )
+        #expect(current.eventSeq == 2)
+        #expect(await staleTransport.sentEventSequences() == [1])
+        #expect(await currentTransport.sentEventSequences() == [2])
+
+        await staleTransport.close()
+        await currentTransport.close()
+    }
+
+    @Test("A queued successor text edit is sequenced before a following action")
+    func textDraftCausalBarrierPrecedesAction() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-order", binding: binding))
+        let firstEditSeq = try #require(EditSeq(1))
+        let secondEditSeq = try #require(EditSeq(2))
+
+        let first = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(10),
+            text: "first",
+            editSeq: firstEditSeq,
+            observedRevision: Revision(1),
+            binding: binding,
+            via: transport
+        ))
+        #expect(try await outbox.queueTextEdit(
+            nodeId: NodeId(10),
+            text: "latest",
+            editSeq: secondEditSeq,
+            observedRevision: Revision(1),
+            binding: binding,
+            via: transport
+        ) == nil)
+
+        let action = Task {
+            try await outbox.sendActivate(
+                nodeId: NodeId(11),
+                observedRevision: Revision(1),
+                binding: binding,
+                via: transport
+            )
+        }
+        #expect(await waitForTextDraftWaiter(outbox))
+        #expect(await outbox.eventSeq == 1)
+
+        let settlement = await outbox.settleAcknowledgement(
+            binding: binding,
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: first.eventId,
+            throughSeq: first.eventSeq,
+            sessionId: "session-order",
+            revisionAfterEffect: 2
+        )
+        #expect(settlement.bound)
+        _ = await outbox.releaseTextAcknowledgements(through: 2)
+
+        let activation = try await action.value
+        #expect(activation.eventSeq == 3)
+        let events = await transport.sentEvents()
+        #expect(events.map(\.eventSeq) == [1, 2, 3])
+        #expect(events.map(\.eventType) == [
+            .EVENT_TEXT_EDIT,
+            .EVENT_TEXT_EDIT,
+            .EVENT_ACTIVATE
+        ])
+        #expect(events[1].textArg == "latest")
+
+        await transport.close()
+    }
+
+    @Test("The newest lifecycle transition inherits an in-progress snapshot invalidation")
+    func newestLifecycleTransitionInheritsBoundary() async throws {
+        let outbox = EventOutbox()
+        let initialBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: initialBinding))
+        #expect(await outbox.suspendNewEvents(binding: initialBinding))
+        let transport = EventSequenceRecordingTransport()
+        let editSeq = try #require(EditSeq(1))
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "pre-snapshot",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            binding: initialBinding,
+            via: transport,
+            laneEpoch: 1
+        )
+        let committed = try #require(await outbox.commitResyncSnapshot(
+            generation: nil,
+            binding: initialBinding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(committed.renderToken)
+        let blocker = MainActorRenderBlocker()
+        let render = Task { @MainActor in
+            outbox.resyncRenderFence.performIfActive(renderToken) {
+                blocker.block()
+                return true
+            }
+        }
+        await blocker.waitUntilEntered()
+        defer { blocker.releaseRender() }
+
+        let firstRebind = Task { await outbox.beginConnectionBinding() }
+        let intermediateBinding = try #require(
+            await waitForActiveBinding(outbox, differentFrom: initialBinding)
+        )
+        let secondRebind = Task { await outbox.beginConnectionBinding() }
+        let newestBinding = try #require(
+            await waitForActiveBinding(outbox, differentFrom: intermediateBinding)
+        )
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(13),
+            text: "post-snapshot",
+            editSeq: editSeq,
+            observedRevision: Revision(2),
+            binding: newestBinding,
+            via: transport,
+            laneEpoch: 2
+        )
+
+        blocker.releaseRender()
+        _ = await render.value
+        #expect(await firstRebind.value == intermediateBinding)
+        #expect(await secondRebind.value == newestBinding)
+        #expect(await outbox.unsentTextDraftCount == 1)
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: newestBinding))
+        let promoted = try await outbox.promoteReadyTextDrafts(
+            binding: newestBinding,
+            via: transport
+        )
+        #expect(promoted.map(\.nodeId) == [NodeId(13)])
+
+        let staleGeneration = try #require(await outbox.beginResumeAttempt(binding: newestBinding))
+        let nextCommit = try #require(await outbox.commitResyncSnapshot(
+            generation: staleGeneration,
+            binding: newestBinding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let nextToken = try #require(nextCommit.renderToken)
+        let resumeBlocker = MainActorRenderBlocker()
+        let resumeRender = Task { @MainActor in
+            outbox.resyncRenderFence.performIfActive(nextToken) {
+                resumeBlocker.block()
+                return true
+            }
+        }
+        await resumeBlocker.waitUntilEntered()
+        defer { resumeBlocker.releaseRender() }
+
+        let middleAttempt = Task {
+            await outbox.beginResumeAttempt(binding: newestBinding)
+        }
+        #expect(await waitForResumeGeneration(outbox, staleGeneration + 1))
+        let newestAttempt = Task {
+            await outbox.beginResumeAttempt(binding: newestBinding)
+        }
+        #expect(await waitForResumeGeneration(outbox, staleGeneration + 2))
+        resumeBlocker.releaseRender()
+        _ = await resumeRender.value
+        #expect(await middleAttempt.value == nil)
+        #expect(await newestAttempt.value == staleGeneration + 2)
+
+        await outbox.stopResumeWork(generation: staleGeneration + 2)
+        await transport.close()
+    }
+
+    @Test("Stopping resume work applies the completed snapshot boundary")
+    func stopResumeWorkAppliesCompletedBoundary() async throws {
+        let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: binding))
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
+        let transport = EventSequenceRecordingTransport()
+        let editSeq = try #require(EditSeq(1))
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(12),
+            text: "pre-snapshot",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            binding: binding,
+            via: transport,
+            laneEpoch: 1
+        )
+        let committed = try #require(await outbox.commitResyncSnapshot(
+            generation: generation,
+            binding: binding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(committed.renderToken)
+        #expect(await MainActor.run {
+            outbox.resyncRenderFence.performIfActive(
+                renderToken,
+                boundaryEpoch: { $0 }
+            ) {
+                UInt64(2)
+            }
+        } == 2)
+        _ = try await outbox.queueTextEdit(
+            nodeId: NodeId(13),
+            text: "post-snapshot",
+            editSeq: editSeq,
+            observedRevision: Revision(2),
+            binding: binding,
+            via: transport,
+            laneEpoch: 3
+        )
+
+        await outbox.stopResumeWork(generation: generation)
+        #expect(await outbox.unsentTextDraftCount == 1)
+        let currentBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: currentBinding))
+        let promoted = try await outbox.promoteReadyTextDrafts(
+            binding: currentBinding,
+            via: transport
+        )
+        #expect(promoted.map(\.nodeId) == [NodeId(13)])
+
+        await transport.close()
+    }
+
+    @Test("A live render token is invalidated before a newer binding starts")
+    func liveRenderTokenCannotOutliveBinding() async throws {
+        let outbox = EventOutbox()
+        let staleBinding = await outbox.beginConnectionBinding()
+        let staleIncarnation = try #require(await outbox.sessionIncarnation(binding: staleBinding))
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: staleBinding))
+        let committed = try #require(await outbox.commitLiveRender(
+            binding: staleBinding,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(committed.renderToken)
+        let blocker = MainActorRenderBlocker()
+        let render = Task { @MainActor in
+            outbox.resyncRenderFence.performIfActive(renderToken) {
+                blocker.block()
+                return true
+            }
+        }
+        await blocker.waitUntilEntered()
+        defer { blocker.releaseRender() }
+
+        let rebind = Task { await outbox.beginConnectionBinding() }
+        let currentBinding = try #require(
+            await waitForActiveBinding(outbox, differentFrom: staleBinding)
+        )
+        blocker.releaseRender()
+        #expect(await render.value == true)
+        #expect(await rebind.value == currentBinding)
+        let staleCompletion = await outbox.completeLiveRender(
+            binding: staleBinding,
+            sessionIncarnation: staleIncarnation,
+            renderToken: renderToken
+        )
+        #expect(!staleCompletion)
+        #expect(await outbox.commitLiveRender(
+            binding: staleBinding,
+            publish: { true },
+            committed: { $0 }
+        ) == nil)
+    }
+
+    @Test("Resume recovery ownership is generation scoped")
+    func resumeRecoveryOwnershipIsGenerationScoped() async throws {
+        let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: binding))
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
+        let token = try #require(await outbox.beginResumeRecoveryRender(
+            binding: binding,
+            generation: generation
+        ))
+        let blocker = MainActorRenderBlocker()
+        let render = Task { @MainActor in
+            outbox.resyncRenderFence.performIfActive(token) {
+                blocker.block()
+                return true
+            }
+        }
+        await blocker.waitUntilEntered()
+        defer { blocker.releaseRender() }
+
+        let newerAttempt = Task {
+            await outbox.beginResumeAttempt(binding: binding)
+        }
+        #expect(await waitForResumeGeneration(outbox, generation + 1))
+        blocker.releaseRender()
+        #expect(await render.value == true)
+        #expect(await newerAttempt.value == generation + 1)
+        let staleCompletion = await outbox.completeResumeRecoveryRender(
+            binding: binding,
+            generation: generation,
+            renderToken: token
+        )
+        #expect(!staleCompletion)
+
+        let currentToken = try #require(await outbox.beginResumeRecoveryRender(
+            binding: binding,
+            generation: generation + 1
+        ))
+        #expect(await MainActor.run {
+            outbox.resyncRenderFence.performIfActive(currentToken) { true }
+        } == true)
+        #expect(await outbox.completeResumeRecoveryRender(
+            binding: binding,
+            generation: generation + 1,
+            renderToken: currentToken
+        ))
+        await outbox.stopResumeWork(generation: generation + 1)
+    }
+
+    @Test("Resume recovery ownership is connection scoped")
+    func resumeRecoveryOwnershipIsConnectionScoped() async throws {
+        let outbox = EventOutbox()
+        let staleBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: staleBinding))
+        let generation = try #require(await outbox.beginResumeAttempt(binding: staleBinding))
+        let token = try #require(await outbox.beginResumeRecoveryRender(
+            binding: staleBinding,
+            generation: generation
+        ))
+        let blocker = MainActorRenderBlocker()
+        let render = Task { @MainActor in
+            outbox.resyncRenderFence.performIfActive(token) {
+                blocker.block()
+                return true
+            }
+        }
+        await blocker.waitUntilEntered()
+        defer { blocker.releaseRender() }
+
+        let rebind = Task { await outbox.beginConnectionBinding() }
+        let currentBinding = try #require(
+            await waitForActiveBinding(outbox, differentFrom: staleBinding)
+        )
+        blocker.releaseRender()
+        #expect(await render.value == true)
+        #expect(await rebind.value == currentBinding)
+        let staleCompletion = await outbox.completeResumeRecoveryRender(
+            binding: staleBinding,
+            generation: generation,
+            renderToken: token
+        )
+        #expect(!staleCompletion)
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: currentBinding))
+    }
+
+    @Test("Recovery abort clears ownership without reopening dispatch")
+    func recoveryAbortLeavesDispatchClosed() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: binding))
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
+        let token = try #require(await outbox.beginResumeRecoveryRender(
+            binding: binding,
+            generation: generation
+        ))
+        #expect(await outbox.abortResumeRecoveryRender(
+            binding: binding,
+            generation: generation,
+            renderToken: token
+        ))
+
+        await #expect(throws: EventOutboxError.resumeNotConfirmed) {
+            try await outbox.sendActivate(
+                nodeId: NodeId(1),
+                observedRevision: Revision(1),
+                binding: binding,
+                via: transport
+            )
+        }
+        let replacementToken = try #require(await outbox.beginResumeRecoveryRender(
+            binding: binding,
+            generation: generation
+        ))
+        #expect(await outbox.abortResumeRecoveryRender(
+            binding: binding,
+            generation: generation,
+            renderToken: replacementToken
+        ))
+        await outbox.stopResumeWork(generation: generation)
+        await transport.close()
+    }
+
+    @Test("A canceled queued text edit never reaches the native assignment callback")
+    func canceledQueuedTextEditSkipsAssignmentCallback() async throws {
+        let gate = AssignmentSuspensionGate()
+        let transport = FirstSendBlockingTransport(gate: gate)
+        let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "old-session", binding: binding))
+        let recorder = await MainActor.run { TextAssignmentRecorder() }
+
+        let predecessor = Task {
+            try await outbox.sendActivate(
+                nodeId: NodeId(1),
+                observedRevision: Revision(1),
+                binding: binding,
+                via: transport
+            )
+        }
+        await gate.waitUntilEntered()
+        let editSeq = try #require(EditSeq(1))
+        let queued = Task {
+            try await outbox.queueTextEdit(
+                nodeId: NodeId(2),
+                text: "stale",
+                editSeq: editSeq,
+                observedRevision: Revision(1),
+                binding: binding,
+                via: transport,
+                onAssigned: { event in recorder.note(event) }
+            )
+        }
+        while await outbox.eventSeq < 2 {
+            await Task.yield()
+        }
+
+        _ = await outbox.beginConnectionBinding()
+        await gate.releaseAssignment()
+        _ = try? await predecessor.value
+        _ = try? await queued.value
+        #expect(await MainActor.run { recorder.events.isEmpty })
+    }
+
+    @Test("A superseded same-session cleanup preserves the newer binding's draft")
+    func supersededSameSessionCleanupPreservesNewDraft() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let staleBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: staleBinding))
+        let editSeq1 = try #require(EditSeq(1))
+        let retained = try await outbox.queueTextEdit(
+            nodeId: NodeId(40),
+            text: "old",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: staleBinding,
+            via: transport
+        )
+        _ = try #require(retained)
+
+        let gate = AssignmentSuspensionGate()
+        await outbox.setNativeTextLifecycleWillHopForTesting {
+            await gate.holdAssignment()
+        }
+        let recorder = await MainActor.run { TextAssignmentRecorder() }
+        let staleCleanup = Task {
+            try await outbox.applyLiveSameSessionResync(
+                lastProcessedEventSeq: 1,
+                binding: staleBinding,
+                onTextEditsCanceled: { descriptors in
+                    recorder.noteCancellation(descriptors)
+                }
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let currentBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: currentBinding))
+        let editSeq2 = try #require(EditSeq(2))
+        let successor = try await outbox.queueTextEdit(
+            nodeId: NodeId(40),
+            text: "new",
+            editSeq: editSeq2,
+            observedRevision: Revision(2),
+            binding: currentBinding,
+            via: transport
+        )
+        #expect(successor == nil)
+
+        await gate.releaseAssignment()
+        let decision = try await staleCleanup.value
+        if case .superseded = decision {
+            // Expected: the newer binding won before native cleanup.
+        } else {
+            Issue.record("Stale same-session cleanup was not superseded")
+        }
+        #expect(await MainActor.run { recorder.cancellationCalls.isEmpty })
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.unsentTextDraftCount == 1)
+        await transport.close()
+    }
+
+    @Test("A superseded live replacement preserves the newer binding's draft")
+    func supersededLiveReplacementPreservesNewDraft() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let staleBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "old-session", binding: staleBinding))
+        let editSeq1 = try #require(EditSeq(1))
+        let retained = try await outbox.queueTextEdit(
+            nodeId: NodeId(41),
+            text: "old",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: staleBinding,
+            via: transport
+        )
+        _ = try #require(retained)
+
+        let gate = AssignmentSuspensionGate()
+        await outbox.setNativeTextLifecycleWillHopForTesting {
+            await gate.holdAssignment()
+        }
+        let recorder = await MainActor.run { TextAssignmentRecorder() }
+        let staleReplacement = Task {
+            await outbox.applyReplacementFrontier(
+                id: "replacement",
+                lastProcessedEventSeq: 10,
+                binding: staleBinding,
+                onTextEditingReset: { _ in recorder.noteReset() }
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let currentBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "current-session", binding: currentBinding))
+        let editSeq2 = try #require(EditSeq(2))
+        let successor = try await outbox.queueTextEdit(
+            nodeId: NodeId(41),
+            text: "new",
+            editSeq: editSeq2,
+            observedRevision: Revision(2),
+            binding: currentBinding,
+            via: transport
+        )
+        #expect(successor == nil)
+
+        await gate.releaseAssignment()
+        let applied = await staleReplacement.value
+        #expect(!applied)
+        #expect(await MainActor.run { recorder.resetCount == 0 })
+        #expect(await outbox.eventSeq == 1)
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.unsentTextDraftCount == 1)
+        await transport.close()
+    }
+
+    @Test("A superseded resumed replacement preserves the newer binding's draft")
+    func supersededResumedReplacementPreservesNewDraft() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let staleBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "old-session", binding: staleBinding))
+        let editSeq1 = try #require(EditSeq(1))
+        let retained = try await outbox.queueTextEdit(
+            nodeId: NodeId(42),
+            text: "old",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: staleBinding,
+            via: transport
+        )
+        _ = try #require(retained)
+        let generationValue = await outbox.beginResumeAttempt(binding: staleBinding)
+        let generation = try #require(generationValue)
+
+        let gate = AssignmentSuspensionGate()
+        await outbox.setNativeTextLifecycleWillHopForTesting {
+            await gate.holdAssignment()
+        }
+        let recorder = await MainActor.run { TextAssignmentRecorder() }
+        let staleReplacement = Task {
+            await outbox.prepareReplacedSession(
+                id: "replacement",
+                lastProcessedEventSeq: 10,
+                generation: generation,
+                binding: staleBinding,
+                onTextEditingReset: { _ in recorder.noteReset() }
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let currentBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "current-session", binding: currentBinding))
+        let editSeq2 = try #require(EditSeq(2))
+        let successor = try await outbox.queueTextEdit(
+            nodeId: NodeId(42),
+            text: "new",
+            editSeq: editSeq2,
+            observedRevision: Revision(2),
+            binding: currentBinding,
+            via: transport
+        )
+        #expect(successor == nil)
+
+        await gate.releaseAssignment()
+        let applied = await staleReplacement.value
+        #expect(!applied)
+        #expect(await MainActor.run { recorder.resetCount == 0 })
+        #expect(await outbox.eventSeq == 1)
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.unsentTextDraftCount == 1)
+        await transport.close()
+    }
+
+    @Test("An assignment callback from an old incarnation cannot enter replacement native state")
+    func staleAssignmentCannotEnterReplacementNativeState() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let binding = await outbox.beginConnectionBinding()
+        let staleIncarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        #expect(await outbox.confirmFreshSession(id: "old-session", binding: binding))
+        let recorder = await MainActor.run { TextAssignmentRecorder() }
+        let gate = AssignmentSuspensionGate()
+        await outbox.setNativeTextAssignmentWillHopForTesting {
+            await gate.holdAssignment()
+        }
+        let editSeq1 = try #require(EditSeq(1))
+        let staleQueue = Task {
+            try await outbox.queueTextEdit(
+                nodeId: NodeId(45),
+                text: "stale",
+                editSeq: editSeq1,
+                observedRevision: Revision(1),
+                binding: binding,
+                sessionIncarnation: staleIncarnation,
+                via: transport,
+                onAssigned: { event in recorder.note(event) }
+            )
+        }
+        await gate.waitUntilEntered()
+        await outbox.setNativeTextAssignmentWillHopForTesting(nil)
+
+        #expect(await outbox.applyReplacementFrontier(
+            id: "replacement-session",
+            lastProcessedEventSeq: 0,
+            binding: binding
+        ))
+        #expect(await outbox.confirmFreshSession(id: "replacement-session", binding: binding))
+        let currentIncarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        let currentQueue = Task {
+            try await outbox.queueTextEdit(
+                nodeId: NodeId(45),
+                text: "current",
+                editSeq: editSeq1,
+                observedRevision: Revision(1),
+                binding: binding,
+                sessionIncarnation: currentIncarnation,
+                via: transport,
+                onAssigned: { event in recorder.note(event) }
+            )
+        }
+
+        await gate.releaseAssignment()
+        _ = try? await staleQueue.value
+        let current = try #require(try await currentQueue.value)
+        #expect(await MainActor.run { recorder.events.map(\.eventId) } == [current.eventId])
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [current.eventId])
+        await transport.close()
+    }
+
+    @Test("An oversized text edit preserves its draft and does not burn event_seq")
+    func oversizedTextEditAllocationIsTransactional() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let binding = await outbox.beginConnectionBinding()
+        let incarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: binding))
+        let editSeq1 = try #require(EditSeq(1))
+
+        do {
+            _ = try await outbox.queueTextEdit(
+                nodeId: NodeId(46),
+                text: String(repeating: "x", count: defaultMaxFrameSize),
+                editSeq: editSeq1,
+                observedRevision: Revision(1),
+                binding: binding,
+                sessionIncarnation: incarnation,
+                via: transport
+            )
+            Issue.record("Oversized TEXT_EDIT unexpectedly framed")
+        } catch let error as SRUIFramingError {
+            guard case .frameSizeLimitExceeded = error else {
+                Issue.record("Unexpected framing error: \(error)")
+                return
+            }
+        }
+
+        #expect(await outbox.eventSeq == 0)
+        #expect(await outbox.lastAckedEventSeq == 0)
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.unsentTextDraftCount == 1)
+
+        let editSeq2 = try #require(EditSeq(2))
+        let next = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(46),
+            text: "fits",
+            editSeq: editSeq2,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: incarnation,
+            via: transport
+        ))
+        #expect(next.eventSeq == 1)
+        #expect(await outbox.eventSeq == 1)
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(await transport.sentEventSequences() == [1])
+        await transport.close()
+    }
+
+    @Test("An old-incarnation adapter invalidation cannot clear a replacement draft")
+    func staleIncarnationCannotInvalidateReplacementDraft() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let binding = await outbox.beginConnectionBinding()
+        let staleIncarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        #expect(await outbox.confirmFreshSession(id: "old-session", binding: binding))
+        let editSeq1 = try #require(EditSeq(1))
+        _ = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(43),
+            text: "old-assigned",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: staleIncarnation,
+            via: transport
+        ))
+
+        #expect(await outbox.applyReplacementFrontier(
+            id: "replacement-session",
+            lastProcessedEventSeq: 0,
+            binding: binding
+        ))
+        #expect(await outbox.confirmFreshSession(id: "replacement-session", binding: binding))
+        let currentIncarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        #expect(currentIncarnation != staleIncarnation)
+
+        _ = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(43),
+            text: "replacement-assigned",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: currentIncarnation,
+            via: transport,
+            laneEpoch: 1
+        ))
+        let editSeq2 = try #require(EditSeq(2))
+        let successor = try await outbox.queueTextEdit(
+            nodeId: NodeId(43),
+            text: "replacement-draft",
+            editSeq: editSeq2,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: currentIncarnation,
+            via: transport,
+            laneEpoch: 2
+        )
+        #expect(successor == nil)
+
+        let invalidated = await outbox.invalidateTextDraft(
+            nodeId: NodeId(43),
+            laneEpoch: 2,
+            binding: binding,
+            sessionIncarnation: staleIncarnation
+        )
+        #expect(!invalidated)
+        #expect(await outbox.unsentTextDraftCount == 1)
+        await transport.close()
+    }
+
+    @Test("A rejected acknowledgement from an old incarnation cannot resolve replacement text")
+    func staleRejectedAcknowledgementCannotResolveReplacementText() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let binding = await outbox.beginConnectionBinding()
+        let staleIncarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        #expect(await outbox.confirmFreshSession(id: "old-session", binding: binding))
+        let editSeq1 = try #require(EditSeq(1))
+        let retained = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(44),
+            text: "rejected",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: staleIncarnation,
+            via: transport
+        ))
+        let settlement = await outbox.settleAcknowledgement(
+            binding: binding,
+            sessionIncarnation: staleIncarnation,
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: retained.eventId,
+            throughSeq: retained.eventSeq,
+            sessionId: "old-session",
+            revisionAfterEffect: 5,
+            textEditRejected: true
+        )
+        #expect(settlement.bound)
+
+        let gate = AssignmentSuspensionGate()
+        await outbox.setNativeTextLifecycleWillHopForTesting {
+            await gate.holdAssignment()
+        }
+        let recorder = await MainActor.run { TextAssignmentRecorder() }
+        let staleResolution = Task {
+            await outbox.releaseTextAcknowledgements(
+                through: 5,
+                binding: binding,
+                sessionIncarnation: staleIncarnation,
+                onResolved: { barriers in
+                    recorder.noteAcknowledgements(barriers)
+                    return []
+                }
+            )
+        }
+        await gate.waitUntilEntered()
+        await outbox.setNativeTextLifecycleWillHopForTesting(nil)
+
+        #expect(await outbox.applyReplacementFrontier(
+            id: "replacement-session",
+            lastProcessedEventSeq: 0,
+            binding: binding
+        ))
+        #expect(await outbox.confirmFreshSession(id: "replacement-session", binding: binding))
+        let currentIncarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        let current = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(44),
+            text: "current",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: currentIncarnation,
+            via: transport
+        ))
+
+        await gate.releaseAssignment()
+        let stillOwned = await staleResolution.value
+        #expect(!stillOwned)
+        #expect(await MainActor.run { recorder.acknowledgementCalls.isEmpty })
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [current.eventId])
+        await transport.close()
+    }
+
+    @Test("Rebinding waits for an active correction render before changing invalidation ownership")
+    func rebindRetainsCorrectionPublishedInsideActiveRender() async throws {
+        let outbox = EventOutbox()
+        let transport = EventSequenceRecordingTransport()
+        let binding = await outbox.beginConnectionBinding()
+        let incarnation = try #require(await outbox.sessionIncarnation(binding: binding))
+        #expect(await outbox.confirmFreshSession(id: "same-session", binding: binding))
+
+        let editSeq1 = try #require(EditSeq(1))
+        _ = try #require(try await outbox.queueTextEdit(
+            nodeId: NodeId(47),
+            text: "assigned",
+            editSeq: editSeq1,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: incarnation,
+            via: transport,
+            laneEpoch: 1
+        ))
+        let editSeq2 = try #require(EditSeq(2))
+        let successor = try await outbox.queueTextEdit(
+            nodeId: NodeId(47),
+            text: "successor",
+            editSeq: editSeq2,
+            observedRevision: Revision(1),
+            binding: binding,
+            sessionIncarnation: incarnation,
+            via: transport,
+            laneEpoch: 2
+        )
+        #expect(successor == nil)
+        #expect(await outbox.unsentTextDraftCount == 1)
+
+        let commit = try #require(await outbox.commitLiveRender(
+            binding: binding,
+            sessionIncarnation: incarnation,
+            publish: { true },
+            committed: { $0 }
+        ))
+        let renderToken = try #require(commit.renderToken)
+        let blocker = MainActorRenderBlocker()
+        let oldRender = Task { @MainActor in
+            let staged = outbox.resyncRenderFence.performIfActive(renderToken) {
+                blocker.block()
+                return outbox.stageTextDraftInvalidation(
+                    nodeId: NodeId(47),
+                    laneEpoch: 2,
+                    sessionIncarnation: incarnation
+                )
+            }
+            return staged == true
+        }
+        await blocker.waitUntilEntered()
+
+        let replacement = Task {
+            await outbox.beginConnectionBinding()
+        }
+        let observedReplacement = try #require(
+            await waitForActiveBinding(outbox, differentFrom: binding)
+        )
+
+        blocker.releaseRender()
+        let invalidationPublished = await oldRender.value
+        #expect(invalidationPublished)
+        let replacementBinding = await replacement.value
+        #expect(replacementBinding == observedReplacement)
+        #expect(await outbox.unsentTextDraftCount == 0)
+        await transport.close()
+    }
+}
+
+private func waitForActiveBinding(
+    _ outbox: EventOutbox,
+    differentFrom binding: EventOutboxConnectionBinding
+) async -> EventOutboxConnectionBinding? {
+    for _ in 0..<10_000 {
+        if let current = await outbox.activeConnectionBindingForTesting,
+           current != binding {
+            return current
+        }
+        await Task.yield()
+    }
+    return nil
+}
+
+private func waitForResumeGeneration(
+    _ outbox: EventOutbox,
+    _ generation: UInt64
+) async -> Bool {
+    for _ in 0..<10_000 {
+        if await outbox.isActiveResumeGeneration(generation) {
+            return true
+        }
+        await Task.yield()
+    }
+    return false
+}
+
+private func waitForTextDraftWaiter(_ outbox: EventOutbox) async -> Bool {
+    for _ in 0..<10_000 {
+        if await outbox.textDraftWaiterCountForTesting > 0 {
+            return true
+        }
+        await Task.yield()
+    }
+    return false
+}
+
+private final class MainActorRenderBlocker: @unchecked Sendable {
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+
+    @MainActor
+    func block() {
+        entered.signal()
+        release.wait()
+    }
+
+    func waitUntilEntered() async {
+        await Task.detached { [self] in
+            waitForEntry()
+        }.value
+    }
+
+    private func waitForEntry() {
+        entered.wait()
+    }
+
+    func releaseRender() {
+        release.signal()
+    }
+}
+
+private actor AssignmentSuspensionGate {
+    private var entered = false
+    private var released = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func holdAssignment() async {
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            waiter.resume()
+        }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            if released {
+                continuation.resume()
+            } else {
+                releaseWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            if entered {
+                continuation.resume()
+            } else {
+                enteredWaiters.append(continuation)
+            }
+        }
+    }
+
+    func releaseAssignment() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll(keepingCapacity: true)
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+@MainActor
+private final class TextAssignmentRecorder {
+    private(set) var events: [Event] = []
+    private(set) var cancellationCalls: [[PendingTextEditDescriptor]] = []
+    private(set) var acknowledgementCalls: [[TextEditAcknowledgementBarrier]] = []
+    private(set) var resetCount = 0
+
+    func note(_ event: Event) {
+        events.append(event)
+    }
+
+    func noteCancellation(_ descriptors: [PendingTextEditDescriptor]) {
+        cancellationCalls.append(descriptors)
+    }
+
+    func noteAcknowledgements(_ barriers: [TextEditAcknowledgementBarrier]) {
+        acknowledgementCalls.append(barriers)
+    }
+
+    func noteReset() {
+        resetCount += 1
+    }
+}
+
+private actor FirstSendBlockingTransport: Transport {
+    nonisolated let stream = AsyncThrowingStream<Data, Error> { continuation in
+        continuation.finish()
+    }
+    private let gate: AssignmentSuspensionGate
+    private var sendCount = 0
+
+    init(gate: AssignmentSuspensionGate) {
+        self.gate = gate
+    }
+
+    func send(data _: Data, logicalClass _: LogicalChannelClass) async throws {
+        sendCount += 1
+        if sendCount == 1 {
+            await gate.holdAssignment()
+        }
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {}
+}
+
+private actor EventSequenceRecordingTransport: Transport {
+    nonisolated let stream = AsyncThrowingStream<Data, Error> { continuation in
+        continuation.finish()
+    }
+    private var eventSequences: [UInt64] = []
+    private var events: [Event] = []
+
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
+        let message = try decodeFramedMessage(from: data)
+        guard case .event(let event) = message.msg else { return }
+        eventSequences.append(event.eventSeq)
+        events.append(try ProtocolDecoder().validateAndConvertEvent(wire: event))
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {}
+
+    func sentEventSequences() -> [UInt64] {
+        eventSequences
+    }
+
+    func sentEvents() -> [Event] {
+        events
     }
 }

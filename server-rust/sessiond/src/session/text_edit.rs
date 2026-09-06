@@ -17,7 +17,8 @@ use srui_semantic_tree::{
 };
 
 use super::{
-    bound_diagnostic_string, lock_or_recover, EventOutcome, Session, SessionError, SessionInner,
+    bound_diagnostic_string, lock_or_recover, EventOutcome, HandlerFn, Session, SessionError,
+    SessionInner,
 };
 
 /// Default cap on tracked `(client_instance_id, node_id)` editor streams (§26).
@@ -72,12 +73,40 @@ struct EditorStream {
     generation: u64,
 }
 
-/// Bounded per-`(client_instance_id, node_id)` editor sequence table (§18.3, §26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommittedHandlerTextEdit {
+    node_id: u64,
+    edit_seq: u64,
+}
+
+impl CommittedHandlerTextEdit {
+    fn from_event(event: &WireEvent) -> Self {
+        Self {
+            node_id: event.node_id,
+            edit_seq: event.edit_seq,
+        }
+    }
+
+    fn matches_pending(self, reference: &srui_protocol::PendingTextEditRef) -> bool {
+        self.node_id == reference.node_id && self.edit_seq == reference.edit_seq
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClientTextEditState {
+    editor_streams: HashMap<u64, EditorStream>,
+    /// Keyed by event_seq; event-id and event-type equality stay in the dedupe window, which
+    /// already owns and bounds those peer-sized identity bytes. Values are fixed-size.
+    committed_handler_edits: HashMap<u64, CommittedHandlerTextEdit>,
+}
+
+/// Bounded per-(client_instance_id, node_id) editor sequence table (§18.3, §26).
 #[derive(Debug, Clone)]
 pub struct TextEditTracker {
-    /// Grouping by client lets all hot-path probes borrow `&[u8]`; the peer-selected identifier is
-    /// cloned only when that client's first editor stream is admitted.
-    streams: HashMap<Vec<u8>, HashMap<u64, EditorStream>>,
+    /// One peer-sized client key owns both editor streams and fixed-size handler-phase records.
+    /// Handler records correspond one-for-one with in-flight dedupe entries, so their count is
+    /// bounded by the dedupe receive window without retaining another event-id copy.
+    streams: HashMap<Vec<u8>, ClientTextEditState>,
     stream_count: usize,
     max_streams: usize,
 }
@@ -111,7 +140,7 @@ impl TextEditTracker {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.stream_count == 0
+        self.streams.is_empty()
     }
 
     /// Reserves a generation for a sequence strictly above the terminal watermark.
@@ -124,7 +153,7 @@ impl TextEditTracker {
         if let Some(stream) = self
             .streams
             .get_mut(client_instance_id)
-            .and_then(|client| client.get_mut(&node_id.get()))
+            .and_then(|client| client.editor_streams.get_mut(&node_id.get()))
         {
             let watermark = stream
                 .in_flight_edit_seqs
@@ -153,6 +182,7 @@ impl TextEditTracker {
         self.streams
             .entry(client_instance_id.to_vec())
             .or_default()
+            .editor_streams
             .insert(
                 node_id.get(),
                 EditorStream {
@@ -169,15 +199,57 @@ impl TextEditTracker {
     pub fn last_terminal_of(&self, client_instance_id: &[u8], node_id: NodeId) -> Option<u64> {
         self.streams
             .get(client_instance_id)
-            .and_then(|client| client.get(&node_id.get()))
+            .and_then(|client| client.editor_streams.get(&node_id.get()))
             .map(|stream| stream.last_terminal_edit_seq)
+    }
+
+    fn begin_committed_handler_dispatch(&mut self, event: &WireEvent) {
+        let client = self
+            .streams
+            .get_mut(event.client_instance_id.as_slice())
+            .expect("an accepted text edit retains its client tracker state");
+        let replaced = client
+            .committed_handler_edits
+            .insert(event.event_seq, CommittedHandlerTextEdit::from_event(event));
+        debug_assert!(
+            replaced.is_none(),
+            "dedupe prevents concurrent reuse of an in-flight event_seq"
+        );
+    }
+
+    fn finish_committed_handler_dispatch(&mut self, event: &WireEvent) {
+        let remove_client = self
+            .streams
+            .get_mut(event.client_instance_id.as_slice())
+            .is_some_and(|client| {
+                client.committed_handler_edits.remove(&event.event_seq);
+                client.editor_streams.is_empty() && client.committed_handler_edits.is_empty()
+            });
+        if remove_client {
+            self.streams.remove(event.client_instance_id.as_slice());
+        }
+    }
+
+    /// Returns Some only for an accepted edit whose handlers are still running. The caller first
+    /// validates (client_instance_id, event_id, event_seq, event_type) through the dedupe window;
+    /// this fixed-size marker completes the exact comparison with (node_id, edit_seq).
+    fn committed_handler_identity_matches(
+        &self,
+        client_instance_id: &[u8],
+        reference: &srui_protocol::PendingTextEditRef,
+    ) -> Option<bool> {
+        self.streams
+            .get(client_instance_id)
+            .and_then(|client| client.committed_handler_edits.get(&reference.event_seq))
+            .copied()
+            .map(|identity| identity.matches_pending(reference))
     }
 
     #[must_use]
     pub fn generation_of(&self, client_instance_id: &[u8], node_id: NodeId) -> Option<u64> {
         self.streams
             .get(client_instance_id)
-            .and_then(|client| client.get(&node_id.get()))
+            .and_then(|client| client.editor_streams.get(&node_id.get()))
             .map(|stream| stream.generation)
     }
 
@@ -187,7 +259,7 @@ impl TextEditTracker {
         if let Some(stream) = self
             .streams
             .get_mut(client_instance_id)
-            .and_then(|client| client.get_mut(&node_id.get()))
+            .and_then(|client| client.editor_streams.get_mut(&node_id.get()))
         {
             stream.in_flight_edit_seqs.remove(&edit_seq.get());
             stream.last_terminal_edit_seq = stream.last_terminal_edit_seq.max(edit_seq.get());
@@ -205,7 +277,7 @@ impl TextEditTracker {
         if let Some(stream) = self
             .streams
             .get_mut(client_instance_id)
-            .and_then(|client| client.get_mut(&node_id.get()))
+            .and_then(|client| client.editor_streams.get_mut(&node_id.get()))
         {
             stream.in_flight_edit_seqs.remove(&edit_seq.get());
         }
@@ -215,8 +287,8 @@ impl TextEditTracker {
         let node_id = node_id.get();
         let mut removed = 0;
         self.streams.retain(|_, client| {
-            removed += usize::from(client.remove(&node_id).is_some());
-            !client.is_empty()
+            removed += usize::from(client.editor_streams.remove(&node_id).is_some());
+            !client.editor_streams.is_empty() || !client.committed_handler_edits.is_empty()
         });
         self.stream_count -= removed;
     }
@@ -232,15 +304,16 @@ impl TextEditTracker {
         }
         let mut removed = 0;
         self.streams.retain(|_, client| {
-            let before = client.len();
-            client.retain(|node_id, _| !doomed.contains(node_id));
-            removed += before - client.len();
-            !client.is_empty()
+            let before = client.editor_streams.len();
+            client
+                .editor_streams
+                .retain(|node_id, _| !doomed.contains(node_id));
+            removed += before - client.editor_streams.len();
+            !client.editor_streams.is_empty() || !client.committed_handler_edits.is_empty()
         });
         self.stream_count -= removed;
     }
 }
-
 pub(crate) fn is_editor_type(ty: TypeRef) -> bool {
     ty == TypeRef::TEXT_INPUT || ty == TypeRef::TEXT_AREA
 }
@@ -302,22 +375,30 @@ impl Session {
                 .text_edit_tracker
                 .reserve(&client_bytes, domain.node_id, edit_seq)
             {
-                Ok(generation) => PreparedTextEdit {
-                    request: TextEditRequest {
-                        client_instance_id: domain
-                            .client_instance_id
-                            .clone()
-                            .unwrap_or_else(|| ClientInstanceId::new(client_bytes.clone())),
-                        event_id: domain.event_id.clone(),
-                        event_seq: domain.event_seq,
-                        edit_seq,
-                        node_id: domain.node_id,
-                        value: domain.text_arg().unwrap_or_default().to_string(),
-                        observed_revision: domain.observed_revision,
-                    },
-                    generation,
-                    policy: guard.text_edit_policy.clone(),
-                },
+                Ok(generation) => {
+                    let handlers = guard
+                        .handlers
+                        .get(&(domain.node_id, domain.event_type))
+                        .cloned()
+                        .unwrap_or_default();
+                    PreparedTextEdit {
+                        request: TextEditRequest {
+                            client_instance_id: domain
+                                .client_instance_id
+                                .clone()
+                                .unwrap_or_else(|| ClientInstanceId::new(client_bytes.clone())),
+                            event_id: domain.event_id.clone(),
+                            event_seq: domain.event_seq,
+                            edit_seq,
+                            node_id: domain.node_id,
+                            value: domain.text_arg().unwrap_or_default().to_string(),
+                            observed_revision: domain.observed_revision,
+                        },
+                        generation,
+                        policy: guard.text_edit_policy.clone(),
+                        handlers,
+                    }
+                }
                 Err(error) => return Ok(reject_admitted(&mut guard, event, error)),
             }
         };
@@ -329,29 +410,44 @@ impl Session {
             match dispatch {
                 Ok(decision) => decision,
                 Err(panic_payload) => {
-                    let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-                    guard.text_edit_tracker.abandon_reservation(
-                        &event.client_instance_id,
-                        prepared.request.node_id,
-                        prepared.request.edit_seq,
+                    return self.abandon_text_edit_after_panic(
+                        event,
+                        &prepared.request,
+                        panic_payload,
                     );
-                    guard.dedupe.abandon_event(event);
-                    drop(guard);
-                    let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
-                    };
-                    return Err(SessionError::Panicked(panic_msg));
                 }
             }
         } else {
             TextEditDecision::Accept
         };
 
-        self.commit_text_edit_decision(event, &prepared.request, prepared.generation, decision)
+        self.commit_text_edit_decision(
+            event,
+            &prepared.request,
+            prepared.generation,
+            decision,
+            &prepared.handlers,
+        )
+    }
+
+    fn abandon_text_edit_after_panic(
+        &self,
+        event: &WireEvent,
+        request: &TextEditRequest,
+        panic_payload: Box<dyn std::any::Any + Send>,
+    ) -> Result<EventOutcome, SessionError> {
+        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        guard.text_edit_tracker.abandon_reservation(
+            &event.client_instance_id,
+            request.node_id,
+            request.edit_seq,
+        );
+        guard.dedupe.abandon_event(event);
+        drop(guard);
+
+        Err(SessionError::Panicked(panic_payload_message(
+            panic_payload.as_ref(),
+        )))
     }
 
     fn commit_text_edit_decision(
@@ -360,6 +456,7 @@ impl Session {
         request: &TextEditRequest,
         reserved_generation: u64,
         decision: TextEditDecision,
+        handlers: &[HandlerFn],
     ) -> Result<EventOutcome, SessionError> {
         let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
@@ -468,30 +565,68 @@ impl Session {
             request.node_id,
             request.edit_seq,
         );
+        if accepted {
+            guard
+                .text_edit_tracker
+                .begin_committed_handler_dispatch(event);
+        }
         self.publish_committed(&tx_wire);
 
+        if !accepted {
+            let revision_after_effect = guard.store.revision().get();
+            let last_processed_event_seq = guard.dedupe.settle_event(
+                event,
+                EventOutcomeRecord {
+                    accepted: false,
+                    revision_after_effect,
+                    reject_reason: reject_reason.clone(),
+                },
+            );
+            return Ok(EventOutcome::Rejected {
+                error: EventValidationError::PolicyRejected(reject_reason),
+                revision_after_effect,
+                last_processed_event_seq,
+            });
+        }
+
+        // Keep the admitted identity in flight until registered handlers finish. An accepted
+        // TEXT_EDIT has the same ACK semantics as every other accepted event: the reported
+        // revision includes transactions committed by its handlers.
+        drop(guard);
+        let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for handler in handlers {
+                handler(self, event);
+            }
+        }));
+
+        // The authoritative text value is already committed even if a notification handler
+        // panics. Settle it as accepted before surfacing the infrastructure failure so a resumed
+        // client cannot replay the edit or re-enter the handler.
+        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let revision_after_effect = guard.store.revision().get();
         let last_processed_event_seq = guard.dedupe.settle_event(
             event,
             EventOutcomeRecord {
-                accepted,
+                accepted: true,
                 revision_after_effect,
-                reject_reason: reject_reason.clone(),
+                reject_reason: String::new(),
             },
         );
+        guard
+            .text_edit_tracker
+            .finish_committed_handler_dispatch(event);
+        drop(guard);
 
-        if accepted {
-            Ok(EventOutcome::Processed {
-                revision_after_effect,
-                last_processed_event_seq,
-            })
-        } else {
-            Ok(EventOutcome::Rejected {
-                error: EventValidationError::PolicyRejected(reject_reason),
-                revision_after_effect,
-                last_processed_event_seq,
-            })
+        if let Err(panic_payload) = dispatch {
+            return Err(SessionError::Panicked(panic_payload_message(
+                panic_payload.as_ref(),
+            )));
         }
+
+        Ok(EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        })
     }
 
     pub(crate) fn validate_pending_text_edit_refs(
@@ -559,12 +694,43 @@ impl Session {
                 edit_seq: edit_seq.get(),
                 ..Default::default()
             };
-            staged_dedupe.admit_and_settle(&placeholder, outcome.clone())?;
-            staged_tracker.mark_terminal(
-                client_instance_id,
-                NodeId::new(reference.node_id),
-                edit_seq,
-            );
+            // A duplicate accepted identity remains accepted, while unseen identities are
+            // canceled and made terminal. An edit whose authoritative commit already landed but
+            // whose registered handlers are still running must remain in flight: the resync still
+            // tells the client to discard its local copy, and handler completion will cache the
+            // accepted result at the true post-handler revision.
+            // Admission validates the variable-sized event_id plus event_seq and event type
+            // against the bounded dedupe record before the fixed-size handler marker is consulted.
+            let (settle_as_canceled, mark_terminal) = match staged_dedupe
+                .admit_event(&placeholder)?
+            {
+                RecordOutcome::Duplicate { .. } => (false, true),
+                RecordOutcome::Fresh { .. } => (true, true),
+                RecordOutcome::Pending { .. } => {
+                    match staged_tracker
+                        .committed_handler_identity_matches(client_instance_id, reference)
+                    {
+                        Some(true) => (false, false),
+                        Some(false) => {
+                            return Err(SessionError::InvalidInput(
+                                    "pending TEXT_EDIT ref does not match committed in-handler event identity"
+                                        .into(),
+                                ));
+                        }
+                        None => (true, true),
+                    }
+                }
+            };
+            if settle_as_canceled {
+                staged_dedupe.settle_event(&placeholder, outcome.clone());
+            }
+            if mark_terminal {
+                staged_tracker.mark_terminal(
+                    client_instance_id,
+                    NodeId::new(reference.node_id),
+                    edit_seq,
+                );
+            }
             discarded.push(reference.clone());
         }
         inner.dedupe = staged_dedupe;
@@ -577,6 +743,17 @@ struct PreparedTextEdit {
     request: TextEditRequest,
     generation: u64,
     policy: Option<TextEditPolicy>,
+    handlers: Vec<HandlerFn>,
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 fn validate_text_edit(
@@ -764,6 +941,60 @@ mod tests {
     }
 
     #[test]
+    fn handler_phase_records_reuse_the_bounded_client_key() {
+        let client = vec![b'x'; 4_096];
+        let huge_event_id = vec![b'e'; 64 * 1_024];
+        let mut tracker = TextEditTracker::new(8);
+
+        tracker.reserve(&client, node(1), seq(1)).unwrap();
+        tracker.mark_terminal(&client, node(1), seq(1));
+        let first = WireEvent {
+            client_instance_id: client.clone(),
+            event_id: huge_event_id.clone(),
+            event_seq: 1,
+            node_id: 1,
+            edit_seq: 1,
+            ..Default::default()
+        };
+        tracker.begin_committed_handler_dispatch(&first);
+
+        tracker.reserve(&client, node(2), seq(1)).unwrap();
+        tracker.mark_terminal(&client, node(2), seq(1));
+        let second = WireEvent {
+            client_instance_id: client.clone(),
+            event_id: huge_event_id,
+            event_seq: 2,
+            node_id: 2,
+            edit_seq: 1,
+            ..Default::default()
+        };
+        tracker.begin_committed_handler_dispatch(&second);
+
+        assert_eq!(tracker.streams.len(), 1);
+        assert_eq!(tracker.retained_client_id_bytes(), client.len());
+        assert_eq!(
+            tracker
+                .streams
+                .get(client.as_slice())
+                .unwrap()
+                .committed_handler_edits
+                .len(),
+            2
+        );
+
+        tracker.reclaim_nodes([node(1), node(2)]);
+        assert_eq!(tracker.len(), 0);
+        assert!(!tracker.is_empty());
+        assert_eq!(tracker.retained_client_id_bytes(), client.len());
+
+        tracker.finish_committed_handler_dispatch(&first);
+        assert_eq!(tracker.retained_client_id_bytes(), client.len());
+        tracker.finish_committed_handler_dispatch(&second);
+        assert!(tracker.is_empty());
+        assert_eq!(tracker.retained_client_id_bytes(), 0);
+    }
+
+    #[test]
     fn tracker_refuses_generation_overflow() {
         let mut tracker = TextEditTracker::new(8);
         tracker.reserve(b"c", node(1), seq(1)).unwrap();
@@ -771,6 +1002,7 @@ mod tests {
             .streams
             .get_mut(&b"c"[..])
             .unwrap()
+            .editor_streams
             .get_mut(&1u64)
             .unwrap()
             .generation = u64::MAX;

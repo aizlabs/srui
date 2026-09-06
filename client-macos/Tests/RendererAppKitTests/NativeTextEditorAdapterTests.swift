@@ -150,4 +150,33 @@ struct NativeTextEditorAdapterTests {
         #expect(commits.isEmpty)
         #expect(session.localValue(for: NodeId(12)) == "hello!")
     }
+
+    @Test("Remount end-editing abandons IME so the replacement apply is not deferred")
+    func remountEndEditingAbandonsComposition() {
+        let (session, adapter, field) = makeField()
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        adapter.applyAuthoritativeString("hello")
+        adapter.compositionOverride = true
+        field.stringValue = "hel"
+        adapter.notifyTextDidChangeForTests()
+        #expect(session.isComposing(for: NodeId(12)))
+        #expect(commits.isEmpty)
+
+        session.withPreservedLocalText {
+            adapter.notifyEndEditingForTests()
+            adapter.applyAuthoritativeString("hello")
+        }
+        #expect(commits.isEmpty)
+        #expect(!session.isComposing(for: NodeId(12)))
+        #expect(field.stringValue == "hello")
+
+        adapter.compositionOverride = false
+        field.stringValue = "hello!"
+        adapter.notifyTextDidChangeForTests()
+        #expect(field.stringValue == "hello!")
+        #expect(session.localValue(for: NodeId(12)) == "hello!")
+        #expect(commits == ["hello!"])
+    }
 }

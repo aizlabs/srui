@@ -213,6 +213,53 @@ struct TextEditingSessionTests {
         #expect(commits.isEmpty)
     }
 
+    @Test("A remount while composing applies the store string instead of deferring it")
+    func remountAbandonsCompositionSoStoreStringIsNotDeferred() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
+        _ = session.setComposing(true, nodeID: nodeID)
+        session.noteLocalValue("hel", nodeID: nodeID, composing: true, flushImmediately: false)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .deferred)
+        #expect(session.isComposing(for: nodeID))
+
+        let resolution = session.withPreservedLocalText {
+            session.endEditing(nodeID: nodeID)
+            session.noteLocalValue("hel", nodeID: nodeID, composing: true, flushImmediately: true)
+            return session.applyPublishedValue(nodeID: nodeID, published: "hello")
+        }
+        #expect(resolution == .apply)
+        #expect(!session.isComposing(for: nodeID))
+        #expect(session.localValue(for: nodeID) == "hello")
+        #expect(commits.isEmpty)
+
+        session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(session.localValue(for: nodeID) == "hello!")
+        #expect(commits == ["hello!"])
+    }
+
+    @Test("A remount while composing still keeps an unflushed committed draft")
+    func remountAbandonsCompositionButKeepsPendingDraft() {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
+        session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: false)
+        _ = session.setComposing(true, nodeID: nodeID)
+        session.noteLocalValue("hel", nodeID: nodeID, composing: true, flushImmediately: false)
+
+        let resolution = session.withPreservedLocalText {
+            return session.applyPublishedValue(nodeID: nodeID, published: "hello")
+        }
+        #expect(resolution == .keepLocal)
+        #expect(!session.isComposing(for: nodeID))
+        #expect(session.localValue(for: nodeID) == "hello!")
+        #expect(commits.isEmpty)
+    }
+
     @Test("A remount after a non-publishing acknowledgement applies the store string")
     func remountAfterAcknowledgedRejectApplies() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)

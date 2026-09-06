@@ -173,6 +173,9 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
         guard !applyingAuthoritative else { return }
         if session?.isPreservingLocalTextAcrossRemount == true {
             lastKnownComposing = false
+            // Teardown destroys marked text. Drop composing so the replacement adapter
+            // can apply or keepLocal instead of deferring, but do not flush a TEXT_EDIT.
+            session?.abandonComposition(nodeID: nodeID)
             return
         }
         lastKnownComposing = false

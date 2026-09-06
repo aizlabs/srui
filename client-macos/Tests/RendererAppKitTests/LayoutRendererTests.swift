@@ -82,6 +82,50 @@ struct LayoutRendererTests {
     }
 
     @Test
+    func structuralRemountAbandonsCompositionInsteadOfDeferringStoreString() throws {
+        let renderer = LayoutRenderer()
+        renderer.controlFactory.textEditingSession.debounceNanoseconds = 0
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .textInput,
+                parentID: 1,
+                properties: [(.value, .string("hello"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        adapter.compositionOverride = true
+        let field = try #require(handle.view as? NSTextField)
+        field.stringValue = "hel"
+        adapter.notifyTextDidChangeForTests()
+        #expect(renderer.controlFactory.textEditingSession.isComposing(for: editorID))
+
+        let structural = SemanticModel.Operation.createNode(id: 3, nodeType: .text, parentID: 1)
+        let newStore = try makeStore(base + [structural])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [structural]),
+            newStore: newStore
+        )
+
+        let after = try #require(renderer.registry.handle(for: editorID))
+        let adapterAfter = try #require(after.textAdapter)
+        let fieldAfter = try #require(after.view as? NSTextField)
+        #expect(!renderer.controlFactory.textEditingSession.isComposing(for: editorID))
+        #expect(fieldAfter.stringValue == "hello")
+
+        fieldAfter.stringValue = "hello!"
+        adapterAfter.notifyTextDidChangeForTests()
+        #expect(fieldAfter.stringValue == "hello!")
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+    }
+
+    @Test
     func scalarPropertyUpdatePreservesViewIdentityWithoutRemounting() throws {
         let base: [SemanticModel.Operation] = [
             .createNode(id: 1, nodeType: .surface),

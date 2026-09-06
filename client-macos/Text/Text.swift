@@ -124,8 +124,12 @@ public final class TextEditingSession {
 
     /// Structural remounts re-apply the current store string for every editor. That is not a
     /// correction: keep local typing while the published value is still the last known store value.
+    ///
+    /// IME composition cannot survive field-editor teardown, so every in-flight composition is
+    /// abandoned here (without flushing) before `body` runs.
     public func withPreservedLocalText<T>(_ body: () throws -> T) rethrows -> T {
         preservingLocalTextAcrossRemount = true
+        abandonAllCompositions()
         defer { preservingLocalTextAcrossRemount = false }
         return try body()
     }
@@ -150,9 +154,18 @@ public final class TextEditingSession {
         guard !suppressingLocalEditsForResync else { return }
         if preservingLocalTextAcrossRemount {
             var state = nodes[nodeID] ?? NodeState()
+            // Marked text dies with the field editor. Do not re-enter composing or promote
+            // an intermediate preedit into a pending draft (§22.6).
+            if composing {
+                state.composing = false
+                state.deferredAuthoritative = nil
+                nodes[nodeID] = state
+                return
+            }
             state.localValue = value
-            state.composing = composing
-            if !composing, state.pendingValue != nil || value != state.lastKnownAuthoritative {
+            state.composing = false
+            state.deferredAuthoritative = nil
+            if state.pendingValue != nil || value != state.lastKnownAuthoritative {
                 state.pendingValue = value
             }
             nodes[nodeID] = state
@@ -276,6 +289,27 @@ public final class TextEditingSession {
         nodes[nodeID]?.localValue
     }
 
+    /// True while this editor has marked text that has not yet been committed locally.
+    public func isComposing(for nodeID: NodeId) -> Bool {
+        nodes[nodeID]?.composing ?? false
+    }
+
+    /// Drops IME bookkeeping for a destroyed field editor without flushing a `TEXT_EDIT`.
+    ///
+    /// A committed unflushed draft or in-flight submit is restored as `localValue` so a
+    /// remount `keepLocal` does not paint the intermediate marked string.
+    public func abandonComposition(nodeID: NodeId) {
+        guard var state = nodes[nodeID] else { return }
+        state.composing = false
+        state.deferredAuthoritative = nil
+        if let pending = state.pendingValue {
+            state.localValue = pending
+        } else if let submitted = state.lastSubmittedValue {
+            state.localValue = submitted
+        }
+        nodes[nodeID] = state
+    }
+
     /// Last store string applied or echoed for this editor; `nil` if none has been published.
     public func lastKnownAuthoritative(for nodeID: NodeId) -> String? {
         nodes[nodeID]?.lastKnownAuthoritative
@@ -342,6 +376,10 @@ public final class TextEditingSession {
     @discardableResult
     public func setComposing(_ composing: Bool, nodeID: NodeId) -> String? {
         guard !suppressingLocalEditsForResync else { return nil }
+        if preservingLocalTextAcrossRemount {
+            abandonComposition(nodeID: nodeID)
+            return nil
+        }
         var state = nodes[nodeID] ?? NodeState()
         let ending = state.composing && !composing
         state.composing = composing
@@ -354,6 +392,12 @@ public final class TextEditingSession {
             }
         }
         return nil
+    }
+
+    private func abandonAllCompositions() {
+        for nodeID in Array(nodes.keys) {
+            abandonComposition(nodeID: nodeID)
+        }
     }
 
     @discardableResult

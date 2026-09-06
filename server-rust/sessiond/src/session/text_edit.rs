@@ -5,7 +5,7 @@
 //! is rechecked before commit so an older concurrent validator cannot overwrite a newer edit.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use srui_event_dedupe::{EventOutcomeRecord, RecordOutcome};
 use srui_protocol::Event as WireEvent;
@@ -17,8 +17,8 @@ use srui_semantic_tree::{
 };
 
 use super::{
-    bound_diagnostic_string, lock_or_recover, EventOutcome, HandlerFn, Session, SessionError,
-    SessionInner,
+    bound_diagnostic_string, lock_or_recover, panic_payload_message, EventOutcome,
+    HandlerDispatchKind, HandlerFn, Session, SessionError, SessionInner,
 };
 
 /// Default cap on tracked `(client_instance_id, node_id)` editor streams (§26).
@@ -217,7 +217,7 @@ impl TextEditTracker {
         );
     }
 
-    fn finish_committed_handler_dispatch(&mut self, event: &WireEvent) {
+    pub(super) fn finish_committed_handler_dispatch(&mut self, event: &WireEvent) {
         let remove_client = self
             .streams
             .get_mut(event.client_instance_id.as_slice())
@@ -335,42 +335,18 @@ impl Session {
         let mut guard = lock_or_recover(&self.inner);
         guard.text_edit_policy = None;
     }
-
-    pub(crate) fn process_text_edit(
+    pub(crate) fn process_admitted_text_edit(
         &self,
         event: &WireEvent,
         domain: DomainEvent,
+        mut guard: MutexGuard<'_, SessionInner>,
     ) -> Result<EventOutcome, SessionError> {
-        let prepared = {
-            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-
-            match guard.dedupe.admit_event(event)? {
-                RecordOutcome::Duplicate {
-                    prior,
-                    last_processed_event_seq,
-                } => {
-                    return Ok(EventOutcome::Duplicate {
-                        accepted: prior.accepted,
-                        revision_after_effect: prior.revision_after_effect,
-                        last_processed_event_seq,
-                        reject_reason: prior.reject_reason,
-                    });
-                }
-                RecordOutcome::Pending {
-                    last_processed_event_seq,
-                } => {
-                    return Ok(EventOutcome::Pending {
-                        last_processed_event_seq,
-                    });
-                }
-                RecordOutcome::Fresh { .. } => {}
-            }
-
-            let edit_seq = match validate_text_edit(&guard, &domain) {
-                Ok(seq) => seq,
-                Err(error) => return Ok(reject_admitted(&mut guard, event, error)),
-            };
-            let client_bytes = event.client_instance_id.clone();
+        let edit_seq = match validate_text_edit(&guard, &domain) {
+            Ok(seq) => seq,
+            Err(error) => return Ok(Self::settle_rejected_event(&mut guard, event, error)),
+        };
+        let client_bytes = event.client_instance_id.clone();
+        let prepared =
             match guard
                 .text_edit_tracker
                 .reserve(&client_bytes, domain.node_id, edit_seq)
@@ -386,7 +362,7 @@ impl Session {
                             client_instance_id: domain
                                 .client_instance_id
                                 .clone()
-                                .unwrap_or_else(|| ClientInstanceId::new(client_bytes.clone())),
+                                .unwrap_or_else(|| ClientInstanceId::new(client_bytes)),
                             event_id: domain.event_id.clone(),
                             event_seq: domain.event_seq,
                             edit_seq,
@@ -399,9 +375,9 @@ impl Session {
                         handlers,
                     }
                 }
-                Err(error) => return Ok(reject_admitted(&mut guard, event, error)),
-            }
-        };
+                Err(error) => return Ok(Self::settle_rejected_event(&mut guard, event, error)),
+            };
+        drop(guard);
 
         let decision = if let Some(policy) = prepared.policy {
             let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -421,13 +397,19 @@ impl Session {
             TextEditDecision::Accept
         };
 
-        self.commit_text_edit_decision(
+        match self.commit_text_edit_decision(
             event,
             &prepared.request,
             prepared.generation,
             decision,
-            &prepared.handlers,
-        )
+        )? {
+            TextEditCommit::Settled(outcome) => Ok(outcome),
+            TextEditCommit::DispatchAccepted => self.dispatch_admitted_event(
+                event,
+                &prepared.handlers,
+                HandlerDispatchKind::CommittedTextEdit,
+            ),
+        }
     }
 
     fn abandon_text_edit_after_panic(
@@ -456,8 +438,7 @@ impl Session {
         request: &TextEditRequest,
         reserved_generation: u64,
         decision: TextEditDecision,
-        handlers: &[HandlerFn],
-    ) -> Result<EventOutcome, SessionError> {
+    ) -> Result<TextEditCommit, SessionError> {
         let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
 
         if !guard
@@ -471,22 +452,24 @@ impl Session {
                 let last_processed_event_seq = guard
                     .dedupe
                     .last_contiguous_processed_seq(&event.client_instance_id);
-                return Ok(EventOutcome::Duplicate {
+                return Ok(TextEditCommit::Settled(EventOutcome::Duplicate {
                     accepted: prior.accepted,
                     revision_after_effect: prior.revision_after_effect,
                     last_processed_event_seq,
                     reject_reason: prior.reject_reason,
-                });
+                }));
             }
-            return Ok(EventOutcome::Pending {
+            return Ok(TextEditCommit::Settled(EventOutcome::Pending {
                 last_processed_event_seq: guard
                     .dedupe
                     .last_contiguous_processed_seq(&event.client_instance_id),
-            });
+            }));
         }
 
         if let Err(error) = revalidate_editor_for_commit(&guard, request.node_id) {
-            return Ok(reject_reserved(&mut guard, event, request, error));
+            return Ok(TextEditCommit::Settled(reject_reserved(
+                &mut guard, event, request, error,
+            )));
         }
 
         let current_generation = guard
@@ -494,8 +477,12 @@ impl Session {
             .generation_of(&event.client_instance_id, request.node_id)
             .unwrap_or(0);
         if current_generation != reserved_generation {
-            let error = EventValidationError::SupersededGeneration;
-            return Ok(reject_reserved(&mut guard, event, request, error));
+            return Ok(TextEditCommit::Settled(reject_reserved(
+                &mut guard,
+                event,
+                request,
+                EventValidationError::SupersededGeneration,
+            )));
         }
 
         let current_value = current_editor_value(&guard, request.node_id);
@@ -523,7 +510,9 @@ impl Session {
                 length: publish_value.len(),
                 limit: max_string_length,
             };
-            return Ok(reject_reserved(&mut guard, event, request, error));
+            return Ok(TextEditCommit::Settled(reject_reserved(
+                &mut guard, event, request, error,
+            )));
         }
 
         let reject_reason = bound_diagnostic_string(reject_reason, max_string_length);
@@ -535,26 +524,30 @@ impl Session {
             PropertyRef::VALUE,
             Value::String(publish_value),
         ) {
-            return Ok(reject_reserved_store(&mut guard, event, request, error));
+            return Ok(TextEditCommit::Settled(reject_reserved_store(
+                &mut guard, event, request, error,
+            )));
         }
         if let Err(error) = ui.set(
             request.node_id,
             PropertyRef::VALIDATION_STATE,
             Value::EnumToken(validation.into()),
         ) {
-            return Ok(reject_reserved_store(&mut guard, event, request, error));
+            return Ok(TextEditCommit::Settled(reject_reserved_store(
+                &mut guard, event, request, error,
+            )));
         }
         let (staged, ops) = ui.into_staged_and_ops();
         let commit = AuthoritativeCommit::new(base_revision, ops);
         let permit = match guard.journal.prepare(&commit) {
             Ok(permit) => permit,
             Err(error) => {
-                return Ok(reject_reserved(
+                return Ok(TextEditCommit::Settled(reject_reserved(
                     &mut guard,
                     event,
                     request,
                     EventValidationError::PolicyRejected(error.to_string()),
-                ));
+                )));
             }
         };
         let tx_wire = permit.transaction().clone();
@@ -582,92 +575,53 @@ impl Session {
                     reject_reason: reject_reason.clone(),
                 },
             );
-            return Ok(EventOutcome::Rejected {
+            return Ok(TextEditCommit::Settled(EventOutcome::Rejected {
                 error: EventValidationError::PolicyRejected(reject_reason),
                 revision_after_effect,
                 last_processed_event_seq,
-            });
+            }));
         }
 
-        // Keep the admitted identity in flight until registered handlers finish. An accepted
-        // TEXT_EDIT has the same ACK semantics as every other accepted event: the reported
-        // revision includes transactions committed by its handlers.
-        drop(guard);
-        let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for handler in handlers {
-                handler(self, event);
-            }
-        }));
-
-        // The authoritative text value is already committed even if a notification handler
-        // panics. Settle it as accepted before surfacing the infrastructure failure so a resumed
-        // client cannot replay the edit or re-enter the handler.
-        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-        let revision_after_effect = guard.store.revision().get();
-        let last_processed_event_seq = guard.dedupe.settle_event(
-            event,
-            EventOutcomeRecord {
-                accepted: true,
-                revision_after_effect,
-                reject_reason: String::new(),
-            },
-        );
-        guard
-            .text_edit_tracker
-            .finish_committed_handler_dispatch(event);
-        drop(guard);
-
-        if let Err(panic_payload) = dispatch {
-            return Err(SessionError::Panicked(panic_payload_message(
-                panic_payload.as_ref(),
-            )));
-        }
-
-        Ok(EventOutcome::Processed {
-            revision_after_effect,
-            last_processed_event_seq,
-        })
+        // Keep the admitted identity in flight until registered handlers finish. The shared
+        // dispatch path samples the post-handler revision and always removes this marker.
+        Ok(TextEditCommit::DispatchAccepted)
     }
 
     pub(crate) fn validate_pending_text_edit_refs(
         refs: &[srui_protocol::PendingTextEditRef],
-    ) -> Result<(), SessionError> {
+    ) -> Result<Vec<ValidatedPendingTextEditRef<'_>>, SessionError> {
         if refs.len() > MAX_TEXT_EDIT_STREAMS {
             return Err(SessionError::InvalidInput(format!(
                 "pending_text_edits has {} entries; at most {MAX_TEXT_EDIT_STREAMS} are accepted (§18.3, §26)",
                 refs.len()
             )));
         }
+
+        let mut validated = Vec::with_capacity(refs.len());
         for reference in refs {
             if reference.event_id.is_empty() || reference.event_seq == 0 {
                 return Err(SessionError::InvalidInput(
                     "pending TEXT_EDIT ref is missing event_id or event_seq".into(),
                 ));
             }
-            if EditSeq::new(reference.edit_seq).is_none() {
-                return Err(SessionError::InvalidInput(
+            let edit_seq = EditSeq::new(reference.edit_seq).ok_or_else(|| {
+                SessionError::InvalidInput(
                     "pending TEXT_EDIT ref requires a positive edit_seq".into(),
-                ));
-            }
+                )
+            })?;
+            validated.push(ValidatedPendingTextEditRef {
+                reference,
+                edit_seq,
+            });
         }
-        Ok(())
+        Ok(validated)
     }
 
     pub(crate) fn cancel_pending_text_edits(
         inner: &mut SessionInner,
         client_instance_id: &[u8],
-        refs: &[srui_protocol::PendingTextEditRef],
+        refs: &[ValidatedPendingTextEditRef<'_>],
     ) -> Result<Vec<srui_protocol::PendingTextEditRef>, SessionError> {
-        Self::validate_pending_text_edit_refs(refs)?;
-        let validated: Vec<_> = refs
-            .iter()
-            .map(|reference| {
-                EditSeq::new(reference.edit_seq)
-                    .map(|edit_seq| (reference, edit_seq))
-                    .ok_or_else(|| SessionError::InvalidInput("invalid edit_seq".into()))
-            })
-            .collect::<Result<_, _>>()?;
-
         let revision_after_effect = inner.store.revision().get();
         let max_string_length = inner.store.limits().max_string_length;
         let outcome = EventOutcomeRecord {
@@ -683,8 +637,10 @@ impl Session {
         // identity conflict must not leave an earlier ref settled when the handshake fails.
         let mut staged_dedupe = inner.dedupe.clone();
         let mut staged_tracker = inner.text_edit_tracker.clone();
-        let mut discarded = Vec::with_capacity(validated.len());
-        for (reference, edit_seq) in validated {
+        let mut discarded = Vec::with_capacity(refs.len());
+        for validated in refs {
+            let reference = validated.reference;
+            let edit_seq = validated.edit_seq;
             let placeholder = WireEvent {
                 client_instance_id: client_instance_id.to_vec(),
                 event_seq: reference.event_seq,
@@ -738,7 +694,6 @@ impl Session {
         Ok(discarded)
     }
 }
-
 struct PreparedTextEdit {
     request: TextEditRequest,
     generation: u64,
@@ -746,14 +701,14 @@ struct PreparedTextEdit {
     handlers: Vec<HandlerFn>,
 }
 
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic".to_string()
-    }
+enum TextEditCommit {
+    Settled(EventOutcome),
+    DispatchAccepted,
+}
+
+pub(crate) struct ValidatedPendingTextEditRef<'a> {
+    reference: &'a srui_protocol::PendingTextEditRef,
+    edit_seq: EditSeq,
 }
 
 fn validate_text_edit(
@@ -829,7 +784,7 @@ fn reject_reserved(
         request.node_id,
         request.edit_seq,
     );
-    reject_admitted(inner, event, error)
+    Session::settle_rejected_event(inner, event, error)
 }
 
 fn current_editor_value(inner: &SessionInner, node_id: NodeId) -> String {
@@ -846,28 +801,6 @@ fn current_editor_value(inner: &SessionInner, node_id: NodeId) -> String {
         })
         .unwrap_or("")
         .to_string()
-}
-
-fn reject_admitted(
-    inner: &mut SessionInner,
-    event: &WireEvent,
-    error: EventValidationError,
-) -> EventOutcome {
-    let max_string_length = inner.store.limits().max_string_length;
-    let revision_after_effect = inner.store.revision().get();
-    let last_processed_event_seq = inner.dedupe.settle_event(
-        event,
-        EventOutcomeRecord {
-            accepted: false,
-            revision_after_effect,
-            reject_reason: bound_diagnostic_string(error.to_string(), max_string_length),
-        },
-    );
-    EventOutcome::Rejected {
-        error,
-        revision_after_effect,
-        last_processed_event_seq,
-    }
 }
 
 #[cfg(test)]
@@ -1044,7 +977,9 @@ mod tests {
             },
         ];
 
-        assert!(Session::cancel_pending_text_edits(&mut inner, client, &refs).is_err());
+        let validated =
+            Session::validate_pending_text_edit_refs(&refs).expect("structurally valid refs");
+        assert!(Session::cancel_pending_text_edits(&mut inner, client, &validated).is_err());
         assert!(!inner.dedupe.is_duplicate(client, b"text-1"));
         assert!(inner.dedupe.is_in_flight(client, b"shared"));
         assert_eq!(inner.dedupe.last_contiguous_processed_seq(client), 0);

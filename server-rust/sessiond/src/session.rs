@@ -97,9 +97,9 @@ use srui_resources::{PublishOutcome, ResourceEntry, ResourceStore};
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     AuthoritativeCommit, Event as DomainEvent, EventValidationError, NegotiationError, NodeId,
-    Operation, PropertyRef, ResourceHash, SemanticStore, ServerCapabilities, StoreError, TxnError,
-    TypeRef, Value, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
-    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
+    Operation, ResourceHash, SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef,
+    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
+    DEFAULT_MAX_TREE_DEPTH,
 };
 use thiserror::Error;
 
@@ -253,6 +253,27 @@ pub enum EventOutcome {
         revision_after_effect: u64,
         last_processed_event_seq: u64,
     },
+}
+
+enum EventAdmission {
+    Fresh,
+    Existing(EventOutcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandlerDispatchKind {
+    Ordinary,
+    CommittedTextEdit,
+}
+
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 pub(crate) struct SessionInner {
@@ -825,119 +846,121 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
-        let domain = match DomainEvent::try_from(event.clone()) {
-            Ok(domain) => domain,
-            Err(error) => return self.reject_malformed_event(event, error),
-        };
-        if domain.event_type == TypeRef::EVENT_TEXT_EDIT {
-            return self.process_text_edit(event, domain);
+        // Cloning and decoding peer-controlled arguments may be proportional to the frame size,
+        // so perform that work before entering the session-wide critical section. Admission is
+        // still evaluated first semantically: receive-window errors win over a captured decode
+        // failure, and malformed replays remain idempotent through the settled result cache.
+        let domain = DomainEvent::try_from(event.clone());
+
+        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        match Self::admit_event(&mut guard, event)? {
+            EventAdmission::Fresh => {}
+            EventAdmission::Existing(outcome) => return Ok(outcome),
         }
 
-        let matching_handlers = {
-            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-
-            // Deduplication check (§18.2, §32.4). A settled replay is answered from the result
-            // cache; an in-flight replay remains unacknowledged so the client cannot mistake it
-            // for a completed action.
-            match guard.dedupe.admit_event(event)? {
-                RecordOutcome::Duplicate {
-                    prior,
-                    last_processed_event_seq,
-                } => {
-                    return Ok(EventOutcome::Duplicate {
-                        accepted: prior.accepted,
-                        revision_after_effect: prior.revision_after_effect,
-                        last_processed_event_seq,
-                        reject_reason: prior.reject_reason,
-                    });
-                }
-                RecordOutcome::Pending {
-                    last_processed_event_seq,
-                } => {
-                    return Ok(EventOutcome::Pending {
-                        last_processed_event_seq,
-                    });
-                }
-                RecordOutcome::Fresh { .. } => {}
+        let domain = match domain {
+            Ok(domain) => domain,
+            Err(wire_error) => {
+                let error =
+                    EventValidationError::PolicyRejected(format!("malformed event: {wire_error}"));
+                return Ok(Self::settle_rejected_event(&mut guard, event, error));
             }
+        };
 
-            let node_id = srui_semantic_tree::NodeId::new(event.node_id);
-            let obs_rev = srui_semantic_tree::Revision::new(event.observed_revision);
-            let current_rev = guard.store.revision();
+        if domain.event_type == TypeRef::EVENT_TEXT_EDIT {
+            return self.process_admitted_text_edit(event, domain, guard);
+        }
 
-            let validation = if obs_rev > current_rev {
-                Err(EventValidationError::FutureRevision {
-                    observed: obs_rev,
-                    current: current_rev,
-                })
-            } else {
-                match guard.store.get_node(node_id) {
-                    None => Err(EventValidationError::NodeNotFound(node_id)),
-                    Some(node) => {
-                        if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
-                            Err(EventValidationError::NodeDisabled(node_id))
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
-            };
+        let validation = domain
+            .validate_observed_revision(guard.store.revision())
+            .and_then(|()| domain.validate_node_interactive(&guard.store).map(|_| ()));
+        if let Err(error) = validation {
+            return Ok(Self::settle_rejected_event(&mut guard, event, error));
+        }
 
-            if let Err(error) = validation {
-                let max_string_length = guard.store.limits().max_string_length;
-                let last_processed_event_seq = guard.dedupe.settle_event(
-                    event,
-                    EventOutcomeRecord {
-                        accepted: false,
-                        revision_after_effect: current_rev.get(),
-                        reject_reason: bound_diagnostic_string(
-                            error.to_string(),
-                            max_string_length,
-                        ),
-                    },
-                );
-                return Ok(EventOutcome::Rejected {
-                    error,
-                    revision_after_effect: current_rev.get(),
-                    last_processed_event_seq,
-                });
-            }
+        let matching_handlers = guard
+            .handlers
+            .get(&(domain.node_id, domain.event_type))
+            .cloned()
+            .unwrap_or_default();
+        drop(guard);
 
-            let event_type = event
-                .event_type
-                .map(srui_semantic_tree::TypeRef::from)
-                .unwrap_or(srui_semantic_tree::TypeRef::new(0, 0));
+        self.dispatch_admitted_event(event, &matching_handlers, HandlerDispatchKind::Ordinary)
+    }
 
-            guard
-                .handlers
-                .get(&(node_id, event_type))
-                .cloned()
-                .unwrap_or_default()
-        }; // Lock released here!
+    fn admit_event(
+        inner: &mut SessionInner,
+        event: &Event,
+    ) -> Result<EventAdmission, SessionError> {
+        let admission = match inner.dedupe.admit_event(event)? {
+            RecordOutcome::Duplicate {
+                prior,
+                last_processed_event_seq,
+            } => EventAdmission::Existing(EventOutcome::Duplicate {
+                accepted: prior.accepted,
+                revision_after_effect: prior.revision_after_effect,
+                last_processed_event_seq,
+                reject_reason: prior.reject_reason,
+            }),
+            RecordOutcome::Pending {
+                last_processed_event_seq,
+            } => EventAdmission::Existing(EventOutcome::Pending {
+                last_processed_event_seq,
+            }),
+            RecordOutcome::Fresh { .. } => EventAdmission::Fresh,
+        };
+        Ok(admission)
+    }
 
-        let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for handler in matching_handlers {
+    pub(crate) fn settle_rejected_event(
+        inner: &mut SessionInner,
+        event: &Event,
+        error: EventValidationError,
+    ) -> EventOutcome {
+        let revision_after_effect = inner.store.revision().get();
+        let max_string_length = inner.store.limits().max_string_length;
+        let last_processed_event_seq = inner.dedupe.settle_event(
+            event,
+            EventOutcomeRecord {
+                accepted: false,
+                revision_after_effect,
+                reject_reason: bound_diagnostic_string(error.to_string(), max_string_length),
+            },
+        );
+        EventOutcome::Rejected {
+            error,
+            revision_after_effect,
+            last_processed_event_seq,
+        }
+    }
+
+    pub(crate) fn dispatch_admitted_event(
+        &self,
+        event: &Event,
+        handlers: &[HandlerFn],
+        kind: HandlerDispatchKind,
+    ) -> Result<EventOutcome, SessionError> {
+        let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for handler in handlers {
                 handler(self, event);
             }
         }));
 
-        if let Err(panic_payload) = dispatch_result {
-            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-            guard.dedupe.abandon_event(event);
-            drop(guard);
+        let panic_payload = match (kind, dispatch) {
+            (HandlerDispatchKind::Ordinary, Err(panic_payload)) => {
+                let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+                guard.dedupe.abandon_event(event);
+                drop(guard);
+                return Err(SessionError::Panicked(panic_payload_message(
+                    panic_payload.as_ref(),
+                )));
+            }
+            (_, dispatch) => dispatch.err(),
+        };
 
-            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            return Err(SessionError::Panicked(panic_msg));
-        }
-
-        // Sampled after dispatch so the ack reports the revision the side effect produced
-        // (App. B `semantic_revision_after_effect`).
+        // Sample after dispatch so the ACK includes every handler transaction. A TEXT_EDIT is
+        // already authoritative at this point, so even a notification-handler panic must settle
+        // it as accepted before the infrastructure failure is surfaced.
         let (revision_after_effect, last_processed_event_seq) = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
             let revision_after_effect = guard.store.revision().get();
@@ -949,62 +972,21 @@ impl Session {
                     reject_reason: String::new(),
                 },
             );
+            if kind == HandlerDispatchKind::CommittedTextEdit {
+                guard
+                    .text_edit_tracker
+                    .finish_committed_handler_dispatch(event);
+            }
             (revision_after_effect, last_processed_event_seq)
         };
 
-        Ok(EventOutcome::Processed {
-            revision_after_effect,
-            last_processed_event_seq,
-        })
-    }
-
-    /// Settles a peer-controlled wire event that cannot be converted to the semantic model.
-    ///
-    /// Malformed events are still admitted to the dedupe window before rejection so a resumed
-    /// client receives the cached terminal result instead of replaying the same bad frame forever.
-    fn reject_malformed_event(
-        &self,
-        event: &Event,
-        wire_error: impl std::fmt::Display,
-    ) -> Result<EventOutcome, SessionError> {
-        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-
-        match guard.dedupe.admit_event(event)? {
-            RecordOutcome::Duplicate {
-                prior,
-                last_processed_event_seq,
-            } => {
-                return Ok(EventOutcome::Duplicate {
-                    accepted: prior.accepted,
-                    revision_after_effect: prior.revision_after_effect,
-                    last_processed_event_seq,
-                    reject_reason: prior.reject_reason,
-                });
-            }
-            RecordOutcome::Pending {
-                last_processed_event_seq,
-            } => {
-                return Ok(EventOutcome::Pending {
-                    last_processed_event_seq,
-                });
-            }
-            RecordOutcome::Fresh { .. } => {}
+        if let Some(panic_payload) = panic_payload {
+            return Err(SessionError::Panicked(panic_payload_message(
+                panic_payload.as_ref(),
+            )));
         }
 
-        let error = EventValidationError::PolicyRejected(format!("malformed event: {wire_error}"));
-        let revision_after_effect = guard.store.revision().get();
-        let max_string_length = guard.store.limits().max_string_length;
-        let last_processed_event_seq = guard.dedupe.settle_event(
-            event,
-            EventOutcomeRecord {
-                accepted: false,
-                revision_after_effect,
-                reject_reason: bound_diagnostic_string(error.to_string(), max_string_length),
-            },
-        );
-
-        Ok(EventOutcome::Rejected {
-            error,
+        Ok(EventOutcome::Processed {
             revision_after_effect,
             last_processed_event_seq,
         })
@@ -1068,6 +1050,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use srui_semantic_tree::{PropertyRef, Value};
 
     impl Session {
         fn poison_lock_for_test(&self) {

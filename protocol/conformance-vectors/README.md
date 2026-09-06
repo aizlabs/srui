@@ -13,8 +13,11 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 | `golden_framed_message.bin` | Length-prefixed framed `SruiMessage` containing a transaction |
 | `golden_event_ack.bin` | Length-prefixed framed `SruiMessage` containing a `ServerEventAck` (§18.2) |
 | `golden_client_model_range_request.bin` | Length-prefixed framed `SruiMessage` containing a `ClientModelRangeRequest` (§8, §22.7) |
+| `golden_text_edit_event.bin` | Length-prefixed framed `SruiMessage` containing a valid whole-value `TEXT_EDIT` with positive `edit_seq` (§18.3, §22.6) |
 | `malformed_overlong_varint.bin` | Truncated/overlong varint rejection check |
 | `malformed_truncated_frame.bin` | Truncated length-prefixed frame rejection check |
+| `malformed_text_edit_zero_edit_seq.bin` | Protobuf-valid `TEXT_EDIT` rejected during semantic conversion because `edit_seq == 0` |
+| `malformed_activate_nonzero_edit_seq.bin` | Protobuf-valid non-text event rejected during semantic conversion because `edit_seq != 0` |
 
 See `expected.json` for canonical hex and field declarations.
 

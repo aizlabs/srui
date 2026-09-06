@@ -172,9 +172,12 @@ struct SessionControllerReplayFailureTests {
             replayRetryInitialDelay: .zero,
             replayRetryMaximumDelay: .zero
         )
+        let seedBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.allowNewEvents(binding: seedBinding))
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
         await seedClient.close()

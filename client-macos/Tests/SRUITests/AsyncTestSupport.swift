@@ -13,10 +13,21 @@ enum AsyncTestSupport {
         description: String,
         condition: @MainActor () -> Bool
     ) async throws {
+        try await eventuallyAsync(timeout: timeout, description: description) {
+            condition()
+        }
+    }
+
+    static func eventuallyAsync(
+        isolation: isolated (any Actor)? = #isolation,
+        timeout: Duration = .seconds(2),
+        description: String,
+        condition: () async -> Bool
+    ) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
 
-        while condition() == false {
+        while await condition() == false {
             guard clock.now < deadline else {
                 throw AsyncTestTimeout(description: "Timed out waiting for \(description)")
             }

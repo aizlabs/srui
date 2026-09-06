@@ -58,6 +58,11 @@ Tests in **Rust** (`server-rust/protocol/tests/conformance_test.rs`), **Swift** 
 2. **Encode Conformance**: Messages constructed from scratch in Rust and Swift serialize to bit-for-bit identical binary bytes matching `expected.json["hex"]`.
 3. **Roundtrip Re-encode**: Decoded messages re-encode to the exact golden fixture bytes.
 
+The event vectors include a canonical whole-value `TEXT_EDIT` and two protobuf-valid envelopes
+that semantic conversion must reject: `TEXT_EDIT` with `edit_seq == 0`, and a non-text event
+with `edit_seq != 0`. This distinguishes framing/protobuf conformance from the §18.3 event
+invariant.
+
 ---
 
 ## Standard Registry & Operation Wire Tags

@@ -16,35 +16,6 @@ import Testing
 struct TextEditingSessionTests {
     private let nodeID = NodeId(12)
 
-    @Test("Quiet-period debounce coalesces to the newest whole value")
-    func debounceCoalescesToNewestValue() async throws {
-        let session = TextEditingSession(debounceNanoseconds: 40_000_000)
-        var commits: [(String, EditSeq)] = []
-        session.onCommit = { _, text, seq, _ in
-            commits.append((text, seq))
-        }
-
-        session.noteLocalValue("a", nodeID: nodeID, composing: false, flushImmediately: false)
-        session.noteLocalValue("ab", nodeID: nodeID, composing: false, flushImmediately: false)
-        session.noteLocalValue("abc", nodeID: nodeID, composing: false, flushImmediately: false)
-
-        // The debounce timer is a main-actor task competing with every other @MainActor suite
-        // in the run, so wait for the commit to land rather than for one debounce period to
-        // elapse: under a saturated actor the timer misses a fixed 80 ms budget and the test
-        // reports "coalesced to zero commits".
-        for _ in 0..<200 where commits.isEmpty {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-
-        // `#require`, not a bare subscript. A missed commit must fail this test; `commits[0]`
-        // on an empty array traps and takes the whole `swift test` process down with it.
-        let commit = try #require(commits.first)
-        #expect(commits.count == 1)
-        #expect(commit.0 == "abc")
-        #expect(commit.1.rawValue == 1)
-        #expect(session.nextEditSeqValue(for: nodeID) == 2)
-    }
-
     @Test("Each committed flush increments edit_seq without wrapping")
     func committedFlushesIncrementEditSeq() {
         let session = TextEditingSession(debounceNanoseconds: 0)
@@ -105,11 +76,9 @@ struct TextEditingSessionTests {
         #expect(commits == ["hello"])
     }
 
-    @Test("A different published value is a correction and invalidates drafts")
-    func correctionReplacesNativeAndInvalidatesDrafts() throws {
+    @Test("A different published value is a correction and clears unassigned local work")
+    func correctionReplacesNativeAndClearsUnassignedEdit() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)
-        var invalidated: [NodeId] = []
-        session.onInvalidateOutboxDraft = { id, _ in invalidated.append(id) }
         session.noteLocalValue("nope", nodeID: nodeID, composing: false, flushImmediately: true)
         session.noteAssigned(
             Event.textEdit(
@@ -121,10 +90,13 @@ struct TextEditingSessionTests {
                 editSeq: try #require(EditSeq(1))
             )
         )
+        session.noteLocalValue("nope!", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID))
 
         #expect(session.applyPublishedValue(nodeID: nodeID, published: "corrected") == .apply)
         #expect(session.localValue(for: nodeID) == "corrected")
-        #expect(invalidated == [nodeID])
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID) == false)
+        #expect(session.nextUnassignedEditNode() == nil)
     }
 
     @Test("Conflicting authoritative updates wait until marked text ends")
@@ -143,20 +115,18 @@ struct TextEditingSessionTests {
     @Test("Reapplying the last known store value keeps a local draft")
     func remountOfUnchangedValueKeepsLocalDraft() throws {
         let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
-        var invalidated: [NodeId] = []
         var commits: [String] = []
-        session.onInvalidateOutboxDraft = { id, _ in invalidated.append(id) }
         session.onCommit = { _, text, _, _ in commits.append(text) }
 
         #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .apply)
         session.noteLocalValue("hello!", nodeID: nodeID, composing: false, flushImmediately: false)
 
-        let resolution = try session.withPreservedLocalText {
+        let resolution = session.withPreservedLocalText {
             session.applyPublishedValue(nodeID: nodeID, published: "hello")
         }
         #expect(resolution == .keepLocal)
         #expect(session.localValue(for: nodeID) == "hello!")
-        #expect(invalidated.isEmpty)
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID))
         #expect(commits.isEmpty)
     }
 
@@ -356,8 +326,6 @@ struct TextEditingSessionTests {
     @Test("A rejection that republishes the previous value replaces local text")
     func rejectionRevertingToLastKnownApplies() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)
-        var invalidated: [NodeId] = []
-        session.onInvalidateOutboxDraft = { id, _ in invalidated.append(id) }
 
         #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
         session.noteLocalValue("abcd", nodeID: nodeID, composing: false, flushImmediately: true)
@@ -374,7 +342,7 @@ struct TextEditingSessionTests {
 
         #expect(session.applyPublishedValue(nodeID: nodeID, published: "abc") == .apply)
         #expect(session.localValue(for: nodeID) == "abc")
-        #expect(invalidated == [nodeID])
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID) == false)
     }
 
     @Test("Authoritative apply resets lastFlushedValue so retyping the previous submit commits")

@@ -83,12 +83,8 @@ struct TextEditingIntegrationTests {
     func renderedAcknowledgementRetiresSettledEchoIdentity() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)
         var commits: [(value: String, editSeq: EditSeq)] = []
-        var invalidatedDrafts = 0
         session.onCommit = { _, value, editSeq, _ in
             commits.append((value, editSeq))
-        }
-        session.onInvalidateOutboxDraft = { _, _ in
-            invalidatedDrafts += 1
         }
 
         #expect(session.applyPublishedValue(nodeID: editorID, published: "seed") == .apply)
@@ -124,8 +120,7 @@ struct TextEditingIntegrationTests {
 
         #expect(session.applyPublishedValue(nodeID: editorID, published: "foo") == .apply)
         #expect(session.localValue(for: editorID) == "foo")
-        #expect(!session.hasUnsentSuccessorDraft(for: editorID))
-        #expect(invalidatedDrafts == 1)
+        #expect(session.hasUnsentSuccessorDraft(for: editorID) == false)
     }
 
     @Test("Delayed input lane: native text changes before any network delivery")
@@ -178,15 +173,15 @@ struct TextEditingIntegrationTests {
         #expect(await collector.eventCount() == 0)
 
         editor.unmarkText()
-        #expect(!editor.hasMarkedText())
+        #expect(editor.hasMarkedText() == false)
         adapter.notifyTextDidChangeForTests()
         _ = window.makeFirstResponder(nil)
         adapter.notifyEndEditingForTests()
         let committed = field.stringValue
-        #expect(!committed.isEmpty)
+        #expect(committed.isEmpty == false)
         #expect(await collector.eventCount() == 0)
 
-        try await Task.sleep(nanoseconds: 80_000_000)
+        await delayed.waitUntilInputSendStarted()
         #expect(await collector.eventCount() == 0)
 
         let delivered = try await waitForTextEvent(collector)
@@ -214,67 +209,76 @@ struct TextEditingIntegrationTests {
             renderer: renderer
         )
         controller.attachRenderer(renderer)
-        try await controller.start()
-        try await handshakeAndMount(
-            controller: controller,
-            server: serverTransport,
-            applier: applier,
-            renderer: renderer,
-            sessionId: "text-before-action"
-        )
-
         let collector = EventCollector()
-        await collector.start(draining: serverTransport)
 
-        renderer.textEditingSession.noteLocalValue(
-            "first",
-            nodeID: editorID,
-            composing: false,
-            flushImmediately: true
-        )
-        let first = try await waitForTextEvent(collector)
-        renderer.textEditingSession.noteLocalValue(
-            "second",
-            nodeID: editorID,
-            composing: false,
-            flushImmediately: false
-        )
-        renderer.onInteraction?(.activate(nodeID: NodeId(99)))
+        do {
+            try await controller.start()
+            try await handshakeAndMount(
+                controller: controller,
+                server: serverTransport,
+                applier: applier,
+                renderer: renderer,
+                sessionId: "text-before-action"
+            )
+            await collector.start(draining: serverTransport)
 
-        try await Task.sleep(nanoseconds: 50_000_000)
-        #expect(
-            await collector.eventCount() == 1,
-            "the action must remain unallocated while the successor text draft is blocked"
-        )
+            renderer.textEditingSession.noteLocalValue(
+                "first",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: true
+            )
+            let first = try await waitForTextEvent(collector)
+            renderer.textEditingSession.noteLocalValue(
+                "second",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: false
+            )
+            // The activate callback synchronously flushes and queues the successor before it
+            // returns. E1 still owns this editor lane, so neither E2 nor the action may allocate.
+            renderer.onInteraction?(.activate(nodeID: NodeId(99)))
+            #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
+            #expect(await controller.outbox.eventSeq == 1)
+            #expect(
+                await collector.eventCount() == 1,
+                "the action must remain unallocated while the successor text draft is blocked"
+            )
 
-        var acknowledgement = SRUIServerEventAck()
-        acknowledgement.clientInstanceID = try #require(first.clientInstanceId).bytes
-        acknowledgement.eventID = first.eventId.bytes
-        acknowledgement.lastProcessedEventSeq = first.eventSeq
-        acknowledgement.status = .processed
-        acknowledgement.revisionAfterEffect = 1
-        acknowledgement.sessionID = "text-before-action"
-        var acknowledgementMessage = SRUIMessage()
-        acknowledgementMessage.serverEventAck = acknowledgement
-        await controller.handleIncomingMessage(acknowledgementMessage)
+            var acknowledgement = SRUIServerEventAck()
+            acknowledgement.clientInstanceID = try #require(first.clientInstanceId).bytes
+            acknowledgement.eventID = first.eventId.bytes
+            acknowledgement.lastProcessedEventSeq = first.eventSeq
+            acknowledgement.status = .processed
+            acknowledgement.revisionAfterEffect = 1
+            acknowledgement.sessionID = "text-before-action"
+            var acknowledgementMessage = SRUIMessage()
+            acknowledgementMessage.serverEventAck = acknowledgement
+            await controller.handleIncomingMessage(acknowledgementMessage)
 
-        try await waitUntil(description: "successor text and action delivered") {
-            await collector.eventCount() == 3
+            try await waitUntil(description: "successor text and action delivered") {
+                await collector.eventCount() == 3
+            }
+            let delivered = await collector.events()
+            #expect(delivered.map(\.eventType) == [
+                .EVENT_TEXT_EDIT,
+                .EVENT_TEXT_EDIT,
+                .EVENT_ACTIVATE,
+            ])
+            #expect(delivered.map(\.eventSeq) == [1, 2, 3])
+            #expect(delivered[1].textArg == "second")
+        } catch {
+            // A failed assertion must not strand the AppKit fixture window above the desktop.
+            await controller.stop()
+            await collector.stop()
+            await serverTransport.close()
+            throw error
         }
-        let delivered = await collector.events()
-        #expect(delivered.map(\.eventType) == [
-            .EVENT_TEXT_EDIT,
-            .EVENT_TEXT_EDIT,
-            .EVENT_ACTIVATE,
-        ])
-        #expect(delivered.map(\.eventSeq) == [1, 2, 3])
-        #expect(delivered[1].textArg == "second")
 
         await controller.stop()
         await collector.stop()
         await serverTransport.close()
     }
-
     @Test("Stopping wakes an action blocked behind a text draft without allocating it")
     @MainActor
     func stopCancelsActionWaitingForTextDraft() async throws {
@@ -315,11 +319,11 @@ struct TextEditingIntegrationTests {
             flushImmediately: false
         )
         renderer.onInteraction?(.activate(nodeID: NodeId(99)))
-        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(await outbox.eventSeq == 1)
         #expect(await collector.eventCount() == 1)
 
-        // This callback is serialized behind the blocked action. Terminal suspension must wake
-        // that predecessor and drain this newer edit into the outbox before canceling the tail.
+        // This callback is serialized behind the blocked successor and action. Terminal suspension
+        // must cancel that tail without losing the newest MainActor-owned draft.
         renderer.textEditingSession.noteLocalValue(
             "third",
             nodeID: editorID,
@@ -327,14 +331,13 @@ struct TextEditingIntegrationTests {
             flushImmediately: true
         )
         await controller.stop()
-        try await Task.sleep(nanoseconds: 50_000_000)
         #expect(
             await collector.eventCount() == 1,
             "terminal suspension must not let the blocked action allocate on a closed transport"
         )
-        let retained = await outbox.unsentTextDraftForTesting(nodeId: editorID)
-        #expect(retained?.text == "third")
-        #expect(retained?.editSeq.rawValue == 3)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
+        #expect(renderer.textEditingSession.localValue(for: editorID) == "third")
+        #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 4)
 
         await collector.stop()
         await serverTransport.close()
@@ -344,10 +347,7 @@ struct TextEditingIntegrationTests {
     @MainActor
     func stopCancelsBlockedWriterAndRetainsBufferedText() async throws {
         let (clientPipe, serverTransport) = await PipeTransport.createPair()
-        let delayed = DelayedInputTransport(
-            inner: clientPipe,
-            delayNanoseconds: 60_000_000_000
-        )
+        let delayed = DelayedInputTransport(suspendingInputTo: clientPipe)
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
         renderer.textEditingSession.debounceNanoseconds = 0
@@ -377,6 +377,7 @@ struct TextEditingIntegrationTests {
         try await waitUntil(description: "first edit retained before blocked send") {
             await outbox.assignedTextEditDescriptors().count == 1
         }
+        await delayed.waitUntilInputSendStarted()
         renderer.textEditingSession.noteLocalValue(
             "second",
             nodeID: editorID,
@@ -388,9 +389,9 @@ struct TextEditingIntegrationTests {
         let started = clock.now
         await controller.stop()
         #expect(started.duration(to: clock.now) < .seconds(2))
-        let retained = await outbox.unsentTextDraftForTesting(nodeId: editorID)
-        #expect(retained?.text == "second")
-        #expect(retained?.editSeq.rawValue == 2)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
+        #expect(renderer.textEditingSession.localValue(for: editorID) == "second")
+        #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 3)
 
         await serverTransport.close()
     }
@@ -425,7 +426,7 @@ struct TextEditingIntegrationTests {
         field.stringValue = "offline draft"
         adapter.notifyTextDidChangeForTests()
         await controller.stop()
-        #expect(await outbox.unsentTextDraftCount == 1)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
 
         let (resumeClient, resumeServer) = await PipeTransport.createPair()
         let resumed = SessionController(
@@ -451,7 +452,7 @@ struct TextEditingIntegrationTests {
             matching: { $0.textArg == "offline draft" }
         )
         #expect(edit.editSeq?.rawValue == 1)
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
 
         await resumed.stop()
         await collector.stop()
@@ -459,9 +460,86 @@ struct TextEditingIntegrationTests {
         await resumeServer.close()
     }
 
-    @Test("A replacement snapshot discards a debounce draft retained by stop")
+    @Test("An edit committed while disconnected replays when the same session resumes")
     @MainActor
-    func replacementDiscardsDraftFlushedByStop() async throws {
+    func disconnectedEditReplaysAfterResume() async throws {
+        let outbox = EventOutbox()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 60_000_000_000
+        let (client, server) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: client,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+        try await handshakeAndMount(
+            controller: controller,
+            server: server,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "offline-edit-resume"
+        )
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        await controller.stop()
+
+        field.stringValue = "typed while disconnected"
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
+        #expect(renderer.textEditingSession.localValue(for: editorID) == "typed while disconnected")
+
+        let (resumeClient, resumeServer) = await PipeTransport.createPair()
+        let resumed = SessionController(
+            transport: resumeClient,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "offline-edit-resume"
+        )
+        resumed.attachRenderer(renderer)
+        let collector = EventCollector()
+        await collector.start(draining: resumeServer)
+
+        do {
+            try await resumed.start()
+            var resumeOK = SRUIServerResumeOk()
+            resumeOK.sessionID = "offline-edit-resume"
+            var resumeMessage = SRUIMessage()
+            resumeMessage.serverResumeOk = resumeOK
+            await resumed.handleIncomingMessage(resumeMessage)
+
+            let edit = try await waitForTextEvent(
+                collector,
+                matching: { $0.textArg == "typed while disconnected" }
+            )
+            #expect(edit.editSeq?.rawValue == 1)
+            #expect(edit.observedRevision == Revision(1))
+            #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
+            #expect(field.stringValue == "typed while disconnected")
+        } catch {
+            await resumed.stop()
+            await collector.stop()
+            await server.close()
+            await resumeServer.close()
+            throw error
+        }
+
+        await resumed.stop()
+        await collector.stop()
+        await server.close()
+        await resumeServer.close()
+    }
+
+    @Test("A replacement snapshot discards an edit committed while disconnected")
+    @MainActor
+    func replacementDiscardsDisconnectedDraft() async throws {
         let outbox = EventOutbox()
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
@@ -486,10 +564,11 @@ struct TextEditingIntegrationTests {
         let handle = try #require(renderer.registry.handle(for: editorID))
         let adapter = try #require(handle.textAdapter)
         let field = try #require(handle.view as? NSTextField)
+        await controller.stop()
         field.stringValue = "discard me"
         adapter.notifyTextDidChangeForTests()
-        await controller.stop()
-        #expect(await outbox.unsentTextDraftCount == 1)
+        adapter.notifyEndEditingForTests()
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
 
         let (resumeClient, resumeServer) = await PipeTransport.createPair()
         let resumed = SessionController(
@@ -538,7 +617,7 @@ struct TextEditingIntegrationTests {
             }
             return replacement.stringValue == "authoritative"
         }
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
         #expect(await collector.eventCount() == 0)
 
         await resumed.stop()
@@ -587,7 +666,7 @@ struct TextEditingIntegrationTests {
         adapter.notifyTextDidChangeForTests()
         adapter.notifyEndEditingForTests()
         try await waitUntil(description: "successor retained after ambiguous send") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
 
         var echo = SRUIMessage()
@@ -669,7 +748,7 @@ struct TextEditingIntegrationTests {
         adapter.notifyTextDidChangeForTests()
         adapter.notifyEndEditingForTests()
         try await waitUntil(description: "E2 retained in the coalescing slot") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
         #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
 
@@ -703,7 +782,7 @@ struct TextEditingIntegrationTests {
             renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false
         )
         try await waitUntil(description: "correction invalidated E2 before acknowledgement") {
-            await outbox.unsentTextDraftCount == 0
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false
         }
 
         var acknowledgement = SRUIServerEventAck()
@@ -721,7 +800,7 @@ struct TextEditingIntegrationTests {
         #expect(field.stringValue == "E3 marked")
         #expect(renderer.textEditingSession.lastKnownAuthoritative(for: editorID) == "corrected")
         #expect(await outbox.pendingCount == 0)
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
 
         adapter.compositionOverride = false
@@ -869,7 +948,7 @@ struct TextEditingIntegrationTests {
         originalAdapter.notifyTextDidChangeForTests()
         originalAdapter.notifyEndEditingForTests()
         try await waitUntil(description: "E2 retained behind assigned E1") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
 
         originalAdapter.compositionOverride = true
@@ -903,7 +982,7 @@ struct TextEditingIntegrationTests {
         #expect(firstRemountedField.stringValue == "E2 coalesced")
         #expect(renderer.textEditingSession.localValue(for: editorID) == "E2 coalesced")
         #expect(renderer.textEditingSession.isComposing(for: editorID) == false)
-        #expect(await outbox.unsentTextDraftCount == 1)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
 
         // A real correction is classified while the replacement field has active marked text.
@@ -930,7 +1009,7 @@ struct TextEditingIntegrationTests {
         #expect(renderer.textEditingSession.localValue(for: editorID) == "E4 marked")
         #expect(renderer.textEditingSession.lastKnownAuthoritative(for: editorID) == "corrected")
         try await waitUntil(description: "correction retired E2 before structural remount") {
-            await outbox.unsentTextDraftCount == 0
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false
         }
 
         var secondStructural = SRUIMessage()
@@ -973,7 +1052,7 @@ struct TextEditingIntegrationTests {
 
         #expect(correctedField.stringValue == "corrected")
         #expect(await outbox.pendingCount == 0)
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
 
         await controller.stop()
@@ -1050,7 +1129,9 @@ struct TextEditingIntegrationTests {
         ackMessage.serverEventAck = ack
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(ackMessage))
 
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitUntil(description: "rejected acknowledgement retired") {
+            await outbox.pendingCount == 0
+        }
         #expect(field.stringValue == "corrected")
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
 
@@ -1262,7 +1343,7 @@ struct TextEditingIntegrationTests {
         adapter.notifyTextDidChangeForTests()
         adapter.notifyEndEditingForTests()
         try await waitUntil(description: "successor draft queued") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
 
         var ack = SRUIServerEventAck()
@@ -1326,7 +1407,7 @@ struct TextEditingIntegrationTests {
         adapter.notifyTextDidChangeForTests()
         adapter.notifyEndEditingForTests()
         try await waitUntil(description: "successor draft queued behind first edit") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
 
         var acknowledgement = SRUIServerEventAck()
@@ -1341,7 +1422,6 @@ struct TextEditingIntegrationTests {
         acknowledgementMessage.serverEventAck = acknowledgement
         await controller.handleIncomingMessage(acknowledgementMessage)
 
-        controller.suspendsTextDraftInvalidationDispatchForTesting = true
 
         var correction = SRUIMessage()
         correction.transaction = Transaction(
@@ -1357,16 +1437,14 @@ struct TextEditingIntegrationTests {
         ).toWire()
         await controller.handleIncomingMessage(correction)
 
-        controller.suspendsTextDraftInvalidationDispatchForTesting = false
 
         try await waitUntil(description: "correction converged without successor promotion") {
-            let draftCount = await outbox.unsentTextDraftCount
+            let hasDraft = renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
             let pendingCount = await outbox.pendingCount
             return field.stringValue == "corrected"
-                && draftCount == 0
+                && hasDraft == false
                 && pendingCount == 0
         }
-        try await Task.sleep(nanoseconds: 50_000_000)
         #expect(
             await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1
         )
@@ -1378,7 +1456,7 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
-    @Test("A buffered correction invalidation survives connection rebinding")
+    @Test("A correction invalidation remains authoritative across connection rebinding")
     @MainActor
     func correctionInvalidationSurvivesRebind() async throws {
         let (clientPipe, serverTransport) = await PipeTransport.createPair()
@@ -1417,7 +1495,7 @@ struct TextEditingIntegrationTests {
         adapter.notifyTextDidChangeForTests()
         adapter.notifyEndEditingForTests()
         try await waitUntil(description: "successor draft queued before correction") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
 
         var acknowledgement = SRUIServerEventAck()
@@ -1431,7 +1509,6 @@ struct TextEditingIntegrationTests {
         acknowledgementMessage.serverEventAck = acknowledgement
         await controller.handleIncomingMessage(acknowledgementMessage)
 
-        controller.suspendsTextDraftInvalidationDispatchForTesting = true
         let renderGate = TextLifecycleGate()
         controller.rendererDidRenderInterceptorForTesting = {
             await renderGate.pause()
@@ -1463,16 +1540,14 @@ struct TextEditingIntegrationTests {
         )
         try await replacement.start()
         try await waitUntil(description: "rebinding consumed buffered correction invalidation") {
-            await outbox.unsentTextDraftCount == 0
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false
         }
 
         controller.rendererDidRenderInterceptorForTesting = nil
-        controller.suspendsTextDraftInvalidationDispatchForTesting = false
         await renderGate.release()
         await correctionTask.value
-        try await Task.sleep(nanoseconds: 50_000_000)
 
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
         #expect(
             await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1
         )
@@ -1526,7 +1601,7 @@ struct TextEditingIntegrationTests {
         adapter.notifyTextDidChangeForTests()
         adapter.notifyEndEditingForTests()
         try await waitUntil(description: "successor draft queued") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
 
         var ack = SRUIServerEventAck()
@@ -1540,7 +1615,9 @@ struct TextEditingIntegrationTests {
         ackMessage.serverEventAck = ack
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(ackMessage))
 
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitUntil(description: "processed acknowledgement installed its revision barrier") {
+            await outbox.pendingCount == 0
+        }
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
         #expect(field.stringValue == "food")
 
@@ -1636,7 +1713,7 @@ struct TextEditingIntegrationTests {
         oldAdapter.notifyTextDidChangeForTests()
         oldAdapter.notifyEndEditingForTests()
         try await waitUntil(description: "pre-snapshot draft queued") {
-            await outbox.unsentTextDraftCount == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
         }
         #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 2)
 
@@ -1675,10 +1752,18 @@ struct TextEditingIntegrationTests {
             return field.stringValue == "authoritative"
         }
         await actionGate.release()
-        try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(await outbox.unsentTextDraftCount == 0)
+        renderer.onInteraction?(.activate(nodeID: NodeId(100)))
+        try await waitUntil(description: "post-resync sentinel followed the stale dispatch tail") {
+            await collector.events().contains {
+                $0.eventType == .EVENT_ACTIVATE && $0.nodeId == NodeId(100)
+            }
+        }
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.isEmpty)
-        #expect(await collector.events().filter { $0.eventType == .EVENT_ACTIVATE }.isEmpty)
+        #expect(
+            await collector.events().filter { $0.eventType == .EVENT_ACTIVATE }.map(\.nodeId)
+                == [NodeId(100)]
+        )
 
         let newHandle = try #require(renderer.registry.handle(for: editorID))
         let newAdapter = try #require(newHandle.textAdapter)
@@ -1735,8 +1820,7 @@ struct TextEditingIntegrationTests {
             flushImmediately: true
         )
         await admissionGate.waitUntilPaused()
-        #expect(controller.bufferedNativeTextEditCountForTesting == 1)
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
 
         let manualGate = TextLifecycleGate()
         controller.interactionWillEnterOutboxForTesting = {
@@ -1761,7 +1845,7 @@ struct TextEditingIntegrationTests {
         var resyncMessage = SRUIMessage()
         resyncMessage.serverResyncRequired = resync
         await controller.handleIncomingMessage(resyncMessage)
-        #expect(controller.bufferedNativeTextEditCountForTesting == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
 
         var snapshotMessage = SRUIMessage()
         snapshotMessage.transaction = Transaction(
@@ -1792,11 +1876,20 @@ struct TextEditingIntegrationTests {
         await admissionGate.release()
         await manualGate.release()
         #expect(await manualAction.value)
-        try await Task.sleep(nanoseconds: 100_000_000)
+        renderer.onInteraction?(.activate(nodeID: NodeId(100)))
+        try await waitUntil(description: "replacement sentinel followed the stale dispatch tail") {
+            await collector.events().contains {
+                $0.eventType == .EVENT_ACTIVATE && $0.nodeId == NodeId(100)
+            }
+        }
 
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
         #expect(await outbox.assignedTextEditDescriptors().isEmpty)
-        #expect(await collector.events().isEmpty)
+        #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.isEmpty)
+        #expect(
+            await collector.events().filter { $0.eventType == .EVENT_ACTIVATE }.map(\.nodeId)
+                == [NodeId(100)]
+        )
         #expect(
             (renderer.registry.handle(for: editorID)?.view as? NSTextField)?.stringValue
                 == "authoritative"
@@ -1812,10 +1905,7 @@ struct TextEditingIntegrationTests {
     @MainActor
     func replacementResyncResetsTextSession() async throws {
         let (clientPipe, serverTransport) = await PipeTransport.createPair()
-        let delayed = DelayedInputTransport(
-            inner: clientPipe,
-            delayNanoseconds: 60_000_000_000
-        )
+        let delayed = DelayedInputTransport(suspendingInputTo: clientPipe)
         let renderer = AppKitRenderer()
         renderer.textEditingSession.debounceNanoseconds = 0
         let applier = TransactionApplier()
@@ -1842,11 +1932,10 @@ struct TextEditingIntegrationTests {
             composing: false,
             flushImmediately: true
         )
-        try await waitUntil(description: "old edit buffered behind its blocked writer") {
-            let assignedTextEditCount = await outbox.assignedTextEditDescriptors().count
-            return controller.bufferedNativeTextEditCountForTesting == 1
-                && assignedTextEditCount == 1
+        try await waitUntil(description: "old edit retained by its blocked writer") {
+            await outbox.assignedTextEditDescriptors().count == 1
         }
+        await delayed.waitUntilInputSendStarted()
         #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 2)
 
         var resync = SRUIServerResyncRequired()
@@ -1861,7 +1950,7 @@ struct TextEditingIntegrationTests {
 
         #expect(renderer.textEditingSession.nextEditSeqValue(for: editorID) == 1)
         #expect(renderer.textEditingSession.localValue(for: editorID) == nil)
-        #expect(controller.bufferedNativeTextEditCountForTesting == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
 
         renderer.textEditingSession.noteLocalValue(
             "new incarnation",
@@ -1870,8 +1959,9 @@ struct TextEditingIntegrationTests {
             flushImmediately: true
         )
         try await waitUntil(description: "new incarnation edit accepted at reset sequence") {
-            let draft = await outbox.unsentTextDraftForTesting(nodeId: editorID)
-            return draft?.text == "new incarnation" && draft?.editSeq.rawValue == 1
+            renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
+                && renderer.textEditingSession.localValue(for: editorID) == "new incarnation"
+                && renderer.textEditingSession.nextEditSeqValue(for: editorID) == 2
         }
 
         await controller.stop()
@@ -1926,12 +2016,11 @@ struct TextEditingIntegrationTests {
         description: String,
         condition: @MainActor () async -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        throw AsyncTestTimeout(description: "timed out waiting for \(description)")
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(timeout),
+            description: description,
+            condition: condition
+        )
     }
 
     private func waitForTextEvent(
@@ -1939,31 +2028,70 @@ struct TextEditingIntegrationTests {
         timeout: Double = 2.0,
         matching predicate: @Sendable (Event) -> Bool = { $0.eventType == .EVENT_TEXT_EDIT }
     ) async throws -> Event {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if let event = await collector.events().first(where: { $0.eventType == .EVENT_TEXT_EDIT && predicate($0) }) {
-                return event
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(timeout),
+            description: "TEXT_EDIT"
+        ) {
+            await collector.events().contains {
+                $0.eventType == .EVENT_TEXT_EDIT && predicate($0)
             }
-            try await Task.sleep(nanoseconds: 10_000_000)
         }
-        throw AsyncTestTimeout(description: "timed out waiting for TEXT_EDIT")
+        if let event = await collector.events().first(where: {
+            $0.eventType == .EVENT_TEXT_EDIT && predicate($0)
+        }) {
+            return event
+        }
+        throw AsyncTestTimeout(description: "Timed out waiting for TEXT_EDIT")
     }
 }
 
 private actor DelayedInputTransport: Transport {
     let inner: PipeTransport
-    let delayNanoseconds: UInt64
+    private let delayNanoseconds: UInt64?
+    private let inputSuspensionStream: AsyncStream<Void>?
+    private let inputSuspensionContinuation: AsyncStream<Void>.Continuation?
     private let stream: AsyncThrowingStream<Data, Error>
+    private var inputSendStarted = false
+    private var inputSendStartWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(inner: PipeTransport, delayNanoseconds: UInt64) {
         self.inner = inner
         self.delayNanoseconds = delayNanoseconds
+        self.inputSuspensionStream = nil
+        self.inputSuspensionContinuation = nil
         self.stream = inner.receiveStream()
+    }
+
+    init(suspendingInputTo inner: PipeTransport) {
+        let (suspensionStream, suspensionContinuation) = AsyncStream<Void>.makeStream()
+        self.inner = inner
+        self.delayNanoseconds = nil
+        self.inputSuspensionStream = suspensionStream
+        self.inputSuspensionContinuation = suspensionContinuation
+        self.stream = inner.receiveStream()
+    }
+
+    func waitUntilInputSendStarted() async {
+        guard inputSendStarted == false else { return }
+        await withCheckedContinuation { continuation in
+            if inputSendStarted {
+                continuation.resume()
+            } else {
+                inputSendStartWaiters.append(continuation)
+            }
+        }
     }
 
     func send(data: Data, logicalClass: LogicalChannelClass) async throws {
         if logicalClass == .input {
-            try await Task.sleep(nanoseconds: delayNanoseconds)
+            noteInputSendStarted()
+            if let delayNanoseconds {
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+            } else if let inputSuspensionStream {
+                var iterator = inputSuspensionStream.makeAsyncIterator()
+                _ = await iterator.next()
+                try Task.checkCancellation()
+            }
         }
         try await inner.send(data: data, logicalClass: logicalClass)
     }
@@ -1973,7 +2101,18 @@ private actor DelayedInputTransport: Transport {
     }
 
     func close() async {
+        inputSuspensionContinuation?.finish()
         await inner.close()
+    }
+
+    private func noteInputSendStarted() {
+        guard inputSendStarted == false else { return }
+        inputSendStarted = true
+        let waiters = inputSendStartWaiters
+        inputSendStartWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 }
 
@@ -2001,76 +2140,5 @@ private actor DeliverThenThrowInputTransport: Transport {
 
     func close() async {
         await inner.close()
-    }
-}
-
-private actor TextLifecycleGate {
-    private var paused = false
-    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseContinuation: CheckedContinuation<Void, Never>?
-
-    func pause() async {
-        paused = true
-        let waiters = pauseWaiters
-        pauseWaiters.removeAll()
-        for waiter in waiters {
-            waiter.resume()
-        }
-        await withCheckedContinuation { continuation in
-            releaseContinuation = continuation
-        }
-    }
-
-    func waitUntilPaused() async {
-        if paused { return }
-        await withCheckedContinuation { continuation in
-            pauseWaiters.append(continuation)
-        }
-    }
-
-    func release() {
-        releaseContinuation?.resume()
-        releaseContinuation = nil
-    }
-}
-
-private actor EventCollector {
-    private var decoded: [Event] = []
-    private var task: Task<Void, Never>?
-
-    func start(draining transport: any Transport) {
-        guard task == nil else { return }
-        let stream = transport.receiveStream()
-        task = Task { [weak self] in
-            var decoder = SRUIMessageStreamDecoder()
-            let protocolDecoder = ProtocolDecoder()
-            do {
-                for try await chunk in stream {
-                    for message in try decoder.appendAndExtract(incoming: chunk) {
-                        if case .event(let wire) = message.msg,
-                           let event = try? protocolDecoder.validateAndConvertEvent(wire: wire) {
-                            await self?.append(event)
-                        }
-                    }
-                }
-            } catch {}
-        }
-    }
-
-    private func append(_ event: Event) {
-        decoded.append(event)
-    }
-
-    func stop() {
-        task?.cancel()
-        task = nil
-    }
-
-    func events() -> [Event] {
-        decoded
-    }
-
-    func eventCount() -> Int {
-        decoded.count
     }
 }

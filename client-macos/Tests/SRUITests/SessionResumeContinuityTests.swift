@@ -13,49 +13,7 @@ import Protocol
 @testable import Session
 import TransportSSH
 
-/// Drains one side of a transport and decodes the framed messages it carries.
-private actor ResumeWireCollector {
-    private var messages: [SRUIMessage] = []
-    private var task: Task<Void, Never>?
-
-    func start(draining transport: any Transport) {
-        guard task == nil else { return }
-        let stream = transport.receiveStream()
-        task = Task { [weak self] in
-            var decoder = SRUIMessageStreamDecoder()
-            do {
-                for try await chunk in stream {
-                    for message in try decoder.appendAndExtract(incoming: chunk) {
-                        await self?.append(message)
-                    }
-                }
-            } catch {
-                // Stream teardown at end of test; whatever was collected stays valid.
-            }
-        }
-    }
-
-    private func append(_ message: SRUIMessage) {
-        messages.append(message)
-    }
-
-    func stop() {
-        task?.cancel()
-        task = nil
-    }
-
-    func collected() -> [SRUIMessage] {
-        messages
-    }
-
-    func wait(forAtLeast count: Int, timeout: Double = 2.0) async -> [SRUIMessage] {
-        let deadline = Date().addingTimeInterval(timeout)
-        while messages.count < count && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        return messages
-    }
-}
+typealias ResumeWireCollector = ResyncWireCollector
 
 @Suite("Resume continuity decisions (§18)")
 struct SessionResumeContinuityTests {
@@ -109,13 +67,51 @@ struct SessionResumeContinuityTests {
         return message
     }
 
+    private func activeBinding(
+        for outbox: EventOutbox,
+        sessionId: String? = nil
+    ) async -> EventOutboxConnectionBinding {
+        let binding = await outbox.beginConnectionBinding()
+        if let sessionId {
+            #expect(await outbox.confirmFreshSession(id: sessionId, binding: binding))
+        } else {
+            #expect(await outbox.allowNewEvents(binding: binding))
+        }
+        #expect(await outbox.isActiveConnectionBinding(binding))
+        #expect(await outbox.sessionIncarnation(binding: binding) != nil)
+        return binding
+    }
+
+    private func sendPreparedTextEdit(
+        _ outbox: EventOutbox,
+        nodeId: NodeId,
+        text: String,
+        editSeq: EditSeq,
+        observedRevision: Revision,
+        binding: EventOutboxConnectionBinding,
+        via transport: any Transport
+    ) async throws -> Event {
+        let prepared = try #require(try await outbox.prepareTextEdit(
+            nodeId: nodeId,
+            text: text,
+            editSeq: editSeq,
+            observedRevision: observedRevision,
+            binding: binding,
+            via: transport
+        ))
+        #expect(await outbox.authorizePreparedTextEdit(prepared))
+        return try #require(try await outbox.releasePreparedTextEdit(prepared))
+    }
+
     @Test("SAME_SESSION resync replays pending events, then the snapshot re-enables dispatch")
     func sameSessionResyncReplaysPendingThenAppliesSnapshot() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = await activeBinding(for: outbox)
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -169,9 +165,11 @@ struct SessionResumeContinuityTests {
     func replacedResyncSendsNoEventFrames() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = await activeBinding(for: outbox)
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -197,7 +195,8 @@ struct SessionResumeContinuityTests {
         // §18: an expired incarnation's intents are abandoned, never replayed against the
         // replacement's unrelated state.
         try? await Task.sleep(nanoseconds: 100_000_000)
-        #expect(try events(in: await collector.collected()).isEmpty)
+        let messages = await collector.wait(forAtLeast: 1)
+        #expect(try events(in: messages).isEmpty)
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == 4)
         #expect(await outbox.eventSeq == 4)
@@ -226,9 +225,11 @@ struct SessionResumeContinuityTests {
     ) async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = await activeBinding(for: outbox)
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -259,7 +260,8 @@ struct SessionResumeContinuityTests {
         }
 
         // Fail closed: no replay, no rebind, no new-event allocation.
-        #expect(try events(in: await collector.collected()).isEmpty)
+        let messages = await collector.wait(forAtLeast: 1)
+        #expect(try events(in: messages).isEmpty)
         #expect(await outbox.pendingCount == 1)
         #expect(controller.isEventDispatchEnabled == false)
         await #expect(throws: SessionDispatchError.self) {
@@ -277,9 +279,11 @@ struct SessionResumeContinuityTests {
     func supersededReplacementResyncIsDiscarded() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = await activeBinding(for: outbox)
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -330,7 +334,7 @@ struct SessionResumeContinuityTests {
         )
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.eventSeq == 9)
-        #expect(try events(in: await secondCollector.collected()).isEmpty)
+        #expect(try events(in: await secondCollector.wait(forAtLeast: 1)).isEmpty)
 
         await firstController.stop()
         await secondController.stop()
@@ -346,9 +350,11 @@ struct SessionResumeContinuityTests {
     func supersededResumeOkCannotUnblockOlderAttempt() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = await activeBinding(for: outbox)
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -383,7 +389,7 @@ struct SessionResumeContinuityTests {
 
         await firstController.handleIncomingMessage(response)
         try? await Task.sleep(nanoseconds: 100_000_000)
-        #expect(try events(in: await firstCollector.collected()).isEmpty)
+        #expect(try events(in: await firstCollector.wait(forAtLeast: 1)).isEmpty)
         #expect(firstController.isEventDispatchEnabled == false)
         await #expect(throws: SessionDispatchError.self) {
             try await firstController.sendActivate(nodeId: NodeId(9))
@@ -494,16 +500,19 @@ struct SessionResumeContinuityTests {
     func supersededReplayReportsSupersessionNotTransportFailure() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = await activeBinding(for: outbox)
         // Two pending events: the cancellation the newer attempt raises is observed between
         // frames, so a single-frame replay would finish before it is ever checked.
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
         _ = try await outbox.sendActivate(
             nodeId: NodeId(8),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -655,11 +664,7 @@ struct SessionResumeContinuityTests {
         )
         #expect(controller.isEventDispatchEnabled)
 
-        let event = try await outbox.sendActivate(
-            nodeId: NodeId(4),
-            observedRevision: Revision(1),
-            via: client
-        )
+        let event = try await controller.sendActivate(nodeId: NodeId(4))
 
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
@@ -689,15 +694,18 @@ struct SessionResumeContinuityTests {
     func resumeOkReplaysAssignedTextEditUnchanged() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let seedBinding = await activeBinding(for: outbox, sessionId: "session-live")
         let seq = try #require(EditSeq(4))
-        let pending = try #require(try await outbox.queueTextEdit(
+        let pending = try await sendPreparedTextEdit(
+            outbox,
             nodeId: NodeId(12),
             text: "typed",
             editSeq: seq,
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
-        ))
+        )
+        #expect(await outbox.assignedTextEditEvents() == [pending])
 
         let (client, server) = await PipeTransport.createPair()
         let collector = ResumeWireCollector()
@@ -745,18 +753,22 @@ struct SessionResumeContinuityTests {
     func sameSessionResyncCancelsTextAndReplaysOrdinaryEvent() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let seedBinding = await activeBinding(for: outbox, sessionId: "session-live")
         let seq = try #require(EditSeq(2))
-        let textEvent = try #require(try await outbox.queueTextEdit(
+        let textEvent = try await sendPreparedTextEdit(
+            outbox,
             nodeId: NodeId(12),
             text: "draft",
             editSeq: seq,
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
-        ))
+        )
+        #expect(await outbox.assignedTextEditEvents() == [textEvent])
         let activate = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
         #expect(textEvent.eventSeq == 1)
@@ -806,23 +818,18 @@ struct SessionResumeContinuityTests {
     func replacementResyncDiscardsTextEditState() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-old"))
-        let seq = try #require(EditSeq(9))
-        _ = try await outbox.queueTextEdit(
+        let seedBinding = await activeBinding(for: outbox, sessionId: "session-old")
+        let assigned = try await sendPreparedTextEdit(
+            outbox,
             nodeId: NodeId(12),
             text: "old",
-            editSeq: seq,
+            editSeq: try #require(EditSeq(9)),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
-        _ = try await outbox.queueTextEdit(
-            nodeId: NodeId(12),
-            text: "newer-draft",
-            editSeq: try #require(EditSeq(10)),
-            observedRevision: Revision(3),
-            via: seedClient
-        )
-        #expect(await outbox.unsentTextDraftCount == 1)
+        #expect(await outbox.assignedTextEditEvents() == [assigned])
+        #expect(await outbox.pendingCount == 1)
 
         let (client, server) = await PipeTransport.createPair()
         let collector = ResumeWireCollector()
@@ -839,9 +846,10 @@ struct SessionResumeContinuityTests {
             resyncMessage(sessionId: "session-new", continuity: .replaced)
         )
 
-        #expect(try events(in: await collector.collected()).isEmpty)
+        let messages = await collector.wait(forAtLeast: 1)
+        #expect(try events(in: messages).isEmpty)
         #expect(await outbox.pendingCount == 0)
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(await outbox.eventSeq == 0)
         #expect(await outbox.assignedTextEditDescriptors().isEmpty)
 
         await controller.stop()
@@ -855,15 +863,18 @@ struct SessionResumeContinuityTests {
     func supersededSameSessionResyncDoesNotCancelTextEdits() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let seedBinding = await activeBinding(for: outbox, sessionId: "session-live")
         let editSeq = try #require(EditSeq(1))
-        let textEvent = try #require(try await outbox.queueTextEdit(
+        let textEvent = try await sendPreparedTextEdit(
+            outbox,
             nodeId: NodeId(12),
             text: "typed",
             editSeq: editSeq,
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
-        ))
+        )
+        #expect(await outbox.assignedTextEditEvents() == [textEvent])
         let (firstClient, firstServer) = await PipeTransport.createPair()
         let firstCollector = ResumeWireCollector()
         await firstCollector.start(draining: firstServer)
@@ -905,7 +916,7 @@ struct SessionResumeContinuityTests {
 
         #expect(await outbox.assignedTextEditDescriptors().count == 1)
         #expect(await outbox.pendingCount == 1)
-        #expect(try events(in: await firstCollector.collected()).isEmpty)
+        #expect(try events(in: await firstCollector.wait(forAtLeast: 1)).isEmpty)
 
         await firstController.stop()
         await secondController.stop()
@@ -921,14 +932,17 @@ struct SessionResumeContinuityTests {
     func mismatchedTextDiscardConfirmationFailsClosed() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-live"))
-        _ = try await outbox.queueTextEdit(
+        let seedBinding = await activeBinding(for: outbox, sessionId: "session-live")
+        let assigned = try await sendPreparedTextEdit(
+            outbox,
             nodeId: NodeId(12),
             text: "typed",
             editSeq: try #require(EditSeq(1)),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
+        #expect(await outbox.assignedTextEditEvents() == [assigned])
 
         let (client, server) = await PipeTransport.createPair()
         let collector = ResumeWireCollector()
@@ -964,7 +978,8 @@ struct SessionResumeContinuityTests {
             return
         }
         #expect(await outbox.pendingCount == 1)
-        #expect(try events(in: await collector.collected()).isEmpty)
+        let messages = await collector.wait(forAtLeast: 1)
+        #expect(try events(in: messages).isEmpty)
 
         await controller.stop()
         await collector.stop()
@@ -1052,18 +1067,4 @@ private actor DrainOnCloseTransport: Transport {
 }
 
 /// Collects reported session failures for assertions.
-private actor FailureRecorder {
-    private var failures: [SessionFailure] = []
-
-    func record(_ failure: SessionFailure) {
-        failures.append(failure)
-    }
-
-    func wait(timeout: Double = 2.0) async -> SessionFailure? {
-        let deadline = Date().addingTimeInterval(timeout)
-        while failures.isEmpty && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        return failures.first
-    }
-}
+typealias FailureRecorder = SessionFailureRecorder

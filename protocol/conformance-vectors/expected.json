@@ -1,5 +1,5 @@
 {
-  "version": "0.4.0",
+  "version": "0.5.0",
   "namespace": 0,
   "vectors": {
     "golden_node_record": {
@@ -176,6 +176,38 @@
         "count": 64,
         "observed_revision": 5
       }
+    },
+    "golden_text_edit_event": {
+      "file": "golden_text_edit_event.bin",
+      "sha256": "440f27ec48cdcda5796d6f832dbeaea2d1e3c1da91d0314f0d8f5995c641c62b",
+      "hex": "3f3a3d0a09636c69656e742d3239101d1a0d6576656e742d746578742d323920292807320210053a150a02100c120f320d636f6d706f73656420746578744003",
+      "byte_length": 64,
+      "expected": {
+        "msg_type": "event",
+        "client_instance_id": "client-29",
+        "event_seq": 29,
+        "event_id": "event-text-29",
+        "observed_revision": 41,
+        "node_id": 7,
+        "event_type": {
+          "namespace_id": 0,
+          "local_id": 5,
+          "name": "TEXT_EDIT"
+        },
+        "arguments": [
+          {
+            "property": {
+              "namespace_id": 0,
+              "local_id": 12,
+              "name": "text"
+            },
+            "value": {
+              "string_value": "composed text"
+            }
+          }
+        ],
+        "edit_seq": 3
+      }
     }
   },
   "malformed_vectors": {
@@ -192,6 +224,20 @@
       "hex": "6401020304",
       "byte_length": 5,
       "expected_error": "truncated_frame"
+    },
+    "malformed_text_edit_zero_edit_seq": {
+      "file": "malformed_text_edit_zero_edit_seq.bin",
+      "sha256": "81692e798a9095f867b0a126c03408055d3c2654a7f33ae312f1db5b5734e0b0",
+      "hex": "3d3a3b0a09636c69656e742d3239101e1a0d6261642d746578742d7a65726f20292807320210053a150a02100c120f320d72656a65637465642074657874",
+      "byte_length": 62,
+      "expected_error": "event error: TEXT_EDIT requires a positive edit_seq"
+    },
+    "malformed_activate_nonzero_edit_seq": {
+      "file": "malformed_activate_nonzero_edit_seq.bin",
+      "sha256": "ace04e855c08c8c0f4e13f779f882df215407f3f455ea3c26a1428dd1acc246c",
+      "hex": "2b3a290a09636c69656e742d3239101f1a106261642d61637469766174652d73657120292807320210014001",
+      "byte_length": 44,
+      "expected_error": "event error: only TEXT_EDIT may carry edit_seq"
     }
   }
 }

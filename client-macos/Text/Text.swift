@@ -23,14 +23,40 @@ public enum AuthoritativeResolution: Equatable, Sendable {
     case deferred
 }
 
+/// A whole-value local edit ready to acquire its durable transport identity.
+public struct LocalTextEdit: Equatable, Sendable {
+    public var nodeId: NodeId
+    public var text: String
+    public var editSeq: EditSeq
+    public var observedRevision: Revision
+    public var laneEpoch: UInt64
+
+    public init(
+        nodeId: NodeId,
+        text: String,
+        editSeq: EditSeq,
+        observedRevision: Revision,
+        laneEpoch: UInt64
+    ) {
+        self.nodeId = nodeId
+        self.text = text
+        self.editSeq = editSeq
+        self.observedRevision = observedRevision
+        self.laneEpoch = laneEpoch
+    }
+}
+
 /// Shared coordinator for native text editors in one semantic session (§18.3, §22.6).
 @MainActor
 public final class TextEditingSession {
+    typealias DebounceSleep = @Sendable (UInt64) async throws -> Void
+
     public var debounceNanoseconds: UInt64
     public var onCommit: (@MainActor (NodeId, String, EditSeq, UInt64) -> Void)?
-    public var onInvalidateOutboxDraft: (@MainActor (NodeId, UInt64) -> Void)?
     /// Surfaced when `edit_seq` cannot increment; the pending value is kept (§18.3).
     public var onEditSeqOverflow: (@MainActor (NodeId) -> Void)?
+
+    private let debounceSleep: DebounceSleep
 
     private struct NodeState {
         var nextEditSeq: UInt64 = 1
@@ -43,6 +69,9 @@ public final class TextEditingSession {
         /// must stop treating its value as an in-flight echo without hiding a newer flushed draft.
         var unassignedFlushedEditSeq: EditSeq?
         var unassignedFlushedValue: String?
+        var unassignedObservedRevision: Revision?
+        var unassignedLaneEpoch: UInt64?
+        var unassignedClaimed = false
         var lastSubmittedValue: String?
         /// Last string known to be the store's `.value` (echo or applied correction).
         var lastKnownAuthoritative: String?
@@ -53,6 +82,7 @@ public final class TextEditingSession {
     }
 
     private var nodes: [NodeId: NodeState] = [:]
+    private var unassignedNodeOrder: [NodeId] = []
     /// Structural remounts reapply unchanged store strings; live corrections must not.
     private var preservingLocalTextAcrossRemount = false
     /// Bumped when a correction/cancel invalidates drafts so unordered outbox Tasks cannot
@@ -67,6 +97,17 @@ public final class TextEditingSession {
 
     public init(debounceNanoseconds: UInt64 = defaultTextEditDebounceNanoseconds) {
         self.debounceNanoseconds = debounceNanoseconds
+        debounceSleep = { delay in
+            try await Task<Never, Never>.sleep(nanoseconds: delay)
+        }
+    }
+
+    init(
+        debounceNanoseconds: UInt64,
+        sleep: @escaping DebounceSleep
+    ) {
+        self.debounceNanoseconds = debounceNanoseconds
+        debounceSleep = sleep
     }
 
     public func resetForReplacementSession() {
@@ -74,6 +115,7 @@ public final class TextEditingSession {
             state.debounceTask?.cancel()
         }
         nodes.removeAll()
+        unassignedNodeOrder.removeAll(keepingCapacity: false)
         laneEpoch.removeAll()
         resyncLaneEpoch = 0
         suppressingLocalEditsForResync = false
@@ -88,6 +130,7 @@ public final class TextEditingSession {
             nodes.removeValue(forKey: nodeID)
             laneEpoch.removeValue(forKey: nodeID)
         }
+        unassignedNodeOrder.removeAll { !present.contains($0) }
     }
 
     public func noteAssigned(_ event: Event) {
@@ -96,8 +139,7 @@ public final class TextEditingSession {
         state.lastSubmittedValue = event.textArg
         state.assignedEventId = event.eventId
         if state.unassignedFlushedEditSeq == event.editSeq {
-            state.unassignedFlushedEditSeq = nil
-            state.unassignedFlushedValue = nil
+            clearUnassignedEdit(&state, nodeID: event.nodeId)
         }
         nodes[event.nodeId] = state
     }
@@ -126,13 +168,11 @@ public final class TextEditingSession {
         state.assignedEventId = nil
         state.lastSubmittedValue = nil
         state.pendingValue = nil
-        state.unassignedFlushedEditSeq = nil
-        state.unassignedFlushedValue = nil
+        clearUnassignedEdit(&state, nodeID: nodeID)
         state.debounceTask?.cancel()
         state.debounceTask = nil
-        let epoch = bumpLaneEpoch(nodeID: nodeID)
+        _ = bumpLaneEpoch(nodeID: nodeID)
         nodes[nodeID] = state
-        onInvalidateOutboxDraft?(nodeID, epoch)
     }
 
     /// Structural remounts re-apply the current store string for every editor. That is not a
@@ -156,12 +196,11 @@ public final class TextEditingSession {
     public func invalidateDraft(for nodeID: NodeId) {
         guard var state = nodes[nodeID] else { return }
         state.pendingValue = nil
-        state.unassignedFlushedEditSeq = nil
-        state.unassignedFlushedValue = nil
+        clearUnassignedEdit(&state, nodeID: nodeID)
         state.debounceTask?.cancel()
         state.debounceTask = nil
         nodes[nodeID] = state
-        onInvalidateOutboxDraft?(nodeID, bumpLaneEpoch(nodeID: nodeID))
+        _ = bumpLaneEpoch(nodeID: nodeID)
     }
 
     /// Records a committed local string. While composition is active, remote emission is suppressed.
@@ -219,10 +258,15 @@ public final class TextEditingSession {
             return
         }
         let delay = debounceNanoseconds
+        let sleep = debounceSleep
         state.debounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: delay)
+            do {
+                try await sleep(delay)
+            } catch {
+                return
+            }
             guard !Task.isCancelled else { return }
-            await self?.flushPending(nodeID: nodeID)
+            self?.flushPending(nodeID: nodeID)
         }
         nodes[nodeID] = state
     }
@@ -260,9 +304,15 @@ public final class TextEditingSession {
         state.lastFlushedValue = value
         state.unassignedFlushedEditSeq = seq
         state.unassignedFlushedValue = value
+        state.unassignedObservedRevision = nil
+        let epoch = bumpLaneEpoch(nodeID: nodeID)
+        state.unassignedLaneEpoch = epoch
+        state.unassignedClaimed = false
         state.localValue = value
         nodes[nodeID] = state
-        onCommit?(nodeID, value, seq, bumpLaneEpoch(nodeID: nodeID))
+        unassignedNodeOrder.removeAll { $0 == nodeID }
+        unassignedNodeOrder.append(nodeID)
+        onCommit?(nodeID, value, seq, epoch)
     }
 
     /// Flushes every committed, non-composing native value before a non-text interaction is
@@ -271,6 +321,107 @@ public final class TextEditingSession {
         for nodeID in Array(nodes.keys) {
             flushPending(nodeID: nodeID)
         }
+    }
+
+    /// Records the revision visible when this already-flushed edit entered interaction dispatch.
+    @discardableResult
+    public func recordObservedRevision(
+        nodeID: NodeId,
+        text: String,
+        editSeq: EditSeq,
+        laneEpoch: UInt64,
+        observedRevision: Revision
+    ) -> Bool {
+        guard var state = nodes[nodeID],
+              state.unassignedFlushedEditSeq == editSeq,
+              state.unassignedFlushedValue == text,
+              state.unassignedLaneEpoch == laneEpoch else {
+            return false
+        }
+        state.unassignedObservedRevision = observedRevision
+        nodes[nodeID] = state
+        return true
+    }
+
+    /// Node whose oldest unassigned edit must acquire lane availability next.
+    public func nextUnassignedEditNode() -> NodeId? {
+        firstUnassignedNode()
+    }
+
+    /// Claims the oldest unassigned edit after its assigned-event lane is available.
+    public func claimNextUnassignedEdit() -> LocalTextEdit? {
+        guard let nodeID = firstUnassignedNode(),
+              var state = nodes[nodeID],
+              !state.unassignedClaimed,
+              let text = state.unassignedFlushedValue,
+              let editSeq = state.unassignedFlushedEditSeq,
+              let observedRevision = state.unassignedObservedRevision,
+              let laneEpoch = state.unassignedLaneEpoch else {
+            return nil
+        }
+        state.unassignedClaimed = true
+        nodes[nodeID] = state
+        return LocalTextEdit(
+            nodeId: nodeID,
+            text: text,
+            editSeq: editSeq,
+            observedRevision: observedRevision,
+            laneEpoch: laneEpoch
+        )
+    }
+
+    public func releaseClaim(_ edit: LocalTextEdit) {
+        guard var state = nodes[edit.nodeId],
+              state.unassignedFlushedEditSeq == edit.editSeq,
+              state.unassignedFlushedValue == edit.text,
+              state.unassignedLaneEpoch == edit.laneEpoch else {
+            return
+        }
+        state.unassignedClaimed = false
+        nodes[edit.nodeId] = state
+    }
+
+    @discardableResult
+    public func noteAssigned(_ event: Event, matching edit: LocalTextEdit) -> Bool {
+        guard event.eventType == .EVENT_TEXT_EDIT,
+              event.nodeId == edit.nodeId,
+              event.editSeq == edit.editSeq,
+              event.textArg == edit.text,
+              var state = nodes[edit.nodeId],
+              state.unassignedClaimed,
+              state.unassignedFlushedEditSeq == edit.editSeq,
+              state.unassignedFlushedValue == edit.text,
+              state.unassignedLaneEpoch == edit.laneEpoch else {
+            return false
+        }
+        state.lastSubmittedValue = event.textArg
+        state.assignedEventId = event.eventId
+        clearUnassignedEdit(&state, nodeID: edit.nodeId)
+        nodes[edit.nodeId] = state
+        return true
+    }
+
+    /// Restores a native assignment when its still-closed transport slot was rolled back by a
+    /// lifecycle transition. A correction or replacement that already retired the assignment wins.
+    public func restoreUnassigned(_ edit: LocalTextEdit, from event: Event) {
+        guard event.eventType == .EVENT_TEXT_EDIT,
+              event.nodeId == edit.nodeId,
+              event.editSeq == edit.editSeq,
+              var state = nodes[edit.nodeId],
+              state.assignedEventId == event.eventId,
+              state.lastSubmittedValue == event.textArg else {
+            return
+        }
+        state.assignedEventId = nil
+        state.lastSubmittedValue = nil
+        state.unassignedFlushedEditSeq = edit.editSeq
+        state.unassignedFlushedValue = edit.text
+        state.unassignedObservedRevision = edit.observedRevision
+        state.unassignedLaneEpoch = edit.laneEpoch
+        state.unassignedClaimed = false
+        nodes[edit.nodeId] = state
+        unassignedNodeOrder.removeAll { $0 == edit.nodeId }
+        unassignedNodeOrder.insert(edit.nodeId, at: 0)
     }
 
     /// Echo of a submitted value must not overwrite newer local typing; any other published
@@ -309,8 +460,7 @@ public final class TextEditingSession {
             || state.lastSubmittedValue != nil
         let deferNativeReplacement = state.composing
         state.pendingValue = nil
-        state.unassignedFlushedEditSeq = nil
-        state.unassignedFlushedValue = nil
+        clearUnassignedEdit(&state, nodeID: nodeID)
         state.debounceTask?.cancel()
         state.debounceTask = nil
         state.lastSubmittedValue = nil
@@ -324,7 +474,7 @@ public final class TextEditingSession {
         }
         nodes[nodeID] = state
         if hadDraft {
-            onInvalidateOutboxDraft?(nodeID, bumpLaneEpoch(nodeID: nodeID))
+            _ = bumpLaneEpoch(nodeID: nodeID)
         }
         return deferNativeReplacement ? .deferred : .apply
     }
@@ -390,6 +540,7 @@ public final class TextEditingSession {
         suppressingLocalEditsForResync = true
         let highest = max(resyncLaneEpoch, laneEpoch.values.max() ?? 0)
         resyncLaneEpoch = highest == .max ? .max : highest + 1
+        unassignedNodeOrder.removeAll(keepingCapacity: false)
 
         for nodeID in Array(nodes.keys) {
             guard var state = nodes[nodeID] else { continue }
@@ -397,8 +548,7 @@ public final class TextEditingSession {
             state.debounceTask = nil
             state.pendingValue = nil
             state.lastFlushedValue = nil
-            state.unassignedFlushedEditSeq = nil
-            state.unassignedFlushedValue = nil
+            clearUnassignedEdit(&state, nodeID: nodeID)
             state.lastSubmittedValue = nil
             state.assignedEventId = nil
             state.deferredAuthoritative = nil
@@ -454,6 +604,30 @@ public final class TextEditingSession {
             state.lastKnownAuthoritative = ""
         }
         return state
+    }
+
+    private func firstUnassignedNode() -> NodeId? {
+        while let nodeID = unassignedNodeOrder.first {
+            guard let state = nodes[nodeID],
+                  state.unassignedFlushedEditSeq != nil,
+                  state.unassignedFlushedValue != nil,
+                  state.unassignedObservedRevision != nil,
+                  state.unassignedLaneEpoch != nil else {
+                unassignedNodeOrder.removeFirst()
+                continue
+            }
+            return nodeID
+        }
+        return nil
+    }
+
+    private func clearUnassignedEdit(_ state: inout NodeState, nodeID: NodeId) {
+        state.unassignedFlushedEditSeq = nil
+        state.unassignedFlushedValue = nil
+        state.unassignedObservedRevision = nil
+        state.unassignedLaneEpoch = nil
+        state.unassignedClaimed = false
+        unassignedNodeOrder.removeAll { $0 == nodeID }
     }
 
     @discardableResult

@@ -231,6 +231,42 @@ impl ResyncCause {
 }
 
 impl Session {
+    fn subscribe_client_locked(
+        &self,
+        inner: &mut super::SessionInner,
+        client_instance_id: &[u8],
+        advertised_resource_hashes: &[Vec<u8>],
+        max_resource_size: u64,
+    ) -> Result<OutboundReceiver, SessionError> {
+        let max_ops = inner.limits.max_transaction_operations as usize;
+        let max_frame_size = inner.limits.max_frame_size as usize;
+        remember_client_resource_ceiling(
+            &mut inner.client_resource_ceilings,
+            client_instance_id,
+            max_resource_size,
+        );
+        let known_hashes = known_resource_hashes(
+            advertised_resource_hashes,
+            inner.resources.limits().max_entries,
+        );
+        let retained_resources = inner.resources.retained_entries();
+        let transactions = self.outbound_hub.subscribe(
+            client_instance_id.to_vec(),
+            self.outbound_queue_capacity,
+            max_ops,
+            max_frame_size,
+            max_resource_size,
+        )?;
+        // Seed while still holding SessionInner so a resource published between snapshot
+        // creation and live subscription cannot be missed (SessionInner -> OutboundHub order).
+        self.outbound_hub.seed_resources_excluding(
+            &transactions,
+            &retained_resources,
+            &known_hashes,
+        );
+        Ok(transactions)
+    }
+
     /// Atomically prepares a fresh client handshake and subscribes it to transactions (§15, §18, §20.2).
     ///
     /// Evaluates `ClientHello`, negotiates capabilities, constructs `ServerWelcome`, and
@@ -328,36 +364,16 @@ impl Session {
                 .take()
                 .expect("subscription callback runs once")();
 
-            let max_ops = inner_guard.limits.max_transaction_operations as usize;
-            let max_frame_size = inner_guard.limits.max_frame_size as usize;
             let max_resource_size = negotiated_max_resource_size(
                 inner_guard.limits.max_resource_size,
                 hello.limits.as_ref(),
             );
-            remember_client_resource_ceiling(
-                &mut inner_guard.client_resource_ceilings,
+            let transactions = self.subscribe_client_locked(
+                &mut inner_guard,
                 &hello.client_instance_id,
-                max_resource_size,
-            );
-            let known_hashes = known_resource_hashes(
                 &hello.known_resource_hashes,
-                inner_guard.resources.limits().max_entries,
-            );
-            let retained_resources = inner_guard.resources.retained_entries();
-            let transactions = self.outbound_hub.subscribe(
-                hello.client_instance_id.clone(),
-                self.outbound_queue_capacity,
-                max_ops,
-                max_frame_size,
                 max_resource_size,
             )?;
-            // Seed while still holding SessionInner so a resource published between snapshot
-            // creation and live subscription cannot be missed (SessionInner -> OutboundHub order).
-            self.outbound_hub.seed_resources_excluding(
-                &transactions,
-                &retained_resources,
-                &known_hashes,
-            );
             drop(inner_guard);
 
             return Ok(FreshClientBootstrap {
@@ -422,7 +438,8 @@ impl Session {
         }
 
         validate_client_instance_id(&resume.client_instance_id)?;
-        Session::validate_pending_text_edit_refs(&resume.pending_text_edits)?;
+        let pending_text_edits =
+            Session::validate_pending_text_edit_refs(&resume.pending_text_edits)?;
 
         let determine_resync_cause = |inner_guard: &super::SessionInner| {
             if resume.session_id != inner_guard.session_id {
@@ -513,7 +530,7 @@ impl Session {
                 Session::cancel_pending_text_edits(
                     &mut inner_guard,
                     &resume.client_instance_id,
-                    &resume.pending_text_edits,
+                    &pending_text_edits,
                 )?
             } else {
                 Vec::new()
@@ -537,8 +554,6 @@ impl Session {
             .take()
             .expect("subscription callback runs once")();
 
-        let max_ops = inner_guard.limits.max_transaction_operations as usize;
-        let max_frame_size = inner_guard.limits.max_frame_size as usize;
         let max_resource_size = if resume.limits.is_some() {
             negotiated_max_resource_size(
                 inner_guard.limits.max_resource_size,
@@ -551,28 +566,12 @@ impl Session {
                 .copied()
                 .unwrap_or_else(|| u64::from(inner_guard.limits.max_resource_size))
         };
-        remember_client_resource_ceiling(
-            &mut inner_guard.client_resource_ceilings,
+        let transactions = self.subscribe_client_locked(
+            &mut inner_guard,
             &resume.client_instance_id,
-            max_resource_size,
-        );
-        let known_hashes = known_resource_hashes(
             &resume.known_resource_hashes,
-            inner_guard.resources.limits().max_entries,
-        );
-        let retained_resources = inner_guard.resources.retained_entries();
-        let transactions = self.outbound_hub.subscribe(
-            resume.client_instance_id.clone(),
-            self.outbound_queue_capacity,
-            max_ops,
-            max_frame_size,
             max_resource_size,
         )?;
-        self.outbound_hub.seed_resources_excluding(
-            &transactions,
-            &retained_resources,
-            &known_hashes,
-        );
         drop(inner_guard);
 
         let outcome = match plan {

@@ -245,11 +245,14 @@ struct SessionRobustnessTests {
     func outboxBoundsPendingEventCache() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "bounded-outbox", binding: binding))
 
         for _ in 0..<EventOutbox.defaultMaxPendingEvents {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(1),
+                binding: binding,
                 via: clientTransport
             )
         }
@@ -258,6 +261,7 @@ struct SessionRobustnessTests {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(1),
+                binding: binding,
                 via: clientTransport
             )
         }

@@ -347,32 +347,70 @@ struct SessionControllerResyncTests {
         #expect(await outbox.confirmFreshSession(id: sessionID, binding: binding))
         let (seedClient, seedServer) = await PipeTransport.createPair()
 
-        let firstEditSeq = try #require(EditSeq(1))
-        let first = try #require(try await outbox.queueTextEdit(
+        let renderer = AppKitRenderer()
+        #expect(
+            renderer.textEditingSession.applyPublishedValue(
+                nodeID: nodeID,
+                published: "authoritative"
+            ) == .apply
+        )
+        var committedEdits: [(text: String, editSeq: EditSeq, laneEpoch: UInt64)] = []
+        renderer.textEditingSession.onCommit = { _, text, editSeq, laneEpoch in
+            committedEdits.append((text, editSeq, laneEpoch))
+        }
+
+        renderer.textEditingSession.noteLocalValue(
+            "first",
+            nodeID: nodeID,
+            composing: false,
+            flushImmediately: true
+        )
+        let firstCommit = try #require(committedEdits.last)
+        #expect(renderer.textEditingSession.recordObservedRevision(
+            nodeID: nodeID,
+            text: firstCommit.text,
+            editSeq: firstCommit.editSeq,
+            laneEpoch: firstCommit.laneEpoch,
+            observedRevision: Revision(1)
+        ))
+        let prepared = try #require(try await outbox.prepareTextEdit(
             nodeId: nodeID,
-            text: "first",
-            editSeq: firstEditSeq,
+            text: firstCommit.text,
+            editSeq: firstCommit.editSeq,
             observedRevision: Revision(1),
+            binding: binding,
             via: seedClient
         ))
-        let secondEditSeq = try #require(EditSeq(2))
-        let coalesced = try await outbox.queueTextEdit(
-            nodeId: nodeID,
-            text: "second",
-            editSeq: secondEditSeq,
-            observedRevision: Revision(1),
-            via: seedClient
+        renderer.textEditingSession.noteAssigned(prepared.event)
+        #expect(await outbox.authorizePreparedTextEdit(prepared))
+        let first = try #require(try await outbox.releasePreparedTextEdit(prepared))
+
+        renderer.textEditingSession.noteLocalValue(
+            "second",
+            nodeID: nodeID,
+            composing: false,
+            flushImmediately: true
         )
-        #expect(coalesced == nil)
-        #expect(await outbox.unsentTextDraftCount == 1)
+        let secondCommit = try #require(committedEdits.last)
+        let secondEditSeq = secondCommit.editSeq
+        #expect(renderer.textEditingSession.recordObservedRevision(
+            nodeID: nodeID,
+            text: secondCommit.text,
+            editSeq: secondCommit.editSeq,
+            laneEpoch: secondCommit.laneEpoch,
+            observedRevision: Revision(1)
+        ))
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: nodeID))
 
         let settlement = await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: first.eventId,
             throughSeq: first.eventSeq,
             sessionId: sessionID
         )
         #expect(settlement.bound)
+        renderer.textEditingSession.noteAcknowledged(first)
         #expect(await outbox.pendingCount == 0)
 
         let applier = TransactionApplier()
@@ -394,7 +432,6 @@ struct SessionControllerResyncTests {
             return
         }
 
-        let renderer = AppKitRenderer()
         let (client, server) = await PipeTransport.createPair()
         let collector = ResyncWireCollector()
         await collector.start(draining: server)
@@ -427,10 +464,10 @@ struct SessionControllerResyncTests {
         #expect(promoted.eventSeq == first.eventSeq + 1)
         #expect(promoted.editSeq == secondEditSeq)
         #expect(promoted.textArg == "second")
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: nodeID) == false)
         #expect(controller.isEventDispatchEnabled)
         let field = try #require(renderer.registry.handle(for: nodeID)?.view as? NSTextField)
-        #expect(field.stringValue == "authoritative")
+        #expect(field.stringValue == "second")
 
         await controller.stop()
         await collector.stop()
@@ -1588,7 +1625,6 @@ struct SessionControllerResyncTests {
         var staleMsg = SRUIMessage()
         staleMsg.transaction = staleTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(staleMsg))
-        try await Task.sleep(nanoseconds: 30_000_000)
         #expect(applier.lastAppliedRevision == Revision(1))
 
         let validTx = Transaction(
@@ -1823,13 +1859,7 @@ private func makeOnePixelPNG(_ color: NSColor) throws -> Data {
 }
 
 private func makeWelcomeMessage(sessionID: String) -> SRUIMessage {
-    var welcome = SRUIServerWelcome()
-    welcome.coreVersion = SRUICoreVersion
-    welcome.sessionID = sessionID
-    welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
-    var message = SRUIMessage()
-    message.serverWelcome = welcome
-    return message
+    HandshakeFixtures.welcomeMessage(sessionId: sessionID)
 }
 
 private func makeResourceMetadataMessage(
@@ -1881,74 +1911,6 @@ private func commitPNG(_ bytes: Data, into cache: ResourceCache) async throws ->
     return hash
 }
 
-private actor LiveRenderGate {
-    private var paused = false
-    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseContinuation: CheckedContinuation<Void, Never>?
-
-    func pauseAfterPublish() async {
-        paused = true
-        let waiters = pauseWaiters
-        pauseWaiters.removeAll()
-        for waiter in waiters {
-            waiter.resume()
-        }
-        await withCheckedContinuation { continuation in
-            releaseContinuation = continuation
-        }
-    }
-
-    func waitUntilPaused() async {
-        if paused { return }
-        await withCheckedContinuation { continuation in
-            pauseWaiters.append(continuation)
-        }
-    }
-
-    func release() {
-        releaseContinuation?.resume()
-        releaseContinuation = nil
-    }
-}
-
-private actor ResyncWireCollector {
-    private var messages: [SRUIMessage] = []
-    private var task: Task<Void, Never>?
-
-    func start(draining transport: any Transport) {
-        guard task == nil else { return }
-        task = Task { [weak self] in
-            var decoder = SRUIMessageStreamDecoder()
-            do {
-                for try await chunk in transport.receiveStream() {
-                    for message in try decoder.appendAndExtract(incoming: chunk) {
-                        await self?.append(message)
-                    }
-                }
-            } catch {
-                // Test teardown closes the transport; retain everything collected before closure.
-            }
-        }
-    }
-
-    private func append(_ message: SRUIMessage) {
-        messages.append(message)
-    }
-
-    func wait(forAtLeast count: Int, timeout: TimeInterval = 5) async -> [SRUIMessage] {
-        let deadline = Date().addingTimeInterval(timeout)
-        while messages.count < count, Date() < deadline {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        return messages
-    }
-
-    func stop() {
-        task?.cancel()
-        task = nil
-    }
-}
-
 private enum InjectedRendererFailure: Error {
     case requested
 }
@@ -1965,23 +1927,5 @@ private final class RendererFailureInjector {
         guard remainingFailures > 0 else { return }
         remainingFailures -= 1
         throw InjectedRendererFailure.requested
-    }
-}
-
-private actor ResyncFailureRecorder {
-    private(set) var first: SessionFailure?
-
-    func record(_ failure: SessionFailure) {
-        if first == nil {
-            first = failure
-        }
-    }
-
-    func wait(timeout: TimeInterval = 5) async -> SessionFailure? {
-        let deadline = Date().addingTimeInterval(timeout)
-        while first == nil, Date() < deadline {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        return first
     }
 }

@@ -15,28 +15,6 @@ import SemanticModel
 import Testing
 import TransportSSH
 
-private actor LifecycleRaceGate {
-    private var paused = false
-    private var released = false
-    private var releaseContinuation: CheckedContinuation<Void, Never>?
-
-    var hasPaused: Bool { paused }
-
-    func pause() async {
-        paused = true
-        guard released == false else { return }
-        await withCheckedContinuation { continuation in
-            releaseContinuation = continuation
-        }
-    }
-
-    func release() {
-        released = true
-        releaseContinuation?.resume()
-        releaseContinuation = nil
-    }
-}
-
 private final class LifecycleRaceCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var storedValue = 0
@@ -215,9 +193,7 @@ struct SessionControllerLifecycleRaceTests {
                 return true
             }
         }
-        try await Self.waitUntil("initial handshake entered transport send") {
-            await sendGate.hasPaused
-        }
+        await sendGate.waitUntilPaused()
         #expect(transport.sentFrameCount == 0)
 
         let stopFinished = LifecycleRaceCounter()
@@ -235,9 +211,7 @@ struct SessionControllerLifecycleRaceTests {
         #expect(transport.sentFrameCount == 0)
         #expect(stopFinished.value == 0)
         await sendGate.release()
-        try await Self.waitUntil("old start paused after its owned send finished") {
-            await completionGate.hasPaused
-        }
+        await completionGate.waitUntilPaused()
         await stopTask.value
         #expect(stopFinished.value == 1)
         #expect(transport.sentFrameCount == 0)
@@ -295,9 +269,7 @@ struct SessionControllerLifecycleRaceTests {
         let stopTask = Task {
             await controller.stop()
         }
-        try await Self.waitUntil("transport close entered") {
-            await closeGate.hasPaused
-        }
+        await closeGate.waitUntilPaused()
 
         // Both callbacks arrive after stop has synchronously closed admission but while transport
         // teardown is still suspended. Neither may allocate a dispatch-tail task.
@@ -310,9 +282,9 @@ struct SessionControllerLifecycleRaceTests {
         )
 
         #expect(admissionCalls.value == 0)
-        #expect(controller.bufferedNativeTextEditCountForTesting == 0)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: NodeId(91)))
         #expect(await outbox.pendingCount == 0)
-        #expect(await outbox.unsentTextDraftCount == 0)
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
 
         await closeGate.release()
         await stopTask.value
@@ -352,9 +324,7 @@ struct SessionControllerLifecycleRaceTests {
                 return true
             }
         }
-        try await Self.waitUntil("receive loop reached pre-adoption seam") {
-            await adoptionGate.hasPaused
-        }
+        await adoptionGate.waitUntilPaused()
 
         // stop() owns no published receive task yet, but it must still supersede and quiesce the
         // gated task. Put frames on the replacement stream so an orphan that starts late would
@@ -386,9 +356,12 @@ struct SessionControllerLifecycleRaceTests {
             replayRetryInitialDelay: .zero,
             replayRetryMaximumDelay: .zero
         )
+        let seedBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "replay-session", binding: seedBinding))
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(1),
+            binding: seedBinding,
             via: seedClient
         )
         await seedClient.close()
@@ -424,9 +397,7 @@ struct SessionControllerLifecycleRaceTests {
             sessionID: "replay-session",
             lastProcessedEventSeq: 0
         ))
-        try await Self.waitUntil("old replay failure reached controller") {
-            await replayFailureGate.hasPaused
-        }
+        await replayFailureGate.waitUntilPaused()
         #expect(transport.sentFrameCount == 3)
 
         // Invalidate every ownership component captured by the paused failure callback.
@@ -456,10 +427,6 @@ struct SessionControllerLifecycleRaceTests {
         try await Self.waitUntil("stale replay callback left its test seam") {
             replayHookReturns.value == 1
         }
-        for _ in 0..<64 {
-            await Task.yield()
-        }
-
         let fresh = try await controller.sendActivate(nodeId: NodeId(8))
         #expect(fresh.eventSeq == pending.eventSeq + 1)
         #expect(failures.value == 0)
@@ -505,9 +472,7 @@ struct SessionControllerLifecycleRaceTests {
         let stopTask = Task {
             await controller.stop()
         }
-        try await Self.waitUntil("stop reached mount retirement") {
-            await retirementGate.hasPaused
-        }
+        await retirementGate.waitUntilPaused()
 
         // Admission must remain closed until the old lifecycle has retired its MainActor mount.
         // A start attempted here is a no-op and cannot publish a new receive task or handshake.
@@ -616,13 +581,10 @@ struct SessionControllerLifecycleRaceTests {
         timeout: Duration = .seconds(2),
         condition: @escaping @Sendable () async -> Bool
     ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while await condition() == false {
-            guard clock.now < deadline else {
-                throw AsyncTestTimeout(description: "Timed out waiting for \(description)")
-            }
-            await Task.yield()
-        }
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: timeout,
+            description: description,
+            condition: condition
+        )
     }
 }

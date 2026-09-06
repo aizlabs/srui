@@ -113,30 +113,6 @@ private struct RendererUpdateResult: Sendable {
     var wasSuperseded: Bool = false
 }
 
-private struct BufferedNativeTextEdit: Sendable {
-    var nodeId: NodeId
-    var text: String
-    var editSeq: EditSeq
-    var observedRevision: Revision
-    var binding: EventOutboxConnectionBinding
-    var sessionIncarnation: EventOutboxSessionIncarnation
-    var laneEpoch: UInt64
-    var order: UInt64
-}
-
-private struct BufferedTextDraftInvalidationKey: Hashable, Sendable {
-    var nodeId: NodeId
-    var sessionIncarnation: EventOutboxSessionIncarnation
-}
-
-private struct BufferedTextDraftInvalidation: Equatable, Sendable {
-    var nodeId: NodeId
-    var laneEpoch: UInt64
-    var binding: EventOutboxConnectionBinding
-    var sessionIncarnation: EventOutboxSessionIncarnation
-    var order: UInt64
-}
-
 private struct PendingReplayFailureOwnership: Sendable {
     var lifecycleGeneration: UInt64
     var binding: EventOutboxConnectionBinding
@@ -221,19 +197,6 @@ public final class SessionController: @unchecked Sendable {
     /// Actor-validated session-incarnation authority carried by every interaction admission.
     /// Protected by `lock` so public async send APIs can capture it before their first await.
     private var outboxSessionIncarnation: EventOutboxSessionIncarnation?
-    /// Text intent is durable before its transport Task joins the serialized dispatch tail.
-    @MainActor private var bufferedNativeTextEdits: [NodeId: BufferedNativeTextEdit] = [:]
-    @MainActor private var nextBufferedNativeTextOrder: UInt64 = 0
-    /// Native correction invalidations are durable until the actor applies them. The tail keeps
-    /// ordinary callbacks ordered; acknowledgement resolution also drains them synchronously.
-    @MainActor private var bufferedTextDraftInvalidations:
-        [BufferedTextDraftInvalidationKey: BufferedTextDraftInvalidation] = [:]
-    @MainActor private var nextBufferedTextDraftInvalidationOrder: UInt64 = 0
-    @MainActor private var textDraftInvalidationTail: Task<Void, Never>?
-    @MainActor var bufferedNativeTextEditCountForTesting: Int {
-        bufferedNativeTextEdits.count
-    }
-    @MainActor var suspendsTextDraftInvalidationDispatchForTesting = false
     /// Deterministic internal fault seams for renderer lifecycle regression tests.
     @MainActor var rendererUpdateInterceptorForTesting: (() throws -> Void)?
     private var _liveTransactionPublishedInterceptorForTesting: (@Sendable () async -> Void)?
@@ -280,12 +243,6 @@ public final class SessionController: @unchecked Sendable {
     var stopWillRetireMountForTesting: (@Sendable () async -> Void)? {
         get { withStateLock { _stopWillRetireMountForTesting } }
         set { withStateLock { _stopWillRetireMountForTesting = newValue } }
-    }
-    private var _textDraftInvalidationWillEnterOutboxForTesting:
-        (@Sendable () async -> Void)?
-    var textDraftInvalidationWillEnterOutboxForTesting: (@Sendable () async -> Void)? {
-        get { withStateLock { _textDraftInvalidationWillEnterOutboxForTesting } }
-        set { withStateLock { _textDraftInvalidationWillEnterOutboxForTesting = newValue } }
     }
     private var _resourceReferencesSynchronizedInterceptorForTesting:
         (@Sendable () async -> Void)?
@@ -406,49 +363,31 @@ public final class SessionController: @unchecked Sendable {
         guard !actionHandlerWired else { return }
         actionHandlerWired = true
 
-        renderer.textEditingSession.onInvalidateOutboxDraft = { [weak self] nodeID, epoch in
-            guard let self,
-                  let ownership = self.withStateLock({ () -> (
-                    EventOutboxConnectionBinding,
-                    EventOutboxSessionIncarnation
-                  )? in
-                      guard let binding = self.outboxConnectionBinding,
-                            let sessionIncarnation = self.outboxSessionIncarnation else {
-                          return nil
-                      }
-                      return (binding, sessionIncarnation)
-                  }) else {
-                return
-            }
-            guard self.outbox.stageTextDraftInvalidation(
-                nodeId: nodeID,
-                laneEpoch: epoch,
-                sessionIncarnation: ownership.1
-            ) else {
-                return
-            }
-            self.bufferTextDraftInvalidation(
-                nodeId: nodeID,
-                laneEpoch: epoch,
-                binding: ownership.0,
-                sessionIncarnation: ownership.1
-            )
-        }
-
         renderer.onInteraction = { [weak self, weak renderer] interaction in
             guard let self else { return }
+
+            // §7.7: observed_revision is the revision the user was actually looking at when the
+            // control was interacted with. Record it synchronously even while disconnected so a
+            // locally committed text edit can be replayed if this same session resumes (§18.3).
+            // Dispatch remains gated below; a replacement/full resync discards the recorded draft.
+            let observedRev = self.applier.currentSnapshot.revision
+            if case .textEdit(let nodeID, let text, let editSeq, let laneEpoch) = interaction {
+                guard renderer?.textEditingSession.recordObservedRevision(
+                    nodeID: nodeID,
+                    text: text,
+                    editSeq: editSeq,
+                    laneEpoch: laneEpoch,
+                    observedRevision: observedRev
+                ) == true else {
+                    return
+                }
+            }
+
             let acceptsInteraction = self.withStateLock {
                 (self.isRunning && !self.isStopping && !self._isDiverged)
                     || self.isFlushingTextForDisconnect
             }
             guard acceptsInteraction else { return }
-
-            // §7.7: observed_revision is the revision the user was actually looking at when the
-            // control was interacted with, and the server validates that the action is still enabled
-            // and permitted at that revision. It must therefore be sampled synchronously here on the
-            // MainActor — reading it after a suspension point would report a revision the user
-            // never saw and defeat that staleness check.
-            let observedRev = self.applier.currentSnapshot.revision
 
             // AppKit can report the button/menu action before the editor's debounce fires. Flush
             // every committed, non-composing native value synchronously; each recursive text-edit
@@ -474,17 +413,6 @@ public final class SessionController: @unchecked Sendable {
                 return
             }
             let (binding, sessionIncarnation) = ownership
-            if case .textEdit(let nodeID, let text, let editSeq, let laneEpoch) = interaction {
-                self.bufferNativeTextEdit(
-                    nodeId: nodeID,
-                    text: text,
-                    editSeq: editSeq,
-                    observedRevision: observedRev,
-                    binding: binding,
-                    sessionIncarnation: sessionIncarnation,
-                    laneEpoch: laneEpoch
-                )
-            }
             let incarnation = self.interactionIncarnation
             let predecessor = self.interactionDispatchTail
             let dispatch = Task { [weak self] in
@@ -522,27 +450,11 @@ public final class SessionController: @unchecked Sendable {
                             binding: binding,
                             sessionIncarnation: sessionIncarnation
                         )
-                    case .textEdit(let nodeID, let text, let editSeq, let laneEpoch):
-                        // Retain and record assignment before awaiting the transport. A write may
-                        // reach the server and still report an error locally (§18.2, §22.6).
-                        _ = try await self.outbox.queueTextEdit(
-                            nodeId: nodeID,
-                            text: text,
-                            editSeq: editSeq,
-                            observedRevision: observedRev,
+                    case .textEdit:
+                        try await self.dispatchUnassignedTextEdits(
                             binding: binding,
                             sessionIncarnation: sessionIncarnation,
-                            via: self.transport,
-                            laneEpoch: laneEpoch,
-                            onAssigned: { [weak self] event in
-                                self?.noteAssignedTextEdits([event])
-                            }
-                        )
-                        self.clearBufferedNativeTextEdit(
-                            nodeId: nodeID,
-                            editSeq: editSeq,
-                            binding: binding,
-                            sessionIncarnation: sessionIncarnation
+                            interactionIncarnation: incarnation
                         )
                     }
                 } catch {
@@ -569,168 +481,107 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
-    @MainActor
-    private func bufferNativeTextEdit(
-        nodeId: NodeId,
-        text: String,
-        editSeq: EditSeq,
-        observedRevision: Revision,
+    /// Drains TextEditingSession-owned drafts through retain, native authorization, then send.
+    private func dispatchUnassignedTextEdits(
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
-        laneEpoch: UInt64
-    ) {
-        if let existing = bufferedNativeTextEdits[nodeId],
-           existing.editSeq.rawValue >= editSeq.rawValue {
-            return
-        }
-        if nextBufferedNativeTextOrder < UInt64.max {
-            nextBufferedNativeTextOrder += 1
-        }
-        bufferedNativeTextEdits[nodeId] = BufferedNativeTextEdit(
-            nodeId: nodeId,
-            text: text,
-            editSeq: editSeq,
-            observedRevision: observedRevision,
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            laneEpoch: laneEpoch,
-            order: nextBufferedNativeTextOrder
-        )
-    }
-
-    @MainActor
-    private func clearBufferedNativeTextEdit(
-        nodeId: NodeId,
-        editSeq: EditSeq,
-        binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) {
-        guard let buffered = bufferedNativeTextEdits[nodeId],
-              buffered.editSeq == editSeq,
-              buffered.binding == binding,
-              buffered.sessionIncarnation == sessionIncarnation else {
-            return
-        }
-        bufferedNativeTextEdits[nodeId] = nil
-    }
-
-    @MainActor
-    private func bufferTextDraftInvalidation(
-        nodeId: NodeId,
-        laneEpoch: UInt64,
-        binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) {
-        if let buffered = bufferedNativeTextEdits[nodeId],
-           buffered.binding == binding,
-           buffered.sessionIncarnation == sessionIncarnation,
-           buffered.laneEpoch < laneEpoch {
-            bufferedNativeTextEdits[nodeId] = nil
-        }
-
-        let key = BufferedTextDraftInvalidationKey(
-            nodeId: nodeId,
-            sessionIncarnation: sessionIncarnation
-        )
-        if let existing = bufferedTextDraftInvalidations[key],
-           existing.laneEpoch >= laneEpoch {
-            return
-        }
-        if nextBufferedTextDraftInvalidationOrder < UInt64.max {
-            nextBufferedTextDraftInvalidationOrder += 1
-        }
-        let invalidation = BufferedTextDraftInvalidation(
-            nodeId: nodeId,
-            laneEpoch: laneEpoch,
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            order: nextBufferedTextDraftInvalidationOrder
-        )
-        bufferedTextDraftInvalidations[key] = invalidation
-        guard !suspendsTextDraftInvalidationDispatchForTesting else { return }
-
-        let predecessor = textDraftInvalidationTail
-        let dispatch = Task { [weak self] in
-            _ = await predecessor?.result
-            guard let self, !Task.isCancelled else { return }
-            await self.drainBufferedTextDraftInvalidations(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation
-            )
-        }
-        textDraftInvalidationTail = dispatch
-    }
-
-    private func drainBufferedTextDraftInvalidations(
-        binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) async {
+        interactionIncarnation: UInt64
+    ) async throws {
         while true {
-            guard let invalidation = await MainActor.run(body: {
-                self.bufferedTextDraftInvalidations.values
-                    .filter {
-                        $0.binding == binding
-                            && $0.sessionIncarnation == sessionIncarnation
-                    }
-                    .min { $0.order < $1.order }
+            try Task.checkCancellation()
+            guard withStateLock({
+                outboxConnectionBinding == binding
+                    && outboxSessionIncarnation == sessionIncarnation
             }) else {
                 return
             }
-            if let interceptor = textDraftInvalidationWillEnterOutboxForTesting {
-                await interceptor()
+            guard let nodeID = await MainActor.run(body: { () -> NodeId? in
+                guard self.interactionIncarnation == interactionIncarnation else { return nil }
+                return self.renderer?.textEditingSession.nextUnassignedEditNode()
+            }) else {
+                return
             }
-            _ = await outbox.invalidateTextDraft(
-                nodeId: invalidation.nodeId,
-                laneEpoch: invalidation.laneEpoch,
+            try await outbox.waitUntilTextEditLaneIsAvailable(
+                nodeId: nodeID,
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
             )
-            await MainActor.run {
-                let key = BufferedTextDraftInvalidationKey(
-                    nodeId: invalidation.nodeId,
-                    sessionIncarnation: invalidation.sessionIncarnation
-                )
-                guard self.bufferedTextDraftInvalidations[key] == invalidation else {
-                    return
+            guard let edit = await MainActor.run(body: { () -> LocalTextEdit? in
+                guard self.interactionIncarnation == interactionIncarnation,
+                      self.renderer?.textEditingSession.nextUnassignedEditNode() == nodeID else {
+                    return nil
                 }
-                self.bufferedTextDraftInvalidations[key] = nil
-            }
-        }
-    }
-
-    @MainActor
-    private func takeBufferedTextDraftInvalidations(
-        binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) -> [TextDraftInvalidation] {
-        let owned = bufferedTextDraftInvalidations.values
-            .filter {
-                $0.binding == binding
-                    && $0.sessionIncarnation == sessionIncarnation
-            }
-            .sorted { $0.order < $1.order }
-        for invalidation in owned {
-            let key = BufferedTextDraftInvalidationKey(
-                nodeId: invalidation.nodeId,
-                sessionIncarnation: invalidation.sessionIncarnation
-            )
-            guard bufferedTextDraftInvalidations[key] == invalidation else { continue }
-            bufferedTextDraftInvalidations[key] = nil
-        }
-        return owned.map {
-            TextDraftInvalidation(nodeId: $0.nodeId, laneEpoch: $0.laneEpoch)
-        }
-    }
-
-    @MainActor
-    private func discardBufferedNativeTextEdits(before laneEpoch: UInt64) {
-        advanceInteractionIncarnation()
-        for nodeId in Array(bufferedNativeTextEdits.keys) {
-            guard let edit = bufferedNativeTextEdits[nodeId],
-                  edit.laneEpoch < laneEpoch else {
+                return self.renderer?.textEditingSession.claimNextUnassignedEdit()
+            }) else {
                 continue
             }
-            bufferedNativeTextEdits[nodeId] = nil
+
+            var prepared: PreparedTextEdit?
+            do {
+                guard let retained = try await outbox.prepareTextEdit(
+                    nodeId: edit.nodeId,
+                    text: edit.text,
+                    editSeq: edit.editSeq,
+                    observedRevision: edit.observedRevision,
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation,
+                    via: transport
+                ) else {
+                    await MainActor.run {
+                        self.renderer?.textEditingSession.releaseClaim(edit)
+                    }
+                    continue
+                }
+                prepared = retained
+                let assigned = await MainActor.run { () -> Bool in
+                    guard self.interactionIncarnation == interactionIncarnation,
+                          self.withStateLock({
+                              self.outboxConnectionBinding == binding
+                                  && self.outboxSessionIncarnation == sessionIncarnation
+                          }) else {
+                        return false
+                    }
+                    return self.renderer?.textEditingSession.noteAssigned(
+                        retained.event,
+                        matching: edit
+                    ) == true
+                }
+                if !assigned {
+                    let rejected = await outbox.rejectPreparedTextEdit(retained)
+                    await MainActor.run {
+                        self.renderer?.textEditingSession.releaseClaim(edit)
+                    }
+                    if rejected {
+                        continue
+                    }
+                    return
+                }
+                guard await outbox.authorizePreparedTextEdit(retained) else {
+                    await MainActor.run {
+                        self.renderer?.textEditingSession.restoreUnassigned(
+                            edit,
+                            from: retained.event
+                        )
+                    }
+                    return
+                }
+                guard try await outbox.releasePreparedTextEdit(retained) != nil else {
+                    await MainActor.run {
+                        self.renderer?.textEditingSession.restoreUnassigned(
+                            edit,
+                            from: retained.event
+                        )
+                    }
+                    return
+                }
+            } catch {
+                if prepared == nil {
+                    await MainActor.run {
+                        self.renderer?.textEditingSession.releaseClaim(edit)
+                    }
+                }
+                throw error
+            }
         }
     }
 
@@ -743,8 +594,6 @@ public final class SessionController: @unchecked Sendable {
         interactionIncarnation += 1
         interactionDispatchTail?.cancel()
         interactionDispatchTail = nil
-        textDraftInvalidationTail?.cancel()
-        textDraftInvalidationTail = nil
     }
 
     @MainActor
@@ -1193,9 +1042,11 @@ public final class SessionController: @unchecked Sendable {
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
     ) async throws -> Event {
-        await drainBufferedTextDraftInvalidations(
+        let incarnation = await MainActor.run { self.interactionIncarnation }
+        try await dispatchUnassignedTextEdits(
             binding: binding,
-            sessionIncarnation: sessionIncarnation
+            sessionIncarnation: sessionIncarnation,
+            interactionIncarnation: incarnation
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1213,10 +1064,7 @@ public final class SessionController: @unchecked Sendable {
             observedRevision: observedRevision,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onTextEditAssigned: { [weak self] event in
-                self?.noteAssignedTextEdits([event])
-            }
+            via: transport
         )
     }
 
@@ -1256,9 +1104,11 @@ public final class SessionController: @unchecked Sendable {
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
     ) async throws -> Event {
-        await drainBufferedTextDraftInvalidations(
+        let incarnation = await MainActor.run { self.interactionIncarnation }
+        try await dispatchUnassignedTextEdits(
             binding: binding,
-            sessionIncarnation: sessionIncarnation
+            sessionIncarnation: sessionIncarnation,
+            interactionIncarnation: incarnation
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1277,10 +1127,7 @@ public final class SessionController: @unchecked Sendable {
             value: value,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onTextEditAssigned: { [weak self] event in
-                self?.noteAssignedTextEdits([event])
-            }
+            via: transport
         )
     }
 
@@ -1320,9 +1167,11 @@ public final class SessionController: @unchecked Sendable {
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
     ) async throws -> Event {
-        await drainBufferedTextDraftInvalidations(
+        let incarnation = await MainActor.run { self.interactionIncarnation }
+        try await dispatchUnassignedTextEdits(
             binding: binding,
-            sessionIncarnation: sessionIncarnation
+            sessionIncarnation: sessionIncarnation,
+            interactionIncarnation: incarnation
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1341,10 +1190,7 @@ public final class SessionController: @unchecked Sendable {
             itemId: itemId,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onTextEditAssigned: { [weak self] event in
-                self?.noteAssignedTextEdits([event])
-            }
+            via: transport
         )
     }
 
@@ -1650,16 +1496,40 @@ public final class SessionController: @unchecked Sendable {
         }
 
         do {
-            let accepted = try await outbox.completeSameSessionResume(
+            guard let preparation = try await outbox.prepareSameSessionResume(
                 id: resumeOk.sessionID,
                 lastProcessedEventSeq: resumeOk.lastProcessedEventSeq,
                 generation: generation,
-                binding: connectionBinding,
+                binding: connectionBinding
+            ) else {
+                await failRefusedResumeDecision(
+                    generation,
+                    "SERVER RESUME_OK answered a superseded resume attempt"
+                )
+                return
+            }
+            let adoptedAssignments = await MainActor.run { () -> Bool in
+                guard self.withStateLock({
+                    self.outboxConnectionBinding == preparation.binding
+                        && self.outboxSessionIncarnation == preparation.sessionIncarnation
+                        && self.resumeGeneration == preparation.generation
+                }) else {
+                    return false
+                }
+                self.noteAssignedTextEdits(preparation.assignedTextEdits)
+                return true
+            }
+            guard adoptedAssignments else {
+                await failRefusedResumeDecision(
+                    generation,
+                    "SERVER RESUME_OK lost native text assignment authority"
+                )
+                return
+            }
+            let accepted = try await outbox.completeSameSessionResume(
+                preparation,
                 via: transport,
                 enableNewEventsAfterReplay: false,
-                onTextEditAssigned: { [weak self] event in
-                    self?.noteAssignedTextEdits([event])
-                },
                 onReplayFailure: { [weak self] error in
                     await self?.handlePendingEventReplayFailure(
                         error,
@@ -1715,7 +1585,7 @@ public final class SessionController: @unchecked Sendable {
             ))
             return
         }
-        await promoteReadyTextDrafts(
+        await dispatchReadyTextEdits(
             binding: connectionBinding,
             sessionIncarnation: resumedIncarnation
         )
@@ -1877,21 +1747,45 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
-                    let accepted = try await outbox.completeSameSessionResume(
+                    guard let preparation = try await outbox.prepareSameSessionResume(
                         id: resync.sessionID,
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
                         generation: generation,
                         binding: connectionBinding,
-                        via: transport,
-                        enableNewEventsAfterReplay: false,
                         discardedTextEdits: resync.discardedTextEdits,
                         requireExactTextMatch: true,
-                        onTextEditAssigned: { [weak self] event in
-                            self?.noteAssignedTextEdits([event])
-                        },
                         onTextEditsCanceled: { [weak self] descriptors in
                             self?.noteCanceledTextEdits(descriptors)
-                        },
+                        }
+                    ) else {
+                        await failRefusedResumeDecision(
+                            generation,
+                            "same-session resync answered a superseded resume attempt"
+                        )
+                        return
+                    }
+                    let adoptedAssignments = await MainActor.run { () -> Bool in
+                        guard self.withStateLock({
+                            self.outboxConnectionBinding == preparation.binding
+                                && self.outboxSessionIncarnation == preparation.sessionIncarnation
+                                && self.resumeGeneration == preparation.generation
+                        }) else {
+                            return false
+                        }
+                        self.noteAssignedTextEdits(preparation.assignedTextEdits)
+                        return true
+                    }
+                    guard adoptedAssignments else {
+                        await failRefusedResumeDecision(
+                            generation,
+                            "same-session resync lost native text assignment authority"
+                        )
+                        return
+                    }
+                    let accepted = try await outbox.completeSameSessionResume(
+                        preparation,
+                        via: transport,
+                        enableNewEventsAfterReplay: false,
                         onReplayFailure: { [weak self] error in
                             await self?.handlePendingEventReplayFailure(
                                 error,
@@ -2310,7 +2204,7 @@ public final class SessionController: @unchecked Sendable {
             ))
             return
         }
-        await promoteReadyTextDrafts(
+        await dispatchReadyTextEdits(
             binding: connectionBinding,
             sessionIncarnation: sessionIncarnation
         )
@@ -2324,22 +2218,12 @@ public final class SessionController: @unchecked Sendable {
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
     ) async -> Bool {
-        await drainBufferedTextDraftInvalidations(
-            binding: binding,
-            sessionIncarnation: sessionIncarnation
-        )
         return await outbox.releaseTextAcknowledgements(
             through: revision,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
             onResolved: { [weak self] acknowledgements in
-                guard let self else { return [] }
-                guard let renderer = self.renderer else {
-                    return self.takeBufferedTextDraftInvalidations(
-                        binding: binding,
-                        sessionIncarnation: sessionIncarnation
-                    )
-                }
+                guard let self, let renderer = self.renderer else { return }
                 let session = renderer.textEditingSession
                 for acknowledgement in acknowledgements {
                     session.noteAcknowledged(
@@ -2366,10 +2250,6 @@ public final class SessionController: @unchecked Sendable {
                         )
                     }
                 }
-                return self.takeBufferedTextDraftInvalidations(
-                    binding: binding,
-                    sessionIncarnation: sessionIncarnation
-                )
             }
         )
     }
@@ -2406,10 +2286,6 @@ public final class SessionController: @unchecked Sendable {
         }
         advanceInteractionIncarnation()
         renderer?.textEditingSession.resetForReplacementSession()
-        bufferedNativeTextEdits.removeAll(keepingCapacity: true)
-        bufferedTextDraftInvalidations.removeAll(keepingCapacity: true)
-        nextBufferedNativeTextOrder = 0
-        nextBufferedTextDraftInvalidationOrder = 0
     }
 
     @MainActor
@@ -2420,8 +2296,6 @@ public final class SessionController: @unchecked Sendable {
             outboxSessionIncarnation = sessionIncarnation
         }
         advanceInteractionIncarnation()
-        bufferedTextDraftInvalidations.removeAll(keepingCapacity: true)
-        nextBufferedTextDraftInvalidationOrder = 0
     }
 
     @MainActor
@@ -2431,32 +2305,53 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
-    private func promoteReadyTextDrafts(
+    /// Schedules a drain behind native interaction callbacks without blocking the receive loop.
+    ///
+    /// Acknowledgements can release an existing drain while this method runs. Appending to the
+    /// same tail prevents two drain loops from claiming one MainActor-owned draft concurrently,
+    /// and lets the receive loop continue delivering the transaction named by an effect barrier.
+    private func dispatchReadyTextEdits(
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
     ) async {
-        await drainBufferedTextDraftInvalidations(
+        await enqueueReadyTextEditDispatch(
             binding: binding,
             sessionIncarnation: sessionIncarnation
         )
+    }
+
+    @MainActor
+    private func enqueueReadyTextEditDispatch(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) {
         guard withStateLock({
             outboxConnectionBinding == binding
                 && outboxSessionIncarnation == sessionIncarnation
         }) else {
             return
         }
-        do {
-            _ = try await outbox.promoteReadyTextDrafts(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation,
-                via: transport,
-                onAssigned: { [weak self] event in
-                    self?.noteAssignedTextEdits([event])
-                }
-            )
-        } catch {
-            SessionDiagnostics.error("Failed to promote coalesced text drafts: \(error)")
+
+        let incarnation = interactionIncarnation
+        let predecessor = interactionDispatchTail
+        let dispatch = Task { [weak self] in
+            _ = await predecessor?.result
+            guard let self,
+                  !Task.isCancelled,
+                  self.interactionIncarnation == incarnation else {
+                return
+            }
+            do {
+                try await self.dispatchUnassignedTextEdits(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation,
+                    interactionIncarnation: incarnation
+                )
+            } catch {
+                SessionDiagnostics.error("Failed to dispatch local text edits: \(error)")
+            }
         }
+        interactionDispatchTail = dispatch
     }
 
     private func handleTransaction(_ wireTx: SRUITransaction) async {
@@ -2675,7 +2570,7 @@ public final class SessionController: @unchecked Sendable {
                 // intent. No unresolved pre-snapshot edit is silently merged (§18.3).
                 await completeSnapshotCatchUp()
             } else {
-                await promoteReadyTextDrafts(
+                await dispatchReadyTextEdits(
                     binding: connectionBinding,
                     sessionIncarnation: renderSessionIncarnation
                 )
@@ -2807,7 +2702,7 @@ public final class SessionController: @unchecked Sendable {
             }
         }
         await reissueCollectionRangeRequestsIfAllowed()
-        await promoteReadyTextDrafts(
+        await dispatchReadyTextEdits(
             binding: connectionBinding,
             sessionIncarnation: sessionIncarnation
         )
@@ -2937,8 +2832,8 @@ public final class SessionController: @unchecked Sendable {
                 let epoch = discardTextEditsForResync
                     ? renderer.textEditingSession.discardUnresolvedEditsForResync()
                     : nil
-                if let epoch {
-                    self.discardBufferedNativeTextEdits(before: epoch)
+                if epoch != nil {
+                    self.advanceInteractionIncarnation()
                 }
                 defer {
                     if discardTextEditsForResync {
@@ -3014,8 +2909,8 @@ public final class SessionController: @unchecked Sendable {
         return result
     }
 
-    /// Suspends allocation and its transport writer, then turns every committed non-composing
-    /// debounce value plus every already-emitted text callback into a durable outbox draft.
+    /// Suspends allocation, then leaves every flushed edit in TextEditingSession for same-session
+    /// resume. Assigned envelopes remain in EventOutbox; a forced resync clears native drafts.
     private func retainNativeTextBeforeDisconnect(
         binding: EventOutboxConnectionBinding?
     ) async {
@@ -3023,46 +2918,11 @@ public final class SessionController: @unchecked Sendable {
               await outbox.suspendForTeardown(binding: binding) else {
             return
         }
-        if let sessionIncarnation = withStateLock({
-            outboxConnectionBinding == binding ? outboxSessionIncarnation : nil
-        }) {
-            await drainBufferedTextDraftInvalidations(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation
-            )
-        }
         withStateLock { isFlushingTextForDisconnect = true }
-        let buffered = await MainActor.run { () -> [BufferedNativeTextEdit] in
+        await MainActor.run {
             self.renderer?.textEditingSession.flushAllPending()
             self.withStateLock { self.isFlushingTextForDisconnect = false }
             self.advanceInteractionIncarnation()
-            return self.bufferedNativeTextEdits.values
-                .filter { $0.binding == binding }
-                .sorted { $0.order < $1.order }
-        }
-        for edit in buffered {
-            do {
-                _ = try await outbox.queueTextEdit(
-                    nodeId: edit.nodeId,
-                    text: edit.text,
-                    editSeq: edit.editSeq,
-                    observedRevision: edit.observedRevision,
-                    binding: binding,
-                    sessionIncarnation: edit.sessionIncarnation,
-                    via: transport,
-                    laneEpoch: edit.laneEpoch
-                )
-                await clearBufferedNativeTextEdit(
-                    nodeId: edit.nodeId,
-                    editSeq: edit.editSeq,
-                    binding: binding,
-                    sessionIncarnation: edit.sessionIncarnation
-                )
-            } catch {
-                SessionDiagnostics.error(
-                    "Failed to retain native text during disconnect: \(error)"
-                )
-            }
         }
     }
 
@@ -3133,20 +2993,6 @@ public final class SessionController: @unchecked Sendable {
             }
             receiveTask.cancel()
             await receiveTask.value
-        }
-
-        if let binding = stoppedState.connectionBinding,
-           let sessionIncarnation = stoppedState.sessionIncarnation {
-            await drainBufferedTextDraftInvalidations(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation
-            )
-        }
-        await MainActor.run {
-            self.textDraftInvalidationTail?.cancel()
-            self.textDraftInvalidationTail = nil
-            self.bufferedTextDraftInvalidations.removeAll(keepingCapacity: false)
-            self.nextBufferedTextDraftInvalidationOrder = 0
         }
 
         let replayGeneration = withStateLock {

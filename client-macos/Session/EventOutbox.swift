@@ -21,24 +21,12 @@ public enum EventOutboxError: Error, Equatable, Sendable {
     case textEditDiscardMismatch
 }
 
-/// Called after a `TEXT_EDIT` has a retained wire identity but before its first transmission.
-/// This closes the ambiguous-send window: native state knows which value is assigned even when
-/// the transport delivers the frame and then reports an error (§18.2, §22.6).
-public typealias TextEditAssignmentHandler = @MainActor @Sendable (Event) -> Void
-
 typealias TextEditCancellationHandler =
     @MainActor @Sendable ([PendingTextEditDescriptor]) -> Void
 typealias ReplacementTextEditingResetHandler =
     @MainActor @Sendable (EventOutboxSessionIncarnation) -> Void
 typealias TextAcknowledgementResolutionHandler =
-    @MainActor @Sendable ([TextEditAcknowledgementBarrier]) -> [TextDraftInvalidation]
-
-/// A native correction/cancellation that must reach the outbox before an acknowledgement barrier
-/// is released. The surrounding lifecycle fence supplies the exact session-incarnation authority.
-struct TextDraftInvalidation: Equatable, Sendable {
-    var nodeId: NodeId
-    var laneEpoch: UInt64
-}
+    @MainActor @Sendable ([TextEditAcknowledgementBarrier]) -> Void
 
 /// Assigned, unacknowledged `TEXT_EDIT` identity declared on resume (§18.3).
 public struct PendingTextEditDescriptor: Hashable, Equatable, Sendable {
@@ -158,6 +146,68 @@ public struct EventOutboxSessionIncarnation: Hashable, Sendable {
     fileprivate var sequence: UInt64
 }
 
+/// Retained TEXT_EDIT waiting for native assignment authorization before its FIFO send slot opens.
+struct PreparedTextEdit: Sendable {
+    var event: Event
+    fileprivate var token: UUID
+}
+
+/// Actor-validated same-session state handed to MainActor before replay opens.
+struct SameSessionResumePreparation: Sendable {
+    var sessionId: String
+    var generation: UInt64
+    var binding: EventOutboxConnectionBinding
+    var sessionIncarnation: EventOutboxSessionIncarnation
+    var assignedTextEdits: [Event]
+}
+
+private final class PreparedTextEditSendGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var decision: Bool?
+    private var waiter: CheckedContinuation<Bool, Never>?
+
+    func wait() async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let decided = lock.withLock { () -> Bool? in
+                    if let decision { return decision }
+                    waiter = continuation
+                    return nil
+                }
+                if let decided {
+                    continuation.resume(returning: decided)
+                }
+            }
+        } onCancel: {
+            self.resolve(shouldSend: false)
+        }
+    }
+
+    @discardableResult
+    func resolve(shouldSend: Bool) -> Bool {
+        var didResolve = false
+        let continuation = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+            guard decision == nil else { return nil }
+            decision = shouldSend
+            didResolve = true
+            defer { waiter = nil }
+            return waiter
+        }
+        continuation?.resume(returning: shouldSend)
+        return didResolve
+    }
+
+    func cancelIfUnresolved() -> Bool {
+        resolve(shouldSend: false)
+    }
+}
+
+private struct PreparedTextEditSend: Sendable {
+    var event: Event
+    var gate: PreparedTextEditSendGate
+    var task: Task<Void, any Error>
+}
+
 /// Result of applying a live same-session resync decision.
 enum LiveSameSessionResyncDecision: Sendable {
     /// The server frontier proves every canceled edit reached the server.
@@ -244,135 +294,34 @@ private struct ResumeRecoveryRenderOwnership: Sendable {
     var token: UUID
 }
 
-private final class TextEditAssignmentFence: @unchecked Sendable {
-    private let authorizationLock = NSLock()
-    private let invalidationLock = NSLock()
+/// Fences MainActor lifecycle effects for assigned envelopes; unassigned text stays in TextEditingSession.
+private final class TextLifecycleFence: @unchecked Sendable {
+    private let lock = NSLock()
     private var activeSessionIncarnation: EventOutboxSessionIncarnation?
-    private var activeInvalidationSessionIncarnation: EventOutboxSessionIncarnation?
-    private var authorizedEventIncarnations: [EventId: EventOutboxSessionIncarnation] = [:]
-    private var stagedInvalidations:
-        [EventOutboxSessionIncarnation: [NodeId: TextDraftInvalidation]] = [:]
 
-    /// Immediately retires assignment and lifecycle callbacks for the previous incarnation.
-    /// Invalidation publication remains on the retiring incarnation until its active render exits.
-    func beginActivation(
-        _ sessionIncarnation: EventOutboxSessionIncarnation
-    ) {
-        authorizationLock.withLock {
+    func beginActivation(_ sessionIncarnation: EventOutboxSessionIncarnation) {
+        lock.withLock {
             activeSessionIncarnation = sessionIncarnation
-            authorizedEventIncarnations.removeAll(keepingCapacity: true)
         }
     }
 
-    /// Transfers correction-invalidation ownership after the retiring render is quiescent.
-    /// A superseded connection transition cannot claim the mailbox for its stale incarnation.
-    func completeActivation(
-        _ sessionIncarnation: EventOutboxSessionIncarnation
-    ) -> [TextDraftInvalidation]? {
-        authorizationLock.withLock {
-            guard activeSessionIncarnation == sessionIncarnation else { return nil }
-            return invalidationLock.withLock {
-                let retired = activeInvalidationSessionIncarnation.flatMap {
-                    stagedInvalidations.removeValue(forKey: $0)
-                } ?? [:]
-                activeInvalidationSessionIncarnation = sessionIncarnation
-                stagedInvalidations = stagedInvalidations.filter {
-                    $0.key == sessionIncarnation
-                }
-                return retired.values.sorted { $0.nodeId.value < $1.nodeId.value }
-            }
+    func completeActivation(_ sessionIncarnation: EventOutboxSessionIncarnation) -> Bool {
+        lock.withLock {
+            activeSessionIncarnation == sessionIncarnation
         }
     }
 
-    /// Atomically advances both native callback and invalidation ownership when no render can
-    /// still publish against the retiring incarnation.
-    func activate(
-        _ sessionIncarnation: EventOutboxSessionIncarnation
-    ) -> [TextDraftInvalidation] {
+    func activate(_ sessionIncarnation: EventOutboxSessionIncarnation) {
         beginActivation(sessionIncarnation)
-        return completeActivation(sessionIncarnation) ?? []
-    }
-    func stageInvalidation(
-        _ invalidation: TextDraftInvalidation,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) -> Bool {
-        invalidationLock.withLock {
-            guard activeInvalidationSessionIncarnation == sessionIncarnation else {
-                return false
-            }
-            if let current = stagedInvalidations[sessionIncarnation]?[invalidation.nodeId],
-               current.laneEpoch >= invalidation.laneEpoch {
-                return true
-            }
-            stagedInvalidations[sessionIncarnation, default: [:]][invalidation.nodeId]
-                = invalidation
-            return true
-        }
-    }
-
-    func takeStagedInvalidations(
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) -> [TextDraftInvalidation] {
-        invalidationLock.withLock {
-            guard activeInvalidationSessionIncarnation == sessionIncarnation else {
-                return []
-            }
-            let pending = stagedInvalidations.removeValue(
-                forKey: sessionIncarnation
-            ) ?? [:]
-            return pending.values.sorted { $0.nodeId.value < $1.nodeId.value }
-        }
-    }
-
-    func authorize(
-        _ event: Event,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) {
-        guard event.eventType == .EVENT_TEXT_EDIT else { return }
-        authorizationLock.withLock {
-            guard activeSessionIncarnation == sessionIncarnation else { return }
-            authorizedEventIncarnations[event.eventId] = sessionIncarnation
-        }
-    }
-
-    func revoke(_ eventId: EventId) {
-        authorizationLock.withLock {
-            _ = authorizedEventIncarnations.removeValue(forKey: eventId)
-        }
-    }
-
-    func revokeAll() {
-        authorizationLock.withLock {
-            authorizedEventIncarnations.removeAll(keepingCapacity: true)
-        }
     }
 
     @MainActor
-    func performIfAuthorized(
-        _ event: Event,
-        sessionIncarnation: EventOutboxSessionIncarnation,
-        handler: TextEditAssignmentHandler
-    ) -> Bool {
-        authorizationLock.lock()
-        defer { authorizationLock.unlock() }
-        guard activeSessionIncarnation == sessionIncarnation,
-              authorizedEventIncarnations[event.eventId] == sessionIncarnation else {
-            return false
-        }
-        handler(event)
-        return true
-    }
-
-    /// Linearizes short native bookkeeping with session-incarnation activation. This lock never
-    /// covers rendering or an await; an old callback either finishes before replacement advances
-    /// the incarnation, or observes the new incarnation and becomes a no-op.
-    @MainActor
-    func performLifecycleIfActive<Value: Sendable>(
+    func performIfActive<Value: Sendable>(
         sessionIncarnation: EventOutboxSessionIncarnation,
         handler: @MainActor @Sendable () -> Value
     ) -> Value? {
-        authorizationLock.lock()
-        defer { authorizationLock.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
         guard activeSessionIncarnation == sessionIncarnation else { return nil }
         return handler()
     }
@@ -382,14 +331,15 @@ private final class TextEditAssignmentFence: @unchecked Sendable {
 /// Retry safety (§18.2): every application-side-effect event carries a stable `event_id` and
 /// `event_seq`. Selective acknowledgements may settle later events first, but
 /// `lastAckedEventSeq` advances only across a contiguous settled prefix, like a TCP cumulative
-/// acknowledgement.
+/// acknowledgement. Unassigned whole-value edits remain owned by `TextEditingSession`; this
+/// actor retains only envelopes whose generic event identity has been allocated.
 public actor EventOutbox {
     /// Maximum span between the contiguous ack frontier and the newest allocated event (§18.2).
     public static let defaultMaxPendingEvents = 256
 
     public nonisolated let clientInstanceId: ClientInstanceId
     nonisolated let resyncRenderFence = ResyncRenderFence()
-    private nonisolated let textEditAssignmentFence = TextEditAssignmentFence()
+    private nonisolated let textLifecycleFence = TextLifecycleFence()
     private var resyncRenderOwnership: ResyncRenderOwnership?
     private var liveRenderOwnership: LiveRenderOwnership?
     private var resumeRecoveryRenderOwnership: ResumeRecoveryRenderOwnership?
@@ -428,35 +378,27 @@ public actor EventOutbox {
     /// does not replace this: increasing `event_seq` must reach the transport in allocation order
     /// (§18.2).
     private var sendTail: Task<Void, any Error>?
-    private var textDrafts: [NodeId: TextEditDraft] = [:]
-    /// Highest correction/cancel epoch observed per node. Stale `queueTextEdit` Tasks
-    /// with a lower epoch are dropped so unordered hops cannot resurrect a rejected draft.
-    private var textLaneEpoch: [NodeId: UInt64] = [:]
-    /// Session-wide floor advanced by an authoritative full resync. It also fences edits from
-    /// newly mounted nodes whose IDs did not exist before the snapshot.
-    private var textLaneEpochFloor: UInt64 = 0
+    /// Closed slots that may still roll back after explicit native assignment failure.
+    /// Unassigned text values never enter this actor; only allocated envelopes occupy this gate.
+    private var preparedTextEditSends: [UUID: PreparedTextEditSend] = [:]
+    /// Authorized slots whose transport task is still completing.
+    private var authorizedPreparedTextEditSends: [UUID: PreparedTextEditSend] = [:]
+    /// Lifecycle suspension canceled these closed slots before MainActor reported its decision.
+    private var lifecycleSuspendedPreparedTextEdits: [UUID: Event] = [:]
+    /// MainActor authorized these identities after their old transport had already been canceled.
+    private var lifecycleAuthorizedPreparedTextEdits: [UUID: Event] = [:]
     /// A successor for a node cannot be promoted until this acknowledgement's authoritative
     /// revision has reached the rendered replica.
     private var textAcknowledgementBarriers: [NodeId: TextEditAcknowledgementBarrier] = [:]
     /// Resume frontiers prove processing but not a text edit's rejection/correction outcome.
     /// These identities remain replayable until their own cached acknowledgement arrives.
     private var textEventsAwaitingOutcome: Set<EventId> = []
-    private var textDraftStateVersion: UInt64 = 0
-    private var textDraftWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var textLaneStateVersion: UInt64 = 0
+    private var textLaneWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var nativeTextLifecycleWillHopForTesting: (@Sendable () async -> Void)?
-    private var nativeTextAssignmentWillHopForTesting: (@Sendable () async -> Void)?
-    private struct TextEditDraft: Equatable, Sendable {
-        var nodeId: NodeId
-        var text: String
-        var editSeq: EditSeq
-        var observedRevision: Revision
-        var laneEpoch: UInt64
-    }
-
     private struct PendingResyncBoundaryCleanup: Sendable {
         var token: UUID
         var invalidation: Task<UInt64?, Never>
-        var draftsAtStart: [NodeId: TextEditDraft]
         var acknowledgementBarriersAtStart: [NodeId: TextEditAcknowledgementBarrier]
     }
 
@@ -469,17 +411,6 @@ public actor EventOutbox {
         var generation: UInt64
         var token: UUID
         var invalidation: Task<UInt64?, Never>
-    }
-
-    nonisolated func stageTextDraftInvalidation(
-        nodeId: NodeId,
-        laneEpoch: UInt64,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) -> Bool {
-        textEditAssignmentFence.stageInvalidation(
-            TextDraftInvalidation(nodeId: nodeId, laneEpoch: laneEpoch),
-            sessionIncarnation: sessionIncarnation
-        )
     }
 
     public init(
@@ -530,10 +461,12 @@ public actor EventOutbox {
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
         via transport: any Transport,
-        onRetained: TextEditAssignmentHandler? = nil,
-        onAllocated: ((Event) -> Void)? = nil,
         _ makeEvent: (UInt64, EventId) -> Event
     ) async throws -> Event {
+        try await waitForPreparedTextEditResolution(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
         guard activeConnectionBinding == binding,
               activeSessionIncarnation == sessionIncarnation,
               acceptsNewEvents else {
@@ -546,19 +479,17 @@ public actor EventOutbox {
             .withClientInstanceId(clientInstanceId)
         let framedBytes = try encodeEvent(event)
 
-        // Framing and every fallible retention check precede sequence/draft mutation. An oversized
-        // whole-value edit therefore cannot burn a sequence or remove the only durable draft.
+        // Framing and every fallible retention check precede sequence mutation, so an
+        // unencodable event cannot burn a sequence in the contiguous send window.
         try retainPending(event)
         currentEventSeq = nextEventSeq
-        onAllocated?(event)
 
         try await transmitRetainedEvent(
             event,
             framedBytes: framedBytes,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onRetained: onRetained
+            via: transport
         )
         return event
     }
@@ -568,12 +499,15 @@ public actor EventOutbox {
         _ event: Event,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
-        via transport: any Transport,
-        onRetained: TextEditAssignmentHandler? = nil
+        via transport: any Transport
     ) async throws {
         let sessionIncarnation = try resolveSessionIncarnation(
             suppliedIncarnation,
             binding: binding
+        )
+        try await waitForPreparedTextEditResolution(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
         )
         guard acceptsNewEvents else {
             throw EventOutboxError.resumeNotConfirmed
@@ -588,8 +522,7 @@ public actor EventOutbox {
             framedBytes: framedBytes,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onRetained: onRetained
+            via: transport
         )
     }
 
@@ -604,19 +537,13 @@ public actor EventOutbox {
         framedBytes: Data,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
-        via transport: any Transport,
-        onRetained: TextEditAssignmentHandler?
+        via transport: any Transport
     ) async throws {
-        textEditAssignmentFence.authorize(
-            event,
-            sessionIncarnation: sessionIncarnation
-        )
         let retainedResumeEpoch = lastIssuedResumeGeneration
         let retainedSessionId = activeSessionId
 
-        // Join the FIFO before the assignment callback suspends. Otherwise a later event can
-        // allocate and reach the transport while this TEXT_EDIT is waiting on MainActor, reversing
-        // event_seq order. The callback remains before this event's first transmission.
+        // Join the FIFO before the transport suspension so retained events reach the wire in
+        // allocation order even when earlier writes are slow.
         let send = enqueueSend { [weak self] in
             try Task.checkCancellation()
             guard let self,
@@ -628,16 +555,6 @@ public actor EventOutbox {
                     sessionId: retainedSessionId
                   ) else {
                 return
-            }
-            if let onRetained {
-                guard await self.performTextEditAssignment(
-                    event,
-                    binding: binding,
-                    sessionIncarnation: sessionIncarnation,
-                    handler: onRetained
-                ) else {
-                    return
-                }
             }
             _ = try await self.sendRetainedEventIfActive(
                 event,
@@ -657,18 +574,11 @@ public actor EventOutbox {
         observedRevision: Revision,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
-        via transport: any Transport,
-        onTextEditAssigned: TextEditAssignmentHandler? = nil
+        via transport: any Transport
     ) async throws -> Event {
         let sessionIncarnation = try resolveSessionIncarnation(
             suppliedIncarnation,
             binding: binding
-        )
-        try await waitForTextDraftsBeforeNonTextEvent(
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onAssigned: onTextEditAssigned
         )
         return try await allocateAndSend(
             binding: binding,
@@ -692,18 +602,11 @@ public actor EventOutbox {
         value: Value,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
-        via transport: any Transport,
-        onTextEditAssigned: TextEditAssignmentHandler? = nil
+        via transport: any Transport
     ) async throws -> Event {
         let sessionIncarnation = try resolveSessionIncarnation(
             suppliedIncarnation,
             binding: binding
-        )
-        try await waitForTextDraftsBeforeNonTextEvent(
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onAssigned: onTextEditAssigned
         )
         return try await allocateAndSend(
             binding: binding,
@@ -728,18 +631,11 @@ public actor EventOutbox {
         itemId: ItemId,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
-        via transport: any Transport,
-        onTextEditAssigned: TextEditAssignmentHandler? = nil
+        via transport: any Transport
     ) async throws -> Event {
         let sessionIncarnation = try resolveSessionIncarnation(
             suppliedIncarnation,
             binding: binding
-        )
-        try await waitForTextDraftsBeforeNonTextEvent(
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onAssigned: onTextEditAssigned
         )
         return try await allocateAndSend(
             binding: binding,
@@ -756,82 +652,162 @@ public actor EventOutbox {
         }
     }
 
-    /// Queues a whole-value `TEXT_EDIT`. Drafts are retained while dispatch is suspended or
-    /// another edit for the same node is already assigned (§18.3, §22.6).
-    @discardableResult
-    public func queueTextEdit(
+    /// Allocates and retains a TEXT_EDIT, reserving its FIFO transport slot before returning.
+    /// The caller must authorize only after MainActor records the exact native assignment; explicit
+    /// assignment failure may reject and rewind this newest identity before any later allocation.
+    /// Unassigned/coalesced values remain in TextEditingSession and never enter this actor.
+    func prepareTextEdit(
         nodeId: NodeId,
         text: String,
         editSeq: EditSeq,
         observedRevision: Revision,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
-        via transport: any Transport,
-        laneEpoch: UInt64 = 0,
-        onAssigned: TextEditAssignmentHandler? = nil
-    ) async throws -> Event? {
+        via transport: any Transport
+    ) async throws -> PreparedTextEdit? {
         let sessionIncarnation = try resolveSessionIncarnation(
             suppliedIncarnation,
             binding: binding
         )
-        applyStagedTextDraftInvalidations(for: sessionIncarnation)
-        let minimumEpoch = max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0)
-        guard laneEpoch >= minimumEpoch else { return nil }
-
-        if let assignedEditSeq = assignedTextEvent(for: nodeId)?.editSeq,
-           editSeq <= assignedEditSeq {
+        guard activeConnectionBinding == binding,
+              activeSessionIncarnation == sessionIncarnation,
+              acceptsNewEvents else {
+            throw EventOutboxError.resumeNotConfirmed
+        }
+        guard preparedTextEditSends.isEmpty,
+              assignedTextEvent(for: nodeId) == nil,
+              textAcknowledgementBarriers[nodeId] == nil else {
             return nil
         }
-        if let retainedDraft = textDrafts[nodeId], editSeq <= retainedDraft.editSeq {
-            return nil
-        }
+        try ensureSequenceWindowCapacity()
 
-        textLaneEpoch[nodeId] = max(textLaneEpoch[nodeId] ?? 0, laneEpoch)
-        textDrafts[nodeId] = TextEditDraft(
+        let nextEventSeq = currentEventSeq + 1
+        let event = Event.textEdit(
+            eventSeq: nextEventSeq,
+            eventId: generateEventId(),
+            observedRevision: observedRevision,
             nodeId: nodeId,
             text: text,
-            editSeq: editSeq,
-            observedRevision: observedRevision,
-            laneEpoch: laneEpoch
+            editSeq: editSeq
+        ).withClientInstanceId(clientInstanceId)
+        let framedBytes = try encodeEvent(event)
+        try retainPending(event)
+        currentEventSeq = nextEventSeq
+
+        let token = UUID()
+        let gate = PreparedTextEditSendGate()
+        let retainedResumeEpoch = lastIssuedResumeGeneration
+        let retainedSessionId = activeSessionId
+        let send = enqueueSend { [weak self] in
+            guard await gate.wait() else { return }
+            try Task.checkCancellation()
+            guard let self else { return }
+            _ = try await self.sendRetainedEventIfActive(
+                event,
+                framedBytes: framedBytes,
+                binding: binding,
+                sessionIncarnation: sessionIncarnation,
+                resumeEpoch: retainedResumeEpoch,
+                sessionId: retainedSessionId,
+                via: transport
+            )
+        }
+        preparedTextEditSends[token] = PreparedTextEditSend(
+            event: event,
+            gate: gate,
+            task: send
         )
-        signalTextDraftStateChange()
-        return try await promoteTextDraft(
-            nodeId: nodeId,
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onAssigned: onAssigned
-        )
+        return PreparedTextEdit(event: event, token: token)
     }
 
-    /// Promotes every coalesced draft that can enter the contiguous send window.
-    /// Returns each newly allocated `TEXT_EDIT`; `onAssigned` runs after retention and before the
-    /// first transport suspension so native coordination cannot miss an ambiguous send.
-    @discardableResult
-    public func promoteReadyTextDrafts(
+    /// Waits only on assigned-envelope state; callers claim the current MainActor draft after it
+    /// returns, so a correction cannot invalidate a copied edit while this actor is suspended.
+    func waitUntilTextEditLaneIsAvailable(
+        nodeId: NodeId,
         binding: EventOutboxConnectionBinding,
-        sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
-        via transport: any Transport,
-        onAssigned: TextEditAssignmentHandler? = nil
-    ) async throws -> [Event] {
+        sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil
+    ) async throws {
         let sessionIncarnation = try resolveSessionIncarnation(
             suppliedIncarnation,
             binding: binding
         )
-        applyStagedTextDraftInvalidations(for: sessionIncarnation)
-        var promoted: [Event] = []
-        for nodeId in Array(textDrafts.keys) {
-            if let event = try await promoteTextDraft(
-                nodeId: nodeId,
-                binding: binding,
-                sessionIncarnation: sessionIncarnation,
-                via: transport,
-                onAssigned: onAssigned
-            ) {
-                promoted.append(event)
+        while !preparedTextEditSends.isEmpty
+            || assignedTextEvent(for: nodeId) != nil
+            || textAcknowledgementBarriers[nodeId] != nil {
+            guard activeConnectionBinding == binding,
+                  activeSessionIncarnation == sessionIncarnation,
+                  acceptsNewEvents else {
+                throw EventOutboxError.resumeNotConfirmed
             }
+            let version = textLaneStateVersion
+            try await waitForTextLaneStateChange(binding: binding, after: version)
         }
-        return promoted
+    }
+
+    /// Authorizes a prepared identity immediately after MainActor records the native assignment.
+    ///
+    /// Authorization opens the FIFO gate and makes rollback impossible. If teardown canceled the
+    /// old transport during the actor hop, the exact retained envelope is authorized for replay.
+    @discardableResult
+    func authorizePreparedTextEdit(_ prepared: PreparedTextEdit) -> Bool {
+        if let retained = preparedTextEditSends[prepared.token],
+           retained.event == prepared.event {
+            guard retained.gate.resolve(shouldSend: true) else { return false }
+            preparedTextEditSends.removeValue(forKey: prepared.token)
+            authorizedPreparedTextEditSends[prepared.token] = retained
+            signalTextLaneStateChange()
+            return true
+        }
+        if lifecycleSuspendedPreparedTextEdits[prepared.token] == prepared.event,
+           pendingEvents[prepared.event.eventId] == prepared.event {
+            lifecycleSuspendedPreparedTextEdits.removeValue(forKey: prepared.token)
+            lifecycleAuthorizedPreparedTextEdits[prepared.token] = prepared.event
+            return true
+        }
+        return authorizedPreparedTextEditSends[prepared.token]?.event == prepared.event
+            || lifecycleAuthorizedPreparedTextEdits[prepared.token] == prepared.event
+    }
+
+    /// Waits for an authorized edit's first transmission. A lifecycle-canceled transport returns
+    /// the retained identity immediately; same-session resume owns its next transmission.
+    @discardableResult
+    func releasePreparedTextEdit(_ prepared: PreparedTextEdit) async throws -> Event? {
+        if let retained = authorizedPreparedTextEditSends.removeValue(forKey: prepared.token),
+           retained.event == prepared.event {
+            try await retained.task.value
+            return prepared.event
+        }
+        if lifecycleAuthorizedPreparedTextEdits.removeValue(forKey: prepared.token) == prepared.event,
+           pendingEvents[prepared.event.eventId] == prepared.event {
+            return prepared.event
+        }
+        return nil
+    }
+
+    /// Rolls back only an explicitly rejected, still-unauthorized edit. Global prepared-slot
+    /// exclusion makes it the newest allocation, so rewinding event_seq cannot create a hole.
+    @discardableResult
+    func rejectPreparedTextEdit(_ prepared: PreparedTextEdit) -> Bool {
+        guard pendingOrder.last == prepared.event.eventId,
+              pendingEvents[prepared.event.eventId] == prepared.event,
+              currentEventSeq == prepared.event.eventSeq else {
+            return false
+        }
+        if let retained = preparedTextEditSends[prepared.token],
+           retained.event == prepared.event {
+            guard retained.gate.cancelIfUnresolved() else { return false }
+            retained.task.cancel()
+            preparedTextEditSends.removeValue(forKey: prepared.token)
+        } else if lifecycleSuspendedPreparedTextEdits[prepared.token] == prepared.event {
+            lifecycleSuspendedPreparedTextEdits.removeValue(forKey: prepared.token)
+        } else {
+            return false
+        }
+        pendingEvents.removeValue(forKey: prepared.event.eventId)
+        pendingOrder.removeLast()
+        currentEventSeq -= 1
+        signalTextLaneStateChange()
+        return true
     }
 
     /// Assigned, unacknowledged `TEXT_EDIT` events in send order (§18.3).
@@ -841,51 +817,6 @@ public actor EventOutbox {
                 return nil
             }
             return event
-        }
-    }
-
-    /// Invalidates a coalesced native draft only for the exact session incarnation that installed
-    /// the callback. Delayed callbacks from replaced controls cannot poison a new lane epoch.
-    @discardableResult
-    package func invalidateTextDraft(
-        nodeId: NodeId,
-        laneEpoch: UInt64 = 0,
-        binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
-    ) -> Bool {
-        guard activeConnectionBinding == binding,
-              activeSessionIncarnation == sessionIncarnation else {
-            return false
-        }
-        applyStagedTextDraftInvalidations(for: sessionIncarnation)
-        applyTextDraftInvalidation(
-            TextDraftInvalidation(nodeId: nodeId, laneEpoch: laneEpoch)
-        )
-        return true
-    }
-
-    private func applyStagedTextDraftInvalidations(
-        for sessionIncarnation: EventOutboxSessionIncarnation
-    ) {
-        for invalidation in textEditAssignmentFence.takeStagedInvalidations(
-            sessionIncarnation: sessionIncarnation
-        ) {
-            applyTextDraftInvalidation(invalidation)
-        }
-    }
-
-    private func applyTextDraftInvalidation(_ invalidation: TextDraftInvalidation) {
-        let minimumEpoch = max(
-            textLaneEpochFloor,
-            textLaneEpoch[invalidation.nodeId] ?? 0
-        )
-        guard invalidation.laneEpoch >= minimumEpoch else { return }
-
-        textLaneEpoch[invalidation.nodeId] = invalidation.laneEpoch
-        if let draft = textDrafts[invalidation.nodeId],
-           draft.laneEpoch <= invalidation.laneEpoch {
-            textDrafts.removeValue(forKey: invalidation.nodeId)
-            signalTextDraftStateChange()
         }
     }
 
@@ -905,18 +836,6 @@ public actor EventOutbox {
         }
     }
 
-    /// Count of coalesced whole-value drafts that have not yet been allocated an `event_seq`.
-    public var unsentTextDraftCount: Int {
-        textDrafts.count
-    }
-
-    func unsentTextDraftForTesting(
-        nodeId: NodeId
-    ) -> (text: String, editSeq: EditSeq)? {
-        guard let draft = textDrafts[nodeId] else { return nil }
-        return (draft.text, draft.editSeq)
-    }
-
     /// Selectively cancels assigned `TEXT_EDIT` events. A required exact match fails closed (§18.3).
     func cancelAssignedTextEdits(
         confirming refs: [PendingTextEditDescriptor],
@@ -931,9 +850,7 @@ public actor EventOutbox {
             }
         }
         let condemned = requireExactMatch ? refs : assigned
-        textDrafts.removeAll(keepingCapacity: true)
         for ref in condemned {
-            textEditAssignmentFence.revoke(ref.eventId)
             textEventsAwaitingOutcome.remove(ref.eventId)
             if let event = pendingEvents.removeValue(forKey: ref.eventId) {
                 pendingOrder.removeAll { $0 == ref.eventId }
@@ -942,7 +859,7 @@ public actor EventOutbox {
                 recordSelectiveAcknowledgement(ref.eventSeq)
             }
         }
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         cancelReplayRetryLoopIfSettled()
     }
 
@@ -962,14 +879,7 @@ public actor EventOutbox {
         return true
     }
 
-    func discardUnsentTextDrafts() {
-        textDrafts.removeAll(keepingCapacity: true)
-        signalTextDraftStateChange()
-    }
-
-    /// Applies a hard full-resync boundary. Drafts from native controls that existed before the
-    /// snapshot are discarded; callbacks from newly mounted controls carry laneEpoch (or later)
-    /// and survive this actor hop.
+    /// Applies the assigned-edit acknowledgement boundary after the native full resync.
     @discardableResult
     func applyFullResyncTextBoundary(
         laneEpoch: UInt64?,
@@ -1036,7 +946,6 @@ public actor EventOutbox {
               activeSessionIncarnation == sessionIncarnation else {
             return false
         }
-        applyStagedTextDraftInvalidations(for: sessionIncarnation)
         let ready = textAcknowledgementBarriers.values
             .filter { $0.revisionAfterEffect <= revision }
             .sorted { $0.nodeId.value < $1.nodeId.value }
@@ -1052,20 +961,17 @@ public actor EventOutbox {
               activeSessionIncarnation == sessionIncarnation else {
             return false
         }
-        guard let invalidations = await textEditAssignmentFence.performLifecycleIfActive(
+        let resolved: Bool? = await textLifecycleFence.performIfActive(
             sessionIncarnation: sessionIncarnation,
-            handler: { onResolved(ready) }
-        ) else {
-            return false
-        }
+            handler: {
+                onResolved(ready)
+                return true
+            }
+        )
+        guard resolved == true else { return false }
         guard activeConnectionBinding == binding,
               activeSessionIncarnation == sessionIncarnation else {
             return false
-        }
-
-        applyStagedTextDraftInvalidations(for: sessionIncarnation)
-        for invalidation in invalidations {
-            applyTextDraftInvalidation(invalidation)
         }
 
         var removedBarrier = false
@@ -1074,7 +980,7 @@ public actor EventOutbox {
             removedBarrier = true
         }
         if removedBarrier {
-            signalTextDraftStateChange()
+            signalTextLaneStateChange()
         }
         return activeConnectionBinding == binding
             && activeSessionIncarnation == sessionIncarnation
@@ -1082,48 +988,6 @@ public actor EventOutbox {
 
     private static func identityKey(_ ref: PendingTextEditDescriptor) -> String {
         "\(ref.eventId.toHex()):\(ref.eventSeq):\(ref.nodeId.value):\(ref.editSeq.rawValue)"
-    }
-
-    private func promoteTextDraft(
-        nodeId: NodeId,
-        binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation,
-        via transport: any Transport,
-        onAssigned: TextEditAssignmentHandler? = nil
-    ) async throws -> Event? {
-        guard activeConnectionBinding == binding,
-              activeSessionIncarnation == sessionIncarnation else {
-            throw EventOutboxError.resumeNotConfirmed
-        }
-        guard acceptsNewEvents else { return nil }
-        guard assignedTextEvent(for: nodeId) == nil else { return nil }
-        guard textAcknowledgementBarriers[nodeId] == nil else { return nil }
-        guard let draft = textDrafts[nodeId] else { return nil }
-        if draft.laneEpoch < max(textLaneEpochFloor, textLaneEpoch[nodeId] ?? 0) {
-            textDrafts.removeValue(forKey: nodeId)
-            signalTextDraftStateChange()
-            return nil
-        }
-        return try await allocateAndSend(
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            via: transport,
-            onRetained: onAssigned,
-            onAllocated: { _ in
-                guard self.textDrafts[nodeId] == draft else { return }
-                self.textDrafts.removeValue(forKey: nodeId)
-                self.signalTextDraftStateChange()
-            }
-        ) { eventSeq, eventId in
-            Event.textEdit(
-                eventSeq: eventSeq,
-                eventId: eventId,
-                observedRevision: draft.observedRevision,
-                nodeId: draft.nodeId,
-                text: draft.text,
-                editSeq: draft.editSeq
-            )
-        }
     }
 
     private func assignedTextEvent(for nodeId: NodeId) -> Event? {
@@ -1169,12 +1033,11 @@ public actor EventOutbox {
     /// Private: settling an intent mutates state whose ownership depends on wire identity, so
     /// `settleAcknowledgement` is the only way in from the wire (§18.2).
     private func acknowledgeEvent(id: EventId) {
-        textEditAssignmentFence.revoke(id)
         textEventsAwaitingOutcome.remove(id)
         guard let event = pendingEvents.removeValue(forKey: id) else { return }
         pendingOrder.removeAll { $0 == id }
         recordSelectiveAcknowledgement(event.eventSeq)
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         cancelReplayRetryLoopIfSettled()
     }
 
@@ -1226,9 +1089,7 @@ public actor EventOutbox {
             sequence: current.sequence + 1
         )
         activeSessionIncarnation = next
-        for invalidation in textEditAssignmentFence.activate(next) {
-            applyTextDraftInvalidation(invalidation)
-        }
+        textLifecycleFence.activate(next)
         return next
     }
 
@@ -1236,20 +1097,10 @@ public actor EventOutbox {
         activeConnectionBinding
     }
 
-    var textDraftWaiterCountForTesting: Int {
-        textDraftWaiters.count
-    }
-
     func setNativeTextLifecycleWillHopForTesting(
         _ interceptor: (@Sendable () async -> Void)?
     ) {
         nativeTextLifecycleWillHopForTesting = interceptor
-    }
-
-    func setNativeTextAssignmentWillHopForTesting(
-        _ interceptor: (@Sendable () async -> Void)?
-    ) {
-        nativeTextAssignmentWillHopForTesting = interceptor
     }
 
     func withActiveConnectionBinding<Value: Sendable>(
@@ -1289,13 +1140,13 @@ public actor EventOutbox {
 
         // Retire old assignment/lifecycle callbacks immediately, but leave correction
         // invalidations authorized until every synchronous native render has exited.
-        textEditAssignmentFence.beginActivation(sessionIncarnation)
+        textLifecycleFence.beginActivation(sessionIncarnation)
         activeConnectionBinding = binding
         activeSessionIncarnation = sessionIncarnation
         activeResumeGeneration = nil
         pendingResumeFinalizationGeneration = nil
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         cancelReplayRetryLoop()
         cancelPendingWrites()
 
@@ -1328,13 +1179,8 @@ public actor EventOutbox {
         guard resyncBoundaryTransitionEpoch == transitionEpoch,
               activeConnectionBinding == binding,
               activeSessionIncarnation == sessionIncarnation,
-              let invalidations = textEditAssignmentFence.completeActivation(
-                sessionIncarnation
-              ) else {
+              textLifecycleFence.completeActivation(sessionIncarnation) else {
             return binding
-        }
-        for invalidation in invalidations {
-            applyTextDraftInvalidation(invalidation)
         }
         return binding
     }
@@ -1352,7 +1198,7 @@ public actor EventOutbox {
         let generation = lastIssuedResumeGeneration
         activeResumeGeneration = generation
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
 
         let boundaryCleanup = adoptOrBeginResyncBoundaryCleanup()
         let liveInvalidation = adoptOrBeginLiveRenderInvalidation()
@@ -1617,7 +1463,7 @@ public actor EventOutbox {
             return false
         }
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         _ = await resyncRenderFence.invalidate(renderToken)
         guard ownsResumeRecoveryRender(
             binding: binding,
@@ -1630,27 +1476,24 @@ public actor EventOutbox {
         return true
     }
 
-    /// Completes a same-session decision only if no newer controller superseded this attempt.
+    /// Applies a same-session frontier and returns the assigned identities MainActor must adopt
+    /// before replay can open. The reconnect generation remains latched across that actor hop.
     ///
     /// When `discardedTextEdits` is non-`nil`, assigned `TEXT_EDIT` cancellation shares this
     /// generation check so a stale resync cannot drain a newer attempt's pending set (§18.3).
-    func completeSameSessionResume(
+    func prepareSameSessionResume(
         id: String,
         lastProcessedEventSeq: UInt64,
         generation: UInt64,
         binding: EventOutboxConnectionBinding,
-        via transport: any Transport,
-        enableNewEventsAfterReplay: Bool,
         discardedTextEdits: [SRUIPendingTextEditRef]? = nil,
         requireExactTextMatch: Bool = true,
-        onTextEditAssigned: TextEditAssignmentHandler? = nil,
-        onTextEditsCanceled: TextEditCancellationHandler? = nil,
-        onReplayFailure: (@Sendable (String) async -> Void)? = nil
-    ) async throws -> Bool {
+        onTextEditsCanceled: TextEditCancellationHandler? = nil
+    ) async throws -> SameSessionResumePreparation? {
         guard activeConnectionBinding == binding,
               activeResumeGeneration == generation,
               let sessionIncarnation = activeSessionIncarnation else {
-            return false
+            return nil
         }
         if let discardedTextEdits {
             let confirming = discardedTextEdits.compactMap(PendingTextEditDescriptor.init(wire:))
@@ -1665,7 +1508,7 @@ public actor EventOutbox {
                     resumeGeneration: generation,
                     handler: { onTextEditsCanceled(canceled) }
                 ) else {
-                    return false
+                    return nil
                 }
             }
             // The lifecycle callback and ownership revalidation happen before mutation. If a newer
@@ -1680,56 +1523,59 @@ public actor EventOutbox {
             throughSeq: lastProcessedEventSeq,
             retainingTextEditsForOutcome: true
         )
-        if let onTextEditAssigned {
-            for event in assignedTextEditEvents() {
-                textEditAssignmentFence.authorize(
-                    event,
-                    sessionIncarnation: sessionIncarnation
-                )
-                guard await performTextEditAssignment(
-                    event,
-                    binding: binding,
-                    sessionIncarnation: sessionIncarnation,
-                    handler: onTextEditAssigned
-                ) else {
-                    return false
-                }
-            }
-            guard activeConnectionBinding == binding,
-                  activeResumeGeneration == generation else {
-                return false
-            }
-        }
-        try await resendPendingEvents(
-            binding: binding,
-            sessionIncarnation: sessionIncarnation,
-            via: transport
+        // Once a resume frontier is accepted, an undecided old transport slot is replayable and
+        // can no longer be rolled back by a delayed pre-resume controller task.
+        lifecycleAuthorizedPreparedTextEdits.merge(
+            lifecycleSuspendedPreparedTextEdits,
+            uniquingKeysWith: { current, _ in current }
         )
-        guard activeConnectionBinding == binding,
-              activeSessionIncarnation == sessionIncarnation,
-              activeResumeGeneration == generation else {
-            return false
-        }
-        acceptsNewEvents = enableNewEventsAfterReplay
-        signalTextDraftStateChange()
-        if enableNewEventsAfterReplay {
-            try await promoteReadyTextDrafts(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation,
-                via: transport,
-                onAssigned: onTextEditAssigned
-            )
-        }
-        startReplayRetryLoop(
+        lifecycleSuspendedPreparedTextEdits.removeAll(keepingCapacity: true)
+        return SameSessionResumePreparation(
+            sessionId: id,
             generation: generation,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
+            assignedTextEdits: assignedTextEditEvents()
+        )
+    }
+
+    /// Revalidates a prepared same-session transition after MainActor adopted its assignments,
+    /// then replays retained identities in allocation order.
+    func completeSameSessionResume(
+        _ preparation: SameSessionResumePreparation,
+        via transport: any Transport,
+        enableNewEventsAfterReplay: Bool,
+        onReplayFailure: (@Sendable (String) async -> Void)? = nil
+    ) async throws -> Bool {
+        guard activeConnectionBinding == preparation.binding,
+              activeSessionIncarnation == preparation.sessionIncarnation,
+              activeResumeGeneration == preparation.generation,
+              activeSessionId == preparation.sessionId else {
+            return false
+        }
+        try await resendPendingEvents(
+            binding: preparation.binding,
+            sessionIncarnation: preparation.sessionIncarnation,
+            via: transport
+        )
+        guard activeConnectionBinding == preparation.binding,
+              activeSessionIncarnation == preparation.sessionIncarnation,
+              activeResumeGeneration == preparation.generation,
+              activeSessionId == preparation.sessionId else {
+            return false
+        }
+        acceptsNewEvents = enableNewEventsAfterReplay
+        signalTextLaneStateChange()
+        startReplayRetryLoop(
+            generation: preparation.generation,
+            binding: preparation.binding,
+            sessionIncarnation: preparation.sessionIncarnation,
             via: transport,
             onFailure: onReplayFailure
         )
         if enableNewEventsAfterReplay {
             activeResumeGeneration = nil
-            pendingResumeFinalizationGeneration = generation
+            pendingResumeFinalizationGeneration = preparation.generation
         }
         return true
     }
@@ -1764,7 +1610,7 @@ public actor EventOutbox {
         pendingResumeFinalizationGeneration = nil
         activeSessionId = id
         acceptsNewEvents = true
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         return true
     }
 
@@ -1773,7 +1619,7 @@ public actor EventOutbox {
     func suspendNewEvents(binding: EventOutboxConnectionBinding) -> Bool {
         guard activeConnectionBinding == binding else { return false }
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         return true
     }
 
@@ -1799,7 +1645,7 @@ public actor EventOutbox {
             return false
         }
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         if let ownership = resyncRenderOwnership {
             await resyncRenderFence.invalidate(ownership.token)
             guard activeConnectionBinding == binding, activeResumeGeneration == nil,
@@ -1839,7 +1685,7 @@ public actor EventOutbox {
         // Close allocation before any MainActor hop. Drafts may still coalesce while suspended;
         // no event can allocate and invalidate the frontier proof below.
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         var assigned = assignedTextEditDescriptors()
         guard assigned.allSatisfy({ $0.eventSeq <= lastProcessedEventSeq }) else {
             return .resumeRequired
@@ -1899,7 +1745,7 @@ public actor EventOutbox {
             return false
         }
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         if let ownership = resyncRenderOwnership {
             await resyncRenderFence.invalidate(ownership.token)
             guard activeConnectionBinding == binding, activeResumeGeneration == nil,
@@ -2031,7 +1877,6 @@ public actor EventOutbox {
             }
             .sorted { $0.eventSeq < $1.eventSeq }
         for event in settled {
-            textEditAssignmentFence.revoke(event.eventId)
             pendingEvents.removeValue(forKey: event.eventId)
         }
         pendingOrder.removeAll { pendingEvents[$0] == nil }
@@ -2105,7 +1950,7 @@ public actor EventOutbox {
             return false
         }
         acceptsNewEvents = true
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         return true
     }
 
@@ -2121,7 +1966,7 @@ public actor EventOutbox {
             return false
         }
         acceptsNewEvents = true
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         activeResumeGeneration = nil
         pendingResumeFinalizationGeneration = generation
         return true
@@ -2176,7 +2021,7 @@ public actor EventOutbox {
             cancelReplayRetryLoop()
         }
         acceptsNewEvents = false
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
 
         if let boundaryCleanup {
             let renderedBoundaryEpoch = await boundaryCleanup.invalidation.value
@@ -2233,7 +2078,6 @@ public actor EventOutbox {
         let cleanup = PendingResyncBoundaryCleanup(
             token: ownership.token,
             invalidation: invalidation,
-            draftsAtStart: textDrafts,
             acknowledgementBarriersAtStart: textAcknowledgementBarriers
         )
         pendingResyncBoundaryCleanup = cleanup
@@ -2254,15 +2098,11 @@ public actor EventOutbox {
         if let renderedBoundaryEpoch {
             applyFullResyncTextBoundaryState(laneEpoch: renderedBoundaryEpoch)
         } else {
-            for (nodeId, draft) in cleanup.draftsAtStart
-            where textDrafts[nodeId] == draft {
-                textDrafts.removeValue(forKey: nodeId)
-            }
             for (nodeId, barrier) in cleanup.acknowledgementBarriersAtStart
             where textAcknowledgementBarriers[nodeId] == barrier {
                 textAcknowledgementBarriers.removeValue(forKey: nodeId)
             }
-            signalTextDraftStateChange()
+            signalTextLaneStateChange()
         }
         pendingResyncBoundaryCleanup = nil
         return true
@@ -2348,18 +2188,9 @@ public actor EventOutbox {
     }
 
     private func applyFullResyncTextBoundaryState(laneEpoch: UInt64?) {
+        _ = laneEpoch
         textAcknowledgementBarriers.removeAll(keepingCapacity: true)
-        if let laneEpoch {
-            textLaneEpochFloor = max(textLaneEpochFloor, laneEpoch)
-            for nodeID in Array(textDrafts.keys) {
-                if let draft = textDrafts[nodeID], draft.laneEpoch < textLaneEpochFloor {
-                    textDrafts.removeValue(forKey: nodeID)
-                }
-            }
-        } else {
-            textDrafts.removeAll(keepingCapacity: true)
-        }
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
     }
 
     private func applyReplacementFrontierState(
@@ -2381,14 +2212,12 @@ public actor EventOutbox {
         pendingEvents.removeAll(keepingCapacity: true)
         pendingOrder.removeAll(keepingCapacity: true)
         acknowledgedOutOfOrder.removeAll(keepingCapacity: true)
-        textDrafts.removeAll(keepingCapacity: true)
-        textLaneEpoch.removeAll(keepingCapacity: true)
-        textLaneEpochFloor = 0
         textAcknowledgementBarriers.removeAll(keepingCapacity: true)
         textEventsAwaitingOutcome.removeAll(keepingCapacity: true)
-        textEditAssignmentFence.revokeAll()
-        signalTextDraftStateChange()
+        signalTextLaneStateChange()
         cancelPendingWrites()
+        lifecycleSuspendedPreparedTextEdits.removeAll(keepingCapacity: true)
+        lifecycleAuthorizedPreparedTextEdits.removeAll(keepingCapacity: true)
     }
 
     private func startReplayRetryLoop(
@@ -2509,38 +2338,22 @@ public actor EventOutbox {
         }
     }
 
-    private func waitForTextDraftsBeforeNonTextEvent(
+    private func waitForPreparedTextEditResolution(
         binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation,
-        via transport: any Transport,
-        onAssigned: TextEditAssignmentHandler?
+        sessionIncarnation: EventOutboxSessionIncarnation
     ) async throws {
-        while true {
+        while !preparedTextEditSends.isEmpty {
             guard activeConnectionBinding == binding,
                   activeSessionIncarnation == sessionIncarnation,
                   acceptsNewEvents else {
                 throw EventOutboxError.resumeNotConfirmed
             }
-
-            _ = try await promoteReadyTextDrafts(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation,
-                via: transport,
-                onAssigned: onAssigned
-            )
-            guard activeConnectionBinding == binding,
-                  activeSessionIncarnation == sessionIncarnation,
-                  acceptsNewEvents else {
-                throw EventOutboxError.resumeNotConfirmed
-            }
-            guard !textDrafts.isEmpty else { return }
-
-            let version = textDraftStateVersion
-            try await waitForTextDraftStateChange(binding: binding, after: version)
+            let version = textLaneStateVersion
+            try await waitForTextLaneStateChange(binding: binding, after: version)
         }
     }
 
-    private func waitForTextDraftStateChange(
+    private func waitForTextLaneStateChange(
         binding: EventOutboxConnectionBinding,
         after version: UInt64
     ) async throws {
@@ -2551,56 +2364,29 @@ public actor EventOutbox {
                 guard !Task.isCancelled,
                       activeConnectionBinding == binding,
                       acceptsNewEvents,
-                      textDraftStateVersion == version,
-                      !textDrafts.isEmpty else {
+                      textLaneStateVersion == version else {
                     continuation.resume()
                     return
                 }
-                textDraftWaiters[waiterId] = continuation
+                textLaneWaiters[waiterId] = continuation
             }
         } onCancel: {
-            Task { await self.cancelTextDraftWaiter(waiterId) }
+            Task { await self.cancelTextLaneWaiter(waiterId) }
         }
         try Task.checkCancellation()
     }
 
-    private func cancelTextDraftWaiter(_ waiterId: UUID) {
-        textDraftWaiters.removeValue(forKey: waiterId)?.resume()
+    private func cancelTextLaneWaiter(_ waiterId: UUID) {
+        textLaneWaiters.removeValue(forKey: waiterId)?.resume()
     }
 
-    private func signalTextDraftStateChange() {
-        textDraftStateVersion &+= 1
-        let waiters = textDraftWaiters.values
-        textDraftWaiters.removeAll(keepingCapacity: true)
+    private func signalTextLaneStateChange() {
+        textLaneStateVersion &+= 1
+        let waiters = textLaneWaiters.values
+        textLaneWaiters.removeAll(keepingCapacity: true)
         for waiter in waiters {
             waiter.resume()
         }
-    }
-
-    private func performTextEditAssignment(
-        _ event: Event,
-        binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation,
-        handler: TextEditAssignmentHandler
-    ) async -> Bool {
-        guard activeConnectionBinding == binding,
-              activeSessionIncarnation == sessionIncarnation,
-              pendingEvents[event.eventId] == event else {
-            return false
-        }
-        if let nativeTextAssignmentWillHopForTesting {
-            await nativeTextAssignmentWillHopForTesting()
-        }
-        guard activeConnectionBinding == binding,
-              activeSessionIncarnation == sessionIncarnation,
-              pendingEvents[event.eventId] == event else {
-            return false
-        }
-        return await textEditAssignmentFence.performIfAuthorized(
-            event,
-            sessionIncarnation: sessionIncarnation,
-            handler: handler
-        )
     }
 
     private func performNativeTextLifecycle(
@@ -2617,7 +2403,7 @@ public actor EventOutbox {
               activeResumeGeneration == resumeGeneration else {
             return false
         }
-        let performed: Bool? = await textEditAssignmentFence.performLifecycleIfActive(
+        let performed: Bool? = await textLifecycleFence.performIfActive(
             sessionIncarnation: sessionIncarnation,
             handler: {
                 handler()
@@ -2712,6 +2498,26 @@ public actor EventOutbox {
     /// loop checks it between frames, but a `transport.send` already in flight still runs to
     /// completion, so this bounds the overlap rather than eliminating it.
     private func cancelPendingWrites() {
+        let hadPreparedSlots = !preparedTextEditSends.isEmpty
+            || !authorizedPreparedTextEditSends.isEmpty
+        for (token, retained) in preparedTextEditSends {
+            _ = retained.gate.cancelIfUnresolved()
+            retained.task.cancel()
+            if pendingEvents[retained.event.eventId] == retained.event {
+                lifecycleSuspendedPreparedTextEdits[token] = retained.event
+            }
+        }
+        preparedTextEditSends.removeAll(keepingCapacity: true)
+        for (token, retained) in authorizedPreparedTextEditSends {
+            retained.task.cancel()
+            if pendingEvents[retained.event.eventId] == retained.event {
+                lifecycleAuthorizedPreparedTextEdits[token] = retained.event
+            }
+        }
+        authorizedPreparedTextEditSends.removeAll(keepingCapacity: true)
+        if hadPreparedSlots {
+            signalTextLaneStateChange()
+        }
         sendTail?.cancel()
         sendTail = nil
     }

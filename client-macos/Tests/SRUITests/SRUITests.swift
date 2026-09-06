@@ -407,6 +407,17 @@ final class SRUITests: XCTestCase {
             rustFramedBytes,
             "Cross-language mismatch: Swift-encoded Framed SruiMessage does not match Rust-authored bytes"
         )
+
+        // 4. Cross-language TEXT_EDIT check, including event framing and edit_seq.
+        let swiftTextEditBytes = try SRUIFraming.encodeFramed(createAuthoredTextEditEvent())
+        let rustTextEditBytes = try Data(
+            contentsOf: conformanceVectorsDir.appendingPathComponent("golden_text_edit_event.bin")
+        )
+        XCTAssertEqual(
+            swiftTextEditBytes,
+            rustTextEditBytes,
+            "Cross-language mismatch: Swift-encoded TEXT_EDIT does not match Rust-authored bytes"
+        )
     }
 
     func testDecodeGoldenFramedMessageAgainstExpectedJSON() throws {
@@ -551,6 +562,36 @@ final class SRUITests: XCTestCase {
         return msg
     }
 
+    /// Authors the golden `TEXT_EDIT` envelope from scratch (§18.3, §22.6).
+    private func createAuthoredTextEditEvent() -> Srui_Protocol_SruiMessage {
+        var event = Srui_Protocol_Event()
+        event.clientInstanceID = Data("client-29".utf8)
+        event.eventSeq = 29
+        event.eventID = Data("event-text-29".utf8)
+        event.observedRevision = 41
+        event.nodeID = 7
+        event.eventType = Srui_Protocol_TypeRef.with {
+            $0.namespaceID = standardNamespaceID
+            $0.localID = UInt32(Srui_Protocol_StandardEvent.eventTextEdit.rawValue)
+        }
+        event.arguments = [
+            Srui_Protocol_Property.with {
+                $0.property = Srui_Protocol_PropertyRef.with {
+                    $0.namespaceID = standardNamespaceID
+                    $0.localID = UInt32(Srui_Protocol_StandardProperty.propertyText.rawValue)
+                }
+                $0.value = Srui_Protocol_Value.with {
+                    $0.stringValue = "composed text"
+                }
+            }
+        ]
+        event.editSeq = 3
+
+        var message = Srui_Protocol_SruiMessage()
+        message.event = event
+        return message
+    }
+
     func testDecodeGoldenClientModelRangeRequestAgainstExpectedJSON() throws {
         let spec = try loadExpectedSpec()
         guard let vectors = spec["vectors"] as? [String: Any],
@@ -601,6 +642,84 @@ final class SRUITests: XCTestCase {
 
         XCTAssertEqual(hexString(from: encodedData), expectedHex, "Authored Swift Framed ClientModelRangeRequest hex mismatch")
         XCTAssertEqual(encodedData, fixtureData, "Authored Swift Framed ClientModelRangeRequest byte mismatch against golden fixture")
+    }
+
+    func testDecodeGoldenTextEditEventAgainstExpectedJSON() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let eventSpec = vectors["golden_text_edit_event"] as? [String: Any],
+              let filename = eventSpec["file"] as? String,
+              let expectedHex = eventSpec["hex"] as? String,
+              let expectedSHA256 = eventSpec["sha256"] as? String,
+              let expectedByteLen = eventSpec["byte_length"] as? Int,
+              let expected = eventSpec["expected"] as? [String: Any],
+              let expectedType = expected["event_type"] as? [String: Any],
+              let expectedArguments = expected["arguments"] as? [[String: Any]],
+              let expectedArgument = expectedArguments.first,
+              let expectedProperty = expectedArgument["property"] as? [String: Any],
+              let expectedValue = expectedArgument["value"] as? [String: Any] else {
+            XCTFail("Malformed expected.json structure for golden_text_edit_event")
+            return
+        }
+
+        let data = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+        XCTAssertEqual(data.count, expectedByteLen)
+        XCTAssertEqual(hexString(from: data), expectedHex)
+        XCTAssertEqual(sha256String(from: data), expectedSHA256)
+
+        let decoded = try SRUIFraming.decodeFramed(Srui_Protocol_SruiMessage.self, from: data)
+        guard case .event(let event)? = decoded.msg else {
+            XCTFail("Expected event in framed message, got \(String(describing: decoded.msg))")
+            return
+        }
+        XCTAssertEqual(
+            event.clientInstanceID,
+            Data((expected["client_instance_id"] as? String ?? "").utf8)
+        )
+        XCTAssertEqual(event.eventSeq, UInt64(expected["event_seq"] as? Int ?? -1))
+        XCTAssertEqual(event.eventID, Data((expected["event_id"] as? String ?? "").utf8))
+        XCTAssertEqual(event.observedRevision, UInt64(expected["observed_revision"] as? Int ?? -1))
+        XCTAssertEqual(event.nodeID, UInt64(expected["node_id"] as? Int ?? -1))
+        XCTAssertTrue(event.hasEventType)
+        XCTAssertEqual(
+            event.eventType.namespaceID,
+            UInt32(expectedType["namespace_id"] as? Int ?? -1)
+        )
+        XCTAssertEqual(event.eventType.localID, UInt32(expectedType["local_id"] as? Int ?? -1))
+        XCTAssertEqual(event.arguments.count, expectedArguments.count)
+        XCTAssertEqual(
+            event.arguments[0].property.namespaceID,
+            UInt32(expectedProperty["namespace_id"] as? Int ?? -1)
+        )
+        XCTAssertEqual(
+            event.arguments[0].property.localID,
+            UInt32(expectedProperty["local_id"] as? Int ?? -1)
+        )
+        guard case .stringValue(let text) = event.arguments[0].value.value else {
+            XCTFail("Expected stringValue TEXT_EDIT argument")
+            return
+        }
+        XCTAssertEqual(text, expectedValue["string_value"] as? String)
+        XCTAssertEqual(event.editSeq, UInt64(expected["edit_seq"] as? Int ?? -1))
+
+        let roundtripData = try SRUIFraming.encodeFramed(decoded)
+        XCTAssertEqual(roundtripData, data)
+    }
+
+    func testDirectEncodeGoldenTextEditEventMatchesWireBytes() throws {
+        let spec = try loadExpectedSpec()
+        guard let vectors = spec["vectors"] as? [String: Any],
+              let eventSpec = vectors["golden_text_edit_event"] as? [String: Any],
+              let filename = eventSpec["file"] as? String,
+              let expectedHex = eventSpec["hex"] as? String else {
+            XCTFail("Malformed expected.json structure for golden_text_edit_event")
+            return
+        }
+
+        let fixtureData = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+        let encodedData = try SRUIFraming.encodeFramed(createAuthoredTextEditEvent())
+        XCTAssertEqual(hexString(from: encodedData), expectedHex)
+        XCTAssertEqual(encodedData, fixtureData)
     }
 
     func testLengthDelimitedFraming() throws {

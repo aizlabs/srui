@@ -287,22 +287,13 @@ where
                 }
             }
             clear_stale_if_settled(&session, &hello.client_instance_id, &bootstrap.transactions);
-            if !send_terminal_catch_up(
-                &mut framed_write,
-                bootstrap.terminal.catch_up,
-                &shutdown,
-                &bootstrap.transactions,
-            )
-            .await?
-            {
-                return Ok(());
-            }
             (
                 hello.client_instance_id,
                 bootstrap.transactions,
                 TerminalConnection {
                     negotiated: bootstrap.terminal_negotiated,
                     live: bootstrap.terminal.live,
+                    catch_up: bootstrap.terminal.catch_up,
                 },
             )
         }
@@ -388,22 +379,13 @@ where
                     );
                 }
             }
-            if !send_terminal_catch_up(
-                &mut framed_write,
-                bootstrap.terminal.catch_up,
-                &shutdown,
-                &bootstrap.transactions,
-            )
-            .await?
-            {
-                return Ok(());
-            }
             (
                 resume.client_instance_id,
                 bootstrap.transactions,
                 TerminalConnection {
                     negotiated: bootstrap.terminal_negotiated,
                     live: bootstrap.terminal.live,
+                    catch_up: bootstrap.terminal.catch_up,
                 },
             )
         }
@@ -426,28 +408,12 @@ where
     .await
 }
 
-async fn send_terminal_catch_up<W>(
-    framed_write: &mut FramedWrite<W, SruiCodec>,
-    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
-    shutdown: &CancellationToken,
-    outbound: &OutboundReceiver,
-) -> Result<bool, ConnectionError>
-where
-    W: AsyncWrite + Unpin,
-{
-    for (class, envelope) in catch_up {
-        if !send_message(framed_write, envelope, class, shutdown, outbound).await? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 const TERMINAL_LANE_CAPACITY: usize = 64;
 
 struct TerminalConnection {
     negotiated: bool,
     live: Vec<TerminalSubscription>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
 }
 
 pub(super) struct TerminalLanes {
@@ -463,12 +429,37 @@ pub(super) struct WriterCancel {
 
 fn spawn_terminal_live_pumps(
     live: Vec<TerminalSubscription>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
     shutdown: CancellationToken,
     session_cancel: CancellationToken,
 ) -> (TerminalLanes, Vec<tokio::task::JoinHandle<()>>) {
     let (high_tx, high_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
-    let (_normal_tx, normal_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let (normal_tx, normal_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
     let mut tasks = Vec::new();
+
+    let seed_high = high_tx.clone();
+    let seed_normal = normal_tx.clone();
+    let seed_shutdown = shutdown.clone();
+    let seed_cancel = session_cancel.clone();
+    tasks.push(tokio::spawn(async move {
+        for (class, envelope) in catch_up {
+            let tx = match class {
+                LogicalChannelClass::TerminalNormal => &seed_normal,
+                _ => &seed_high,
+            };
+            tokio::select! {
+                biased;
+                _ = seed_cancel.cancelled() => return,
+                _ = seed_shutdown.cancelled() => return,
+                sent = tx.send(envelope) => {
+                    if sent.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }));
+
     for mut subscription in live {
         let high_tx = high_tx.clone();
         let shutdown = shutdown.clone();
@@ -495,6 +486,7 @@ fn spawn_terminal_live_pumps(
         }));
     }
     drop(high_tx);
+    drop(normal_tx);
     (TerminalLanes { high_rx, normal_rx }, tasks)
 }
 
@@ -530,8 +522,12 @@ where
         })
     };
 
-    let (terminal_lanes, terminal_pumps) =
-        spawn_terminal_live_pumps(terminal.live, shutdown.clone(), session_cancel.clone());
+    let (terminal_lanes, terminal_pumps) = spawn_terminal_live_pumps(
+        terminal.live,
+        terminal.catch_up,
+        shutdown.clone(),
+        session_cancel.clone(),
+    );
     let read = read_loop(
         framed_read,
         session,
@@ -772,13 +768,13 @@ fn handle_terminal_input(
         ));
     }
     let stream_id = NodeId::new(input.stream_id);
-    if !session.pty().contains(stream_id) {
-        return Err(ConnectionError::UnexpectedMessage(
-            "TerminalInput targeted an unknown or unnegotiated stream",
-        ));
-    }
     match session.pty().input(stream_id, input.data) {
         Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::UnknownStream(_)) => {
+            Err(ConnectionError::UnexpectedMessage(
+                "TerminalInput targeted an unknown or unnegotiated stream",
+            ))
+        }
         Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
             warn!("dropping TerminalInput because the PTY command queue is full");
             Ok(())
@@ -800,11 +796,6 @@ fn handle_terminal_resize(
         ));
     }
     let stream_id = NodeId::new(resize.stream_id);
-    if !session.pty().contains(stream_id) {
-        return Err(ConnectionError::UnexpectedMessage(
-            "TerminalResize targeted an unknown or unnegotiated stream",
-        ));
-    }
     match session.pty().resize(
         stream_id,
         resize.columns,
@@ -813,6 +804,11 @@ fn handle_terminal_resize(
         resize.pixel_height,
     ) {
         Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::UnknownStream(_)) => {
+            Err(ConnectionError::UnexpectedMessage(
+                "TerminalResize targeted an unknown or unnegotiated stream",
+            ))
+        }
         Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
             warn!("dropping TerminalResize because the PTY command queue is full");
             Ok(())

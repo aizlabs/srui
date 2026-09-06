@@ -60,12 +60,14 @@ pub enum TerminalStreamError {
     Ring(#[from] RingError),
 }
 
+type ChildSlot = Arc<Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>;
+
 pub(crate) struct TerminalStream {
     pub id: NodeId,
     ring: Arc<Mutex<OutputRing>>,
     next_offset_watch: watch::Sender<u64>,
-    command_tx: mpsc::Sender<StreamCommand>,
-    child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+    command_tx: Mutex<Option<mpsc::Sender<StreamCommand>>>,
+    child: ChildSlot,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     command_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -95,6 +97,7 @@ impl TerminalStream {
             .spawn_command(builder)
             .map_err(|error| TerminalStreamError::Pty(error.to_string()))?;
         drop(pair.slave);
+        become_process_group_leader(child.process_id());
 
         let reader = pair
             .master
@@ -109,22 +112,24 @@ impl TerminalStream {
         let ring = Arc::new(Mutex::new(OutputRing::new(spec.ring_capacity)));
         let (next_offset_watch, _) = watch::channel(0_u64);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let child = Arc::new(Mutex::new(Some(child)));
 
         let stream = Arc::new(Self {
             id,
             ring: Arc::clone(&ring),
             next_offset_watch: next_offset_watch.clone(),
-            command_tx,
-            child: Mutex::new(Some(child)),
+            command_tx: Mutex::new(Some(command_tx)),
+            child: Arc::clone(&child),
             reader_thread: Mutex::new(None),
             command_thread: Mutex::new(None),
         });
 
         let reader_ring = Arc::clone(&ring);
         let reader_watch = next_offset_watch;
+        let reader_child = Arc::clone(&child);
         let reader = thread::Builder::new()
             .name(format!("srui-pty-read-{}", id.get()))
-            .spawn(move || read_loop(reader, reader_ring, reader_watch))
+            .spawn(move || read_loop(reader, reader_ring, reader_watch, reader_child))
             .map_err(|error| TerminalStreamError::Pty(error.to_string()))?;
         *stream.reader_thread.lock().expect("reader thread slot") = Some(reader);
 
@@ -157,12 +162,23 @@ impl TerminalStream {
             }
             StreamCommand::Close => {}
         }
-        self.command_tx
-            .try_send(command)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => TerminalStreamError::CommandQueueFull,
-                mpsc::error::TrySendError::Closed(_) => TerminalStreamError::Closed,
-            })
+        let tx = self.command_tx.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tx) = tx.as_ref() else {
+            return Err(TerminalStreamError::Closed);
+        };
+        tx.try_send(command).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => TerminalStreamError::CommandQueueFull,
+            mpsc::error::TrySendError::Closed(_) => TerminalStreamError::Closed,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_id(&self) -> Option<u32> {
+        self.child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|child| child.process_id())
     }
 
     pub(crate) fn snapshot_offsets(&self) -> (u64, u64) {
@@ -222,13 +238,23 @@ impl TerminalStream {
     }
 
     pub(crate) fn kill_and_reap(&self) {
-        let _ = self.try_enqueue(StreamCommand::Close);
+        // Drop the sender so `command_loop` unblocks even when the queue is full
+        // and `Close` cannot be enqueued.
+        drop(
+            self.command_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
         if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            signal_child_tree(child.process_id());
             let _ = child.kill();
             let _ = child.wait();
         }
+        // Command thread owns the master PTY. Join it first so dropping the master
+        // forces EOF/EIO on the reader if any leftover slave holders remain.
         if let Some(handle) = self
-            .reader_thread
+            .command_thread
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -236,7 +262,7 @@ impl TerminalStream {
             let _ = handle.join();
         }
         if let Some(handle) = self
-            .command_thread
+            .reader_thread
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
@@ -263,6 +289,7 @@ fn read_loop(
     mut reader: Box<dyn Read + Send>,
     ring: Arc<Mutex<OutputRing>>,
     watch: watch::Sender<u64>,
+    child: ChildSlot,
 ) {
     let mut buf = vec![0_u8; PTY_READ_CHUNK];
     loop {
@@ -281,6 +308,33 @@ fn read_loop(
             Err(_) => break,
         }
     }
+    if let Some(mut child) = child.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = child.wait();
+    }
+}
+
+fn become_process_group_leader(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // Best-effort: descendants spawned after this inherit the new pgid.
+        let _ = unsafe { libc::setpgid(pid as libc::pid_t, pid as libc::pid_t) };
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+fn signal_child_tree(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let pid = pid as libc::pid_t;
+        unsafe {
+            let _ = libc::kill(-pid, libc::SIGHUP);
+            let _ = libc::kill(-pid, libc::SIGKILL);
+            let _ = libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 fn command_loop(

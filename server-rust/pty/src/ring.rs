@@ -152,18 +152,65 @@ impl OutputRing {
     }
 
     /// Frames `[start, end)` into bounded `TerminalData` payloads.
+    ///
+    /// Slices directly from retained chunks; does not assemble an intermediate
+    /// contiguous copy of the whole range.
     pub fn frame_range(&self, start: u64, end: u64) -> Result<Vec<(u64, Vec<u8>)>, RingError> {
-        let bytes = self.copy_range(start, end)?;
-        if bytes.is_empty() {
+        if start > end || start < self.retained_start || end > self.next_offset {
+            return Err(RingError::RangeUnavailable {
+                start,
+                end,
+                retained_start: self.retained_start,
+                next_offset: self.next_offset,
+            });
+        }
+        if start == end {
             return Ok(Vec::new());
         }
+
         let mut frames = Vec::new();
-        let mut offset = start;
-        for chunk in bytes.chunks(MAX_TERMINAL_OUTPUT_FRAME_BYTES) {
-            frames.push((offset, chunk.to_vec()));
-            offset = offset
-                .checked_add(chunk.len() as u64)
-                .ok_or(RingError::OffsetOverflow)?;
+        let mut frame = Vec::new();
+        let mut frame_offset = start;
+        let mut cursor = self.retained_start;
+        for chunk in &self.chunks {
+            let chunk_end = cursor + chunk.len() as u64;
+            if chunk_end <= start {
+                cursor = chunk_end;
+                continue;
+            }
+            if cursor >= end {
+                break;
+            }
+            let from = start.saturating_sub(cursor) as usize;
+            let to = (end.min(chunk_end) - cursor) as usize;
+            let mut remaining = &chunk[from..to];
+            while !remaining.is_empty() {
+                let space = MAX_TERMINAL_OUTPUT_FRAME_BYTES - frame.len();
+                let take = remaining.len().min(space);
+                if frame.is_empty() && take == MAX_TERMINAL_OUTPUT_FRAME_BYTES {
+                    frames.push((frame_offset, remaining[..take].to_vec()));
+                    frame_offset = frame_offset
+                        .checked_add(take as u64)
+                        .ok_or(RingError::OffsetOverflow)?;
+                } else {
+                    frame.extend_from_slice(&remaining[..take]);
+                    if frame.len() == MAX_TERMINAL_OUTPUT_FRAME_BYTES {
+                        let filled = std::mem::take(&mut frame);
+                        frames.push((frame_offset, filled));
+                        frame_offset = frame_offset
+                            .checked_add(MAX_TERMINAL_OUTPUT_FRAME_BYTES as u64)
+                            .ok_or(RingError::OffsetOverflow)?;
+                    }
+                }
+                remaining = &remaining[take..];
+            }
+            cursor = chunk_end;
+            if cursor >= end {
+                break;
+            }
+        }
+        if !frame.is_empty() {
+            frames.push((frame_offset, frame));
         }
         Ok(frames)
     }
@@ -204,6 +251,10 @@ mod tests {
         assert_eq!(frames[0].1.len(), MAX_TERMINAL_OUTPUT_FRAME_BYTES);
         assert_eq!(frames[1].0, MAX_TERMINAL_OUTPUT_FRAME_BYTES as u64);
         assert_eq!(frames[1].1.len(), 8);
+        assert_eq!(
+            frames.iter().map(|(_, data)| data.len()).sum::<usize>(),
+            payload.len()
+        );
     }
 
     #[test]

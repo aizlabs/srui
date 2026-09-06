@@ -5,13 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-bytes.workspace = true
+libc = "0.2"
 portable-pty = "0.8"
 srui-protocol = { path = "../protocol" }
 srui-semantic-tree = { path = "../semantic-tree" }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }

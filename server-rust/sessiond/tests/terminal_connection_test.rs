@@ -436,6 +436,26 @@ async fn creating_terminal_marks_profile_required() {
     assert!(matches!(err, SessionError::Negotiation(_)));
 }
 
+#[test]
+fn create_terminal_after_attach_is_rejected() {
+    let session = Session::new("late-term");
+    let surface = NodeId::new(1);
+    session
+        .transaction(|ui| {
+            Surface::builder(surface).label("S").create(ui)?;
+            Ok(())
+        })
+        .unwrap();
+    let _guard = session.attach().expect("attach");
+    let err = session
+        .create_terminal_node(NodeId::new(2), surface, TerminalSpec::interactive_shell())
+        .unwrap_err();
+    assert!(
+        matches!(err, SessionError::InvalidInput(_)),
+        "late spawn must fail, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn flooding_terminal_does_not_starve_counter_ack() {
     let session = Arc::new(Session::new("flood"));

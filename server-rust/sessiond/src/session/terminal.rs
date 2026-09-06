@@ -76,12 +76,23 @@ impl Session {
     ///
     /// Marks `org.srui.terminal/1` required (no semantic fallback), allocates a stable
     /// session namespace, and keeps the PTY alive across detach.
+    ///
+    /// v1 is handshake-scoped: live pumps and `extension_namespaces` are installed only
+    /// when a client attaches. Calling this after [`Session::is_attached`] is therefore
+    /// refused — spawn terminals before `handle_connection` accepts a transport.
     pub fn create_terminal_node(
         &self,
         node_id: NodeId,
         parent: NodeId,
         spec: TerminalSpec,
     ) -> Result<TypeRef, SessionError> {
+        if self.is_attached() {
+            return Err(SessionError::InvalidInput(
+                "v1 create_terminal_node must run before any client attaches; \
+                 live pumps and extension_namespaces are handshake-only"
+                    .to_string(),
+            ));
+        }
         let type_ref = self.prepare_terminal_type()?;
         self.pty
             .spawn(node_id, spec)
@@ -193,7 +204,7 @@ pub(crate) fn live_class_for_event(event: &TerminalEvent) -> LogicalChannelClass
     }
 }
 
-/// Live output and local resync share `terminalHigh`; historical replay is handshake-only.
+/// Live output and local resync share `terminalHigh`; historical replay uses `terminalNormal`.
 #[allow(dead_code)]
 pub(crate) fn live_event_class(reason: Option<TerminalResyncReason>) -> LogicalChannelClass {
     let _ = reason;

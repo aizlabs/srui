@@ -196,6 +196,14 @@ impl PTYManager {
             .map(|stream| stream.snapshot_offsets())
     }
 
+    #[cfg(test)]
+    pub(crate) fn process_id(&self, id: NodeId) -> Option<u32> {
+        self.lock()
+            .streams
+            .get(&id)
+            .and_then(|stream| stream.process_id())
+    }
+
     fn stream(&self, id: NodeId) -> Result<Arc<TerminalStream>, PTYManagerError> {
         self.lock()
             .streams
@@ -536,5 +544,54 @@ mod tests {
         manager.spawn(id, echo_spec("sleep 60", 32)).unwrap();
         manager.shutdown();
         assert!(manager.live_stream_ids().is_empty());
+    }
+
+    #[test]
+    fn shutdown_does_not_deadlock_when_command_queue_is_full() {
+        let manager = PTYManager::default();
+        let id = NodeId::new(21);
+        manager.spawn(id, echo_spec("sleep 60", 32)).unwrap();
+        for _ in 0..128 {
+            let _ = manager.input(id, vec![b'x'; 1024]);
+        }
+        let started = std::time::Instant::now();
+        manager.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "kill_and_reap deadlocked after {:?}",
+            started.elapsed()
+        );
+        assert!(manager.live_stream_ids().is_empty());
+    }
+
+    #[test]
+    fn natural_exit_reaps_the_child() {
+        let manager = PTYManager::default();
+        let id = NodeId::new(22);
+        manager
+            .spawn(id, echo_spec("printf 'SRUI_EXIT_OK'; exit 0", 32))
+            .unwrap();
+        let pid = manager
+            .process_id(id)
+            .expect("spawned child must expose a pid");
+        wait_for_output(&manager, id, b"SRUI_EXIT_OK");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut state = process_state(pid);
+        while std::time::Instant::now() < deadline {
+            state = process_state(pid);
+            if state.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        manager.close(id).unwrap();
+        assert_ne!(state, Some('Z'), "child {pid} remained a zombie");
+        assert!(state.is_none(), "child {pid} still present ({state:?})");
+    }
+
+    fn process_state(pid: u32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let after = stat.rsplit(')').next()?;
+        after.split_whitespace().next()?.chars().next()
     }
 }

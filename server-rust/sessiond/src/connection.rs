@@ -419,6 +419,8 @@ struct TerminalConnection {
 pub(super) struct TerminalLanes {
     high_rx: mpsc::Receiver<SruiMessage>,
     normal_rx: mpsc::Receiver<SruiMessage>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+    catch_up_released: tokio::sync::watch::Sender<bool>,
 }
 
 pub(super) struct WriterCancel {
@@ -435,36 +437,31 @@ fn spawn_terminal_live_pumps(
 ) -> (TerminalLanes, Vec<tokio::task::JoinHandle<()>>) {
     let (high_tx, high_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
     let (normal_tx, normal_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let (catch_up_released, released_rx) = tokio::sync::watch::channel(catch_up.is_empty());
     let mut tasks = Vec::new();
 
-    let seed_high = high_tx.clone();
-    let seed_normal = normal_tx.clone();
-    let seed_shutdown = shutdown.clone();
-    let seed_cancel = session_cancel.clone();
-    tasks.push(tokio::spawn(async move {
-        for (class, envelope) in catch_up {
-            let tx = match class {
-                LogicalChannelClass::TerminalNormal => &seed_normal,
-                _ => &seed_high,
-            };
-            tokio::select! {
-                biased;
-                _ = seed_cancel.cancelled() => return,
-                _ = seed_shutdown.cancelled() => return,
-                sent = tx.send(envelope) => {
-                    if sent.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    }));
-
+    // Live High must not race handshake replay: the Swift client treats an
+    // ahead-of-cursor frame as a local reset and then drops older replay as
+    // duplicates. Gate pumps until the writer has put every catch-up frame
+    // on the wire through TerminalNormal / TerminalHigh scheduler slots.
     for mut subscription in live {
         let high_tx = high_tx.clone();
         let shutdown = shutdown.clone();
         let session_cancel = session_cancel.clone();
+        let mut released = released_rx.clone();
         tasks.push(tokio::spawn(async move {
+            while !*released.borrow() {
+                tokio::select! {
+                    biased;
+                    _ = session_cancel.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
+                    changed = released.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
             loop {
                 tokio::select! {
                     biased;
@@ -487,7 +484,16 @@ fn spawn_terminal_live_pumps(
     }
     drop(high_tx);
     drop(normal_tx);
-    (TerminalLanes { high_rx, normal_rx }, tasks)
+    drop(released_rx);
+    (
+        TerminalLanes {
+            high_rx,
+            normal_rx,
+            catch_up,
+            catch_up_released,
+        },
+        tasks,
+    )
 }
 
 /// Concurrently drives inbound events and scheduled outbound writes (§18.2, §19.2, §20).

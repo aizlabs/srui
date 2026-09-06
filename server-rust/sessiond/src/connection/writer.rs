@@ -1,8 +1,11 @@
 //! Active-session outbound scheduling and delivery.
 
+use std::collections::VecDeque;
+
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::watch;
 use tokio_util::codec::FramedWrite;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -38,6 +41,8 @@ struct Writer<W> {
     control_rx: mpsc::Receiver<ServerEventAck>,
     terminal_high_rx: mpsc::Receiver<SruiMessage>,
     terminal_normal_rx: mpsc::Receiver<SruiMessage>,
+    catch_up: VecDeque<(LogicalChannelClass, SruiMessage)>,
+    catch_up_released: watch::Sender<bool>,
     scheduler: LogicalChannelScheduler,
     pending_ack: Option<ServerEventAck>,
     pending_terminal_high: Option<SruiMessage>,
@@ -68,6 +73,8 @@ where
             control_rx,
             terminal_high_rx: terminal_lanes.high_rx,
             terminal_normal_rx: terminal_lanes.normal_rx,
+            catch_up: terminal_lanes.catch_up.into(),
+            catch_up_released: terminal_lanes.catch_up_released,
             scheduler: LogicalChannelScheduler::new(),
             pending_ack: None,
             pending_terminal_high: None,
@@ -128,14 +135,27 @@ where
 
             let read_finished = self.read_finished.is_cancelled();
             let control_ready = self.pending_ack.is_some();
+            let catching_up = !self.catch_up.is_empty();
+            let catch_up_high = self
+                .catch_up
+                .front()
+                .is_some_and(|(class, _)| *class == LogicalChannelClass::TerminalHigh);
+            let catch_up_normal = self
+                .catch_up
+                .front()
+                .is_some_and(|(class, _)| *class == LogicalChannelClass::TerminalNormal);
             let terminal_high_ready = self.pending_terminal_high.is_some();
             let terminal_normal_ready = self.pending_terminal_normal.is_some();
             let outbound = &self.outbound;
             let class = self.scheduler.select_next(|class| match class {
                 LogicalChannelClass::Control => control_ready,
                 LogicalChannelClass::Input => false,
-                LogicalChannelClass::TerminalHigh => !read_finished && terminal_high_ready,
-                LogicalChannelClass::TerminalNormal => !read_finished && terminal_normal_ready,
+                LogicalChannelClass::TerminalHigh => {
+                    !read_finished && (catch_up_high || (!catching_up && terminal_high_ready))
+                }
+                LogicalChannelClass::TerminalNormal => {
+                    !read_finished && (catch_up_normal || (!catching_up && terminal_normal_ready))
+                }
                 LogicalChannelClass::Ui => {
                     !read_finished && outbound.class_ready(LogicalChannelClass::Ui)
                 }
@@ -170,12 +190,12 @@ where
                         }
                     }
                     LogicalChannelClass::TerminalHigh => self
-                        .pending_terminal_high
-                        .take()
+                        .take_catch_up(LogicalChannelClass::TerminalHigh)
+                        .or_else(|| self.pending_terminal_high.take())
                         .expect("terminalHigh selected only when a live/resync frame is pending"),
                     LogicalChannelClass::TerminalNormal => self
-                        .pending_terminal_normal
-                        .take()
+                        .take_catch_up(LogicalChannelClass::TerminalNormal)
+                        .or_else(|| self.pending_terminal_normal.take())
                         .expect("terminalNormal selected only when a replay frame is pending"),
                     LogicalChannelClass::Input => continue,
                 };
@@ -194,6 +214,9 @@ where
                 .await?
                 {
                     return Ok(());
+                }
+                if self.catch_up.is_empty() {
+                    let _ = self.catch_up_released.send(true);
                 }
 
                 // A send may complete without yielding while the socket remains writable. Yield
@@ -264,6 +287,19 @@ where
                     }
                 }
             }
+        }
+    }
+
+    fn take_catch_up(&mut self, class: LogicalChannelClass) -> Option<SruiMessage> {
+        if self
+            .catch_up
+            .front()
+            .is_some_and(|(front, _)| *front == class)
+        {
+            let (_, envelope) = self.catch_up.pop_front().expect("front checked");
+            Some(envelope)
+        } else {
+            None
         }
     }
 }

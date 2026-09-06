@@ -241,6 +241,16 @@ mod tests {
     }
 
     #[test]
+    fn frame_range_slices_across_chunks_without_requiring_contiguous_copy() {
+        let mut ring = OutputRing::new(64);
+        ring.append(b"abcdef").unwrap();
+        ring.append(b"ghijkl").unwrap();
+        let frames = ring.frame_range(2, 10).unwrap();
+        let joined: Vec<u8> = frames.into_iter().flat_map(|(_, data)| data).collect();
+        assert_eq!(joined, b"cdefghij");
+    }
+
+    #[test]
     fn frames_respect_output_limit() {
         let mut ring = OutputRing::new(64 * 1024);
         let payload = vec![b'x'; MAX_TERMINAL_OUTPUT_FRAME_BYTES + 8];

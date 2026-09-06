@@ -260,6 +260,36 @@ struct TextEditingSessionTests {
         #expect(commits.isEmpty)
     }
 
+    @Test("First local edit on an unpublished editor seeds an empty baseline")
+    func firstLocalEditSeedsEmptyAuthoritativeBaseline() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        #expect(session.lastKnownAuthoritative(for: nodeID) == nil)
+        session.noteLocalValue("too long", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(session.lastKnownAuthoritative(for: nodeID) == "")
+        #expect(commits == ["too long"])
+
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "") == .apply)
+        #expect(session.localValue(for: nodeID) == "")
+    }
+
+    @Test("A remount of an unpublished editor keeps a local draft against empty")
+    func remountOfUnpublishedEditorKeepsDraft() {
+        let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)
+        var commits: [String] = []
+        session.onCommit = { _, text, _, _ in commits.append(text) }
+
+        session.noteLocalValue("draft", nodeID: nodeID, composing: false, flushImmediately: false)
+        let resolution = session.withPreservedLocalText {
+            session.applyPublishedValue(nodeID: nodeID, published: "")
+        }
+        #expect(resolution == .keepLocal)
+        #expect(session.localValue(for: nodeID) == "draft")
+        #expect(commits.isEmpty)
+    }
+
     @Test("A remount after a non-publishing acknowledgement applies the store string")
     func remountAfterAcknowledgedRejectApplies() throws {
         let session = TextEditingSession(debounceNanoseconds: 0)

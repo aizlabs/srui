@@ -173,7 +173,7 @@ public final class TextEditingSession {
     ) {
         guard !suppressingLocalEditsForResync else { return }
         if preservingLocalTextAcrossRemount {
-            var state = nodes[nodeID] ?? NodeState()
+            var state = seededState(for: nodeID)
             // Marked text dies with the field editor. Do not re-enter composing or promote
             // an intermediate preedit into a pending draft (§22.6).
             if composing {
@@ -191,7 +191,7 @@ public final class TextEditingSession {
             nodes[nodeID] = state
             return
         }
-        var state = nodes[nodeID] ?? NodeState()
+        var state = seededState(for: nodeID)
         state.localValue = value
         state.composing = composing
         if composing {
@@ -360,7 +360,10 @@ public final class TextEditingSession {
         nodes[nodeID] = state
     }
 
-    /// Last store string applied or echoed for this editor; `nil` if none has been published.
+    /// Last store string applied or echoed for this editor.
+    ///
+    /// `nil` only when this node has no session state. An editor that never received
+    /// `.value`/`.text` is seeded to `""` on mount or first local edit.
     public func lastKnownAuthoritative(for nodeID: NodeId) -> String? {
         nodes[nodeID]?.lastKnownAuthoritative
     }
@@ -442,6 +445,15 @@ public final class TextEditingSession {
         for nodeID in Array(nodes.keys) {
             abandonComposition(nodeID: nodeID)
         }
+    }
+
+    /// First local edit on an unpublished editor treats the store baseline as empty.
+    private func seededState(for nodeID: NodeId) -> NodeState {
+        var state = nodes[nodeID] ?? NodeState()
+        if state.lastKnownAuthoritative == nil {
+            state.lastKnownAuthoritative = ""
+        }
+        return state
     }
 
     @discardableResult

@@ -281,6 +281,11 @@ public final class ControlFactory {
             }
             apply(property: property, value: value, to: handle, store: store)
         }
+        if let adapter = handle.textAdapter, Self.displayedEditorText(for: node) == nil {
+            // Neither `.value` nor `.text` is defined. Seed the empty store baseline so a
+            // later rejection-only ack can revert and a remount can keepLocal (§22.6).
+            adapter.applyAuthoritativeString("")
+        }
         if handle.nodeType == .table || handle.nodeType == .list || handle.nodeType == .tree {
             refreshCollection(in: handle, for: node, store: store ?? SemanticStore())
         }

@@ -2347,12 +2347,14 @@ public final class SessionController: @unchecked Sendable {
                         eventId: acknowledgement.eventId
                     )
                     guard acknowledgement.rejected,
-                          !session.hasUnsentSuccessorDraft(for: acknowledgement.nodeId),
-                          let published = session.lastKnownAuthoritative(
-                            for: acknowledgement.nodeId
-                          ) else {
+                          !session.hasUnsentSuccessorDraft(for: acknowledgement.nodeId) else {
                         continue
                     }
+                    // Editors mounted without `.value`/`.text` never published a string; the
+                    // store baseline is the empty default, not "unknown".
+                    let published = session.lastKnownAuthoritative(
+                        for: acknowledgement.nodeId
+                    ) ?? ""
                     if let adapter = renderer.registry.handle(
                         for: acknowledgement.nodeId
                     )?.textAdapter {

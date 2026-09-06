@@ -321,6 +321,15 @@ struct ControlFactoryPropertyTests {
     }
 
     @Test(arguments: [TypeRef.textInput, .textArea])
+    func emptyEditorSeedsAuthoritativeEmptyString(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        #expect(renderedText(in: handle) == "")
+        #expect(factory.textEditingSession.lastKnownAuthoritative(for: 1) == "")
+        #expect(factory.textEditingSession.localValue(for: 1) == "")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
     func valueWinsOverTextOnEditors(nodeType: TypeRef) throws {
         let factory = ControlFactory()
         let handle = try factory.makeHandle(

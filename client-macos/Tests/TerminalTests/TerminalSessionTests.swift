@@ -74,6 +74,33 @@ struct TerminalSessionTests {
         #expect(await session.streamOffsets()[7] == 16)
     }
 
+    @Test("resync clears the screen but keeps remote input modes")
+    func resyncPreservesInputModes() async throws {
+        let session = TerminalSession()
+        // DECSET 2004 (bracketed paste) + DECSET 1 (application cursor keys).
+        var modes = Data()
+        modes.append(contentsOf: [0x1B, 0x5B, 0x3F, 0x32, 0x30, 0x30, 0x34, 0x68])
+        modes.append(contentsOf: [0x1B, 0x5B, 0x3F, 0x31, 0x68])
+        _ = try await session.applyData(streamID: stream, byteOffset: 0, data: modes)
+        #expect(await session.bracketedPaste(for: stream))
+        #expect(await session.applicationCursorKeys(for: stream))
+
+        _ = await session.applyResync(
+            streamID: stream,
+            requestedOffset: 0,
+            retainedFromOffset: 64,
+            resumeAtOffset: 128,
+            cause: .retentionLoss
+        )
+        #expect(await session.bracketedPaste(for: stream))
+        #expect(await session.applicationCursorKeys(for: stream))
+
+        // An ahead-of-cursor frame is a local resync too, and must not clear them either.
+        _ = try await session.applyData(streamID: stream, byteOffset: 4096, data: Data("z".utf8))
+        #expect(await session.bracketedPaste(for: stream))
+        #expect(await session.applicationCursorKeys(for: stream))
+    }
+
     @Test("replacement clears streams; same-session sync keeps live IDs")
     func replacementVersusSync() async throws {
         let session = TerminalSession()

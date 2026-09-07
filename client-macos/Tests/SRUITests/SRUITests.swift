@@ -847,6 +847,73 @@ final class SRUITests: XCTestCase {
         )
     }
 
+    /// Negative decode vectors for the terminal envelopes (§21, §26; CLAUDE.md decode-path rule).
+    func testMalformedTerminalVectorsRejectedBySwiftDecodePath() async throws {
+        let spec = try loadExpectedSpec()
+        guard let malformed = spec["malformed_vectors"] as? [String: Any],
+              let inputSpec = malformed["malformed_terminal_input_empty"] as? [String: Any],
+              let dataSpec = malformed["malformed_terminal_data_empty"] as? [String: Any] else {
+            XCTFail("Missing malformed terminal vectors in expected.json")
+            return
+        }
+
+        for vector in [inputSpec, dataSpec] {
+            guard let filename = vector["file"] as? String,
+                  let expectedHex = vector["hex"] as? String,
+                  let expectedSHA256 = vector["sha256"] as? String,
+                  let expectedByteLen = vector["byte_length"] as? Int else {
+                XCTFail("Malformed expected.json structure for a terminal vector")
+                return
+            }
+            let bytes = try Data(contentsOf: conformanceVectorsDir.appendingPathComponent(filename))
+            XCTAssertEqual(bytes.count, expectedByteLen, "\(filename) byte length mismatch")
+            XCTAssertEqual(hexString(from: bytes), expectedHex, "\(filename) hex mismatch")
+            XCTAssertEqual(sha256String(from: bytes), expectedSHA256, "\(filename) SHA256 mismatch")
+        }
+
+        // TERMINAL_INPUT: protobuf-valid, semantically forbidden (no payload).
+        let inputBytes = try Data(
+            contentsOf: conformanceVectorsDir.appendingPathComponent(inputSpec["file"] as! String)
+        )
+        let decodedInput = try SRUIFraming.decodeFramed(
+            Srui_Protocol_SruiMessage.self,
+            from: inputBytes
+        )
+        guard case .terminalInput(let input)? = decodedInput.msg else {
+            XCTFail("Expected terminalInput vector")
+            return
+        }
+        XCTAssertTrue(input.data.isEmpty, "vector must carry an empty payload")
+
+        // TERMINAL_DATA: the client apply path must refuse it instead of advancing an offset.
+        let dataBytes = try Data(
+            contentsOf: conformanceVectorsDir.appendingPathComponent(dataSpec["file"] as! String)
+        )
+        let decodedData = try SRUIFraming.decodeFramed(
+            Srui_Protocol_SruiMessage.self,
+            from: dataBytes
+        )
+        guard case .terminalData(let frame)? = decodedData.msg else {
+            XCTFail("Expected terminalData vector")
+            return
+        }
+        XCTAssertTrue(frame.data.isEmpty, "vector must carry an empty payload")
+
+        let session = TerminalSession()
+        do {
+            _ = try await session.applyData(
+                streamID: NodeId(frame.streamID),
+                byteOffset: frame.byteOffset,
+                data: frame.data
+            )
+            XCTFail("empty TerminalData frame must be rejected")
+        } catch let error as TerminalApplyError {
+            XCTAssertEqual(error, .emptyFrame)
+        }
+        let offsets = await session.streamOffsets()
+        XCTAssertTrue(offsets.isEmpty, "rejected frame must not create stream state")
+    }
+
     private func assertFramedTerminalVector(
         key: String,
         authored: Srui_Protocol_SruiMessage,

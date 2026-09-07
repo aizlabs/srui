@@ -141,14 +141,13 @@ impl Session {
             was_optional,
             created_namespace,
         };
-        Ok((
-            TypeRef::new(namespace_id, TERMINAL_LOCAL_TYPE_ID),
-            rollback,
-        ))
+        Ok((TypeRef::new(namespace_id, TERMINAL_LOCAL_TYPE_ID), rollback))
     }
 
     fn rollback_terminal_type(&self, rollback: TerminalTypeRollback) {
-        let Ok(mut guard) = self.inner.lock() else { return };
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
         if !self.pty.live_stream_ids().is_empty() {
             return;
         }

@@ -392,4 +392,45 @@ fn main() {
         "Wrote golden_terminal_resync_required.bin ({} bytes)",
         terminal_resync_bytes.len()
     );
+
+    // 15. Protobuf-valid TERMINAL_INPUT carrying no payload: forbidden by §21 (the
+    // server must never enqueue an empty write onto a PTY master).
+    let malformed_terminal_input = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalInput(TerminalInput {
+            stream_id: 20,
+            data: Vec::new(),
+        })),
+    };
+    let malformed_terminal_input_bytes =
+        encode_framed(&malformed_terminal_input).expect("encode malformed framed TerminalInput");
+    fs::write(
+        out_dir.join("malformed_terminal_input_empty.bin"),
+        &malformed_terminal_input_bytes,
+    )
+    .expect("write malformed_terminal_input_empty.bin");
+    println!(
+        "Wrote malformed_terminal_input_empty.bin ({} bytes)",
+        malformed_terminal_input_bytes.len()
+    );
+
+    // 16. Protobuf-valid TERMINAL_DATA carrying no payload: forbidden by §21 (an empty
+    // frame advances no offset and must be rejected instead of silently applied).
+    let malformed_terminal_data = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalData(TerminalData {
+            stream_id: 20,
+            byte_offset: 4096,
+            data: Vec::new(),
+        })),
+    };
+    let malformed_terminal_data_bytes =
+        encode_framed(&malformed_terminal_data).expect("encode malformed framed TerminalData");
+    fs::write(
+        out_dir.join("malformed_terminal_data_empty.bin"),
+        &malformed_terminal_data_bytes,
+    )
+    .expect("write malformed_terminal_data_empty.bin");
+    println!(
+        "Wrote malformed_terminal_data_empty.bin ({} bytes)",
+        malformed_terminal_data_bytes.len()
+    );
 }

@@ -834,7 +834,10 @@ fn handle_terminal_input(
             Ok(())
         }
         Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::Closed)) => {
-            tracing::debug!("dropping TerminalInput because stream {} is closed", stream_id.get());
+            tracing::debug!(
+                "dropping TerminalInput because stream {} is closed",
+                stream_id.get()
+            );
             Ok(())
         }
         Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
@@ -872,7 +875,10 @@ fn handle_terminal_resize(
             Ok(())
         }
         Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::Closed)) => {
-            tracing::debug!("dropping TerminalResize because stream {} is closed", stream_id.get());
+            tracing::debug!(
+                "dropping TerminalResize because stream {} is closed",
+                stream_id.get()
+            );
             Ok(())
         }
         Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(

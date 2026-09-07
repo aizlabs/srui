@@ -443,6 +443,38 @@ async fn terminal_input_rejects_unknown_stream() {
     assert!(join.is_err(), "unknown stream must be a protocol error");
 }
 
+/// Negative decode vector for the TERMINAL_INPUT path (§21, §26; CLAUDE.md decode-path rule).
+/// `malformed_terminal_input_empty.bin` is protobuf-valid but carries no payload, and must be
+/// refused at the wire boundary instead of reaching the PTY master.
+#[tokio::test]
+async fn malformed_empty_terminal_input_vector_is_rejected() {
+    let vector = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../protocol/conformance-vectors/malformed_terminal_input_empty.bin");
+    let bytes = std::fs::read(&vector).expect("read malformed_terminal_input_empty.bin");
+    let malformed: SruiMessage =
+        srui_protocol::decode_framed(&bytes).expect("vector must be protobuf-valid");
+    match &malformed.msg {
+        Some(srui_message::Msg::TerminalInput(input)) => {
+            assert!(input.data.is_empty(), "vector must carry an empty payload");
+        }
+        other => panic!("expected TerminalInput vector, got {other:?}"),
+    }
+
+    let (session, _, _) = terminal_session();
+    let (mut read, mut write, mut guard) = connect(session, terminal_profiles(), None).await;
+    let _welcome = recv(&mut read).await;
+    let _snapshot = recv(&mut read).await;
+    write.send(malformed).await.unwrap();
+    let join = tokio::time::timeout(Duration::from_secs(2), guard.join())
+        .await
+        .expect("connection should close")
+        .expect("join");
+    assert!(
+        join.is_err(),
+        "empty TerminalInput must be a protocol error"
+    );
+}
+
 #[tokio::test]
 async fn creating_terminal_marks_profile_required() {
     let session = Session::new("req");
@@ -700,7 +732,10 @@ async fn terminal_input_and_resize_to_closed_stream_does_not_drop_connection() {
             surface,
             TerminalSpec {
                 executable: "/bin/sh".into(),
-                args: vec!["-c".to_string(), "printf 'SRUI_EXIT_EARLY\\n'; exit 0".to_string()],
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'SRUI_EXIT_EARLY\\n'; exit 0".to_string(),
+                ],
                 ring_capacity: 64 * 1024,
                 ..TerminalSpec::default()
             },
@@ -761,7 +796,10 @@ async fn terminal_input_and_resize_to_closed_stream_does_not_drop_connection() {
             saw_ack = true;
         }
     }
-    assert!(saw_ack, "connection was dropped after input to closed stream");
+    assert!(
+        saw_ack,
+        "connection was dropped after input to closed stream"
+    );
 }
 
 #[tokio::test]
@@ -784,7 +822,10 @@ async fn failed_spawn_rolls_back_capabilities_and_namespace() {
             ..TerminalSpec::default()
         },
     );
-    assert!(err.is_err(), "expected spawn failure for nonexistent binary");
+    assert!(
+        err.is_err(),
+        "expected spawn failure for nonexistent binary"
+    );
 
     // Verify terminal_v1 is not in required capabilities
     assert!(
@@ -873,7 +914,10 @@ async fn live_terminal_generation_during_catch_up_does_not_trigger_fallbehind() 
                 panic!("unexpected fallbehind resync during catch-up: {resync:?}");
             }
             Some(srui_message::Msg::TerminalData(data))
-                if data.data.windows(b"LIVE_STREAM_BURST".len()).any(|w| w == b"LIVE_STREAM_BURST") =>
+                if data
+                    .data
+                    .windows(b"LIVE_STREAM_BURST".len())
+                    .any(|w| w == b"LIVE_STREAM_BURST") =>
             {
                 saw_live_data = true;
             }
@@ -883,5 +927,8 @@ async fn live_terminal_generation_during_catch_up_does_not_trigger_fallbehind() 
             return;
         }
     }
-    assert!(saw_resume_ok && saw_live_data, "failed to receive live data smoothly");
+    assert!(
+        saw_resume_ok && saw_live_data,
+        "failed to receive live data smoothly"
+    );
 }

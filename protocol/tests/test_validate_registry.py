@@ -311,6 +311,8 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
         "malformed_truncated_frame",
         "malformed_text_edit_zero_edit_seq",
         "malformed_activate_nonzero_edit_seq",
+        "malformed_terminal_input_empty",
+        "malformed_terminal_data_empty",
     }
     assert required_malformed <= malformed.keys()
 
@@ -353,4 +355,12 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
     assert (
         malformed["malformed_activate_nonzero_edit_seq"]["expected_error"]
         == "event error: only TEXT_EDIT may carry edit_seq"
+    )
+    assert (
+        malformed["malformed_terminal_input_empty"]["expected_error"]
+        == "empty TerminalInput is forbidden"
+    )
+    assert (
+        malformed["malformed_terminal_data_empty"]["expected_error"]
+        == "empty TerminalData frame is forbidden"
     )

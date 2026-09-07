@@ -154,7 +154,12 @@ public actor TerminalSession {
             }
         } else {
             // Ahead of the local cursor: local resync, keep the session semantic.
+            // Input modes belong to the remote application, not to the local screen:
+            // clearing them here would silently unbracket the next paste (§21.2).
+            let previousModes = (state.grid.bracketedPaste, state.grid.applicationCursorKeys)
             state.grid.reset()
+            state.grid.bracketedPaste = previousModes.0
+            state.grid.applicationCursorKeys = previousModes.1
             state.parser.reset()
             state.needsRedraw = true
             state.parser.feed(data, into: state.grid)
@@ -190,9 +195,12 @@ public actor TerminalSession {
             needsRedraw: false,
             snapshotWaiters: [:]
         )
-        let previousBracketed = state.grid.bracketedPaste
+        // The remote application keeps its DECSET modes across a retention gap; only the
+        // local screen is stale, so preserve the input modes the encoder depends on (§21.2).
+        let previousModes = (state.grid.bracketedPaste, state.grid.applicationCursorKeys)
         state.grid.reset()
-        state.grid.bracketedPaste = previousBracketed
+        state.grid.bracketedPaste = previousModes.0
+        state.grid.applicationCursorKeys = previousModes.1
         state.parser.reset()
         state.nextOffset = resumeAtOffset
         state.needsRedraw = true

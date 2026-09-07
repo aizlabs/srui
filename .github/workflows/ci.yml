@@ -268,10 +268,10 @@ jobs:
         run: cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
       - name: Build example servers for integration tests
         run: cargo build --manifest-path examples/counter/Cargo.toml
-      - name: Verify SemanticModel does not import AppKit or Cocoa (§1)
+      - name: Verify toolkit-free targets do not import AppKit or Cocoa (§1, §21)
         run: |
-          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then
-            echo "Error: SemanticModel must never import AppKit or Cocoa"
+          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel client-macos/Terminal; then
+            echo "Error: SemanticModel and Terminal must never import AppKit or Cocoa"
             exit 1
           fi
       - name: Test portable LogicalChannelScheduling module

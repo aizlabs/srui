@@ -993,7 +993,6 @@ public actor EventOutbox {
     /// Applies the assigned-edit acknowledgement boundary after the native full resync.
     @discardableResult
     func applyFullResyncTextBoundary(
-        laneEpoch: UInt64?,
         generation: UInt64?,
         binding: EventOutboxConnectionBinding,
         renderToken: UUID
@@ -1013,7 +1012,7 @@ public actor EventOutbox {
             return false
         }
 
-        applyFullResyncTextBoundaryState(laneEpoch: laneEpoch)
+        applyFullResyncTextBoundaryState()
         resyncRenderOwnership = nil
         return true
     }
@@ -1021,7 +1020,6 @@ public actor EventOutbox {
     /// Abandons ownership after a committed snapshot fails to render.
     @discardableResult
     func abortResyncRender(
-        laneEpoch: UInt64?,
         generation: UInt64?,
         binding: EventOutboxConnectionBinding,
         renderToken: UUID
@@ -1034,7 +1032,7 @@ public actor EventOutbox {
         }
 
         acceptsNewEvents = false
-        applyFullResyncTextBoundaryState(laneEpoch: laneEpoch)
+        applyFullResyncTextBoundaryState()
         await resyncRenderFence.invalidate(renderToken)
         if resyncRenderOwnership?.generation == generation,
            resyncRenderOwnership?.binding == binding,
@@ -1723,7 +1721,7 @@ public actor EventOutbox {
                 return false
             }
             resyncRenderOwnership = nil
-            applyFullResyncTextBoundaryState(laneEpoch: nil)
+            applyFullResyncTextBoundaryState()
         }
 
         // The current HELLO binding owns this decision: retire the prior transport lease while
@@ -2199,8 +2197,8 @@ public actor EventOutbox {
             return false
         }
 
-        if let renderedBoundaryEpoch {
-            applyFullResyncTextBoundaryState(laneEpoch: renderedBoundaryEpoch)
+        if renderedBoundaryEpoch != nil {
+            applyFullResyncTextBoundaryState()
         } else {
             for (nodeId, barrier) in cleanup.acknowledgementBarriersAtStart
             where textAcknowledgementBarriers[nodeId] == barrier {
@@ -2291,8 +2289,11 @@ public actor EventOutbox {
             && pendingResumeRecoveryRenderInvalidation == nil
     }
 
-    private func applyFullResyncTextBoundaryState(laneEpoch: UInt64?) {
-        _ = laneEpoch
+    /// Retires every acknowledgement barrier at the native full-resync boundary.
+    ///
+    /// The lane-epoch floor that fences callbacks queued by the old native controls is owned by
+    /// `TextEditingSession.discardUnresolvedEditsForResync()`, not by this outbox (§18.3).
+    private func applyFullResyncTextBoundaryState() {
         textAcknowledgementBarriers.removeAll(keepingCapacity: true)
         signalTextLaneStateChange()
     }

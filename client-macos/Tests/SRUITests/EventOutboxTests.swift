@@ -1389,7 +1389,6 @@ struct EventOutboxTests {
             outbox.resyncRenderFence.performIfActive(renderToken) { true }
         } == true)
         #expect(await outbox.applyFullResyncTextBoundary(
-            laneEpoch: nil,
             generation: nil,
             binding: binding,
             renderToken: renderToken
@@ -1449,7 +1448,6 @@ struct EventOutboxTests {
             committed: { $0 }
         ) == nil)
         #expect(await outbox.applyFullResyncTextBoundary(
-            laneEpoch: nil,
             generation: nil,
             binding: staleBinding,
             renderToken: staleRenderToken
@@ -1477,7 +1475,6 @@ struct EventOutboxTests {
             outbox.resyncRenderFence.performIfActive(renderToken) { true }
         } == nil)
         #expect(await outbox.applyFullResyncTextBoundary(
-            laneEpoch: 2,
             generation: staleGeneration,
             binding: binding,
             renderToken: renderToken

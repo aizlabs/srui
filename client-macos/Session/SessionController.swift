@@ -2657,7 +2657,6 @@ public final class SessionController: @unchecked Sendable {
                     }
                 } else if isResyncSnapshot {
                     guard await outbox.abortResyncRender(
-                        laneEpoch: rendererUpdate.resyncLaneEpoch,
                         generation: outstandingGeneration,
                         binding: connectionBinding,
                         renderToken: renderToken
@@ -2683,7 +2682,6 @@ public final class SessionController: @unchecked Sendable {
                 // epoch and are discarded; genuinely post-mount edits carry the new epoch and
                 // remain queued while dispatch is still closed.
                 guard await outbox.applyFullResyncTextBoundary(
-                    laneEpoch: rendererUpdate.resyncLaneEpoch,
                     generation: outstandingGeneration,
                     binding: connectionBinding,
                     renderToken: renderToken

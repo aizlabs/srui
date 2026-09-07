@@ -11,16 +11,18 @@ import Terminal
 
 /// Monospace PTY surface. Local echo is forbidden: glyphs come only from `TerminalSnapshot`.
 @MainActor
-public final class TerminalView: NSView, NSTextInputClient {
+public final class TerminalView: NSView {
     public let nodeID: NodeId
     public var onInput: ((Data) -> Void)?
     public var onResize: ((UInt32, UInt32, UInt32, UInt32) -> Void)?
+    public var onAcknowledgeRedraw: (() -> Void)?
+    public var snapshotSubscriptionTask: Task<Void, Never>?
 
     private var snapshot: TerminalSnapshot?
     private var font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
     private var cellSize = NSSize(width: 8, height: 16)
     private var selection: Range<Int>?
-    private var markedText = ""
+    fileprivate var markedText = ""
     private var resizeWork: DispatchWorkItem?
     private var lastReportedSize: (UInt32, UInt32, UInt32, UInt32)?
 
@@ -41,7 +43,16 @@ public final class TerminalView: NSView, NSTextInputClient {
     }
 
     deinit {
-        resizeWork?.cancel()
+        snapshotSubscriptionTask?.cancel()
+    }
+
+    public override func viewWillMove(toSuperview newSuperview: NSView?) {
+        super.viewWillMove(toSuperview: newSuperview)
+        if newSuperview == nil {
+            resizeWork?.cancel()
+            snapshotSubscriptionTask?.cancel()
+            snapshotSubscriptionTask = nil
+        }
     }
 
     public func apply(_ snapshot: TerminalSnapshot) {
@@ -100,9 +111,28 @@ public final class TerminalView: NSView, NSTextInputClient {
             NSColor.white.withAlphaComponent(0.35).setFill()
             cursor.fill()
         }
+        if snapshot.needsRedraw {
+            let notice = " [Desynchronized — press any key to refresh] " as NSString
+            let noticeAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.black,
+                .backgroundColor: NSColor.systemYellow,
+            ]
+            let noticeSize = notice.size(withAttributes: noticeAttrs)
+            let noticeRect = NSRect(
+                x: max(0, bounds.width - noticeSize.width - 8),
+                y: 4,
+                width: noticeSize.width,
+                height: noticeSize.height
+            )
+            notice.draw(in: noticeRect, withAttributes: noticeAttrs)
+        }
     }
 
     public override func keyDown(with event: NSEvent) {
+        if snapshot?.needsRedraw == true {
+            onAcknowledgeRedraw?()
+        }
         if !markedText.isEmpty {
             interpretKeyEvents([event])
             return
@@ -114,55 +144,62 @@ public final class TerminalView: NSView, NSTextInputClient {
             ))
             return
         }
+        if event.modifierFlags.contains(.control),
+           let chars = event.characters,
+           let scalar = chars.unicodeScalars.first,
+           scalar.value < 0x20 || scalar.value == 0x7F {
+            emit(Data([UInt8(scalar.value)]))
+            return
+        }
         interpretKeyEvents([event])
     }
 
-    public func insertText(_ string: Any, replacementRange: NSRange) {
-        markedText = ""
-        let text: String
-        if let value = string as? String {
-            text = value
-        } else if let value = string as? NSAttributedString {
-            text = value.string
-        } else {
-            return
+    public override func doCommand(by selector: Selector) {
+        switch selector {
+        case #selector(NSResponder.insertNewline(_:)):
+            emit(TerminalInputEncoder.encode(key: .enter))
+        case #selector(NSResponder.insertTab(_:)):
+            emit(TerminalInputEncoder.encode(key: .tab))
+        case #selector(NSResponder.cancelOperation(_:)):
+            emit(TerminalInputEncoder.encode(key: .escape))
+        case #selector(NSResponder.deleteBackward(_:)):
+            emit(TerminalInputEncoder.encode(key: .backspace))
+        case #selector(NSResponder.deleteForward(_:)):
+            emit(TerminalInputEncoder.encode(key: .delete))
+        case #selector(NSResponder.moveUp(_:)):
+            emit(TerminalInputEncoder.encode(key: .arrowUp, applicationCursorKeys: snapshot?.applicationCursorKeys ?? false))
+        case #selector(NSResponder.moveDown(_:)):
+            emit(TerminalInputEncoder.encode(key: .arrowDown, applicationCursorKeys: snapshot?.applicationCursorKeys ?? false))
+        case #selector(NSResponder.moveLeft(_:)):
+            emit(TerminalInputEncoder.encode(key: .arrowLeft, applicationCursorKeys: snapshot?.applicationCursorKeys ?? false))
+        case #selector(NSResponder.moveRight(_:)):
+            emit(TerminalInputEncoder.encode(key: .arrowRight, applicationCursorKeys: snapshot?.applicationCursorKeys ?? false))
+        case #selector(NSResponder.pageUp(_:)), #selector(NSResponder.scrollPageUp(_:)):
+            emit(TerminalInputEncoder.encode(key: .pageUp))
+        case #selector(NSResponder.pageDown(_:)), #selector(NSResponder.scrollPageDown(_:)):
+            emit(TerminalInputEncoder.encode(key: .pageDown))
+        case #selector(NSResponder.moveToBeginningOfLine(_:)):
+            emit(Data([0x01]))
+        case #selector(NSResponder.moveToEndOfLine(_:)):
+            emit(Data([0x05]))
+        case #selector(NSResponder.deleteToEndOfParagraph(_:)):
+            emit(Data([0x0B]))
+        case #selector(NSResponder.scrollToBeginningOfDocument(_:)):
+            emit(TerminalInputEncoder.encode(key: .home))
+        case #selector(NSResponder.scrollToEndOfDocument(_:)):
+            emit(TerminalInputEncoder.encode(key: .end))
+        default:
+            super.doCommand(by: selector)
         }
-        emit(TerminalInputEncoder.encode(text: text))
     }
 
-    public func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        if let value = string as? String {
-            markedText = value
-        } else if let value = string as? NSAttributedString {
-            markedText = value.string
-        } else {
-            markedText = ""
-        }
-    }
-
-    public func unmarkText() {
-        markedText = ""
-    }
-
-    public func selectedRange() -> NSRange { NSRange(location: 0, length: 0) }
-    public func markedRange() -> NSRange {
-        markedText.isEmpty ? NSRange(location: NSNotFound, length: 0) : NSRange(location: 0, length: markedText.utf16.count)
-    }
-    public func hasMarkedText() -> Bool { !markedText.isEmpty }
-    public func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? { nil }
-    public func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
-    public func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
-        window?.convertToScreen(convert(bounds, to: nil)) ?? .zero
-    }
-    public func characterIndex(for point: NSPoint) -> Int { 0 }
-
-    public override func copy(_ sender: Any?) {
+    @objc public func copy(_ sender: Any?) {
         let text = snapshot?.plainText() ?? ""
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
 
-    public override func paste(_ sender: Any?) {
+    @objc public func paste(_ sender: Any?) {
         guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
         emit(TerminalInputEncoder.encodePaste(text, bracketed: snapshot?.bracketedPaste ?? false))
     }
@@ -174,7 +211,7 @@ public final class TerminalView: NSView, NSTextInputClient {
         super.mouseDown(with: event)
     }
 
-    private func emit(_ data: Data) {
+    fileprivate func emit(_ data: Data) {
         guard !data.isEmpty else { return }
         onInput?(data)
     }
@@ -190,10 +227,15 @@ public final class TerminalView: NSView, NSTextInputClient {
 
     private func publishResize() {
         measureCells()
-        let cols = max(1, min(UInt32(bounds.width / max(cellSize.width, 1)), UInt32(maxTerminalColumns)))
-        let rows = max(1, min(UInt32(bounds.height / max(cellSize.height, 1)), UInt32(maxTerminalRows)))
-        let pixelsW = UInt32(min(max(bounds.width, 0), CGFloat(maxTerminalPixelDimension)))
-        let pixelsH = UInt32(min(max(bounds.height, 0), CGFloat(maxTerminalPixelDimension)))
+        guard !bounds.width.isNaN, !bounds.height.isNaN, bounds.width > 0, bounds.height > 0 else { return }
+        let cellW = max(cellSize.width, 1)
+        let cellH = max(cellSize.height, 1)
+        let colsFloat = max(1.0, min(floor(bounds.width / cellW), Double(maxTerminalColumns)))
+        let rowsFloat = max(1.0, min(floor(bounds.height / cellH), Double(maxTerminalRows)))
+        let cols = UInt32(colsFloat)
+        let rows = UInt32(rowsFloat)
+        let pixelsW = UInt32(max(0.0, min(bounds.width, Double(maxTerminalPixelDimension))))
+        let pixelsH = UInt32(max(0.0, min(bounds.height, Double(maxTerminalPixelDimension))))
         let size = (cols, rows, pixelsW, pixelsH)
         if lastReportedSize == nil || lastReportedSize! != size {
             lastReportedSize = size
@@ -250,8 +292,11 @@ public final class TerminalView: NSView, NSTextInputClient {
         case 114: return .insert
         default:
             if let chars = event.charactersIgnoringModifiers, chars.count == 1,
-               let scalar = chars.unicodeScalars.first, (1...12).contains(Int(scalar.value) - 0xF704 + 1) {
-                return nil
+               let scalar = chars.unicodeScalars.first {
+                let fIndex = Int(scalar.value) - 0xF704 + 1
+                if (1...12).contains(fIndex) {
+                    return .function(fIndex)
+                }
             }
             return nil
         }
@@ -266,4 +311,45 @@ public final class TerminalView: NSView, NSTextInputClient {
         if index < 16 { return palette[Int(index - 8)].highlight(withLevel: 0.35) ?? palette[Int(index - 8)] }
         return nil
     }
+}
+
+extension TerminalView: @preconcurrency NSTextInputClient {
+    public func insertText(_ string: Any, replacementRange: NSRange) {
+        markedText = ""
+        let text: String
+        if let value = string as? String {
+            text = value
+        } else if let value = string as? NSAttributedString {
+            text = value.string
+        } else {
+            return
+        }
+        emit(TerminalInputEncoder.encode(text: text))
+    }
+
+    public func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        if let value = string as? String {
+            markedText = value
+        } else if let value = string as? NSAttributedString {
+            markedText = value.string
+        } else {
+            markedText = ""
+        }
+    }
+
+    public func unmarkText() {
+        markedText = ""
+    }
+
+    public func selectedRange() -> NSRange { NSRange(location: 0, length: 0) }
+    public func markedRange() -> NSRange {
+        markedText.isEmpty ? NSRange(location: NSNotFound, length: 0) : NSRange(location: 0, length: markedText.utf16.count)
+    }
+    public func hasMarkedText() -> Bool { !markedText.isEmpty }
+    public func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? { nil }
+    public func validAttributesForMarkedText() -> [NSAttributedString.Key] { [] }
+    public func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        window?.convertToScreen(convert(bounds, to: nil)) ?? .zero
+    }
+    public func characterIndex(for point: NSPoint) -> Int { 0 }
 }

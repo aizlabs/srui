@@ -47,6 +47,12 @@ pub(crate) fn standard_namespace_mapping() -> ExtensionNamespaceMapping {
     }
 }
 
+struct TerminalTypeRollback {
+    was_required: bool,
+    was_optional: bool,
+    created_namespace: Option<u32>,
+}
+
 impl Session {
     /// Returns the session-stable extension namespace table, including namespace 0.
     #[must_use]
@@ -93,41 +99,71 @@ impl Session {
                     .to_string(),
             ));
         }
-        let type_ref = self.prepare_terminal_type()?;
-        self.pty
-            .spawn(node_id, spec)
-            .map_err(|error| SessionError::InvalidInput(error.to_string()))?;
+        let (type_ref, rollback) = self.prepare_terminal_type()?;
+        if let Err(error) = self.pty.spawn(node_id, spec) {
+            self.rollback_terminal_type(rollback);
+            return Err(SessionError::InvalidInput(error.to_string()));
+        }
         let spawned = self.transaction(|ui| {
             StoreMut::create_node(ui, node_id, type_ref, Some(parent), None, [])?;
             Ok(type_ref)
         });
         if spawned.is_err() {
             let _ = self.pty.close(node_id);
+            self.rollback_terminal_type(rollback);
         }
         spawned
     }
 
-    fn prepare_terminal_type(&self) -> Result<TypeRef, SessionError> {
+    fn prepare_terminal_type(&self) -> Result<(TypeRef, TerminalTypeRollback), SessionError> {
         let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let profile = Profile::terminal_v1();
-        guard.capabilities.optional.remove(&profile);
+        let was_required = guard.capabilities.required.contains(&profile);
+        let was_optional = guard.capabilities.optional.remove(&profile);
         guard.capabilities.required.insert(profile);
-        let namespace_id = if let Some(existing) = guard
+        let (namespace_id, created_namespace) = if let Some(existing) = guard
             .extension_namespaces
             .iter()
             .find(|mapping| mapping.extension_uri == TERMINAL_PROFILE_URI)
             .map(|mapping| mapping.namespace_id)
         {
-            existing
+            (existing, None)
         } else {
             let allocated = next_extension_namespace(&guard.extension_namespaces);
             guard.extension_namespaces.push(ExtensionNamespaceMapping {
                 extension_uri: TERMINAL_PROFILE_URI.to_string(),
                 namespace_id: allocated,
             });
-            allocated
+            (allocated, Some(allocated))
         };
-        Ok(TypeRef::new(namespace_id, TERMINAL_LOCAL_TYPE_ID))
+        let rollback = TerminalTypeRollback {
+            was_required,
+            was_optional,
+            created_namespace,
+        };
+        Ok((
+            TypeRef::new(namespace_id, TERMINAL_LOCAL_TYPE_ID),
+            rollback,
+        ))
+    }
+
+    fn rollback_terminal_type(&self, rollback: TerminalTypeRollback) {
+        let Ok(mut guard) = self.inner.lock() else { return };
+        if !self.pty.live_stream_ids().is_empty() {
+            return;
+        }
+        let profile = Profile::terminal_v1();
+        if !rollback.was_required {
+            guard.capabilities.required.remove(&profile);
+        }
+        if rollback.was_optional {
+            guard.capabilities.optional.insert(profile);
+        }
+        if let Some(ns_id) = rollback.created_namespace {
+            guard
+                .extension_namespaces
+                .retain(|mapping| mapping.namespace_id != ns_id);
+        }
     }
 
     /// Subscribes every live stream. Replaced incarnations ignore advertised offsets.

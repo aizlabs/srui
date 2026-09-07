@@ -973,15 +973,24 @@ public final class ControlFactory {
             self?.onTerminalInput?(node.id, data)
         }
         view.onResize = { [weak self] cols, rows, width, height in
+            Task { @MainActor in
+                await self?.terminalSession.resize(streamID: node.id, columns: Int(cols), rows: Int(rows))
+            }
             self?.onTerminalResize?(node.id, cols, rows, width, height)
         }
         let session = terminalSession
         let streamID = node.id
-        Task { @MainActor in
+        view.onAcknowledgeRedraw = {
+            Task { @MainActor in
+                await session.acknowledgeRedraw(streamID: streamID)
+            }
+        }
+        view.snapshotSubscriptionTask = Task { @MainActor [weak view] in
             if let current = await session.snapshot(for: streamID) {
-                view.apply(current)
+                view?.apply(current)
             }
             for await snapshot in await session.snapshots(for: streamID) {
+                guard let view else { break }
                 view.apply(snapshot)
             }
         }

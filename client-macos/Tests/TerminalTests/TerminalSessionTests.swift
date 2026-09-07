@@ -142,6 +142,57 @@ struct TerminalSessionTests {
         }
         #expect(last?.nextOffset == 2)
     }
+    @Test("OSC terminated by ESC backslash is handled")
+    func oscStringTerminator() async throws {
+        let session = TerminalSession()
+        var bytes = Data()
+        bytes.append(contentsOf: [0x1B, 0x5D, 0x30, 0x3B])
+        bytes.append(contentsOf: "title-st".utf8)
+        bytes.append(contentsOf: [0x1B, 0x5C]) // ESC \
+        let snapshot = try await session.applyData(streamID: stream, byteOffset: 0, data: bytes)
+        #expect(snapshot.title == "title-st")
+    }
+
+    @Test("charset designation ESC ( B is consumed without leaking into cells")
+    func charsetDesignation() async throws {
+        let session = TerminalSession()
+        var bytes = Data([0x1B, 0x28, 0x42]) // ESC ( B
+        bytes.append(contentsOf: "A".utf8)
+        let snapshot = try await session.applyData(streamID: stream, byteOffset: 0, data: bytes)
+        #expect(snapshot.cells[0][0].character == "A")
+    }
+
+    @Test("lines scrolling off the top are saved in scrollback")
+    func scrollbackAccumulation() async throws {
+        let session = TerminalSession()
+        var text = ""
+        for i in 0..<25 {
+            text += "line\(i)\r\n"
+        }
+        let snapshot = try await session.applyData(streamID: stream, byteOffset: 0, data: Data(text.utf8))
+        #expect(!snapshot.scrollback.isEmpty)
+        let firstScrollbackLine = snapshot.scrollback[0].map { String($0.character) }.joined().trimmingCharacters(in: .whitespaces)
+        #expect(firstScrollbackLine == "line0")
+    }
+
+    @Test("resync preserves bracketed paste mode")
+    func resyncPreservesBracketedPaste() async throws {
+        let session = TerminalSession()
+        let enablePaste = Data([0x1B, 0x5B, 0x3F, 0x32, 0x30, 0x30, 0x34, 0x68])
+        let snap1 = try await session.applyData(streamID: stream, byteOffset: 0, data: enablePaste)
+        #expect(snap1.bracketedPaste)
+        let snap2 = await session.applyResync(
+            streamID: stream,
+            requestedOffset: 0,
+            retainedFromOffset: 8,
+            resumeAtOffset: 16,
+            cause: .retentionLoss
+        )
+        #expect(snap2.bracketedPaste)
+        #expect(snap2.needsRedraw)
+        await session.acknowledgeRedraw(streamID: stream)
+        #expect(await session.snapshot(for: stream)?.needsRedraw == false)
+    }
 }
 
 @Suite("TerminalInputEncoder")
@@ -154,5 +205,13 @@ struct TerminalInputEncoderTests {
         let paste = TerminalInputEncoder.encodePaste("hi", bracketed: true)
         #expect(paste.starts(with: [0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E]))
         #expect(paste.suffix(6) == Data([0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E]))
+    }
+
+    @Test("bracketed paste sanitizes closing sequence")
+    func bracketedPasteSanitization() {
+        let evil = "foo\u{1B}[201~malicious"
+        let encoded = TerminalInputEncoder.encodePaste(evil, bracketed: true)
+        let string = String(decoding: encoded, as: UTF8.self)
+        #expect(string == "\u{1B}[200~foomalicious\u{1B}[201~")
     }
 }

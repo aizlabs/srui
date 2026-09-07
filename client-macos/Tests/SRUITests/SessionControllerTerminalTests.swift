@@ -95,7 +95,7 @@ struct SessionControllerTerminalTests {
         var resyncMsg = SRUIMessage()
         resyncMsg.terminalResyncRequired = resync
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMsg))
-        try await AsyncTestSupport.eventually(description: "terminal island resync applied") {
+        try await AsyncTestSupport.eventuallyAsync(description: "terminal island resync applied") {
             await renderer.terminalSession.snapshot(for: NodeId(30))?.needsRedraw == true
         }
 

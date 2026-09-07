@@ -190,7 +190,9 @@ public actor TerminalSession {
             needsRedraw: false,
             snapshotWaiters: [:]
         )
+        let previousBracketed = state.grid.bracketedPaste
         state.grid.reset()
+        state.grid.bracketedPaste = previousBracketed
         state.parser.reset()
         state.nextOffset = resumeAtOffset
         state.needsRedraw = true
@@ -208,6 +210,7 @@ public actor TerminalSession {
         guard var state = streams[streamID] else { return }
         state.needsRedraw = false
         streams[streamID] = state
+        publish(streamID)
     }
 
     private func publish(_ streamID: NodeId) {

@@ -1320,6 +1320,7 @@ public nonisolated enum Srui_Protocol_TerminalResyncReason: SwiftProtobuf.Enum, 
     }
   }
 
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
   public static let allCases: [Srui_Protocol_TerminalResyncReason] = [
     .unspecified,
     .retentionLoss,
@@ -2483,6 +2484,76 @@ public nonisolated struct Srui_Protocol_ResourceChunk: Sendable {
   public init() {}
 }
 
+public nonisolated struct Srui_Protocol_TerminalData: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var byteOffset: UInt64 = 0
+
+  public var data: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_TerminalInput: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var data: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_TerminalResize: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var columns: UInt32 = 0
+
+  public var rows: UInt32 = 0
+
+  public var pixelWidth: UInt32 = 0
+
+  public var pixelHeight: UInt32 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_TerminalResyncRequired: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var requestedOffset: UInt64 = 0
+
+  public var retainedFromOffset: UInt64 = 0
+
+  public var resumeAtOffset: UInt64 = 0
+
+  public var reason: Srui_Protocol_TerminalResyncReason = .unspecified
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 /// Client → server request for a missing cached window of a sparse collection
 /// model. Idempotent and replaceable: not journaled, not replayed, and not an
 /// Event. The server answers with an authoritative Transaction containing
@@ -2501,60 +2572,6 @@ public nonisolated struct Srui_Protocol_ClientModelRangeRequest: Sendable {
   public var count: UInt64 = 0
 
   public var observedRevision: UInt64 = 0
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Srui_Protocol_TerminalData: Sendable {
-  public var streamID: UInt64 = 0
-
-  public var byteOffset: UInt64 = 0
-
-  public var data: Data = Data()
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Srui_Protocol_TerminalInput: Sendable {
-  public var streamID: UInt64 = 0
-
-  public var data: Data = Data()
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Srui_Protocol_TerminalResize: Sendable {
-  public var streamID: UInt64 = 0
-
-  public var columns: UInt32 = 0
-
-  public var rows: UInt32 = 0
-
-  public var pixelWidth: UInt32 = 0
-
-  public var pixelHeight: UInt32 = 0
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
-public nonisolated struct Srui_Protocol_TerminalResyncRequired: Sendable {
-  public var streamID: UInt64 = 0
-
-  public var requestedOffset: UInt64 = 0
-
-  public var retainedFromOffset: UInt64 = 0
-
-  public var resumeAtOffset: UInt64 = 0
-
-  public var reason: Srui_Protocol_TerminalResyncReason = .unspecified
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -5088,62 +5105,15 @@ nonisolated extension Srui_Protocol_ResourceChunk: SwiftProtobuf.Message, SwiftP
   }
 }
 
-nonisolated extension Srui_Protocol_ClientModelRangeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".ClientModelRangeRequest"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{3}model_id\0\u{3}start_index\0\u{1}count\0\u{3}observed_revision\0")
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
-      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.modelID) }()
-      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.startIndex) }()
-      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.count) }()
-      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.observedRevision) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if self.nodeID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
-    }
-    if self.modelID != 0 {
-      try visitor.visitSingularUInt64Field(value: self.modelID, fieldNumber: 2)
-    }
-    if self.startIndex != 0 {
-      try visitor.visitSingularUInt64Field(value: self.startIndex, fieldNumber: 3)
-    }
-    if self.count != 0 {
-      try visitor.visitSingularUInt64Field(value: self.count, fieldNumber: 4)
-    }
-    if self.observedRevision != 0 {
-      try visitor.visitSingularUInt64Field(value: self.observedRevision, fieldNumber: 5)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: Srui_Protocol_ClientModelRangeRequest, rhs: Srui_Protocol_ClientModelRangeRequest) -> Bool {
-    if lhs.nodeID != rhs.nodeID {return false}
-    if lhs.modelID != rhs.modelID {return false}
-    if lhs.startIndex != rhs.startIndex {return false}
-    if lhs.count != rhs.count {return false}
-    if lhs.observedRevision != rhs.observedRevision {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
 nonisolated extension Srui_Protocol_TerminalData: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".TerminalData"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}stream_id\0\u{3}byte_offset\0\u{1}data\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.byteOffset) }()
@@ -5181,6 +5151,9 @@ nonisolated extension Srui_Protocol_TerminalInput: SwiftProtobuf.Message, SwiftP
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
       case 2: try { try decoder.decodeSingularBytesField(value: &self.data) }()
@@ -5213,6 +5186,9 @@ nonisolated extension Srui_Protocol_TerminalResize: SwiftProtobuf.Message, Swift
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
       case 2: try { try decoder.decodeSingularUInt32Field(value: &self.columns) }()
@@ -5260,6 +5236,9 @@ nonisolated extension Srui_Protocol_TerminalResyncRequired: SwiftProtobuf.Messag
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.requestedOffset) }()
@@ -5296,6 +5275,56 @@ nonisolated extension Srui_Protocol_TerminalResyncRequired: SwiftProtobuf.Messag
     if lhs.retainedFromOffset != rhs.retainedFromOffset {return false}
     if lhs.resumeAtOffset != rhs.resumeAtOffset {return false}
     if lhs.reason != rhs.reason {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_ClientModelRangeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ClientModelRangeRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{3}model_id\0\u{3}start_index\0\u{1}count\0\u{3}observed_revision\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.modelID) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.startIndex) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.count) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.observedRevision) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.nodeID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
+    }
+    if self.modelID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.modelID, fieldNumber: 2)
+    }
+    if self.startIndex != 0 {
+      try visitor.visitSingularUInt64Field(value: self.startIndex, fieldNumber: 3)
+    }
+    if self.count != 0 {
+      try visitor.visitSingularUInt64Field(value: self.count, fieldNumber: 4)
+    }
+    if self.observedRevision != 0 {
+      try visitor.visitSingularUInt64Field(value: self.observedRevision, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ClientModelRangeRequest, rhs: Srui_Protocol_ClientModelRangeRequest) -> Bool {
+    if lhs.nodeID != rhs.nodeID {return false}
+    if lhs.modelID != rhs.modelID {return false}
+    if lhs.startIndex != rhs.startIndex {return false}
+    if lhs.count != rhs.count {return false}
+    if lhs.observedRevision != rhs.observedRevision {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

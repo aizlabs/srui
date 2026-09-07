@@ -109,6 +109,7 @@ public struct TerminalSnapshot: Equatable, Sendable {
     public var cursorRow: Int
     public var cursorVisible: Bool
     public var cells: [[TerminalCell]]
+    public var scrollback: [[TerminalCell]]
     public var title: String
     public var nextOffset: UInt64
     public var needsRedraw: Bool
@@ -123,6 +124,7 @@ public struct TerminalSnapshot: Equatable, Sendable {
         cursorRow: Int,
         cursorVisible: Bool,
         cells: [[TerminalCell]],
+        scrollback: [[TerminalCell]] = [],
         title: String,
         nextOffset: UInt64,
         needsRedraw: Bool,
@@ -136,6 +138,7 @@ public struct TerminalSnapshot: Equatable, Sendable {
         self.cursorRow = cursorRow
         self.cursorVisible = cursorVisible
         self.cells = cells
+        self.scrollback = scrollback
         self.title = title
         self.nextOffset = nextOffset
         self.needsRedraw = needsRedraw
@@ -145,7 +148,11 @@ public struct TerminalSnapshot: Equatable, Sendable {
 
     public func plainText() -> String {
         cells.map { row in
-            String(row.map(\.character)).replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+            var chars = row.map(\.character)
+            while let last = chars.last, last.isWhitespace {
+                chars.removeLast()
+            }
+            return String(chars)
         }
         .joined(separator: "\n")
         .trimmingCharacters(in: CharacterSet.newlines.union(.whitespaces))
@@ -175,6 +182,9 @@ public final class TerminalGrid {
     public var pendingHyperlink: String?
 
     private var primary: [[TerminalCell]]
+    public private(set) var scrollback: [[TerminalCell]] = []
+    public var maxScrollbackLines: Int = 10_000
+
     private var alternate: [[TerminalCell]]?
     private var usingAlternate = false
     private var savedCursorColumn = 0
@@ -206,6 +216,7 @@ public final class TerminalGrid {
             cursorRow: cursorRow,
             cursorVisible: cursorVisible,
             cells: cells,
+            scrollback: scrollback,
             title: title,
             nextOffset: nextOffset,
             needsRedraw: needsRedraw,
@@ -219,6 +230,7 @@ public final class TerminalGrid {
         rows = max(rows, 1)
         primary = TerminalGrid.blankBuffer(columns: columns, rows: rows)
         alternate = nil
+        scrollback.removeAll(keepingCapacity: true)
         usingAlternate = false
         cursorColumn = 0
         cursorRow = 0
@@ -268,7 +280,7 @@ public final class TerminalGrid {
         if insertMode {
             insertBlanks(1)
         }
-        buffer[cursorRow][cursorColumn] = TerminalCell(character: character, attributes: attrs)
+        setCell(row: cursorRow, column: cursorColumn, TerminalCell(character: character, attributes: attrs))
         if cursorColumn + 1 >= columns {
             pendingWrap = wraparound
         } else {
@@ -403,19 +415,23 @@ public final class TerminalGrid {
         let start = cursorColumn
         let n = min(max(count, 0), columns - start)
         guard n > 0 else { return }
-        var line = buffer[row]
-        line.removeSubrange(start..<(start + n))
-        line.append(contentsOf: repeatElement(blankCell, count: n))
-        buffer[row] = line
+        withActiveBuffer { buf in
+            var line = buf[row]
+            line.removeSubrange(start..<(start + n))
+            line.append(contentsOf: repeatElement(blankCell, count: n))
+            buf[row] = line
+        }
     }
 
     public func insertLines(_ count: Int) {
         guard cursorRow >= scrollTop && cursorRow <= scrollBottom else { return }
         let n = min(max(count, 0), scrollBottom - cursorRow + 1)
         guard n > 0 else { return }
-        for _ in 0..<n {
-            buffer.remove(at: scrollBottom)
-            buffer.insert(Array(repeating: blankCell, count: columns), at: cursorRow)
+        withActiveBuffer { buf in
+            for _ in 0..<n {
+                buf.remove(at: scrollBottom)
+                buf.insert(Array(repeating: blankCell, count: columns), at: cursorRow)
+            }
         }
     }
 
@@ -423,9 +439,11 @@ public final class TerminalGrid {
         guard cursorRow >= scrollTop && cursorRow <= scrollBottom else { return }
         let n = min(max(count, 0), scrollBottom - cursorRow + 1)
         guard n > 0 else { return }
-        for _ in 0..<n {
-            buffer.remove(at: cursorRow)
-            buffer.insert(Array(repeating: blankCell, count: columns), at: scrollBottom)
+        withActiveBuffer { buf in
+            for _ in 0..<n {
+                buf.remove(at: cursorRow)
+                buf.insert(Array(repeating: blankCell, count: columns), at: scrollBottom)
+            }
         }
     }
 
@@ -439,17 +457,27 @@ public final class TerminalGrid {
 
     public func scrollUp(_ count: Int) {
         let n = min(max(count, 0), scrollBottom - scrollTop + 1)
-        for _ in 0..<n {
-            buffer.remove(at: scrollTop)
-            buffer.insert(Array(repeating: blankCell, count: columns), at: scrollBottom)
+        withActiveBuffer { buf in
+            for _ in 0..<n {
+                let removed = buf.remove(at: scrollTop)
+                if !usingAlternate {
+                    scrollback.append(removed)
+                    if scrollback.count > maxScrollbackLines {
+                        scrollback.removeFirst(scrollback.count - maxScrollbackLines)
+                    }
+                }
+                buf.insert(Array(repeating: blankCell, count: columns), at: scrollBottom)
+            }
         }
     }
 
     public func scrollDown(_ count: Int) {
         let n = min(max(count, 0), scrollBottom - scrollTop + 1)
-        for _ in 0..<n {
-            buffer.remove(at: scrollBottom)
-            buffer.insert(Array(repeating: blankCell, count: columns), at: scrollTop)
+        withActiveBuffer { buf in
+            for _ in 0..<n {
+                buf.remove(at: scrollBottom)
+                buf.insert(Array(repeating: blankCell, count: columns), at: scrollTop)
+            }
         }
     }
 
@@ -472,26 +500,41 @@ public final class TerminalGrid {
         TerminalCell(character: " ", attributes: currentAttributes)
     }
 
-    private var buffer: [[TerminalCell]] {
-        get { usingAlternate ? (alternate ?? primary) : primary }
-        set {
-            if usingAlternate {
-                alternate = newValue
-            } else {
-                primary = newValue
+    @inline(__always)
+    private func withActiveBuffer<T>(_ body: (inout [[TerminalCell]]) -> T) -> T {
+        if usingAlternate {
+            if alternate == nil {
+                alternate = TerminalGrid.blankBuffer(columns: columns, rows: rows)
             }
+            return body(&alternate!)
+        } else {
+            return body(&primary)
+        }
+    }
+
+    @inline(__always)
+    private func setCell(row: Int, column: Int, _ cell: TerminalCell) {
+        if usingAlternate {
+            if alternate == nil {
+                alternate = TerminalGrid.blankBuffer(columns: columns, rows: rows)
+            }
+            alternate![row][column] = cell
+        } else {
+            primary[row][column] = cell
         }
     }
 
     private func insertBlanks(_ count: Int) {
         let n = min(max(count, 0), columns - cursorColumn)
         guard n > 0 else { return }
-        var line = buffer[cursorRow]
-        line.insert(contentsOf: repeatElement(blankCell, count: n), at: cursorColumn)
-        if line.count > columns {
-            line.removeLast(line.count - columns)
+        withActiveBuffer { buf in
+            var line = buf[cursorRow]
+            line.insert(contentsOf: repeatElement(blankCell, count: n), at: cursorColumn)
+            if line.count > columns {
+                line.removeLast(line.count - columns)
+            }
+            buf[cursorRow] = line
         }
-        buffer[cursorRow] = line
     }
 
     private func fillRow(_ row: Int, from start: Int, count: Int) {
@@ -499,7 +542,7 @@ public final class TerminalGrid {
         let end = min(columns, start + max(count, 0))
         guard start < end else { return }
         for col in start..<end {
-            buffer[row][col] = blankCell
+            setCell(row: row, column: col, blankCell)
         }
     }
 

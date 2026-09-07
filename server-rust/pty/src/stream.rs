@@ -4,9 +4,6 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-#[cfg(unix)]
-use std::os::fd::RawFd;
-
 use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use srui_protocol::{
     TerminalData, TerminalResyncReason, TerminalResyncRequired, MAX_TERMINAL_COLUMNS,
@@ -72,9 +69,7 @@ pub(crate) struct TerminalStream {
     next_offset_watch: watch::Sender<u64>,
     command_tx: CommandSender,
     child: ChildSlot,
-    child_pid: Option<u32>,
-    #[cfg(unix)]
-    master_fd: Option<RawFd>,
+    child_pid: Arc<Mutex<Option<u32>>>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     command_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -84,9 +79,25 @@ impl TerminalStream {
         spec.validate().map_err(TerminalStreamError::InvalidSpec)?;
         let size = pty_size(spec.columns, spec.rows, 0, 0)?;
         let system = NativePtySystem::default();
-        let pair = system
-            .openpty(size)
-            .map_err(|error| TerminalStreamError::Pty(error.to_string()))?;
+        static PTY_OPEN_LOCK: Mutex<()> = Mutex::new(());
+        let _open_guard = PTY_OPEN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pair = None;
+        let mut last_err = None;
+        for _ in 0..5 {
+            match system.openpty(size) {
+                Ok(p) => {
+                    pair = Some(p);
+                    break;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+            }
+        }
+        let pair = pair.ok_or_else(|| {
+            TerminalStreamError::Pty(last_err.map(|e| e.to_string()).unwrap_or_default())
+        })?;
 
         let mut builder = CommandBuilder::new(spec.executable.as_os_str());
         for arg in &spec.args {
@@ -119,13 +130,12 @@ impl TerminalStream {
             .map_err(|error| TerminalStreamError::Pty(error.to_string()))?;
         let master = pair.master;
         #[cfg(unix)]
-        let master_fd = master.as_raw_fd();
-        #[cfg(unix)]
         let child_pid = master
             .process_group_leader()
             .map(|pgid| pgid as u32)
             .or(child_pid);
 
+        let child_pid = Arc::new(Mutex::new(child_pid));
         let ring = Arc::new(Mutex::new(OutputRing::new(spec.ring_capacity)));
         let (next_offset_watch, _) = watch::channel(0_u64);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
@@ -138,9 +148,7 @@ impl TerminalStream {
             next_offset_watch: next_offset_watch.clone(),
             command_tx: Arc::clone(&command_tx),
             child: Arc::clone(&child),
-            child_pid,
-            #[cfg(unix)]
-            master_fd,
+            child_pid: Arc::clone(&child_pid),
             reader_thread: Mutex::new(None),
             command_thread: Mutex::new(None),
         });
@@ -148,9 +156,19 @@ impl TerminalStream {
         let reader_ring = Arc::clone(&ring);
         let reader_watch = next_offset_watch;
         let reader_child = Arc::clone(&child);
+        let reader_child_pid = Arc::clone(&child_pid);
         let reader = thread::Builder::new()
             .name(format!("srui-pty-read-{}", id.get()))
-            .spawn(move || read_loop(reader, reader_ring, reader_watch, reader_child, command_tx))
+            .spawn(move || {
+                read_loop(
+                    reader,
+                    reader_ring,
+                    reader_watch,
+                    reader_child,
+                    reader_child_pid,
+                    command_tx,
+                )
+            })
             .map_err(|error| TerminalStreamError::Pty(error.to_string()))?;
         *stream.reader_thread.lock().expect("reader thread slot") = Some(reader);
 
@@ -195,11 +213,7 @@ impl TerminalStream {
 
     #[cfg(test)]
     pub(crate) fn process_id(&self) -> Option<u32> {
-        self.child
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(|child| child.process_id())
+        *self.child_pid.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(crate) fn snapshot_offsets(&self) -> (u64, u64) {
@@ -259,52 +273,52 @@ impl TerminalStream {
     }
 
     pub(crate) fn kill_and_reap(&self) {
-        // Drop the sender so `command_loop` unblocks even when the queue is full
-        // and `Close` cannot be enqueued.
-        drop(
-            self.command_tx
+        let run_teardown = || {
+            // Drop the sender so `command_loop` unblocks even when the queue is full
+            // and `Close` cannot be enqueued.
+            drop(
+                self.command_tx
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+            );
+            let pid = self
+                .child_pid
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .take(),
-        );
-        signal_child_tree(self.child_pid);
-        if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            signal_child_tree(child.process_id());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        // Unblock `write_all` and portable-pty's writer Drop (newline+EOT) if a
-        // leftover slave holder kept the PTY buffer full.
-        interrupt_master_io(self.master_fd_for_interrupt());
-        // Command thread owns the master PTY. Join it first so dropping the master
-        // forces EOF/EIO on the reader if any leftover slave holders remain.
-        if let Some(handle) = self
-            .command_thread
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self
-            .reader_thread
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            let _ = handle.join();
-        }
-    }
+                .take();
+            signal_child_tree(pid);
+            if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Command thread owns the master PTY. Join it first so dropping the master
+            // forces EOF/EIO on the reader if any leftover slave holders remain.
+            if let Some(handle) = self
+                .command_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let _ = handle.join();
+            }
+            if let Some(handle) = self
+                .reader_thread
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let _ = handle.join();
+            }
+        };
 
-    fn master_fd_for_interrupt(&self) -> Option<i32> {
-        #[cfg(unix)]
-        {
-            self.master_fd
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(run_teardown);
+                return;
+            }
         }
-        #[cfg(not(unix))]
-        {
-            None
-        }
+        run_teardown();
     }
 }
 
@@ -326,6 +340,7 @@ fn read_loop(
     ring: Arc<Mutex<OutputRing>>,
     watch: watch::Sender<u64>,
     child: ChildSlot,
+    child_pid: Arc<Mutex<Option<u32>>>,
     command_tx: CommandSender,
 ) {
     let mut buf = vec![0_u8; PTY_READ_CHUNK];
@@ -347,6 +362,7 @@ fn read_loop(
     }
     if let Some(mut child) = child.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = child.wait();
+        *child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     // Natural exit: close the command worker so it does not sit on blocking_recv
     // for the rest of the session.
@@ -375,20 +391,6 @@ fn signal_child_tree(pid: Option<u32>) {
     }
     #[cfg(not(unix))]
     let _ = pid;
-}
-
-fn interrupt_master_io(fd: Option<i32>) {
-    #[cfg(unix)]
-    if let Some(fd) = fd {
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags >= 0 {
-                let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = fd;
 }
 
 fn command_loop(

@@ -446,10 +446,12 @@ fn spawn_terminal_live_pumps(
     // on the wire through TerminalNormal / TerminalHigh scheduler slots.
     for mut subscription in live {
         let high_tx = high_tx.clone();
+        let normal_tx = normal_tx.clone();
         let shutdown = shutdown.clone();
         let session_cancel = session_cancel.clone();
         let mut released = released_rx.clone();
         tasks.push(tokio::spawn(async move {
+            let mut staged_events = std::collections::VecDeque::new();
             while !*released.borrow() {
                 tokio::select! {
                     biased;
@@ -460,8 +462,39 @@ fn spawn_terminal_live_pumps(
                             return;
                         }
                     }
+                    events = subscription.recv() => {
+                        if events.is_empty() {
+                            return;
+                        }
+                        for event in events {
+                            staged_events.push_back(event);
+                        }
+                    }
                 }
             }
+
+            while let Some(event) = staged_events.pop_front() {
+                let class = live_class_for_event(&event);
+                let msg = event_to_message(event);
+                match class {
+                    LogicalChannelClass::TerminalHigh => {
+                        if high_tx.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                    LogicalChannelClass::TerminalNormal => {
+                        if normal_tx.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {
+                        if high_tx.send(msg).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+
             loop {
                 tokio::select! {
                     biased;
@@ -472,9 +505,24 @@ fn spawn_terminal_live_pumps(
                             return;
                         }
                         for event in events {
-                            let _ = live_class_for_event(&event);
-                            if high_tx.send(event_to_message(event)).await.is_err() {
-                                return;
+                            let class = live_class_for_event(&event);
+                            let msg = event_to_message(event);
+                            match class {
+                                LogicalChannelClass::TerminalHigh => {
+                                    if high_tx.send(msg).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                LogicalChannelClass::TerminalNormal => {
+                                    if normal_tx.send(msg).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => {
+                                    if high_tx.send(msg).await.is_err() {
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -785,6 +833,10 @@ fn handle_terminal_input(
             warn!("dropping TerminalInput because the PTY command queue is full");
             Ok(())
         }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::Closed)) => {
+            tracing::debug!("dropping TerminalInput because stream {} is closed", stream_id.get());
+            Ok(())
+        }
         Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
             error.to_string(),
         ))),
@@ -817,6 +869,10 @@ fn handle_terminal_resize(
         }
         Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
             warn!("dropping TerminalResize because the PTY command queue is full");
+            Ok(())
+        }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::Closed)) => {
+            tracing::debug!("dropping TerminalResize because stream {} is closed", stream_id.get());
             Ok(())
         }
         Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(

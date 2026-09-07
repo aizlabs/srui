@@ -75,15 +75,16 @@ public enum TerminalInputEncoder {
     /// Wraps clipboard text. When `bracketed` is true the paste is framed with OSC-equivalent
     /// CSI 200~ / 201~ so the remote application can distinguish it from typed input.
     public static func encodePaste(_ text: String, bracketed: Bool) -> Data {
-        let payload = Data(text.utf8)
-        if payload.isEmpty {
+        if text.isEmpty {
             return Data()
         }
         if !bracketed {
-            return payload
+            return Data(text.utf8)
         }
+        // Strip embedded bracketed paste end markers (ESC [ 201 ~) to prevent pastejacking attacks
+        let sanitized = text.replacingOccurrences(of: "\u{1B}[201~", with: "")
         var framed = Data([0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E])
-        framed.append(payload)
+        framed.append(contentsOf: sanitized.utf8)
         framed.append(contentsOf: [0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E])
         return framed
     }

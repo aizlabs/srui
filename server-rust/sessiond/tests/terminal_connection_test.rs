@@ -49,6 +49,33 @@ fn terminal_session() -> (Arc<Session>, NodeId, NodeId) {
     (session, surface, term)
 }
 
+struct ServerGuard {
+    session: Arc<Session>,
+    shutdown: CancellationToken,
+    server_task: Option<tokio::task::JoinHandle<Result<(), srui_sessiond::ConnectionError>>>,
+}
+
+impl ServerGuard {
+    pub async fn join(
+        &mut self,
+    ) -> Result<Result<(), srui_sessiond::ConnectionError>, tokio::task::JoinError> {
+        self.server_task
+            .take()
+            .expect("server_task already joined")
+            .await
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.session.pty().shutdown();
+        if let Some(task) = &self.server_task {
+            task.abort();
+        }
+    }
+}
+
 async fn connect(
     session: Arc<Session>,
     profiles: Vec<String>,
@@ -56,7 +83,7 @@ async fn connect(
 ) -> (
     FramedRead<tokio::io::ReadHalf<tokio::io::DuplexStream>, SruiCodec>,
     FramedWrite<tokio::io::WriteHalf<tokio::io::DuplexStream>, SruiCodec>,
-    tokio::task::JoinHandle<Result<(), srui_sessiond::ConnectionError>>,
+    ServerGuard,
 ) {
     let shutdown = CancellationToken::new();
     let (client_io, server_io) = duplex(1024 * 1024);
@@ -85,7 +112,12 @@ async fn connect(
         },
     };
     write.send(hello).await.expect("send handshake");
-    (read, write, server_task)
+    let guard = ServerGuard {
+        session,
+        shutdown,
+        server_task: Some(server_task),
+    };
+    (read, write, guard)
 }
 
 async fn recv(
@@ -362,7 +394,7 @@ async fn reconnect_beyond_retention_sends_terminal_resync_with_resume_ok() {
 #[tokio::test]
 async fn unsupported_client_fails_before_required_extension_node() {
     let (session, _, _) = terminal_session();
-    let (mut read, _write, task) = connect(
+    let (mut read, _write, mut guard) = connect(
         session,
         vec!["org.srui.standard-widgets/1".to_string()],
         None,
@@ -370,7 +402,7 @@ async fn unsupported_client_fails_before_required_extension_node() {
     .await;
     let result = tokio::time::timeout(Duration::from_secs(2), async {
         let first = read.next().await;
-        let join = task.await;
+        let join = guard.join().await;
         (first, join)
     })
     .await
@@ -392,7 +424,7 @@ async fn unsupported_client_fails_before_required_extension_node() {
 #[tokio::test]
 async fn terminal_input_rejects_unknown_stream() {
     let (session, _, _) = terminal_session();
-    let (mut read, mut write, task) = connect(session, terminal_profiles(), None).await;
+    let (mut read, mut write, mut guard) = connect(session, terminal_profiles(), None).await;
     let _welcome = recv(&mut read).await;
     let _snapshot = recv(&mut read).await;
     write
@@ -404,7 +436,7 @@ async fn terminal_input_rejects_unknown_stream() {
         })
         .await
         .unwrap();
-    let join = tokio::time::timeout(Duration::from_secs(2), task)
+    let join = tokio::time::timeout(Duration::from_secs(2), guard.join())
         .await
         .expect("connection should close")
         .expect("join");
@@ -655,4 +687,201 @@ async fn journal_gap_and_terminal_eviction_are_independent() {
         }
     }
     panic!("expected independent semantic and terminal resyncs");
+}
+
+#[tokio::test]
+async fn terminal_input_and_resize_to_closed_stream_does_not_drop_connection() {
+    let session = Arc::new(Session::new("closed-stream"));
+    let (surface, _text, _progress, button) = common::setup_counter_session(&session);
+    let term = NodeId::new(20);
+    session
+        .create_terminal_node(
+            term,
+            surface,
+            TerminalSpec {
+                executable: "/bin/sh".into(),
+                args: vec!["-c".to_string(), "printf 'SRUI_EXIT_EARLY\\n'; exit 0".to_string()],
+                ring_capacity: 64 * 1024,
+                ..TerminalSpec::default()
+            },
+        )
+        .unwrap();
+    let (mut read, mut write, _guard) = connect(session.clone(), terminal_profiles(), None).await;
+    let _welcome = recv(&mut read).await;
+    let _snapshot = recv(&mut read).await;
+
+    // Wait until child has exited and command sender closed
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send input and resize to the closed stream; must not drop connection
+    write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::TerminalInput(TerminalInput {
+                stream_id: term.get(),
+                data: b"echo after exit\n".to_vec(),
+            })),
+        })
+        .await
+        .unwrap();
+
+    write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::TerminalResize(TerminalResize {
+                stream_id: term.get(),
+                columns: 100,
+                rows: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            })),
+        })
+        .await
+        .unwrap();
+
+    // Verify connection is still alive and semantic interaction succeeds
+    let activate = Event::activate(1, "act-1", 1, button).with_client_instance_id(CLIENT);
+    write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::Event(activate.to_wire())),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_ack = false;
+    while tokio::time::Instant::now() < deadline && !saw_ack {
+        let msg = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            read.next(),
+        )
+        .await
+        .expect("timeout")
+        .expect("eof")
+        .expect("decode");
+        if let Some(srui_message::Msg::ServerEventAck(_)) = msg.msg {
+            saw_ack = true;
+        }
+    }
+    assert!(saw_ack, "connection was dropped after input to closed stream");
+}
+
+#[tokio::test]
+async fn failed_spawn_rolls_back_capabilities_and_namespace() {
+    let session = Session::new("failed-spawn");
+    let surface = NodeId::new(1);
+    session
+        .transaction(|ui| {
+            Surface::builder(surface).label("S").create(ui)?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Attempt to spawn an invalid executable
+    let err = session.create_terminal_node(
+        NodeId::new(2),
+        surface,
+        TerminalSpec {
+            executable: "/nonexistent/binary/srui_fail".into(),
+            ..TerminalSpec::default()
+        },
+    );
+    assert!(err.is_err(), "expected spawn failure for nonexistent binary");
+
+    // Verify terminal_v1 is not in required capabilities
+    assert!(
+        session.terminal_namespace_id().is_none(),
+        "extension namespace must be rolled back on spawn failure"
+    );
+
+    // Standard client without terminal profile must succeed
+    let hello = ClientHello {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
+        limits: None,
+        client_instance_id: vec![1],
+        client_metadata: Default::default(),
+        known_resource_hashes: vec![],
+    };
+    let welcome = session.bootstrap_fresh_client(&hello);
+    assert!(
+        welcome.is_ok(),
+        "standard client was refused due to corrupted required capabilities: {:?}",
+        welcome.err()
+    );
+}
+
+#[tokio::test]
+async fn live_terminal_generation_during_catch_up_does_not_trigger_fallbehind() {
+    let session = Arc::new(Session::new("catchup-drain"));
+    let surface = NodeId::new(1);
+    let term = NodeId::new(24);
+    session
+        .transaction(|ui| {
+            Surface::builder(surface).label("Drain").create(ui)?;
+            Ok(())
+        })
+        .unwrap();
+    session
+        .create_terminal_node(
+            term,
+            surface,
+            TerminalSpec {
+                executable: "/bin/sh".into(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'HISTORICAL_DATA\\n'; sleep 0.1; while true; do printf 'LIVE_STREAM_BURST\\n'; sleep 0.05; done".to_string(),
+                ],
+                ring_capacity: 512,
+                ..TerminalSpec::default()
+            },
+        )
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut read, _write, _guard) = connect(
+        session,
+        terminal_profiles(),
+        Some(ClientResume {
+            session_id: "catchup-drain".to_string(),
+            client_instance_id: CLIENT.to_vec(),
+            last_applied_revision: 1,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: HashMap::from([(term.get(), 0)]),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![],
+        }),
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_resume_ok = false;
+    let mut saw_live_data = false;
+    while tokio::time::Instant::now() < deadline {
+        let msg = tokio::time::timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            read.next(),
+        )
+        .await
+        .expect("timeout")
+        .expect("eof")
+        .expect("decode");
+
+        match msg.msg {
+            Some(srui_message::Msg::ServerResumeOk(_)) => saw_resume_ok = true,
+            Some(srui_message::Msg::TerminalResyncRequired(resync)) => {
+                panic!("unexpected fallbehind resync during catch-up: {resync:?}");
+            }
+            Some(srui_message::Msg::TerminalData(data))
+                if data.data.windows(b"LIVE_STREAM_BURST".len()).any(|w| w == b"LIVE_STREAM_BURST") =>
+            {
+                saw_live_data = true;
+            }
+            _ => {}
+        }
+        if saw_resume_ok && saw_live_data {
+            return;
+        }
+    }
+    assert!(saw_resume_ok && saw_live_data, "failed to receive live data smoothly");
 }

@@ -519,10 +519,24 @@ public final class SessionController: @unchecked Sendable {
         }
 
         renderer.onTerminalInput = { [weak self] nodeID, data in
-            Task { await self?.terminalPump.enqueueInput(streamID: nodeID, data: data) }
+            guard let self else { return }
+            let predecessor = self.interactionDispatchTail
+            let dispatch = Task { [weak self] in
+                _ = await predecessor?.result
+                guard let self, !Task.isCancelled else { return }
+                await self.terminalPump.enqueueInput(streamID: nodeID, data: data)
+            }
+            self.interactionDispatchTail = dispatch
         }
         renderer.onTerminalResize = { [weak self] nodeID, cols, rows, width, height in
-            Task { await self?.terminalPump.enqueueResize(streamID: nodeID, columns: cols, rows: rows, pixelWidth: width, pixelHeight: height) }
+            guard let self else { return }
+            let predecessor = self.interactionDispatchTail
+            let dispatch = Task { [weak self] in
+                _ = await predecessor?.result
+                guard let self, !Task.isCancelled else { return }
+                await self.terminalPump.enqueueResize(streamID: nodeID, columns: cols, rows: rows, pixelWidth: width, pixelHeight: height)
+            }
+            self.interactionDispatchTail = dispatch
         }
 
         renderer.onCollectionRangeRequest = { [weak self, weak renderer] request in
@@ -2022,6 +2036,7 @@ public final class SessionController: @unchecked Sendable {
                     await renderer.terminalSession.resetForReplacementSession()
                     await MainActor.run { renderer.resetExtensionRegistry() }
                 }
+                await terminalPump.prune(retainedStreamIDs: [])
                 guard await resourceCache.clearPartials(
                     ownerEpoch: connectionBinding.resourceOwnershipEpoch
                 ) else {
@@ -2188,7 +2203,8 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
-    private func registerTerminalTypes(from store: SemanticStore) async {
+    @discardableResult
+    private func registerTerminalTypes(from store: SemanticStore) async -> Set<NodeId> {
         let negotiated = withStateLock { () -> CapabilitySet? in
             switch phase {
             case .active(let caps), .awaitingSnapshot(let caps):
@@ -2197,14 +2213,16 @@ public final class SessionController: @unchecked Sendable {
                 return retainedCapabilities
             }
         }
-        guard negotiated?.contains(.terminalV1) == true, let renderer else { return }
+        guard negotiated?.contains(.terminalV1) == true, let renderer else { return [] }
         var types = Set<TypeRef>()
+        var terminalNodeIDs = Set<NodeId>()
         var pending = store.rootIDs
         var seen = Set<NodeId>()
         while let id = pending.popLast() {
             guard seen.insert(id).inserted, let node = store.getNode(id) else { continue }
             if !node.nodeType.isStandard, node.nodeType.localID == terminalLocalTypeID {
                 types.insert(node.nodeType)
+                terminalNodeIDs.insert(id)
             }
             pending.append(contentsOf: node.orderedChildren)
         }
@@ -2213,6 +2231,7 @@ public final class SessionController: @unchecked Sendable {
                 try? renderer.registerTerminalType(typeRef)
             }
         }
+        return terminalNodeIDs
     }
 
     /// Local terminal apply only. Never touches semantic phase, revision, outbox, or text drafts.
@@ -2783,6 +2802,8 @@ public final class SessionController: @unchecked Sendable {
                let interceptor = liveTransactionPublishedInterceptorForTesting {
                 await interceptor()
             }
+            let terminalNodeIDs = await registerTerminalTypes(from: snapshot.store)
+            await terminalPump.prune(retainedStreamIDs: terminalNodeIDs)
             let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,
                 snapshot: snapshot,
@@ -2871,7 +2892,6 @@ public final class SessionController: @unchecked Sendable {
                 return
             }
 
-            await registerTerminalTypes(from: snapshot.store)
 
             if isResyncSnapshot {
                 // Only now may the outbox release the reconnect latch and promote post-snapshot

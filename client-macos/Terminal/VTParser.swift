@@ -18,6 +18,8 @@ public struct VTParser: Sendable {
         case escape
         case csi
         case osc
+        case oscEscape
+        case charsetDesignate
         case ignoreUntilST
     }
 
@@ -67,6 +69,10 @@ public struct VTParser: Sendable {
             handleCSI(byte, grid: grid)
         case .osc:
             handleOSC(byte, grid: grid)
+        case .oscEscape:
+            handleOSCEscape(byte, grid: grid)
+        case .charsetDesignate:
+            state = .ground
         case .ignoreUntilST:
             if byte == 0x1B {
                 state = .escape
@@ -143,11 +149,8 @@ public struct VTParser: Sendable {
             grid.reverseIndex()
             state = .ground
         case 0x28, 0x29, 0x2A, 0x2B:
-            // charset designate; consume next byte in ground on next call via ignore-one
-            state = .ignoreUntilST
-            // treat the next graphic as the designator then return to ground
-            state = .ground
-            _ = byte
+            // charset designate; consume next designator byte (e.g. 'B') before returning to ground
+            state = .charsetDesignate
         default:
             state = .ground
         }
@@ -186,11 +189,7 @@ public struct VTParser: Sendable {
             return
         }
         if byte == 0x1B {
-            state = .escape
-            // BEL-less ST is ESC \ ; stash and finish if next is '\'
-            applyOSC(osc, grid: grid)
-            osc.removeAll(keepingCapacity: true)
-            state = .ground
+            state = .oscEscape
             return
         }
         if osc.count >= Self.maxOSCBytes {
@@ -201,9 +200,29 @@ public struct VTParser: Sendable {
         osc.append(byte)
     }
 
+    private mutating func handleOSCEscape(_ byte: UInt8, grid: TerminalGrid) {
+        if byte == 0x5C { // '\' terminates OSC (ESC \)
+            applyOSC(osc, grid: grid)
+            osc.removeAll(keepingCapacity: true)
+            state = .ground
+            return
+        }
+        // Non-backslash character following ESC: complete OSC and process byte as new escape sequence
+        applyOSC(osc, grid: grid)
+        osc.removeAll(keepingCapacity: true)
+        state = .escape
+        handleEscape(byte, grid: grid)
+    }
+
     private func applyCSI(_ raw: [UInt8], grid: TerminalGrid) {
         guard let final = raw.last else { return }
         let body = raw.dropLast()
+        let nonStandardPrefix = body.first == UInt8(ascii: "<") || body.first == UInt8(ascii: "=") || body.first == UInt8(ascii: ">")
+        if nonStandardPrefix {
+            // Non-standard private sequences (modifyOtherKeys, secondary device attributes)
+            // MUST NOT be stripped into standard SGR or cursor commands.
+            return
+        }
         let privateMark = body.first == UInt8(ascii: "?")
         let paramsSource = privateMark ? body.dropFirst() : body
         let intermediates = paramsSource.filter { (0x20...0x2F).contains($0) }
@@ -268,6 +287,7 @@ public struct VTParser: Sendable {
     }
 
     private func applyPrivate(final: UInt8, params: [Int], grid: TerminalGrid) {
+        guard final == UInt8(ascii: "h") || final == UInt8(ascii: "l") else { return }
         let enable = final == UInt8(ascii: "h")
         for mode in params {
             switch mode {

@@ -46,6 +46,26 @@ actor TerminalCommandPump {
         }
     }
 
+    func prune(retainedStreamIDs: Set<NodeId>) {
+        latestSize = latestSize.filter { retainedStreamIDs.contains($0.key) }
+        queue.removeAll { item in
+            switch item {
+            case .input(let id, _), .resize(let id, _, _, _, _):
+                return !retainedStreamIDs.contains(id)
+            }
+        }
+    }
+
+    func removeStream(streamID: NodeId) {
+        latestSize.removeValue(forKey: streamID)
+        queue.removeAll { item in
+            switch item {
+            case .input(let id, _), .resize(let id, _, _, _, _):
+                return id == streamID
+            }
+        }
+    }
+
     func enqueueInput(streamID: NodeId, data: Data) {
         guard connected, !data.isEmpty, data.count <= maxTerminalInputBytes else { return }
         queue.append(.input(streamID, data))

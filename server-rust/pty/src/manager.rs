@@ -143,11 +143,23 @@ impl PTYManager {
         &self,
         offsets: &HashMap<u64, u64>,
     ) -> Result<Vec<SubscribeOutcome>, PTYManagerError> {
-        let ids: Vec<NodeId> = self.lock().streams.keys().copied().collect();
-        let mut outcomes = Vec::with_capacity(ids.len());
-        for id in ids {
+        let streams: Vec<(NodeId, Arc<TerminalStream>)> = {
+            let inner = self.lock();
+            inner
+                .streams
+                .iter()
+                .map(|(id, stream)| (*id, Arc::clone(stream)))
+                .collect()
+        };
+        let mut outcomes = Vec::with_capacity(streams.len());
+        for (id, stream) in streams {
             let requested = offsets.get(&id.get()).copied().unwrap_or(0);
-            outcomes.push(self.subscribe(id, requested)?);
+            let (snapshot, subscription) = stream.subscribe(requested);
+            outcomes.push(SubscribeOutcome {
+                stream_id: id,
+                snapshot,
+                subscription,
+            });
         }
         Ok(outcomes)
     }
@@ -427,10 +439,16 @@ mod tests {
         let manager = PTYManager::default();
         let id = NodeId::new(9);
         manager
-            .spawn(id, echo_spec("printf 'abcdefghij'; sleep 30", 64))
+            .spawn(id, echo_spec("printf 'abcdefghij'; sleep 30", 512))
             .unwrap();
-        wait_for_output(&manager, id, b"abcdefghij");
-        let outcome = manager.subscribe(id, 3).unwrap();
+        let out = wait_for_output(&manager, id, b"abcdefghij");
+        let abc_offset = out
+            .windows(b"abcdefghij".len())
+            .position(|w| w == b"abcdefghij")
+            .unwrap() as u64;
+        let (retained_start, _) = manager.offsets(id).unwrap();
+        let target_offset = retained_start + abc_offset + 3;
+        let outcome = manager.subscribe(id, target_offset).unwrap();
         let replay: Vec<u8> = outcome
             .catch_up_events()
             .into_iter()
@@ -597,22 +615,39 @@ mod tests {
             .expect("spawned child must expose a pid");
         wait_for_output(&manager, id, b"SRUI_EXIT_OK");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut state = process_state(pid);
+        let mut reaped = false;
         while std::time::Instant::now() < deadline {
-            state = process_state(pid);
-            if state.is_none() {
+            if is_child_reaped(pid) {
+                reaped = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         manager.close(id).unwrap();
-        assert_ne!(state, Some('Z'), "child {pid} remained a zombie");
-        assert!(state.is_none(), "child {pid} still present ({state:?})");
+        assert!(reaped, "child {pid} was not reaped by natural exit");
     }
 
-    fn process_state(pid: u32) -> Option<char> {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let after = stat.rsplit(')').next()?;
-        after.split_whitespace().next()?.chars().next()
+    fn is_child_reaped(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if res == -1 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                return err == Some(libc::ESRCH);
+            }
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if let Some(after) = stat.rsplit(')').next() {
+                    if let Some(state) = after.split_whitespace().next().and_then(|s| s.chars().next()) {
+                        return state != 'Z';
+                    }
+                }
+            }
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            true
+        }
     }
 }

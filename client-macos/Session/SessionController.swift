@@ -17,6 +17,9 @@
 //   `WELCOME.initial_revision > 0`) replace the replica; incremental transactions never do.
 // - §18.2 Event settlement: server event frontiers raise `last_acked_event_seq`, while
 //   per-event acknowledgements selectively drain the outbox's retry set.
+// - §18.3 / §22.6 Native text editing: local drafts are claimed on MainActor, assigned a
+//   monotonic `edit_seq`, and reconciled against `RESUME_OK` / `RESYNC_REQUIRED` discard lists
+//   before any native mutation runs.
 // - §22.2 Threading: network IO and protobuf decoding run off the main actor; AppKit mutations
 //   are dispatched to `MainActor`.
 // - §8 / §22.7 Sparse collections: `ClientModelRangeRequest` is sent on the `.ui` lane and is
@@ -525,6 +528,7 @@ public final class SessionController: @unchecked Sendable {
             }
         }
     }
+
     /// Drains TextEditingSession-owned drafts through retain, native authorization, then send.
     ///
     /// The callback's initial edit is snapshotted synchronously on MainActor. Later typing may

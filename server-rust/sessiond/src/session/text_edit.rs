@@ -177,6 +177,8 @@ impl TextEditTracker {
         });
         self.stream_count -= removed;
     }
+
+    /// Reserves a generation for a sequence strictly above the terminal watermark.
     pub fn reserve(
         &mut self,
         client_instance_id: &[u8],

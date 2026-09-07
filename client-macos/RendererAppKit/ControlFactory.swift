@@ -7,6 +7,7 @@ import Terminal
 public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
     case unnegotiatedTerminal(TypeRef)
+    case invalidExtensionFallback(TypeRef)
 }
 
 /// Extension node kinds resolved from `ServerWelcome.extension_namespaces` (§15, §21).
@@ -104,9 +105,20 @@ public final class ControlFactory {
                 result = (view, nil, nil, nil)
             }
         } else if !node.nodeType.isStandard {
-            throw ControlFactoryError.unnegotiatedTerminal(node.nodeType)
+            guard hasValidStandardFallback(for: node, store: store) else {
+                if node.orderedChildren.isEmpty {
+                    throw ControlFactoryError.unnegotiatedTerminal(node.nodeType)
+                }
+                throw ControlFactoryError.invalidExtensionFallback(node.nodeType)
+            }
+            let stack = NSStackView()
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.distribution = .fill
+            stack.spacing = 8
+            result = (stack, nil, nil, nil)
         } else {
-        switch node.nodeType {
+            switch node.nodeType {
         case .surface:
             let contentView = NSStackView(frame: NSRect(x: 0, y: 0, width: 440, height: 320))
             contentView.orientation = .vertical
@@ -304,7 +316,24 @@ public final class ControlFactory {
         node.propertyEntries.sorted { $0.0 < $1.0 }
     }
 
-    /// Editors with a canonical `.value` ignore `.text` so incremental and full applies agree.
+    /// v1 fallback convention: one ordered child roots a namespace-0-only subtree (§11.1).
+    /// A nonempty but malformed subtree must not turn unknown required semantics into content.
+    private func hasValidStandardFallback(for node: Node, store: SemanticStore?) -> Bool {
+        guard node.orderedChildren.count == 1, let store else { return false }
+        var pending = node.orderedChildren
+        var seen = Set<NodeId>()
+        while let nodeID = pending.popLast() {
+            guard seen.insert(nodeID).inserted,
+                  let fallbackNode = store.getNode(nodeID),
+                  fallbackNode.nodeType.isStandard else {
+                return false
+            }
+            pending.append(contentsOf: fallbackNode.orderedChildren)
+        }
+        return true
+    }
+
+    /// Property entries of `node` in the order they are applied to a handle.
     public static func shouldSkipTextFallback(for handle: RenderHandle, node: Node) -> Bool {
         handle.textAdapter != nil && node.getProperty(.value) != nil
     }

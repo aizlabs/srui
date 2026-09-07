@@ -912,6 +912,80 @@ struct LayoutRendererTests {
         #expect(adapter.isNestedInScroll == false)
         #expect(adapter.minHeightConstraint?.isActive == true)
     }
+    @Test
+    func unsupportedExtensionMountsValidatedStandardFallback() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(id: 3, nodeType: .column, parentID: 2),
+            .createNode(
+                id: 4,
+                nodeType: .text,
+                parentID: 3,
+                properties: [(.text, .string("Fallback"))]
+            ),
+        ])
+        let renderer = LayoutRenderer()
+
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is NSStackView)
+        #expect((renderer.registry.view(for: 4) as? NSTextField)?.stringValue == "Fallback")
+    }
+
+    @Test
+    func malformedExtensionFallbackIsRejected() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let nestedExtension = TypeRef(namespaceID: 5, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(id: 3, nodeType: .column, parentID: 2),
+            .createNode(id: 4, nodeType: nestedExtension, parentID: 3),
+        ])
+        let renderer = LayoutRenderer()
+
+        #expect(throws: ControlFactoryError.invalidExtensionFallback(extensionType)) {
+            try renderer.mount(store: store)
+        }
+    }
+
+    @Test
+    func registeredExtensionSuppressesFallbackAndIgnoresItsUpdates() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(id: 3, nodeType: .column, parentID: 2),
+            .createNode(
+                id: 4,
+                nodeType: .text,
+                parentID: 3,
+                properties: [(.text, .string("Fallback"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        let renderer = LayoutRenderer()
+        try renderer.controlFactory.registerExtension(typeRef: extensionType, kind: .terminal)
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is TerminalView)
+        #expect(renderer.registry.view(for: 3) == nil)
+        #expect(renderer.registry.view(for: 4) == nil)
+
+        let update = SemanticModel.Operation.setProperty(
+            id: 4,
+            property: .text,
+            value: .string("Updated fallback")
+        )
+        let newStore = try makeStore(base + [update])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [update]),
+            newStore: newStore
+        )
+        #expect(renderer.registry.view(for: 4) == nil)
+    }
 
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {
         var store = SemanticStore()

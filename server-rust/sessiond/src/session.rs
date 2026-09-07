@@ -8,12 +8,12 @@
 //! Conforms to [`async-bounded-channel`](rules/async-bounded-channel.md):
 //! per-connection outbound transaction queues are strictly bounded.
 
+mod extensions;
 mod handshake;
 mod model_range;
 mod snapshot;
 pub(crate) mod terminal;
 mod text_edit;
-
 pub use handshake::{
     FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION,
     MAX_CLIENT_INSTANCE_ID_BYTES,

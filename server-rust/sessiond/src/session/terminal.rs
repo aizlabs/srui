@@ -10,6 +10,7 @@ use srui_pty::{PTYManager, SubscribeOutcome, TerminalEvent, TerminalSpec, Termin
 use srui_sdk::StoreMut;
 use srui_semantic_tree::{NodeId, Profile, TypeRef};
 
+use super::extensions::next_extension_namespace;
 use super::{lock_or_recover, Session, SessionError};
 use crate::outbound::LogicalChannelClass;
 
@@ -133,7 +134,7 @@ impl Session {
         {
             (existing, None)
         } else {
-            let allocated = next_extension_namespace(&guard.extension_namespaces);
+            let allocated = next_extension_namespace(&guard.extension_namespaces)?;
             guard.extension_namespaces.push(ExtensionNamespaceMapping {
                 extension_uri: TERMINAL_PROFILE_URI.to_string(),
                 namespace_id: allocated,
@@ -200,13 +201,6 @@ impl Session {
     pub(crate) fn shutdown_terminals(&self) {
         self.pty.shutdown();
     }
-}
-
-fn next_extension_namespace(existing: &[ExtensionNamespaceMapping]) -> u32 {
-    let used: std::collections::HashSet<u32> = existing.iter().map(|m| m.namespace_id).collect();
-    (1..=u32::MAX)
-        .find(|id| !used.contains(id))
-        .expect("extension namespace space exhausted")
 }
 
 fn attach_from_outcomes(outcomes: Vec<SubscribeOutcome>) -> TerminalAttach {

@@ -156,4 +156,67 @@ struct SessionControllerTerminalTests {
         await controller.stop()
         await serverTransport.close()
     }
+
+    @Test("Only the negotiated terminal namespace is registered when local IDs collide")
+    @MainActor
+    func exactTerminalNamespaceWinsLocalIDCollision() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        var terminalMapping = Srui_Protocol_ExtensionNamespaceMapping()
+        terminalMapping.extensionUri = terminalProfileURI
+        terminalMapping.namespaceID = 3
+        var diffMapping = Srui_Protocol_ExtensionNamespaceMapping()
+        diffMapping.extensionUri = "org.example.diff/1"
+        diffMapping.namespaceID = 4
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-namespace-collision"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.optionalProfiles = ["org.example.diff/1"]
+        welcome.extensionNamespaces = [terminalMapping, diffMapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+        try await AsyncTestSupport.eventually(description: "collision handshake") {
+            controller.isHandshakeComplete
+        }
+
+        let terminalType = TypeRef(namespaceID: 3, localID: 1)
+        let diffType = TypeRef(namespaceID: 4, localID: 1)
+        let transaction = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: 1, nodeType: .surface),
+                .createNode(id: 2, nodeType: diffType, parentID: 1),
+                .createNode(id: 3, nodeType: .column, parentID: 2),
+                .createNode(id: 4, nodeType: .text, parentID: 3),
+                .createNode(id: 30, nodeType: terminalType, parentID: 1),
+            ]
+        )
+        var transactionMessage = SRUIMessage()
+        transactionMessage.transaction = transaction.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(transactionMessage))
+        try await AsyncTestSupport.eventually(description: "collision snapshot rendered") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.handle(for: NodeId(30)) != nil
+        }
+
+        #expect(renderer.registry.view(for: NodeId(2)) is NSStackView)
+        #expect(renderer.registry.view(for: NodeId(30)) is TerminalView)
+        #expect(renderer.controlFactory.extensionKind(for: diffType) == nil)
+        #expect(renderer.controlFactory.extensionKind(for: terminalType) == .terminal)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
 }

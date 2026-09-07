@@ -283,6 +283,8 @@ public final class SessionController: @unchecked Sendable {
     private var retainedCapabilities: CapabilitySet?
     /// Hashes whose transfer was already rejected; suppress per-chunk log spam (§14, §26).
     private var rejectedResourceHashes: Set<ResourceHash> = []
+    /// Exact Terminal type assigned by the latest fresh welcome; retained across same-session resume.
+    private var negotiatedTerminalTypeRef: TypeRef?
     private var rangeRequestContinuation: AsyncStream<CollectionRangeRequest>.Continuation?
     private var rangeRequestTask: Task<Void, Never>?
     private let terminalPump = TerminalCommandPump()
@@ -2220,46 +2222,51 @@ public final class SessionController: @unchecked Sendable {
                 "required \(terminalProfileURI) but ServerWelcome omitted its namespace mapping"
             )
         }
-        guard negotiated.contains(.terminalV1), let mapping else { return }
-        guard mapping.namespaceID != 0 else {
+        if let mapping, mapping.namespaceID == 0 {
             throw SessionFailure.protocolViolation(
                 "\(terminalProfileURI) must use a nonzero session-assigned namespace"
             )
         }
+        let resolvedType = negotiated.contains(.terminalV1)
+            ? mapping.map { terminalTypeRef(namespaceID: $0.namespaceID) }
+            : nil
+        withStateLock {
+            negotiatedTerminalTypeRef = resolvedType
+        }
         if let renderer {
             try await MainActor.run {
-                try renderer.registerTerminalType(terminalTypeRef(namespaceID: mapping.namespaceID))
+                renderer.resetExtensionRegistry()
+                if let resolvedType {
+                    try renderer.registerTerminalType(resolvedType)
+                }
             }
         }
     }
 
     @discardableResult
     private func registerTerminalTypes(from store: SemanticStore) async -> Set<NodeId> {
-        let negotiated = withStateLock { () -> CapabilitySet? in
+        let (negotiated, terminalType) = withStateLock { () -> (CapabilitySet?, TypeRef?) in
+            let capabilities: CapabilitySet?
             switch phase {
             case .active(let caps), .awaitingSnapshot(let caps):
-                return caps
+                capabilities = caps
             default:
-                return retainedCapabilities
+                capabilities = retainedCapabilities
             }
+            return (capabilities, negotiatedTerminalTypeRef)
         }
-        guard negotiated?.contains(.terminalV1) == true, let renderer else { return [] }
-        var types = Set<TypeRef>()
+        guard negotiated?.contains(.terminalV1) == true,
+              let terminalType,
+              renderer != nil else { return [] }
         var terminalNodeIDs = Set<NodeId>()
         var pending = store.rootIDs
         var seen = Set<NodeId>()
         while let id = pending.popLast() {
             guard seen.insert(id).inserted, let node = store.getNode(id) else { continue }
-            if !node.nodeType.isStandard, node.nodeType.localID == terminalLocalTypeID {
-                types.insert(node.nodeType)
+            if node.nodeType == terminalType {
                 terminalNodeIDs.insert(id)
             }
             pending.append(contentsOf: node.orderedChildren)
-        }
-        await MainActor.run {
-            for typeRef in types {
-                try? renderer.registerTerminalType(typeRef)
-            }
         }
         return terminalNodeIDs
     }

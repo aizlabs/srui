@@ -15,6 +15,8 @@ public final class LayoutRenderer {
     public let registry: RenderRegistry
     public let controlFactory: ControlFactory
 
+    /// Fallback descendants hidden behind a locally supported extension view (§11.1).
+    private var suppressedFallbackNodeIDs = Set<NodeId>()
     /// Whether surfaces have been ordered on screen, so a remount can restore visibility.
     private var surfacesShown = false
 
@@ -69,22 +71,19 @@ public final class LayoutRenderer {
             return classifications
         }
 
-        RendererDiagnostics.log(
-            "transaction revision=\(transaction.newRevision) non-structural operations=\(transaction.operations.count)"
-        )
-
-        var changedModelIDs: Set<ModelId> = []
-        for classification in classifications {
+        let changedModelIDs = Set(classifications.compactMap { classification -> ModelId? in
             if case .modelContent(let modelID) = classification {
-                changedModelIDs.insert(modelID)
+                return modelID
             }
-        }
+            return nil
+        })
 
         var affectedCollectionNodeIDs: Set<NodeId> = []
         for operation in transaction.operations {
             switch operation {
             case .setProperty(let nodeID, let property, _),
                  .clearProperty(let nodeID, let property):
+                guard !suppressedFallbackNodeIDs.contains(nodeID) else { continue }
                 if isCollectionProperty(property) {
                     affectedCollectionNodeIDs.insert(nodeID)
                 } else {
@@ -92,6 +91,7 @@ public final class LayoutRenderer {
                 }
 
             case .batchPropertySet(let nodeID, let properties):
+                guard !suppressedFallbackNodeIDs.contains(nodeID) else { continue }
                 for property in properties {
                     if isCollectionProperty(property.property) {
                         affectedCollectionNodeIDs.insert(nodeID)
@@ -156,11 +156,15 @@ public final class LayoutRenderer {
             }
             attach(handle.view, to: parentHandle)
         }
-        configureCollectionScrolling(for: handle)
-
+        if !node.nodeType.isStandard,
+           controlFactory.extensionKind(for: node.nodeType) != nil {
+            suppressFallbackDescendants(of: node, in: store)
+            return
+        }
         for childID in node.orderedChildren {
             try mount(nodeID: childID, from: store)
         }
+        configureCollectionScrolling(for: handle)
     }
 
     private func attach(_ child: NSView, to parent: RenderHandle) {
@@ -252,7 +256,17 @@ public final class LayoutRenderer {
         return false
     }
 
+    private func suppressFallbackDescendants(of node: Node, in store: SemanticStore) {
+        var pending = node.orderedChildren
+        while let nodeID = pending.popLast() {
+            guard suppressedFallbackNodeIDs.insert(nodeID).inserted,
+                  let child = store.getNode(nodeID) else { continue }
+            pending.append(contentsOf: child.orderedChildren)
+        }
+    }
+
     private func tearDown() {
+        suppressedFallbackNodeIDs.removeAll(keepingCapacity: true)
         let handles = registry.removeAll()
         for handle in handles {
             handle.view.removeFromSuperview()

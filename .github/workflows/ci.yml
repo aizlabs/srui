@@ -270,10 +270,12 @@ jobs:
         run: cargo build --manifest-path examples/counter/Cargo.toml
       # `Text` owns TextEditingSession, the toolkit-free half of native text editing (§18.3,
       # §22.6); NativeTextEditorAdapter in RendererAppKit is the only AppKit-touching half.
-      - name: Verify SemanticModel and Text do not import AppKit or Cocoa (§1)
+      # `Terminal` owns the VT parser and grid; TerminalView in RendererAppKit is the only
+      # AppKit-touching half of the terminal island (§21).
+      - name: Verify toolkit-free targets do not import AppKit or Cocoa (§1, §21)
         run: |
-          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel client-macos/Text; then
-            echo "Error: SemanticModel and Text must never import AppKit or Cocoa"
+          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel client-macos/Text client-macos/Terminal; then
+            echo "Error: SemanticModel, Text, and Terminal must never import AppKit or Cocoa"
             exit 1
           fi
       - name: Test portable LogicalChannelScheduling module

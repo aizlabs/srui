@@ -6,6 +6,9 @@
 //! - Server: `--port <port>` binds a TCP loopback socket and hosts the counter application.
 //! - Opt-in: `--image-fixture` publishes a deterministic 1×1 PNG and mounts an Image node
 //!   referencing its `ResourceHash` for cross-language resource integration tests (§14).
+//! - Opt-in: `--terminal-fixture` adds a required Terminal extension node and spawns a
+//!   trusted PTY (`/bin/sh -i` by default). There is no automatic tmux redraw after the
+//!   output ring is lost.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +20,7 @@ use tracing::{info, warn};
 use srui_example_counter::CounterApp;
 use srui_sdk::*;
 use srui_semantic_tree::{ItemId, ModelId, ModelItem, Operation, TypeRef, Value};
-use srui_sessiond::{handle_connection, ModelRangeProvider, Session};
+use srui_sessiond::{handle_connection, ModelRangeProvider, Session, TerminalSpec};
 
 /// Deterministic valid 1×1 RGB PNG (69 bytes); shared with Swift ResourceCacheTests.
 fn fixture_png() -> Vec<u8> {
@@ -49,6 +52,35 @@ fn wants_large_collection_fixture(args: &[String]) -> bool {
     args.iter().any(|a| a == "--large-collection-fixture")
 }
 
+fn wants_terminal_fixture(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--terminal-fixture")
+}
+
+fn terminal_ring_capacity(args: &[String]) -> usize {
+    args.iter()
+        .position(|a| a == "--terminal-ring-bytes")
+        .and_then(|pos| args.get(pos + 1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024 * 1024)
+}
+
+fn terminal_command(args: &[String]) -> TerminalSpec {
+    let mut spec = TerminalSpec::interactive_shell();
+    spec.ring_capacity = terminal_ring_capacity(args);
+    if let Some(pos) = args.iter().position(|a| a == "--terminal-command") {
+        if let Some(command) = args.get(pos + 1) {
+            spec.executable = command.into();
+            spec.args = args
+                .iter()
+                .skip(pos + 2)
+                .take_while(|arg| !arg.starts_with("--"))
+                .cloned()
+                .collect();
+        }
+    }
+    spec
+}
+
 fn collection_provider_delay() -> Duration {
     std::env::var("SRUI_COLLECTION_PROVIDER_DELAY_MS")
         .ok()
@@ -63,11 +95,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let capabilities = parse_server_capabilities(&args);
     let image_fixture = wants_image_fixture(&args);
     let large_collection = wants_large_collection_fixture(&args);
+    let terminal_fixture = wants_terminal_fixture(&args);
+    let terminal_spec = terminal_command(&args);
 
     if let Some(pos) = args.iter().position(|a| a == "--socket") {
         if let Some(socket_path_str) = args.get(pos + 1) {
             let socket_path = PathBuf::from(socket_path_str);
-            run_unix_server(socket_path, capabilities, image_fixture, large_collection).await?;
+            run_unix_server(
+                socket_path,
+                capabilities,
+                image_fixture,
+                large_collection,
+                terminal_fixture,
+                terminal_spec,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -75,7 +117,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pos) = args.iter().position(|a| a == "--port") {
         if let Some(port_str) = args.get(pos + 1) {
             let port: u16 = port_str.parse().expect("valid port number");
-            run_tcp_server(port, capabilities, image_fixture, large_collection).await?;
+            run_tcp_server(
+                port,
+                capabilities,
+                image_fixture,
+                large_collection,
+                terminal_fixture,
+                terminal_spec,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -191,6 +241,19 @@ fn initialize_counter_session(
     (surface_id, text_id, progress_id, button_id)
 }
 
+fn initialize_terminal_fixture(session: &Arc<Session>, spec: TerminalSpec) {
+    let terminal_id = NodeId::new(30);
+    session
+        .create_terminal_node(terminal_id, NodeId::new(1), spec.clone())
+        .expect("initialize terminal fixture");
+    info!(
+        "Terminal fixture ready: node={} command={} ring_bytes={} (v1 has no redraw backend / tmux integration)",
+        terminal_id.get(),
+        spec.executable.display(),
+        spec.ring_capacity
+    );
+}
+
 async fn initialize_large_collection_fixture(session: &Arc<Session>) {
     let table_id = NodeId::new(10);
     let model_id = ModelId::new(1);
@@ -252,6 +315,8 @@ async fn run_unix_server(
     capabilities: ServerCapabilities,
     image_fixture: bool,
     large_collection: bool,
+    terminal_fixture: bool,
+    terminal_spec: TerminalSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -279,6 +344,9 @@ async fn run_unix_server(
     let _ = initialize_counter_session(&session, image_fixture);
     if large_collection {
         initialize_large_collection_fixture(&session).await;
+    }
+    if terminal_fixture {
+        initialize_terminal_fixture(&session, terminal_spec);
     }
 
     let shutdown = CancellationToken::new();
@@ -317,6 +385,8 @@ async fn run_tcp_server(
     capabilities: ServerCapabilities,
     image_fixture: bool,
     large_collection: bool,
+    terminal_fixture: bool,
+    terminal_spec: TerminalSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -336,6 +406,9 @@ async fn run_tcp_server(
     let _ = initialize_counter_session(&session, image_fixture);
     if large_collection {
         initialize_large_collection_fixture(&session).await;
+    }
+    if terminal_fixture {
+        initialize_terminal_fixture(&session, terminal_spec);
     }
 
     let shutdown = CancellationToken::new();

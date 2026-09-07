@@ -2,9 +2,16 @@ import AppKit
 import SemanticModel
 import Collections
 import Text
+import Terminal
 
 public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
+    case unnegotiatedTerminal(TypeRef)
+}
+
+/// Extension node kinds resolved from `ServerWelcome.extension_namespaces` (§15, §21).
+public enum ExtensionControlKind: Equatable, Sendable {
+    case terminal
 }
 
 /// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
@@ -51,18 +58,54 @@ public final class ControlFactory {
     public var resolveResourceImage: (@MainActor (ResourceHash) -> NSImage?)?
 
     public let textEditingSession: TextEditingSession
+    public let terminalSession: TerminalSession
+    public var onTerminalInput: (@MainActor (NodeId, Data) -> Void)?
+    public var onTerminalResize: (@MainActor (NodeId, UInt32, UInt32, UInt32, UInt32) -> Void)?
 
-    public init(textEditingSession: TextEditingSession = TextEditingSession()) {
+    private var extensionKinds: [TypeRef: ExtensionControlKind] = [:]
+
+    public init(
+        textEditingSession: TextEditingSession = TextEditingSession(),
+        terminalSession: TerminalSession = TerminalSession()
+    ) {
         self.textEditingSession = textEditingSession
+        self.terminalSession = terminalSession
         self.textEditingSession.onCommit = { [weak self] nodeID, text, seq, epoch in
             self?.onInteraction?(.textEdit(nodeID: nodeID, text: text, editSeq: seq, laneEpoch: epoch))
         }
+    }
+
+    public func registerExtension(typeRef: TypeRef, kind: ExtensionControlKind) throws {
+        guard typeRef.namespaceID != 0 else {
+            throw ControlFactoryError.unsupportedNodeType(typeRef)
+        }
+        if let existing = extensionKinds[typeRef], existing != kind {
+            throw ControlFactoryError.unsupportedNodeType(typeRef)
+        }
+        extensionKinds[typeRef] = kind
+    }
+
+    public func resetExtensionRegistry() {
+        extensionKinds.removeAll()
+    }
+
+    public func extensionKind(for typeRef: TypeRef) -> ExtensionControlKind? {
+        extensionKinds[typeRef]
     }
 
     public func makeHandle(for node: Node, store: SemanticStore? = nil) throws -> RenderHandle {
         let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
         var textAdapter: NativeTextEditorAdapter?
 
+        if let kind = extensionKinds[node.nodeType] {
+            switch kind {
+            case .terminal:
+                let view = makeTerminalView(for: node)
+                result = (view, nil, nil, nil)
+            }
+        } else if !node.nodeType.isStandard {
+            throw ControlFactoryError.unnegotiatedTerminal(node.nodeType)
+        } else {
         switch node.nodeType {
         case .surface:
             let contentView = NSStackView(frame: NSRect(x: 0, y: 0, width: 440, height: 320))
@@ -231,6 +274,7 @@ public final class ControlFactory {
 
         default:
             throw ControlFactoryError.unsupportedNodeType(node.nodeType)
+        }
         }
 
         if node.nodeType != .surface {
@@ -918,6 +962,39 @@ public final class ControlFactory {
         }
         NSLayoutConstraint.activate(constraints)
         handle.propertyConstraints[property] = constraints
+    }
+
+    private func makeTerminalView(for node: Node) -> TerminalView {
+        let view = TerminalView(nodeID: node.id)
+        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        view.heightAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
+        view.onInput = { [weak self] data in
+            self?.onTerminalInput?(node.id, data)
+        }
+        view.onResize = { [weak self] cols, rows, width, height in
+            Task { @MainActor in
+                await self?.terminalSession.resize(streamID: node.id, columns: Int(cols), rows: Int(rows))
+            }
+            self?.onTerminalResize?(node.id, cols, rows, width, height)
+        }
+        let session = terminalSession
+        let streamID = node.id
+        view.onAcknowledgeRedraw = {
+            Task { @MainActor in
+                await session.acknowledgeRedraw(streamID: streamID)
+            }
+        }
+        view.snapshotSubscriptionTask = Task { @MainActor [weak view] in
+            if let current = await session.snapshot(for: streamID) {
+                view?.apply(current)
+            }
+            for await snapshot in await session.snapshots(for: streamID) {
+                guard let view else { break }
+                view.apply(snapshot)
+            }
+        }
+        return view
     }
 
     private func spacing(for token: EnumToken?) -> CGFloat {

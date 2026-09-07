@@ -129,6 +129,32 @@ sequence; both sequence spaces restart with the new incarnation.
 
 ---
 
+## Terminal compatibility profile (§21, §21.2)
+
+`org.srui.terminal/1` is a negotiated extension profile, not a Namespace 0 widget.
+Local type ID `1` inside the session-assigned namespace is `Terminal`. The stream
+ID equals that node's `NodeId`. Clients MUST read the numeric namespace from
+`ServerWelcome.extension_namespaces` and MUST NOT assume it is `1`.
+
+| Envelope | Direction | Notes |
+|---|---|---|
+| `TerminalData` | Server → client | `byte_offset` is the absolute offset of `data[0]`. The resumable next offset is `byte_offset + data.size()` with checked `uint64` arithmetic. Empty frames are forbidden. |
+| `TerminalInput` | Client → server | Raw PTY bytes. Bounded by 65536 bytes. |
+| `TerminalResize` | Client → server | `columns`/`rows` in `[1, 512]`; pixel dimensions in `[0, 16384]`. |
+| `TerminalResyncRequired` | Server → client | `resume_at_offset` is where subsequent live data begins. Reasons distinguish retention loss, an offset ahead of the server, and a connected subscriber falling behind. |
+
+`ClientResume.terminal_stream_offsets` is independent of `pending_text_edits` and
+is capped at 256 entries. `TerminalResyncRequired` must not enter the semantic
+`ServerResyncRequired` path. Wrong-direction terminal messages are protocol
+errors. Terminal envelopes are legal only after successful terminal-profile
+negotiation.
+
+A session that emits a Terminal node marks `org.srui.terminal/1` required because
+v1 has no semantic fallback. Direct PTYs survive SRUI network detachment, but
+there is no automatic `tmux` redraw after the replay ring is lost.
+
+---
+
 ## Event Settlement (§18.2)
 
 `ServerEventAck.session_id` is **required and non-empty** on every acknowledgement. It names the

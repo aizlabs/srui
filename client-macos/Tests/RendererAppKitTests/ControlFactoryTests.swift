@@ -560,6 +560,24 @@ struct ControlFactoryTests {
     }
 
     @Test
+    func unnegotiatedExtensionTypeIsRejected() {
+        let typeRef = TypeRef(namespaceID: 4, localID: 1)
+        #expect(throws: ControlFactoryError.unnegotiatedTerminal(typeRef)) {
+            try ControlFactory().makeHandle(for: Node(id: 30, nodeType: typeRef))
+        }
+    }
+
+    @Test
+    func registeredTerminalTypeCreatesTerminalView() throws {
+        let factory = ControlFactory()
+        let typeRef = TypeRef(namespaceID: 2, localID: 1)
+        try factory.registerExtension(typeRef: typeRef, kind: .terminal)
+        let handle = try factory.makeHandle(for: Node(id: 30, nodeType: typeRef))
+        #expect(handle.view is TerminalView)
+        #expect((handle.view as? TerminalView)?.nodeID == NodeId(30))
+    }
+
+    @Test
     func hiddenRetainsLayoutSpaceWhileCollapsedRemovesIt() throws {
         let factory = ControlFactory()
         let hidden = try factory.makeHandle(for: Node(id: 1, nodeType: .text))

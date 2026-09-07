@@ -208,6 +208,58 @@
         ],
         "edit_seq": 3
       }
+    },
+    "golden_terminal_data": {
+      "file": "golden_terminal_data.bin",
+      "sha256": "382a5f2a8366a89724fb1796a16396a22a0ac25107b52cb5548a331fde24dac6",
+      "hex": "0f620d08071080201a067074792d6f6b",
+      "byte_length": 16,
+      "expected": {
+        "msg_type": "terminal_data",
+        "stream_id": 7,
+        "byte_offset": 4096,
+        "data": "pty-ok"
+      }
+    },
+    "golden_terminal_input": {
+      "file": "golden_terminal_input.bin",
+      "sha256": "2e3411384a04e15d1f75fa52457cab6c0c7740e63852223155bbf1eea78c76df",
+      "hex": "096a07080712036c730a",
+      "byte_length": 10,
+      "expected": {
+        "msg_type": "terminal_input",
+        "stream_id": 7,
+        "data": "ls\n"
+      }
+    },
+    "golden_terminal_resize": {
+      "file": "golden_terminal_resize.bin",
+      "sha256": "12f461d18bc1331d3e9a8001b05ae5fa935a581d91bedcf4cccf6e248eda0c96",
+      "hex": "0e720c08071050181820800a28d005",
+      "byte_length": 15,
+      "expected": {
+        "msg_type": "terminal_resize",
+        "stream_id": 7,
+        "columns": 80,
+        "rows": 24,
+        "pixel_width": 1280,
+        "pixel_height": 720
+      }
+    },
+    "golden_terminal_resync_required": {
+      "file": "golden_terminal_resync_required.bin",
+      "sha256": "1f826811692561625db046f8a80620bd4eada086121d6a620df526d3d3a9d301",
+      "hex": "0d7a0b08071064184020f0012801",
+      "byte_length": 14,
+      "expected": {
+        "msg_type": "terminal_resync_required",
+        "stream_id": 7,
+        "requested_offset": 100,
+        "retained_from_offset": 64,
+        "resume_at_offset": 240,
+        "reason": 1,
+        "reason_name": "RETENTION_LOSS"
+      }
     }
   },
   "malformed_vectors": {
@@ -238,6 +290,20 @@
       "hex": "2b3a290a09636c69656e742d3239101f1a106261642d61637469766174652d73657120292807320210014001",
       "byte_length": 44,
       "expected_error": "event error: only TEXT_EDIT may carry edit_seq"
+    },
+    "malformed_terminal_input_empty": {
+      "file": "malformed_terminal_input_empty.bin",
+      "sha256": "e70419beb0759983edc784597b3b0799629a04745a30d44873974d2ab68f29f3",
+      "hex": "046a020814",
+      "byte_length": 5,
+      "expected_error": "empty TerminalInput is forbidden"
+    },
+    "malformed_terminal_data_empty": {
+      "file": "malformed_terminal_data_empty.bin",
+      "sha256": "8104218b0256d368dc2817c4bb9841a592b02ff1c42a259f361438d54f5a8e29",
+      "hex": "0762050814108020",
+      "byte_length": 8,
+      "expected_error": "empty TerminalData frame is forbidden"
     }
   }
 }

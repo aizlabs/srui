@@ -18,6 +18,12 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 | `malformed_truncated_frame.bin` | Truncated length-prefixed frame rejection check |
 | `malformed_text_edit_zero_edit_seq.bin` | Protobuf-valid `TEXT_EDIT` rejected during semantic conversion because `edit_seq == 0` |
 | `malformed_activate_nonzero_edit_seq.bin` | Protobuf-valid non-text event rejected during semantic conversion because `edit_seq != 0` |
+| `golden_terminal_data.bin` | Length-prefixed framed `SruiMessage` containing a `TerminalData` output frame (§21) |
+| `golden_terminal_input.bin` | Length-prefixed framed `SruiMessage` containing a `TerminalInput` keystroke frame (§21) |
+| `golden_terminal_resize.bin` | Length-prefixed framed `SruiMessage` containing a `TerminalResize` (TIOCSWINSZ) frame (§21) |
+| `golden_terminal_resync_required.bin` | Length-prefixed framed `SruiMessage` containing a `TerminalResyncRequired` with `RETENTION_LOSS` (§21.2) |
+| `malformed_terminal_input_empty.bin` | Protobuf-valid `TerminalInput` rejected at the wire boundary because it carries no payload (§21, §26) |
+| `malformed_terminal_data_empty.bin` | Protobuf-valid `TerminalData` rejected by the client apply path because it carries no payload (§21, §26) |
 
 See `expected.json` for canonical hex and field declarations.
 

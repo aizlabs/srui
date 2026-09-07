@@ -142,6 +142,7 @@ struct SSHTransportPersistenceIntegrationTests {
         try await controllerA.start()
         try await AsyncTestSupport.eventually(description: "connection A initial revision over SSH") {
             applierA.lastAppliedRevision == Revision(1)
+                && controllerA.isEventDispatchEnabled
         }
 
         let buttonID = NodeId(4)
@@ -185,7 +186,8 @@ struct SSHTransportPersistenceIntegrationTests {
 
         try await controllerB.start()
         try await AsyncTestSupport.eventually(description: "connection B receives preserved state over SSH") {
-            guard applierB.lastAppliedRevision == Revision(4) else {
+            guard applierB.lastAppliedRevision == Revision(4),
+                  controllerB.isEventDispatchEnabled else {
                 return false
             }
             guard let textHandle = rendererB.registry.handle(for: textID),

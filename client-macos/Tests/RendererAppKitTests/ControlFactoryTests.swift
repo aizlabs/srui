@@ -114,6 +114,7 @@ struct ControlFactoryTests {
             let field = try #require(handle.view as? NSTextField)
             #expect(field.isEditable)
             #expect(field.isBezeled)
+            #expect(handle.textAdapter != nil)
 
         case .textArea:
             let scroll = try #require(handle.view as? NSScrollView)
@@ -121,6 +122,7 @@ struct ControlFactoryTests {
             let textView = try #require(scroll.documentView as? NSTextView)
             #expect(textView.isEditable)
             #expect(textView.isRichText == false)
+            #expect(handle.textAdapter != nil)
 
         case .progress:
             let progress = try #require(handle.view as? NSProgressIndicator)

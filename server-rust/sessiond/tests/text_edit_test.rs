@@ -1,0 +1,926 @@
+//! Authoritative `TEXT_EDIT` processing: sequence watermarks, policy, and generation barriers
+//! (§18.3, §22.6, §26, §27).
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+
+use srui_protocol::{ClientResume, Event as WireEvent};
+use srui_sdk::{Surface, TextInput, TEXT_EDIT};
+use srui_semantic_tree::{
+    EditSeq, Event as DomainEvent, EventValidationError, NodeId, Operation, PropertyRef,
+    StandardValidationState, Transaction as DomainTransaction, Value,
+};
+use srui_sessiond::{
+    EventOutcome, LogicalChannelClass, ResumeOutcome, Session, SessionConfig, SessionError,
+    TextEditDecision, MAX_TEXT_EDIT_STREAMS,
+};
+
+const CLIENT: &[u8] = b"text-client";
+const EDITOR: u64 = 2;
+
+fn seed_editor(session: &Session) {
+    session
+        .transaction(|ui| {
+            Surface::builder(1).label("Editor").create(ui)?;
+            TextInput::builder(EDITOR).parent(1).value("").create(ui)?;
+            Ok(())
+        })
+        .expect("seed text input");
+}
+
+fn edit_seq(n: u64) -> EditSeq {
+    EditSeq::new(n).expect("positive edit_seq")
+}
+
+fn text_edit(event_seq: u64, event_id: &str, text: &str, seq: u64) -> WireEvent {
+    DomainEvent::text_edit(event_seq, event_id, 0u64, EDITOR, text, edit_seq(seq))
+        .with_client_instance_id(CLIENT.to_vec())
+        .to_wire()
+}
+
+fn editor_value(session: &Session) -> String {
+    session.with_store(|store| {
+        store
+            .get_node(NodeId::new(EDITOR))
+            .and_then(|node| {
+                node.get_property(PropertyRef::VALUE)
+                    .and_then(Value::as_string)
+            })
+            .unwrap_or("")
+            .to_string()
+    })
+}
+
+fn editor_validation(session: &Session) -> Option<StandardValidationState> {
+    session.with_store(|store| {
+        store
+            .get_node(NodeId::new(EDITOR))
+            .and_then(|node| node.get_property(PropertyRef::VALIDATION_STATE))
+            .and_then(Value::as_enum_token)
+            .and_then(|token| StandardValidationState::try_from(token).ok())
+    })
+}
+
+#[test]
+fn duplicate_gap_and_stale_edit_sequences() {
+    let session = Session::new("text-seq");
+    seed_editor(&session);
+
+    let first = text_edit(1, "e1", "one", 1);
+    match session.process_event(&first).expect("seq 1") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("expected processed, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "one");
+
+    match session.process_event(&first).expect("duplicate 1") {
+        EventOutcome::Duplicate { accepted: true, .. } => {}
+        other => panic!("expected idempotent duplicate, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "one");
+
+    let gap = text_edit(2, "e3", "three", 3);
+    match session.process_event(&gap).expect("seq 3") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("expected gap accepted, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "three");
+
+    let stale = text_edit(3, "e2", "two", 2);
+    match session.process_event(&stale).expect("seq 2") {
+        EventOutcome::Rejected {
+            error:
+                EventValidationError::StaleEditSeq {
+                    observed: 2,
+                    watermark: 3,
+                },
+            ..
+        } => {}
+        other => panic!("expected stale rejection, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "three");
+}
+
+#[test]
+fn older_validation_cannot_publish_after_newer_generation() {
+    let session = Session::new("text-generation");
+    seed_editor(&session);
+
+    let first_entered = Arc::new(Barrier::new(2));
+    let release_old = Arc::new(Barrier::new(2));
+
+    session.on_text_edit({
+        let first_entered = Arc::clone(&first_entered);
+        let release_old = Arc::clone(&release_old);
+        move |_, request| {
+            if request.edit_seq.get() == 1 {
+                first_entered.wait();
+                release_old.wait();
+            }
+            TextEditDecision::Accept
+        }
+    });
+
+    let session_old = session.clone();
+    let old =
+        thread::spawn(move || session_old.process_event(&text_edit(1, "old", "old-value", 1)));
+
+    first_entered.wait();
+
+    let newer = session
+        .process_event(&text_edit(2, "new", "new-value", 2))
+        .expect("newer edit");
+    match newer {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("expected newer edit processed, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "new-value");
+
+    release_old.wait();
+    let older = old.join().expect("old thread").expect("old result");
+    match older {
+        EventOutcome::Rejected {
+            error: EventValidationError::SupersededGeneration,
+            ..
+        } => {}
+        other => panic!("expected older generation rejected, got {other:?}"),
+    }
+    assert_eq!(
+        editor_value(&session),
+        "new-value",
+        "older validator must not overwrite the newer published value"
+    );
+}
+
+#[test]
+fn in_flight_higher_edit_sequence_rejects_lower_concurrent_edit() {
+    let session = Session::new("text-in-flight-watermark");
+    seed_editor(&session);
+
+    let high_entered = Arc::new(Barrier::new(2));
+    let release_high = Arc::new(Barrier::new(2));
+    session.on_text_edit({
+        let high_entered = Arc::clone(&high_entered);
+        let release_high = Arc::clone(&release_high);
+        move |_, request| {
+            if request.edit_seq == edit_seq(2) {
+                high_entered.wait();
+                release_high.wait();
+            }
+            TextEditDecision::Accept
+        }
+    });
+
+    let high_session = session.clone();
+    let high = thread::spawn(move || high_session.process_event(&text_edit(1, "high", "two", 2)));
+    high_entered.wait();
+
+    match session
+        .process_event(&text_edit(2, "lower", "one", 1))
+        .expect("lower edit settles")
+    {
+        EventOutcome::Rejected {
+            error:
+                EventValidationError::StaleEditSeq {
+                    observed: 1,
+                    watermark: 2,
+                },
+            ..
+        } => {}
+        other => panic!("expected in-flight watermark rejection, got {other:?}"),
+    }
+
+    release_high.wait();
+    match high.join().expect("high thread").expect("high edit") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("expected higher edit processed, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "two");
+}
+
+#[test]
+fn reject_publishes_error_validation_and_authoritative_value() {
+    let session = Session::new("text-reject");
+    seed_editor(&session);
+    let mut receiver = session
+        .subscribe_transactions(CLIENT.to_vec())
+        .expect("subscribe before rejection");
+    session.on_text_edit(|_, _| TextEditDecision::Reject {
+        value: Some("corrected".into()),
+        reason: "not allowed".into(),
+    });
+
+    match session
+        .process_event(&text_edit(1, "bad", "nope", 1))
+        .expect("reject")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::PolicyRejected(reason),
+            ..
+        } => assert_eq!(reason, "not allowed"),
+        other => panic!("expected policy rejection, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "corrected");
+    assert_eq!(
+        editor_validation(&session),
+        Some(StandardValidationState::Error)
+    );
+
+    let published = receiver
+        .try_recv_class(LogicalChannelClass::Ui)
+        .expect("receive correction")
+        .expect("published correction transaction")
+        .into_transaction()
+        .expect("UI transaction");
+    let published = DomainTransaction::try_from(published).expect("valid correction transaction");
+    assert_eq!(
+        published.operations,
+        vec![
+            Operation::SetProperty {
+                id: NodeId::new(EDITOR),
+                property: PropertyRef::VALUE,
+                value: Value::String("corrected".into()),
+            },
+            Operation::SetProperty {
+                id: NodeId::new(EDITOR),
+                property: PropertyRef::VALIDATION_STATE,
+                value: Value::EnumToken(StandardValidationState::Error.into()),
+            },
+        ],
+        "the authoritative correction and validation state must reach the outbound UI lane"
+    );
+}
+
+#[test]
+fn policy_panic_abandons_reservation_and_allows_identical_retry() {
+    let session = Session::new("text-policy-panic-retry");
+    seed_editor(&session);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    session.on_text_edit({
+        let attempts = Arc::clone(&attempts);
+        move |_, _| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("policy failed once");
+            }
+            TextEditDecision::Accept
+        }
+    });
+
+    let event = text_edit(1, "retry", "eventually accepted", 1);
+    match session.process_event(&event) {
+        Err(SessionError::Panicked(reason)) => assert_eq!(reason, "policy failed once"),
+        other => panic!("expected caught policy panic, got {other:?}"),
+    }
+    match session.process_event(&event).expect("identical retry") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("abandoned reservation must allow retry, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "eventually accepted");
+}
+
+#[test]
+fn default_policy_accepts_and_marks_valid() {
+    let session = Session::new("text-accept");
+    seed_editor(&session);
+    match session
+        .process_event(&text_edit(1, "ok", "hello", 1))
+        .expect("accept")
+    {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("expected processed, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "hello");
+    assert_eq!(
+        editor_validation(&session),
+        Some(StandardValidationState::Valid)
+    );
+}
+
+#[test]
+fn deleted_editor_reclaims_monotonicity_state() {
+    let session = Session::new("text-reclaim");
+    seed_editor(&session);
+    session
+        .process_event(&text_edit(1, "first", "keep", 1))
+        .expect("first edit");
+
+    session
+        .transaction(|ui| {
+            ui.delete(NodeId::new(EDITOR))?;
+            Ok(())
+        })
+        .expect("delete editor");
+
+    match session
+        .process_event(&text_edit(2, "gone", "stale", 2))
+        .expect("deleted target")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::NodeNotFound(id),
+            ..
+        } => assert_eq!(id, NodeId::new(EDITOR)),
+        other => panic!("deleted editor must reject TEXT_EDIT, got {other:?}"),
+    }
+
+    // NodeIds are never reused in a session (§6.2). Reclaiming the stream must free the
+    // tracker slot so a *new* editor identity can start at edit_seq 1.
+    const NEW_EDITOR: u64 = 3;
+    session
+        .transaction(|ui| {
+            TextInput::builder(NEW_EDITOR)
+                .parent(1)
+                .value("")
+                .create(ui)?;
+            Ok(())
+        })
+        .expect("create replacement editor");
+
+    let fresh = DomainEvent::text_edit(3, "again", 0u64, NEW_EDITOR, "fresh", edit_seq(1))
+        .with_client_instance_id(CLIENT.to_vec())
+        .to_wire();
+    match session.process_event(&fresh).expect("new editor stream") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("new editor must accept edit_seq 1, got {other:?}"),
+    }
+    assert_eq!(
+        session.with_store(|store| {
+            store
+                .get_node(NodeId::new(NEW_EDITOR))
+                .and_then(|node| {
+                    node.get_property(PropertyRef::VALUE)
+                        .and_then(Value::as_string)
+                })
+                .unwrap_or("")
+                .to_string()
+        }),
+        "fresh"
+    );
+}
+
+#[test]
+fn tracker_full_refuses_a_new_editor_stream() {
+    let session = Session::new("text-full");
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            for id in 0..MAX_TEXT_EDIT_STREAMS {
+                TextInput::builder((id as u64) + 2)
+                    .parent(1)
+                    .value("")
+                    .create(ui)?;
+            }
+            Ok(())
+        })
+        .expect("seed full set of editors");
+
+    for id in 0..MAX_TEXT_EDIT_STREAMS {
+        let node = (id as u64) + 2;
+        let event = DomainEvent::text_edit(
+            id as u64 + 1,
+            format!("id-{id}"),
+            0u64,
+            node,
+            "x",
+            edit_seq(1),
+        )
+        .with_client_instance_id(CLIENT.to_vec())
+        .to_wire();
+        match session.process_event(&event).expect("fill") {
+            EventOutcome::Processed { .. } => {}
+            other => panic!("expected processed while filling tracker, got {other:?}"),
+        }
+    }
+
+    session
+        .transaction(|ui| {
+            TextInput::builder((MAX_TEXT_EDIT_STREAMS as u64) + 2)
+                .parent(1)
+                .value("")
+                .create(ui)?;
+            Ok(())
+        })
+        .expect("one more editor");
+
+    let overflow = DomainEvent::text_edit(
+        MAX_TEXT_EDIT_STREAMS as u64 + 1,
+        "overflow",
+        0u64,
+        (MAX_TEXT_EDIT_STREAMS as u64) + 2,
+        "x",
+        edit_seq(1),
+    )
+    .with_client_instance_id(CLIENT.to_vec())
+    .to_wire();
+    match session.process_event(&overflow).expect("overflow") {
+        EventOutcome::Rejected {
+            error: EventValidationError::TextTrackerFull { limit },
+            ..
+        } => assert_eq!(limit, MAX_TEXT_EDIT_STREAMS),
+        other => panic!("expected tracker full, got {other:?}"),
+    }
+
+    session
+        .transaction(|ui| {
+            ui.delete(NodeId::new(2))?;
+            Ok(())
+        })
+        .expect("reclaim one editor stream");
+
+    let replacement_id = (MAX_TEXT_EDIT_STREAMS as u64) + 2;
+    let retry = DomainEvent::text_edit(
+        MAX_TEXT_EDIT_STREAMS as u64 + 2,
+        "after-reclaim",
+        0u64,
+        replacement_id,
+        "reclaimed",
+        edit_seq(1),
+    )
+    .with_client_instance_id(CLIENT.to_vec())
+    .to_wire();
+    match session.process_event(&retry).expect("after reclaim") {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("deleting an editor must free a tracker slot, got {other:?}"),
+    }
+    assert_eq!(
+        session.with_store(|store| {
+            store
+                .get_node(NodeId::new(replacement_id))
+                .and_then(|node| {
+                    node.get_property(PropertyRef::VALUE)
+                        .and_then(Value::as_string)
+                })
+                .unwrap_or("")
+                .to_string()
+        }),
+        "reclaimed"
+    );
+}
+
+#[test]
+fn non_text_event_with_edit_seq_is_rejected_at_the_wire_boundary() {
+    let session = Session::new("text-invalid-seq");
+    seed_editor(&session);
+    let mut activate =
+        DomainEvent::activate(1, "act", 0u64, EDITOR).with_client_instance_id(CLIENT.to_vec());
+    activate.edit_seq = Some(edit_seq(1));
+    let wire = activate.to_wire();
+
+    match session
+        .process_event(&wire)
+        .expect("malformed event settles")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::PolicyRejected(reason),
+            ..
+        } => assert!(reason.contains("malformed event:")),
+        other => panic!("expected malformed rejection, got {other:?}"),
+    }
+    assert!(matches!(
+        session.process_event(&wire),
+        Ok(EventOutcome::Duplicate {
+            accepted: false,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn correct_policy_publishes_supplied_value() {
+    let session = Session::new("text-correct");
+    seed_editor(&session);
+    session.on_text_edit(|_, request| TextEditDecision::Correct {
+        value: request.value.trim().to_string(),
+        validation: StandardValidationState::Warning,
+    });
+    match session
+        .process_event(&text_edit(1, "trim", "  hi  ", 1))
+        .expect("correct")
+    {
+        EventOutcome::Processed { .. } => {}
+        other => panic!("expected processed correction, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "hi");
+    assert_eq!(
+        editor_validation(&session),
+        Some(StandardValidationState::Warning)
+    );
+}
+
+#[test]
+fn deleted_editor_during_policy_settles_instead_of_stranding() {
+    let session = Session::new("text-delete-during-policy");
+    seed_editor(&session);
+
+    let first_entered = Arc::new(Barrier::new(2));
+    let release_old = Arc::new(Barrier::new(2));
+
+    session.on_text_edit({
+        let first_entered = Arc::clone(&first_entered);
+        let release_old = Arc::clone(&release_old);
+        move |_, _| {
+            first_entered.wait();
+            release_old.wait();
+            TextEditDecision::Accept
+        }
+    });
+
+    let event = text_edit(1, "doomed", "gone", 1);
+    let session_old = session.clone();
+    let event_for_thread = event.clone();
+    let worker = thread::spawn(move || session_old.process_event(&event_for_thread));
+
+    first_entered.wait();
+    session
+        .transaction(|ui| {
+            ui.delete(NodeId::new(EDITOR))?;
+            Ok(())
+        })
+        .expect("delete editor while policy runs");
+    release_old.wait();
+
+    let outcome = worker.join().expect("worker").expect("settled outcome");
+    match outcome {
+        EventOutcome::Rejected {
+            error: EventValidationError::NodeNotFound(_) | EventValidationError::StaleEditSeq { .. },
+            ..
+        } => {}
+        other => panic!("expected settled rejection, got {other:?}"),
+    }
+
+    match session.process_event(&event).expect("replay after settle") {
+        EventOutcome::Duplicate {
+            accepted: false, ..
+        } => {}
+        other => panic!("replay must be answered from the result cache, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_text_edit_supersedes_the_outer_policy_generation() {
+    let session = Session::new("text-reentrant-policy");
+    seed_editor(&session);
+
+    session.on_text_edit(|session, request| {
+        if request.edit_seq == edit_seq(1) {
+            match session
+                .process_event(&text_edit(2, "nested", "inner", 2))
+                .expect("nested edit")
+            {
+                EventOutcome::Processed { .. } => {}
+                other => panic!("nested edit must process, got {other:?}"),
+            }
+        }
+        TextEditDecision::Accept
+    });
+
+    match session
+        .process_event(&text_edit(1, "outer", "outer", 1))
+        .expect("outer settles")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::SupersededGeneration,
+            ..
+        } => {}
+        other => panic!("outer edit must be superseded, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "inner");
+}
+
+#[test]
+fn disabling_editor_during_policy_rejects_without_publishing() {
+    let session = Session::new("text-disable-during-policy");
+    seed_editor(&session);
+
+    session.on_text_edit(|session, request| {
+        session
+            .transaction(|ui| {
+                ui.set(request.node_id, PropertyRef::ENABLED, Value::Bool(false))?;
+                Ok(())
+            })
+            .expect("disable editor while policy runs");
+        TextEditDecision::Accept
+    });
+
+    match session
+        .process_event(&text_edit(1, "disabled", "should-not-land", 5))
+        .expect("settled")
+    {
+        EventOutcome::Rejected {
+            error: EventValidationError::NodeDisabled(id),
+            ..
+        } => assert_eq!(id, NodeId::new(EDITOR)),
+        other => panic!("expected NodeDisabled, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "");
+
+    session.clear_text_edit_policy();
+    session
+        .transaction(|ui| {
+            ui.set(NodeId::new(EDITOR), PropertyRef::ENABLED, Value::Bool(true))?;
+            Ok(())
+        })
+        .expect("re-enable editor");
+
+    match session
+        .process_event(&text_edit(2, "stale-after-reject", "must-not-land", 4))
+        .expect("stale edit settles")
+    {
+        EventOutcome::Rejected {
+            error:
+                EventValidationError::StaleEditSeq {
+                    observed: 4,
+                    watermark: 5,
+                },
+            ..
+        } => {}
+        other => panic!("rejected reservation must advance the terminal watermark, got {other:?}"),
+    }
+    assert_eq!(editor_value(&session), "");
+}
+
+#[test]
+fn registered_text_edit_handler_fires_once_for_an_accepted_edit() {
+    let session = Session::new("registered-text-handler");
+    seed_editor(&session);
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(NodeId::new(EDITOR), TEXT_EDIT, move |session, _| {
+        assert_eq!(
+            editor_value(session),
+            "accepted",
+            "registered handlers must observe the authoritative edit"
+        );
+        session
+            .transaction(|ui| {
+                ui.set(
+                    NodeId::new(EDITOR),
+                    PropertyRef::VALUE,
+                    Value::String("handler override".into()),
+                )?;
+                Ok(())
+            })
+            .expect("handler override");
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let event = text_edit(1, "registered-handler", "accepted", 1);
+    match session.process_event(&event) {
+        Ok(EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        }) => {
+            assert_eq!(
+                revision_after_effect, 3,
+                "the ACK includes the registered handler's transaction"
+            );
+            assert_eq!(last_processed_event_seq, 1);
+        }
+        other => panic!("expected processed edit, got {other:?}"),
+    }
+    assert_eq!(session.current_revision(), 3);
+    assert_eq!(editor_value(&session), "handler override");
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    match session
+        .process_event(&event)
+        .expect("replay reads the accepted result cache")
+    {
+        EventOutcome::Duplicate {
+            accepted: true,
+            revision_after_effect,
+            last_processed_event_seq,
+            reject_reason,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+            assert!(reject_reason.is_empty());
+        }
+        other => panic!("expected accepted duplicate, got {other:?}"),
+    }
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "a settled replay must not dispatch the registered handler again"
+    );
+}
+
+#[test]
+fn registered_text_edit_handler_panic_settles_the_already_committed_edit() {
+    let session = Session::new("registered-text-handler-panic");
+    seed_editor(&session);
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(NodeId::new(EDITOR), TEXT_EDIT, move |session, _| {
+        session
+            .transaction(|ui| {
+                ui.set(
+                    NodeId::new(EDITOR),
+                    PropertyRef::VALUE,
+                    Value::String("handler before panic".into()),
+                )?;
+                Ok(())
+            })
+            .expect("handler transaction before panic");
+        counter.fetch_add(1, Ordering::SeqCst);
+        panic!("registered handler failed");
+    });
+
+    let event = text_edit(1, "registered-handler-panic", "committed", 1);
+    assert!(matches!(
+        session.process_event(&event),
+        Err(SessionError::Panicked(message)) if message == "registered handler failed"
+    ));
+    assert_eq!(session.current_revision(), 3);
+    assert_eq!(editor_value(&session), "handler before panic");
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    session.clear_handlers();
+    match session
+        .process_event(&event)
+        .expect("replay reads the accepted result cache")
+    {
+        EventOutcome::Duplicate {
+            accepted: true,
+            revision_after_effect,
+            last_processed_event_seq,
+            reject_reason,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+            assert!(reject_reason.is_empty());
+        }
+        other => panic!("expected accepted duplicate after panic, got {other:?}"),
+    }
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "replay after post-commit panic must not run the handler or commit again"
+    );
+}
+
+#[test]
+fn committed_edit_survives_editor_reclamation_and_resume_until_handler_finishes() {
+    let session = Session::with_config(
+        "registered-handler-resume-race",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    seed_editor(&session);
+
+    let handler_entered = Arc::new(Barrier::new(2));
+    let release_handler = Arc::new(Barrier::new(2));
+    let invocations = Arc::new(AtomicUsize::new(0));
+    session.on(NodeId::new(EDITOR), TEXT_EDIT, {
+        let handler_entered = Arc::clone(&handler_entered);
+        let release_handler = Arc::clone(&release_handler);
+        let invocations = Arc::clone(&invocations);
+        move |session, _| {
+            invocations.fetch_add(1, Ordering::SeqCst);
+            session
+                .transaction(|ui| {
+                    ui.delete(NodeId::new(EDITOR))?;
+                    Ok(())
+                })
+                .expect("handler deletes the editor");
+            handler_entered.wait();
+            release_handler.wait();
+        }
+    });
+
+    let event = text_edit(1, "resume-cancel-race", "committed-before-handler", 1);
+    let event_for_worker = event.clone();
+    let worker_session = session.clone();
+    let worker = thread::spawn(move || worker_session.process_event(&event_for_worker));
+
+    handler_entered.wait();
+    assert!(session.with_store(|store| store.get_node(NodeId::new(EDITOR)).is_none()));
+
+    let pending_ref = srui_protocol::PendingTextEditRef {
+        node_id: EDITOR,
+        edit_seq: 1,
+        event_seq: 1,
+        event_id: b"resume-cancel-race".to_vec(),
+    };
+    let make_resume = |pending_text_edits| ClientResume {
+        session_id: session.session_id(),
+        client_instance_id: CLIENT.to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits,
+    };
+
+    let mut wrong_sequence = pending_ref.clone();
+    wrong_sequence.event_seq = 2;
+    let wrong_sequence_bootstrap = session
+        .bootstrap_resume(&make_resume(vec![wrong_sequence.clone()]))
+        .expect("a malformed pending ref must not make resume connection-fatal");
+    let ResumeOutcome::Resync {
+        resync_msg: wrong_sequence_resync,
+        ..
+    } = wrong_sequence_bootstrap.outcome
+    else {
+        panic!("journal gap must force resync");
+    };
+    assert_eq!(
+        wrong_sequence_resync.discarded_text_edits,
+        vec![wrong_sequence]
+    );
+    assert_eq!(wrong_sequence_resync.last_processed_event_seq, 0);
+
+    let mut wrong_node = pending_ref.clone();
+    wrong_node.node_id = EDITOR + 1;
+    let wrong_node_bootstrap = session
+        .bootstrap_resume(&make_resume(vec![wrong_node.clone()]))
+        .expect("an unauthenticated node/edit pair must not make resume connection-fatal");
+    let ResumeOutcome::Resync {
+        resync_msg: wrong_node_resync,
+        ..
+    } = wrong_node_bootstrap.outcome
+    else {
+        panic!("journal gap must force resync");
+    };
+    assert_eq!(wrong_node_resync.discarded_text_edits, vec![wrong_node]);
+    assert_eq!(wrong_node_resync.last_processed_event_seq, 0);
+    assert!(matches!(
+        session.process_event(&event),
+        Ok(EventOutcome::Pending {
+            last_processed_event_seq: 0
+        })
+    ));
+
+    let bootstrap = session
+        .bootstrap_resume(&make_resume(vec![pending_ref.clone()]))
+        .expect("same-session resync discards the client's exact pending identity");
+    match &bootstrap.outcome {
+        ResumeOutcome::Resync {
+            resync_msg,
+            snapshot_transaction,
+        } => {
+            assert_eq!(
+                resync_msg.discarded_text_edits,
+                vec![pending_ref],
+                "the client still discards its local copy during full resync"
+            );
+            assert_eq!(
+                resync_msg.last_processed_event_seq, 0,
+                "the receive frontier cannot advance before handlers finish"
+            );
+            assert_eq!(snapshot_transaction.new_revision, 3);
+        }
+        ResumeOutcome::Replay { .. } => panic!("journal gap must force resync"),
+    }
+    assert!(matches!(
+        session.process_event(&event),
+        Ok(EventOutcome::Pending {
+            last_processed_event_seq: 0
+        })
+    ));
+
+    release_handler.wait();
+    let original = worker.join().expect("worker").expect("terminal outcome");
+    match original {
+        EventOutcome::Processed {
+            revision_after_effect,
+            last_processed_event_seq,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+        }
+        other => panic!("authoritative commit must remain accepted, got {other:?}"),
+    }
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(session.current_revision(), 3);
+    assert!(session.with_store(|store| store.get_node(NodeId::new(EDITOR)).is_none()));
+
+    match session
+        .process_event(&event)
+        .expect("replay reads result cache")
+    {
+        EventOutcome::Duplicate {
+            accepted: true,
+            revision_after_effect,
+            last_processed_event_seq,
+            reject_reason,
+        } => {
+            assert_eq!(revision_after_effect, 3);
+            assert_eq!(last_processed_event_seq, 1);
+            assert!(reject_reason.is_empty());
+        }
+        other => panic!("replay must preserve cached acceptance, got {other:?}"),
+    }
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        1,
+        "replay must not dispatch the already-run notification"
+    );
+}

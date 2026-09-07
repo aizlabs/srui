@@ -58,6 +58,11 @@ Tests in **Rust** (`server-rust/protocol/tests/conformance_test.rs`), **Swift** 
 2. **Encode Conformance**: Messages constructed from scratch in Rust and Swift serialize to bit-for-bit identical binary bytes matching `expected.json["hex"]`.
 3. **Roundtrip Re-encode**: Decoded messages re-encode to the exact golden fixture bytes.
 
+The event vectors include a canonical whole-value `TEXT_EDIT` and two protobuf-valid envelopes
+that semantic conversion must reject: `TEXT_EDIT` with `edit_seq == 0`, and a non-text event
+with `edit_seq != 0`. This distinguishes framing/protobuf conformance from the §18.3 event
+invariant.
+
 ---
 
 ## Standard Registry & Operation Wire Tags
@@ -91,6 +96,36 @@ separate field there would be redundant state a peer could contradict. Both resp
   replaying any of them, resets its outbox to the reported frontier, and applies the snapshot.
 - `SESSION_CONTINUITY_UNSPECIFIED` (or any unrecognized value) is a required-semantics failure
   (§4 inv. 13): the client fails the session rather than assuming either outcome.
+
+---
+
+## Native text editing (§18.3, §22.6)
+
+`TEXT_EDIT` travels on the existing `Event` transport. Immediate glyph, caret, selection, IME,
+clipboard, and spellcheck feedback stay in the platform text system; SRUI does not add a
+spellcheck protocol.
+
+**Whole-value encoding.** Each committed local edit carries the current string in
+`arguments[TEXT]`. There is no delta encoding in v0.1.
+
+**`edit_seq`.** A positive `Event.edit_seq` is required on `TEXT_EDIT` and MUST be zero on every
+other event type. The sequence is monotonic per `(session_id, client_instance_id, node_id)`. The
+client increments it for every committed local edit; coalescing may skip values. Global
+`event_seq` is allocated only when a coalesced edit enters the outbox, so `event_seq` stays
+contiguous even when `edit_seq` has gaps. `edit_seq == 0` is absent on the wire.
+
+**Resume.** `ClientResume.pending_text_edits` lists every assigned, unacknowledged `TEXT_EDIT`
+(`event_id`, `event_seq`, `node_id`, `edit_seq`). `SERVER RESUME_OK` ignores that list: the client
+replays assigned events byte-for-byte, then promotes the newest coalesced unsent draft.
+
+**Forced same-session resync.** Before capturing the snapshot, the server settles each declared
+text-event identity in the event-deduplication window (so removing them cannot open a global
+`event_seq` gap), records discard watermarks, and echoes the exact refs in
+`ServerResyncRequired.discarded_text_edits`. The client verifies the echo, selectively removes
+those text events, marks their global sequences settled, discards unsent drafts, replays only
+ordinary pending events, then applies the snapshot. A missing or mismatched echo fails closed.
+Replacement resync (`SESSION_CONTINUITY_REPLACED`) abandons every old event and text-edit
+sequence; both sequence spaces restart with the new incarnation.
 
 ---
 

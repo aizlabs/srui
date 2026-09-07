@@ -1,6 +1,6 @@
 //! # SRUI Event Deduplication
 //!
-//! Provides sliding-window deduplication for incoming client events (§18.2, §20.2, §21, §32.4).
+//! Provides sliding-window deduplication for incoming client events (§18.2, §18.3, §20.2, §21, §32.4).
 //! Enforces bounded memory limits per client to prevent memory exhaustion.
 //!
 //! The window doubles as the bounded **event result cache** of Appendix B:
@@ -46,6 +46,12 @@ pub enum EventSequenceError {
     ReplaySequenceMismatch {
         expected_event_seq: u64,
         received_event_seq: u64,
+    },
+
+    #[error("event replay changed event_type from {expected:?} to {received:?}")]
+    ReplayEventTypeMismatch {
+        expected: Option<(u32, u32)>,
+        received: Option<(u32, u32)>,
     },
 
     #[error("event_seq {event_seq} is already assigned to another event_id")]
@@ -112,9 +118,11 @@ pub struct EventDeduplicator {
 enum EventRecord {
     InFlight {
         event_seq: u64,
+        event_type: Option<(u32, u32)>,
     },
     Settled {
         event_seq: u64,
+        event_type: Option<(u32, u32)>,
         outcome: EventOutcomeRecord,
     },
 }
@@ -122,7 +130,13 @@ enum EventRecord {
 impl EventRecord {
     fn event_seq(&self) -> u64 {
         match self {
-            Self::InFlight { event_seq } | Self::Settled { event_seq, .. } => *event_seq,
+            Self::InFlight { event_seq, .. } | Self::Settled { event_seq, .. } => *event_seq,
+        }
+    }
+
+    fn event_type(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::InFlight { event_type, .. } | Self::Settled { event_type, .. } => *event_type,
         }
     }
 
@@ -184,6 +198,7 @@ impl ClientDedupeWindow {
         &mut self,
         event_id: &[u8],
         event_seq: u64,
+        event_type: Option<(u32, u32)>,
         max_entries: usize,
     ) -> Result<RecordOutcome, EventSequenceError> {
         if let Some(record) = self.seen_ids.get(event_id) {
@@ -192,6 +207,13 @@ impl ClientDedupeWindow {
                 return Err(EventSequenceError::ReplaySequenceMismatch {
                     expected_event_seq,
                     received_event_seq: event_seq,
+                });
+            }
+            let expected_event_type = record.event_type();
+            if expected_event_type != event_type && expected_event_seq != 0 {
+                return Err(EventSequenceError::ReplayEventTypeMismatch {
+                    expected: expected_event_type,
+                    received: event_type,
                 });
             }
             return Ok(match record {
@@ -241,8 +263,13 @@ impl ClientDedupeWindow {
         let id = Bytes::copy_from_slice(event_id);
         self.order.push_back(id.clone());
         self.ids_by_seq.insert(event_seq, id.clone());
-        self.seen_ids
-            .insert(id, EventRecord::InFlight { event_seq });
+        self.seen_ids.insert(
+            id,
+            EventRecord::InFlight {
+                event_seq,
+                event_type,
+            },
+        );
 
         Ok(RecordOutcome::Fresh {
             last_processed_event_seq: self.last_contiguous_processed_seq,
@@ -270,6 +297,7 @@ impl ClientDedupeWindow {
             id,
             EventRecord::Settled {
                 event_seq: 0,
+                event_type: None,
                 outcome,
             },
         );
@@ -303,9 +331,17 @@ impl ClientDedupeWindow {
                 return self.last_contiguous_processed_seq;
             };
             match slot {
-                EventRecord::InFlight { event_seq } => {
+                EventRecord::InFlight {
+                    event_seq,
+                    event_type,
+                } => {
                     let event_seq = *event_seq;
-                    *slot = EventRecord::Settled { event_seq, outcome };
+                    let event_type = *event_type;
+                    *slot = EventRecord::Settled {
+                        event_seq,
+                        event_type,
+                        outcome,
+                    };
                     event_seq
                 }
                 EventRecord::Settled { .. } => return self.last_contiguous_processed_seq,
@@ -336,7 +372,7 @@ impl ClientDedupeWindow {
 
     fn abandon(&mut self, event_id: &[u8]) {
         let event_seq = self.seen_ids.get(event_id).and_then(|record| match record {
-            EventRecord::InFlight { event_seq } => Some(*event_seq),
+            EventRecord::InFlight { event_seq, .. } => Some(*event_seq),
             EventRecord::Settled { .. } => None,
         });
         let Some(event_seq) = event_seq else {
@@ -380,6 +416,15 @@ impl EventDeduplicator {
     #[must_use]
     pub fn client_count(&self) -> usize {
         self.clients.len()
+    }
+
+    /// Whether the full receive/result window for `client_instance_id` is still retained.
+    ///
+    /// A caller with auxiliary per-client state can use this to reclaim state for the same
+    /// least-recently-used instances this deduplicator has already evicted.
+    #[must_use]
+    pub fn has_client_window(&self, client_instance_id: &[u8]) -> bool {
+        self.clients.contains_key(client_instance_id)
     }
 
     /// Moves an existing client instance to the most-recently-used end of the eviction order.
@@ -541,6 +586,10 @@ impl EventDeduplicator {
             return Err(EventSequenceError::MissingEventId);
         }
 
+        let event_type = event
+            .event_type
+            .as_ref()
+            .map(|ty| (ty.namespace_id, ty.local_id));
         let max_entries = self.max_entries_per_client;
         if self
             .clients
@@ -551,7 +600,7 @@ impl EventDeduplicator {
                 .clients
                 .get_mut(event.client_instance_id.as_slice())
                 .expect("window presence checked above");
-            return window.admit(&event.event_id, event.event_seq, max_entries);
+            return window.admit(&event.event_id, event.event_seq, event_type, max_entries);
         }
 
         // Validated against a throwaway window first, so a refused admission never allocates
@@ -560,7 +609,8 @@ impl EventDeduplicator {
         // the same receive window the client is actually numbering against.
         let mut window = self.window_for_new_client(&event.client_instance_id);
         let restored_frontier = window.last_contiguous_processed_seq;
-        let outcome = match window.admit(&event.event_id, event.event_seq, max_entries) {
+        let outcome = match window.admit(&event.event_id, event.event_seq, event_type, max_entries)
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 // Put the frontier back: a refused admission must not consume the state that a
@@ -606,6 +656,53 @@ impl EventDeduplicator {
             return;
         };
         window.abandon(&event.event_id);
+    }
+
+    /// Whether this event identity is currently admitted and not yet terminal (§18.2).
+    #[must_use]
+    pub fn is_in_flight(&self, client_instance_id: &[u8], event_id: &[u8]) -> bool {
+        self.clients
+            .get(client_instance_id)
+            .and_then(|window| window.seen_ids.get(event_id))
+            .is_some_and(|record| matches!(record, EventRecord::InFlight { .. }))
+    }
+
+    /// Cached terminal outcome for a settled `event_id`, if any.
+    #[must_use]
+    pub fn settled_outcome(
+        &self,
+        client_instance_id: &[u8],
+        event_id: &[u8],
+    ) -> Option<EventOutcomeRecord> {
+        self.clients
+            .get(client_instance_id)
+            .and_then(|window| window.seen_ids.get(event_id))
+            .and_then(|record| match record {
+                EventRecord::Settled { outcome, .. } => Some(outcome.clone()),
+                EventRecord::InFlight { .. } => None,
+            })
+    }
+
+    /// Admits (if needed) and settles a placeholder event so deliberately discarded work cannot
+    /// leave a hole in the contiguous `event_seq` frontier (§18.2).
+    ///
+    /// The caller supplies the complete stable identity, including `event_type`. Reusing an
+    /// in-flight identity for a different event kind is rejected, while never-seen placeholders
+    /// are retained so a later replay receives the same terminal outcome.
+    pub fn admit_and_settle(
+        &mut self,
+        event: &Event,
+        outcome: EventOutcomeRecord,
+    ) -> Result<u64, EventSequenceError> {
+        match self.admit_event(event)? {
+            RecordOutcome::Duplicate {
+                last_processed_event_seq,
+                ..
+            } => Ok(last_processed_event_seq),
+            RecordOutcome::Pending { .. } | RecordOutcome::Fresh { .. } => {
+                Ok(self.settle_event(event, outcome))
+            }
+        }
     }
 
     /// Highest contiguous event sequence settled for a client instance (§18.2).
@@ -1201,5 +1298,96 @@ mod tests {
         assert!(dedupe.is_duplicate(client, b"e2"));
         assert!(dedupe.is_duplicate(client, b"e3"));
         assert!(dedupe.is_duplicate(client, b"e4"));
+    }
+
+    #[test]
+    fn test_admit_and_settle_fills_a_frontier_gap() {
+        let mut dedupe = EventDeduplicator::new(16);
+        let client = b"client-text";
+
+        let first = wire_event(client, b"ordinary-1", 1);
+        assert!(matches!(
+            dedupe.admit_event(&first).expect("admit 1"),
+            RecordOutcome::Fresh { .. }
+        ));
+
+        let canceled = EventOutcomeRecord {
+            accepted: false,
+            revision_after_effect: 4,
+            reject_reason: "canceled on same-session resync".into(),
+        };
+        let placeholder = wire_event(client, b"text-2", 2);
+        assert_eq!(
+            dedupe
+                .admit_and_settle(&placeholder, canceled.clone())
+                .expect("settle placeholder seq 2"),
+            0,
+            "sequence 1 is still in flight, so the frontier must not jump"
+        );
+        assert!(!dedupe.is_in_flight(client, b"text-2"));
+        assert_eq!(
+            dedupe.settled_outcome(client, b"text-2"),
+            Some(canceled.clone())
+        );
+
+        assert_eq!(
+            dedupe.settle_event(
+                &first,
+                EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 1,
+                    reject_reason: String::new(),
+                }
+            ),
+            2,
+            "settling sequence 1 must advance through the canceled gap"
+        );
+
+        // A replay of the canceled identity is answered from the cache, not admitted as fresh.
+        let replay = wire_event(client, b"text-2", 2);
+        match dedupe.admit_event(&replay).expect("replay") {
+            RecordOutcome::Duplicate {
+                prior,
+                last_processed_event_seq,
+            } => {
+                assert_eq!(prior, canceled);
+                assert_eq!(last_processed_event_seq, 2);
+            }
+            other => panic!("expected duplicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_placeholder_refuses_a_different_in_flight_event_type() {
+        let mut dedupe = EventDeduplicator::new(16);
+        let client = b"client-type";
+        let mut activate = wire_event(client, b"shared-id", 1);
+        activate.event_type = Some(srui_protocol::TypeRef {
+            namespace_id: 0,
+            local_id: 1,
+        });
+        assert!(matches!(
+            dedupe.admit_event(&activate).expect("admit activate"),
+            RecordOutcome::Fresh { .. }
+        ));
+
+        let mut text_placeholder = activate.clone();
+        text_placeholder.event_type = Some(srui_protocol::TypeRef {
+            namespace_id: 0,
+            local_id: 5,
+        });
+        let outcome = EventOutcomeRecord {
+            accepted: false,
+            revision_after_effect: 0,
+            reject_reason: "discarded".into(),
+        };
+        assert_eq!(
+            dedupe.admit_and_settle(&text_placeholder, outcome),
+            Err(EventSequenceError::ReplayEventTypeMismatch {
+                expected: Some((0, 1)),
+                received: Some((0, 5)),
+            })
+        );
+        assert!(dedupe.is_in_flight(client, b"shared-id"));
     }
 }

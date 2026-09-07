@@ -13,6 +13,7 @@ public typealias SRUIOperation = Srui_Protocol_Operation
 public typealias SRUICommitOp = Srui_Protocol_CommitOp
 public typealias SRUITransaction = Srui_Protocol_Transaction
 public typealias SRUIEvent = Srui_Protocol_Event
+public typealias SRUIPendingTextEditRef = Srui_Protocol_PendingTextEditRef
 public typealias SRUIStandardEnum = Srui_Protocol_StandardEnum
 public typealias SRUIStandardNodeType = Srui_Protocol_StandardNodeType
 public typealias SRUIStandardProperty = Srui_Protocol_StandardProperty

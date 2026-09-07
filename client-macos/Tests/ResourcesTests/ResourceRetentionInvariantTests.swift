@@ -175,12 +175,12 @@ struct ResourceRetentionInvariantTests {
 
             switch rng.next(upperBound: 8) {
             case 0:
-                await cache.clearPartials()
+                try await cache.clearPartials()
             case 1:
                 let known = await cache.knownHashes()
-                await cache.setLiveReferences(Set(known.prefix(2)))
+                try await cache.setLiveReferences(Set(known.prefix(2)))
             case 2:
-                await cache.setLiveReferences([])
+                try await cache.setLiveReferences([])
             default:
                 break
             }

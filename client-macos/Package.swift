@@ -56,6 +56,7 @@ let package = Package(
                 "SemanticModel",
                 "Resources",
                 "Collections",
+                "Text",
             ],
             path: "RendererAppKit"
         ),
@@ -68,6 +69,7 @@ let package = Package(
                 "RendererAppKit",
                 "Resources",
                 "Collections",
+                "Text",
             ],
             path: "Session"
         ),
@@ -92,6 +94,9 @@ let package = Package(
         ),
         .target(
             name: "Text",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "Text"
         ),
         .target(
@@ -117,8 +122,17 @@ let package = Package(
                 "SemanticModel",
                 "Resources",
                 "Collections",
+                "Text",
             ],
             path: "Tests/RendererAppKitTests"
+        ),
+        .testTarget(
+            name: "TextTests",
+            dependencies: [
+                "Text",
+                "SemanticModel",
+            ],
+            path: "Tests/TextTests"
         ),
         .testTarget(
             name: "ResourcesTests",

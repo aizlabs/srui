@@ -701,6 +701,46 @@ final class DecoderTests: XCTestCase {
         XCTAssertEqual(store.nodeCount, originalSnapshot.nodeCount)
     }
 
+    // MARK: - Event edit-sequence conformance
+
+    func testGoldenTextEditEventAcceptedByBothSwiftDecoders() throws {
+        let fileURL = conformanceVectorsDir.appendingPathComponent("golden_text_edit_event.bin")
+        let message = try decodeFramedMessage(from: Data(contentsOf: fileURL))
+        guard case .event(let wireEvent) = message.msg else {
+            XCTFail("Expected event conformance vector")
+            return
+        }
+
+        let validated = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        let converted = try Event(wire: wireEvent)
+        XCTAssertEqual(validated, converted)
+        XCTAssertEqual(validated.eventType, .EVENT_TEXT_EDIT)
+        XCTAssertEqual(validated.editSeq?.rawValue, 3)
+    }
+
+    func testMalformedEventEditSequencesRejectedByBothSwiftDecoders() throws {
+        for filename in [
+            "malformed_text_edit_zero_edit_seq.bin",
+            "malformed_activate_nonzero_edit_seq.bin",
+        ] {
+            let fileURL = conformanceVectorsDir.appendingPathComponent(filename)
+            let message = try decodeFramedMessage(from: Data(contentsOf: fileURL))
+            guard case .event(let wireEvent) = message.msg else {
+                XCTFail("Expected event in \(filename)")
+                continue
+            }
+
+            XCTAssertThrowsError(
+                try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent),
+                "validated decoder accepted \(filename)"
+            )
+            XCTAssertThrowsError(
+                try Event(wire: wireEvent),
+                "wire conversion accepted \(filename)"
+            )
+        }
+    }
+
     // MARK: - §22.2 Thread Safety / Off-Main Execution Test
 
     func testDecodeOffMainThreadSafety() async throws {

@@ -249,17 +249,21 @@ struct LogicalChannelTransportTests {
     func eventOutboxClassifiesEventsAsInput() async throws {
         let transport = RecordingTransport()
         let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.allowNewEvents(binding: binding))
         _ = try await outbox.sendActivate(
             nodeId: NodeId(1),
             observedRevision: Revision(1),
+            binding: binding,
             via: transport
         )
         _ = try await outbox.sendActivate(
             nodeId: NodeId(2),
             observedRevision: Revision(1),
+            binding: binding,
             via: transport
         )
-        try await outbox.resendPendingEvents(via: transport)
+        try await outbox.resendPendingEvents(binding: binding, via: transport)
 
         let writes = await transport.recordedWrites()
         #expect(writes.count == 4)

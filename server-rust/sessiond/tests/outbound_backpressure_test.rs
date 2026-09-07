@@ -286,6 +286,7 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         })),
     };
     r_framed_write

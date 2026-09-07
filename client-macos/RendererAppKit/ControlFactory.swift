@@ -1,6 +1,7 @@
 import AppKit
 import SemanticModel
 import Collections
+import Text
 
 public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
@@ -49,10 +50,18 @@ public final class ControlFactory {
     /// resource paints immediately; a missing hash keeps the system placeholder.
     public var resolveResourceImage: (@MainActor (ResourceHash) -> NSImage?)?
 
-    public init() {}
+    public let textEditingSession: TextEditingSession
+
+    public init(textEditingSession: TextEditingSession = TextEditingSession()) {
+        self.textEditingSession = textEditingSession
+        self.textEditingSession.onCommit = { [weak self] nodeID, text, seq, epoch in
+            self?.onInteraction?(.textEdit(nodeID: nodeID, text: text, editSeq: seq, laneEpoch: epoch))
+        }
+    }
 
     public func makeHandle(for node: Node, store: SemanticStore? = nil) throws -> RenderHandle {
         let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
+        var textAdapter: NativeTextEditorAdapter?
 
         switch node.nodeType {
         case .surface:
@@ -145,6 +154,12 @@ public final class ControlFactory {
         case .textInput:
             let field = NSTextField(frame: .zero)
             field.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
+            let adapter = NativeTextEditorAdapter(
+                nodeID: node.id,
+                session: textEditingSession,
+                textField: field
+            )
+            textAdapter = adapter
             result = (field, nil, nil, nil)
 
         case .textArea:
@@ -159,6 +174,12 @@ public final class ControlFactory {
             scrollView.documentView = textView
             scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 88).isActive = true
+            let adapter = NativeTextEditorAdapter(
+                nodeID: node.id,
+                session: textEditingSession,
+                textView: textView
+            )
+            textAdapter = adapter
             result = (scrollView, nil, nil, nil)
 
         case .progress:
@@ -223,7 +244,8 @@ public final class ControlFactory {
             parentID: node.parentID,
             childIDs: node.orderedChildren,
             modelAdapter: result.adapter,
-            actionTrampoline: result.trampoline
+            actionTrampoline: result.trampoline,
+            textAdapter: textAdapter
         )
         apply(node: node, to: handle, store: store)
         return handle
@@ -238,9 +260,31 @@ public final class ControlFactory {
         node.propertyEntries.sorted { $0.0 < $1.0 }
     }
 
+    /// Editors with a canonical `.value` ignore `.text` so incremental and full applies agree.
+    public static func shouldSkipTextFallback(for handle: RenderHandle, node: Node) -> Bool {
+        handle.textAdapter != nil && node.getProperty(.value) != nil
+    }
+
+    /// Displayed editor string: canonical `.value` when present, otherwise `.text`.
+    ///
+    /// Incremental clears of `.value` must reapply this so they match a remount, which
+    /// stops skipping `.text` once `.value` is gone.
+    public static func displayedEditorText(for node: Node) -> Value? {
+        node.getProperty(.value) ?? node.getProperty(.text)
+    }
+
     public func apply(node: Node, to handle: RenderHandle, store: SemanticStore? = nil) {
-        for (property, value) in Self.orderedPropertyEntries(of: node) {
+        let entries = Self.orderedPropertyEntries(of: node)
+        for (property, value) in entries {
+            if property == .text, Self.shouldSkipTextFallback(for: handle, node: node) {
+                continue
+            }
             apply(property: property, value: value, to: handle, store: store)
+        }
+        if let adapter = handle.textAdapter, Self.displayedEditorText(for: node) == nil {
+            // Neither `.value` nor `.text` is defined. Seed the empty store baseline so a
+            // later rejection-only ack can revert and a remount can keepLocal (§22.6).
+            adapter.applyAuthoritativeString("")
         }
         if handle.nodeType == .table || handle.nodeType == .list || handle.nodeType == .tree {
             refreshCollection(in: handle, for: node, store: store ?? SemanticStore())
@@ -295,17 +339,24 @@ public final class ControlFactory {
 
         case .enabled:
             let enabled = value?.asBool ?? true
+            if let adapter = handle.textAdapter {
+                adapter.applyEnabled(enabled)
+            }
             if let control = handle.view as? NSControl {
                 control.isEnabled = enabled
             }
 
         case .readOnly:
             let readOnly = value?.asBool ?? false
-            if let field = handle.view as? NSTextField {
-                field.isEditable = !readOnly
-            }
-            if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
-                textView.isEditable = !readOnly
+            if let adapter = handle.textAdapter {
+                adapter.applyReadOnly(readOnly)
+            } else {
+                if let field = handle.view as? NSTextField {
+                    field.isEditable = !readOnly
+                }
+                if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+                    textView.isEditable = !readOnly
+                }
             }
 
         case .busy:
@@ -326,18 +377,26 @@ public final class ControlFactory {
             }
 
         case .text:
-            if let field = handle.view as? NSTextField {
-                field.stringValue = value?.asString ?? ""
-            }
-            if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
-                textView.string = value?.asString ?? ""
-            }
-            if let textView = handle.view as? NSTextView {
-                textView.string = value?.asString ?? ""
+            if let adapter = handle.textAdapter {
+                adapter.applyAuthoritative(value)
+            } else {
+                if let field = handle.view as? NSTextField {
+                    field.stringValue = value?.asString ?? ""
+                }
+                if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+                    textView.string = value?.asString ?? ""
+                }
+                if let textView = handle.view as? NSTextView {
+                    textView.string = value?.asString ?? ""
+                }
             }
 
         case .value:
-            applyValue(value, to: handle)
+            if let adapter = handle.textAdapter {
+                adapter.applyAuthoritative(resolvedEditorValue(value, handle: handle, store: store))
+            } else {
+                applyValue(value, to: handle)
+            }
 
         case .placeholder:
             if let field = handle.view as? NSTextField {
@@ -440,8 +499,11 @@ public final class ControlFactory {
         case .role:
             applyRole(value?.asEnumToken, to: handle)
 
-        case .presentationHint, .validationState, .actionKey:
+        case .presentationHint, .actionKey:
             break
+
+        case .validationState:
+            handle.textAdapter?.applyValidation(value)
 
         default:
             break
@@ -679,6 +741,21 @@ public final class ControlFactory {
             return textView
         }
         return (handle.view as? NSScrollView)?.documentView as? NSTextView
+    }
+
+    /// When canonical `.value` is cleared, reapply remaining `.text` from the updated node.
+    private func resolvedEditorValue(
+        _ value: Value?,
+        handle: RenderHandle,
+        store: SemanticStore?
+    ) -> Value? {
+        if value != nil {
+            return value
+        }
+        guard let node = store?.getNode(handle.nodeID) else {
+            return nil
+        }
+        return Self.displayedEditorText(for: node)
     }
 
     private func applyValue(_ value: Value?, to handle: RenderHandle) {

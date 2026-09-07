@@ -330,7 +330,7 @@ struct ResourceCacheTests {
                 priority: .low
             )
         )
-        await cache.clearPartials()
+        try await cache.clearPartials()
         #expect(await cache.contains(hash))
         // Re-announcing after clear must work (partial was dropped).
         _ = try await cache.ingestMetadata(
@@ -434,7 +434,7 @@ struct ResourceCacheTests {
         let first = try await ingestPNG(cache, bytes: FixturePNG.bytes)
         let second = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)
         let third = try await ingestPNG(cache, bytes: FixturePNG.blueBytes)
-        await cache.setLiveReferences([second.image.hash, third.image.hash])
+        try await cache.setLiveReferences([second.image.hash, third.image.hash])
 
         await #expect(throws: ResourceCacheError.self) {
             _ = try await ingestPNG(cache, bytes: largeBytes)
@@ -464,7 +464,7 @@ struct ResourceCacheTests {
         )
         let first = try await ingestPNG(cache, bytes: FixturePNG.bytes)
         #expect(await cache.knownHashes() == [first.image.hash])
-        let hydrated = await cache.setLiveReferencesAndLookup([first.image.hash])
+        let hydrated = try await cache.setLiveReferencesAndLookup([first.image.hash])
         #expect(hydrated.map(\.hash) == [first.image.hash])
 
         await #expect(throws: ResourceCacheError.self) {
@@ -473,7 +473,7 @@ struct ResourceCacheTests {
         #expect(await cache.contains(first.image.hash))
         #expect(await cache.committedCount() == 1)
 
-        await cache.setLiveReferences([])
+        try await cache.setLiveReferences([])
         let second = try await ingestPNG(cache, bytes: FixturePNG.greenBytes)
         #expect(second.evictedHashes == [first.image.hash])
         #expect(await cache.contains(first.image.hash) == false)
@@ -507,5 +507,56 @@ struct ResourceCacheTests {
             )
         }
         #expect(await cache.committedCount() == 0)
+    }
+
+    @Test
+    func managedOwnershipRejectsUnscopedMutationUntilExactOwnerReleases() async throws {
+        let cache = ResourceCache()
+        let hash = try FixturePNG.hash()
+        let metadata = ResourceMetadataInput(
+            resourceHash: hash,
+            mediaType: "image/png",
+            encodedLength: UInt64(FixturePNG.bytes.count),
+            decodedWidth: 1,
+            decodedHeight: 1,
+            priority: .normal
+        )
+        let chunk = ResourceChunkInput(
+            resourceHash: hash,
+            byteOffset: 0,
+            data: FixturePNG.data
+        )
+        let ownershipError = ResourceCacheError.managedReferenceOwnerActive(epoch: 7)
+
+        #expect(await cache.activateReferenceOwner(epoch: 7, liveReferences: []))
+        await #expect(throws: ownershipError) {
+            _ = try await cache.setLiveReferencesAndLookup([])
+        }
+        await #expect(throws: ownershipError) {
+            try await cache.clearPartials()
+        }
+        await #expect(throws: ownershipError) {
+            _ = try await cache.ingestMetadata(metadata)
+        }
+        await #expect(throws: ownershipError) {
+            _ = try await cache.ingestChunk(chunk)
+        }
+        await #expect(throws: ownershipError) {
+            try await cache.setLiveReferences([])
+        }
+
+        #expect(await cache.activateReferenceOwner(epoch: 8, liveReferences: []))
+        #expect(await cache.deactivateReferenceOwner(epoch: 7) == false)
+        #expect(await cache.isReferenceOwnerActive(ownerEpoch: 8))
+        #expect(await cache.deactivateReferenceOwner(epoch: 8))
+        #expect(await cache.isReferenceOwnerActive(ownerEpoch: 8) == false)
+
+        try await cache.clearPartials()
+        try await cache.setLiveReferences([])
+        let hydrated = try await cache.setLiveReferencesAndLookup([])
+        #expect(hydrated.isEmpty)
+        _ = try await cache.ingestMetadata(metadata)
+        let commit = try await cache.ingestChunk(chunk)
+        #expect(commit?.newlyCommitted == true)
     }
 }

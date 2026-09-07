@@ -200,8 +200,14 @@ struct SessionRobustnessTests {
         )
         try await serverTransport.send(data: try Self.framed(mountTx))
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+        try await AsyncTestSupport.eventually(
+            description: "revision 1 button render completes"
+        ) {
+            renderer.registry.handle(for: buttonID) != nil
+        }
 
         let buttonHandle = try #require(renderer.registry.handle(for: buttonID))
+        #expect(buttonHandle.nodeID == buttonID)
         let trampoline = try #require(buttonHandle.actionTrampoline as? ActionTrampoline)
 
         // The user clicks while looking at revision 1.
@@ -239,11 +245,14 @@ struct SessionRobustnessTests {
     func outboxBoundsPendingEventCache() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "bounded-outbox", binding: binding))
 
         for _ in 0..<EventOutbox.defaultMaxPendingEvents {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(1),
+                binding: binding,
                 via: clientTransport
             )
         }
@@ -252,6 +261,7 @@ struct SessionRobustnessTests {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(1),
+                binding: binding,
                 via: clientTransport
             )
         }
@@ -399,7 +409,14 @@ struct SessionRobustnessTests {
                 )
             )
         )
-        #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+        #expect(await Self.waitUntil {
+            await MainActor.run {
+                applier.lastAppliedRevision == Revision(1)
+                    && renderer.registry.count == 2
+                    && (renderer.registry.handle(for: NodeId(2))?.view as? NSTextField)?
+                        .stringValue == "Count: 0"
+            }
+        })
         #expect(renderer.registry.count == 2)
 
         // Force the view tree out of sync with the committed store, so the next incremental apply
@@ -435,7 +452,13 @@ struct SessionRobustnessTests {
         )
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(3) })
 
-        #expect(await Self.waitUntil { await MainActor.run { renderer.registry.count == 2 } })
+        #expect(await Self.waitUntil {
+            await MainActor.run {
+                renderer.registry.count == 2
+                    && (renderer.registry.handle(for: NodeId(2))?.view as? NSTextField)?
+                        .stringValue == "Count: 2"
+            }
+        })
         let textHandle = try #require(renderer.registry.handle(for: NodeId(2)))
         let textField = try #require(textHandle.view as? NSTextField)
         #expect(textField.stringValue == "Count: 2")
@@ -528,6 +551,7 @@ struct SessionRobustnessTests {
 
         #expect(await failures.count == 0, "an intentional stop is not a session failure")
         #expect(!controller.isDiverged)
+        try await controller.resourceCache.clearPartials()
 
         await serverTransport.close()
     }
@@ -608,6 +632,7 @@ struct SessionRobustnessTests {
             try await controller.start()
         }
         #expect(await transport.sentFrameCount == 0)
+        try await controller.resourceCache.clearPartials()
 
         // The failed attempt started nothing, so the second attempt must actually run — not return
         // early on a stale `isRunning` latch.

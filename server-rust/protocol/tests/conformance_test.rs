@@ -480,6 +480,33 @@ fn test_direct_encode_golden_framed_message_matches_wire_bytes() {
     assert_eq!(encoded, fixture_bytes);
 }
 
+/// Authors the golden `TEXT_EDIT` envelope from scratch (§18.3, §22.6).
+fn create_authored_text_edit_event() -> SruiMessage {
+    SruiMessage {
+        msg: Some(srui_message::Msg::Event(Event {
+            client_instance_id: b"client-29".to_vec(),
+            event_seq: 29,
+            event_id: b"event-text-29".to_vec(),
+            observed_revision: 41,
+            node_id: 7,
+            event_type: Some(TypeRef {
+                namespace_id: STANDARD_NAMESPACE_ID,
+                local_id: StandardEvent::EventTextEdit as u32,
+            }),
+            arguments: vec![Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyText as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::StringValue("composed text".to_string())),
+                }),
+            }],
+            edit_seq: 3,
+        })),
+    }
+}
+
 /// Authors the golden `ServerEventAck` envelope from scratch (§18.2), independently of the fixture.
 fn create_authored_event_ack() -> SruiMessage {
     SruiMessage {
@@ -644,6 +671,93 @@ fn test_direct_encode_golden_client_model_range_request_matches_wire_bytes() {
     let encoded =
         encode_framed(&create_authored_client_model_range_request()).expect("encode framed");
 
+    assert_eq!(to_hex(&encoded), expected_hex);
+    assert_eq!(encoded, fixture_bytes);
+}
+
+#[test]
+fn test_decode_golden_text_edit_event_against_expected_json() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let event_spec = &spec["vectors"]["golden_text_edit_event"];
+    let filename = event_spec["file"].as_str().expect("file name");
+    let expected_hex = event_spec["hex"].as_str().expect("hex");
+    let expected_byte_len = event_spec["byte_length"].as_u64().expect("byte_length") as usize;
+    let expected = &event_spec["expected"];
+
+    let fixture_path = vectors_dir.join(filename);
+    let bytes = fs::read(&fixture_path)
+        .unwrap_or_else(|error| panic!("Failed to read fixture from {fixture_path:?}: {error}"));
+    assert_eq!(bytes.len(), expected_byte_len);
+    assert_eq!(to_hex(&bytes), expected_hex);
+
+    let decoded: SruiMessage = decode_framed(&bytes).expect("Decode framed TEXT_EDIT");
+    let event = match decoded.msg.as_ref() {
+        Some(srui_message::Msg::Event(event)) => event,
+        other => panic!("Expected Event in framed message, got {other:?}"),
+    };
+    assert_eq!(
+        event.client_instance_id,
+        expected["client_instance_id"].as_str().unwrap().as_bytes()
+    );
+    assert_eq!(event.event_seq, expected["event_seq"].as_u64().unwrap());
+    assert_eq!(
+        event.event_id,
+        expected["event_id"].as_str().unwrap().as_bytes()
+    );
+    assert_eq!(
+        event.observed_revision,
+        expected["observed_revision"].as_u64().unwrap()
+    );
+    assert_eq!(event.node_id, expected["node_id"].as_u64().unwrap());
+    let expected_type = &expected["event_type"];
+    let event_type = event.event_type.as_ref().expect("event_type");
+    assert_eq!(
+        event_type.namespace_id,
+        expected_type["namespace_id"].as_u64().unwrap() as u32
+    );
+    assert_eq!(
+        event_type.local_id,
+        expected_type["local_id"].as_u64().unwrap() as u32
+    );
+
+    let expected_arguments = expected["arguments"].as_array().expect("arguments array");
+    assert_eq!(event.arguments.len(), expected_arguments.len());
+    let argument = &event.arguments[0];
+    let expected_argument = &expected_arguments[0];
+    let argument_property = argument.property.as_ref().expect("argument property");
+    assert_eq!(
+        argument_property.namespace_id,
+        expected_argument["property"]["namespace_id"]
+            .as_u64()
+            .unwrap() as u32
+    );
+    assert_eq!(
+        argument_property.local_id,
+        expected_argument["property"]["local_id"].as_u64().unwrap() as u32
+    );
+    match &argument.value.as_ref().expect("argument value").value {
+        Some(value::Value::StringValue(value)) => assert_eq!(
+            value,
+            expected_argument["value"]["string_value"].as_str().unwrap()
+        ),
+        other => panic!("Expected StringValue, got {other:?}"),
+    }
+    assert_eq!(event.edit_seq, expected["edit_seq"].as_u64().unwrap());
+
+    let roundtrip = encode_framed(&decoded).expect("re-encode framed TEXT_EDIT");
+    assert_eq!(roundtrip, bytes);
+}
+
+#[test]
+fn test_direct_encode_golden_text_edit_event_matches_wire_bytes() {
+    let (vectors_dir, spec) = load_expected_spec();
+    let event_spec = &spec["vectors"]["golden_text_edit_event"];
+    let filename = event_spec["file"].as_str().expect("file name");
+    let expected_hex = event_spec["hex"].as_str().expect("hex");
+    let fixture_bytes = fs::read(vectors_dir.join(filename)).expect("read TEXT_EDIT fixture");
+
+    let encoded =
+        encode_framed(&create_authored_text_edit_event()).expect("encode framed TEXT_EDIT");
     assert_eq!(to_hex(&encoded), expected_hex);
     assert_eq!(encoded, fixture_bytes);
 }

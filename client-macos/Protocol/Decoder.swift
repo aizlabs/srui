@@ -454,6 +454,7 @@ public struct ProtocolDecoder: Sendable {
             throw ProtocolDecodeError.missingField("Event.eventType")
         }
         let eventType = TypeRef(wire: wire.eventType)
+        let editSeq = try decodeEventEditSequence(wire.editSeq, eventType: eventType)
 
         var args: [PropertyRef: Value] = [:]
         args.reserveCapacity(wire.arguments.count)
@@ -473,7 +474,8 @@ public struct ProtocolDecoder: Sendable {
             observedRevision: Revision(wire.observedRevision),
             nodeId: NodeId(wire.nodeID),
             eventType: eventType,
-            arguments: args
+            arguments: args,
+            editSeq: editSeq
         )
     }
 

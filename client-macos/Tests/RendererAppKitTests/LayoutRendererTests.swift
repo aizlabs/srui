@@ -1,6 +1,7 @@
 import AppKit
 import SemanticModel
 import Testing
+import Text
 @testable import RendererAppKit
 @testable import Collections
 
@@ -42,6 +43,89 @@ struct LayoutRendererTests {
     }
 
     @Test
+    func structuralRemountKeepsUnflushedTextInputDraft() throws {
+        let renderer = LayoutRenderer()
+        renderer.controlFactory.textEditingSession.debounceNanoseconds = 1_000_000_000
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .textInput,
+                parentID: 1,
+                properties: [(.value, .string("hello"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        #expect(field.stringValue == "hello")
+
+        field.stringValue = "hello!"
+        adapter.notifyTextDidChangeForTests()
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+
+        let structural = SemanticModel.Operation.createNode(id: 3, nodeType: .text, parentID: 1)
+        let newStore = try makeStore(base + [structural])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [structural]),
+            newStore: newStore
+        )
+
+        let after = try #require(renderer.registry.handle(for: editorID))
+        let fieldAfter = try #require(after.view as? NSTextField)
+        #expect(fieldAfter.stringValue == "hello!")
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+    }
+
+    @Test
+    func structuralRemountAbandonsCompositionInsteadOfDeferringStoreString() throws {
+        let renderer = LayoutRenderer()
+        renderer.controlFactory.textEditingSession.debounceNanoseconds = 0
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .textInput,
+                parentID: 1,
+                properties: [(.value, .string("hello"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        adapter.compositionOverride = true
+        let field = try #require(handle.view as? NSTextField)
+        field.stringValue = "hel"
+        adapter.notifyTextDidChangeForTests()
+        #expect(renderer.controlFactory.textEditingSession.isComposing(for: editorID))
+
+        let structural = SemanticModel.Operation.createNode(id: 3, nodeType: .text, parentID: 1)
+        let newStore = try makeStore(base + [structural])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [structural]),
+            newStore: newStore
+        )
+
+        let after = try #require(renderer.registry.handle(for: editorID))
+        let adapterAfter = try #require(after.textAdapter)
+        let fieldAfter = try #require(after.view as? NSTextField)
+        #expect(!renderer.controlFactory.textEditingSession.isComposing(for: editorID))
+        #expect(fieldAfter.stringValue == "hello")
+
+        fieldAfter.stringValue = "hello!"
+        adapterAfter.notifyTextDidChangeForTests()
+        #expect(fieldAfter.stringValue == "hello!")
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+    }
+
+    @Test
     func scalarPropertyUpdatePreservesViewIdentityWithoutRemounting() throws {
         let base: [SemanticModel.Operation] = [
             .createNode(id: 1, nodeType: .surface),
@@ -77,6 +161,45 @@ struct LayoutRendererTests {
         #expect(textBefore === textAfter)
         #expect(surfaceWindowBefore === surfaceWindowAfter)
         #expect((textAfter as? NSTextField)?.stringValue == "After")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func clearingValueRestoresTextFallbackWithoutRemount(nodeType: TypeRef) throws {
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: nodeType,
+                parentID: 1,
+                properties: [
+                    (.text, .string("from-text")),
+                    (.value, .string("from-value")),
+                ]
+            ),
+        ]
+        let store = try makeStore(base)
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let handleBefore = try #require(renderer.registry.handle(for: editorID))
+        #expect(renderedEditorText(in: handleBefore) == "from-value")
+        let viewBefore = handleBefore.view
+
+        let clear = SemanticModel.Operation.clearProperty(id: editorID, property: .value)
+        let newStore = try makeStore(base + [clear])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [clear]),
+            newStore: newStore
+        )
+
+        let handleAfter = try #require(renderer.registry.handle(for: editorID))
+        #expect(handleAfter.view === viewBefore)
+        #expect(renderedEditorText(in: handleAfter) == "from-text")
+
+        try renderer.mount(store: newStore)
+        let remounted = try #require(renderer.registry.handle(for: editorID))
+        #expect(renderedEditorText(in: remounted) == "from-text")
     }
 
     @Test
@@ -796,6 +919,12 @@ struct LayoutRendererTests {
             try operation.apply(to: &store)
         }
         return store
+    }
+
+    private func renderedEditorText(in handle: RenderHandle) -> String? {
+        if let field = handle.view as? NSTextField { return field.stringValue }
+        if let textView = handle.view as? NSTextView { return textView.string }
+        return ((handle.view as? NSScrollView)?.documentView as? NSTextView)?.string
     }
 
     private func assertEveryHandleIsMounted(in renderer: LayoutRenderer) {

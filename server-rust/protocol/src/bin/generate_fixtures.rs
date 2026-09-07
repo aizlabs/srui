@@ -216,4 +216,100 @@ fn main() {
         "Wrote golden_client_model_range_request.bin ({} bytes)",
         range_bytes.len()
     );
+
+    // 8. Construct golden framed TEXT_EDIT (§18.3, §22.6).
+    let text_edit_event = SruiMessage {
+        msg: Some(srui_message::Msg::Event(Event {
+            client_instance_id: b"client-29".to_vec(),
+            event_seq: 29,
+            event_id: b"event-text-29".to_vec(),
+            observed_revision: 41,
+            node_id: 7,
+            event_type: Some(TypeRef {
+                namespace_id: STANDARD_NAMESPACE_ID,
+                local_id: StandardEvent::EventTextEdit as u32,
+            }),
+            arguments: vec![Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyText as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::StringValue("composed text".to_string())),
+                }),
+            }],
+            edit_seq: 3,
+        })),
+    };
+    let text_edit_bytes = encode_framed(&text_edit_event).expect("encode framed TEXT_EDIT event");
+    fs::write(out_dir.join("golden_text_edit_event.bin"), &text_edit_bytes)
+        .expect("write golden_text_edit_event.bin");
+    println!(
+        "Wrote golden_text_edit_event.bin ({} bytes)",
+        text_edit_bytes.len()
+    );
+
+    // 9. Construct protobuf-valid TEXT_EDIT missing its required positive edit_seq.
+    let malformed_text_edit = SruiMessage {
+        msg: Some(srui_message::Msg::Event(Event {
+            client_instance_id: b"client-29".to_vec(),
+            event_seq: 30,
+            event_id: b"bad-text-zero".to_vec(),
+            observed_revision: 41,
+            node_id: 7,
+            event_type: Some(TypeRef {
+                namespace_id: STANDARD_NAMESPACE_ID,
+                local_id: StandardEvent::EventTextEdit as u32,
+            }),
+            arguments: vec![Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyText as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::StringValue("rejected text".to_string())),
+                }),
+            }],
+            edit_seq: 0,
+        })),
+    };
+    let malformed_text_edit_bytes =
+        encode_framed(&malformed_text_edit).expect("encode malformed framed TEXT_EDIT event");
+    fs::write(
+        out_dir.join("malformed_text_edit_zero_edit_seq.bin"),
+        &malformed_text_edit_bytes,
+    )
+    .expect("write malformed_text_edit_zero_edit_seq.bin");
+    println!(
+        "Wrote malformed_text_edit_zero_edit_seq.bin ({} bytes)",
+        malformed_text_edit_bytes.len()
+    );
+
+    // 10. Construct protobuf-valid ACTIVATE carrying a forbidden edit_seq.
+    let malformed_activate = SruiMessage {
+        msg: Some(srui_message::Msg::Event(Event {
+            client_instance_id: b"client-29".to_vec(),
+            event_seq: 31,
+            event_id: b"bad-activate-seq".to_vec(),
+            observed_revision: 41,
+            node_id: 7,
+            event_type: Some(TypeRef {
+                namespace_id: STANDARD_NAMESPACE_ID,
+                local_id: StandardEvent::EventActivate as u32,
+            }),
+            arguments: Vec::new(),
+            edit_seq: 1,
+        })),
+    };
+    let malformed_activate_bytes =
+        encode_framed(&malformed_activate).expect("encode malformed framed ACTIVATE event");
+    fs::write(
+        out_dir.join("malformed_activate_nonzero_edit_seq.bin"),
+        &malformed_activate_bytes,
+    )
+    .expect("write malformed_activate_nonzero_edit_seq.bin");
+    println!(
+        "Wrote malformed_activate_nonzero_edit_seq.bin ({} bytes)",
+        malformed_activate_bytes.len()
+    );
 }

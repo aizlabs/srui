@@ -1,7 +1,7 @@
 //! # Session State & Transaction Coordination
 //!
 //! Authoritative state owner managing [`SemanticStore`], [`TransactionJournal`],
-//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §20.2, §21, App. B).
+//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §18.3, §20.2, §21, App. B).
 //!
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
@@ -11,6 +11,7 @@
 mod handshake;
 mod model_range;
 mod snapshot;
+mod text_edit;
 
 pub use handshake::{
     FreshClientBootstrap, ResumeClientBootstrap, ResumeOutcome, CORE_VERSION,
@@ -20,6 +21,7 @@ pub use model_range::{
     run_model_range_worker, ModelRangeError, ModelRangeFulfillment, ModelRangeProvider,
     ModelRangeQuery, ModelRangeRequestInbox,
 };
+pub use text_edit::{TextEditDecision, TextEditRequest, TextEditTracker, MAX_TEXT_EDIT_STREAMS};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -66,7 +68,8 @@ impl std::fmt::Display for SessionState {
 /// literal, so that raising any one of the three moves the budget with it instead of silently
 /// invalidating the invariant test.
 pub const MAX_RETAINED_CLIENT_STATE_BYTES: usize = (handshake::MAX_CLIENT_RESOURCE_CEILINGS
-    + crate::outbound::MAX_TRACKED_STALE_CLIENTS)
+    + crate::outbound::MAX_TRACKED_STALE_CLIENTS
+    + text_edit::MAX_TEXT_EDIT_STREAMS)
     * handshake::MAX_CLIENT_INSTANCE_ID_BYTES;
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
@@ -93,8 +96,8 @@ use srui_protocol::{Event, ServerLimits, Transaction};
 use srui_resources::{PublishOutcome, ResourceEntry, ResourceStore};
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
-    AuthoritativeCommit, EventValidationError, NegotiationError, NodeId, PropertyRef, ResourceHash,
-    SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef, Value,
+    AuthoritativeCommit, Event as DomainEvent, EventValidationError, NegotiationError, NodeId,
+    Operation, ResourceHash, SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef,
     DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
     DEFAULT_MAX_TREE_DEPTH,
 };
@@ -213,6 +216,27 @@ pub enum EventOutcome {
     },
 }
 
+enum EventAdmission {
+    Fresh,
+    Existing(EventOutcome),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandlerDispatchKind {
+    Ordinary,
+    CommittedTextEdit,
+}
+
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 pub(crate) struct SessionInner {
     pub(crate) session_id: String,
     pub(crate) state: SessionState,
@@ -230,6 +254,8 @@ pub(crate) struct SessionInner {
     pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
     /// Sparse-collection window providers keyed by [`srui_semantic_tree::ModelId`] (§8, §22.7).
     pub(crate) model_range_providers: HashMap<srui_semantic_tree::ModelId, ModelRangeProvider>,
+    pub(crate) text_edit_tracker: text_edit::TextEditTracker,
+    pub(crate) text_edit_policy: Option<text_edit::TextEditPolicy>,
 }
 
 impl std::fmt::Debug for SessionInner {
@@ -253,6 +279,7 @@ impl std::fmt::Debug for SessionInner {
                 "model_range_provider_count",
                 &self.model_range_providers.len(),
             )
+            .field("text_edit_streams", &self.text_edit_tracker.len())
             .finish()
     }
 }
@@ -411,6 +438,8 @@ impl Session {
             client_resource_ceilings: HashMap::new(),
             handlers: HashMap::new(),
             model_range_providers: HashMap::new(),
+            text_edit_tracker: text_edit::TextEditTracker::default(),
+            text_edit_policy: None,
         };
 
         Self {
@@ -603,8 +632,11 @@ impl Session {
     pub fn retained_client_state_bytes(&self) -> Result<usize, SessionError> {
         let guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
         let ceiling_key_bytes: usize = guard.client_resource_ceilings.keys().map(Vec::len).sum();
+        let text_edit_key_bytes = guard.text_edit_tracker.retained_client_id_bytes();
         drop(guard);
-        Ok(ceiling_key_bytes + self.outbound_hub.retained_stale_client_bytes())
+        Ok(ceiling_key_bytes
+            + text_edit_key_bytes
+            + self.outbound_hub.retained_stale_client_bytes())
     }
 
     /// Returns a reference to the session's outbound transaction hub.
@@ -681,6 +713,9 @@ impl Session {
             match result {
                 Ok(Ok(val)) => {
                     let (staged, ops) = ui.into_staged_and_ops();
+                    let deletes_nodes = ops
+                        .iter()
+                        .any(|op| matches!(op, Operation::DeleteNode { .. }));
                     let commit = AuthoritativeCommit::new(base_revision, ops);
 
                     // Journal admission is decided before the store mutates: `append` below cannot
@@ -690,6 +725,14 @@ impl Session {
                     let tx_wire = permit.transaction().clone();
                     guard.store.commit_staging(staged, commit.new_revision());
                     guard.journal.append(permit);
+                    if deletes_nodes {
+                        let SessionInner {
+                            store,
+                            text_edit_tracker,
+                            ..
+                        } = &mut *guard;
+                        text_edit_tracker.reclaim_missing_nodes(store);
+                    }
                     // Published under `inner` so delivery order equals commit order (§12.1);
                     // see `publish_committed` for why this is not an `async-no-lock-await`
                     // violation.
@@ -751,9 +794,21 @@ impl Session {
             let staged = guard.store.prepare_commit(&commit)?;
             let permit = guard.journal.prepare(&commit)?;
             let tx_wire = permit.transaction().clone();
+            let deletes_nodes = tx_wire
+                .operations
+                .iter()
+                .any(|op| matches!(op.op, Some(srui_protocol::operation::Op::DeleteNode(_))));
 
             guard.store.commit_prepared(staged);
             guard.journal.append(permit);
+            if deletes_nodes {
+                let SessionInner {
+                    store,
+                    text_edit_tracker,
+                    ..
+                } = &mut *guard;
+                text_edit_tracker.reclaim_missing_nodes(store);
+            }
             // Published under `inner` so delivery order equals commit order (§12.1).
             self.publish_committed(&tx_wire);
             tx_wire
@@ -771,111 +826,121 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
-        let matching_handlers = {
-            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        // Cloning and decoding peer-controlled arguments may be proportional to the frame size,
+        // so perform that work before entering the session-wide critical section. Admission is
+        // still evaluated first semantically: receive-window errors win over a captured decode
+        // failure, and malformed replays remain idempotent through the settled result cache.
+        let domain = DomainEvent::try_from(event.clone());
 
-            // Deduplication check (§18.2, §32.4). A settled replay is answered from the result
-            // cache; an in-flight replay remains unacknowledged so the client cannot mistake it
-            // for a completed action.
-            match guard.dedupe.admit_event(event)? {
-                RecordOutcome::Duplicate {
-                    prior,
-                    last_processed_event_seq,
-                } => {
-                    return Ok(EventOutcome::Duplicate {
-                        accepted: prior.accepted,
-                        revision_after_effect: prior.revision_after_effect,
-                        last_processed_event_seq,
-                        reject_reason: prior.reject_reason,
-                    });
-                }
-                RecordOutcome::Pending {
-                    last_processed_event_seq,
-                } => {
-                    return Ok(EventOutcome::Pending {
-                        last_processed_event_seq,
-                    });
-                }
-                RecordOutcome::Fresh { .. } => {}
+        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        match Self::admit_event(&mut guard, event)? {
+            EventAdmission::Fresh => {}
+            EventAdmission::Existing(outcome) => return Ok(outcome),
+        }
+
+        let domain = match domain {
+            Ok(domain) => domain,
+            Err(wire_error) => {
+                let error =
+                    EventValidationError::PolicyRejected(format!("malformed event: {wire_error}"));
+                return Ok(Self::settle_rejected_event(&mut guard, event, error));
             }
+        };
 
-            let node_id = srui_semantic_tree::NodeId::new(event.node_id);
-            let obs_rev = srui_semantic_tree::Revision::new(event.observed_revision);
-            let current_rev = guard.store.revision();
+        if domain.event_type == TypeRef::EVENT_TEXT_EDIT {
+            return self.process_admitted_text_edit(event, domain, guard);
+        }
 
-            let validation = if obs_rev > current_rev {
-                Err(EventValidationError::FutureRevision {
-                    observed: obs_rev,
-                    current: current_rev,
-                })
-            } else {
-                match guard.store.get_node(node_id) {
-                    None => Err(EventValidationError::NodeNotFound(node_id)),
-                    Some(node) => {
-                        if let Some(Value::Bool(false)) = node.get_property(PropertyRef::ENABLED) {
-                            Err(EventValidationError::NodeDisabled(node_id))
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
-            };
+        let validation = domain
+            .validate_observed_revision(guard.store.revision())
+            .and_then(|()| domain.validate_node_interactive(&guard.store).map(|_| ()));
+        if let Err(error) = validation {
+            return Ok(Self::settle_rejected_event(&mut guard, event, error));
+        }
 
-            if let Err(error) = validation {
-                let max_string_length = guard.store.limits().max_string_length;
-                let last_processed_event_seq = guard.dedupe.settle_event(
-                    event,
-                    EventOutcomeRecord {
-                        accepted: false,
-                        revision_after_effect: current_rev.get(),
-                        reject_reason: bound_diagnostic_string(
-                            error.to_string(),
-                            max_string_length,
-                        ),
-                    },
-                );
-                return Ok(EventOutcome::Rejected {
-                    error,
-                    revision_after_effect: current_rev.get(),
-                    last_processed_event_seq,
-                });
-            }
+        let matching_handlers = guard
+            .handlers
+            .get(&(domain.node_id, domain.event_type))
+            .cloned()
+            .unwrap_or_default();
+        drop(guard);
 
-            let event_type = event
-                .event_type
-                .map(srui_semantic_tree::TypeRef::from)
-                .unwrap_or(srui_semantic_tree::TypeRef::new(0, 0));
+        self.dispatch_admitted_event(event, &matching_handlers, HandlerDispatchKind::Ordinary)
+    }
 
-            guard
-                .handlers
-                .get(&(node_id, event_type))
-                .cloned()
-                .unwrap_or_default()
-        }; // Lock released here!
+    fn admit_event(
+        inner: &mut SessionInner,
+        event: &Event,
+    ) -> Result<EventAdmission, SessionError> {
+        let admission = match inner.dedupe.admit_event(event)? {
+            RecordOutcome::Duplicate {
+                prior,
+                last_processed_event_seq,
+            } => EventAdmission::Existing(EventOutcome::Duplicate {
+                accepted: prior.accepted,
+                revision_after_effect: prior.revision_after_effect,
+                last_processed_event_seq,
+                reject_reason: prior.reject_reason,
+            }),
+            RecordOutcome::Pending {
+                last_processed_event_seq,
+            } => EventAdmission::Existing(EventOutcome::Pending {
+                last_processed_event_seq,
+            }),
+            RecordOutcome::Fresh { .. } => EventAdmission::Fresh,
+        };
+        Ok(admission)
+    }
 
-        let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for handler in matching_handlers {
+    pub(crate) fn settle_rejected_event(
+        inner: &mut SessionInner,
+        event: &Event,
+        error: EventValidationError,
+    ) -> EventOutcome {
+        let revision_after_effect = inner.store.revision().get();
+        let max_string_length = inner.store.limits().max_string_length;
+        let last_processed_event_seq = inner.dedupe.settle_event(
+            event,
+            EventOutcomeRecord {
+                accepted: false,
+                revision_after_effect,
+                reject_reason: bound_diagnostic_string(error.to_string(), max_string_length),
+            },
+        );
+        EventOutcome::Rejected {
+            error,
+            revision_after_effect,
+            last_processed_event_seq,
+        }
+    }
+
+    pub(crate) fn dispatch_admitted_event(
+        &self,
+        event: &Event,
+        handlers: &[HandlerFn],
+        kind: HandlerDispatchKind,
+    ) -> Result<EventOutcome, SessionError> {
+        let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for handler in handlers {
                 handler(self, event);
             }
         }));
 
-        if let Err(panic_payload) = dispatch_result {
-            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-            guard.dedupe.abandon_event(event);
-            drop(guard);
+        let panic_payload = match (kind, dispatch) {
+            (HandlerDispatchKind::Ordinary, Err(panic_payload)) => {
+                let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+                guard.dedupe.abandon_event(event);
+                drop(guard);
+                return Err(SessionError::Panicked(panic_payload_message(
+                    panic_payload.as_ref(),
+                )));
+            }
+            (_, dispatch) => dispatch.err(),
+        };
 
-            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            return Err(SessionError::Panicked(panic_msg));
-        }
-
-        // Sampled after dispatch so the ack reports the revision the side effect produced
-        // (App. B `semantic_revision_after_effect`).
+        // Sample after dispatch so the ACK includes every handler transaction. A TEXT_EDIT is
+        // already authoritative at this point, so even a notification-handler panic must settle
+        // it as accepted before the infrastructure failure is surfaced.
         let (revision_after_effect, last_processed_event_seq) = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
             let revision_after_effect = guard.store.revision().get();
@@ -887,8 +952,19 @@ impl Session {
                     reject_reason: String::new(),
                 },
             );
+            if kind == HandlerDispatchKind::CommittedTextEdit {
+                guard
+                    .text_edit_tracker
+                    .finish_committed_handler_dispatch(event);
+            }
             (revision_after_effect, last_processed_event_seq)
         };
+
+        if let Some(panic_payload) = panic_payload {
+            return Err(SessionError::Panicked(panic_payload_message(
+                panic_payload.as_ref(),
+            )));
+        }
 
         Ok(EventOutcome::Processed {
             revision_after_effect,
@@ -954,6 +1030,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use srui_semantic_tree::{PropertyRef, Value};
 
     impl Session {
         fn poison_lock_for_test(&self) {
@@ -1161,6 +1238,7 @@ mod tests {
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         };
 
         match session.bootstrap_resume(&resume) {
@@ -1172,6 +1250,89 @@ mod tests {
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transaction_reclaims_only_nodes_absent_after_reparent_then_delete() {
+        let session = Session::new("post-commit-delete-reclamation");
+        let root = NodeId::new(1);
+        let deleted_editor = NodeId::new(2);
+        let surviving_editor = NodeId::new(3);
+        session
+            .transaction(|ui| {
+                ui.create_node(root, TypeRef::SURFACE, None, None, std::iter::empty())?;
+                ui.create_node(
+                    deleted_editor,
+                    TypeRef::TEXT_INPUT,
+                    Some(root),
+                    None,
+                    std::iter::empty(),
+                )?;
+                ui.create_node(
+                    surviving_editor,
+                    TypeRef::TEXT_INPUT,
+                    Some(deleted_editor),
+                    None,
+                    std::iter::empty(),
+                )?;
+                Ok(())
+            })
+            .expect("seed editor subtree");
+
+        let client = b"client";
+        {
+            let mut inner = session.inner.lock().unwrap();
+            inner
+                .text_edit_tracker
+                .reserve(
+                    client,
+                    deleted_editor,
+                    srui_semantic_tree::EditSeq::new(5).unwrap(),
+                )
+                .unwrap();
+            inner.text_edit_tracker.mark_terminal(
+                client,
+                deleted_editor,
+                srui_semantic_tree::EditSeq::new(5).unwrap(),
+            );
+            inner
+                .text_edit_tracker
+                .reserve(
+                    client,
+                    surviving_editor,
+                    srui_semantic_tree::EditSeq::new(7).unwrap(),
+                )
+                .unwrap();
+            inner.text_edit_tracker.mark_terminal(
+                client,
+                surviving_editor,
+                srui_semantic_tree::EditSeq::new(7).unwrap(),
+            );
+        }
+
+        session
+            .transaction(|ui| {
+                ui.move_node(surviving_editor, Some(root), None)?;
+                ui.delete(deleted_editor)?;
+                Ok(())
+            })
+            .expect("reparent editor before deleting its old parent");
+
+        assert!(!session.contains_node(deleted_editor));
+        assert!(session.contains_node(surviving_editor));
+        let inner = session.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .text_edit_tracker
+                .last_terminal_of(client, deleted_editor),
+            None
+        );
+        assert_eq!(
+            inner
+                .text_edit_tracker
+                .last_terminal_of(client, surviving_editor),
+            Some(7)
+        );
     }
 
     #[test]

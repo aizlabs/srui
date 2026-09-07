@@ -25,6 +25,16 @@ fn load_fixture_bytes(filename: &str) -> Vec<u8> {
     fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {:?}: {}", path, e))
 }
 
+fn load_framed_event_fixture(filename: &str) -> srui_protocol::Event {
+    let bytes = load_fixture_bytes(filename);
+    let message: srui_protocol::SruiMessage =
+        decode_framed(&bytes).unwrap_or_else(|error| panic!("Decode {filename}: {error}"));
+    match message.msg {
+        Some(srui_protocol::srui_message::Msg::Event(event)) => event,
+        other => panic!("Expected Event in {filename}, got {other:?}"),
+    }
+}
+
 // =============================================================================
 // Verification 1: Task 10 Counter Example Transaction Serialization & Replay
 // =============================================================================
@@ -464,7 +474,14 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
         // 4. SELECTION_CHANGED (ItemId)
         Event::selection_changed(4, "sel-1", 100, 13, ItemId::new(500)),
         // 5. TEXT_EDIT
-        Event::text_edit(5, "txt-1", 100, 14, "New input text"),
+        Event::text_edit(
+            5,
+            "txt-1",
+            100,
+            14,
+            "New input text",
+            EditSeq::new(1).unwrap(),
+        ),
         // 6. EXPANSION_CHANGED
         Event::expansion_changed(6, "exp-1", 100, 15, true),
         // 7. VIEWPORT_CHANGED
@@ -508,6 +525,61 @@ fn test_standard_and_custom_events_wire_byte_roundtrip() {
 
         assert_eq!(event, back, "Roundtrip mismatch on event #{}", idx + 1);
     }
+
+    let with_edit = Event::text_edit(9, "txt-seq", 100, 14, "coalesced", EditSeq::new(3).unwrap())
+        .with_client_instance_id(client_id);
+    let back = decode_event(&encode_event(&with_edit)).unwrap();
+    assert_eq!(with_edit, back);
+    assert_eq!(back.edit_seq, EditSeq::new(3));
+
+    let mut missing_text_seq: srui_protocol::Event = (&with_edit).into();
+    missing_text_seq.edit_seq = 0;
+    assert!(matches!(
+        Event::try_from(missing_text_seq),
+        Err(WireError::Event(_))
+    ));
+
+    let activate = Event::activate(10, "bad-edit-seq", 100, 14);
+    let mut unexpected_seq: srui_protocol::Event = (&activate).into();
+    unexpected_seq.edit_seq = 1;
+    assert!(matches!(
+        Event::try_from(unexpected_seq),
+        Err(WireError::Event(_))
+    ));
+}
+
+#[test]
+fn test_text_edit_conformance_vectors_enforce_edit_seq_semantics() {
+    let valid = Event::try_from(load_framed_event_fixture("golden_text_edit_event.bin"))
+        .expect("valid TEXT_EDIT fixture");
+    assert_eq!(valid.event_type, TypeRef::EVENT_TEXT_EDIT);
+    assert_eq!(valid.edit_seq, EditSeq::new(3));
+
+    let missing_seq = Event::try_from(load_framed_event_fixture(
+        "malformed_text_edit_zero_edit_seq.bin",
+    ))
+    .expect_err("TEXT_EDIT without edit_seq must fail");
+    assert_eq!(
+        missing_seq,
+        WireError::Event("TEXT_EDIT requires a positive edit_seq".to_string())
+    );
+    assert_eq!(
+        missing_seq.to_string(),
+        "event error: TEXT_EDIT requires a positive edit_seq"
+    );
+
+    let unexpected_seq = Event::try_from(load_framed_event_fixture(
+        "malformed_activate_nonzero_edit_seq.bin",
+    ))
+    .expect_err("non-TEXT_EDIT with edit_seq must fail");
+    assert_eq!(
+        unexpected_seq,
+        WireError::Event("only TEXT_EDIT may carry edit_seq".to_string())
+    );
+    assert_eq!(
+        unexpected_seq.to_string(),
+        "event error: only TEXT_EDIT may carry edit_seq"
+    );
 }
 
 // =============================================================================
@@ -688,6 +760,7 @@ fn test_malformed_protobuf_bytes_rejected_cleanly() {
         node_id: 10,
         event_type: None, // Missing required type
         arguments: vec![],
+        edit_seq: 0,
     };
     let err = Event::try_from(wire_event_missing_type).expect_err("must fail without event_type");
     assert!(matches!(err, WireError::MissingField("Event.event_type")));

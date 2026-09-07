@@ -84,9 +84,15 @@ struct SessionControllerThreadingTests {
         let bytes1 = try SRUIFraming.encodeFramed(msg1)
         try await serverTransport.send(data: bytes1)
 
-        // Await until both applier and renderer have processed the initial mount
-        while applier.lastAppliedRevision < Revision(1) || renderer.registry.count < 4 {
-            await Task.yield()
+        // The applier commits before the MainActor render hop. Wait for the exact native state
+        // under test rather than treating the committed revision as a render-completion signal.
+        try await AsyncTestSupport.eventually(
+            description: "initial transaction rendered"
+        ) {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.count == 4
+                && (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue
+                    == "Count: 0"
         }
 
         // Verify initial mount
@@ -115,10 +121,17 @@ struct SessionControllerThreadingTests {
         let bytes2 = try SRUIFraming.encodeFramed(msg2)
         try await serverTransport.send(data: bytes2)
 
-        while applier.lastAppliedRevision < Revision(2) {
-            await Task.yield()
+        try await AsyncTestSupport.eventually(
+            description: "scalar transaction rendered"
+        ) {
+            applier.lastAppliedRevision == Revision(2)
+                && (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue
+                    == "Count: 1"
+                && abs(
+                    ((renderer.registry.handle(for: progressID)?.view as? NSProgressIndicator)?
+                        .doubleValue ?? -1) - 0.01
+                ) < 0.0001
         }
-        await Task.yield()
 
         // Verify scalar update in place
         #expect(applier.lastAppliedRevision == Revision(2))
@@ -221,8 +234,12 @@ struct SessionControllerThreadingTests {
         mountMsg.transaction = mountTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMsg))
 
-        while applier.lastAppliedRevision < Revision(1) || renderer.registry.count < 4 {
-            await Task.yield()
+        try await AsyncTestSupport.eventually(
+            description: "interaction controls rendered"
+        ) {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.count == 4
+                && (renderer.registry.handle(for: buttonID)?.view as? NSButton)?.title == "Click"
         }
 
         // Advance revision to Revision(2) with a scalar update
@@ -237,10 +254,13 @@ struct SessionControllerThreadingTests {
         rev2Msg.transaction = rev2Tx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(rev2Msg))
 
-        while applier.lastAppliedRevision < Revision(2) {
-            await Task.yield()
+        try await AsyncTestSupport.eventually(
+            description: "revision-two button rendered"
+        ) {
+            applier.lastAppliedRevision == Revision(2)
+                && (renderer.registry.handle(for: buttonID)?.view as? NSButton)?.title
+                    == "Click Rev 2"
         }
-        await Task.yield()
 
         let buttonHandle = try #require(renderer.registry.handle(for: buttonID))
         let toggleHandle = try #require(renderer.registry.handle(for: toggleID))

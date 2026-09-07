@@ -2,6 +2,7 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+import Text
 
 @MainActor
 struct ControlFactoryPropertyTests {
@@ -104,6 +105,28 @@ struct ControlFactoryPropertyTests {
         #expect(editable() == true)
     }
 
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func enabledSetAndClearOnEditors(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        let editable: () -> Bool? = {
+            if let field = handle.view as? NSTextField { return field.isEditable }
+            return ((handle.view as? NSScrollView)?.documentView as? NSTextView)?.isEditable
+        }
+
+        factory.apply(property: .enabled, value: .bool(false), to: handle)
+        #expect(editable() == false)
+        if let field = handle.view as? NSTextField {
+            #expect(field.isEnabled == false)
+        }
+
+        factory.apply(property: .enabled, value: nil, to: handle)
+        #expect(editable() == true)
+        if let field = handle.view as? NSTextField {
+            #expect(field.isEnabled == true)
+        }
+    }
+
     @Test(arguments: [TypeRef.text, .richText, .textInput, .textArea])
     func textSetAndClear(nodeType: TypeRef) throws {
         let factory = ControlFactory()
@@ -126,6 +149,31 @@ struct ControlFactoryPropertyTests {
 
         factory.apply(property: .value, value: nil, to: handle)
         #expect(renderedText(in: handle) == "")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func clearingValueFallsBackToText(nodeType: TypeRef) throws {
+        let nodeID = NodeId(1)
+        var store = SemanticStore()
+        try store.createNode(
+            id: nodeID,
+            nodeType: nodeType,
+            properties: [(.text, .string("fallback"))]
+        )
+        let node = try #require(store.getNode(nodeID))
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: node, store: store)
+
+        factory.apply(
+            property: .value,
+            value: .string("canonical"),
+            to: handle,
+            store: store
+        )
+        #expect(renderedText(in: handle) == "canonical")
+
+        factory.apply(property: .value, value: nil, to: handle, store: store)
+        #expect(renderedText(in: handle) == "fallback")
     }
 
     @Test(arguments: [
@@ -262,6 +310,100 @@ struct ControlFactoryPropertyTests {
         } else {
             Issue.record("unexpected view for \(nodeType)")
         }
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func textEditorsRetainANativeAdapter(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        #expect(handle.textAdapter != nil)
+        #expect(handle.textAdapter?.nodeID == NodeId(1))
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func emptyEditorSeedsAuthoritativeEmptyString(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        #expect(renderedText(in: handle) == "")
+        #expect(factory.textEditingSession.lastKnownAuthoritative(for: 1) == "")
+        #expect(factory.textEditingSession.localValue(for: 1) == "")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func valueWinsOverTextOnEditors(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(
+            for: Node(
+                id: 1,
+                nodeType: nodeType,
+                properties: [
+                    (.text, .string("from-text")),
+                    (.value, .string("from-value")),
+                ]
+            )
+        )
+        #expect(renderedText(in: handle) == "from-value")
+        #expect(factory.textEditingSession.localValue(for: 1) == "from-value")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func clearingValueRestoresTextFallback(nodeType: TypeRef) throws {
+        var store = SemanticStore()
+        try store.createNode(
+            id: 1,
+            nodeType: nodeType,
+            properties: [
+                (.text, .string("from-text")),
+                (.value, .string("from-value")),
+            ]
+        )
+        let factory = ControlFactory()
+        let node = try #require(store.getNode(1))
+        let handle = try factory.makeHandle(for: node, store: store)
+        #expect(renderedText(in: handle) == "from-value")
+        #expect(ControlFactory.shouldSkipTextFallback(for: handle, node: node))
+        #expect(ControlFactory.displayedEditorText(for: node) == .string("from-value"))
+
+        try store.clearProperty(nodeID: 1, property: .value)
+        let withoutValue = try #require(store.getNode(1))
+        #expect(ControlFactory.shouldSkipTextFallback(for: handle, node: withoutValue) == false)
+        #expect(ControlFactory.displayedEditorText(for: withoutValue) == .string("from-text"))
+
+        factory.apply(property: .value, value: nil, to: handle, store: store)
+        #expect(renderedText(in: handle) == "from-text")
+
+        factory.apply(node: withoutValue, to: handle, store: store)
+        #expect(renderedText(in: handle) == "from-text")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func identicalAuthoritativeStringDoesNotResetNativeText(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        factory.apply(property: .value, value: .string("stable"), to: handle)
+        let before = renderedText(in: handle)
+        factory.apply(property: .value, value: .string("stable"), to: handle)
+        #expect(renderedText(in: handle) == before)
+        #expect(renderedText(in: handle) == "stable")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func validationStateDecoratesEditors(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: nodeType))
+        let adapter = try #require(handle.textAdapter)
+
+        factory.apply(property: .validationState, value: .enumToken(StandardValidationState.valid.enumToken), to: handle)
+        #expect(adapter.validationState == .valid)
+
+        factory.apply(property: .validationState, value: .enumToken(StandardValidationState.warning.enumToken), to: handle)
+        #expect(adapter.validationState == .warning)
+
+        factory.apply(property: .validationState, value: .enumToken(StandardValidationState.error.enumToken), to: handle)
+        #expect(adapter.validationState == .error)
+
+        factory.apply(property: .validationState, value: nil, to: handle)
+        #expect(adapter.validationState == nil)
     }
 
     @Test

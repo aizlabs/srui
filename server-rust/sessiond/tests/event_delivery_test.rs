@@ -18,7 +18,7 @@ use srui_protocol::{
     srui_message, ClientHello, ClientResume, EventAckStatus, ServerEventAck, ServerResumeOk,
     SruiCodec, SruiMessage,
 };
-use srui_sdk::{Button, NodeId, ACTIVATE, LABEL};
+use srui_sdk::{Button, NodeId, ACTIVATE, LABEL, TEXT_EDIT};
 use srui_semantic_tree::Event;
 use srui_sessiond::{handle_connection, ConnectionError, EventOutcome, Session, SessionError};
 
@@ -129,6 +129,7 @@ async fn resume_client(
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         })),
     };
     client_framed_write.send(resume).await.expect("send resume");
@@ -653,6 +654,101 @@ async fn test_missing_node_event_rejected_without_mutation() {
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(session.current_revision(), 1);
     assert_eq!(session.node_count(), 1);
+
+    assert_connection_survived(client_write, client_read, server_task).await;
+}
+
+#[tokio::test]
+async fn malformed_events_are_rejected_without_tearing_down_the_connection() {
+    let session = Arc::new(Session::new("malformed-events"));
+    let btn = NodeId::new(1);
+    seed_button(&session, btn);
+
+    let invocations = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(btn, ACTIVATE, move |_, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let shutdown = CancellationToken::new();
+    let (mut client_write, mut client_read, server_task) =
+        connect_client(session.clone(), shutdown, CLIENT_A).await;
+
+    let mut missing_event_type = Event::activate(1, "missing-type", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    missing_event_type.event_type = None;
+
+    let mut missing_edit_seq = Event::activate(2, "missing-edit-seq", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    missing_edit_seq.event_type = Some(TEXT_EDIT.into());
+    missing_edit_seq.edit_seq = 0;
+
+    let mut unexpected_edit_seq = Event::activate(3, "unexpected-edit-seq", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    unexpected_edit_seq.edit_seq = 1;
+
+    let mut undecodable_argument = Event::activate(4, "undecodable-argument", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    undecodable_argument
+        .arguments
+        .push(srui_protocol::Property {
+            property: Some(LABEL.into()),
+            value: Some(srui_protocol::Value { value: None }),
+        });
+
+    let malformed = [
+        missing_event_type,
+        missing_edit_seq,
+        unexpected_edit_seq,
+        undecodable_argument,
+    ];
+    for (index, event) in malformed.iter().enumerate() {
+        client_write
+            .send(SruiMessage {
+                msg: Some(srui_message::Msg::Event(event.clone())),
+            })
+            .await
+            .expect("send malformed event");
+        let ack = recv_event_ack(&mut client_read).await;
+        assert_eq!(ack.status(), EventAckStatus::Rejected);
+        assert_eq!(ack.last_processed_event_seq, (index + 1) as u64);
+        assert!(
+            ack.reject_reason.contains("malformed event:"),
+            "unexpected rejection: {:?}",
+            ack.reject_reason
+        );
+
+        if index == 0 {
+            client_write
+                .send(SruiMessage {
+                    msg: Some(srui_message::Msg::Event(event.clone())),
+                })
+                .await
+                .expect("replay malformed event");
+            let replay_ack = recv_event_ack(&mut client_read).await;
+            assert_eq!(replay_ack.status(), EventAckStatus::Rejected);
+            assert_eq!(replay_ack.reject_reason, ack.reject_reason);
+            assert_eq!(replay_ack.last_processed_event_seq, 1);
+        }
+    }
+
+    send_activate(
+        &mut client_write,
+        CLIENT_A,
+        5,
+        "valid-after-malformed",
+        1,
+        btn,
+    )
+    .await;
+    let ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(ack.status(), EventAckStatus::Processed);
+    assert_eq!(ack.last_processed_event_seq, 5);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
 
     assert_connection_survived(client_write, client_read, server_task).await;
 }

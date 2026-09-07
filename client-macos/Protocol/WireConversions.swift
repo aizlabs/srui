@@ -570,6 +570,22 @@ extension Transaction {
 
 // MARK: - Event <-> SRUIEvent
 
+/// Enforces the cross-language `edit_seq` shape before either Swift event decoder constructs
+/// a domain event. Protobuf's scalar default cannot distinguish omitted from explicit zero, so
+/// TEXT_EDIT requires a positive value and every other event requires the zero default.
+func decodeEventEditSequence(_ rawValue: UInt64, eventType: TypeRef) throws -> EditSeq? {
+    if eventType == .EVENT_TEXT_EDIT {
+        guard let editSeq = EditSeq(rawValue) else {
+            throw ProtocolDecodeError.custom("event error: TEXT_EDIT requires a positive edit_seq")
+        }
+        return editSeq
+    }
+    guard rawValue == 0 else {
+        throw ProtocolDecodeError.custom("event error: only TEXT_EDIT may carry edit_seq")
+    }
+    return nil
+}
+
 extension Event {
     public init(wire: SRUIEvent) throws {
         let clientInstanceId = wire.clientInstanceID.isEmpty ? nil : ClientInstanceId(wire.clientInstanceID)
@@ -577,6 +593,7 @@ extension Event {
             throw ProtocolDecodeError.missingField("Event.eventType")
         }
         let eventType = TypeRef(wire: wire.eventType)
+        let editSeq = try decodeEventEditSequence(wire.editSeq, eventType: eventType)
 
         var args: [PropertyRef: Value] = [:]
         args.reserveCapacity(wire.arguments.count)
@@ -592,7 +609,8 @@ extension Event {
             observedRevision: Revision(wire.observedRevision),
             nodeId: NodeId(wire.nodeID),
             eventType: eventType,
-            arguments: args
+            arguments: args,
+            editSeq: editSeq
         )
     }
 
@@ -612,6 +630,7 @@ extension Event {
             wireProp.value = v.toWire()
             return wireProp
         }
+        wire.editSeq = editSeq?.rawValue ?? 0
         return wire
     }
 }

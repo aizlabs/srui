@@ -15,7 +15,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::event::{ClientInstanceId, Event, EventId};
+use crate::event::{ClientInstanceId, EditSeq, Event, EventId};
 use crate::ids::{NodeId, PropertyRef, TypeRef};
 use crate::store::node::Node;
 use crate::transaction::error::TxnError;
@@ -315,6 +315,7 @@ impl From<&Event> for srui_protocol::Event {
             node_id: event.node_id.get(),
             event_type: Some(event.event_type.into()),
             arguments,
+            edit_seq: event.edit_seq.map(EditSeq::get).unwrap_or(0),
         }
     }
 }
@@ -339,11 +340,22 @@ impl TryFrom<srui_protocol::Event> for Event {
             .event_type
             .map(TypeRef::from)
             .ok_or(WireError::MissingField("Event.event_type"))?;
+        let edit_seq = if event_type == TypeRef::EVENT_TEXT_EDIT {
+            Some(EditSeq::new(wire.edit_seq).ok_or_else(|| {
+                WireError::Event("TEXT_EDIT requires a positive edit_seq".to_string())
+            })?)
+        } else if wire.edit_seq == 0 {
+            None
+        } else {
+            return Err(WireError::Event(
+                "only TEXT_EDIT may carry edit_seq".to_string(),
+            ));
+        };
 
         let mut arguments = HashMap::with_capacity(wire.arguments.len());
-        for p in wire.arguments {
-            let prop = Property::try_from(p).map_err(WireError::ValueConversion)?;
-            arguments.insert(prop.property, prop.value);
+        for property in wire.arguments {
+            let property = Property::try_from(property).map_err(WireError::ValueConversion)?;
+            arguments.insert(property.property, property.value);
         }
 
         Ok(Self {
@@ -354,6 +366,7 @@ impl TryFrom<srui_protocol::Event> for Event {
             node_id: NodeId::new(wire.node_id),
             event_type,
             arguments,
+            edit_seq,
         })
     }
 }

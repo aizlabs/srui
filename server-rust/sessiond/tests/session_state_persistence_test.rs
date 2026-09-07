@@ -284,6 +284,7 @@ async fn test_process_restart_replaced_continuity_on_old_session_id_resume() {
         terminal_stream_offsets: Default::default(),
         limits: None,
         known_resource_hashes: vec![],
+        pending_text_edits: vec![],
     };
 
     let outcome = session2

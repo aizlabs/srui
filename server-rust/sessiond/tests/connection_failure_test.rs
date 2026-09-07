@@ -215,6 +215,7 @@ async fn event_as_first_message_is_rejected() {
             node_id: 42,
             event_type: None,
             arguments: vec![],
+            edit_seq: 0,
         })),
     };
     client_framed_write

@@ -65,13 +65,34 @@ struct CounterSocketIntegrationTests {
 
         let textID = NodeId(2)
         let buttonID = NodeId(4)
+        try await AsyncTestSupport.eventually(
+            description: "initial counter render reaches Count: 0"
+        ) {
+            guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
+                return false
+            }
+            return field.stringValue == "Count: 0"
+        }
 
         for cycle in 1...3 {
             _ = try await controller.sendActivate(nodeId: buttonID)
-            try await Self.waitForRevision(applier, expected: Revision(UInt64(cycle + 1)), timeoutSeconds: 5)
+            try await Self.waitForRevision(
+                applier,
+                expected: Revision(UInt64(cycle + 1)),
+                timeoutSeconds: 5
+            )
+            try await AsyncTestSupport.eventually(
+                description: "counter render reaches Count: \(cycle)"
+            ) {
+                guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
+                    return false
+                }
+                return field.stringValue == "Count: \(cycle)"
+            }
 
             let textHandle = try #require(renderer.registry.handle(for: textID))
             let textField = try #require(textHandle.view as? NSTextField)
+            #expect(textHandle.nodeID == textID)
             #expect(textField.stringValue == "Count: \(cycle)")
         }
 
@@ -130,9 +151,18 @@ struct CounterSocketIntegrationTests {
 
         _ = try await controller.sendActivate(nodeId: buttonID)
         try await Self.waitForRevision(applier, expected: Revision(2), timeoutSeconds: 5)
+        try await AsyncTestSupport.eventually(
+            description: "HELLO catch-up counter render reaches Count: 1"
+        ) {
+            guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
+                return false
+            }
+            return field.stringValue == "Count: 1"
+        }
 
         let textHandle = try #require(renderer.registry.handle(for: textID))
         let textField = try #require(textHandle.view as? NSTextField)
+        #expect(textHandle.nodeID == textID)
         #expect(textField.stringValue == "Count: 1")
 
         await controller.stop()

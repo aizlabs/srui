@@ -1,5 +1,6 @@
 import AppKit
 import SemanticModel
+import Text
 
 public enum LayoutRendererError: Error, Equatable, Sendable {
     case missingSemanticNode(NodeId)
@@ -25,18 +26,28 @@ public final class LayoutRenderer {
         self.controlFactory = controlFactory
     }
 
-    public func mount(store: SemanticStore) throws {
+    public func mount(store: SemanticStore, preserveLocalText: Bool = false) throws {
         RendererDiagnostics.log(
             "mount begin revision=\(store.revision) roots=\(store.rootIDs.count)"
         )
-        tearDown()
-        for rootID in store.rootIDs {
-            try mount(nodeID: rootID, from: store)
+        let remount: () throws -> Void = {
+            // Window close emits end-editing synchronously. That callback must not flush
+            // pending drafts before rebuild, or the new adapter reapplies the stale store string (§22.6).
+            self.tearDown()
+            for rootID in store.rootIDs {
+                try self.mount(nodeID: rootID, from: store)
+            }
+        }
+        if preserveLocalText {
+            try controlFactory.textEditingSession.withPreservedLocalText(remount)
+        } else {
+            try remount()
         }
         // tearDown() closed the previous surfaces; a remount must not leave the UI invisible.
         if surfacesShown {
             showWindows()
         }
+        controlFactory.textEditingSession.syncPresentNodes(Set(registry.allHandles.map(\.nodeID)))
         RendererDiagnostics.log("mount complete handles=\(registry.count)")
     }
 
@@ -50,7 +61,7 @@ public final class LayoutRenderer {
             RendererDiagnostics.log(
                 "transaction revision=\(transaction.newRevision) structural; remounting"
             )
-            try mount(store: newStore)
+            try mount(store: newStore, preserveLocalText: true)
             return classifications
         }
 
@@ -192,9 +203,18 @@ public final class LayoutRenderer {
         guard let node = store.getNode(nodeID) else {
             throw LayoutRendererError.missingSemanticNode(nodeID)
         }
+        if property == .text, ControlFactory.shouldSkipTextFallback(for: handle, node: node) {
+            return
+        }
+        let appliedValue: Value?
+        if property == .value, handle.textAdapter != nil {
+            appliedValue = ControlFactory.displayedEditorText(for: node)
+        } else {
+            appliedValue = node.getProperty(property)
+        }
         controlFactory.apply(
             property: property,
-            value: node.getProperty(property),
+            value: appliedValue,
             to: handle,
             store: store
         )

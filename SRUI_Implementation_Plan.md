@@ -1,15 +1,15 @@
 # SRUI Implementation Plan — Sequential Task Tickets (T0–T38)
 
-This is a task backlog for implementing the SRUI design (`SRUI_Semantic_Remote_UI_Design_v0.4.md`, v0.4) as a series of small, independently verifiable jobs for coding agents (Claude Code, Codex, etc.).
+This is a task backlog for implementing the SRUI design (`SRUI_Semantic_Remote_UI_Design_v0.6.md`, v0.6) as a series of small, independently verifiable jobs for coding agents (Claude Code, Codex, etc.).
 
-**One small note on the design doc, not a change:** its final line reads "End of SRUI design draft v0.2" while the header says v0.4 — a leftover footer from an earlier revision. Cosmetic only; nothing in this plan depends on it, so it's left untouched rather than edited per your instruction to avoid touching the doc unless an error would cause real harm.
+**One small note on the design doc, not a change:** its final line reads "End of SRUI design draft v0.2" — a leftover footer from an earlier revision. Cosmetic only; nothing in this plan depends on it, so it's left untouched rather than edited per your instruction to avoid touching the doc unless an error would cause real harm.
 
 ## How to use this document
 
 Each task below is a **self-contained prompt** in a fenced block. To execute task N:
 
 1. Start a fresh coding-agent session in the SRUI repository.
-2. Attach/paste `SRUI_Semantic_Remote_UI_Design_v0.4.md`.
+2. Attach/paste `SRUI_Semantic_Remote_UI_Design_v0.6.md`.
 3. Copy the entire fenced block for that task and paste it as your instruction.
 4. Let the agent inspect the repo, implement, and run the verification steps.
 5. Only once verification passes, commit, and move to the next task's block.
@@ -46,7 +46,7 @@ Every task's paste block begins with the same standing preamble — repeated del
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI), a
 protocol that replicates application UI *meaning/state* to a native local renderer instead of
 remotely painting pixels. The authoritative design document is attached:
-`SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as read-only and authoritative — do not edit
+`SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as read-only and authoritative — do not edit
 it. This is Task 0 of a sequential implementation plan (Tasks 0–38). This is the first task, so
 the repository is currently empty or near-empty.
 
@@ -87,7 +87,7 @@ Verification (must pass before you stop):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 1 of a sequential implementation plan
 (Tasks 0–38). Task 0 already created the repository scaffold from §28 — inspect it before
 starting; do not redo it.
@@ -132,7 +132,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 2 of a sequential implementation plan
 (Tasks 0–38). Tasks 0–1 already created the repo scaffold and the ID registry (protocol/registry.yaml)
 — inspect them before starting.
@@ -177,7 +177,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 3 of a sequential implementation plan
 (Tasks 0–38). Tasks 0–2 built the repo scaffold, the ID registry, and the protobuf schema +
 codegen — inspect them before starting.
@@ -209,7 +209,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 4 of a sequential implementation plan
 (Tasks 0–38). Task 3 built the Value/TypeRef/PropertyRef/NodeId types in server-rust/semantic-tree
 — inspect it before starting; build directly on those types, do not redefine them.
@@ -247,7 +247,7 @@ Verification (`cargo test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 5 of a sequential implementation plan
 (Tasks 0–38). Task 4 built the raw SemanticStore mutation primitives (create/delete/set/move/
 reorder) in server-rust/semantic-tree/src/store.rs — inspect it before starting; wrap it, don't
@@ -286,7 +286,7 @@ Verification (`cargo test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 6 of a sequential implementation plan
 (Tasks 0–38). Task 5 added atomic transactions/revisions on top of Task 4's store — inspect both
 before starting.
@@ -320,7 +320,7 @@ Verification (`cargo test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 7 of a sequential implementation plan
 (Tasks 0–38). Tasks 3–6 built the value/id types, store, transactions, and model data in
 server-rust/semantic-tree — inspect them before starting.
@@ -355,7 +355,7 @@ Verification (`cargo test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 8 of a sequential implementation plan
 (Tasks 0–38). Tasks 3–7 built the full in-memory Rust Core (values, store, transactions, models,
 events, capabilities) — inspect them before starting.
@@ -399,7 +399,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 9 of a sequential implementation plan
 (Tasks 0–38). Tasks 3–8 built the generic Rust Core (store/transactions/models/events) — inspect
 it before starting; this task adds a typed layer on top, it does not touch the generic store's
@@ -442,7 +442,7 @@ Verification (`cargo test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 10 of a sequential implementation plan
 (Tasks 0–38). Task 9 added the typed Standard Widget layer over the Task 3–8 Rust Core — inspect
 it before starting.
@@ -479,7 +479,7 @@ Verification (`cargo test` plus running examples/counter as a test, not a manual
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 11 of a sequential implementation plan
 (Tasks 0–38). Task 2 generated Rust protobuf bindings from protocol/srui.proto; Tasks 3–10 built
 the in-memory Core, widgets, and SDK. Inspect all of it before starting — this task is the bridge
@@ -514,7 +514,7 @@ Verification (`cargo test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 12 of a sequential implementation plan
 (Tasks 0–38). Task 0 created the client-macos SwiftPM scaffold with a SemanticModel target among
 others — inspect it before starting. This task mirrors Task 3 (Rust Value/id types) in Swift; the
@@ -549,7 +549,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 13 of a sequential implementation plan
 (Tasks 0–38). Task 12 built the Swift Value/Ids types in client-macos/SemanticModel — inspect it
 before starting.
@@ -589,7 +589,7 @@ Verification (`swift test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 14 of a sequential implementation plan
 (Tasks 0–38). Task 13 built the Swift SemanticStore replica primitives — inspect it before
 starting. This task mirrors Rust Tasks 5 and 6 on the client side.
@@ -626,7 +626,7 @@ Verification (`swift test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 15 of a sequential implementation plan
 (Tasks 0–38). Task 2 generated SwiftProtobuf bindings; Tasks 12–14 built the Swift Core store/
 transactions/model. Inspect all of it before starting.
@@ -663,7 +663,7 @@ Verification (`swift test`):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 16 of a sequential implementation plan
 (Tasks 0–38). Tasks 12–15 built the Swift Core store/transactions/decode — inspect them before
 starting. This is the first task that touches AppKit; it is the ONLY task so far allowed to
@@ -711,7 +711,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 17 of a sequential implementation plan
 (Tasks 0–38). Tasks 3–11 built the full in-memory Rust Core/widgets/SDK/wire-encode — inspect
 them before starting.
@@ -747,7 +747,7 @@ Verification (an integration test in server-rust, not a manual demo):
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 18 of a sequential implementation plan
 (Tasks 0–38). Task 16 built the fixture-driven Swift AppKit renderer; Task 17 built the Rust
 local sessiond + socket bridge. Inspect both before starting — this task wires them together for
@@ -788,7 +788,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 19 of a sequential implementation plan
 (Tasks 0–38). Task 18 got a full local-loopback demo working over a plain socket — inspect it
 before starting. This task replaces the loopback transport with real SSH without touching
@@ -828,7 +828,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 20 of a sequential implementation plan
 (Tasks 0–38). Task 19 made the transport real SSH; Task 7 already built the Rust-side
 CapabilitySet negotiation logic (in-process only, no wire I/O). Inspect both before starting.
@@ -864,7 +864,7 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.4.md`. Treat it as
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md`. Treat it as
 read-only and authoritative — do not edit it. This is Task 21 of a sequential implementation plan
 (Tasks 0–38). Unlike most tasks in this plan, this one is a demo/example checkpoint rather than
 new protocol infrastructure: everything it needs — the required-tier Standard Widget Profile
@@ -945,10 +945,9 @@ Verification:
 
 ```
 You are implementing one bounded task in a larger project called SRUI (Semantic Remote UI). The
-authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md` (this design
-was revised from v0.4 partway through this plan — the design has not changed for Tasks 0–21,
-which were implemented against the earlier draft and are not being revisited; from this task
-onward, v0.6 is authoritative). Treat it as read-only and authoritative — do not edit it. This is
+authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.md` (Tasks 0–21
+were originally written against an earlier v0.4 draft with identical technical content; all task
+prompts now reference v0.6 for consistency). Treat it as read-only and authoritative — do not edit it. This is
 Task 22 of a sequential implementation plan (Tasks 0–38). Tasks 17–20 got a real SSH connection
 with capability negotiation running end to end, but sessiond has only ever served one connection
 for the lifetime of a test. Inspect the current server-rust/sessiond before starting.
@@ -1223,6 +1222,29 @@ Verification (a load-style integration test):
 - Commit the result.
 ```
 
+**Follow-up improvements (post-implementation errata):**
+
+> Task 25 as implemented coalesces scalar updates on the server side, but the resulting
+> envelope must use v0.6 §12.1's **coalesced scalar-delta delivery form** (`base=N, new=M`
+> where `M > N+1`, containing only scalar `SET_PROPERTY` operations). Task 14's client-side
+> `TransactionApplier` enforces a strict `base + 1` rule and will reject these multi-revision
+> spans. The following items must be addressed:
+>
+> 1. **Server: emit the §12.1 envelope** — when coalescing collapses revisions N through M,
+>    the outbound frame must carry `base=N, new=M` with only the latest value per
+>    `(node, property)` pair. Structural transactions remain barriers that end a coalescing
+>    run and are delivered individually as normal `base=K, new=K+1` commits.
+> 2. **Client: upgrade the replica applier** — `TransactionApplier.applyDelivered()` (or
+>    equivalent) must accept `new > base + 1` **if and only if** every operation in the
+>    envelope is a scalar `SET_PROPERTY` and `base == currentRevision`. Multi-revision frames
+>    containing structural operations, or applied to an authoritative store, must still be
+>    rejected.
+> 3. **Test: add coalesced-span conformance fixtures** — e.g.
+>    `48_coalesced_scalar_delta_delivered.json` (valid span accepted by replica) and
+>    `49_coalesced_scalar_delta_rejected_as_commit.json` (same span rejected on authoritative
+>    path). The existing 1,000-update convergence test must exercise the upgraded applier
+>    end-to-end.
+
 ---
 
 ## Phase G — Resources and scheduling
@@ -1460,8 +1482,10 @@ client renders instead).
 
 Build, in examples/coding-agent-demo/:
 - Assemble the §30 tree using real components from prior tasks: Surface > Column > Row(heading +
-  Progress) > Split(Tree(files) | Column(RichText(conversation), Terminal, Row(Approve/Reject
-  buttons))) > TextArea(prompt).
+  Progress) > Row(Tree(files), Column(RichText(conversation), Terminal, Row(Approve/Reject
+  buttons))) > TextArea(prompt). (Note: §30 shows a Split pane, but Split is a SHOULD-tier widget
+  deferred in Tasks 9 and 16; a horizontal Row achieves the same two-panel layout using only
+  required-tier components.)
 - Add one placeholder extension node (e.g. representing a future `Diff` or `ApprovalRequest`
   from the coding profile mentioned in §30, which is explicitly NOT being implemented in this
   plan) that always carries a Standard Widget fallback subtree per §11.1, so the fallback path
@@ -1748,17 +1772,22 @@ Build, in sdk/second-language/:
   quickly) that can: complete the Task 20 capability handshake, connect over the Task 19 SSH
   transport, decode transactions into a simple in-memory tree (doesn't need a full typed
   Standard Widget layer, just enough structure to run Task 33's conformance fixtures against),
-  and run the full Task 33 conformance suite against a live server.
+  and run the protocol/headless subset of the Task 33 conformance suite (suites 1–5, 7–9)
+  against a live server. Renderer-specific suites — 6 (local text interaction), 10 (renderer
+  semantics), 11 (semantic inspection/automation), and 12 (toolkit mappings) — are excluded
+  because they require a GUI renderer or interactive text-editing stack that this client
+  explicitly does not implement.
 
 Out of scope: no rendering, no text editing, no terminal support, no resource caching beyond
 what's needed to not crash on receiving a resource reference — this client's entire purpose is
 to prove the protocol layer (not the renderer layer) is genuinely toolkit/platform-neutral.
 
 Verification:
-- this client passes the same Task 33 conformance suite the Swift client passes, run against the
-  same live server, with zero macOS-specific assumptions anywhere in its code (spot-check: it
-  should build and run on a non-macOS machine, or at minimum have no import/dependency on
-  anything Apple-specific);
+- this client passes the protocol/headless conformance suites (1–5, 7–9) when run against the
+  same live server as the Swift client, with zero macOS-specific assumptions anywhere in its code
+  (spot-check: it should build and run on a non-macOS machine, or at minimum have no
+  import/dependency on anything Apple-specific). Renderer-specific suites (6, 10, 11, 12) are
+  reserved for GUI clients and are not required here;
 - Commit the result.
 ```
 

@@ -1915,6 +1915,15 @@ maximum pending unacknowledged events
 maximum terminal escape payload lengths
 ```
 
+`maximum update rate` is enforced per session with a token bucket: 120 semantic transactions per
+second sustained, with a 240-transaction burst capacity. These are the default limits and MAY be
+locally configurable, but implementations MUST enforce finite bounds. When the bucket is
+exhausted, the receiver MUST apply backpressure or fail explicitly; it MUST NOT silently discard
+transactions. This default is high enough for ordinary semantic UI traffic and admits short
+legitimate bursts, while preserving the invariant that protocol traffic does not scale with
+display refresh rate (§12.2, §31.3). It should be revised only if benchmarks demonstrate that
+legitimate workloads exceed it.
+
 `maximum pending unacknowledged events` bounds the client's retry set, which is drained by
 `SERVER EVENT_ACK` (§18.2). Reaching the bound means events are being discarded before they were
 known to be processed, so an eviction there MUST be reported rather than silently dropped.

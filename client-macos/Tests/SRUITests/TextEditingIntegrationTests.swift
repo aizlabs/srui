@@ -280,6 +280,97 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
+    @Test("Manual sendActivate flushes a debounced draft before the action")
+    @MainActor
+    func manualSendActivateFlushesPendingDraftBeforeAction() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 60_000_000_000
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let collector = EventCollector()
+
+        do {
+            try await controller.start()
+            try await handshakeAndMount(
+                controller: controller,
+                server: serverTransport,
+                applier: applier,
+                renderer: renderer,
+                sessionId: "manual-activate-flushes-text"
+            )
+            await collector.start(draining: serverTransport)
+
+            renderer.textEditingSession.noteLocalValue(
+                "first",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: true
+            )
+            let first = try await waitForTextEvent(collector)
+            renderer.textEditingSession.noteLocalValue(
+                "second",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: false
+            )
+            #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID))
+            let generationBeforeFlush = renderer.textEditingSession.currentFlushGeneration
+
+            // Public sendActivate must flush the still-debounced draft before taking the drain
+            // cutoff. Ack E1 only after that flush, or the activate Task waits on the editor lane.
+            let activateTask = Task {
+                try await controller.sendActivate(nodeId: NodeId(99))
+            }
+            try await waitUntil(description: "manual activate flushed text but has not allocated") {
+                let eventSeq = await controller.outbox.eventSeq
+                return eventSeq == 1
+                    && renderer.textEditingSession.currentFlushGeneration > generationBeforeFlush
+                    && renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID)
+            }
+
+            var acknowledgement = SRUIServerEventAck()
+            acknowledgement.clientInstanceID = try #require(first.clientInstanceId).bytes
+            acknowledgement.eventID = first.eventId.bytes
+            acknowledgement.lastProcessedEventSeq = first.eventSeq
+            acknowledgement.status = .processed
+            acknowledgement.revisionAfterEffect = 1
+            acknowledgement.sessionID = "manual-activate-flushes-text"
+            var acknowledgementMessage = SRUIMessage()
+            acknowledgementMessage.serverEventAck = acknowledgement
+            await controller.handleIncomingMessage(acknowledgementMessage)
+
+            let activate = try await activateTask.value
+            try await waitUntil(description: "flushed text preceded the manual action") {
+                await collector.eventCount() == 3
+            }
+            let delivered = await collector.events()
+            #expect(delivered.map(\.eventType) == [
+                .EVENT_TEXT_EDIT,
+                .EVENT_TEXT_EDIT,
+                .EVENT_ACTIVATE,
+            ])
+            #expect(delivered.map(\.eventSeq) == [1, 2, 3])
+            #expect(delivered[1].textArg == "second")
+            #expect(activate.eventSeq == 3)
+            #expect(activate.eventType == .EVENT_ACTIVATE)
+        } catch {
+            await controller.stop()
+            await collector.stop()
+            await serverTransport.close()
+            throw error
+        }
+
+        await controller.stop()
+        await collector.stop()
+        await serverTransport.close()
+    }
+
     @Test("Typing during an editor-lane wait stays behind the already-queued action")
     @MainActor
     func typingDuringLaneWaitFollowsNonTextAction() async throws {

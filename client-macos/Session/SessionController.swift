@@ -1094,6 +1094,26 @@ public final class SessionController: @unchecked Sendable {
         return limits
     }
 
+    /// Flushes every committed, non-composing native value and waits for the resulting text-edit
+    /// Tasks so a manual activate/value/selection cannot overtake a still-debounced draft.
+    ///
+    /// `flushAllPending()` commits through `onCommit`, which claims each draft onto
+    /// `interactionDispatchTail`. Capturing that tail on the same MainActor hop is required:
+    /// the later inline drain skips claimed identities, so returning without waiting would
+    /// allocate the non-text event first.
+    private func flushPendingTextForManualNonTextInteraction() async -> UInt64 {
+        let (drainCutoff, predecessor) = await MainActor.run {
+            () -> (UInt64, Task<Void, Never>?) in
+            self.renderer?.textEditingSession.flushAllPending()
+            return (
+                self.renderer?.textEditingSession.currentFlushGeneration ?? 0,
+                self.interactionDispatchTail
+            )
+        }
+        _ = await predecessor?.result
+        return drainCutoff
+    }
+
     /// Dispatches a manual activation event for the given node ID (§7.7).
     @discardableResult
     public func sendActivate(nodeId: NodeId) async throws -> Event {
@@ -1113,9 +1133,7 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
-        let drainCutoff = await MainActor.run {
-            self.renderer?.textEditingSession.currentFlushGeneration ?? 0
-        }
+        let drainCutoff = await flushPendingTextForManualNonTextInteraction()
         return try await sendActivate(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
@@ -1179,9 +1197,7 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
-        let drainCutoff = await MainActor.run {
-            self.renderer?.textEditingSession.currentFlushGeneration ?? 0
-        }
+        let drainCutoff = await flushPendingTextForManualNonTextInteraction()
         return try await sendValueChanged(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
@@ -1248,9 +1264,7 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
-        let drainCutoff = await MainActor.run {
-            self.renderer?.textEditingSession.currentFlushGeneration ?? 0
-        }
+        let drainCutoff = await flushPendingTextForManualNonTextInteraction()
         return try await sendSelectionChanged(
             nodeId: nodeId,
             observedRevision: snapshot.revision,

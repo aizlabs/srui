@@ -1,5 +1,5 @@
 //! Atomic client attach: optimistic catch-up export plus bounded outbound subscribe
-//! (§15, §18, §18.1, §20.2, §21).
+//! (§15, §18, §18.1, §18.3, §20.2, §21).
 //!
 //! # Lock Order
 //!

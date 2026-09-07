@@ -329,6 +329,10 @@ private final class TextLifecycleFence: @unchecked Sendable {
     }
 }
 
+/// Lets a MainActor correction revoke a prepared send before its FIFO gate opens.
+///
+/// Records are registered at preparation and retired at authorization, rejection, cancellation,
+/// or settlement, so the revocation set cannot grow without bound (§18.3, §22.6).
 private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
     private let lock = NSLock()
     private var preparedEventIds: Set<EventId> = []
@@ -376,6 +380,7 @@ private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
         lock.withLock { revokedEventIds.count }
     }
 }
+
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
 ///
 /// Retry safety (§18.2): every application-side-effect event carries a stable `event_id` and
@@ -461,6 +466,7 @@ public actor EventOutbox {
         var token: UUID
         var invalidation: Task<UInt64?, Never>
     }
+
     public init(
         clientInstanceId: ClientInstanceId = ClientInstanceId(string: UUID().uuidString),
         maxPendingEvents: Int = EventOutbox.defaultMaxPendingEvents
@@ -851,6 +857,7 @@ public actor EventOutbox {
             return false
         }
     }
+
     /// Waits for an authorized edit's first transmission. A lifecycle-canceled transport returns
     /// the retained identity immediately; same-session resume owns its next transmission.
     @discardableResult
@@ -866,6 +873,7 @@ public actor EventOutbox {
         }
         return nil
     }
+
     /// Rolls back only an explicitly rejected, still-unauthorized edit. Global prepared-slot
     /// exclusion makes it the newest allocation, so rewinding event_seq cannot create a hole.
     ///
@@ -910,6 +918,7 @@ public actor EventOutbox {
             return event
         }
     }
+
     public func assignedTextEditDescriptors() -> [PendingTextEditDescriptor] {
         pendingOrder.compactMap { id in
             guard let event = pendingEvents[id],
@@ -980,9 +989,10 @@ public actor EventOutbox {
         try cancelAssignedTextEdits(confirming: confirming, requireExactMatch: requireExactMatch)
         return true
     }
+
+    /// Applies the assigned-edit acknowledgement boundary after the native full resync.
     @discardableResult
     func applyFullResyncTextBoundary(
-        laneEpoch: UInt64?,
         generation: UInt64?,
         binding: EventOutboxConnectionBinding,
         renderToken: UUID
@@ -1002,7 +1012,7 @@ public actor EventOutbox {
             return false
         }
 
-        applyFullResyncTextBoundaryState(laneEpoch: laneEpoch)
+        applyFullResyncTextBoundaryState()
         resyncRenderOwnership = nil
         return true
     }
@@ -1010,7 +1020,6 @@ public actor EventOutbox {
     /// Abandons ownership after a committed snapshot fails to render.
     @discardableResult
     func abortResyncRender(
-        laneEpoch: UInt64?,
         generation: UInt64?,
         binding: EventOutboxConnectionBinding,
         renderToken: UUID
@@ -1023,7 +1032,7 @@ public actor EventOutbox {
         }
 
         acceptsNewEvents = false
-        applyFullResyncTextBoundaryState(laneEpoch: laneEpoch)
+        applyFullResyncTextBoundaryState()
         await resyncRenderFence.invalidate(renderToken)
         if resyncRenderOwnership?.generation == generation,
            resyncRenderOwnership?.binding == binding,
@@ -1650,7 +1659,6 @@ public actor EventOutbox {
         )
     }
 
-
     /// Revalidates a prepared same-session transition after MainActor adopted its assignments,
     /// then replays retained identities in allocation order.
     func completeSameSessionResume(
@@ -1713,7 +1721,7 @@ public actor EventOutbox {
                 return false
             }
             resyncRenderOwnership = nil
-            applyFullResyncTextBoundaryState(laneEpoch: nil)
+            applyFullResyncTextBoundaryState()
         }
 
         // The current HELLO binding owns this decision: retire the prior transport lease while
@@ -1744,7 +1752,6 @@ public actor EventOutbox {
         cancelPendingWrites()
         return true
     }
-    /// Applies the event frontier for a live-session resync without an outstanding resume attempt.
     /// Applies the event frontier for a live-session resync without an outstanding resume attempt.
     ///
     /// Does not cancel the replay retry loop: unsettled events keep retrying until settlement
@@ -2190,8 +2197,8 @@ public actor EventOutbox {
             return false
         }
 
-        if let renderedBoundaryEpoch {
-            applyFullResyncTextBoundaryState(laneEpoch: renderedBoundaryEpoch)
+        if renderedBoundaryEpoch != nil {
+            applyFullResyncTextBoundaryState()
         } else {
             for (nodeId, barrier) in cleanup.acknowledgementBarriersAtStart
             where textAcknowledgementBarriers[nodeId] == barrier {
@@ -2282,8 +2289,11 @@ public actor EventOutbox {
             && pendingResumeRecoveryRenderInvalidation == nil
     }
 
-    private func applyFullResyncTextBoundaryState(laneEpoch: UInt64?) {
-        _ = laneEpoch
+    /// Retires every acknowledgement barrier at the native full-resync boundary.
+    ///
+    /// The lane-epoch floor that fences callbacks queued by the old native controls is owned by
+    /// `TextEditingSession.discardUnresolvedEditsForResync()`, not by this outbox (§18.3).
+    private func applyFullResyncTextBoundaryState() {
         textAcknowledgementBarriers.removeAll(keepingCapacity: true)
         signalTextLaneStateChange()
     }

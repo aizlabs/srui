@@ -342,7 +342,10 @@ public final class TextEditingSession {
     /// Flushes every committed, non-composing native value before a non-text interaction is
     /// admitted. Snapshotting the keys makes recursive commit callbacks safe.
     public func flushAllPending() {
-        for nodeID in Array(nodes.keys) {
+        // Sorted, not `nodes.keys`: Dictionary order is seeded per process, and `flushPending`
+        // appends to `unassignedNodeOrder`, so hash order would make cross-editor `event_seq`
+        // assignment differ between otherwise identical runs (§18.2).
+        for nodeID in nodes.keys.sorted() {
             flushPending(nodeID: nodeID)
         }
     }
@@ -641,7 +644,7 @@ public final class TextEditingSession {
         unassignedNodeOrder.removeAll(keepingCapacity: false)
 
         var revokedEventIds: [EventId] = []
-        for nodeID in Array(nodes.keys) {
+        for nodeID in nodes.keys.sorted() {
             guard var state = nodes[nodeID] else { continue }
             if let eventId = state.assignedEventId {
                 revokedEventIds.append(eventId)
@@ -698,7 +701,7 @@ public final class TextEditingSession {
     }
 
     private func abandonAllCompositions() {
-        for nodeID in Array(nodes.keys) {
+        for nodeID in nodes.keys.sorted() {
             abandonComposition(nodeID: nodeID)
         }
     }

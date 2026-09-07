@@ -1,7 +1,7 @@
 //! # Session State & Transaction Coordination
 //!
 //! Authoritative state owner managing [`SemanticStore`], [`TransactionJournal`],
-//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §20.2, §21, App. B).
+//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §18.3, §20.2, §21, App. B).
 //!
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.

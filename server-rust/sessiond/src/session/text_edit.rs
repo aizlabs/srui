@@ -4,7 +4,7 @@
 //! Policy runs *outside* the session mutex. A per-node generation reserved before the policy call
 //! is rechecked before commit so an older concurrent validator cannot overwrite a newer edit.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, MutexGuard};
 
 use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, RecordOutcome};
@@ -177,6 +177,8 @@ impl TextEditTracker {
         });
         self.stream_count -= removed;
     }
+
+    /// Reserves a generation for a sequence strictly above the terminal watermark.
     pub fn reserve(
         &mut self,
         client_instance_id: &[u8],
@@ -656,10 +658,19 @@ impl Session {
         }
 
         let mut validated = Vec::with_capacity(refs.len());
+        let mut seen_event_ids: HashSet<&[u8]> = HashSet::with_capacity(refs.len());
         for reference in refs {
             if reference.event_id.is_empty() || reference.event_seq == 0 {
                 return Err(SessionError::InvalidInput(
                     "pending TEXT_EDIT ref is missing event_id or event_seq".into(),
+                ));
+            }
+            // `event_id` is the dedupe key, so a repeat makes the intended settlement ambiguous
+            // and would desynchronize the echoed discard list from the client's assigned set.
+            // Malformed input fails explicitly rather than being silently coalesced (§4 inv. 13).
+            if !seen_event_ids.insert(reference.event_id.as_slice()) {
+                return Err(SessionError::InvalidInput(
+                    "pending_text_edits repeats an event_id".into(),
                 ));
             }
             let edit_seq = EditSeq::new(reference.edit_seq).ok_or_else(|| {
@@ -1232,5 +1243,35 @@ mod tests {
             .text_edit_tracker
             .reserve(client, node(7), seq(2))
             .is_ok());
+    }
+
+    #[test]
+    fn duplicate_pending_text_edit_event_ids_are_rejected() {
+        let duplicated = srui_protocol::PendingTextEditRef {
+            event_id: b"repeated".to_vec(),
+            event_seq: 1,
+            node_id: 7,
+            edit_seq: 1,
+        };
+        let refs = vec![
+            duplicated.clone(),
+            srui_protocol::PendingTextEditRef {
+                event_seq: 2,
+                node_id: 8,
+                edit_seq: 2,
+                ..duplicated
+            },
+        ];
+
+        match Session::validate_pending_text_edit_refs(&refs) {
+            Err(SessionError::InvalidInput(message)) => {
+                assert!(
+                    message.contains("event_id"),
+                    "unexpected message: {message}"
+                );
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a repeated event_id is malformed"),
+        }
     }
 }

@@ -67,9 +67,34 @@ actor TerminalCommandPump {
     }
 
     func enqueueInput(streamID: NodeId, data: Data) {
-        guard connected, !data.isEmpty, data.count <= maxTerminalInputBytes else { return }
-        queue.append(.input(streamID, data))
+        guard connected, !data.isEmpty else { return }
+        // A clipboard paste routinely exceeds the per-envelope limit. Dropping it would send no
+        // input at all, so split it into ordered TerminalInput frames instead: the PTY is a byte
+        // stream, chunks reassemble exactly, and the single bracketed-paste begin/end pair the
+        // encoder produced is preserved because only the encoded byte run is cut (§21, §26).
+        var remaining = data[...]
+        while !remaining.isEmpty {
+            let take = Self.chunkLength(of: remaining, limit: maxTerminalInputBytes)
+            let cut = remaining.index(remaining.startIndex, offsetBy: take)
+            queue.append(.input(streamID, Data(remaining[..<cut])))
+            remaining = remaining[cut...]
+        }
         kick()
+    }
+
+    /// Longest prefix of at most `limit` bytes that does not cut a UTF-8 scalar in half, so a
+    /// remote line editor never reads a truncated codepoint. Falls back to `limit` for byte runs
+    /// that are not valid UTF-8 at that boundary, so every chunk makes progress.
+    private static func chunkLength(of bytes: Data.SubSequence, limit: Int) -> Int {
+        guard limit < bytes.count else { return bytes.count }
+        var take = limit
+        let floor = max(1, limit - 3)
+        while take > floor {
+            let byte = bytes[bytes.index(bytes.startIndex, offsetBy: take)]
+            if byte & 0xC0 != 0x80 { return take }
+            take -= 1
+        }
+        return limit
     }
 
     func enqueueResize(streamID: NodeId, columns: UInt32, rows: UInt32, pixelWidth: UInt32, pixelHeight: UInt32) {

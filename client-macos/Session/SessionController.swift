@@ -1492,6 +1492,12 @@ public final class SessionController: @unchecked Sendable {
         case .terminalData(let data):
             switch phase {
             case .active, .awaitingSnapshot, .awaitingResume:
+                guard terminalNegotiated(in: phase) else {
+                    await reportFailure(.protocolViolation(
+                        "Received TerminalData without a negotiated \(terminalProfileURI)"
+                    ))
+                    return
+                }
                 await handleTerminalData(data)
             case .idle, .awaitingWelcome, .failed:
                 await reportFailure(.protocolViolation(
@@ -1502,12 +1508,32 @@ public final class SessionController: @unchecked Sendable {
         case .terminalResyncRequired(let resync):
             switch phase {
             case .active, .awaitingSnapshot, .awaitingResume:
+                guard terminalNegotiated(in: phase) else {
+                    await reportFailure(.protocolViolation(
+                        "Received TerminalResyncRequired without a negotiated \(terminalProfileURI)"
+                    ))
+                    return
+                }
                 await handleTerminalResync(resync)
             case .idle, .awaitingWelcome, .failed:
                 await reportFailure(.protocolViolation(
                     "Received TerminalResyncRequired before handshake completed"
                 ))
             }
+        }
+    }
+
+    /// Terminal envelopes are legal only for a peer that negotiated `org.srui.terminal/1`.
+    /// An unnegotiated terminal frame is a required-semantics failure, not something to drop
+    /// silently: accepting it would also let the peer allocate stream state (§11.1, §21, §4 inv. 13).
+    private func terminalNegotiated(in phase: ProtocolPhase) -> Bool {
+        switch phase {
+        case .active(let negotiated), .awaitingSnapshot(let negotiated):
+            return negotiated.contains(.terminalV1)
+        case .awaitingResume:
+            return withStateLock { retainedCapabilities }?.contains(.terminalV1) ?? false
+        case .idle, .awaitingWelcome, .failed:
+            return false
         }
     }
 
@@ -2239,6 +2265,10 @@ public final class SessionController: @unchecked Sendable {
     }
 
     /// Local terminal apply only. Never touches semantic phase, revision, outbox, or text drafts.
+    ///
+    /// Empty, oversized and offset-overflowing frames are wire-contract violations (§21, §26), not
+    /// recoverable drops: silently discarding an oversized frame would leave the local cursor
+    /// behind and turn the next frame into a fake local gap that clears the screen.
     private func handleTerminalData(_ data: SRUITerminalData) async {
         guard let renderer else { return }
         do {
@@ -2248,7 +2278,7 @@ public final class SessionController: @unchecked Sendable {
                 data: data.data
             )
         } catch {
-            SessionDiagnostics.error("TerminalData rejected: \(error)")
+            await reportFailure(.protocolViolation("TerminalData rejected: \(error)"))
         }
     }
 
@@ -2263,13 +2293,17 @@ public final class SessionController: @unchecked Sendable {
         case .unspecified: cause = .unspecified
         case .UNRECOGNIZED: cause = .unspecified
         }
-        _ = await renderer.terminalSession.applyResync(
-            streamID: NodeId(resync.streamID),
-            requestedOffset: resync.requestedOffset,
-            retainedFromOffset: resync.retainedFromOffset,
-            resumeAtOffset: resync.resumeAtOffset,
-            cause: cause
-        )
+        do {
+            _ = try await renderer.terminalSession.applyResync(
+                streamID: NodeId(resync.streamID),
+                requestedOffset: resync.requestedOffset,
+                retainedFromOffset: resync.retainedFromOffset,
+                resumeAtOffset: resync.resumeAtOffset,
+                cause: cause
+            )
+        } catch {
+            await reportFailure(.protocolViolation("TerminalResyncRequired rejected: \(error)"))
+        }
     }
 
     /// Assembles resource metadata into the shared cache. Failures log/drop; the semantic store

@@ -382,6 +382,9 @@ impl Session {
                 &hello.known_resource_hashes,
                 max_resource_size,
             )?;
+            // Capabilities are now fixed for the rest of this session's life: a later detach
+            // must not reopen capability-changing operations (§15, §21).
+            inner_guard.has_negotiated = true;
             drop(inner_guard);
 
             // Attach only after the catch-up export is committed so optimistic retries cannot
@@ -583,6 +586,39 @@ impl Session {
             break (inner_guard, plan);
         };
 
+        // A replaced incarnation was never negotiated with this client: CLIENT_RESUME carries no
+        // profile list, so the server cannot know whether the peer implements the extension
+        // profiles this incarnation requires. Inferring support from server state would push a
+        // Terminal node and terminal frames at a client that cannot mount them. Fail explicitly
+        // and make the client re-handshake instead of degrading silently (§11.1, §15, §4 inv. 13).
+        //
+        // The standard-widgets baseline is exempt: no peer can reach the data plane without it,
+        // so a resume already proves it was negotiated.
+        if matches!(
+            &plan,
+            ResumePlan::Resync {
+                continuity: SessionContinuity::Replaced,
+                ..
+            }
+        ) {
+            let unproven: Vec<String> = inner_guard
+                .capabilities
+                .required
+                .iter()
+                .filter(|profile| **profile != Profile::standard_widgets_v1())
+                .map(ToString::to_string)
+                .collect();
+            if !unproven.is_empty() {
+                let unproven = unproven.join(", ");
+                drop(inner_guard);
+                return Err(SessionError::InvalidInput(format!(
+                    "CLIENT_RESUME names a replaced incarnation, but this session requires \
+                     [{unproven}], which this client never negotiated here. Reconnect with \
+                     CLIENT_HELLO (§11.1, §15)"
+                )));
+            }
+        }
+
         before_subscribe
             .take()
             .expect("subscription callback runs once")();
@@ -605,6 +641,7 @@ impl Session {
             &resume.known_resource_hashes,
             max_resource_size,
         )?;
+        inner_guard.has_negotiated = true;
         if let ResumePlan::Resync {
             pending_text_edit_cancellation,
             ..

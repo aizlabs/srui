@@ -163,6 +163,8 @@ public enum TerminalApplyError: Error, Equatable, Sendable {
     case emptyFrame
     case frameTooLarge(Int)
     case offsetOverflow
+    /// A peer named more distinct stream IDs than this client will retain (§21, §26).
+    case tooManyStreams(Int)
 }
 
 /// Mutable screen + parser state for one PTY stream. Not `Sendable`; owned by `TerminalSession`.

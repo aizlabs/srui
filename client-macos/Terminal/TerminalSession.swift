@@ -132,6 +132,7 @@ public actor TerminalSession {
         if data.count > maxTerminalOutputFrameBytes {
             throw TerminalApplyError.frameTooLarge(data.count)
         }
+        try admit(streamID)
         let end = try addOffsets(byteOffset, UInt64(data.count))
         var state = streams[streamID] ?? StreamState(
             grid: TerminalGrid(),
@@ -176,6 +177,14 @@ public actor TerminalSession {
         return snapshot
     }
 
+    /// Bounds the stream table: a peer cannot force unbounded client memory by naming a fresh
+    /// stream ID per frame. The ceiling matches the resume map the client can carry (§21, §26).
+    private func admit(_ streamID: NodeId) throws {
+        guard streams[streamID] != nil || streams.count < maxTerminalResumeMapEntries else {
+            throw TerminalApplyError.tooManyStreams(streams.count)
+        }
+    }
+
     /// Applies `TerminalResyncRequired` without touching semantic session state.
     @discardableResult
     public func applyResync(
@@ -184,10 +193,11 @@ public actor TerminalSession {
         retainedFromOffset: UInt64,
         resumeAtOffset: UInt64,
         cause: TerminalResyncCause
-    ) -> TerminalSnapshot {
+    ) throws -> TerminalSnapshot {
         _ = requestedOffset
         _ = retainedFromOffset
         _ = cause
+        try admit(streamID)
         var state = streams[streamID] ?? StreamState(
             grid: TerminalGrid(),
             parser: VTParser(),

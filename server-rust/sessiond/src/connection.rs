@@ -451,7 +451,12 @@ fn spawn_terminal_live_pumps(
         let session_cancel = session_cancel.clone();
         let mut released = released_rx.clone();
         tasks.push(tokio::spawn(async move {
-            let mut staged_events = std::collections::VecDeque::new();
+            // Do not drain the ring while the gate is closed. Staging live output here
+            // would bypass both the bounded output ring and the bounded terminal lane, so a
+            // continuously writing child could grow the server heap for as long as the socket
+            // blocks. Leaving the bytes in the ring keeps the §21.2 retention bound; a cursor
+            // that falls behind the retained window emits the existing SubscriberFallbehind
+            // resync on the first drain after release.
             while !*released.borrow() {
                 tokio::select! {
                     biased;
@@ -459,36 +464,6 @@ fn spawn_terminal_live_pumps(
                     _ = shutdown.cancelled() => return,
                     changed = released.changed() => {
                         if changed.is_err() {
-                            return;
-                        }
-                    }
-                    events = subscription.recv() => {
-                        if events.is_empty() {
-                            return;
-                        }
-                        for event in events {
-                            staged_events.push_back(event);
-                        }
-                    }
-                }
-            }
-
-            while let Some(event) = staged_events.pop_front() {
-                let class = live_class_for_event(&event);
-                let msg = event_to_message(event);
-                match class {
-                    LogicalChannelClass::TerminalHigh => {
-                        if high_tx.send(msg).await.is_err() {
-                            return;
-                        }
-                    }
-                    LogicalChannelClass::TerminalNormal => {
-                        if normal_tx.send(msg).await.is_err() {
-                            return;
-                        }
-                    }
-                    _ => {
-                        if high_tx.send(msg).await.is_err() {
                             return;
                         }
                     }

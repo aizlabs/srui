@@ -260,6 +260,12 @@ pub(crate) struct SessionInner {
     pub(crate) text_edit_policy: Option<text_edit::TextEditPolicy>,
     /// Session-stable extension URI → namespace_id table advertised on every welcome (§15, §21).
     pub(crate) extension_namespaces: Vec<srui_protocol::ExtensionNamespaceMapping>,
+    /// Set once any client has completed a handshake against this session (§15, §21).
+    ///
+    /// Detaching clears [`SessionState::Attached`] but not this flag: a client that already
+    /// negotiated can resume without a second `ServerWelcome`, so capability-changing operations
+    /// stay illegal for the rest of the session's life, not just while a transport is attached.
+    pub(crate) has_negotiated: bool,
 }
 
 impl std::fmt::Debug for SessionInner {
@@ -448,6 +454,7 @@ impl Session {
             text_edit_tracker: text_edit::TextEditTracker::default(),
             text_edit_policy: None,
             extension_namespaces: vec![terminal::standard_namespace_mapping()],
+            has_negotiated: false,
         };
 
         Self {
@@ -498,6 +505,17 @@ impl Session {
     #[must_use]
     pub fn is_attached(&self) -> bool {
         self.state() == SessionState::Attached
+    }
+
+    /// Returns `true` once any client has completed a handshake against this session (§15, §21).
+    ///
+    /// Unlike [`Session::is_attached`], this never returns to `false`: a detached client can
+    /// resume without a second `ServerWelcome`, so its negotiated capability set outlives the
+    /// transport.
+    #[must_use]
+    pub fn has_negotiated(&self) -> bool {
+        let guard = lock_or_recover(&self.inner);
+        guard.has_negotiated
     }
 
     /// Returns `true` if the session is detached from all transports (§17).

@@ -58,10 +58,10 @@ struct TerminalSessionTests {
     }
 
     @Test("TerminalResyncRequired clears the grid and jumps to resume_at")
-    func resyncRequired() async {
+    func resyncRequired() async throws {
         let session = TerminalSession()
         _ = try? await session.applyData(streamID: stream, byteOffset: 0, data: Data("hello".utf8))
-        let after = await session.applyResync(
+        let after = try await session.applyResync(
             streamID: stream,
             requestedOffset: 0,
             retainedFromOffset: 8,
@@ -85,7 +85,7 @@ struct TerminalSessionTests {
         #expect(await session.bracketedPaste(for: stream))
         #expect(await session.applicationCursorKeys(for: stream))
 
-        _ = await session.applyResync(
+        _ = try await session.applyResync(
             streamID: stream,
             requestedOffset: 0,
             retainedFromOffset: 64,
@@ -202,13 +202,43 @@ struct TerminalSessionTests {
         #expect(firstScrollbackLine == "line0")
     }
 
+    @Test("the stream table is bounded so a peer cannot name unbounded stream IDs")
+    func streamTableIsBounded() async throws {
+        let session = TerminalSession()
+        for id in 0..<maxTerminalResumeMapEntries {
+            _ = try await session.applyData(
+                streamID: NodeId(UInt64(id)),
+                byteOffset: 0,
+                data: Data("x".utf8)
+            )
+        }
+        // An existing stream still applies.
+        _ = try await session.applyData(streamID: NodeId(0), byteOffset: 1, data: Data("y".utf8))
+        await #expect(throws: TerminalApplyError.self) {
+            try await session.applyData(
+                streamID: NodeId(UInt64(maxTerminalResumeMapEntries)),
+                byteOffset: 0,
+                data: Data("x".utf8)
+            )
+        }
+        await #expect(throws: TerminalApplyError.self) {
+            try await session.applyResync(
+                streamID: NodeId(UInt64(maxTerminalResumeMapEntries) + 1),
+                requestedOffset: 0,
+                retainedFromOffset: 0,
+                resumeAtOffset: 8,
+                cause: .retentionLoss
+            )
+        }
+    }
+
     @Test("resync preserves bracketed paste mode")
     func resyncPreservesBracketedPaste() async throws {
         let session = TerminalSession()
         let enablePaste = Data([0x1B, 0x5B, 0x3F, 0x32, 0x30, 0x30, 0x34, 0x68])
         let snap1 = try await session.applyData(streamID: stream, byteOffset: 0, data: enablePaste)
         #expect(snap1.bracketedPaste)
-        let snap2 = await session.applyResync(
+        let snap2 = try await session.applyResync(
             streamID: stream,
             requestedOffset: 0,
             retainedFromOffset: 8,

@@ -109,4 +109,51 @@ struct SessionControllerTerminalTests {
         await controller.stop()
         await serverTransport.close()
     }
+
+    /// A server that never negotiated `org.srui.terminal/1` must not be able to push terminal
+    /// frames, nor to allocate per-stream client state by naming stream IDs (§11.1, §21).
+    @Test("TerminalData without a negotiated terminal profile fails the session")
+    @MainActor
+    func unnegotiatedTerminalDataIsAProtocolViolation() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1, Profile.terminalV1]
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "no-terminal"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.optionalProfiles = []
+        welcome.initialRevision = 0
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+        try await AsyncTestSupport.eventually(description: "handshake") {
+            controller.isHandshakeComplete
+        }
+
+        var data = SRUITerminalData()
+        data.streamID = 30
+        data.byteOffset = 0
+        data.data = Data("hello".utf8)
+        var dataMsg = SRUIMessage()
+        dataMsg.terminalData = data
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(dataMsg))
+
+        try await AsyncTestSupport.eventually(description: "unnegotiated terminal frame rejected") {
+            controller.isDiverged
+        }
+        #expect(await renderer.terminalSession.snapshot(for: NodeId(30)) == nil)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
 }

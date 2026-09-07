@@ -520,6 +520,75 @@ fn create_terminal_after_attach_is_rejected() {
     );
 }
 
+/// CLIENT_RESUME carries no profile list. When the requested incarnation is gone, the server has
+/// never negotiated with this client, so it must not infer Terminal support from its own state and
+/// push a snapshot plus terminal frames the peer may not implement (§11.1, §15, §4 inv. 13).
+#[test]
+fn replaced_incarnation_resume_is_rejected_when_terminal_is_required() {
+    let (session, _surface, _term) = terminal_session();
+    let resume = ClientResume {
+        session_id: "a-different-incarnation".to_string(),
+        client_instance_id: CLIENT.to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: HashMap::new(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![],
+    };
+    let err = session.bootstrap_resume(&resume).unwrap_err();
+    match err {
+        SessionError::InvalidInput(message) => {
+            assert!(
+                message.contains(TERMINAL_PROFILE_URI) && message.contains("CLIENT_HELLO"),
+                "replacement resume must name the unproven profile, got {message}"
+            );
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+/// Detaching returns the session to `Detached`, but a client that already handshook can resume
+/// without a second `ServerWelcome`. Adding the required Terminal profile in that window would
+/// hand that client a node whose profile and namespace its negotiated set omits (§15, §21).
+#[test]
+fn create_terminal_after_a_completed_handshake_is_rejected_even_once_detached() {
+    let session = Session::new("detached-term");
+    let surface = NodeId::new(1);
+    session
+        .transaction(|ui| {
+            Surface::builder(surface).label("S").create(ui)?;
+            Ok(())
+        })
+        .unwrap();
+
+    let hello = ClientHello {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
+        limits: None,
+        client_instance_id: vec![7],
+        client_metadata: Default::default(),
+        known_resource_hashes: vec![],
+    };
+    let guard = session.attach().expect("attach");
+    let _bootstrap = session.bootstrap_fresh_client(&hello).expect("handshake");
+    drop(guard);
+    assert!(session.is_detached(), "guard drop returns to Detached");
+    assert!(session.has_negotiated(), "the handshake is remembered");
+
+    let err = session
+        .create_terminal_node(NodeId::new(2), surface, TerminalSpec::interactive_shell())
+        .unwrap_err();
+    assert!(
+        matches!(err, SessionError::InvalidInput(_)),
+        "post-handshake spawn must fail, got {err:?}"
+    );
+    assert!(
+        session.terminal_namespace_id().is_none(),
+        "a refused spawn must not leave a terminal namespace behind"
+    );
+}
+
 #[tokio::test]
 async fn flooding_terminal_does_not_starve_counter_ack() {
     let session = Arc::new(Session::new("flood"));

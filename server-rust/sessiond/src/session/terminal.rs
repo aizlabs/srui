@@ -92,9 +92,13 @@ impl Session {
         parent: NodeId,
         spec: TerminalSpec,
     ) -> Result<TypeRef, SessionError> {
-        if self.is_attached() {
+        // `is_attached()` is not sufficient: dropping the last AttachmentGuard returns the
+        // session to Detached, yet a client that already handshook can resume without a second
+        // ServerWelcome and would then receive a Terminal node whose profile and namespace its
+        // negotiated capability set omits (§15, §21, §4 inv. 13).
+        if self.is_attached() || self.has_negotiated() {
             return Err(SessionError::InvalidInput(
-                "v1 create_terminal_node must run before any client attaches; \
+                "v1 create_terminal_node must run before any client attaches or handshakes; \
                  live pumps and extension_namespaces are handshake-only"
                     .to_string(),
             ));

@@ -224,6 +224,11 @@ public final class SessionController: @unchecked Sendable {
         get { withStateLock { _interactionWillEnterOutboxForTesting } }
         set { withStateLock { _interactionWillEnterOutboxForTesting = newValue } }
     }
+    private var _textEditWillAuthorizeForTesting: (@Sendable () async -> Void)?
+    var textEditWillAuthorizeForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _textEditWillAuthorizeForTesting } }
+        set { withStateLock { _textEditWillAuthorizeForTesting = newValue } }
+    }
     private var _receiveLoopWillAdoptForTesting: (@Sendable () async -> Void)?
     var receiveLoopWillAdoptForTesting: (@Sendable () async -> Void)? {
         get { withStateLock { _receiveLoopWillAdoptForTesting } }
@@ -363,6 +368,10 @@ public final class SessionController: @unchecked Sendable {
         guard !actionHandlerWired else { return }
         actionHandlerWired = true
 
+        renderer.textEditingSession.onAssignedIdentityRevoked = { [weak self] eventId in
+            self?.outbox.revokeUnauthorizedPreparedTextEdit(eventId: eventId)
+        }
+
         renderer.onInteraction = { [weak self, weak renderer] interaction in
             guard let self else { return }
 
@@ -399,6 +408,15 @@ public final class SessionController: @unchecked Sendable {
                 renderer?.textEditingSession.flushAllPending()
             }
 
+            let drainCutoff: UInt64
+            switch interaction {
+            case .textEdit(let nodeID, _, _, _):
+                drainCutoff = renderer?.textEditingSession.unassignedFlushGeneration(for: nodeID)
+                    ?? renderer?.textEditingSession.currentFlushGeneration ?? 0
+            case .activate, .valueChanged, .selectionChanged:
+                drainCutoff = renderer?.textEditingSession.currentFlushGeneration ?? 0
+            }
+
             guard let ownership = self.withStateLock({ () -> (
                 EventOutboxConnectionBinding,
                 EventOutboxSessionIncarnation
@@ -432,7 +450,8 @@ public final class SessionController: @unchecked Sendable {
                             nodeId: nodeID,
                             observedRevision: observedRev,
                             binding: binding,
-                            sessionIncarnation: sessionIncarnation
+                            sessionIncarnation: sessionIncarnation,
+                            maxFlushGeneration: drainCutoff
                         )
                     case .valueChanged(let nodeID, let value):
                         try await self.sendValueChanged(
@@ -440,7 +459,8 @@ public final class SessionController: @unchecked Sendable {
                             observedRevision: observedRev,
                             value: value,
                             binding: binding,
-                            sessionIncarnation: sessionIncarnation
+                            sessionIncarnation: sessionIncarnation,
+                            maxFlushGeneration: drainCutoff
                         )
                     case .selectionChanged(let nodeID, let itemID):
                         try await self.sendSelectionChanged(
@@ -448,13 +468,15 @@ public final class SessionController: @unchecked Sendable {
                             observedRevision: observedRev,
                             itemId: itemID,
                             binding: binding,
-                            sessionIncarnation: sessionIncarnation
+                            sessionIncarnation: sessionIncarnation,
+                            maxFlushGeneration: drainCutoff
                         )
                     case .textEdit:
                         try await self.dispatchUnassignedTextEdits(
                             binding: binding,
                             sessionIncarnation: sessionIncarnation,
-                            interactionIncarnation: incarnation
+                            interactionIncarnation: incarnation,
+                            maxFlushGeneration: drainCutoff
                         )
                     }
                 } catch {
@@ -482,10 +504,15 @@ public final class SessionController: @unchecked Sendable {
     }
 
     /// Drains TextEditingSession-owned drafts through retain, native authorization, then send.
+    ///
+    /// The unassigned identity is snapshotted before waiting for the editor lane. Later typing
+    /// may coalesce into the live slot, but this drain still sends the claimed snapshot and a
+    /// non-text interaction only admits generations `<= maxFlushGeneration`.
     private func dispatchUnassignedTextEdits(
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
-        interactionIncarnation: UInt64
+        interactionIncarnation: UInt64,
+        maxFlushGeneration: UInt64
     ) async throws {
         while true {
             try Task.checkCancellation()
@@ -495,24 +522,27 @@ public final class SessionController: @unchecked Sendable {
             }) else {
                 return
             }
-            guard let nodeID = await MainActor.run(body: { () -> NodeId? in
+            guard let edit = await MainActor.run(body: { () -> LocalTextEdit? in
                 guard self.interactionIncarnation == interactionIncarnation else { return nil }
-                return self.renderer?.textEditingSession.nextUnassignedEditNode()
+                return self.renderer?.textEditingSession.claimNextUnassignedEdit(
+                    maxFlushGeneration: maxFlushGeneration
+                )
             }) else {
                 return
             }
             try await outbox.waitUntilTextEditLaneIsAvailable(
-                nodeId: nodeID,
+                nodeId: edit.nodeId,
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
             )
-            guard let edit = await MainActor.run(body: { () -> LocalTextEdit? in
-                guard self.interactionIncarnation == interactionIncarnation,
-                      self.renderer?.textEditingSession.nextUnassignedEditNode() == nodeID else {
-                    return nil
+            let snapshotStillValid = await MainActor.run { () -> Bool in
+                guard self.interactionIncarnation == interactionIncarnation else { return false }
+                return self.renderer?.textEditingSession.isSnapshotStillValid(edit) == true
+            }
+            if !snapshotStillValid {
+                await MainActor.run {
+                    self.renderer?.textEditingSession.releaseClaim(edit)
                 }
-                return self.renderer?.textEditingSession.claimNextUnassignedEdit()
-            }) else {
                 continue
             }
 
@@ -556,6 +586,9 @@ public final class SessionController: @unchecked Sendable {
                     }
                     return
                 }
+                if let interceptor = textEditWillAuthorizeForTesting {
+                    await interceptor()
+                }
                 guard await outbox.authorizePreparedTextEdit(retained) else {
                     await MainActor.run {
                         self.renderer?.textEditingSession.restoreUnassigned(
@@ -563,7 +596,12 @@ public final class SessionController: @unchecked Sendable {
                             from: retained.event
                         )
                     }
-                    return
+                    if await outbox.assignedTextEditEvents().contains(where: {
+                        $0.eventId == retained.event.eventId
+                    }) {
+                        return
+                    }
+                    continue
                 }
                 guard try await outbox.releasePreparedTextEdit(retained) != nil else {
                     await MainActor.run {
@@ -1027,11 +1065,15 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
+        let drainCutoff = await MainActor.run {
+            self.renderer?.textEditingSession.currentFlushGeneration ?? 0
+        }
         return try await sendActivate(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
             binding: ownership.0,
-            sessionIncarnation: ownership.1
+            sessionIncarnation: ownership.1,
+            maxFlushGeneration: drainCutoff
         )
     }
 
@@ -1040,13 +1082,15 @@ public final class SessionController: @unchecked Sendable {
         nodeId: NodeId,
         observedRevision: Revision,
         binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
+        sessionIncarnation: EventOutboxSessionIncarnation,
+        maxFlushGeneration: UInt64
     ) async throws -> Event {
         let incarnation = await MainActor.run { self.interactionIncarnation }
         try await dispatchUnassignedTextEdits(
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            interactionIncarnation: incarnation
+            interactionIncarnation: incarnation,
+            maxFlushGeneration: maxFlushGeneration
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1087,12 +1131,16 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
+        let drainCutoff = await MainActor.run {
+            self.renderer?.textEditingSession.currentFlushGeneration ?? 0
+        }
         return try await sendValueChanged(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
             value: value,
             binding: ownership.0,
-            sessionIncarnation: ownership.1
+            sessionIncarnation: ownership.1,
+            maxFlushGeneration: drainCutoff
         )
     }
 
@@ -1102,13 +1150,15 @@ public final class SessionController: @unchecked Sendable {
         observedRevision: Revision,
         value: Value,
         binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
+        sessionIncarnation: EventOutboxSessionIncarnation,
+        maxFlushGeneration: UInt64
     ) async throws -> Event {
         let incarnation = await MainActor.run { self.interactionIncarnation }
         try await dispatchUnassignedTextEdits(
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            interactionIncarnation: incarnation
+            interactionIncarnation: incarnation,
+            maxFlushGeneration: maxFlushGeneration
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1150,12 +1200,16 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
+        let drainCutoff = await MainActor.run {
+            self.renderer?.textEditingSession.currentFlushGeneration ?? 0
+        }
         return try await sendSelectionChanged(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
             itemId: itemId,
             binding: ownership.0,
-            sessionIncarnation: ownership.1
+            sessionIncarnation: ownership.1,
+            maxFlushGeneration: drainCutoff
         )
     }
 
@@ -1165,13 +1219,15 @@ public final class SessionController: @unchecked Sendable {
         observedRevision: Revision,
         itemId: ItemId,
         binding: EventOutboxConnectionBinding,
-        sessionIncarnation: EventOutboxSessionIncarnation
+        sessionIncarnation: EventOutboxSessionIncarnation,
+        maxFlushGeneration: UInt64
     ) async throws -> Event {
         let incarnation = await MainActor.run { self.interactionIncarnation }
         try await dispatchUnassignedTextEdits(
             binding: binding,
             sessionIncarnation: sessionIncarnation,
-            interactionIncarnation: incarnation
+            interactionIncarnation: incarnation,
+            maxFlushGeneration: maxFlushGeneration
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -2333,6 +2389,7 @@ public final class SessionController: @unchecked Sendable {
         }
 
         let incarnation = interactionIncarnation
+        let drainCutoff = renderer?.textEditingSession.currentFlushGeneration ?? 0
         let predecessor = interactionDispatchTail
         let dispatch = Task { [weak self] in
             _ = await predecessor?.result
@@ -2345,7 +2402,8 @@ public final class SessionController: @unchecked Sendable {
                 try await self.dispatchUnassignedTextEdits(
                     binding: binding,
                     sessionIncarnation: sessionIncarnation,
-                    interactionIncarnation: incarnation
+                    interactionIncarnation: incarnation,
+                    maxFlushGeneration: drainCutoff
                 )
             } catch {
                 SessionDiagnostics.error("Failed to dispatch local text edits: \(error)")

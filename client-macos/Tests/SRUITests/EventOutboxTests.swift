@@ -645,7 +645,84 @@ struct EventOutboxTests {
         #expect(await transport.sentEventSequences() == [1])
         await transport.close()
     }
-    @Test("Native assignment followed by teardown retains the exact envelope for resume")
+
+    @Test("A correction before authorization rolls back the prepared TEXT_EDIT")
+    func correctionRevokesUnauthorizedPreparedTextEdit() async throws {
+        let transport = EventSequenceRecordingTransport()
+        let outbox = EventOutbox()
+        let binding = await activeBinding(for: outbox)
+        let textSession = await MainActor.run {
+            TextEditingSession(debounceNanoseconds: 0)
+        }
+        let edit = try await MainActor.run {
+            let editSeq = try #require(EditSeq(1))
+            textSession.noteLocalValue(
+                "stale",
+                nodeID: NodeId(12),
+                composing: false,
+                flushImmediately: true
+            )
+            #expect(textSession.recordObservedRevision(
+                nodeID: NodeId(12),
+                text: "stale",
+                editSeq: editSeq,
+                laneEpoch: 1,
+                observedRevision: Revision(1)
+            ))
+            return try #require(textSession.claimNextUnassignedEdit())
+        }
+        let prepared = try #require(try await outbox.prepareTextEdit(
+            nodeId: edit.nodeId,
+            text: edit.text,
+            editSeq: edit.editSeq,
+            observedRevision: edit.observedRevision,
+            binding: binding,
+            via: transport
+        ))
+
+        #expect(await MainActor.run {
+            textSession.onAssignedIdentityRevoked = { eventId in
+                outbox.revokeUnauthorizedPreparedTextEdit(eventId: eventId)
+            }
+            textSession.noteAssigned(prepared.event, matching: edit)
+        })
+        #expect(await MainActor.run {
+            textSession.applyPublishedValue(nodeID: NodeId(12), published: "corrected")
+        } == .apply)
+        #expect(await outbox.authorizePreparedTextEdit(prepared) == false)
+        #expect(await outbox.eventSeq == 0)
+        #expect(await outbox.pendingCount == 0)
+        #expect(await transport.sentEventSequences().isEmpty)
+
+        let action = try await outbox.sendActivate(
+            nodeId: NodeId(13), observedRevision: Revision(1), binding: binding, via: transport
+        )
+        #expect(action.eventSeq == 1)
+        #expect(await transport.sentEventSequences() == [1])
+        await transport.close()
+    }
+
+    @Test("Authorization that already opened the send gate is not rolled back by a later revoke")
+    func revokeAfterAuthorizationDoesNotPreventSend() async throws {
+        let transport = EventSequenceRecordingTransport()
+        let outbox = EventOutbox()
+        let binding = await activeBinding(for: outbox)
+        let editSeq = try #require(EditSeq(1))
+        let prepared = try #require(try await outbox.prepareTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            binding: binding,
+            via: transport
+        ))
+        #expect(await outbox.authorizePreparedTextEdit(prepared))
+        outbox.revokeUnauthorizedPreparedTextEdit(eventId: prepared.event.eventId)
+        let sent = try #require(try await outbox.releasePreparedTextEdit(prepared))
+        #expect(sent == prepared.event)
+        #expect(await transport.sentEventSequences() == [1])
+        await transport.close()
+    }
     func nativeAssignmentSurvivesTeardownBeforeRelease() async throws {
         let transport = EventSequenceRecordingTransport()
         let outbox = EventOutbox()

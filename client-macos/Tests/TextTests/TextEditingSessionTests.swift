@@ -478,4 +478,139 @@ struct TextEditingSessionTests {
         session.endEditing(nodeID: nodeID)
         #expect(commits == 0)
     }
+
+    @Test("A claimed snapshot survives coalescing; cutoff skips the newer generation")
+    func claimedSnapshotSurvivesCoalescedSuccessor() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var commits: [String] = []
+        var lastCommit: (String, EditSeq, UInt64)?
+        session.onCommit = { _, text, seq, epoch in
+            commits.append(text)
+            lastCommit = (text, seq, epoch)
+        }
+
+        session.noteLocalValue("second", nodeID: nodeID, composing: false, flushImmediately: true)
+        let first = try #require(lastCommit)
+        #expect(session.recordObservedRevision(
+            nodeID: nodeID,
+            text: first.0,
+            editSeq: first.1,
+            laneEpoch: first.2,
+            observedRevision: Revision(1)
+        ))
+        let claimed = try #require(session.claimNextUnassignedEdit(maxFlushGeneration: 1))
+        #expect(claimed.text == "second")
+        #expect(claimed.flushGeneration == 1)
+        #expect(session.nextUnassignedEditNode(maxFlushGeneration: 1) == nil)
+
+        session.noteLocalValue("third", nodeID: nodeID, composing: false, flushImmediately: true)
+        #expect(commits == ["second", "third"])
+        let successorCommit = try #require(lastCommit)
+        #expect(session.recordObservedRevision(
+            nodeID: nodeID,
+            text: successorCommit.0,
+            editSeq: successorCommit.1,
+            laneEpoch: successorCommit.2,
+            observedRevision: Revision(1)
+        ))
+        #expect(session.isSnapshotStillValid(claimed))
+        #expect(session.unassignedFlushGeneration(for: nodeID) == 2)
+        #expect(session.nextUnassignedEditNode(maxFlushGeneration: 1) == nil)
+        #expect(session.nextUnassignedEditNode(maxFlushGeneration: 2) == nodeID)
+
+        let event = Event.textEdit(
+            eventSeq: 1,
+            eventId: EventId(string: "e2"),
+            observedRevision: Revision(1),
+            nodeId: nodeID,
+            text: "second",
+            editSeq: first.1
+        )
+        #expect(session.noteAssigned(event, matching: claimed))
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID))
+        let successor = try #require(session.claimNextUnassignedEdit(maxFlushGeneration: 2))
+        #expect(successor.text == "third")
+        #expect(successor.flushGeneration == 2)
+    }
+
+    @Test("An unclaimed later flush coalesces away the earlier identity")
+    func unclaimedFlushCoalescesEarlierDraft() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var lastCommit: (String, EditSeq, UInt64)?
+        session.onCommit = { _, text, seq, epoch in lastCommit = (text, seq, epoch) }
+
+        session.noteLocalValue("second", nodeID: nodeID, composing: false, flushImmediately: true)
+        let first = try #require(lastCommit)
+        #expect(session.recordObservedRevision(
+            nodeID: nodeID,
+            text: first.0,
+            editSeq: first.1,
+            laneEpoch: first.2,
+            observedRevision: Revision(1)
+        ))
+        session.noteLocalValue("third", nodeID: nodeID, composing: false, flushImmediately: true)
+        let coalescedCommit = try #require(lastCommit)
+        #expect(session.recordObservedRevision(
+            nodeID: nodeID,
+            text: coalescedCommit.0,
+            editSeq: coalescedCommit.1,
+            laneEpoch: coalescedCommit.2,
+            observedRevision: Revision(1)
+        ))
+        #expect(session.claimNextUnassignedEdit(maxFlushGeneration: 1) == nil)
+        let coalesced = try #require(session.claimNextUnassignedEdit())
+        #expect(coalesced.text == "third")
+        #expect(coalesced.flushGeneration == 2)
+    }
+
+    @Test("A correction invalidates a claimed snapshot and revokes its assignment identity")
+    func correctionInvalidatesClaimedSnapshotAndRevokesAssignment() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var revoked: [EventId] = []
+        session.onAssignedIdentityRevoked = { revoked.append($0) }
+
+        session.noteLocalValue("stale", nodeID: nodeID, composing: false, flushImmediately: true)
+        let seq = try #require(EditSeq(1))
+        #expect(session.recordObservedRevision(
+            nodeID: nodeID,
+            text: "stale",
+            editSeq: seq,
+            laneEpoch: 1,
+            observedRevision: Revision(1)
+        ))
+        let claimed = try #require(session.claimNextUnassignedEdit())
+        let assigned = Event.textEdit(
+            eventSeq: 1,
+            eventId: EventId(string: "stale-edit"),
+            observedRevision: Revision(1),
+            nodeId: nodeID,
+            text: "stale",
+            editSeq: seq
+        )
+        #expect(session.noteAssigned(assigned, matching: claimed))
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "corrected") == .apply)
+        #expect(!session.isSnapshotStillValid(claimed))
+        #expect(revoked == [assigned.eventId])
+        #expect(session.hasUnsentSuccessorDraft(for: nodeID) == false)
+    }
+
+    @Test("An accepted echo does not revoke the in-flight assignment")
+    func echoDoesNotRevokeAssignedIdentity() throws {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        var revoked = 0
+        session.onAssignedIdentityRevoked = { _ in revoked += 1 }
+
+        session.noteLocalValue("hello", nodeID: nodeID, composing: false, flushImmediately: true)
+        let assigned = Event.textEdit(
+            eventSeq: 1,
+            eventId: EventId(string: "echo"),
+            observedRevision: Revision(1),
+            nodeId: nodeID,
+            text: "hello",
+            editSeq: try #require(EditSeq(1))
+        )
+        session.noteAssigned(assigned)
+        #expect(session.applyPublishedValue(nodeID: nodeID, published: "hello") == .keepLocal)
+        #expect(revoked == 0)
+    }
 }

@@ -279,6 +279,174 @@ struct TextEditingIntegrationTests {
         await collector.stop()
         await serverTransport.close()
     }
+
+    @Test("Typing during an editor-lane wait stays behind the already-queued action")
+    @MainActor
+    func typingDuringLaneWaitFollowsNonTextAction() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 60_000_000_000
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let collector = EventCollector()
+
+        do {
+            try await controller.start()
+            try await handshakeAndMount(
+                controller: controller,
+                server: serverTransport,
+                applier: applier,
+                renderer: renderer,
+                sessionId: "text-after-action"
+            )
+            await collector.start(draining: serverTransport)
+
+            renderer.textEditingSession.noteLocalValue(
+                "first",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: true
+            )
+            let first = try await waitForTextEvent(collector)
+            renderer.textEditingSession.noteLocalValue(
+                "second",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: false
+            )
+            renderer.onInteraction?(.activate(nodeID: NodeId(99)))
+            renderer.textEditingSession.noteLocalValue(
+                "third",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: true
+            )
+            #expect(await controller.outbox.eventSeq == 1)
+            #expect(
+                await collector.eventCount() == 1,
+                "later typing must not allocate ahead of the queued action"
+            )
+
+            var acknowledgement = SRUIServerEventAck()
+            acknowledgement.clientInstanceID = try #require(first.clientInstanceId).bytes
+            acknowledgement.eventID = first.eventId.bytes
+            acknowledgement.lastProcessedEventSeq = first.eventSeq
+            acknowledgement.status = .processed
+            acknowledgement.revisionAfterEffect = 1
+            acknowledgement.sessionID = "text-after-action"
+            var acknowledgementMessage = SRUIMessage()
+            acknowledgementMessage.serverEventAck = acknowledgement
+            await controller.handleIncomingMessage(acknowledgementMessage)
+
+            try await waitUntil(description: "E2, action, then later typing delivered") {
+                await collector.eventCount() == 4
+            }
+            let delivered = await collector.events()
+            #expect(delivered.map(\.eventType) == [
+                .EVENT_TEXT_EDIT,
+                .EVENT_TEXT_EDIT,
+                .EVENT_ACTIVATE,
+                .EVENT_TEXT_EDIT,
+            ])
+            #expect(delivered.map(\.eventSeq) == [1, 2, 3, 4])
+            #expect(delivered[1].textArg == "second")
+            #expect(delivered[3].textArg == "third")
+        } catch {
+            await controller.stop()
+            await collector.stop()
+            await serverTransport.close()
+            throw error
+        }
+
+        await controller.stop()
+        await collector.stop()
+        await serverTransport.close()
+    }
+
+    @Test("A correction between native assignment and authorization does not send the stale edit")
+    @MainActor
+    func correctionBeforeAuthorizationDropsStaleTextEdit() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let collector = EventCollector()
+
+        do {
+            try await controller.start()
+            try await handshakeAndMount(
+                controller: controller,
+                server: serverTransport,
+                applier: applier,
+                renderer: renderer,
+                sessionId: "text-correction-before-authorize"
+            )
+            await collector.start(draining: serverTransport)
+
+            let authorizeGate = TextLifecycleGate()
+            controller.textEditWillAuthorizeForTesting = {
+                await authorizeGate.pause()
+            }
+
+            renderer.textEditingSession.noteLocalValue(
+                "stale",
+                nodeID: editorID,
+                composing: false,
+                flushImmediately: true
+            )
+            await authorizeGate.waitUntilPaused()
+            #expect(await collector.events().isEmpty)
+
+            var correction = SRUIMessage()
+            correction.transaction = Transaction(
+                baseRevision: Revision(1),
+                newRevision: Revision(2),
+                operations: [
+                    .setProperty(id: editorID, property: .value, value: .string("corrected")),
+                ]
+            ).toWire()
+            try await serverTransport.send(data: try SRUIFraming.encodeFramed(correction))
+            try await waitUntil(description: "correction rendered") {
+                (renderer.registry.handle(for: editorID)?.view as? NSTextField)?.stringValue
+                    == "corrected"
+            }
+
+            controller.textEditWillAuthorizeForTesting = nil
+            await authorizeGate.release()
+
+            try await waitUntil(description: "stale envelope rolled back") {
+                let pending = await controller.outbox.pendingCount
+                let eventSeq = await controller.outbox.eventSeq
+                return pending == 0 && eventSeq == 0
+            }
+            #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.isEmpty)
+            #expect(
+                (renderer.registry.handle(for: editorID)?.view as? NSTextField)?.stringValue
+                    == "corrected"
+            )
+        } catch {
+            await controller.stop()
+            await collector.stop()
+            await serverTransport.close()
+            throw error
+        }
+
+        await controller.stop()
+        await collector.stop()
+        await serverTransport.close()
+    }
+
     @Test("Stopping wakes an action blocked behind a text draft without allocating it")
     @MainActor
     func stopCancelsActionWaitingForTextDraft() async throws {

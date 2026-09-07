@@ -326,6 +326,24 @@ private final class TextLifecycleFence: @unchecked Sendable {
         return handler()
     }
 }
+
+/// Lets a MainActor correction revoke a prepared send before its FIFO gate opens.
+private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var revokedEventIds: Set<EventId> = []
+
+    func revoke(_ eventId: EventId) {
+        lock.lock()
+        revokedEventIds.insert(eventId)
+        lock.unlock()
+    }
+
+    func withLock<T>(_ body: (Set<EventId>) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(revokedEventIds)
+    }
+}
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
 ///
 /// Retry safety (§18.2): every application-side-effect event carries a stable `event_id` and
@@ -340,6 +358,7 @@ public actor EventOutbox {
     public nonisolated let clientInstanceId: ClientInstanceId
     nonisolated let resyncRenderFence = ResyncRenderFence()
     private nonisolated let textLifecycleFence = TextLifecycleFence()
+    private nonisolated let preparedTextEditAuthorizationFence = PreparedTextEditAuthorizationFence()
     private var resyncRenderOwnership: ResyncRenderOwnership?
     private var liveRenderOwnership: LiveRenderOwnership?
     private var resumeRecoveryRenderOwnership: ResumeRecoveryRenderOwnership?
@@ -720,8 +739,8 @@ public actor EventOutbox {
         return PreparedTextEdit(event: event, token: token)
     }
 
-    /// Waits only on assigned-envelope state; callers claim the current MainActor draft after it
-    /// returns, so a correction cannot invalidate a copied edit while this actor is suspended.
+    /// Waits only on assigned-envelope state. Callers snapshot the MainActor draft *before*
+    /// waiting so a later coalesced value cannot replace the identity this drain will send.
     func waitUntilTextEditLaneIsAvailable(
         nodeId: NodeId,
         binding: EventOutboxConnectionBinding,
@@ -744,28 +763,61 @@ public actor EventOutbox {
         }
     }
 
+    /// Marks a native assignment as retracted. `authorizePreparedTextEdit` consults this fence
+    /// in the same lock that opens the send gate, so a correction cannot lose the race after
+    /// `noteAssigned` and still transmit the stale envelope.
+    nonisolated func revokeUnauthorizedPreparedTextEdit(eventId: EventId) {
+        preparedTextEditAuthorizationFence.revoke(eventId)
+    }
+
     /// Authorizes a prepared identity immediately after MainActor records the native assignment.
     ///
     /// Authorization opens the FIFO gate and makes rollback impossible. If teardown canceled the
     /// old transport during the actor hop, the exact retained envelope is authorized for replay.
+    /// A correction that revoked this `event_id` rejects the still-closed slot instead.
     @discardableResult
     func authorizePreparedTextEdit(_ prepared: PreparedTextEdit) -> Bool {
-        if let retained = preparedTextEditSends[prepared.token],
-           retained.event == prepared.event {
-            guard retained.gate.resolve(shouldSend: true) else { return false }
-            preparedTextEditSends.removeValue(forKey: prepared.token)
-            authorizedPreparedTextEditSends[prepared.token] = retained
+        enum Decision {
+            case authorizeAndSignal
+            case alreadyAuthorized
+            case reject
+            case failed
+        }
+        let decision = preparedTextEditAuthorizationFence.withLock { revoked -> Decision in
+            if revoked.contains(prepared.event.eventId) {
+                return .reject
+            }
+            if let retained = preparedTextEditSends[prepared.token],
+               retained.event == prepared.event {
+                guard retained.gate.resolve(shouldSend: true) else { return .failed }
+                preparedTextEditSends.removeValue(forKey: prepared.token)
+                authorizedPreparedTextEditSends[prepared.token] = retained
+                return .authorizeAndSignal
+            }
+            if lifecycleSuspendedPreparedTextEdits[prepared.token] == prepared.event,
+               pendingEvents[prepared.event.eventId] == prepared.event {
+                lifecycleSuspendedPreparedTextEdits.removeValue(forKey: prepared.token)
+                lifecycleAuthorizedPreparedTextEdits[prepared.token] = prepared.event
+                return .alreadyAuthorized
+            }
+            if authorizedPreparedTextEditSends[prepared.token]?.event == prepared.event
+                || lifecycleAuthorizedPreparedTextEdits[prepared.token] == prepared.event {
+                return .alreadyAuthorized
+            }
+            return .failed
+        }
+        switch decision {
+        case .authorizeAndSignal:
             signalTextLaneStateChange()
             return true
-        }
-        if lifecycleSuspendedPreparedTextEdits[prepared.token] == prepared.event,
-           pendingEvents[prepared.event.eventId] == prepared.event {
-            lifecycleSuspendedPreparedTextEdits.removeValue(forKey: prepared.token)
-            lifecycleAuthorizedPreparedTextEdits[prepared.token] = prepared.event
+        case .alreadyAuthorized:
             return true
+        case .reject:
+            _ = rejectPreparedTextEdit(prepared)
+            return false
+        case .failed:
+            return false
         }
-        return authorizedPreparedTextEditSends[prepared.token]?.event == prepared.event
-            || lifecycleAuthorizedPreparedTextEdits[prepared.token] == prepared.event
     }
 
     /// Waits for an authorized edit's first transmission. A lifecycle-canceled transport returns

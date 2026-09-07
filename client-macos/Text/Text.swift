@@ -30,19 +30,27 @@ public struct LocalTextEdit: Equatable, Sendable {
     public var editSeq: EditSeq
     public var observedRevision: Revision
     public var laneEpoch: UInt64
+    /// Session-wide flush identity used to fence later typing behind a non-text interaction.
+    public var flushGeneration: UInt64
+    /// Bumped only by correction/cancel/resync; coalescing overwrites keep this stable.
+    public var invalidationEpoch: UInt64
 
     public init(
         nodeId: NodeId,
         text: String,
         editSeq: EditSeq,
         observedRevision: Revision,
-        laneEpoch: UInt64
+        laneEpoch: UInt64,
+        flushGeneration: UInt64,
+        invalidationEpoch: UInt64
     ) {
         self.nodeId = nodeId
         self.text = text
         self.editSeq = editSeq
         self.observedRevision = observedRevision
         self.laneEpoch = laneEpoch
+        self.flushGeneration = flushGeneration
+        self.invalidationEpoch = invalidationEpoch
     }
 }
 
@@ -55,6 +63,9 @@ public final class TextEditingSession {
     public var onCommit: (@MainActor (NodeId, String, EditSeq, UInt64) -> Void)?
     /// Surfaced when `edit_seq` cannot increment; the pending value is kept (§18.3).
     public var onEditSeqOverflow: (@MainActor (NodeId) -> Void)?
+    /// Fired synchronously when a live correction/cancel drops a native assignment identity so
+    /// a still-unauthorized prepared envelope can refuse to open its send gate.
+    public var onAssignedIdentityRevoked: (@MainActor (EventId) -> Void)?
 
     private let debounceSleep: DebounceSleep
 
@@ -71,7 +82,10 @@ public final class TextEditingSession {
         var unassignedFlushedValue: String?
         var unassignedObservedRevision: Revision?
         var unassignedLaneEpoch: UInt64?
+        var unassignedFlushGeneration: UInt64?
         var unassignedClaimed = false
+        /// Bumped by authoritative invalidation, not by coalescing a newer flush into this slot.
+        var invalidationEpoch: UInt64 = 0
         var lastSubmittedValue: String?
         /// Last string known to be the store's `.value` (echo or applied correction).
         var lastKnownAuthoritative: String?
@@ -91,6 +105,9 @@ public final class TextEditingSession {
     /// Session-wide floor used to fence delayed local callbacks across an authoritative full
     /// resync. Per-node edit sequences intentionally survive a same-session resync (§18.3).
     private var resyncLaneEpoch: UInt64 = 0
+    /// Monotonic identity of each successful `flushPending`. Non-text interactions drain only
+    /// generations that existed when they were queued.
+    private var flushGeneration: UInt64 = 0
     /// True only while old native controls are torn down and snapshot controls are mounted.
     /// AppKit may emit end-editing notifications during teardown; those are pre-snapshot intent.
     private var suppressingLocalEditsForResync = false
@@ -172,7 +189,9 @@ public final class TextEditingSession {
         state.debounceTask?.cancel()
         state.debounceTask = nil
         _ = bumpLaneEpoch(nodeID: nodeID)
+        bumpInvalidationEpoch(&state)
         nodes[nodeID] = state
+        onAssignedIdentityRevoked?(eventId)
     }
 
     /// Structural remounts re-apply the current store string for every editor. That is not a
@@ -199,6 +218,7 @@ public final class TextEditingSession {
         clearUnassignedEdit(&state, nodeID: nodeID)
         state.debounceTask?.cancel()
         state.debounceTask = nil
+        bumpInvalidationEpoch(&state)
         nodes[nodeID] = state
         _ = bumpLaneEpoch(nodeID: nodeID)
     }
@@ -307,6 +327,10 @@ public final class TextEditingSession {
         state.unassignedObservedRevision = nil
         let epoch = bumpLaneEpoch(nodeID: nodeID)
         state.unassignedLaneEpoch = epoch
+        flushGeneration = flushGeneration == .max ? .max : flushGeneration + 1
+        state.unassignedFlushGeneration = flushGeneration
+        // A later coalesced value may replace this slot, including one already claimed by a
+        // drain that snapshotted the previous identity. That drain still sends its snapshot.
         state.unassignedClaimed = false
         state.localValue = value
         nodes[nodeID] = state
@@ -343,20 +367,30 @@ public final class TextEditingSession {
         return true
     }
 
-    /// Node whose oldest unassigned edit must acquire lane availability next.
-    public func nextUnassignedEditNode() -> NodeId? {
-        firstUnassignedNode()
+    /// Highest `flushPending` generation observed in this session.
+    public var currentFlushGeneration: UInt64 { flushGeneration }
+
+    /// Flush generation of the current unassigned slot, if any.
+    public func unassignedFlushGeneration(for nodeID: NodeId) -> UInt64? {
+        nodes[nodeID]?.unassignedFlushGeneration
     }
 
-    /// Claims the oldest unassigned edit after its assigned-event lane is available.
-    public func claimNextUnassignedEdit() -> LocalTextEdit? {
-        guard let nodeID = firstUnassignedNode(),
+    /// Node whose oldest claimable unassigned edit must acquire lane availability next.
+    public func nextUnassignedEditNode(maxFlushGeneration: UInt64? = nil) -> NodeId? {
+        firstClaimableUnassignedNode(maxFlushGeneration: maxFlushGeneration)
+    }
+
+    /// Claims the oldest claimable unassigned edit. Callers wait for the lane *after* this
+    /// snapshot so a later coalesced value cannot replace the identity already in flight.
+    public func claimNextUnassignedEdit(maxFlushGeneration: UInt64? = nil) -> LocalTextEdit? {
+        guard let nodeID = firstClaimableUnassignedNode(maxFlushGeneration: maxFlushGeneration),
               var state = nodes[nodeID],
               !state.unassignedClaimed,
               let text = state.unassignedFlushedValue,
               let editSeq = state.unassignedFlushedEditSeq,
               let observedRevision = state.unassignedObservedRevision,
-              let laneEpoch = state.unassignedLaneEpoch else {
+              let laneEpoch = state.unassignedLaneEpoch,
+              let flushGeneration = state.unassignedFlushGeneration else {
             return nil
         }
         state.unassignedClaimed = true
@@ -366,8 +400,16 @@ public final class TextEditingSession {
             text: text,
             editSeq: editSeq,
             observedRevision: observedRevision,
-            laneEpoch: laneEpoch
+            laneEpoch: laneEpoch,
+            flushGeneration: flushGeneration,
+            invalidationEpoch: state.invalidationEpoch
         )
+    }
+
+    /// True until a correction, cancel, or resync retires this snapshotted identity.
+    /// Coalescing a newer unassigned value does not invalidate the snapshot.
+    public func isSnapshotStillValid(_ edit: LocalTextEdit) -> Bool {
+        nodes[edit.nodeId]?.invalidationEpoch == edit.invalidationEpoch
     }
 
     public func releaseClaim(_ edit: LocalTextEdit) {
@@ -388,15 +430,16 @@ public final class TextEditingSession {
               event.editSeq == edit.editSeq,
               event.textArg == edit.text,
               var state = nodes[edit.nodeId],
-              state.unassignedClaimed,
-              state.unassignedFlushedEditSeq == edit.editSeq,
-              state.unassignedFlushedValue == edit.text,
-              state.unassignedLaneEpoch == edit.laneEpoch else {
+              state.invalidationEpoch == edit.invalidationEpoch else {
             return false
         }
         state.lastSubmittedValue = event.textArg
         state.assignedEventId = event.eventId
-        clearUnassignedEdit(&state, nodeID: edit.nodeId)
+        if state.unassignedFlushedEditSeq == edit.editSeq,
+           state.unassignedFlushedValue == edit.text,
+           state.unassignedLaneEpoch == edit.laneEpoch {
+            clearUnassignedEdit(&state, nodeID: edit.nodeId)
+        }
         nodes[edit.nodeId] = state
         return true
     }
@@ -418,6 +461,7 @@ public final class TextEditingSession {
         state.unassignedFlushedValue = edit.text
         state.unassignedObservedRevision = edit.observedRevision
         state.unassignedLaneEpoch = edit.laneEpoch
+        state.unassignedFlushGeneration = edit.flushGeneration
         state.unassignedClaimed = false
         nodes[edit.nodeId] = state
         unassignedNodeOrder.removeAll { $0 == edit.nodeId }
@@ -458,12 +502,14 @@ public final class TextEditingSession {
         let hadDraft = state.pendingValue != nil
             || state.unassignedFlushedEditSeq != nil
             || state.lastSubmittedValue != nil
+        let revokedEventId = state.assignedEventId
         let deferNativeReplacement = state.composing
         state.pendingValue = nil
         clearUnassignedEdit(&state, nodeID: nodeID)
         state.debounceTask?.cancel()
         state.debounceTask = nil
         state.lastSubmittedValue = nil
+        state.assignedEventId = nil
         state.lastKnownAuthoritative = published
         state.lastFlushedValue = published
         if deferNativeReplacement {
@@ -472,9 +518,13 @@ public final class TextEditingSession {
             state.deferredAuthoritative = nil
             state.localValue = published
         }
-        nodes[nodeID] = state
         if hadDraft {
             _ = bumpLaneEpoch(nodeID: nodeID)
+            bumpInvalidationEpoch(&state)
+        }
+        nodes[nodeID] = state
+        if let revokedEventId {
+            onAssignedIdentityRevoked?(revokedEventId)
         }
         return deferNativeReplacement ? .deferred : .apply
     }
@@ -542,8 +592,12 @@ public final class TextEditingSession {
         resyncLaneEpoch = highest == .max ? .max : highest + 1
         unassignedNodeOrder.removeAll(keepingCapacity: false)
 
+        var revokedEventIds: [EventId] = []
         for nodeID in Array(nodes.keys) {
             guard var state = nodes[nodeID] else { continue }
+            if let eventId = state.assignedEventId {
+                revokedEventIds.append(eventId)
+            }
             state.debounceTask?.cancel()
             state.debounceTask = nil
             state.pendingValue = nil
@@ -554,8 +608,12 @@ public final class TextEditingSession {
             state.deferredAuthoritative = nil
             state.composing = false
             state.localValue = state.lastKnownAuthoritative ?? ""
+            bumpInvalidationEpoch(&state)
             nodes[nodeID] = state
             laneEpoch[nodeID] = resyncLaneEpoch
+        }
+        for eventId in revokedEventIds {
+            onAssignedIdentityRevoked?(eventId)
         }
         return resyncLaneEpoch
     }
@@ -606,14 +664,25 @@ public final class TextEditingSession {
         return state
     }
 
-    private func firstUnassignedNode() -> NodeId? {
-        while let nodeID = unassignedNodeOrder.first {
+    private func firstClaimableUnassignedNode(maxFlushGeneration: UInt64?) -> NodeId? {
+        var index = unassignedNodeOrder.startIndex
+        while index < unassignedNodeOrder.endIndex {
+            let nodeID = unassignedNodeOrder[index]
             guard let state = nodes[nodeID],
                   state.unassignedFlushedEditSeq != nil,
-                  state.unassignedFlushedValue != nil,
+                  state.unassignedFlushedValue != nil else {
+                unassignedNodeOrder.remove(at: index)
+                continue
+            }
+            guard !state.unassignedClaimed,
                   state.unassignedObservedRevision != nil,
-                  state.unassignedLaneEpoch != nil else {
-                unassignedNodeOrder.removeFirst()
+                  state.unassignedLaneEpoch != nil,
+                  let generation = state.unassignedFlushGeneration else {
+                index = unassignedNodeOrder.index(after: index)
+                continue
+            }
+            if let maxFlushGeneration, generation > maxFlushGeneration {
+                index = unassignedNodeOrder.index(after: index)
                 continue
             }
             return nodeID
@@ -626,8 +695,15 @@ public final class TextEditingSession {
         state.unassignedFlushedValue = nil
         state.unassignedObservedRevision = nil
         state.unassignedLaneEpoch = nil
+        state.unassignedFlushGeneration = nil
         state.unassignedClaimed = false
         unassignedNodeOrder.removeAll { $0 == nodeID }
+    }
+
+    private func bumpInvalidationEpoch(_ state: inout NodeState) {
+        state.invalidationEpoch = state.invalidationEpoch == .max
+            ? .max
+            : state.invalidationEpoch + 1
     }
 
     @discardableResult

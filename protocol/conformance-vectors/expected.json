@@ -208,6 +208,58 @@
         ],
         "edit_seq": 3
       }
+    },
+    "golden_terminal_data": {
+      "file": "golden_terminal_data.bin",
+      "sha256": "382a5f2a8366a89724fb1796a16396a22a0ac25107b52cb5548a331fde24dac6",
+      "hex": "0f620d08071080201a067074792d6f6b",
+      "byte_length": 16,
+      "expected": {
+        "msg_type": "terminal_data",
+        "stream_id": 7,
+        "byte_offset": 4096,
+        "data": "pty-ok"
+      }
+    },
+    "golden_terminal_input": {
+      "file": "golden_terminal_input.bin",
+      "sha256": "2e3411384a04e15d1f75fa52457cab6c0c7740e63852223155bbf1eea78c76df",
+      "hex": "096a07080712036c730a",
+      "byte_length": 10,
+      "expected": {
+        "msg_type": "terminal_input",
+        "stream_id": 7,
+        "data": "ls\n"
+      }
+    },
+    "golden_terminal_resize": {
+      "file": "golden_terminal_resize.bin",
+      "sha256": "12f461d18bc1331d3e9a8001b05ae5fa935a581d91bedcf4cccf6e248eda0c96",
+      "hex": "0e720c08071050181820800a28d005",
+      "byte_length": 15,
+      "expected": {
+        "msg_type": "terminal_resize",
+        "stream_id": 7,
+        "columns": 80,
+        "rows": 24,
+        "pixel_width": 1280,
+        "pixel_height": 720
+      }
+    },
+    "golden_terminal_resync_required": {
+      "file": "golden_terminal_resync_required.bin",
+      "sha256": "1f826811692561625db046f8a80620bd4eada086121d6a620df526d3d3a9d301",
+      "hex": "0d7a0b08071064184020f0012801",
+      "byte_length": 14,
+      "expected": {
+        "msg_type": "terminal_resync_required",
+        "stream_id": 7,
+        "requested_offset": 100,
+        "retained_from_offset": 64,
+        "resume_at_offset": 240,
+        "reason": 1,
+        "reason_name": "RETENTION_LOSS"
+      }
     }
   },
   "malformed_vectors": {

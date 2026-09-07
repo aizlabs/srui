@@ -312,4 +312,84 @@ fn main() {
         "Wrote malformed_activate_nonzero_edit_seq.bin ({} bytes)",
         malformed_activate_bytes.len()
     );
+
+    // 11–14. Terminal compatibility envelopes (§21)
+    let terminal_data = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalData(TerminalData {
+            stream_id: 7,
+            byte_offset: 4096,
+            data: b"pty-ok".to_vec(),
+        })),
+    };
+    let terminal_data_bytes = encode_framed(&terminal_data).expect("encode framed TerminalData");
+    fs::write(
+        out_dir.join("golden_terminal_data.bin"),
+        &terminal_data_bytes,
+    )
+    .expect("write golden_terminal_data.bin");
+    println!(
+        "Wrote golden_terminal_data.bin ({} bytes)",
+        terminal_data_bytes.len()
+    );
+
+    let terminal_input = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalInput(TerminalInput {
+            stream_id: 7,
+            data: b"ls\n".to_vec(),
+        })),
+    };
+    let terminal_input_bytes = encode_framed(&terminal_input).expect("encode framed TerminalInput");
+    fs::write(
+        out_dir.join("golden_terminal_input.bin"),
+        &terminal_input_bytes,
+    )
+    .expect("write golden_terminal_input.bin");
+    println!(
+        "Wrote golden_terminal_input.bin ({} bytes)",
+        terminal_input_bytes.len()
+    );
+
+    let terminal_resize = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalResize(TerminalResize {
+            stream_id: 7,
+            columns: 80,
+            rows: 24,
+            pixel_width: 1280,
+            pixel_height: 720,
+        })),
+    };
+    let terminal_resize_bytes =
+        encode_framed(&terminal_resize).expect("encode framed TerminalResize");
+    fs::write(
+        out_dir.join("golden_terminal_resize.bin"),
+        &terminal_resize_bytes,
+    )
+    .expect("write golden_terminal_resize.bin");
+    println!(
+        "Wrote golden_terminal_resize.bin ({} bytes)",
+        terminal_resize_bytes.len()
+    );
+
+    let terminal_resync = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalResyncRequired(
+            TerminalResyncRequired {
+                stream_id: 7,
+                requested_offset: 100,
+                retained_from_offset: 64,
+                resume_at_offset: 240,
+                reason: TerminalResyncReason::RetentionLoss as i32,
+            },
+        )),
+    };
+    let terminal_resync_bytes =
+        encode_framed(&terminal_resync).expect("encode framed TerminalResyncRequired");
+    fs::write(
+        out_dir.join("golden_terminal_resync_required.bin"),
+        &terminal_resync_bytes,
+    )
+    .expect("write golden_terminal_resync_required.bin");
+    println!(
+        "Wrote golden_terminal_resync_required.bin ({} bytes)",
+        terminal_resync_bytes.len()
+    );
 }

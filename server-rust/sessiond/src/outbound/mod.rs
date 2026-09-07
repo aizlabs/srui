@@ -32,7 +32,8 @@ use crate::session::{lock_or_recover, SessionError};
 pub use receiver::OutboundReceiver;
 pub use resource::ResourceOutboundFrame;
 pub use scheduler::{
-    logical_class_for_server_envelope, LogicalChannelClass, LogicalChannelScheduler, SERVICE_CYCLE,
+    logical_class_for_server_envelope, server_envelope_matches_class, LogicalChannelClass,
+    LogicalChannelScheduler, SERVICE_CYCLE,
 };
 
 /// Default capacity for per-connection outbound transaction queues (§20.2).

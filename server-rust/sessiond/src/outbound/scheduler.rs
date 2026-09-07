@@ -55,11 +55,34 @@ pub fn logical_class_for_server_envelope(message: &SruiMessage) -> Option<Logica
         Some(srui_message::Msg::Transaction(_)) => Some(LogicalChannelClass::Ui),
         Some(srui_message::Msg::ResourceMetadata(_))
         | Some(srui_message::Msg::ResourceChunk(_)) => Some(LogicalChannelClass::Resource),
+        Some(srui_message::Msg::TerminalResyncRequired(_)) => {
+            Some(LogicalChannelClass::TerminalHigh)
+        }
         Some(srui_message::Msg::ClientHello(_))
         | Some(srui_message::Msg::ClientResume(_))
         | Some(srui_message::Msg::Event(_))
         | Some(srui_message::Msg::ClientModelRangeRequest(_))
+        | Some(srui_message::Msg::TerminalInput(_))
+        | Some(srui_message::Msg::TerminalResize(_))
+        | Some(srui_message::Msg::TerminalData(_))
         | None => None,
+    }
+}
+
+/// Whether `message` may legally occupy `class` on the server outbound scheduler (§19.2, §21).
+///
+/// `TerminalData` is legal on either terminal class because live versus replay priority is a
+/// delivery-context decision, not a message-type property.
+#[must_use]
+pub fn server_envelope_matches_class(message: &SruiMessage, class: LogicalChannelClass) -> bool {
+    match &message.msg {
+        Some(srui_message::Msg::TerminalData(_)) => {
+            matches!(
+                class,
+                LogicalChannelClass::TerminalHigh | LogicalChannelClass::TerminalNormal
+            )
+        }
+        _ => logical_class_for_server_envelope(message) == Some(class),
     }
 }
 
@@ -366,6 +389,21 @@ mod tests {
             Some(LogicalChannelClass::Resource)
         );
 
+        assert_eq!(
+            logical_class_for_server_envelope(&envelope(
+                srui_message::Msg::TerminalResyncRequired(Default::default())
+            )),
+            Some(LogicalChannelClass::TerminalHigh)
+        );
+        assert!(server_envelope_matches_class(
+            &envelope(srui_message::Msg::TerminalData(Default::default())),
+            LogicalChannelClass::TerminalHigh
+        ));
+        assert!(server_envelope_matches_class(
+            &envelope(srui_message::Msg::TerminalData(Default::default())),
+            LogicalChannelClass::TerminalNormal
+        ));
+
         for unschedulable in [
             SruiMessage::default(),
             envelope(srui_message::Msg::ClientHello(Default::default())),
@@ -374,6 +412,8 @@ mod tests {
             envelope(srui_message::Msg::ClientModelRangeRequest(
                 Default::default(),
             )),
+            envelope(srui_message::Msg::TerminalInput(Default::default())),
+            envelope(srui_message::Msg::TerminalResize(Default::default())),
         ] {
             assert_eq!(
                 logical_class_for_server_envelope(&unschedulable),

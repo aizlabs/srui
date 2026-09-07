@@ -416,6 +416,29 @@ fn test_cross_language_rust_vs_swift_byte_equality() {
         rust_ack_bytes, golden_ack_bytes,
         "Rust-encoded Framed ServerEventAck does not match golden bytes"
     );
+
+    for (name, authored) in [
+        ("golden_terminal_data.bin", create_authored_terminal_data()),
+        (
+            "golden_terminal_input.bin",
+            create_authored_terminal_input(),
+        ),
+        (
+            "golden_terminal_resize.bin",
+            create_authored_terminal_resize(),
+        ),
+        (
+            "golden_terminal_resync_required.bin",
+            create_authored_terminal_resync(),
+        ),
+    ] {
+        let rust_bytes = encode_framed(&authored).unwrap();
+        let golden = fs::read(vectors_dir.join(name)).unwrap();
+        assert_eq!(
+            rust_bytes, golden,
+            "Rust-encoded {name} does not match golden bytes"
+        );
+    }
 }
 
 #[test]
@@ -673,6 +696,96 @@ fn test_direct_encode_golden_client_model_range_request_matches_wire_bytes() {
 
     assert_eq!(to_hex(&encoded), expected_hex);
     assert_eq!(encoded, fixture_bytes);
+}
+
+fn create_authored_terminal_data() -> SruiMessage {
+    SruiMessage {
+        msg: Some(srui_message::Msg::TerminalData(TerminalData {
+            stream_id: 7,
+            byte_offset: 4096,
+            data: b"pty-ok".to_vec(),
+        })),
+    }
+}
+
+fn create_authored_terminal_input() -> SruiMessage {
+    SruiMessage {
+        msg: Some(srui_message::Msg::TerminalInput(TerminalInput {
+            stream_id: 7,
+            data: b"ls\n".to_vec(),
+        })),
+    }
+}
+
+fn create_authored_terminal_resize() -> SruiMessage {
+    SruiMessage {
+        msg: Some(srui_message::Msg::TerminalResize(TerminalResize {
+            stream_id: 7,
+            columns: 80,
+            rows: 24,
+            pixel_width: 1280,
+            pixel_height: 720,
+        })),
+    }
+}
+
+fn create_authored_terminal_resync() -> SruiMessage {
+    SruiMessage {
+        msg: Some(srui_message::Msg::TerminalResyncRequired(
+            TerminalResyncRequired {
+                stream_id: 7,
+                requested_offset: 100,
+                retained_from_offset: 64,
+                resume_at_offset: 240,
+                reason: TerminalResyncReason::RetentionLoss as i32,
+            },
+        )),
+    }
+}
+
+fn assert_framed_vector(name: &str, authored: SruiMessage) {
+    let (vectors_dir, spec) = load_expected_spec();
+    let vector = &spec["vectors"][name];
+    let filename = vector["file"].as_str().unwrap();
+    let expected_hex = vector["hex"].as_str().unwrap();
+    let expected_len = vector["byte_length"].as_u64().unwrap() as usize;
+    let bytes = fs::read(vectors_dir.join(filename)).unwrap();
+    assert_eq!(bytes.len(), expected_len);
+    assert_eq!(to_hex(&bytes), expected_hex);
+    let decoded: SruiMessage = decode_framed(&bytes).expect("decode framed");
+    let roundtrip = encode_framed(&decoded).unwrap();
+    assert_eq!(roundtrip, bytes);
+    let encoded = encode_framed(&authored).unwrap();
+    assert_eq!(encoded, bytes);
+}
+
+#[test]
+fn test_terminal_envelope_conformance() {
+    assert_framed_vector("golden_terminal_data", create_authored_terminal_data());
+    assert_framed_vector("golden_terminal_input", create_authored_terminal_input());
+    assert_framed_vector("golden_terminal_resize", create_authored_terminal_resize());
+    assert_framed_vector(
+        "golden_terminal_resync_required",
+        create_authored_terminal_resync(),
+    );
+
+    let (vectors_dir, spec) = load_expected_spec();
+    let data = decode_framed::<SruiMessage>(
+        &fs::read(vectors_dir.join("golden_terminal_data.bin")).unwrap(),
+    )
+    .unwrap();
+    match data.msg {
+        Some(srui_message::Msg::TerminalData(ref payload)) => {
+            let expected = &spec["vectors"]["golden_terminal_data"]["expected"];
+            assert_eq!(payload.stream_id, expected["stream_id"].as_u64().unwrap());
+            assert_eq!(
+                payload.byte_offset,
+                expected["byte_offset"].as_u64().unwrap()
+            );
+            assert_eq!(payload.data, expected["data"].as_str().unwrap().as_bytes());
+        }
+        other => panic!("expected TerminalData, got {other:?}"),
+    }
 }
 
 #[test]

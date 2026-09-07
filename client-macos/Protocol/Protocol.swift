@@ -40,6 +40,11 @@ public typealias SRUIResourceMetadata = Srui_Protocol_ResourceMetadata
 public typealias SRUIResourceChunk = Srui_Protocol_ResourceChunk
 public typealias SRUIResourcePriority = Srui_Protocol_ResourcePriority
 public typealias SRUIClientModelRangeRequest = Srui_Protocol_ClientModelRangeRequest
+public typealias SRUITerminalData = Srui_Protocol_TerminalData
+public typealias SRUITerminalInput = Srui_Protocol_TerminalInput
+public typealias SRUITerminalResize = Srui_Protocol_TerminalResize
+public typealias SRUITerminalResyncRequired = Srui_Protocol_TerminalResyncRequired
+public typealias SRUITerminalResyncReason = Srui_Protocol_TerminalResyncReason
 
 public struct ProtocolPlaceholder {
     public init() {}

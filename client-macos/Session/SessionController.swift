@@ -22,6 +22,11 @@
 // - §8 / §22.7 Sparse collections: `ClientModelRangeRequest` is sent on the `.ui` lane and is
 //   not an Event. A copy arriving from the server is a protocol violation.
 // - §4 inv. 13: unrecoverable divergence fails explicitly instead of degrading silently.
+// - §21 Terminal compatibility: `TerminalData` / `TerminalResyncRequired` update the local
+//   VT actor only. They never enter the semantic `ServerResyncRequired` path, discard
+//   pending text edits, mutate EventOutbox, reset revision, disable dispatch, or mark
+//   the session diverged. `ClientResume.terminal_stream_offsets` is independent of
+//   `pending_text_edits`.
 //
 
 import Foundation
@@ -32,6 +37,7 @@ import RendererAppKit
 import Resources
 import Collections
 import Text
+import Terminal
 
 /// Reason a session stopped tracking the authoritative semantic stream (§4 inv. 13, §18).
 public enum SessionFailure: Error, Sendable, CustomStringConvertible {
@@ -276,6 +282,7 @@ public final class SessionController: @unchecked Sendable {
     private var rejectedResourceHashes: Set<ResourceHash> = []
     private var rangeRequestContinuation: AsyncStream<CollectionRangeRequest>.Continuation?
     private var rangeRequestTask: Task<Void, Never>?
+    private let terminalPump = TerminalCommandPump()
 
     public init(
         transport: any Transport,
@@ -287,7 +294,7 @@ public final class SessionController: @unchecked Sendable {
         /// survive replacement; the default constructs a fresh CAS per controller (§14, §18).
         resourceCache: ResourceCache = ResourceCache(),
         sessionId: String? = nil,
-        clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1],
+        clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1],
         requiredServerProfiles: CapabilitySet = []
     ) {
         self.transport = transport
@@ -509,6 +516,13 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
             self.interactionDispatchTail = dispatch
+        }
+
+        renderer.onTerminalInput = { [weak self] nodeID, data in
+            Task { await self?.terminalPump.enqueueInput(streamID: nodeID, data: data) }
+        }
+        renderer.onTerminalResize = { [weak self] nodeID, cols, rows, width, height in
+            Task { await self?.terminalPump.enqueueResize(streamID: nodeID, columns: cols, rows: rows, pixelWidth: width, pixelHeight: height) }
         }
 
         renderer.onCollectionRangeRequest = { [weak self, weak renderer] request in
@@ -918,6 +932,9 @@ public final class SessionController: @unchecked Sendable {
                 resume.pendingTextEdits = await outbox.assignedTextEditDescriptors().map {
                     $0.toWire()
                 }
+                if let renderer {
+                    resume.terminalStreamOffsets = await renderer.terminalSession.streamOffsets()
+                }
 
                 var envelope = SRUIMessage()
                 envelope.clientResume = resume
@@ -990,6 +1007,8 @@ public final class SessionController: @unchecked Sendable {
                 )
             }
 
+            await terminalPump.attach(transport: transport)
+
             // The detached loop waits behind this gate until its task is published under the
             // lifecycle lock. A concurrent stop therefore either owns and awaits the task, or
             // prevents it from ever entering message dispatch.
@@ -1053,6 +1072,7 @@ public final class SessionController: @unchecked Sendable {
         }
         guard let cleanup else { return }
 
+        await terminalPump.disconnect()
         stopRangeRequestPump()
         if let resumeGeneration = cleanup.resumeGeneration {
             await outbox.stopResumeWork(generation: resumeGeneration)
@@ -1445,6 +1465,31 @@ public final class SessionController: @unchecked Sendable {
             await reportFailure(.protocolViolation(
                 "Received client-originated handshake message from server"
             ))
+
+        case .terminalInput, .terminalResize:
+            await reportFailure(.protocolViolation(
+                "Received client-originated terminal command from server"
+            ))
+
+        case .terminalData(let data):
+            switch phase {
+            case .active, .awaitingSnapshot, .awaitingResume:
+                await handleTerminalData(data)
+            case .idle, .awaitingWelcome, .failed:
+                await reportFailure(.protocolViolation(
+                    "Received TerminalData before handshake completed"
+                ))
+            }
+
+        case .terminalResyncRequired(let resync):
+            switch phase {
+            case .active, .awaitingSnapshot, .awaitingResume:
+                await handleTerminalResync(resync)
+            case .idle, .awaitingWelcome, .failed:
+                await reportFailure(.protocolViolation(
+                    "Received TerminalResyncRequired before handshake completed"
+                ))
+            }
         }
     }
 
@@ -1532,6 +1577,16 @@ public final class SessionController: @unchecked Sendable {
                 self.phase = .active(negotiated: negotiated)
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
             }
+        }
+        do {
+            try await applyExtensionNamespaces(
+                welcome.extensionNamespaces,
+                negotiated: negotiated,
+                terminalRequired: serverRequired.contains(.terminalV1)
+            )
+        } catch {
+            await reportFailure(.protocolViolation("\(error)"))
+            return
         }
         if welcome.initialRevision > 0 {
             guard await outbox.suspendNewEvents(binding: connectionBinding) else {
@@ -1963,6 +2018,10 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
+                if let renderer {
+                    await renderer.terminalSession.resetForReplacementSession()
+                    await MainActor.run { renderer.resetExtensionRegistry() }
+                }
                 guard await resourceCache.clearPartials(
                     ownerEpoch: connectionBinding.resourceOwnershipEpoch
                 ) else {
@@ -2048,6 +2107,10 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                if let renderer {
+                    await renderer.terminalSession.resetForReplacementSession()
+                    await MainActor.run { renderer.resetExtensionRegistry() }
+                }
                 guard await resourceCache.clearPartials(
                     ownerEpoch: connectionBinding.resourceOwnershipEpoch
                 ) else {
@@ -2085,6 +2148,105 @@ public final class SessionController: @unchecked Sendable {
             self.retainedCapabilities = negotiated
             self.phase = .awaitingSnapshot(negotiated: negotiated)
         }
+    }
+
+    private func applyExtensionNamespaces(
+        _ mappings: [Srui_Protocol_ExtensionNamespaceMapping],
+        negotiated: CapabilitySet,
+        terminalRequired: Bool
+    ) async throws {
+        var seenIDs = Set<UInt32>()
+        var seenURIs = Set<String>()
+        for mapping in mappings {
+            if !seenIDs.insert(mapping.namespaceID).inserted {
+                throw SessionFailure.protocolViolation(
+                    "duplicate extension namespace_id \(mapping.namespaceID)"
+                )
+            }
+            if !seenURIs.insert(mapping.extensionUri).inserted {
+                throw SessionFailure.protocolViolation(
+                    "duplicate extension_uri \(mapping.extensionUri)"
+                )
+            }
+        }
+        let mapping = mappings.first(where: { $0.extensionUri == terminalProfileURI })
+        if terminalRequired && mapping == nil {
+            throw SessionFailure.protocolViolation(
+                "required \(terminalProfileURI) but ServerWelcome omitted its namespace mapping"
+            )
+        }
+        guard negotiated.contains(.terminalV1), let mapping else { return }
+        guard mapping.namespaceID != 0 else {
+            throw SessionFailure.protocolViolation(
+                "\(terminalProfileURI) must use a nonzero session-assigned namespace"
+            )
+        }
+        if let renderer {
+            try await MainActor.run {
+                try renderer.registerTerminalType(terminalTypeRef(namespaceID: mapping.namespaceID))
+            }
+        }
+    }
+
+    private func registerTerminalTypes(from store: SemanticStore) async {
+        let negotiated = withStateLock { () -> CapabilitySet? in
+            switch phase {
+            case .active(let caps), .awaitingSnapshot(let caps):
+                return caps
+            default:
+                return retainedCapabilities
+            }
+        }
+        guard negotiated?.contains(.terminalV1) == true, let renderer else { return }
+        var types = Set<TypeRef>()
+        var pending = store.rootIDs
+        var seen = Set<NodeId>()
+        while let id = pending.popLast() {
+            guard seen.insert(id).inserted, let node = store.getNode(id) else { continue }
+            if !node.nodeType.isStandard, node.nodeType.localID == terminalLocalTypeID {
+                types.insert(node.nodeType)
+            }
+            pending.append(contentsOf: node.orderedChildren)
+        }
+        await MainActor.run {
+            for typeRef in types {
+                try? renderer.registerTerminalType(typeRef)
+            }
+        }
+    }
+
+    /// Local terminal apply only. Never touches semantic phase, revision, outbox, or text drafts.
+    private func handleTerminalData(_ data: SRUITerminalData) async {
+        guard let renderer else { return }
+        do {
+            _ = try await renderer.terminalSession.applyData(
+                streamID: NodeId(data.streamID),
+                byteOffset: data.byteOffset,
+                data: data.data
+            )
+        } catch {
+            SessionDiagnostics.error("TerminalData rejected: \(error)")
+        }
+    }
+
+    /// Island resync. Must not enter `ServerResyncRequired` handling.
+    private func handleTerminalResync(_ resync: SRUITerminalResyncRequired) async {
+        guard let renderer else { return }
+        let cause: TerminalResyncCause
+        switch resync.reason {
+        case .retentionLoss: cause = .retentionLoss
+        case .offsetAhead: cause = .offsetAhead
+        case .subscriberFallbehind: cause = .subscriberFallbehind
+        case .unspecified: cause = .unspecified
+        case .UNRECOGNIZED: cause = .unspecified
+        }
+        _ = await renderer.terminalSession.applyResync(
+            streamID: NodeId(resync.streamID),
+            requestedOffset: resync.requestedOffset,
+            retainedFromOffset: resync.retainedFromOffset,
+            resumeAtOffset: resync.resumeAtOffset,
+            cause: cause
+        )
     }
 
     /// Assembles resource metadata into the shared cache. Failures log/drop; the semantic store
@@ -2709,6 +2871,8 @@ public final class SessionController: @unchecked Sendable {
                 return
             }
 
+            await registerTerminalTypes(from: snapshot.store)
+
             if isResyncSnapshot {
                 // Only now may the outbox release the reconnect latch and promote post-snapshot
                 // intent. No unresolved pre-snapshot edit is silently merged (§18.3).
@@ -3108,6 +3272,7 @@ public final class SessionController: @unchecked Sendable {
         await retainNativeTextBeforeDisconnect(
             binding: stoppedState.connectionBinding
         )
+        await terminalPump.disconnect()
         stopRangeRequestPump()
         await MainActor.run {
             self.interactionDispatchTail?.cancel()

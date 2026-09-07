@@ -32,15 +32,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::outbound::{
-    logical_class_for_server_envelope, LogicalChannelClass, OutboundReceiver, OutboundRecvError,
+    server_envelope_matches_class, LogicalChannelClass, OutboundReceiver, OutboundRecvError,
 };
+use crate::session::terminal::{event_to_message, live_class_for_event};
 use crate::session::{
     run_model_range_worker, EventOutcome, ModelRangeRequestInbox, ResumeOutcome, Session,
     SessionError,
 };
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
+    MAX_TERMINAL_INPUT_BYTES,
 };
+use srui_pty::TerminalSubscription;
+use srui_semantic_tree::NodeId;
 use thiserror::Error;
 
 /// Handshake timeout in seconds (5 seconds, §18.1).
@@ -140,9 +144,8 @@ async fn send_message_with_read_state<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    debug_assert_eq!(
-        logical_class_for_server_envelope(&envelope),
-        Some(logical_class),
+    debug_assert!(
+        server_envelope_matches_class(&envelope, logical_class),
         "envelope class must match the annotated write class"
     );
     debug!(?logical_class, "sending outbound frame");
@@ -246,7 +249,7 @@ where
         }
     };
 
-    let (client_instance_id, tx_rx) = match handshake_msg.msg {
+    let (client_instance_id, tx_rx, terminal) = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
                 client_instance_id = ?hello.client_instance_id,
@@ -284,7 +287,15 @@ where
                 }
             }
             clear_stale_if_settled(&session, &hello.client_instance_id, &bootstrap.transactions);
-            (hello.client_instance_id, bootstrap.transactions)
+            (
+                hello.client_instance_id,
+                bootstrap.transactions,
+                TerminalConnection {
+                    negotiated: bootstrap.terminal_negotiated,
+                    live: bootstrap.terminal.live,
+                    catch_up: bootstrap.terminal.catch_up,
+                },
+            )
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
             info!(
@@ -368,7 +379,15 @@ where
                     );
                 }
             }
-            (resume.client_instance_id, bootstrap.transactions)
+            (
+                resume.client_instance_id,
+                bootstrap.transactions,
+                TerminalConnection {
+                    negotiated: bootstrap.terminal_negotiated,
+                    live: bootstrap.terminal.live,
+                    catch_up: bootstrap.terminal.catch_up,
+                },
+            )
         }
         _ => {
             return Err(ConnectionError::UnexpectedMessage(
@@ -383,9 +402,98 @@ where
         session,
         client_instance_id,
         tx_rx,
+        terminal,
         shutdown,
     )
     .await
+}
+
+const TERMINAL_LANE_CAPACITY: usize = 64;
+
+struct TerminalConnection {
+    negotiated: bool,
+    live: Vec<TerminalSubscription>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+}
+
+pub(super) struct TerminalLanes {
+    high_rx: mpsc::Receiver<SruiMessage>,
+    normal_rx: mpsc::Receiver<SruiMessage>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+    catch_up_released: tokio::sync::watch::Sender<bool>,
+}
+
+pub(super) struct WriterCancel {
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+    read_finished: CancellationToken,
+}
+
+fn spawn_terminal_live_pumps(
+    live: Vec<TerminalSubscription>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+) -> (TerminalLanes, Vec<tokio::task::JoinHandle<()>>) {
+    let (high_tx, high_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let (normal_tx, normal_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let (catch_up_released, released_rx) = tokio::sync::watch::channel(catch_up.is_empty());
+    let mut tasks = Vec::new();
+
+    // Live High must not race handshake replay: the Swift client treats an
+    // ahead-of-cursor frame as a local reset and then drops older replay as
+    // duplicates. Gate pumps until the writer has put every catch-up frame
+    // on the wire through TerminalNormal / TerminalHigh scheduler slots.
+    for mut subscription in live {
+        let high_tx = high_tx.clone();
+        let shutdown = shutdown.clone();
+        let session_cancel = session_cancel.clone();
+        let mut released = released_rx.clone();
+        tasks.push(tokio::spawn(async move {
+            while !*released.borrow() {
+                tokio::select! {
+                    biased;
+                    _ = session_cancel.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
+                    changed = released.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = session_cancel.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
+                    events = subscription.recv() => {
+                        if events.is_empty() {
+                            return;
+                        }
+                        for event in events {
+                            let _ = live_class_for_event(&event);
+                            if high_tx.send(event_to_message(event)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    drop(high_tx);
+    drop(normal_tx);
+    drop(released_rx);
+    (
+        TerminalLanes {
+            high_rx,
+            normal_rx,
+            catch_up,
+            catch_up_released,
+        },
+        tasks,
+    )
 }
 
 /// Concurrently drives inbound events and scheduled outbound writes (§18.2, §19.2, §20).
@@ -399,6 +507,7 @@ async fn run_active_session<R, W>(
     session: Arc<Session>,
     client_instance_id: Vec<u8>,
     outbound: OutboundReceiver,
+    terminal: TerminalConnection,
     shutdown: CancellationToken,
 ) -> Result<(), ConnectionError>
 where
@@ -419,22 +528,35 @@ where
         })
     };
 
+    let (terminal_lanes, terminal_pumps) = spawn_terminal_live_pumps(
+        terminal.live,
+        terminal.catch_up,
+        shutdown.clone(),
+        session_cancel.clone(),
+    );
     let read = read_loop(
         framed_read,
         session,
         client_instance_id,
         control_tx,
         range_inbox.clone(),
-        shutdown.clone(),
-        session_cancel.clone(),
+        terminal.negotiated,
+        WriterCancel {
+            shutdown: shutdown.clone(),
+            session_cancel: session_cancel.clone(),
+            read_finished: read_finished.clone(),
+        },
     );
     let write = write_loop(
         framed_write,
         outbound,
         control_rx,
-        shutdown,
-        session_cancel.clone(),
-        read_finished.clone(),
+        terminal_lanes,
+        WriterCancel {
+            shutdown,
+            session_cancel: session_cancel.clone(),
+            read_finished: read_finished.clone(),
+        },
     );
 
     tokio::pin!(read);
@@ -469,6 +591,9 @@ where
     };
     range_inbox.close();
     session_cancel.cancel();
+    for task in terminal_pumps {
+        let _ = task.await;
+    }
     let _ = range_worker.await;
     result
 }
@@ -479,8 +604,8 @@ async fn read_loop<R>(
     client_instance_id: Vec<u8>,
     control_tx: mpsc::Sender<ServerEventAck>,
     range_inbox: ModelRangeRequestInbox,
-    shutdown: CancellationToken,
-    session_cancel: CancellationToken,
+    terminal_negotiated: bool,
+    cancel: WriterCancel,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncRead + Unpin,
@@ -488,8 +613,8 @@ where
     loop {
         tokio::select! {
             biased;
-            _ = session_cancel.cancelled() => return Ok(()),
-            _ = shutdown.cancelled() => {
+            _ = cancel.session_cancel.cancelled() => return Ok(()),
+            _ = cancel.shutdown.cancelled() => {
                 debug!("Connection read loop terminating due to shutdown signal");
                 return Ok(());
             }
@@ -497,7 +622,14 @@ where
                 match incoming {
                     Some(Ok(msg)) => {
                         if let Some(ack) =
-                            handle_incoming_message(msg, &session, &client_instance_id, &range_inbox).await?
+                            handle_incoming_message(
+                                msg,
+                                &session,
+                                &client_instance_id,
+                                &range_inbox,
+                                terminal_negotiated,
+                            )
+                            .await?
                         {
                             tokio::select! {
                                 biased;
@@ -506,8 +638,8 @@ where
                                         return Ok(());
                                     }
                                 }
-                                _ = session_cancel.cancelled() => return Ok(()),
-                                _ = shutdown.cancelled() => return Ok(()),
+                                _ = cancel.session_cancel.cancelled() => return Ok(()),
+                                _ = cancel.shutdown.cancelled() => return Ok(()),
                             }
                         }
                     }
@@ -530,6 +662,7 @@ async fn handle_incoming_message(
     session: &Session,
     client_instance_id: &[u8],
     range_inbox: &ModelRangeRequestInbox,
+    terminal_negotiated: bool,
 ) -> Result<Option<ServerEventAck>, ConnectionError> {
     match msg.msg {
         Some(srui_message::Msg::Event(event)) => {
@@ -588,12 +721,24 @@ async fn handle_incoming_message(
             );
             Err(ConnectionError::ClientTransactionRejected)
         }
+        Some(srui_message::Msg::TerminalInput(input)) => {
+            handle_terminal_input(session, terminal_negotiated, input)?;
+            Ok(None)
+        }
+        Some(srui_message::Msg::TerminalResize(resize)) => {
+            handle_terminal_resize(session, terminal_negotiated, resize)?;
+            Ok(None)
+        }
         Some(srui_message::Msg::ClientHello(_)) => Err(ConnectionError::UnexpectedMessage(
             "ClientHello is valid only during handshake",
         )),
         Some(srui_message::Msg::ClientResume(_)) => Err(ConnectionError::UnexpectedMessage(
             "ClientResume is valid only during handshake",
         )),
+        Some(srui_message::Msg::TerminalData(_))
+        | Some(srui_message::Msg::TerminalResyncRequired(_)) => Err(
+            ConnectionError::UnexpectedMessage("server-only terminal message received from client"),
+        ),
         Some(_) => Err(ConnectionError::UnexpectedMessage(
             "server-only or unsupported message during active session",
         )),
@@ -605,6 +750,78 @@ async fn handle_incoming_message(
             warn!("Ignoring empty or unrecognized active-session envelope");
             Ok(None)
         }
+    }
+}
+
+fn handle_terminal_input(
+    session: &Session,
+    terminal_negotiated: bool,
+    input: srui_protocol::TerminalInput,
+) -> Result<(), ConnectionError> {
+    if !terminal_negotiated {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalInput is legal only after org.srui.terminal/1 negotiation",
+        ));
+    }
+    if input.data.is_empty() {
+        return Err(ConnectionError::UnexpectedMessage(
+            "empty TerminalInput is forbidden",
+        ));
+    }
+    if input.data.len() > MAX_TERMINAL_INPUT_BYTES {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalInput exceeds MAX_TERMINAL_INPUT_BYTES",
+        ));
+    }
+    let stream_id = NodeId::new(input.stream_id);
+    match session.pty().input(stream_id, input.data) {
+        Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::UnknownStream(_)) => {
+            Err(ConnectionError::UnexpectedMessage(
+                "TerminalInput targeted an unknown or unnegotiated stream",
+            ))
+        }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
+            warn!("dropping TerminalInput because the PTY command queue is full");
+            Ok(())
+        }
+        Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
+            error.to_string(),
+        ))),
+    }
+}
+
+fn handle_terminal_resize(
+    session: &Session,
+    terminal_negotiated: bool,
+    resize: srui_protocol::TerminalResize,
+) -> Result<(), ConnectionError> {
+    if !terminal_negotiated {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalResize is legal only after org.srui.terminal/1 negotiation",
+        ));
+    }
+    let stream_id = NodeId::new(resize.stream_id);
+    match session.pty().resize(
+        stream_id,
+        resize.columns,
+        resize.rows,
+        resize.pixel_width,
+        resize.pixel_height,
+    ) {
+        Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::UnknownStream(_)) => {
+            Err(ConnectionError::UnexpectedMessage(
+                "TerminalResize targeted an unknown or unnegotiated stream",
+            ))
+        }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
+            warn!("dropping TerminalResize because the PTY command queue is full");
+            Ok(())
+        }
+        Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
+            error.to_string(),
+        ))),
     }
 }
 
@@ -670,6 +887,7 @@ fn build_event_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbound::logical_class_for_server_envelope;
     use srui_sdk::{NodeId, Surface};
     use tokio::io::duplex;
 

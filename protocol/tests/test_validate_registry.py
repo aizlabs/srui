@@ -298,6 +298,10 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
         "golden_transaction",
         "golden_client_model_range_request",
         "golden_text_edit_event",
+        "golden_terminal_data",
+        "golden_terminal_input",
+        "golden_terminal_resize",
+        "golden_terminal_resync_required",
     }
     assert required_vectors <= vectors.keys()
 

@@ -47,7 +47,11 @@ public final class LayoutRenderer {
         if surfacesShown {
             showWindows()
         }
-        controlFactory.textEditingSession.syncPresentNodes(Set(registry.allHandles.map(\.nodeID)))
+        let present = Set(registry.allHandles.map(\.nodeID))
+        controlFactory.textEditingSession.syncPresentNodes(present)
+        Task {
+            await controlFactory.terminalSession.syncPresentNodes(present)
+        }
         RendererDiagnostics.log("mount complete handles=\(registry.count)")
     }
 

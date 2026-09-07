@@ -78,8 +78,16 @@ def _parse_proto_enums(proto_text: str) -> dict[str, dict[str, int]]:
 #   - EventAckStatus: settlement status of a `ServerEventAck` (§18.2), never carried in a Value.
 #   - SessionContinuity: machine-readable session continuity for snapshot response (§18), not in Value.
 #   - ResourcePriority: transfer scheduling hint on `ResourceMetadata` (§14, §19.2), never a Value.
+#   - TerminalResyncReason: extension-profile envelope field for `org.srui.terminal/1` (§21),
+#     not a Namespace 0 Value token.
 PROTO_SKIP_ENUMS = frozenset(
-    {"NullValue", "EventAckStatus", "SessionContinuity", "ResourcePriority"}
+    {
+        "NullValue",
+        "EventAckStatus",
+        "SessionContinuity",
+        "ResourcePriority",
+        "TerminalResyncReason",
+    }
 )
 
 

@@ -20,8 +20,8 @@ QUIC.
 | `control` | highest | `CLIENT HELLO`, `CLIENT RESUME`, `SERVER WELCOME`, resume responses, `SERVER EVENT_ACK` |
 | `input` | highest | semantic user events (`EventOutbox`) |
 | `ui` | high | committed transactions (reserved on the client outbound path) |
-| `terminalHigh` | high | interactive PTY bytes (reserved; Task 30) |
-| `terminalNormal` | normal | bulk terminal output (reserved; Task 30) |
+| `terminalHigh` | high | interactive PTY input/resize and live `TerminalData` / `TerminalResyncRequired` |
+| `terminalNormal` | normal | historical PTY replay (`TerminalData` catch-up) |
 | `resource` | low | images and attachments (reserved on the client outbound path) |
 
 `Transport.send(data:)` is the compatibility path and defaults to `control`. Production writers

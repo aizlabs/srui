@@ -434,6 +434,8 @@ impl Session {
                 reason: String,
                 last_processed_event_seq: u64,
                 discarded_text_edits: Vec<srui_protocol::PendingTextEditRef>,
+                pending_text_edit_cancellation:
+                    Option<super::text_edit::PendingTextEditCancellation>,
             },
         }
 
@@ -462,7 +464,7 @@ impl Session {
 
         let mut before_subscribe = Some(before_subscribe);
         let mut optimistic_attempts = 0usize;
-        let (mut inner_guard, plan) = loop {
+        let (mut inner_guard, mut plan) = loop {
             let inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
             let Some(cause) = determine_resync_cause(&inner_guard) else {
                 let last_processed_event_seq = inner_guard
@@ -486,7 +488,7 @@ impl Session {
             let snapshot_revision = inner_guard.store.revision().get();
             let store_snapshot = inner_guard.store.clone_staging();
 
-            let (mut inner_guard, snapshot_transaction) =
+            let (inner_guard, snapshot_transaction) =
                 if optimistic_attempts >= MAX_OPTIMISTIC_SNAPSHOT_EXPORT_ATTEMPTS {
                     // Bounded fallback: guarantee handshake progress under continuous commits. Export
                     // still precedes cancellation and subscription, so failure has no side effects.
@@ -497,10 +499,9 @@ impl Session {
                                 "refusing to send an unrepresentable resync snapshot"
                             );
                         })?;
-                    if determine_resync_cause(&inner_guard) != Some(cause) {
-                        drop(inner_guard);
-                        continue;
-                    }
+                    // The cause can become less severe while the outbound stale marker is
+                    // cleared, but the already-selected full resync remains safe. Do not restart
+                    // the fallback and serialize the full store without a bound.
                     (inner_guard, snapshot_transaction)
                 } else {
                     drop(inner_guard);
@@ -523,21 +524,31 @@ impl Session {
                     (inner_guard, snapshot_result?)
                 };
 
-            let discarded_text_edits = if matches!(
+            let pending_text_edit_cancellation = if matches!(
                 cause,
                 ResyncCause::OutboundQueueOverflow | ResyncCause::JournalGap
             ) {
-                Session::cancel_pending_text_edits(
-                    &mut inner_guard,
+                Some(Session::prepare_pending_text_edit_cancellation(
+                    &inner_guard,
                     &resume.client_instance_id,
                     &pending_text_edits,
-                )?
+                ))
             } else {
-                Vec::new()
+                None
             };
-            let last_processed_event_seq = inner_guard
-                .dedupe
-                .last_contiguous_processed_seq(&resume.client_instance_id);
+            let last_processed_event_seq = pending_text_edit_cancellation.as_ref().map_or_else(
+                || {
+                    inner_guard
+                        .dedupe
+                        .last_contiguous_processed_seq(&resume.client_instance_id)
+                },
+                |cancellation| cancellation.last_processed_event_seq(&resume.client_instance_id),
+            );
+            let discarded_text_edits = pending_text_edit_cancellation
+                .as_ref()
+                .map_or_else(Vec::new, |cancellation| {
+                    cancellation.discarded_text_edits().to_vec()
+                });
             let plan = ResumePlan::Resync {
                 session_id: inner_guard.session_id.clone(),
                 snapshot_revision,
@@ -546,6 +557,7 @@ impl Session {
                 reason: cause.reason().to_string(),
                 last_processed_event_seq,
                 discarded_text_edits,
+                pending_text_edit_cancellation,
             };
             break (inner_guard, plan);
         };
@@ -572,6 +584,15 @@ impl Session {
             &resume.known_resource_hashes,
             max_resource_size,
         )?;
+        if let ResumePlan::Resync {
+            pending_text_edit_cancellation,
+            ..
+        } = &mut plan
+        {
+            if let Some(cancellation) = pending_text_edit_cancellation.take() {
+                cancellation.commit(&mut inner_guard);
+            }
+        }
         drop(inner_guard);
 
         let outcome = match plan {
@@ -590,6 +611,7 @@ impl Session {
                 reason,
                 last_processed_event_seq,
                 discarded_text_edits,
+                pending_text_edit_cancellation: _,
             } => ResumeOutcome::Resync {
                 resync_msg: ServerResyncRequired {
                     session_id,
@@ -706,6 +728,110 @@ mod tests {
             panic!("replacement resume must enforce the pending TEXT_EDIT ref bound");
         };
         assert!(reason.contains("at most"));
+    }
+
+    #[test]
+    fn failed_resume_subscription_does_not_commit_pending_edit_cancellation() {
+        let session = Session::with_outbound_queue_capacity("failed-resume-cancellation", 1);
+        let client = vec![8, 9];
+        let _receiver = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe client");
+        session
+            .commit_transaction(empty_tx(0, 1))
+            .expect("fill outbound queue");
+        session
+            .commit_transaction(empty_tx(1, 2))
+            .expect("overflow outbound queue");
+        assert!(session.outbound_hub.is_client_stale(&client));
+        session.close_outbound();
+
+        let pending = pending_text_edit_ref();
+        let resume = ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: client.clone(),
+            last_applied_revision: 2,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![pending.clone()],
+        };
+
+        assert!(matches!(
+            session.bootstrap_resume(&resume),
+            Err(SessionError::OutboundClosed)
+        ));
+        let inner = session.inner.lock().unwrap();
+        assert!(
+            !inner
+                .dedupe
+                .is_duplicate(&client, pending.event_id.as_slice()),
+            "a failed handshake must not settle the pending edit"
+        );
+    }
+
+    #[test]
+    fn pending_edit_dedupe_conflict_does_not_fail_resume() {
+        let session = Session::with_outbound_queue_capacity("resume-dedupe-conflict", 1);
+        let client = vec![8, 10];
+        let existing = srui_protocol::Event {
+            client_instance_id: client.clone(),
+            event_seq: 1,
+            event_id: b"existing-activate".to_vec(),
+            event_type: Some(TypeRef::EVENT_ACTIVATE.into()),
+            ..Default::default()
+        };
+        {
+            let mut inner = session.inner.lock().unwrap();
+            assert!(matches!(
+                inner.dedupe.admit_event(&existing).unwrap(),
+                srui_event_dedupe::RecordOutcome::Fresh { .. }
+            ));
+            inner.dedupe.settle_event(
+                &existing,
+                srui_event_dedupe::EventOutcomeRecord {
+                    accepted: true,
+                    revision_after_effect: 0,
+                    reject_reason: String::new(),
+                },
+            );
+        }
+
+        let _receiver = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe client");
+        session
+            .commit_transaction(empty_tx(0, 1))
+            .expect("fill outbound queue");
+        session
+            .commit_transaction(empty_tx(1, 2))
+            .expect("overflow outbound queue");
+        let mut conflicting = pending_text_edit_ref();
+        conflicting.event_seq = 1;
+        conflicting.event_id = b"conflicting-text-edit".to_vec();
+        let resume = ClientResume {
+            session_id: session.session_id(),
+            client_instance_id: client.clone(),
+            last_applied_revision: 2,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![conflicting.clone()],
+        };
+
+        let bootstrap = session
+            .bootstrap_resume(&resume)
+            .expect("dedupe conflict must not fail resume");
+        let ResumeOutcome::Resync { resync_msg, .. } = bootstrap.outcome else {
+            panic!("outbound-stale client must resync");
+        };
+        assert_eq!(resync_msg.discarded_text_edits, vec![conflicting]);
+        let inner = session.inner.lock().unwrap();
+        assert!(inner
+            .dedupe
+            .is_duplicate(&client, existing.event_id.as_slice()));
     }
 
     #[test]
@@ -1402,12 +1528,24 @@ mod tests {
 
     #[test]
     fn resume_snapshot_export_falls_back_after_bounded_contention() {
-        let session = Session::new("resume-export-bounded-fallback");
+        let session = Session::with_outbound_queue_capacity("resume-export-bounded-fallback", 1);
         seed_revision_one(&session);
+        let client = vec![6, 7];
+        let _receiver = session
+            .subscribe_transactions(client.clone())
+            .expect("subscribe client");
+        session
+            .commit_transaction(empty_tx(1, 2))
+            .expect("fill outbound queue");
+        session
+            .commit_transaction(empty_tx(2, 3))
+            .expect("overflow outbound queue");
+        assert!(session.outbound_hub.is_client_stale(&client));
+
         let resume = ClientResume {
-            session_id: "replaced-incarnation".to_string(),
-            client_instance_id: vec![6, 7],
-            last_applied_revision: 0,
+            session_id: session.session_id(),
+            client_instance_id: client.clone(),
+            last_applied_revision: 3,
             last_acked_event_seq: 0,
             terminal_stream_offsets: Default::default(),
             limits: None,
@@ -1437,6 +1575,7 @@ mod tests {
                             matches!(session.inner.try_lock(), Err(TryLockError::WouldBlock)),
                             "bounded fallback must retain the lock through serialization"
                         );
+                        session.clear_stale_client(&client);
                     }
                     export_snapshot_transaction(store_snapshot)
                 },
@@ -1452,11 +1591,11 @@ mod tests {
                 resync_msg,
                 snapshot_transaction,
             } => {
-                let expected_revision = 1 + MAX_OPTIMISTIC_SNAPSHOT_EXPORT_ATTEMPTS as u64;
+                let expected_revision = 3 + MAX_OPTIMISTIC_SNAPSHOT_EXPORT_ATTEMPTS as u64;
                 assert_eq!(resync_msg.snapshot_revision, expected_revision);
                 assert_eq!(snapshot_transaction.new_revision, expected_revision);
             }
-            ResumeOutcome::Replay { .. } => panic!("expected resync"),
+            ResumeOutcome::Replay { .. } => panic!("fallback must finish the selected resync"),
         }
     }
 }

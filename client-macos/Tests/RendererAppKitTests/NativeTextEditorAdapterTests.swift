@@ -132,6 +132,53 @@ struct NativeTextEditorAdapterTests {
         #expect(adapter.currentString == "area")
     }
 
+    @Test("Authoritative replacement preserves and clamps text-view selection")
+    func authoritativeReplacementPreservesSelection() {
+        let session = TextEditingSession(debounceNanoseconds: 0)
+        let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 280, height: 88))
+        let adapter = NativeTextEditorAdapter(nodeID: NodeId(14), session: session, textView: view)
+
+        adapter.applyAuthoritativeString("abcdef")
+        view.selectedRange = NSRange(location: 2, length: 2)
+        adapter.applyAuthoritativeString("uvwxyz")
+        #expect(view.selectedRange == NSRange(location: 2, length: 2))
+
+        adapter.applyAuthoritativeString("x")
+        #expect(view.selectedRange == NSRange(location: 1, length: 0))
+    }
+
+    @Test("Non-string authoritative values preserve display but retire draft bookkeeping")
+    func nonStringAuthoritativeValueRetiresDraft() {
+        let session = TextEditingSession(debounceNanoseconds: 60_000_000_000)
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 180, height: 24))
+        let adapter = NativeTextEditorAdapter(nodeID: NodeId(12), session: session, textField: field)
+        session.onCommit = { nodeID, text, editSeq, laneEpoch in
+            #expect(session.recordObservedRevision(
+                nodeID: nodeID,
+                text: text,
+                editSeq: editSeq,
+                laneEpoch: laneEpoch,
+                observedRevision: 1
+            ))
+        }
+        adapter.applyAuthoritativeString("server")
+        field.stringValue = "local draft"
+        session.noteLocalValue(
+            "local draft",
+            nodeID: NodeId(12),
+            composing: false,
+            flushImmediately: true
+        )
+        #expect(session.localValue(for: NodeId(12)) == "local draft")
+        #expect(session.nextUnassignedEditNode() == NodeId(12))
+
+        adapter.applyAuthoritative(Value(integerLiteral: 42))
+        #expect(field.stringValue == "local draft")
+        #expect(session.localValue(for: NodeId(12)) == "local draft")
+        #expect(session.nextUnassignedEditNode() == nil)
+        #expect(session.claimNextUnassignedEdit() == nil)
+    }
+
     @Test("End-editing during remount preservation does not flush")
     func endEditingDuringRemountPreserveDoesNotFlush() {
         let session = TextEditingSession(debounceNanoseconds: 1_000_000_000)

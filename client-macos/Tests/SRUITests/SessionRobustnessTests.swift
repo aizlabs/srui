@@ -551,6 +551,7 @@ struct SessionRobustnessTests {
 
         #expect(await failures.count == 0, "an intentional stop is not a session failure")
         #expect(!controller.isDiverged)
+        try await controller.resourceCache.clearPartials()
 
         await serverTransport.close()
     }
@@ -631,6 +632,7 @@ struct SessionRobustnessTests {
             try await controller.start()
         }
         #expect(await transport.sentFrameCount == 0)
+        try await controller.resourceCache.clearPartials()
 
         // The failed attempt started nothing, so the second attempt must actually run — not return
         // early on a stale `isRunning` latch.

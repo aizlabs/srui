@@ -343,7 +343,32 @@ struct TextEditingIntegrationTests {
             acknowledgementMessage.serverEventAck = acknowledgement
             await controller.handleIncomingMessage(acknowledgementMessage)
 
-            try await waitUntil(description: "E2, action, then later typing delivered") {
+            try await waitUntil(description: "E2 and the queued action delivered") {
+                await collector.eventCount() == 3
+            }
+            let beforeSecondAck = await collector.events()
+            #expect(beforeSecondAck.map(\.eventType) == [
+                .EVENT_TEXT_EDIT,
+                .EVENT_TEXT_EDIT,
+                .EVENT_ACTIVATE,
+            ])
+            #expect(beforeSecondAck.map(\.eventSeq) == [1, 2, 3])
+            #expect(beforeSecondAck[1].textArg == "second")
+
+            var secondAcknowledgement = SRUIServerEventAck()
+            secondAcknowledgement.clientInstanceID = try #require(
+                beforeSecondAck[1].clientInstanceId
+            ).bytes
+            secondAcknowledgement.eventID = beforeSecondAck[1].eventId.bytes
+            secondAcknowledgement.lastProcessedEventSeq = beforeSecondAck[1].eventSeq
+            secondAcknowledgement.status = .processed
+            secondAcknowledgement.revisionAfterEffect = 1
+            secondAcknowledgement.sessionID = "text-after-action"
+            var secondAcknowledgementMessage = SRUIMessage()
+            secondAcknowledgementMessage.serverEventAck = secondAcknowledgement
+            await controller.handleIncomingMessage(secondAcknowledgementMessage)
+
+            try await waitUntil(description: "later typing delivered after E2 settles") {
                 await collector.eventCount() == 4
             }
             let delivered = await collector.events()
@@ -354,7 +379,6 @@ struct TextEditingIntegrationTests {
                 .EVENT_TEXT_EDIT,
             ])
             #expect(delivered.map(\.eventSeq) == [1, 2, 3, 4])
-            #expect(delivered[1].textArg == "second")
             #expect(delivered[3].textArg == "third")
         } catch {
             await controller.stop()

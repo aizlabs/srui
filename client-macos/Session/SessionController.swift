@@ -430,14 +430,36 @@ public final class SessionController: @unchecked Sendable {
                 SessionDiagnostics.error("Interaction dispatch skipped without outbox session ownership")
                 return
             }
+
+            // A text callback is the ordering boundary itself. Claim its exact snapshot before
+            // yielding MainActor; otherwise later typing can replace the coalesced slot before the
+            // queued dispatch task starts.
+            let initialTextEdit: LocalTextEdit?
+            if case .textEdit(let nodeID, let text, let editSeq, let laneEpoch) = interaction {
+                guard let claimed = renderer?.textEditingSession.claimUnassignedEdit(
+                    nodeID: nodeID,
+                    text: text,
+                    editSeq: editSeq,
+                    laneEpoch: laneEpoch
+                ) else {
+                    return
+                }
+                initialTextEdit = claimed
+            } else {
+                initialTextEdit = nil
+            }
+
             let (binding, sessionIncarnation) = ownership
             let incarnation = self.interactionIncarnation
             let predecessor = self.interactionDispatchTail
             let dispatch = Task { [weak self] in
                 _ = await predecessor?.result
-                guard let self,
-                      !Task.isCancelled,
+                guard let self else { return }
+                guard !Task.isCancelled,
                       self.interactionIncarnation == incarnation else {
+                    if let initialTextEdit {
+                        self.renderer?.textEditingSession.releaseClaim(initialTextEdit)
+                    }
                     return
                 }
                 if let interceptor = self.interactionWillEnterOutboxForTesting {
@@ -476,7 +498,8 @@ public final class SessionController: @unchecked Sendable {
                             binding: binding,
                             sessionIncarnation: sessionIncarnation,
                             interactionIncarnation: incarnation,
-                            maxFlushGeneration: drainCutoff
+                            maxFlushGeneration: drainCutoff,
+                            initialEdit: initialTextEdit
                         )
                     }
                 } catch {
@@ -502,52 +525,70 @@ public final class SessionController: @unchecked Sendable {
             }
         }
     }
-
     /// Drains TextEditingSession-owned drafts through retain, native authorization, then send.
     ///
-    /// The unassigned identity is snapshotted before waiting for the editor lane. Later typing
-    /// may coalesce into the live slot, but this drain still sends the claimed snapshot and a
-    /// non-text interaction only admits generations `<= maxFlushGeneration`.
+    /// The callback's initial edit is snapshotted synchronously on MainActor. Later typing may
+    /// coalesce into the live slot, but this drain still sends the claimed snapshot and a non-text
+    /// interaction only admits generations `<= maxFlushGeneration`.
     private func dispatchUnassignedTextEdits(
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
         interactionIncarnation: UInt64,
-        maxFlushGeneration: UInt64
+        maxFlushGeneration: UInt64,
+        initialEdit: LocalTextEdit? = nil
     ) async throws {
+        var queuedEdit = initialEdit
         while true {
-            try Task.checkCancellation()
-            guard withStateLock({
-                outboxConnectionBinding == binding
-                    && outboxSessionIncarnation == sessionIncarnation
-            }) else {
-                return
-            }
-            guard let edit = await MainActor.run(body: { () -> LocalTextEdit? in
-                guard self.interactionIncarnation == interactionIncarnation else { return nil }
-                return self.renderer?.textEditingSession.claimNextUnassignedEdit(
-                    maxFlushGeneration: maxFlushGeneration
-                )
-            }) else {
-                return
-            }
-            try await outbox.waitUntilTextEditLaneIsAvailable(
-                nodeId: edit.nodeId,
-                binding: binding,
-                sessionIncarnation: sessionIncarnation
-            )
-            let snapshotStillValid = await MainActor.run { () -> Bool in
-                guard self.interactionIncarnation == interactionIncarnation else { return false }
-                return self.renderer?.textEditingSession.isSnapshotStillValid(edit) == true
-            }
-            if !snapshotStillValid {
-                await MainActor.run {
-                    self.renderer?.textEditingSession.releaseClaim(edit)
+            let edit: LocalTextEdit
+            if let initial = queuedEdit {
+                edit = initial
+                queuedEdit = nil
+            } else {
+                guard withStateLock({
+                    outboxConnectionBinding == binding
+                        && outboxSessionIncarnation == sessionIncarnation
+                }) else {
+                    return
                 }
-                continue
+                guard let claimed = await MainActor.run(body: { () -> LocalTextEdit? in
+                    guard self.interactionIncarnation == interactionIncarnation else { return nil }
+                    return self.renderer?.textEditingSession.claimNextUnassignedEdit(
+                        maxFlushGeneration: maxFlushGeneration
+                    )
+                }) else {
+                    return
+                }
+                edit = claimed
             }
 
             var prepared: PreparedTextEdit?
             do {
+                try Task.checkCancellation()
+                guard withStateLock({
+                    outboxConnectionBinding == binding
+                        && outboxSessionIncarnation == sessionIncarnation
+                }) else {
+                    await MainActor.run {
+                        self.renderer?.textEditingSession.releaseClaim(edit)
+                    }
+                    return
+                }
+                try await outbox.waitUntilTextEditLaneIsAvailable(
+                    nodeId: edit.nodeId,
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                )
+                let snapshotStillValid = await MainActor.run { () -> Bool in
+                    guard self.interactionIncarnation == interactionIncarnation else { return false }
+                    return self.renderer?.textEditingSession.isSnapshotStillValid(edit) == true
+                }
+                if !snapshotStillValid {
+                    await MainActor.run {
+                        self.renderer?.textEditingSession.releaseClaim(edit)
+                    }
+                    continue
+                }
+
                 guard let retained = try await outbox.prepareTextEdit(
                     nodeId: edit.nodeId,
                     text: edit.text,
@@ -787,6 +828,7 @@ public final class SessionController: @unchecked Sendable {
             return self.lifecycleGeneration
         }
         guard let lifecycleGeneration else { return }
+        var activatedResourceOwnerEpoch: UInt64?
 
         startRangeRequestPump()
 
@@ -804,6 +846,7 @@ public final class SessionController: @unchecked Sendable {
                     "connection lost resource-cache ownership during binding"
                 )
             }
+            activatedResourceOwnerEpoch = connectionBinding.resourceOwnershipEpoch
             guard ownsRunningLifecycle(lifecycleGeneration),
                   let sessionIncarnation = await outbox.sessionIncarnation(
                     binding: connectionBinding
@@ -980,6 +1023,11 @@ public final class SessionController: @unchecked Sendable {
             await receiveStartGate.release()
         } catch {
             await cleanUpFailedStart(generation: lifecycleGeneration)
+            if let activatedResourceOwnerEpoch {
+                _ = await resourceCache.deactivateReferenceOwner(
+                    epoch: activatedResourceOwnerEpoch
+                )
+            }
             throw error
         }
     }
@@ -1288,7 +1336,7 @@ public final class SessionController: @unchecked Sendable {
         // normal shutdown. Unless `stop()` asked for the teardown, this is terminal for the replica
         // and must be reported so the caller reconnects and resumes rather than sitting on a live
         // session with no reader (§18, §4 inv. 13).
-        let stoppedIntentionally = Task.isCancelled || withStateLock { !isRunning }
+        let stoppedIntentionally = Task.isCancelled || withStateLock { isStopping || !isRunning }
         guard !stoppedIntentionally else { return }
         await reportFailure(.transportEnded("receive stream closed by peer"))
     }
@@ -1572,6 +1620,9 @@ public final class SessionController: @unchecked Sendable {
                 }) else {
                     return false
                 }
+                self.reconcileFrontierSettledTextEdits(
+                    preparation.frontierSettledTextEdits
+                )
                 self.noteAssignedTextEdits(preparation.assignedTextEdits)
                 return true
             }
@@ -2321,6 +2372,27 @@ public final class SessionController: @unchecked Sendable {
             requireExactMatch: requireExactMatch,
             onlyIfResumeGeneration: generation
         )
+    }
+
+    @MainActor
+    private func reconcileFrontierSettledTextEdits(_ events: [Event]) {
+        guard let renderer else { return }
+        let session = renderer.textEditingSession
+        for event in events where event.eventType == .EVENT_TEXT_EDIT {
+            session.noteAcknowledged(nodeID: event.nodeId, eventId: event.eventId)
+            guard !session.hasUnsentSuccessorDraft(for: event.nodeId) else {
+                continue
+            }
+            // A cumulative frontier proves settlement but carries no individual rejection bit.
+            // Reapply the last published value conservatively; an accepted edit's transaction
+            // will publish its value, while a rejected edit cannot remain visible.
+            let published = session.lastKnownAuthoritative(for: event.nodeId) ?? ""
+            if let adapter = renderer.registry.handle(for: event.nodeId)?.textAdapter {
+                adapter.applyAuthoritativeString(published)
+            } else {
+                _ = session.applyPublishedValue(nodeID: event.nodeId, published: published)
+            }
+        }
     }
 
     @MainActor
@@ -3085,6 +3157,11 @@ public final class SessionController: @unchecked Sendable {
                 }
                 self.hasMountedInitialTree = false
             }
+        }
+        if let connectionBinding = stoppedState.connectionBinding {
+            _ = await resourceCache.deactivateReferenceOwner(
+                epoch: connectionBinding.resourceOwnershipEpoch
+            )
         }
         _ = clearSessionStateAfterStop(
             generation: stoppedState.lifecycleGeneration

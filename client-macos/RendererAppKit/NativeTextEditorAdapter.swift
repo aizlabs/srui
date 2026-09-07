@@ -66,6 +66,9 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
     /// `ControlFactory.displayedEditorText` so a cleared `.value` still shows `.text`.
     public func applyAuthoritative(_ value: Value?) {
         if let value, value.asString == nil {
+            // Wrong-typed content has no native representation, but it is still a publication
+            // boundary: retire stale protocol work without wiping the last renderable string.
+            session?.noteInvalidPublishedValue(nodeID: nodeID)
             return
         }
         applyAuthoritativeString(value?.asString ?? "")
@@ -196,13 +199,41 @@ public final class NativeTextEditorAdapter: NSObject, NSTextFieldDelegate, NSTex
         if currentString == string {
             return
         }
+
+        let fieldEditor = textField?.currentEditor() as? NSTextView
+        let activeEditor = textView ?? fieldEditor
+        let selectedRanges = activeEditor?.selectedRanges ?? []
+
         applyingAuthoritative = true
         defer { applyingAuthoritative = false }
         if let textField {
             textField.stringValue = string
+            // While a field is first responder, AppKit renders through its shared field editor.
+            fieldEditor?.string = string
         }
         if let textView {
             textView.string = string
+        }
+        if let activeEditor, !selectedRanges.isEmpty {
+            activeEditor.selectedRanges = Self.clampedSelectionRanges(
+                selectedRanges,
+                utf16Length: string.utf16.count
+            )
+        }
+    }
+
+    private static func clampedSelectionRanges(
+        _ ranges: [NSValue],
+        utf16Length: Int
+    ) -> [NSValue] {
+        ranges.map { value in
+            let range = value.rangeValue
+            guard range.location != NSNotFound else {
+                return NSValue(range: NSRange(location: utf16Length, length: 0))
+            }
+            let location = min(range.location, utf16Length)
+            let length = min(range.length, utf16Length - location)
+            return NSValue(range: NSRange(location: location, length: length))
         }
     }
 }

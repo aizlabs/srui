@@ -684,7 +684,7 @@ struct EventOutboxTests {
             textSession.onAssignedIdentityRevoked = { eventId in
                 outbox.revokeUnauthorizedPreparedTextEdit(eventId: eventId)
             }
-            textSession.noteAssigned(prepared.event, matching: edit)
+            return textSession.noteAssigned(prepared.event, matching: edit)
         })
         #expect(await MainActor.run {
             textSession.applyPublishedValue(nodeID: NodeId(12), published: "corrected")
@@ -721,8 +721,11 @@ struct EventOutboxTests {
         let sent = try #require(try await outbox.releasePreparedTextEdit(prepared))
         #expect(sent == prepared.event)
         #expect(await transport.sentEventSequences() == [1])
+        #expect(await outbox.retainedPreparedTextEditRevocationCountForTesting == 0)
         await transport.close()
     }
+
+    @Test("A prepared assignment survives teardown before its send gate opens")
     func nativeAssignmentSurvivesTeardownBeforeRelease() async throws {
         let transport = EventSequenceRecordingTransport()
         let outbox = EventOutbox()
@@ -791,6 +794,46 @@ struct EventOutboxTests {
         )
         #expect(action.eventSeq == 2)
         #expect(await transport.sentEventSequences() == [1, 2])
+        await transport.close()
+    }
+
+    @Test("Rejecting a settled prepared edit always releases the outbound FIFO")
+    func rejectSettledPreparedTextEditReleasesSendGate() async throws {
+        let transport = EventSequenceRecordingTransport()
+        let outbox = EventOutbox()
+        let binding = await activeBinding(for: outbox)
+        let editSeq = try #require(EditSeq(1))
+        let prepared = try #require(try await outbox.prepareTextEdit(
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            binding: binding,
+            via: transport
+        ))
+        let descriptor = PendingTextEditDescriptor(
+            eventId: prepared.event.eventId,
+            eventSeq: prepared.event.eventSeq,
+            nodeId: prepared.event.nodeId,
+            editSeq: editSeq
+        )
+        try await outbox.cancelAssignedTextEdits(
+            confirming: [descriptor],
+            requireExactMatch: true
+        )
+
+        #expect(await outbox.rejectPreparedTextEdit(prepared) == false)
+        #expect(await outbox.preparedTextEditSendCountForTesting == 0)
+        #expect(await outbox.retainedPreparedTextEditRevocationCountForTesting == 0)
+
+        let action = try await outbox.sendActivate(
+            nodeId: NodeId(13),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: transport
+        )
+        #expect(action.eventSeq == 2)
+        #expect(await transport.sentEventSequences() == [2])
         await transport.close()
     }
 
@@ -928,8 +971,8 @@ struct EventOutboxTests {
         await client.close()
         await server.close()
     }
-    @Test("A cumulative ack retains earlier text lanes until each outcome is known")
-    func cumulativeAckRetainsEarlierTextOutcomes() async throws {
+    @Test("A cumulative ack settles every covered text lane with conservative barriers")
+    func cumulativeAckSettlesCoveredTextOutcomes() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         let binding = await outbox.beginConnectionBinding()
@@ -949,7 +992,7 @@ struct EventOutboxTests {
             sessionIncarnation: incarnation, via: client
         )
 
-        let secondSettlement = await outbox.settleAcknowledgement(
+        let settlement = await outbox.settleAcknowledgement(
             binding: binding,
             sessionIncarnation: incarnation,
             clientInstanceId: outbox.clientInstanceId,
@@ -958,8 +1001,10 @@ struct EventOutboxTests {
             sessionId: "session-barriers",
             revisionAfterEffect: 5
         )
-        #expect(secondSettlement.settledEvents.map(\.eventId) == [second.eventId])
-        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [first.eventId])
+        #expect(settlement.settledEvents.map(\.eventId) == [first.eventId, second.eventId])
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+        #expect(await outbox.pendingCount == 0)
+
         #expect(await outbox.releaseTextAcknowledgements(
             through: 4,
             binding: binding,
@@ -975,29 +1020,11 @@ struct EventOutboxTests {
             onResolved: { recorder.noteAcknowledgements($0) }
         ))
         #expect(await MainActor.run {
-            recorder.acknowledgementCalls.map { $0.map(\.eventId) } == [[second.eventId]]
-        })
-
-        let firstSettlement = await outbox.settleAcknowledgement(
-            binding: binding,
-            sessionIncarnation: incarnation,
-            clientInstanceId: outbox.clientInstanceId,
-            eventId: first.eventId,
-            throughSeq: second.eventSeq,
-            sessionId: "session-barriers",
-            revisionAfterEffect: 4,
-            textEditRejected: true
-        )
-        #expect(firstSettlement.settledEvents.map(\.eventId) == [first.eventId])
-        #expect(await outbox.releaseTextAcknowledgements(
-            through: 5,
-            binding: binding,
-            sessionIncarnation: incarnation,
-            onResolved: { recorder.noteAcknowledgements($0) }
-        ))
-        #expect(await MainActor.run {
-            recorder.acknowledgementCalls.last?.first?.eventId == first.eventId
-                && recorder.acknowledgementCalls.last?.first?.rejected == true
+            let barriers = recorder.acknowledgementCalls.last ?? []
+            let outcomes = Dictionary(uniqueKeysWithValues: barriers.map {
+                ($0.eventId, $0.rejected)
+            })
+            return outcomes == [first.eventId: true, second.eventId: false]
         })
         await client.close()
         await server.close()
@@ -1151,9 +1178,51 @@ struct EventOutboxTests {
         await seedClient.close()
         await seedServer.close()
     }
-    @Test("Resume frontier replays text until its cached outcome is acknowledged")
-    func resumeFrontierRetainsTextUntilOutcomeAck() async throws {
-        let (seedClient, seedServer) = await PipeTransport.createPair()
+    @Test("Resume discard mismatch is rejected before native drafts are canceled")
+    func resumeDiscardMismatchPreservesNativeAndOutboxState() async throws {
+        let transport = EventSequenceRecordingTransport()
+        let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-mismatch", binding: binding))
+        let assigned = try await sendPreparedTextEdit(
+            outbox,
+            nodeId: NodeId(12),
+            text: "typed",
+            editSeq: try #require(EditSeq(1)),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: transport
+        )
+        let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
+        let recorder = await MainActor.run { TextAssignmentRecorder() }
+        var mismatch = PendingTextEditDescriptor(
+            eventId: assigned.eventId,
+            eventSeq: assigned.eventSeq,
+            nodeId: assigned.nodeId,
+            editSeq: try #require(assigned.editSeq)
+        ).toWire()
+        mismatch.nodeID += 1
+
+        await #expect(throws: EventOutboxError.textEditDiscardMismatch) {
+            _ = try await outbox.prepareSameSessionResume(
+                id: "session-mismatch",
+                lastProcessedEventSeq: 0,
+                generation: generation,
+                binding: binding,
+                discardedTextEdits: [mismatch],
+                requireExactTextMatch: true,
+                onTextEditsCanceled: { recorder.noteCancellation($0) }
+            )
+        }
+        #expect(await MainActor.run { recorder.cancellationCalls.isEmpty })
+        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [assigned.eventId])
+        #expect(await outbox.pendingCount == 1)
+        await transport.close()
+    }
+
+    @Test("Resume frontier settles covered text and never replays an evictable result")
+    func resumeFrontierSettlesCoveredTextWithoutReplay() async throws {
+        let transport = EventSequenceRecordingTransport()
         let outbox = EventOutbox()
         let binding = await outbox.beginConnectionBinding()
         #expect(await outbox.confirmFreshSession(id: "session-outcome", binding: binding))
@@ -1164,77 +1233,39 @@ struct EventOutboxTests {
             editSeq: try #require(EditSeq(1)),
             observedRevision: Revision(1),
             binding: binding,
-            via: seedClient
+            via: transport
         )
+        #expect(await transport.sentEventSequences() == [1])
 
         let generation = try #require(await outbox.beginResumeAttempt(binding: binding))
-        let (client, server) = await PipeTransport.createPair()
-        let serverStream = server.receiveStream()
-        #expect(try await resumeSameSession(
-            outbox,
+        let preparation = try #require(try await outbox.prepareSameSessionResume(
             id: "session-outcome",
             lastProcessedEventSeq: pending.eventSeq,
             generation: generation,
-            binding: binding,
-            via: client,
+            binding: binding
+        ))
+        #expect(preparation.frontierSettledTextEdits == [pending])
+        #expect(preparation.assignedTextEdits.isEmpty)
+        #expect(await outbox.lastAckedEventSeq == pending.eventSeq)
+        #expect(await outbox.pendingCount == 0)
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+
+        #expect(try await outbox.completeSameSessionResume(
+            preparation,
+            via: transport,
             enableNewEventsAfterReplay: true
         ))
-
-        #expect(await outbox.lastAckedEventSeq == pending.eventSeq)
-        #expect(await outbox.pendingCount == 1)
-        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [pending.eventId])
-
-        var streamDecoder = SRUIMessageStreamDecoder()
-        var replayedEvent: Event?
-        for try await chunk in serverStream {
-            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
-                if case .event(let wireEvent) = message.msg {
-                    replayedEvent = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
-                    break
-                }
-            }
-            if replayedEvent != nil { break }
-        }
-        #expect(replayedEvent?.eventId == pending.eventId)
-        #expect(replayedEvent?.eventSeq == pending.eventSeq)
-        #expect(replayedEvent?.editSeq == pending.editSeq)
+        #expect(await transport.sentEventSequences() == [1])
 
         let later = try await outbox.sendActivate(
             nodeId: NodeId(13),
             observedRevision: Revision(2),
             binding: binding,
-            via: client
+            via: transport
         )
-        let laterSettlement = await outbox.settleAcknowledgement(
-            binding: binding,
-            clientInstanceId: outbox.clientInstanceId,
-            eventId: later.eventId,
-            throughSeq: later.eventSeq,
-            sessionId: "session-outcome",
-            revisionAfterEffect: 2
-        )
-        #expect(laterSettlement.bound)
-        #expect(await outbox.pendingCount == 1)
-        #expect(await outbox.assignedTextEditDescriptors().map(\.eventId) == [pending.eventId])
-
-        let settlement = await outbox.settleAcknowledgement(
-            binding: binding,
-            clientInstanceId: outbox.clientInstanceId,
-            eventId: pending.eventId,
-            throughSeq: later.eventSeq,
-            sessionId: "session-outcome",
-            revisionAfterEffect: 2,
-            textEditRejected: true
-        )
-        #expect(settlement.bound)
-        #expect(settlement.event?.eventId == pending.eventId)
-        #expect(settlement.settledEvents.map(\.eventId) == [pending.eventId])
-        #expect(await outbox.pendingCount == 0)
-
-        await client.close()
-        await server.close()
-        await seedClient.close()
-        await seedServer.close()
+        #expect(later.eventSeq == 2)
+        #expect(await transport.sentEventSequences() == [1, 2])
+        await transport.close()
     }
     @Test("A reconnect generation makes live same-session resync an atomic no-op")
     func reconnectSupersedesLiveSameSessionResyncAtomically() async throws {

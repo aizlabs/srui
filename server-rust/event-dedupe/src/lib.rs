@@ -418,6 +418,15 @@ impl EventDeduplicator {
         self.clients.len()
     }
 
+    /// Whether the full receive/result window for `client_instance_id` is still retained.
+    ///
+    /// A caller with auxiliary per-client state can use this to reclaim state for the same
+    /// least-recently-used instances this deduplicator has already evicted.
+    #[must_use]
+    pub fn has_client_window(&self, client_instance_id: &[u8]) -> bool {
+        self.clients.contains_key(client_instance_id)
+    }
+
     /// Moves an existing client instance to the most-recently-used end of the eviction order.
     fn touch_client(&mut self, client_instance_id: &[u8]) {
         let Some(position) = self

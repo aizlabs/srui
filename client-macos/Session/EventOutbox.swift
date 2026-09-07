@@ -158,6 +158,8 @@ struct SameSessionResumePreparation: Sendable {
     var generation: UInt64
     var binding: EventOutboxConnectionBinding
     var sessionIncarnation: EventOutboxSessionIncarnation
+    /// Text edits settled by the cumulative frontier and therefore forbidden to replay (§18.2).
+    var frontierSettledTextEdits: [Event]
     var assignedTextEdits: [Event]
 }
 
@@ -327,21 +329,51 @@ private final class TextLifecycleFence: @unchecked Sendable {
     }
 }
 
-/// Lets a MainActor correction revoke a prepared send before its FIFO gate opens.
 private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
     private let lock = NSLock()
+    private var preparedEventIds: Set<EventId> = []
     private var revokedEventIds: Set<EventId> = []
 
-    func revoke(_ eventId: EventId) {
-        lock.lock()
-        revokedEventIds.insert(eventId)
-        lock.unlock()
+    func register(_ eventId: EventId) {
+        lock.withLock {
+            _ = preparedEventIds.insert(eventId)
+        }
     }
 
-    func withLock<T>(_ body: (Set<EventId>) -> T) -> T {
+    func revoke(_ eventId: EventId) {
+        lock.withLock {
+            guard preparedEventIds.contains(eventId) else { return }
+            revokedEventIds.insert(eventId)
+        }
+    }
+
+    /// Consults and retires one authorization record atomically with the caller's decision.
+    func resolve<T>(_ eventId: EventId, _ body: (Bool) -> T) -> T {
         lock.lock()
-        defer { lock.unlock() }
-        return body(revokedEventIds)
+        defer {
+            preparedEventIds.remove(eventId)
+            revokedEventIds.remove(eventId)
+            lock.unlock()
+        }
+        return body(revokedEventIds.contains(eventId))
+    }
+
+    func retire(_ eventId: EventId) {
+        lock.withLock {
+            preparedEventIds.remove(eventId)
+            revokedEventIds.remove(eventId)
+        }
+    }
+
+    func reset() {
+        lock.withLock {
+            preparedEventIds.removeAll(keepingCapacity: false)
+            revokedEventIds.removeAll(keepingCapacity: false)
+        }
+    }
+
+    var retainedRevocationCount: Int {
+        lock.withLock { revokedEventIds.count }
     }
 }
 /// Actor managing outbound semantic event generation, sequencing, and wire transmission.
@@ -409,12 +441,10 @@ public actor EventOutbox {
     /// A successor for a node cannot be promoted until this acknowledgement's authoritative
     /// revision has reached the rendered replica.
     private var textAcknowledgementBarriers: [NodeId: TextEditAcknowledgementBarrier] = [:]
-    /// Resume frontiers prove processing but not a text edit's rejection/correction outcome.
-    /// These identities remain replayable until their own cached acknowledgement arrives.
-    private var textEventsAwaitingOutcome: Set<EventId> = []
     private var textLaneStateVersion: UInt64 = 0
     private var textLaneWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var nativeTextLifecycleWillHopForTesting: (@Sendable () async -> Void)?
+
     private struct PendingResyncBoundaryCleanup: Sendable {
         var token: UUID
         var invalidation: Task<UInt64?, Never>
@@ -431,7 +461,6 @@ public actor EventOutbox {
         var token: UUID
         var invalidation: Task<UInt64?, Never>
     }
-
     public init(
         clientInstanceId: ClientInstanceId = ClientInstanceId(string: UUID().uuidString),
         maxPendingEvents: Int = EventOutbox.defaultMaxPendingEvents
@@ -736,6 +765,7 @@ public actor EventOutbox {
             gate: gate,
             task: send
         )
+        preparedTextEditAuthorizationFence.register(event.eventId)
         return PreparedTextEdit(event: event, token: token)
     }
 
@@ -783,8 +813,10 @@ public actor EventOutbox {
             case reject
             case failed
         }
-        let decision = preparedTextEditAuthorizationFence.withLock { revoked -> Decision in
-            if revoked.contains(prepared.event.eventId) {
+        let decision = preparedTextEditAuthorizationFence.resolve(
+            prepared.event.eventId
+        ) { revoked -> Decision in
+            if revoked {
                 return .reject
             }
             if let retained = preparedTextEditSends[prepared.token],
@@ -819,7 +851,6 @@ public actor EventOutbox {
             return false
         }
     }
-
     /// Waits for an authorized edit's first transmission. A lifecycle-canceled transport returns
     /// the retained identity immediately; same-session resume owns its next transmission.
     @discardableResult
@@ -835,30 +866,38 @@ public actor EventOutbox {
         }
         return nil
     }
-
     /// Rolls back only an explicitly rejected, still-unauthorized edit. Global prepared-slot
     /// exclusion makes it the newest allocation, so rewinding event_seq cannot create a hole.
+    ///
+    /// Even when lifecycle settlement already removed the pending identity, the closed send slot
+    /// is always canceled and removed so it cannot wedge the outbound FIFO.
     @discardableResult
     func rejectPreparedTextEdit(_ prepared: PreparedTextEdit) -> Bool {
-        guard pendingOrder.last == prepared.event.eventId,
+        let canceledBeforeSend: Bool
+        if let retained = preparedTextEditSends.removeValue(forKey: prepared.token),
+           retained.event == prepared.event {
+            canceledBeforeSend = retained.gate.cancelIfUnresolved()
+            retained.task.cancel()
+        } else if lifecycleSuspendedPreparedTextEdits[prepared.token] == prepared.event {
+            lifecycleSuspendedPreparedTextEdits.removeValue(forKey: prepared.token)
+            canceledBeforeSend = true
+        } else {
+            preparedTextEditAuthorizationFence.retire(prepared.event.eventId)
+            return false
+        }
+
+        preparedTextEditAuthorizationFence.retire(prepared.event.eventId)
+        signalTextLaneStateChange()
+        guard canceledBeforeSend,
+              pendingOrder.last == prepared.event.eventId,
               pendingEvents[prepared.event.eventId] == prepared.event,
               currentEventSeq == prepared.event.eventSeq else {
             return false
         }
-        if let retained = preparedTextEditSends[prepared.token],
-           retained.event == prepared.event {
-            guard retained.gate.cancelIfUnresolved() else { return false }
-            retained.task.cancel()
-            preparedTextEditSends.removeValue(forKey: prepared.token)
-        } else if lifecycleSuspendedPreparedTextEdits[prepared.token] == prepared.event {
-            lifecycleSuspendedPreparedTextEdits.removeValue(forKey: prepared.token)
-        } else {
-            return false
-        }
+
         pendingEvents.removeValue(forKey: prepared.event.eventId)
         pendingOrder.removeLast()
         currentEventSeq -= 1
-        signalTextLaneStateChange()
         return true
     }
 
@@ -871,7 +910,6 @@ public actor EventOutbox {
             return event
         }
     }
-
     public func assignedTextEditDescriptors() -> [PendingTextEditDescriptor] {
         pendingOrder.compactMap { id in
             guard let event = pendingEvents[id],
@@ -888,22 +926,34 @@ public actor EventOutbox {
         }
     }
 
+    /// Validates the exact server echo before any native cancellation callback can run.
+    private func textEditsToCancel(
+        confirming refs: [PendingTextEditDescriptor],
+        requireExactMatch: Bool
+    ) throws -> [PendingTextEditDescriptor] {
+        let assigned = assignedTextEditDescriptors()
+        if requireExactMatch {
+            let assignedKeys = Set(assigned.map(Self.identityKey))
+            let echoKeys = Set(refs.map(Self.identityKey))
+            guard assigned.count == refs.count, assignedKeys == echoKeys else {
+                throw EventOutboxError.textEditDiscardMismatch
+            }
+            return refs
+        }
+        return assigned
+    }
+
     /// Selectively cancels assigned `TEXT_EDIT` events. A required exact match fails closed (§18.3).
     func cancelAssignedTextEdits(
         confirming refs: [PendingTextEditDescriptor],
         requireExactMatch: Bool
     ) throws {
-        let assigned = assignedTextEditDescriptors()
-        if requireExactMatch {
-            let assignedKeys = Set(assigned.map(Self.identityKey))
-            let echoKeys = Set(refs.map(Self.identityKey))
-            guard assignedKeys == echoKeys else {
-                throw EventOutboxError.textEditDiscardMismatch
-            }
-        }
-        let condemned = requireExactMatch ? refs : assigned
+        let condemned = try textEditsToCancel(
+            confirming: refs,
+            requireExactMatch: requireExactMatch
+        )
         for ref in condemned {
-            textEventsAwaitingOutcome.remove(ref.eventId)
+            preparedTextEditAuthorizationFence.retire(ref.eventId)
             if let event = pendingEvents.removeValue(forKey: ref.eventId) {
                 pendingOrder.removeAll { $0 == ref.eventId }
                 recordSelectiveAcknowledgement(event.eventSeq)
@@ -930,8 +980,6 @@ public actor EventOutbox {
         try cancelAssignedTextEdits(confirming: confirming, requireExactMatch: requireExactMatch)
         return true
     }
-
-    /// Applies the assigned-edit acknowledgement boundary after the native full resync.
     @discardableResult
     func applyFullResyncTextBoundary(
         laneEpoch: UInt64?,
@@ -1085,7 +1133,7 @@ public actor EventOutbox {
     /// Private: settling an intent mutates state whose ownership depends on wire identity, so
     /// `settleAcknowledgement` is the only way in from the wire (§18.2).
     private func acknowledgeEvent(id: EventId) {
-        textEventsAwaitingOutcome.remove(id)
+        preparedTextEditAuthorizationFence.retire(id)
         guard let event = pendingEvents.removeValue(forKey: id) else { return }
         pendingOrder.removeAll { $0 == id }
         recordSelectiveAcknowledgement(event.eventSeq)
@@ -1147,6 +1195,14 @@ public actor EventOutbox {
 
     var activeConnectionBindingForTesting: EventOutboxConnectionBinding? {
         activeConnectionBinding
+    }
+
+    var preparedTextEditSendCountForTesting: Int {
+        preparedTextEditSends.count
+    }
+
+    var retainedPreparedTextEditRevocationCountForTesting: Int {
+        preparedTextEditAuthorizationFence.retainedRevocationCount
     }
 
     func setNativeTextLifecycleWillHopForTesting(
@@ -1552,7 +1608,12 @@ public actor EventOutbox {
             if requireExactTextMatch, confirming.count != discardedTextEdits.count {
                 throw EventOutboxError.textEditDiscardMismatch
             }
-            let canceled = assignedTextEditDescriptors()
+            // Validate before the destructive MainActor callback. The mutation revalidates after
+            // the hop so a superseding lifecycle still fails closed.
+            let canceled = try textEditsToCancel(
+                confirming: confirming,
+                requireExactMatch: requireExactTextMatch
+            )
             if let onTextEditsCanceled {
                 guard await performNativeTextLifecycle(
                     binding: binding,
@@ -1563,18 +1624,15 @@ public actor EventOutbox {
                     return nil
                 }
             }
-            // The lifecycle callback and ownership revalidation happen before mutation. If a newer
-            // binding won the hop, the old transition leaves both native and outbox state intact.
             try cancelAssignedTextEdits(
                 confirming: confirming,
                 requireExactMatch: requireExactTextMatch
             )
         }
         activeSessionId = id
-        acknowledgeEvents(
-            throughSeq: lastProcessedEventSeq,
-            retainingTextEditsForOutcome: true
-        )
+        let frontierSettledTextEdits = acknowledgeEvents(
+            throughSeq: lastProcessedEventSeq
+        ).filter { $0.eventType == .EVENT_TEXT_EDIT }
         // Once a resume frontier is accepted, an undecided old transport slot is replayable and
         // can no longer be rolled back by a delayed pre-resume controller task.
         lifecycleAuthorizedPreparedTextEdits.merge(
@@ -1587,9 +1645,11 @@ public actor EventOutbox {
             generation: generation,
             binding: binding,
             sessionIncarnation: sessionIncarnation,
+            frontierSettledTextEdits: frontierSettledTextEdits,
             assignedTextEdits: assignedTextEditEvents()
         )
     }
+
 
     /// Revalidates a prepared same-session transition after MainActor adopted its assignments,
     /// then replays retained identities in allocation order.
@@ -1685,6 +1745,7 @@ public actor EventOutbox {
         return true
     }
     /// Applies the event frontier for a live-session resync without an outstanding resume attempt.
+    /// Applies the event frontier for a live-session resync without an outstanding resume attempt.
     ///
     /// Does not cancel the replay retry loop: unsettled events keep retrying until settlement
     /// advances the frontier (§18.2).
@@ -1707,10 +1768,7 @@ public actor EventOutbox {
             }
             resyncRenderOwnership = nil
         }
-        acknowledgeEvents(
-            throughSeq: lastProcessedEventSeq,
-            retainingTextEditsForOutcome: true
-        )
+        acknowledgeEvents(throughSeq: lastProcessedEventSeq)
         return true
     }
 
@@ -1778,10 +1836,7 @@ public actor EventOutbox {
         // Every assigned sequence is covered by the server frontier, so exact local cancellation
         // cannot manufacture a receive-window acknowledgement for an unprocessed event.
         try cancelAssignedTextEdits(confirming: assigned, requireExactMatch: true)
-        acknowledgeEvents(
-            throughSeq: lastProcessedEventSeq,
-            retainingTextEditsForOutcome: true
-        )
+        acknowledgeEvents(throughSeq: lastProcessedEventSeq)
         return .applied(canceledTextEdits: assigned.map { $0.toWire() })
     }
 
@@ -1860,33 +1915,32 @@ public actor EventOutbox {
             return .unbound
         }
         let event = pendingEvents[eventId]
-        // A cumulative frontier proves that earlier events were processed, but only the named
-        // text event carries this acknowledgement's accept/reject outcome and effect revision.
-        // Keep every other covered TEXT_EDIT replayable until its own cached outcome arrives.
-        var settledEvents = acknowledgeEvents(
-            throughSeq: seq,
-            retainingTextEditsForOutcome: true
-        )
+        // The cumulative frontier is normative settlement (§18.2). Keeping covered text edits in
+        // the retry set can outlive the server's bounded result record and turn replay into a
+        // permanent OutsideReceiveWindow reconnect loop.
+        var settledEvents = acknowledgeEvents(throughSeq: seq)
         if let event, !settledEvents.contains(where: { $0.eventId == event.eventId }) {
             settledEvents.append(event)
             settledEvents.sort { $0.eventSeq < $1.eventSeq }
         }
 
-        if let revisionAfterEffect,
-           let event,
-           event.eventType == .EVENT_TEXT_EDIT {
+        // The named edit has an exact outcome. Earlier edits settled only by the cumulative
+        // frontier are handled conservatively as rejected: after this revision renders, native
+        // state converges to the last authoritative value unless a newer local draft exists.
+        let effectRevision = revisionAfterEffect ?? 0
+        for settledEvent in settledEvents where settledEvent.eventType == .EVENT_TEXT_EDIT {
             let barrier = TextEditAcknowledgementBarrier(
-                nodeId: event.nodeId,
-                eventId: event.eventId,
-                revisionAfterEffect: revisionAfterEffect,
-                rejected: textEditRejected
+                nodeId: settledEvent.nodeId,
+                eventId: settledEvent.eventId,
+                revisionAfterEffect: effectRevision,
+                rejected: settledEvent.eventId == eventId ? textEditRejected : true
             )
-            if let current = textAcknowledgementBarriers[event.nodeId] {
-                if current.revisionAfterEffect <= revisionAfterEffect {
-                    textAcknowledgementBarriers[event.nodeId] = barrier
+            if let current = textAcknowledgementBarriers[settledEvent.nodeId] {
+                if current.revisionAfterEffect <= effectRevision {
+                    textAcknowledgementBarriers[settledEvent.nodeId] = barrier
                 }
             } else {
-                textAcknowledgementBarriers[event.nodeId] = barrier
+                textAcknowledgementBarriers[settledEvent.nodeId] = barrier
             }
         }
 
@@ -1904,35 +1958,24 @@ public actor EventOutbox {
     /// Private for the same reason as `acknowledgeEvent(id:)`: reachable from the wire only
     /// through the identity-checked `settleAcknowledgement`, and internally only from a resume or
     /// resync decision the generation latch already bound to this outbox (§18, §18.2).
-    ///
-    /// `retainTextEdits` keeps assigned `TEXT_EDIT` events in the retry set so a lost rejection
-    /// ack can still be recovered as a duplicate after `RESUME_OK` / live resync (§18.3, §22.6).
     @discardableResult
-    private func acknowledgeEvents(
-        throughSeq seq: UInt64,
-        retainingTextEditsForOutcome: Bool = false
-    ) -> [Event] {
+    private func acknowledgeEvents(throughSeq seq: UInt64) -> [Event] {
         guard seq > _lastAckedEventSeq, seq <= currentEventSeq else { return [] }
 
         _lastAckedEventSeq = seq
         acknowledgedOutOfOrder = Set(acknowledgedOutOfOrder.filter { $0 > seq })
-        if retainingTextEditsForOutcome {
-            for event in pendingEvents.values
-            where event.eventSeq <= seq && event.eventType == .EVENT_TEXT_EDIT {
-                textEventsAwaitingOutcome.insert(event.eventId)
-            }
-        }
         let settled = pendingEvents.values
-            .filter {
-                $0.eventSeq <= seq
-                    && !textEventsAwaitingOutcome.contains($0.eventId)
-            }
+            .filter { $0.eventSeq <= seq }
             .sorted { $0.eventSeq < $1.eventSeq }
         for event in settled {
+            preparedTextEditAuthorizationFence.retire(event.eventId)
             pendingEvents.removeValue(forKey: event.eventId)
         }
         pendingOrder.removeAll { pendingEvents[$0] == nil }
         advanceContiguousAcknowledgement()
+        if !settled.isEmpty {
+            signalTextLaneStateChange()
+        }
         cancelReplayRetryLoopIfSettled()
         return settled
     }
@@ -2265,11 +2308,11 @@ public actor EventOutbox {
         pendingOrder.removeAll(keepingCapacity: true)
         acknowledgedOutOfOrder.removeAll(keepingCapacity: true)
         textAcknowledgementBarriers.removeAll(keepingCapacity: true)
-        textEventsAwaitingOutcome.removeAll(keepingCapacity: true)
         signalTextLaneStateChange()
         cancelPendingWrites()
         lifecycleSuspendedPreparedTextEdits.removeAll(keepingCapacity: true)
         lifecycleAuthorizedPreparedTextEdits.removeAll(keepingCapacity: true)
+        preparedTextEditAuthorizationFence.reset()
     }
 
     private func startReplayRetryLoop(

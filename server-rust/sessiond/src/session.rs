@@ -23,7 +23,7 @@ pub use model_range::{
 };
 pub use text_edit::{TextEditDecision, TextEditRequest, TextEditTracker, MAX_TEXT_EDIT_STREAMS};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::outbound::{OutboundHub, OutboundReceiver, DEFAULT_OUTBOUND_QUEUE_CAPACITY};
@@ -183,45 +183,6 @@ pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> Stri
     }
     value.truncate(end);
     value
-}
-
-fn deleted_subtree_ids(store: &SemanticStore, ops: &[Operation]) -> Vec<NodeId> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    for op in ops {
-        if let Operation::DeleteNode { id } = op {
-            collect_deleted_subtree(store, *id, &mut ids, &mut seen);
-        }
-    }
-    ids
-}
-
-fn deleted_subtree_ids_from_wire(store: &SemanticStore, tx: &Transaction) -> Vec<NodeId> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    for op in &tx.operations {
-        if let Some(srui_protocol::operation::Op::DeleteNode(ref deletion)) = op.op {
-            collect_deleted_subtree(store, NodeId::new(deletion.node_id), &mut ids, &mut seen);
-        }
-    }
-    ids
-}
-
-fn collect_deleted_subtree(
-    store: &SemanticStore,
-    id: NodeId,
-    out: &mut Vec<NodeId>,
-    seen: &mut HashSet<u64>,
-) {
-    if !seen.insert(id.get()) {
-        return;
-    }
-    out.push(id);
-    if let Some(node) = store.get_node(id) {
-        for child in node.ordered_children.iter().copied() {
-            collect_deleted_subtree(store, child, out, seen);
-        }
-    }
 }
 
 /// Outcome of one client event (§18.2).
@@ -752,7 +713,9 @@ impl Session {
             match result {
                 Ok(Ok(val)) => {
                     let (staged, ops) = ui.into_staged_and_ops();
-                    let deleted = deleted_subtree_ids(&guard.store, &ops);
+                    let deletes_nodes = ops
+                        .iter()
+                        .any(|op| matches!(op, Operation::DeleteNode { .. }));
                     let commit = AuthoritativeCommit::new(base_revision, ops);
 
                     // Journal admission is decided before the store mutates: `append` below cannot
@@ -762,7 +725,14 @@ impl Session {
                     let tx_wire = permit.transaction().clone();
                     guard.store.commit_staging(staged, commit.new_revision());
                     guard.journal.append(permit);
-                    guard.text_edit_tracker.reclaim_nodes(deleted);
+                    if deletes_nodes {
+                        let SessionInner {
+                            store,
+                            text_edit_tracker,
+                            ..
+                        } = &mut *guard;
+                        text_edit_tracker.reclaim_missing_nodes(store);
+                    }
                     // Published under `inner` so delivery order equals commit order (§12.1);
                     // see `publish_committed` for why this is not an `async-no-lock-await`
                     // violation.
@@ -824,11 +794,21 @@ impl Session {
             let staged = guard.store.prepare_commit(&commit)?;
             let permit = guard.journal.prepare(&commit)?;
             let tx_wire = permit.transaction().clone();
-            let deleted = deleted_subtree_ids_from_wire(&guard.store, &tx_wire);
+            let deletes_nodes = tx_wire
+                .operations
+                .iter()
+                .any(|op| matches!(op.op, Some(srui_protocol::operation::Op::DeleteNode(_))));
 
             guard.store.commit_prepared(staged);
             guard.journal.append(permit);
-            guard.text_edit_tracker.reclaim_nodes(deleted);
+            if deletes_nodes {
+                let SessionInner {
+                    store,
+                    text_edit_tracker,
+                    ..
+                } = &mut *guard;
+                text_edit_tracker.reclaim_missing_nodes(store);
+            }
             // Published under `inner` so delivery order equals commit order (§12.1).
             self.publish_committed(&tx_wire);
             tx_wire
@@ -1270,6 +1250,89 @@ mod tests {
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transaction_reclaims_only_nodes_absent_after_reparent_then_delete() {
+        let session = Session::new("post-commit-delete-reclamation");
+        let root = NodeId::new(1);
+        let deleted_editor = NodeId::new(2);
+        let surviving_editor = NodeId::new(3);
+        session
+            .transaction(|ui| {
+                ui.create_node(root, TypeRef::SURFACE, None, None, std::iter::empty())?;
+                ui.create_node(
+                    deleted_editor,
+                    TypeRef::TEXT_INPUT,
+                    Some(root),
+                    None,
+                    std::iter::empty(),
+                )?;
+                ui.create_node(
+                    surviving_editor,
+                    TypeRef::TEXT_INPUT,
+                    Some(deleted_editor),
+                    None,
+                    std::iter::empty(),
+                )?;
+                Ok(())
+            })
+            .expect("seed editor subtree");
+
+        let client = b"client";
+        {
+            let mut inner = session.inner.lock().unwrap();
+            inner
+                .text_edit_tracker
+                .reserve(
+                    client,
+                    deleted_editor,
+                    srui_semantic_tree::EditSeq::new(5).unwrap(),
+                )
+                .unwrap();
+            inner.text_edit_tracker.mark_terminal(
+                client,
+                deleted_editor,
+                srui_semantic_tree::EditSeq::new(5).unwrap(),
+            );
+            inner
+                .text_edit_tracker
+                .reserve(
+                    client,
+                    surviving_editor,
+                    srui_semantic_tree::EditSeq::new(7).unwrap(),
+                )
+                .unwrap();
+            inner.text_edit_tracker.mark_terminal(
+                client,
+                surviving_editor,
+                srui_semantic_tree::EditSeq::new(7).unwrap(),
+            );
+        }
+
+        session
+            .transaction(|ui| {
+                ui.move_node(surviving_editor, Some(root), None)?;
+                ui.delete(deleted_editor)?;
+                Ok(())
+            })
+            .expect("reparent editor before deleting its old parent");
+
+        assert!(!session.contains_node(deleted_editor));
+        assert!(session.contains_node(surviving_editor));
+        let inner = session.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .text_edit_tracker
+                .last_terminal_of(client, deleted_editor),
+            None
+        );
+        assert_eq!(
+            inner
+                .text_edit_tracker
+                .last_terminal_of(client, surviving_editor),
+            Some(7)
+        );
     }
 
     #[test]

@@ -380,16 +380,20 @@ public final class TextEditingSession {
         firstClaimableUnassignedNode(maxFlushGeneration: maxFlushGeneration)
     }
 
-    /// Claims the oldest claimable unassigned edit. Callers wait for the lane *after* this
-    /// snapshot so a later coalesced value cannot replace the identity already in flight.
-    public func claimNextUnassignedEdit(maxFlushGeneration: UInt64? = nil) -> LocalTextEdit? {
-        guard let nodeID = firstClaimableUnassignedNode(maxFlushGeneration: maxFlushGeneration),
-              var state = nodes[nodeID],
+    /// Claims the exact edit emitted by a synchronous MainActor callback. Capturing it before
+    /// returning to the run loop prevents later typing from coalescing away an ordering boundary.
+    public func claimUnassignedEdit(
+        nodeID: NodeId,
+        text: String,
+        editSeq: EditSeq,
+        laneEpoch: UInt64
+    ) -> LocalTextEdit? {
+        guard var state = nodes[nodeID],
               !state.unassignedClaimed,
-              let text = state.unassignedFlushedValue,
-              let editSeq = state.unassignedFlushedEditSeq,
+              state.unassignedFlushedEditSeq == editSeq,
+              state.unassignedFlushedValue == text,
+              state.unassignedLaneEpoch == laneEpoch,
               let observedRevision = state.unassignedObservedRevision,
-              let laneEpoch = state.unassignedLaneEpoch,
               let flushGeneration = state.unassignedFlushGeneration else {
             return nil
         }
@@ -403,6 +407,24 @@ public final class TextEditingSession {
             laneEpoch: laneEpoch,
             flushGeneration: flushGeneration,
             invalidationEpoch: state.invalidationEpoch
+        )
+    }
+
+    /// Claims the oldest claimable unassigned edit. Callers wait for the lane *after* this
+    /// snapshot so a later coalesced value cannot replace the identity already in flight.
+    public func claimNextUnassignedEdit(maxFlushGeneration: UInt64? = nil) -> LocalTextEdit? {
+        guard let nodeID = firstClaimableUnassignedNode(maxFlushGeneration: maxFlushGeneration),
+              let state = nodes[nodeID],
+              let text = state.unassignedFlushedValue,
+              let editSeq = state.unassignedFlushedEditSeq,
+              let laneEpoch = state.unassignedLaneEpoch else {
+            return nil
+        }
+        return claimUnassignedEdit(
+            nodeID: nodeID,
+            text: text,
+            editSeq: editSeq,
+            laneEpoch: laneEpoch
         )
     }
 
@@ -527,6 +549,32 @@ public final class TextEditingSession {
             onAssignedIdentityRevoked?(revokedEventId)
         }
         return deferNativeReplacement ? .deferred : .apply
+    }
+
+    /// Retires protocol-visible local work when an editor property is present with the wrong
+    /// semantic type. The malformed value has no display representation, so native text and the
+    /// last valid authoritative string stay untouched while stale drafts and assignments cannot
+    /// leak across the publication boundary.
+    public func noteInvalidPublishedValue(nodeID: NodeId) {
+        guard var state = nodes[nodeID] else { return }
+        let hadDraft = state.pendingValue != nil
+            || state.unassignedFlushedEditSeq != nil
+            || state.lastSubmittedValue != nil
+        let revokedEventId = state.assignedEventId
+        state.pendingValue = nil
+        clearUnassignedEdit(&state, nodeID: nodeID)
+        state.debounceTask?.cancel()
+        state.debounceTask = nil
+        state.lastSubmittedValue = nil
+        state.assignedEventId = nil
+        if hadDraft {
+            _ = bumpLaneEpoch(nodeID: nodeID)
+            bumpInvalidationEpoch(&state)
+        }
+        nodes[nodeID] = state
+        if let revokedEventId {
+            onAssignedIdentityRevoked?(revokedEventId)
+        }
     }
 
     public func localValue(for nodeID: NodeId) -> String? {

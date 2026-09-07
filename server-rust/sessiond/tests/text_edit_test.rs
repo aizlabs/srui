@@ -820,18 +820,36 @@ fn committed_edit_survives_editor_reclamation_and_resume_until_handler_finishes(
 
     let mut wrong_sequence = pending_ref.clone();
     wrong_sequence.event_seq = 2;
-    assert!(matches!(
-        session.bootstrap_resume(&make_resume(vec![wrong_sequence])),
-        Err(SessionError::EventSequence(_))
-    ));
+    let wrong_sequence_bootstrap = session
+        .bootstrap_resume(&make_resume(vec![wrong_sequence.clone()]))
+        .expect("a malformed pending ref must not make resume connection-fatal");
+    let ResumeOutcome::Resync {
+        resync_msg: wrong_sequence_resync,
+        ..
+    } = wrong_sequence_bootstrap.outcome
+    else {
+        panic!("journal gap must force resync");
+    };
+    assert_eq!(
+        wrong_sequence_resync.discarded_text_edits,
+        vec![wrong_sequence]
+    );
+    assert_eq!(wrong_sequence_resync.last_processed_event_seq, 0);
 
     let mut wrong_node = pending_ref.clone();
     wrong_node.node_id = EDITOR + 1;
-    assert!(matches!(
-        session.bootstrap_resume(&make_resume(vec![wrong_node])),
-        Err(SessionError::InvalidInput(reason))
-            if reason.contains("does not match committed in-handler event identity")
-    ));
+    let wrong_node_bootstrap = session
+        .bootstrap_resume(&make_resume(vec![wrong_node.clone()]))
+        .expect("an unauthenticated node/edit pair must not make resume connection-fatal");
+    let ResumeOutcome::Resync {
+        resync_msg: wrong_node_resync,
+        ..
+    } = wrong_node_bootstrap.outcome
+    else {
+        panic!("journal gap must force resync");
+    };
+    assert_eq!(wrong_node_resync.discarded_text_edits, vec![wrong_node]);
+    assert_eq!(wrong_node_resync.last_processed_event_seq, 0);
     assert!(matches!(
         session.process_event(&event),
         Ok(EventOutcome::Pending {

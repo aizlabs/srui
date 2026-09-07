@@ -11,11 +11,11 @@ import Testing
 @Suite("ResourceCache Public API Tests")
 struct ResourceCachePublicAPITests {
     @Test("External callers retain the unmanaged cache lifecycle")
-    func unmanagedLifecycleRemainsPublic() async {
+    func unmanagedLifecycleRemainsPublic() async throws {
         let cache = ResourceCache()
 
-        await cache.setLiveReferences([])
-        await cache.clearPartials()
+        try await cache.setLiveReferences([])
+        try await cache.clearPartials()
 
         #expect(await cache.knownHashes().isEmpty)
         #expect(await cache.committedCount() == 0)

@@ -7,13 +7,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, MutexGuard};
 
-use srui_event_dedupe::{EventOutcomeRecord, RecordOutcome};
+use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, RecordOutcome};
 use srui_protocol::Event as WireEvent;
 use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     AuthoritativeCommit, ClientInstanceId, EditSeq, Event as DomainEvent, EventId,
-    EventValidationError, NodeId, PropertyRef, Revision, StandardValidationState, StoreError,
-    TypeRef, Value,
+    EventValidationError, NodeId, PropertyRef, Revision, SemanticStore, StandardValidationState,
+    StoreError, TypeRef, Value,
 };
 
 use super::{
@@ -143,7 +143,40 @@ impl TextEditTracker {
         self.streams.is_empty()
     }
 
-    /// Reserves a generation for a sequence strictly above the terminal watermark.
+    fn is_at_capacity(&self) -> bool {
+        self.stream_count >= self.max_streams
+    }
+
+    /// Reclaims terminal editor streams only after all event-sequence history for the client has
+    /// aged out.
+    ///
+    /// An evicted full receive window may leave a retained contiguous frontier. That frontier lets
+    /// the same client resume at its next `event_seq`, so its edit-sequence watermarks must remain
+    /// coupled to it; otherwise a returning client could overwrite newer text with a lower
+    /// `edit_seq`. Both the full windows and retained frontiers are bounded by the deduplicator,
+    /// so sustained identity churn eventually makes genuinely departed clients reclaimable.
+    ///
+    /// A client with an in-flight policy or committed handler remains pinned defensively, even
+    /// though the deduplicator itself will not evict a window with an unsettled event.
+    fn reclaim_departed_clients(&mut self, dedupe: &EventDeduplicator) {
+        let mut removed = 0;
+        self.streams.retain(|client_instance_id, client| {
+            let pinned = !client.committed_handler_edits.is_empty()
+                || client
+                    .editor_streams
+                    .values()
+                    .any(|stream| !stream.in_flight_edit_seqs.is_empty());
+            let has_event_sequence_history = dedupe.has_client_window(client_instance_id)
+                || dedupe.last_contiguous_processed_seq(client_instance_id) != 0;
+            if has_event_sequence_history || pinned {
+                true
+            } else {
+                removed += client.editor_streams.len();
+                false
+            }
+        });
+        self.stream_count -= removed;
+    }
     pub fn reserve(
         &mut self,
         client_instance_id: &[u8],
@@ -313,6 +346,23 @@ impl TextEditTracker {
         });
         self.stream_count -= removed;
     }
+
+    /// Reclaims streams only for nodes absent from the committed post-transaction store.
+    ///
+    /// Scanning is bounded by `max_streams`; final membership, rather than the pre-commit tree,
+    /// handles transactions that reparent nodes into or out of a deleted subtree.
+    pub(super) fn reclaim_missing_nodes(&mut self, store: &SemanticStore) {
+        let mut removed = 0;
+        self.streams.retain(|_, client| {
+            let before = client.editor_streams.len();
+            client
+                .editor_streams
+                .retain(|node_id, _| store.contains_node(NodeId::new(*node_id)));
+            removed += before - client.editor_streams.len();
+            !client.editor_streams.is_empty() || !client.committed_handler_edits.is_empty()
+        });
+        self.stream_count -= removed;
+    }
 }
 pub(crate) fn is_editor_type(ty: TypeRef) -> bool {
     ty == TypeRef::TEXT_INPUT || ty == TypeRef::TEXT_AREA
@@ -346,6 +396,14 @@ impl Session {
             Err(error) => return Ok(Self::settle_rejected_event(&mut guard, event, error)),
         };
         let client_bytes = event.client_instance_id.clone();
+        if guard.text_edit_tracker.is_at_capacity() {
+            let SessionInner {
+                dedupe,
+                text_edit_tracker,
+                ..
+            } = &mut *guard;
+            text_edit_tracker.reclaim_departed_clients(dedupe);
+        }
         let prepared =
             match guard
                 .text_edit_tracker
@@ -617,11 +675,11 @@ impl Session {
         Ok(validated)
     }
 
-    pub(crate) fn cancel_pending_text_edits(
-        inner: &mut SessionInner,
+    pub(crate) fn prepare_pending_text_edit_cancellation(
+        inner: &SessionInner,
         client_instance_id: &[u8],
         refs: &[ValidatedPendingTextEditRef<'_>],
-    ) -> Result<Vec<srui_protocol::PendingTextEditRef>, SessionError> {
+    ) -> PendingTextEditCancellation {
         let revision_after_effect = inner.store.revision().get();
         let max_string_length = inner.store.limits().max_string_length;
         let outcome = EventOutcomeRecord {
@@ -633,65 +691,59 @@ impl Session {
             ),
         };
 
-        // Stage the bounded receive-window and editor-watermark changes together. A later
-        // identity conflict must not leave an earlier ref settled when the handshake fails.
+        // Stage cancellation until subscription succeeds. Never derive an editor watermark from
+        // the resume payload: node_id/edit_seq are peer-controlled and the dedupe identity does
+        // not authenticate either field. An already in-flight edit is allowed to finish; its
+        // eventual transaction follows the snapshot and converges the client authoritatively.
         let mut staged_dedupe = inner.dedupe.clone();
-        let mut staged_tracker = inner.text_edit_tracker.clone();
         let mut discarded = Vec::with_capacity(refs.len());
         for validated in refs {
             let reference = validated.reference;
-            let edit_seq = validated.edit_seq;
             let placeholder = WireEvent {
                 client_instance_id: client_instance_id.to_vec(),
                 event_seq: reference.event_seq,
                 event_id: reference.event_id.clone(),
                 node_id: reference.node_id,
                 event_type: Some(TypeRef::EVENT_TEXT_EDIT.into()),
-                edit_seq: edit_seq.get(),
+                edit_seq: validated.edit_seq.get(),
                 ..Default::default()
             };
-            // A duplicate accepted identity remains accepted, while unseen identities are
-            // canceled and made terminal. An edit whose authoritative commit already landed but
-            // whose registered handlers are still running must remain in flight: the resync still
-            // tells the client to discard its local copy, and handler completion will cache the
-            // accepted result at the true post-handler revision.
-            // Admission validates the variable-sized event_id plus event_seq and event type
-            // against the bounded dedupe record before the fixed-size handler marker is consulted.
-            let (settle_as_canceled, mark_terminal) = match staged_dedupe
-                .admit_event(&placeholder)?
-            {
-                RecordOutcome::Duplicate { .. } => (false, true),
-                RecordOutcome::Fresh { .. } => (true, true),
-                RecordOutcome::Pending { .. } => {
-                    match staged_tracker
-                        .committed_handler_identity_matches(client_instance_id, reference)
-                    {
-                        Some(true) => (false, false),
-                        Some(false) => {
-                            return Err(SessionError::InvalidInput(
-                                    "pending TEXT_EDIT ref does not match committed in-handler event identity"
-                                        .into(),
-                                ));
-                        }
-                        None => (true, true),
+
+            match staged_dedupe.admit_event(&placeholder) {
+                Ok(RecordOutcome::Fresh { .. }) => {
+                    staged_dedupe.settle_event(&placeholder, outcome.clone());
+                }
+                Ok(RecordOutcome::Duplicate { .. }) => {}
+                Ok(RecordOutcome::Pending { .. }) => {
+                    if matches!(
+                        inner
+                            .text_edit_tracker
+                            .committed_handler_identity_matches(client_instance_id, reference),
+                        Some(false)
+                    ) {
+                        tracing::warn!(
+                            event_seq = reference.event_seq,
+                            "ignoring mismatched pending TEXT_EDIT resume identity"
+                        );
                     }
                 }
-            };
-            if settle_as_canceled {
-                staged_dedupe.settle_event(&placeholder, outcome.clone());
-            }
-            if mark_terminal {
-                staged_tracker.mark_terminal(
-                    client_instance_id,
-                    NodeId::new(reference.node_id),
-                    edit_seq,
-                );
+                Err(error) => {
+                    // A bad replay reference must not make every subsequent resume fail. Echo it
+                    // as discarded, but leave the authoritative dedupe entry untouched.
+                    tracing::warn!(
+                        %error,
+                        event_seq = reference.event_seq,
+                        "ignoring invalid pending TEXT_EDIT resume identity"
+                    );
+                }
             }
             discarded.push(reference.clone());
         }
-        inner.dedupe = staged_dedupe;
-        inner.text_edit_tracker = staged_tracker;
-        Ok(discarded)
+
+        PendingTextEditCancellation {
+            staged_dedupe,
+            discarded,
+        }
     }
 }
 struct PreparedTextEdit {
@@ -709,6 +761,26 @@ enum TextEditCommit {
 pub(crate) struct ValidatedPendingTextEditRef<'a> {
     reference: &'a srui_protocol::PendingTextEditRef,
     edit_seq: EditSeq,
+}
+
+pub(crate) struct PendingTextEditCancellation {
+    staged_dedupe: EventDeduplicator,
+    discarded: Vec<srui_protocol::PendingTextEditRef>,
+}
+
+impl PendingTextEditCancellation {
+    pub(crate) fn last_processed_event_seq(&self, client_instance_id: &[u8]) -> u64 {
+        self.staged_dedupe
+            .last_contiguous_processed_seq(client_instance_id)
+    }
+
+    pub(crate) fn discarded_text_edits(&self) -> &[srui_protocol::PendingTextEditRef] {
+        &self.discarded
+    }
+
+    pub(crate) fn commit(self, inner: &mut SessionInner) {
+        inner.dedupe = self.staged_dedupe;
+    }
 }
 
 fn validate_text_edit(
@@ -946,7 +1018,143 @@ mod tests {
     }
 
     #[test]
-    fn cancel_pending_text_edits_is_atomic_on_identity_conflict() {
+    fn processing_retains_edit_watermark_while_event_frontier_can_resume() {
+        use srui_sdk::{Surface, TextInput};
+
+        let session = Session::new("tracker-frontier-coupling");
+        session
+            .transaction(|ui| {
+                Surface::builder(1).create(ui)?;
+                TextInput::builder(2).parent(1).value("").create(ui)?;
+                TextInput::builder(3).parent(1).value("").create(ui)?;
+                Ok(())
+            })
+            .expect("seed editors");
+        {
+            let mut inner = session.inner.lock().unwrap();
+            inner.text_edit_tracker = TextEditTracker::new(1);
+            inner.dedupe = EventDeduplicator::with_limits(8, 1);
+        }
+
+        let veteran = DomainEvent::text_edit(1, "veteran-1", 1u64, 2, "newer", seq(10))
+            .with_client_instance_id(b"veteran".to_vec())
+            .to_wire();
+        assert!(matches!(
+            session.process_event(&veteran),
+            Ok(EventOutcome::Processed { .. })
+        ));
+
+        let newcomer = DomainEvent::text_edit(1, "newcomer-1", 2u64, 3, "other", seq(1))
+            .with_client_instance_id(b"newcomer".to_vec())
+            .to_wire();
+        assert!(matches!(
+            session.process_event(&newcomer),
+            Ok(EventOutcome::Rejected {
+                error: EventValidationError::TextTrackerFull { limit: 1 },
+                ..
+            })
+        ));
+
+        {
+            let inner = session.inner.lock().unwrap();
+            assert!(
+                !inner.dedupe.has_client_window(b"veteran"),
+                "the veteran's full receive window was evicted"
+            );
+            assert_eq!(
+                inner.dedupe.last_contiguous_processed_seq(b"veteran"),
+                1,
+                "the resumable event frontier remains"
+            );
+            assert_eq!(
+                inner
+                    .text_edit_tracker
+                    .last_terminal_of(b"veteran", node(2)),
+                Some(10),
+                "the edit watermark must outlive the full receive window"
+            );
+        }
+
+        let stale_return = DomainEvent::text_edit(2, "veteran-2", 2u64, 2, "stale", seq(9))
+            .with_client_instance_id(b"veteran".to_vec())
+            .to_wire();
+        assert!(matches!(
+            session.process_event(&stale_return),
+            Ok(EventOutcome::Rejected {
+                error: EventValidationError::StaleEditSeq {
+                    observed: 9,
+                    watermark: 10,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn processing_reclaims_client_after_window_and_frontier_age_out() {
+        use srui_sdk::{Surface, TextInput};
+
+        let session = Session::new("tracker-client-reclamation");
+        session
+            .transaction(|ui| {
+                Surface::builder(1).create(ui)?;
+                TextInput::builder(2).parent(1).value("").create(ui)?;
+                TextInput::builder(3).parent(1).value("").create(ui)?;
+                Ok(())
+            })
+            .expect("seed editors");
+        {
+            let mut inner = session.inner.lock().unwrap();
+            inner.text_edit_tracker = TextEditTracker::new(1);
+            inner.dedupe = EventDeduplicator::with_limits(8, 1);
+        }
+
+        let departed_event =
+            DomainEvent::text_edit(1, "departed-event", 1u64, 2, "departed", seq(1))
+                .with_client_instance_id(b"departed".to_vec())
+                .to_wire();
+        assert!(matches!(
+            session.process_event(&departed_event),
+            Ok(EventOutcome::Processed { .. })
+        ));
+
+        let bridge_event = DomainEvent::text_edit(1, "bridge-event", 2u64, 3, "bridge", seq(1))
+            .with_client_instance_id(b"bridge".to_vec())
+            .to_wire();
+        assert!(matches!(
+            session.process_event(&bridge_event),
+            Ok(EventOutcome::Rejected {
+                error: EventValidationError::TextTrackerFull { limit: 1 },
+                ..
+            })
+        ));
+
+        let current_event = DomainEvent::text_edit(1, "current-event", 2u64, 3, "current", seq(1))
+            .with_client_instance_id(b"current".to_vec())
+            .to_wire();
+        assert!(matches!(
+            session.process_event(&current_event),
+            Ok(EventOutcome::Processed { .. })
+        ));
+
+        let inner = session.inner.lock().unwrap();
+        assert_eq!(inner.text_edit_tracker.len(), 1);
+        assert_eq!(
+            inner
+                .text_edit_tracker
+                .last_terminal_of(b"departed", node(2)),
+            None
+        );
+        assert_eq!(
+            inner
+                .text_edit_tracker
+                .last_terminal_of(b"current", node(3)),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pending_text_edit_cancellation_is_staged_and_conflicts_are_nonfatal() {
         let session = Session::new("cancel-atomic");
         let client = b"client";
         let activate = WireEvent {
@@ -979,9 +1187,50 @@ mod tests {
 
         let validated =
             Session::validate_pending_text_edit_refs(&refs).expect("structurally valid refs");
-        assert!(Session::cancel_pending_text_edits(&mut inner, client, &validated).is_err());
+        let cancellation =
+            Session::prepare_pending_text_edit_cancellation(&inner, client, &validated);
+        assert_eq!(cancellation.discarded_text_edits(), refs);
         assert!(!inner.dedupe.is_duplicate(client, b"text-1"));
         assert!(inner.dedupe.is_in_flight(client, b"shared"));
-        assert_eq!(inner.dedupe.last_contiguous_processed_seq(client), 0);
+
+        cancellation.commit(&mut inner);
+        assert!(inner.dedupe.is_duplicate(client, b"text-1"));
+        assert!(inner.dedupe.is_in_flight(client, b"shared"));
+        assert_eq!(inner.dedupe.last_contiguous_processed_seq(client), 1);
+    }
+
+    #[test]
+    fn pending_text_edit_cancellation_never_trusts_resume_watermarks() {
+        let session = Session::new("cancel-untrusted-watermark");
+        let client = b"client";
+        let mut inner = session.inner.lock().unwrap();
+        inner
+            .text_edit_tracker
+            .reserve(client, node(7), seq(1))
+            .unwrap();
+        inner
+            .text_edit_tracker
+            .mark_terminal(client, node(7), seq(1));
+
+        let refs = vec![srui_protocol::PendingTextEditRef {
+            event_id: b"forged-watermark".to_vec(),
+            event_seq: 1,
+            node_id: 7,
+            edit_seq: u64::MAX,
+        }];
+        let validated =
+            Session::validate_pending_text_edit_refs(&refs).expect("structurally valid refs");
+        let cancellation =
+            Session::prepare_pending_text_edit_cancellation(&inner, client, &validated);
+        cancellation.commit(&mut inner);
+
+        assert_eq!(
+            inner.text_edit_tracker.last_terminal_of(client, node(7)),
+            Some(1)
+        );
+        assert!(inner
+            .text_edit_tracker
+            .reserve(client, node(7), seq(2))
+            .is_ok());
     }
 }

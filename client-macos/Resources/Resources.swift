@@ -150,6 +150,7 @@ public enum ResourceCacheError: Error, Equatable, Sendable, CustomStringConverti
     case committedBytesLimit(requested: Int, limit: Int)
     case committedEntryLimit(count: Int, limit: Int)
     case metadataConflict(ResourceHash)
+    case managedReferenceOwnerActive(epoch: UInt64)
 
     public var description: String {
         switch self {
@@ -183,6 +184,8 @@ public enum ResourceCacheError: Error, Equatable, Sendable, CustomStringConverti
             return "committed entry count would become \(count), limit \(limit)"
         case .metadataConflict(let hash):
             return "conflicting metadata for already-assembling resource \(hash)"
+        case .managedReferenceOwnerActive(let epoch):
+            return "unscoped resource-cache mutation rejected while owner epoch \(epoch) is active"
         }
     }
 }
@@ -267,6 +270,12 @@ private final class ResourceReferenceOwnerFence: Sendable {
     func activate(epoch: UInt64) -> Bool {
         if let activeOwnerEpoch, epoch < activeOwnerEpoch { return false }
         activeOwnerEpoch = epoch
+        return true
+    }
+
+    func deactivate(epoch: UInt64) -> Bool {
+        guard activeOwnerEpoch == epoch else { return false }
+        activeOwnerEpoch = nil
         return true
     }
 
@@ -363,8 +372,8 @@ public actor ResourceCache {
     /// before they are protected from eviction (§14, §18, §26).
     public func setLiveReferencesAndLookup(
         _ hashes: Set<ResourceHash>
-    ) -> [ValidatedDecodedImage] {
-        guard activeReferenceOwnerEpoch == nil else { return [] }
+    ) throws -> [ValidatedDecodedImage] {
+        try requireUnmanagedAccess()
         liveReferences = hashes
         let hits = committedOrder.filter { hashes.contains($0) }
         for hash in hits {
@@ -406,6 +415,22 @@ public actor ResourceCache {
 
         guard await referenceOwnerFence.activate(epoch: epoch) else { return false }
         return activeReferenceOwnerEpoch == epoch
+    }
+
+    /// Releases managed ownership only when the exact connection epoch is still current.
+    /// Committed resources survive; temporary pins and incomplete transfers do not.
+    @discardableResult
+    package func deactivateReferenceOwner(epoch: UInt64) async -> Bool {
+        guard activeReferenceOwnerEpoch == epoch else { return false }
+        guard await referenceOwnerFence.deactivate(epoch: epoch) else { return false }
+        // Actor reentrancy: a newer activation may have superseded this owner during the
+        // MainActor hop. Never let an older stop clear the replacement's cache state.
+        guard activeReferenceOwnerEpoch == epoch else { return false }
+        activeReferenceOwnerEpoch = nil
+        liveReferences.removeAll(keepingCapacity: false)
+        renderReferenceLease = nil
+        discardAllPartials()
+        return true
     }
 
     /// Reports whether a managed connection still owns every scoped cache mutation.
@@ -488,8 +513,8 @@ public actor ResourceCache {
 
     /// Discards unmanaged in-flight assemblies while retaining the committed CAS (§14, §18).
     /// Once connection ownership is activated, callers must use the scoped overload.
-    public func clearPartials() {
-        guard activeReferenceOwnerEpoch == nil else { return }
+    public func clearPartials() throws {
+        try requireUnmanagedAccess()
         discardAllPartials()
     }
 
@@ -506,10 +531,15 @@ public actor ResourceCache {
         inFlightBytes = 0
     }
 
+    private func requireUnmanagedAccess() throws {
+        guard let activeReferenceOwnerEpoch else { return }
+        throw ResourceCacheError.managedReferenceOwnerActive(epoch: activeReferenceOwnerEpoch)
+    }
+
     /// Announces metadata before managed connection ownership has been activated.
     @discardableResult
     public func ingestMetadata(_ input: ResourceMetadataInput) throws -> ResourceCommit? {
-        guard activeReferenceOwnerEpoch == nil else { return nil }
+        try requireUnmanagedAccess()
         return try ingestMetadataForActiveOwner(input)
     }
 
@@ -577,7 +607,7 @@ public actor ResourceCache {
     /// Appends one contiguous chunk before managed connection ownership has been activated.
     @discardableResult
     public func ingestChunk(_ input: ResourceChunkInput) throws -> ResourceCommit? {
-        guard activeReferenceOwnerEpoch == nil else { return nil }
+        try requireUnmanagedAccess()
         return try ingestChunkForActiveOwner(input)
     }
 
@@ -733,8 +763,8 @@ public actor ResourceCache {
 
     /// Updates the set of hashes currently referenced by live Image nodes. Eviction never drops
     /// these entries, so visible content is not permanently replaced with placeholders (§14, §26).
-    public func setLiveReferences(_ hashes: Set<ResourceHash>) {
-        guard activeReferenceOwnerEpoch == nil else { return }
+    public func setLiveReferences(_ hashes: Set<ResourceHash>) throws {
+        try requireUnmanagedAccess()
         liveReferences = hashes
     }
 

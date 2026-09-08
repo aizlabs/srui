@@ -105,6 +105,7 @@ struct TransportTests {
             }
         }
         try #require(bindRes == 0)
+        try #require(chmod(tempSocketPath, 0o600) == 0)
         try #require(Darwin.listen(serverFD, 5) == 0)
 
         // Connect with UnixSocketTransport
@@ -140,6 +141,47 @@ struct TransportTests {
         }
 
         #expect(clientReceived == responseMsg)
+        await transport.close()
+    }
+
+    @Test("UnixSocketTransport rejects group- or world-accessible socket paths")
+    func unixSocketTransportRejectsInsecureMode() async throws {
+        let socketPath = "/tmp/test-srui-insecure-\(UUID().uuidString).sock"
+        defer { unlink(socketPath) }
+
+        let serverFD = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        try #require(serverFD >= 0)
+        defer { Darwin.close(serverFD) }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        socketPath.utf8CString.withUnsafeBytes { source in
+            withUnsafeMutablePointer(to: &address.sun_path) { destination in
+                UnsafeMutableRawPointer(destination).copyMemory(
+                    from: source.baseAddress!,
+                    byteCount: source.count
+                )
+            }
+        }
+        let addressLength = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let bindResult = withUnsafePointer(to: &address) { addressPointer in
+            addressPointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                Darwin.bind(serverFD, socketAddress, addressLength)
+            }
+        }
+        try #require(bindResult == 0)
+        try #require(chmod(socketPath, 0o666) == 0)
+        try #require(Darwin.listen(serverFD, 1) == 0)
+
+        let transport = UnixSocketTransport(socketPath: socketPath)
+        var rejected = false
+        do {
+            try await transport.connect()
+        } catch {
+            rejected = true
+            #expect(String(describing: error).contains("expected mode 0600"))
+        }
+        #expect(rejected)
         await transport.close()
     }
 }

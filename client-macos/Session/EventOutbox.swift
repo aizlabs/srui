@@ -52,11 +52,13 @@ public struct PendingTextEditDescriptor: Hashable, Equatable, Sendable {
     }
 
     public init?(wire: SRUIPendingTextEditRef) {
-        guard let seq = EditSeq(wire.editSeq), !wire.eventID.isEmpty, wire.eventSeq > 0 else {
+        guard let seq = EditSeq(wire.editSeq),
+              let eventID = try? validateAndConvertEventID(wire.eventID),
+              wire.eventSeq > 0 else {
             return nil
         }
         self.init(
-            eventId: EventId(wire.eventID),
+            eventId: eventID,
             eventSeq: wire.eventSeq,
             nodeId: NodeId(wire.nodeID),
             editSeq: seq

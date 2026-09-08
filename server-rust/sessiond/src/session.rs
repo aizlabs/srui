@@ -1,7 +1,12 @@
 //! # Session State & Transaction Coordination
 //!
 //! Authoritative state owner managing [`SemanticStore`], [`TransactionJournal`],
-//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §18.3, §20.2, §21, App. B).
+//! and [`EventDeduplicator`] for a session (§6.3, §12, §18, §18.2, §18.3, §20.2, §21, §26,
+//! App. B).
+//!
+//! §26 here is the retained-identifier bound: a peer `event_id` over [`MAX_EVENT_ID_BYTES`] never
+//! enters deduplication state or an outbound message. It is replaced by a bounded, digest-derived
+//! marker that keeps two distinct oversized identifiers distinct.
 //!
 //! Conforms strictly to [`async-no-lock-await`](rules/async-no-lock-await.md):
 //! internal locks are held only for fast in-memory operations and never across `.await` points.
@@ -92,6 +97,7 @@ pub fn mint_session_id() -> String {
     s
 }
 
+use sha2::{Digest, Sha256};
 use srui_event_dedupe::{EventDeduplicator, EventOutcomeRecord, EventSequenceError, RecordOutcome};
 use srui_journal::{JournalError, TransactionJournal, DEFAULT_MAX_JOURNAL_ENTRIES};
 use srui_protocol::{Event, ServerLimits, Transaction};
@@ -100,8 +106,8 @@ use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     AuthoritativeCommit, Event as DomainEvent, EventValidationError, NegotiationError, NodeId,
     Operation, ResourceHash, SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef,
-    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
-    DEFAULT_MAX_TREE_DEPTH,
+    WireError, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
+    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH, MAX_EVENT_ID_BYTES,
 };
 use thiserror::Error;
 
@@ -208,10 +214,70 @@ pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> Stri
     value
 }
 
+/// Bytes of `event_id` that a bounded marker carries forward so two different oversized
+/// identifiers stay different. Truncated SHA-256; `sha2` is already a workspace dependency.
+const OVERSIZED_EVENT_DIGEST_BYTES: usize = 16;
+
+fn oversized_event_digest(event_id: &[u8]) -> [u8; OVERSIZED_EVENT_DIGEST_BYTES] {
+    let digest = Sha256::digest(event_id);
+    let mut truncated = [0u8; OVERSIZED_EVENT_DIGEST_BYTES];
+    truncated.copy_from_slice(&digest[..OVERSIZED_EVENT_DIGEST_BYTES]);
+    truncated
+}
+
+/// Returns a fixed-size, out-of-band dedupe key for an invalid oversized identifier.
+///
+/// Valid wire identifiers are at most 64 bytes, so this 65-byte marker cannot collide with one.
+/// The marker binds `event_seq` *and* a digest of the rejected bytes. Keying on `event_seq` alone
+/// would make two different oversized identifiers at one sequence indistinguishable, so the second
+/// would be answered `Duplicate` where a pair of valid identifiers raises `SequenceAlreadyAssigned`
+/// (§18.2). Malformed input must fail the same way valid input does, not be coalesced into a
+/// weaker outcome (§4 inv. 13). The sequence still settles either way, so later valid events can
+/// advance the frontier.
+pub(crate) fn oversized_event_dedupe_id(event_seq: u64, event_id: &[u8]) -> Vec<u8> {
+    const SEQ_BYTES: usize = std::mem::size_of::<u64>();
+    let mut marker = vec![0xff; MAX_EVENT_ID_BYTES + 1];
+    marker[..SEQ_BYTES].copy_from_slice(&event_seq.to_be_bytes());
+    marker[SEQ_BYTES..SEQ_BYTES + OVERSIZED_EVENT_DIGEST_BYTES]
+        .copy_from_slice(&oversized_event_digest(event_id));
+    marker
+}
+
+/// Returns a bounded wire identity for a rejected oversized event without reflecting peer bytes.
+///
+/// Carries the same digest as [`oversized_event_dedupe_id`] so the echoed discard list keeps two
+/// distinct rejections distinct, and stays within [`MAX_EVENT_ID_BYTES`] so a conformant peer can
+/// decode it (24 + 8 + 16 = 48 bytes).
+pub(crate) fn bounded_rejected_event_id(event_seq: u64, event_id: &[u8]) -> Vec<u8> {
+    let mut marker = b"srui-rejected-oversized:".to_vec();
+    marker.extend_from_slice(&event_seq.to_be_bytes());
+    marker.extend_from_slice(&oversized_event_digest(event_id));
+    debug_assert!(marker.len() <= MAX_EVENT_ID_BYTES);
+    marker
+}
+
+pub(crate) fn bounded_event_id_for_response(event: &Event) -> Vec<u8> {
+    if event.event_id.len() <= MAX_EVENT_ID_BYTES {
+        event.event_id.clone()
+    } else {
+        bounded_rejected_event_id(event.event_seq, &event.event_id)
+    }
+}
+
+fn oversized_event_placeholder(event: &Event) -> Event {
+    Event {
+        client_instance_id: event.client_instance_id.clone(),
+        event_seq: event.event_seq,
+        event_id: oversized_event_dedupe_id(event.event_seq, &event.event_id),
+        event_type: event.event_type,
+        ..Event::default()
+    }
+}
+
 /// Outcome of one client event (§18.2).
 ///
-/// `Processed`, `Duplicate`, and `Rejected` are terminal and become `SERVER EVENT_ACK`; `Pending`
-/// is explicitly non-terminal and produces no acknowledgement. `last_processed_event_seq` is the
+/// Processed, Duplicate, and Rejected are terminal and become SERVER EVENT_ACK; Pending is
+/// explicitly non-terminal and produces no acknowledgement. last_processed_event_seq is the
 /// highest contiguous settled sequence for the event's `client_instance_id`; it never crosses
 /// an in-flight or missing sequence (§18.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,7 +424,6 @@ pub struct SessionConfig {
     /// Must be positive; zero is rejected at session construction, like `journal_capacity`.
     pub outbound_queue_capacity: usize,
 }
-
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
@@ -435,9 +500,8 @@ impl Session {
     ///
     /// # Panics
     ///
-    /// Panics when `journal_capacity` or `outbound_queue_capacity` is zero. Both are refused rather
-    /// than clamped: a zero journal window silently degrades every reconnect to a snapshot resync
-    /// (§18.1), and a zero outbound capacity cannot deliver a single transaction (§20.2).
+    /// Panics when `journal_capacity` or `outbound_queue_capacity` is zero. Both are refused
+    /// rather than clamped because the corresponding queue could not retain a single valid entry.
     #[must_use]
     pub fn with_config(session_id: impl Into<String>, config: SessionConfig) -> Self {
         assert!(
@@ -924,14 +988,22 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
-        // Cloning and decoding peer-controlled arguments may be proportional to the frame size,
-        // so perform that work before entering the session-wide critical section. Admission is
-        // still evaluated first semantically: receive-window errors win over a captured decode
-        // failure, and malformed replays remain idempotent through the settled result cache.
+        // Decode before constructing a domain EventId. Malformed events are still admitted and
+        // settled so the connection can acknowledge rejection instead of creating a retry loop.
         let domain = DomainEvent::try_from(event.clone());
+        let oversized_placeholder;
+        // The placeholder identity is digest-bound, so a cache hit here means this same identifier
+        // was replayed and a *different* oversized identifier at the same sequence still raises
+        // `SequenceAlreadyAssigned`, exactly as a pair of valid identifiers would.
+        let admission_event = if matches!(domain, Err(WireError::EventIdTooLong { .. })) {
+            oversized_placeholder = oversized_event_placeholder(event);
+            &oversized_placeholder
+        } else {
+            event
+        };
 
         let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-        match Self::admit_event(&mut guard, event)? {
+        match Self::admit_event(&mut guard, admission_event)? {
             EventAdmission::Fresh => {}
             EventAdmission::Existing(outcome) => return Ok(outcome),
         }
@@ -941,7 +1013,11 @@ impl Session {
             Err(wire_error) => {
                 let error =
                     EventValidationError::PolicyRejected(format!("malformed event: {wire_error}"));
-                return Ok(Self::settle_rejected_event(&mut guard, event, error));
+                return Ok(Self::settle_rejected_event(
+                    &mut guard,
+                    admission_event,
+                    error,
+                ));
             }
         };
 

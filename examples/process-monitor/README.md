@@ -30,8 +30,8 @@ Guardrails that are always in force:
 - **Per-client selection ownership.** A selection is recorded against the `client_instance_id` that made it, and "Kill Selected" only ever resolves the activating client's own selection — never another client's, and never a shared fallback. An event that carries no `client_instance_id` cannot be attributed to an owner and is refused outright.
 - **PID-reuse protection & Linux `pidfd`.** A selection is an `ItemId`. The server resolves it to the `ProcessKey(pid, start_time)` it assigned. On Linux, signalling uses `pidfd_open` and `pidfd_send_signal` for race-free process targeting. On other Unix platforms, the server re-reads the live process start time immediately before signalling via `kill(2)`. A mismatch or vanished PID is refused as stale.
 - **Single-process numeric validation.** PID targets are strictly validated within `[1, i32::MAX]` before invoking system APIs. Process group (`0`, negative) and broadcast (`-1`) targets cannot be signalled.
-- **Socket protection.** The Unix domain socket is created `0600` (owner-only) and guarded by an exclusive `flock(2)` lock file held for the process lifetime, plus a connect probe, before any stale predecessor is unlinked — a live endpoint can never be hijacked, and a crashed server's socket is still reclaimable.
-- **The socket is the authorization boundary.** There is no per-connection authentication: anything that can connect to the endpoint can select a row and press **Kill Selected**, subject to every guardrail above. `0600` on the socket, and a private parent directory (`$XDG_RUNTIME_DIR`, or a `0700` directory you choose with `--socket`), are therefore load-bearing. Over SSH the SSH login *is* the authentication. Do not place the socket in a world-writable directory or relax its mode.
+- **Socket protection.** The Unix domain socket is created `0600` inside a `0700`, effective-UID-owned runtime directory. Missing private ancestors are created descriptor-relatively without following symlinks. An exclusive `flock(2)` lock plus a connect probe protects stale replacement, so a live endpoint cannot be hijacked and a crashed server's socket remains reclaimable.
+- **The socket is the authorization boundary.** Every accepted connection is checked with kernel peer credentials and must have the same effective UID as the monitor. The server refuses to run as root. Socket ownership/mode and the private parent remain load-bearing defense in depth; over SSH, deployment must still ensure the daemon and bridge run as the SSH-authenticated account.
 - **No shell.** Termination goes directly through `kill(2)` / `pidfd`. The example never constructs shell commands and never invokes `sh`, `bash`, `zsh`, or `system()`.
 - **PID text is never trusted.** Row text, PID text, row index, labels and `action_key` sent by the client are ignored when resolving the target.
 
@@ -57,19 +57,20 @@ cargo build --manifest-path examples/process-monitor/Cargo.toml --release
 ## Run locally over a Unix socket
 
 ```bash
-# defaults to $XDG_RUNTIME_DIR/srui-process-monitor.sock, else $TMPDIR/srui-process-monitor.sock
+# defaults to $XDG_RUNTIME_DIR/srui-process-monitor.sock,
+# else $TMPDIR/srui-$(id -u)/srui-process-monitor.sock
 ./examples/process-monitor/target/release/process-monitor
 
-# explicit socket path plus wire accounting
+# explicit socket path plus wire accounting; the parent is created as 0700
 ./examples/process-monitor/target/release/process-monitor \
-    --socket /tmp/srui-process-monitor.sock --wire-stats
+    --socket /tmp/srui-$(id -u)/monitor/srui-process-monitor.sock --wire-stats
 ```
 
 Options:
 
 | Flag | Meaning |
 | --- | --- |
-| `--socket <path>` | Unix socket to bind. Defaults to `srui-process-monitor.sock`. |
+| `--socket <path>` | Unix socket to bind. Its final parent must be private (0700 and owned by the effective UID); missing non-symlink ancestors are created securely. |
 | `--wire-stats` | Log the framed byte size and operation mix of every committed transaction. |
 
 A malformed or missing option argument is rejected with a clear error. Ownership of the endpoint is
@@ -107,7 +108,8 @@ swift build --package-path client-macos
 swift run --package-path client-macos RendererDemoApp --ssh server-host --user alice
 
 # or, when server and client are the same machine, skip SSH entirely:
-swift run --package-path client-macos RendererDemoApp --socket /tmp/srui-process-monitor.sock
+swift run --package-path client-macos RendererDemoApp \
+    --socket /tmp/srui-$(id -u)/srui-process-monitor.sock
 ```
 
 A freshly connected client receives `SERVER_WELCOME` followed by a complete authoritative snapshot

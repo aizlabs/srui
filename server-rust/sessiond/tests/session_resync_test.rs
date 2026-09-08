@@ -769,6 +769,101 @@ fn same_session_resync_does_not_track_canceled_refs_for_missing_nodes() {
 }
 
 #[test]
+fn same_session_resync_settles_oversized_pending_event_id_with_bounded_identity() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_semantic_tree::{EditSeq, Event as DomainEvent, MAX_EVENT_ID_BYTES};
+    use srui_sessiond::{EventOutcome, SessionConfig};
+
+    let session = Session::with_config(
+        "resync-oversized-event-id",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let oversized_id = vec![0x41; MAX_EVENT_ID_BYTES + 1];
+    let resume = ClientResume {
+        session_id: "resync-oversized-event-id".to_string(),
+        client_instance_id: b"client-oversized".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![PendingTextEditRef {
+            event_id: oversized_id.clone(),
+            event_seq: 1,
+            node_id: 2,
+            edit_seq: 1,
+        }],
+    };
+
+    match session.bootstrap_resume(&resume).expect("resume").outcome {
+        ResumeOutcome::Resync { resync_msg, .. } => {
+            assert_eq!(resync_msg.discarded_text_edits.len(), 1);
+            let discarded = &resync_msg.discarded_text_edits[0];
+            assert_eq!(discarded.event_seq, 1);
+            assert!(discarded.event_id.len() <= MAX_EVENT_ID_BYTES);
+            assert_ne!(discarded.event_id, oversized_id);
+            assert_eq!(resync_msg.last_processed_event_seq, 1);
+        }
+        other => panic!("expected same-session resync, got {other:?}"),
+    }
+
+    let oversized_replay = DomainEvent::text_edit(
+        1,
+        "temporary",
+        0u64,
+        2,
+        "discarded",
+        EditSeq::new(1).unwrap(),
+    )
+    .with_client_instance_id(b"client-oversized".as_slice())
+    .to_wire();
+    let oversized_replay = srui_protocol::Event {
+        event_id: oversized_id,
+        ..oversized_replay
+    };
+    assert!(matches!(
+        session
+            .process_event(&oversized_replay)
+            .expect("oversized replay returns settled rejection"),
+        EventOutcome::Duplicate {
+            accepted: false,
+            last_processed_event_seq: 1,
+            ..
+        }
+    ));
+
+    let live = DomainEvent::text_edit(2, "next-valid", 0u64, 2, "ok", EditSeq::new(2).unwrap())
+        .with_client_instance_id(b"client-oversized".as_slice())
+        .to_wire();
+    assert!(matches!(
+        session.process_event(&live).expect("next valid event"),
+        EventOutcome::Processed {
+            last_processed_event_seq: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn same_session_resync_refuses_oversized_pending_text_edits() {
     use srui_protocol::PendingTextEditRef;
     use srui_sessiond::{SessionConfig, SessionError, MAX_TEXT_EDIT_STREAMS};

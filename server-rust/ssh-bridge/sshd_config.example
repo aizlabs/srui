@@ -10,7 +10,12 @@
 # Format:
 #   Subsystem <subsystem_name> <path_to_binary> [<arguments>...]
 
-# Default configuration (connects to $XDG_RUNTIME_DIR/srui-sessiond.sock or /tmp/srui-sessiond.sock):
+# The runtime directory holding the socket must be a real directory (not a symlink) owned by the
+# authenticated user with mode 0700, and the bridge refuses effective UID 0 (§27). Shared
+# directories such as /tmp itself are refused; the no-XDG fallback is a per-user subdirectory.
+
+# Default configuration (connects to $XDG_RUNTIME_DIR/srui-sessiond.sock, or
+# $TMPDIR/srui-<uid>/srui-sessiond.sock when XDG_RUNTIME_DIR is unset):
 Subsystem srui /usr/local/bin/srui-ssh-bridge
 
 # Or specify a custom socket path explicitly:

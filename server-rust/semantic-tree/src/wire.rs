@@ -38,6 +38,8 @@ pub enum WireError {
     InvalidResourceHashLength(usize),
     /// Transaction validation or revision mismatch error.
     Transaction(String),
+    /// Event identifier exceeds the protocol-wide wire bound.
+    EventIdTooLong { actual: usize, limit: usize },
     /// Event conversion error.
     Event(String),
     /// NodeRecord conversion error.
@@ -60,6 +62,12 @@ impl fmt::Display for WireError {
                 write!(f, "expected 32-byte resource hash, got {} bytes", len)
             }
             Self::Transaction(msg) => write!(f, "transaction error: {}", msg),
+            Self::EventIdTooLong { actual, limit } => {
+                write!(
+                    f,
+                    "event_id is {actual} bytes; at most {limit} are accepted (§26)"
+                )
+            }
             Self::Event(msg) => write!(f, "event error: {}", msg),
             Self::NodeRecord(msg) => write!(f, "node record error: {}", msg),
             Self::InvalidOperation(msg) => write!(f, "invalid operation: {}", msg),
@@ -335,6 +343,17 @@ impl TryFrom<srui_protocol::Event> for Event {
         } else {
             Some(ClientInstanceId::new(wire.client_instance_id))
         };
+        // `srui.proto` declares `event_id` non-empty, and it is the deduplication key: an absent
+        // one cannot be retried or acknowledged coherently. Swift's decoder refuses it too, so
+        // both languages reject the same wire bytes (§18.2, §4 inv. 13).
+        if wire.event_id.is_empty() {
+            return Err(WireError::MissingField("Event.event_id"));
+        }
+        let event_id =
+            EventId::try_new(wire.event_id).map_err(|error| WireError::EventIdTooLong {
+                actual: error.actual(),
+                limit: error.limit(),
+            })?;
 
         let event_type = wire
             .event_type
@@ -361,7 +380,7 @@ impl TryFrom<srui_protocol::Event> for Event {
         Ok(Self {
             client_instance_id,
             event_seq: wire.event_seq,
-            event_id: EventId::new(wire.event_id),
+            event_id,
             observed_revision: Revision::new(wire.observed_revision),
             node_id: NodeId::new(wire.node_id),
             event_type,

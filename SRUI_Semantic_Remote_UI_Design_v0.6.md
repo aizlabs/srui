@@ -1050,6 +1050,8 @@ message ServerEventAck {
   uint64 revision_after_effect = 5;
   string reject_reason = 6;
   string session_id = 7;
+  // Exact positive sequence slot settled by this ack; zero means a legacy sender omitted it.
+  uint64 settled_event_seq = 8;
 }
 ```
 

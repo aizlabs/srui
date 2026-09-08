@@ -1949,6 +1949,11 @@ public actor EventOutbox {
         } else {
             event = eventById
         }
+        // With an explicit `settled_event_seq` the sequence — not the echoed `event_id` — names the
+        // slot to retire (§18.2). A rejection's `event_id` may be a bounded marker that collides
+        // with an unrelated valid identifier, so an unresolved sequence means that slot was already
+        // settled and nothing may be retired by identity.
+        let settledIdentity: EventId? = settledEventSeq == nil ? eventId : event?.eventId
         // The cumulative frontier is normative settlement (§18.2). Keeping covered text edits in
         // the retry set can outlive the server's bounded result record and turn replay into a
         // permanent OutsideReceiveWindow reconnect loop.
@@ -1967,7 +1972,7 @@ public actor EventOutbox {
                 nodeId: settledEvent.nodeId,
                 eventId: settledEvent.eventId,
                 revisionAfterEffect: effectRevision,
-                rejected: settledEvent.eventId == eventId ? textEditRejected : true
+                rejected: settledEvent.eventId == settledIdentity ? textEditRejected : true
             )
             if let current = textAcknowledgementBarriers[settledEvent.nodeId] {
                 if current.revisionAfterEffect <= effectRevision {
@@ -1978,7 +1983,9 @@ public actor EventOutbox {
             }
         }
 
-        acknowledgeEvent(id: event?.eventId ?? eventId)
+        if let settledIdentity {
+            acknowledgeEvent(id: settledIdentity)
+        }
         return EventAcknowledgementSettlement(
             connectionBound: true,
             bound: true,

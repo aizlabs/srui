@@ -732,6 +732,63 @@ struct EventOutboxRetryTests {
         await server.close()
     }
 
+    @Test("A replayed bounded rejection marker cannot retire the ID it collides with (§18.2)")
+    func replayedBoundedRejectionMarkerLeavesCollidingEventPending() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let binding = try #require(await outbox.activeConnectionBindingForTesting)
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: client
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(2),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: client
+        )
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = first.eventId.bytes
+        ack.settledEventSeq = second.eventSeq
+        ack.lastProcessedEventSeq = 0
+        ack.status = .rejected
+        ack.rejectReason = "event_id exceeds 64 bytes"
+        ack.sessionID = "test-session"
+        var message = SRUIMessage()
+        message.serverEventAck = ack
+        await controller.handleIncomingMessage(message)
+
+        #expect(await outbox.pendingCount == 1)
+
+        // A duplicate or delayed copy names a slot that is already gone. Falling back to the marker
+        // would retire the unrelated `first` and selectively acknowledge its sequence, so the
+        // missing slot must read as already settled instead.
+        await controller.handleIncomingMessage(message)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        try await outbox.resendPendingEvents(binding: binding, via: client)
+        let replayedMessages = await collector.wait(forAtLeast: 4)
+        let replayed = try #require(try events(in: replayedMessages).last)
+        #expect(replayed.eventId == first.eventId)
+
+        await controller.stop()
+        await collector.stop()
+        await client.close()
+        await server.close()
+    }
+
     @Test("A REJECTED ack settles the event so it is never replayed (§18.2)")
     func rejectedAckDropsEventInsteadOfReplayingIt() async throws {
         let (client, server) = await PipeTransport.createPair()

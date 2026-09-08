@@ -570,14 +570,18 @@ extension Transaction {
 
 // MARK: - Event <-> SRUIEvent
 
-/// Validates the opaque event identifier before it can become a retained deduplication key.
-func validateEventIDLength(_ eventID: Data) throws {
+/// Converts one wire identifier through the protocol-wide retained-ID contract.
+public func validateAndConvertEventID(_ eventID: Data) throws -> EventId {
+    guard !eventID.isEmpty else {
+        throw ProtocolDecodeError.missingField("event_id")
+    }
     guard eventID.count <= maxEventIDBytes else {
         throw ProtocolDecodeError.eventIDSizeLimitExceeded(
             limit: maxEventIDBytes,
             actual: eventID.count
         )
     }
+    return EventId(eventID)
 }
 
 /// Enforces the cross-language `edit_seq` shape before either Swift event decoder constructs

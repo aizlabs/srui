@@ -816,7 +816,11 @@ fn same_session_resync_settles_oversized_pending_event_id_with_bounded_identity(
 
     match session.bootstrap_resume(&resume).expect("resume").outcome {
         ResumeOutcome::Resync { resync_msg, .. } => {
-            assert_eq!(resync_msg.discarded_text_edits, resume.pending_text_edits);
+            assert_eq!(resync_msg.discarded_text_edits.len(), 1);
+            let discarded = &resync_msg.discarded_text_edits[0];
+            assert_eq!(discarded.event_seq, 1);
+            assert!(discarded.event_id.len() <= MAX_EVENT_ID_BYTES);
+            assert_ne!(discarded.event_id, oversized_id);
             assert_eq!(resync_msg.last_processed_event_seq, 1);
         }
         other => panic!("expected same-session resync, got {other:?}"),

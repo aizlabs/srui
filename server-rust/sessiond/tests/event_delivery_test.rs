@@ -722,6 +722,12 @@ async fn malformed_events_are_rejected_without_tearing_down_the_connection() {
         let ack = recv_event_ack(&mut client_read).await;
         assert_eq!(ack.status(), EventAckStatus::Rejected);
         assert_eq!(ack.last_processed_event_seq, (index + 1) as u64);
+        if event.event_id.len() > srui_semantic_tree::MAX_EVENT_ID_BYTES {
+            assert!(ack.event_id.len() <= srui_semantic_tree::MAX_EVENT_ID_BYTES);
+            assert_ne!(ack.event_id, event.event_id);
+        } else {
+            assert_eq!(ack.event_id, event.event_id);
+        }
         assert!(
             ack.reject_reason.contains("malformed event:"),
             "unexpected rejection: {:?}",

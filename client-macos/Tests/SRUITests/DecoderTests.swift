@@ -641,6 +641,7 @@ final class DecoderTests: XCTestCase {
 
         // 3. Missing eventType in Event
         var wireEvent = SRUIEvent()
+        wireEvent.eventID = Data("missing-type".utf8)
         wireEvent.nodeID = 10
         XCTAssertThrowsError(try Event(wire: wireEvent)) { error in
             guard case ProtocolDecodeError.missingField(let field) = error else {

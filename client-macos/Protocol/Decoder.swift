@@ -455,7 +455,7 @@ public struct ProtocolDecoder: Sendable {
     }
 
     public func validateAndConvertEvent(wire: SRUIEvent) throws -> Event {
-        try validateEventIDLength(wire.eventID)
+        let eventID = try validateAndConvertEventID(wire.eventID)
         let clientInstanceId = wire.clientInstanceID.isEmpty ? nil : ClientInstanceId(wire.clientInstanceID)
         guard wire.hasEventType else {
             throw ProtocolDecodeError.missingField("Event.eventType")
@@ -477,7 +477,7 @@ public struct ProtocolDecoder: Sendable {
         return Event(
             clientInstanceId: clientInstanceId,
             eventSeq: wire.eventSeq,
-            eventId: EventId(wire.eventID),
+            eventId: eventID,
             observedRevision: Revision(wire.observedRevision),
             nodeId: NodeId(wire.nodeID),
             eventType: eventType,

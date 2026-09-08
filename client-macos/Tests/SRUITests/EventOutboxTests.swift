@@ -16,6 +16,19 @@ import TransportSSH
 @Suite("EventOutbox Tests")
 struct EventOutboxTests {
 
+    @Test("Pending text-edit wire identities use the protocol-wide event-ID bound")
+    func pendingTextEditWireIdentityBound() {
+        var reference = SRUIPendingTextEditRef()
+        reference.eventID = Data(repeating: 0x41, count: maxEventIDBytes + 1)
+        reference.eventSeq = 1
+        reference.nodeID = 2
+        reference.editSeq = 1
+        #expect(PendingTextEditDescriptor(wire: reference) == nil)
+
+        reference.eventID = Data("bounded".utf8)
+        #expect(PendingTextEditDescriptor(wire: reference)?.eventId == EventId(string: "bounded"))
+    }
+
     @Test("EventOutbox allocates monotonically increasing sequence numbers")
     func monotonicSequenceNumbers() async throws {
         let (client, server) = await PipeTransport.createPair()

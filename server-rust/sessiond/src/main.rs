@@ -13,7 +13,8 @@ use tracing::{error, info, warn};
 use srui_sessiond::{handle_connection, Session, SessionConfig};
 use srui_unix_security::{
     default_socket_path as private_default_socket_path, effective_uid,
-    prepare_private_socket_parent, require_unprivileged_uid, secure_bound_socket, validate_peer,
+    prepare_private_socket_parent, require_unprivileged_uid, validate_peer, PrivateSocketParent,
+    SocketIdentity,
 };
 /// Ignores `SIGHUP` so SSH session detach / controlling-terminal loss does not terminate
 /// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
@@ -179,8 +180,10 @@ fn initialize_counter_app(session: &Arc<Session>) {
 /// A socket path this process created and is therefore allowed to unlink.
 struct OwnedSocket {
     path: PathBuf,
-    /// `(device, inode)` of the endpoint created by this process.
-    identity: (u64, u64),
+    /// Descriptor-relative identity of the endpoint created by this process.
+    identity: SocketIdentity,
+    /// Retains the validated parent inode for identity checks and cleanup.
+    parent: PrivateSocketParent,
     /// Exclusive advisory lock on the socket path, released when this value is dropped.
     _lock: std::fs::File,
 }
@@ -191,9 +194,9 @@ impl OwnedSocket {
     /// If a replacement server has since taken the path over, its socket has a different inode and
     /// is left alone.
     fn remove(&self) {
-        match socket_identity(&self.path) {
+        match self.parent.socket_identity() {
             Ok(Some(identity)) if identity == self.identity => {
-                if let Err(error) = std::fs::remove_file(&self.path) {
+                if let Err(error) = self.parent.remove_socket() {
                     warn!("failed to remove {}: {error}", self.path.display());
                 }
             }
@@ -314,7 +317,7 @@ async fn probe_socket_liveness(path: &std::path::Path) -> std::io::Result<Socket
 /// predecessor safely without disturbing a live server.
 async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
     let uid = effective_uid();
-    prepare_private_socket_parent(path, uid)?;
+    let socket_parent = prepare_private_socket_parent(path, uid)?;
 
     let lock = acquire_socket_lock(path)?;
 
@@ -343,23 +346,13 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
     // The lock is held across the unlink and the bind, so no other daemon can slip in between.
     // `socket_identity` refuses a path that exists but is not a socket, so an unrelated file is
     // never a removal candidate.
-    if socket_identity(path)?.is_some() {
+    if socket_parent.socket_identity()?.is_some() {
         info!("removing stale socket {}", path.display());
-        std::fs::remove_file(path)?;
+        socket_parent.remove_socket()?;
     }
 
-    // Create the endpoint as `0600`: a Unix socket honours the umask, and any connector can drive
-    // the session, so the endpoint must not be world-connectable.
-    //
-    // SAFETY: `umask(2)` reads and replaces a process-wide value and cannot fail. This runs during
-    // single-threaded startup, and the previous value is restored immediately after the bind.
-    let previous_umask = unsafe { libc::umask(0o177) };
-    let bind_result = UnixListener::bind(path);
-    unsafe { libc::umask(previous_umask) };
-    let listener = bind_result?;
-    secure_bound_socket(path, uid)?;
-
-    let identity = socket_identity(path)?.ok_or_else(|| {
+    let listener = UnixListener::from_std(socket_parent.bind()?)?;
+    let identity = socket_parent.socket_identity()?.ok_or_else(|| {
         std::io::Error::other(format!(
             "{} vanished immediately after bind",
             path.display()
@@ -370,6 +363,7 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
         OwnedSocket {
             path: path.to_path_buf(),
             identity,
+            parent: socket_parent,
             _lock: lock,
         },
     ))

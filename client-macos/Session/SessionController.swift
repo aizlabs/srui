@@ -134,6 +134,7 @@ private struct SessionFailureTeardownState: Sendable {
     var replayGeneration: UInt64?
     var connectionBinding: EventOutboxConnectionBinding?
     var lifecycleGeneration: UInt64
+    var transactionTasks: [Task<Void, Never>]
 }
 
 private actor ReceiveLoopStartGate {
@@ -178,9 +179,12 @@ public final class SessionController: @unchecked Sendable {
 
     private let lock = NSLock()
     private let transactionIngressGate: TransactionIngressGate
+    /// Ordered data-plane work runs separately from control-message dispatch. The transport's
+    /// unacknowledged-byte gate remains the hard memory bound while this lane is throttled.
+    private var transactionIngressTail: Task<Void, Never>?
+    private var transactionIngressTasks: [UUID: Task<Void, Never>] = [:]
     private var streamDecoder = SRUIMessageStreamDecoder()
     private var receiveTask: Task<Void, Never>?
-    /// The handshake send is published before it can enter Transport so stop() can cancel,
     /// close, and await it before admitting a restarted lifecycle.
     private var handshakeSendOwnership: HandshakeSendOwnership?
     private var isRunning = false
@@ -1079,6 +1083,17 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// Transactions already read from the transport may finish during the bounded stop drain.
+    private func ownsTransactionIngressLifecycle(_ generation: UInt64) -> Bool {
+        withStateLock {
+            guard isRunning else { return false }
+            if lifecycleGeneration == generation { return true }
+            return isStopping
+                && generation < UInt64.max
+                && lifecycleGeneration == generation + 1
+        }
+    }
+
     private func cleanUpFailedStart(generation: UInt64) async {
         let cleanup: (
             resumeGeneration: UInt64?,
@@ -1370,16 +1385,31 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
 
-                for msg in messages {
+                var transactionCompletions: [Task<Void, Never>] = []
+                for message in messages {
                     guard !Task.isCancelled else { break }
-                    await handleIncomingMessage(msg)
+                    if case .transaction(let transaction)? = message.msg {
+                        if let completion = await enqueueIncomingTransaction(transaction) {
+                            transactionCompletions.append(completion)
+                        }
+                    } else {
+                        await handleIncomingMessage(message)
+                    }
                 }
 
-                // Release half of inbound backpressure (§26): acknowledged only after the chunk
-                // has been decoded *and* applied, so a slow renderer throttles the socket instead
-                // of letting the transport buffer committed transactions without bound. Reporting
-                // it earlier would make the bound meaningless, since rendering is the slow step.
-                await transport.acknowledgeReceived(byteCount: chunk.count)
+                // Keep control traffic responsive while the ordered transaction lane waits for
+                // rate credit. The transport's outstanding-byte gate remains the memory bound.
+                if transactionCompletions.isEmpty {
+                    await transport.acknowledgeReceived(byteCount: chunk.count)
+                } else {
+                    let transport = self.transport
+                    Task {
+                        for completion in transactionCompletions {
+                            await completion.value
+                        }
+                        await transport.acknowledgeReceived(byteCount: chunk.count)
+                    }
+                }
             }
         } catch {
             guard !Task.isCancelled else { return }
@@ -1387,16 +1417,96 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        // A peer that closes cleanly finishes the stream *without* throwing (socket EOF calls
-        // `continuation.finish()`), so falling out of the loop here is the common disconnect, not a
-        // normal shutdown. Unless `stop()` asked for the teardown, this is terminal for the replica
-        // and must be reported so the caller reconnects and resumes rather than sitting on a live
-        // session with no reader (§18, §4 inv. 13).
+        // A clean EOF can arrive while final decoded transactions remain queued. Normal EOF waits
+        // for them; intentional stop drains them separately under the same bounded grace period.
+        if !Task.isCancelled, !withStateLock({ isStopping }) {
+            let transactionTail = withStateLock { transactionIngressTail }
+            await transactionTail?.value
+        }
+
         let stoppedIntentionally = Task.isCancelled || withStateLock { isStopping || !isRunning }
         guard !stoppedIntentionally else { return }
         await reportFailure(.transportEnded("receive stream closed by peer"))
     }
 
+    ///
+    /// The receive loop does not await this task, so acknowledgements and other control traffic can
+    /// be consumed while rate credit refills. Public direct dispatch still awaits the returned task.
+    private func enqueueIncomingTransaction(
+        _ wireTransaction: SRUITransaction
+    ) async -> Task<Void, Never>? {
+        var rejectedPhase: ProtocolPhase?
+        let taskID = UUID()
+        let completion = withStateLock { () -> Task<Void, Never>? in
+            let currentPhase = phase
+            guard allowsDataPlane(currentPhase) else {
+                rejectedPhase = currentPhase
+                return nil
+            }
+            let generation = lifecycleGeneration
+            let predecessor = transactionIngressTail
+            let task = Task { [weak self] in
+                guard let self else { return }
+                await self.runQueuedTransaction(
+                    wireTransaction,
+                    taskID: taskID,
+                    predecessor: predecessor,
+                    lifecycleGeneration: generation
+                )
+            }
+            transactionIngressTasks[taskID] = task
+            transactionIngressTail = task
+            return task
+        }
+        if rejectedPhase != nil {
+            await reportFailure(.protocolViolation(
+                "Received Transaction before handshake completed"
+            ))
+        }
+        return completion
+    }
+
+    private func runQueuedTransaction(
+        _ wireTransaction: SRUITransaction,
+        taskID: UUID,
+        predecessor: Task<Void, Never>?,
+        lifecycleGeneration: UInt64
+    ) async {
+        defer { finishQueuedTransaction(taskID) }
+        await predecessor?.value
+        guard !Task.isCancelled, ownsTransactionIngressLifecycle(lifecycleGeneration) else {
+            return
+        }
+
+        do {
+            try await transactionIngressGate.waitForAdmission()
+        } catch {
+            guard !Task.isCancelled,
+                  ownsTransactionIngressLifecycle(lifecycleGeneration) else {
+                return
+            }
+            await reportFailure(.protocolViolation(
+                "Transaction ingress admission failed: \(error)"
+            ))
+            return
+        }
+
+        guard !Task.isCancelled,
+              ownsTransactionIngressLifecycle(lifecycleGeneration),
+              allowsDataPlane(withStateLock({ phase })) else {
+            return
+        }
+        await handleTransaction(wireTransaction)
+    }
+
+    private func finishQueuedTransaction(_ taskID: UUID) {
+        withStateLock {
+            transactionIngressTasks.removeValue(forKey: taskID)
+            if transactionIngressTasks.isEmpty {
+                transactionIngressTail = nil
+            }
+        }
+    }
     /// Processes a single wire envelope, dispatching on handshake phase (§12.1, §15, §22.2).
     public func handleIncomingMessage(_ message: SRUIMessage) async {
         guard let payload = message.msg else { return }
@@ -1434,20 +1544,28 @@ public final class SessionController: @unchecked Sendable {
                 ))
             }
 
-        case .transaction(let wireTx):
-            guard allowsDataPlane(phase) else {
-                await reportFailure(.protocolViolation(
-                    "Received Transaction before handshake completed"
-                ))
-                return
+        case .transaction(let transaction):
+            if withStateLock({ isRunning }) {
+                guard let completion = await enqueueIncomingTransaction(transaction) else { return }
+                await completion.value
+            } else {
+                guard allowsDataPlane(phase) else {
+                    await reportFailure(.protocolViolation(
+                        "Received Transaction before handshake completed"
+                    ))
+                    return
+                }
+                do {
+                    try await transactionIngressGate.waitForAdmission()
+                } catch {
+                    await reportFailure(.protocolViolation(
+                        "Transaction ingress admission failed: \(error)"
+                    ))
+                    return
+                }
+                guard allowsDataPlane(withStateLock({ self.phase })) else { return }
+                await handleTransaction(transaction)
             }
-            do {
-                try await transactionIngressGate.waitForAdmission()
-            } catch {
-                return
-            }
-            guard allowsDataPlane(withStateLock({ self.phase })) else { return }
-            await handleTransaction(wireTx)
 
         case .event:
             guard allowsDataPlane(phase) else {
@@ -2465,7 +2583,15 @@ public final class SessionController: @unchecked Sendable {
     /// refuses must be dropped here: leaving it pending would replay it on the next resume, which
     /// the server would refuse again, forever.
     private func handleEventAck(_ ack: SRUIServerEventAck) async {
-        let eventId = EventId(ack.eventID)
+        let eventId: EventId
+        do {
+            eventId = try validateAndConvertEventID(ack.eventID)
+        } catch {
+            await reportFailure(.protocolViolation(
+                "SERVER EVENT_ACK contains an invalid event_id: \(error)"
+            ))
+            return
+        }
         guard let ownership = withStateLock({ () -> (
             EventOutboxConnectionBinding,
             EventOutboxSessionIncarnation
@@ -3129,11 +3255,15 @@ public final class SessionController: @unchecked Sendable {
             phase = .failed
             let replayGeneration = resumeGeneration ?? activeReplayRetryGeneration
             activeReplayRetryGeneration = nil
+            let transactionTasks = Array(transactionIngressTasks.values)
+            transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressTail = nil
             return SessionFailureTeardownState(
                 handler: _onFailure ?? { _ in },
                 replayGeneration: replayGeneration,
                 connectionBinding: outboxConnectionBinding,
-                lifecycleGeneration: lifecycleGeneration
+                lifecycleGeneration: lifecycleGeneration,
+                transactionTasks: transactionTasks
             )
         }
     }
@@ -3147,6 +3277,9 @@ public final class SessionController: @unchecked Sendable {
         _ failure: SessionFailure,
         state: SessionFailureTeardownState
     ) async {
+        for task in state.transactionTasks {
+            task.cancel()
+        }
         await retainNativeTextBeforeDisconnect(
             binding: state.connectionBinding
         )
@@ -3304,6 +3437,28 @@ public final class SessionController: @unchecked Sendable {
     /// How long `stop()` lets the receive loop drain closed-transport frames before cancelling it.
     private static let receiveDrainGraceNanoseconds: UInt64 = 2_000_000_000
 
+    private func drainTransactionIngressTasks() async {
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            + Self.receiveDrainGraceNanoseconds
+        while withStateLock({ !transactionIngressTasks.isEmpty }),
+              DispatchTime.now().uptimeNanoseconds < deadline {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        let remaining = withStateLock {
+            let tasks = Array(transactionIngressTasks.values)
+            transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressTail = nil
+            return tasks
+        }
+        for task in remaining {
+            task.cancel()
+        }
+        for task in remaining {
+            await task.value
+        }
+    }
+
     /// Stops the session coordinator and closes the underlying transport.
     public func stop() async {
         let stoppedState: (
@@ -3336,9 +3491,7 @@ public final class SessionController: @unchecked Sendable {
 
         guard stoppedState.shouldStop else { return }
         stoppedState.handshakeSendTask?.cancel()
-        await retainNativeTextBeforeDisconnect(
-            binding: stoppedState.connectionBinding
-        )
+        await retainNativeTextBeforeDisconnect(binding: stoppedState.connectionBinding)
         await terminalPump.disconnect()
         stopRangeRequestPump()
         await MainActor.run {
@@ -3347,17 +3500,12 @@ public final class SessionController: @unchecked Sendable {
             self.renderer?.clearCollectionRangeTrackers()
         }
 
-        // Restart stays inadmissible until this close and receive drain complete, so the old
-        // teardown can never close a newly started attempt on the same Transport instance.
         await transport.close()
 
         if let handshakeSendTask = stoppedState.handshakeSendTask {
             _ = try? await handshakeSendTask.value
         }
         if let receiveTask = stoppedState.receiveTask {
-            // Bound the drain. `Transport` is a public protocol: a conformer whose `close()` never
-            // finishes its stream continuation would otherwise hang `stop()` forever, with no
-            // cancellation to break it.
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await receiveTask.value }
                 group.addTask {
@@ -3370,6 +3518,7 @@ public final class SessionController: @unchecked Sendable {
             receiveTask.cancel()
             await receiveTask.value
         }
+        await drainTransactionIngressTasks()
 
         let replayGeneration = withStateLock {
             resumeGeneration ?? activeReplayRetryGeneration
@@ -3378,8 +3527,6 @@ public final class SessionController: @unchecked Sendable {
             await outbox.stopResumeWork(generation: replayGeneration)
         }
 
-        // An active disconnect drops only its own in-flight assemblies. A stale controller
-        // cannot clear transfers already started by a replacement cache owner.
         if let connectionBinding = stoppedState.connectionBinding {
             _ = await resourceCache.clearPartials(
                 ownerEpoch: connectionBinding.resourceOwnershipEpoch
@@ -3409,9 +3556,7 @@ public final class SessionController: @unchecked Sendable {
                 epoch: connectionBinding.resourceOwnershipEpoch
             )
         }
-        _ = clearSessionStateAfterStop(
-            generation: stoppedState.lifecycleGeneration
-        )
+        _ = clearSessionStateAfterStop(generation: stoppedState.lifecycleGeneration)
     }
 
     @discardableResult
@@ -3422,6 +3567,8 @@ public final class SessionController: @unchecked Sendable {
             }
             handshakeSendOwnership = nil
             receiveTask = nil
+            transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressTail = nil
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
             // mount state may survive.
             streamDecoder = SRUIMessageStreamDecoder()

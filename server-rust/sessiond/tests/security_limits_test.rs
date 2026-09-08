@@ -1,6 +1,7 @@
 //! Task 32 server-side event identifier limits (§18.2, §26).
 
 use srui_protocol::Event;
+use srui_sdk::Button;
 use srui_semantic_tree::{Event as DomainEvent, WireError, MAX_EVENT_ID_BYTES};
 use srui_sessiond::{EventOutcome, Session};
 
@@ -9,6 +10,9 @@ fn event(sequence: u64, event_id: Vec<u8>) -> Event {
         client_instance_id: b"event-limit-client".to_vec(),
         event_seq: sequence,
         event_id,
+        observed_revision: 1,
+        node_id: 1,
+        event_type: Some(srui_semantic_tree::TypeRef::EVENT_ACTIVATE.into()),
         ..Event::default()
     }
 }
@@ -29,6 +33,12 @@ fn wire_conversion_refuses_oversized_event_id_before_domain_construction() {
 #[test]
 fn oversized_event_id_is_settled_as_rejected_without_blocking_the_frontier() {
     let session = Session::new("event-id-limit");
+    session
+        .transaction(|ui| {
+            Button::builder(1).create(ui)?;
+            Ok(())
+        })
+        .expect("seed interactive node");
     let oversized = event(1, vec![0x41; MAX_EVENT_ID_BYTES + 1]);
 
     let rejected = session
@@ -47,7 +57,7 @@ fn oversized_event_id_is_settled_as_rejected_without_blocking_the_frontier() {
         .expect("later bounded event remains processable");
     assert!(matches!(
         later,
-        EventOutcome::Rejected {
+        EventOutcome::Processed {
             last_processed_event_seq: 2,
             ..
         }

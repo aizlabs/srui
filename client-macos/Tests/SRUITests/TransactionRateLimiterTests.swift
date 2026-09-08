@@ -20,6 +20,10 @@ private actor TransactionRateFailureLog {
     var isEmpty: Bool {
         messages.isEmpty
     }
+
+    func contains(_ fragment: String) -> Bool {
+        messages.contains { $0.contains(fragment) }
+    }
 }
 
 @Suite("Transaction rate security limits")
@@ -150,6 +154,75 @@ struct TransactionRateLimiterTests {
             applier.store.node(for: NodeId(1))?.getProperty(.label)
                 == .string("revision-241")
         )
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    @Test("Control messages bypass a throttled transaction lane and reject oversized ACK IDs")
+    func controlMessagesRemainResponsiveDuringThrottle() async throws {
+        let limits = try #require(TransactionRateLimits(
+            sustainedTransactionsPerSecond: 1,
+            burstCapacity: 1
+        ))
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            transactionRateLimits: limits
+        )
+        let failures = TransactionRateFailureLog()
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+
+        try await controller.start()
+        try await serverTransport.send(
+            data: try SRUIFraming.encodeFramed(
+                HandshakeFixtures.welcomeMessage(sessionId: "throttled-control")
+            )
+        )
+        try await AsyncTestSupport.eventually(description: "welcome completes") {
+            controller.isHandshakeComplete
+        }
+
+        let first = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [.createNode(id: NodeId(1), nodeType: .surface)]
+        )
+        let second = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(
+                    id: NodeId(1),
+                    property: .label,
+                    value: .string("queued")
+                ),
+            ]
+        )
+        var firstEnvelope = SRUIMessage()
+        firstEnvelope.transaction = first.toWire()
+        var secondEnvelope = SRUIMessage()
+        secondEnvelope.transaction = second.toWire()
+        var invalidAck = SRUIServerEventAck()
+        invalidAck.eventID = Data(repeating: 0x41, count: maxEventIDBytes + 1)
+        invalidAck.sessionID = "throttled-control"
+        var ackEnvelope = SRUIMessage()
+        ackEnvelope.serverEventAck = invalidAck
+
+        var combined = Data()
+        combined.append(try SRUIFraming.encodeFramed(firstEnvelope))
+        combined.append(try SRUIFraming.encodeFramed(secondEnvelope))
+        combined.append(try SRUIFraming.encodeFramed(ackEnvelope))
+        try await serverTransport.send(data: combined)
+
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .milliseconds(300),
+            description: "oversized control ACK rejected without waiting one second for rate credit"
+        ) {
+            await failures.contains("invalid event_id")
+        }
 
         await controller.stop()
         await serverTransport.close()

@@ -190,12 +190,28 @@ pub(crate) fn bound_diagnostic_string(mut value: String, max_len: usize) -> Stri
 /// Returns a fixed-size, out-of-band dedupe key for an invalid oversized identifier.
 ///
 /// Valid wire identifiers are at most 64 bytes, so this 65-byte marker cannot collide with one.
-/// Encoding only `event_seq` is sufficient: invalid events have no side effects, while the
-/// receive-window sequence still must settle so later valid events can advance.
+/// Encoding only event_seq is sufficient: invalid events have no side effects, while the receive
+/// window sequence still must settle so later valid events can advance.
 pub(crate) fn oversized_event_dedupe_id(event_seq: u64) -> Vec<u8> {
     let mut marker = vec![0xff; MAX_EVENT_ID_BYTES + 1];
     marker[..std::mem::size_of::<u64>()].copy_from_slice(&event_seq.to_be_bytes());
     marker
+}
+
+/// Returns a bounded wire identity for a rejected oversized event without reflecting peer bytes.
+pub(crate) fn bounded_rejected_event_id(event_seq: u64) -> Vec<u8> {
+    let mut marker = b"srui-rejected-oversized:".to_vec();
+    marker.extend_from_slice(&event_seq.to_be_bytes());
+    debug_assert!(marker.len() <= MAX_EVENT_ID_BYTES);
+    marker
+}
+
+pub(crate) fn bounded_event_id_for_response(event: &Event) -> Vec<u8> {
+    if event.event_id.len() <= MAX_EVENT_ID_BYTES {
+        event.event_id.clone()
+    } else {
+        bounded_rejected_event_id(event.event_seq)
+    }
 }
 
 fn oversized_event_placeholder(event: &Event) -> Event {
@@ -210,8 +226,8 @@ fn oversized_event_placeholder(event: &Event) -> Event {
 
 /// Outcome of one client event (§18.2).
 ///
-/// `Processed`, `Duplicate`, and `Rejected` are terminal and become `SERVER EVENT_ACK`; `Pending`
-/// is explicitly non-terminal and produces no acknowledgement. `last_processed_event_seq` is the
+/// Processed, Duplicate, and Rejected are terminal and become SERVER EVENT_ACK; Pending is
+/// explicitly non-terminal and produces no acknowledgement. last_processed_event_seq is the
 /// highest contiguous settled sequence for the event's `client_instance_id`; it never crosses
 /// an in-flight or missing sequence (§18.2).
 #[derive(Debug, Clone, PartialEq, Eq)]

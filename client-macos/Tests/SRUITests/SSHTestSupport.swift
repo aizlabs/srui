@@ -65,10 +65,64 @@ enum SSHTestSupport {
         throw SSHTestSupportError.portTimeout(port)
     }
 
+    /// Launches an ephemeral sshd whose stdio is detached from this process.
+    ///
+    /// Every sshd spawn in the test suite must go through here. swift-test reads the test
+    /// binary's stdout/stderr through pipes and only returns once *every* descriptor on the write
+    /// end is closed. sshd that inherited those pipes and outlived the test therefore wedges the
+    /// whole run after the tests have already passed — a silent, minutes-long stall with no
+    /// failing test to point at.
+    ///
+    /// Setting `Process.standardOutput`/`standardError` is not enough: sshd re-execs itself at
+    /// startup and the redirection does not survive into the re-exec'd listener (confirmed with
+    /// lsof — fd 1/2 stay on the inherited pipes while the replacement descriptors land on spare
+    /// fds). Redirecting in the shell before `exec` applies to the descriptors themselves, so
+    /// sshd and every connection child it forks inherit /dev/null instead.
+    ///
+    /// `exec` means the returned `Process` still refers to sshd itself, so `terminate()` and
+    /// `waitUntilExit()` keep their usual meaning for callers.
+    static func launchSSHD(
+        configPath: String,
+        hostKeyPath: String,
+        port: UInt16,
+        debug: Bool = false
+    ) throws -> Process {
+        let sshd = Process()
+        sshd.executableURL = URL(fileURLWithPath: "/bin/sh")
+        // Paths arrive as positional parameters so they are never re-parsed by the shell.
+        sshd.arguments = [
+            "-c",
+            "exec /usr/sbin/sshd -f \"$1\" -h \"$2\" \(debug ? "-d" : "-D") -p \"$3\" </dev/null >/dev/null 2>&1",
+            "sshd",
+            configPath,
+            hostKeyPath,
+            String(port),
+        ]
+        try sshd.run()  // stdio: detached by the shell redirection above
+        return sshd
+    }
+
+    /// Tears down an sshd launched by `launchSSHD`.
+    ///
+    /// Guarding the kill with `Process.isRunning` is what leaked a listener pair per run: when it
+    /// reports false the signal is skipped entirely and the daemon survives the test binary,
+    /// accumulating ports and /tmp fixtures across runs. The SIGKILL here is unconditional and
+    /// safe — Foundation has not reaped the child yet, so its pid cannot have been recycled, and
+    /// signalling an already-dead pid just returns ESRCH.
+    static func terminate(_ sshd: Process) {
+        sshd.terminate()
+        kill(sshd.processIdentifier, SIGKILL)
+        sshd.waitUntilExit()
+    }
+
     static func generateEd25519Key(at path: String) throws {
         let gen = Process()
         gen.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
         gen.arguments = ["-t", "ed25519", "-N", "", "-f", path]
+        // Keeps ssh-keygen's progress banner off the test binary's stdout/stderr, so a spawn that
+        // outlives its `waitUntilExit()` cannot hold those pipes open (see `launchSSHD`).
+        gen.standardOutput = FileHandle.nullDevice
+        gen.standardError = FileHandle.nullDevice
         try gen.run()
         gen.waitUntilExit()
         guard gen.terminationStatus == 0 else {

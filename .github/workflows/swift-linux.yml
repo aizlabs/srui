@@ -63,6 +63,11 @@ jobs:
           swift-version: "6.0"
       - name: Refuse Apple-platform imports in the portable module
         run: bash scripts/check-logical-channel-scheduling-imports.sh
+      # Pure awk over the Swift test sources, so it belongs on the cheap Linux runner even though
+      # the failure it prevents (a leaked server wedging swift-test on an inherited pipe) only
+      # happens on macOS.
+      - name: Refuse test-spawned processes that inherit the test binary's stdio
+        run: bash scripts/check-test-process-stdio.sh
       - name: Describe nested package (portable targets only)
         working-directory: client-macos/LogicalChannelScheduling
         run: |

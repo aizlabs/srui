@@ -51,6 +51,7 @@ fi
 
 # Pure grep, no Swift toolchain required, so it runs on every platform.
 run "swift: LogicalChannelScheduling imports" bash scripts/check-logical-channel-scheduling-imports.sh
+run "swift: test process stdio" bash scripts/check-test-process-stdio.sh
 
 if command -v swiftc >/dev/null 2>&1; then
 	run "swift: parse changed sources (syntax-only)" bash scripts/parse-changed-swift.sh

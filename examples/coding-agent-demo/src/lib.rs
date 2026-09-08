@@ -50,7 +50,7 @@ impl CodingAgentApp {
     }
 
     pub fn with_terminal_spec(terminal_spec: TerminalSpec) -> Result<Self, SessionError> {
-        let session = Arc::new(Session::new("coding-agent-demo-session"));
+        let session = Arc::new(Session::mint());
         let profile = Profile::parse(DIFF_PROFILE_URI)
             .map_err(|error| SessionError::InvalidInput(error.to_string()))?;
         let diff_namespace = session.register_optional_extension_profile(profile)?;
@@ -62,10 +62,9 @@ impl CodingAgentApp {
             "Cargo.toml",
             "README.md",
         ];
-        let model_items: Vec<ModelItem> = files
-            .iter()
-            .enumerate()
-            .map(|(index, path)| ModelItem::with_value(ItemId::new(index as u64 + 1), *path))
+        let model_items: Vec<ModelItem> = (1_u64..)
+            .zip(files)
+            .map(|(item_id, path)| ModelItem::with_value(ItemId::new(item_id), path))
             .collect();
 
         // Revision 1: everything whose parent can be created atomically before the PTY node.
@@ -173,23 +172,21 @@ impl CodingAgentApp {
             Ok(())
         })?;
 
-        session.on(APPROVE_ID, ACTIVATE, |ctx, _event| {
+        session.on_result(APPROVE_ID, ACTIVATE, |ctx, _event| {
             ctx.transaction(|ui| {
                 append_conversation(ui, "User approved the proposed changes.")?;
                 ui.set(PROGRESS_ID, VALUE, 0.75)?;
                 ui.set(PROGRESS_ID, VALUE_DESCRIPTION, "75% complete")?;
                 Ok(())
             })
-            .expect("approve transaction failed");
         });
-        session.on(REJECT_ID, ACTIVATE, |ctx, _event| {
+        session.on_result(REJECT_ID, ACTIVATE, |ctx, _event| {
             ctx.transaction(|ui| {
                 append_conversation(ui, "User rejected the proposed changes.")?;
                 ui.set(PROGRESS_ID, VALUE, 0.50)?;
                 ui.set(PROGRESS_ID, VALUE_DESCRIPTION, "50% complete")?;
                 Ok(())
             })
-            .expect("reject transaction failed");
         });
         session.on_text_edit(|_ctx, request| {
             if request.node_id == PROMPT_ID {

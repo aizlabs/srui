@@ -86,6 +86,29 @@ fn terminal_and_placeholder_namespaces_are_unique_in_either_order() {
 }
 
 #[test]
+fn terminal_spawn_failure_rolls_back_the_handshake_contract() {
+    let session = Session::new("terminal-spawn-rollback");
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            Ok(())
+        })
+        .expect("surface");
+
+    let mut invalid_spec = TerminalSpec::interactive_shell();
+    invalid_spec.columns = 0;
+    assert!(matches!(
+        session.create_terminal_node(2.into(), 1.into(), invalid_spec),
+        Err(SessionError::InvalidInput(_))
+    ));
+    assert!(session.terminal_namespace_id().is_none());
+
+    session
+        .bootstrap_fresh_client(&hello(&["org.srui.standard-widgets/1"]))
+        .expect("failed terminal creation must not leave Terminal required");
+}
+
+#[test]
 fn registration_rejects_reserved_profiles_and_late_mutation() {
     let session = Session::new("reserved-extension");
     assert!(matches!(
@@ -103,6 +126,11 @@ fn registration_rejects_reserved_profiles_and_late_mutation() {
         attached.register_optional_extension_profile(diff_profile()),
         Err(SessionError::InvalidInput(_))
     ));
+    assert!(matches!(
+        attached.create_terminal_node(2.into(), 1.into(), TerminalSpec::interactive_shell()),
+        Err(SessionError::InvalidInput(_))
+    ));
+    assert!(attached.terminal_namespace_id().is_none());
 
     let negotiated = Session::new("negotiated-extension");
     let bootstrap = negotiated
@@ -111,6 +139,10 @@ fn registration_rejects_reserved_profiles_and_late_mutation() {
     drop(bootstrap);
     assert!(matches!(
         negotiated.register_optional_extension_profile(diff_profile()),
+        Err(SessionError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        negotiated.create_terminal_node(2.into(), 1.into(), TerminalSpec::interactive_shell()),
         Err(SessionError::InvalidInput(_))
     ));
     assert!(negotiated

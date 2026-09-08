@@ -66,6 +66,17 @@ fn tree_composition_and_extension_fallback_are_complete_before_attach() {
 }
 
 #[test]
+fn app_instances_mint_distinct_session_incarnations() {
+    let first = CodingAgentApp::new().expect("first app");
+    let second = CodingAgentApp::new().expect("second app");
+
+    assert_ne!(first.session().session_id(), second.session().session_id());
+
+    first.session().pty().shutdown();
+    second.session().pty().shutdown();
+}
+
+#[test]
 fn base_client_negotiates_without_placeholder_profile() {
     let app = CodingAgentApp::new().expect("app");
     let bootstrap = app
@@ -109,7 +120,12 @@ fn base_client_negotiates_without_placeholder_profile() {
             .terminal_namespace_id()
             .expect("terminal namespace")
     );
-    assert_eq!(Profile::parse(DIFF_PROFILE_URI).unwrap().version(), 1);
+    assert_eq!(
+        Profile::parse(DIFF_PROFILE_URI)
+            .expect("valid diff profile")
+            .version(),
+        1
+    );
     app.session().pty().shutdown();
 }
 
@@ -155,12 +171,16 @@ async fn terminal_stream_runs_a_real_pty() {
         .subscription;
     app.session()
         .pty()
-        .input(TERMINAL_ID, b"printf 'TASK31_PTY_OK\\n'\n".to_vec())
+        .input(TERMINAL_ID, b"printf 'TASK31_PTY_OK\n'\n".to_vec())
         .expect("terminal input");
 
     let seen = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            for event in subscription.recv().await {
+            let events = subscription.recv().await;
+            if events.is_empty() {
+                return false;
+            }
+            for event in events {
                 if let TerminalEvent::Data(data) = event {
                     if data
                         .data

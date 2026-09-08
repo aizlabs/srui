@@ -19,9 +19,15 @@ pub(crate) fn next_extension_namespace(
         .iter()
         .map(|mapping| mapping.namespace_id)
         .collect();
-    (1..=u32::MAX).find(|id| !used.contains(id)).ok_or_else(|| {
-        SessionError::InvalidInput("extension namespace space exhausted".to_string())
-    })
+    let mut candidate = 1_u32;
+    loop {
+        if !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+        candidate = candidate.checked_add(1).ok_or_else(|| {
+            SessionError::InvalidInput("extension namespace space exhausted".to_string())
+        })?;
+    }
 }
 
 impl Session {

@@ -840,11 +840,13 @@ dependencies = [
 name = "srui-example-coding-agent"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "srui-protocol",
  "srui-pty",
  "srui-sdk",
  "srui-semantic-tree",
  "srui-sessiond",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

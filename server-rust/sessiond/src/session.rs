@@ -105,8 +105,29 @@ use srui_semantic_tree::{
 };
 use thiserror::Error;
 
-/// Type alias for event handler callbacks in `sessiond` (§29).
+/// Type alias for infallible event handler callbacks in `sessiond` (§29).
 pub type HandlerFn = Arc<dyn Fn(&Session, &Event) + Send + Sync + 'static>;
+
+type FallibleHandlerFn =
+    Arc<dyn Fn(&Session, &Event) -> Result<(), SessionError> + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub(crate) enum RegisteredHandler {
+    Infallible(HandlerFn),
+    Fallible(FallibleHandlerFn),
+}
+
+impl RegisteredHandler {
+    fn call(&self, session: &Session, event: &Event) -> Result<(), SessionError> {
+        match self {
+            Self::Infallible(handler) => {
+                handler(session, event);
+                Ok(())
+            }
+            Self::Fallible(handler) => handler(session, event),
+        }
+    }
+}
 
 /// Errors produced by session state operations.
 #[derive(Debug, Error)]
@@ -253,7 +274,7 @@ pub(crate) struct SessionInner {
     ///
     /// Retained so ClientResume (which carries no limits) can reuse the last negotiated value.
     pub(crate) client_resource_ceilings: HashMap<Vec<u8>, u64>,
-    pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<HandlerFn>>,
+    pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<RegisteredHandler>>,
     /// Sparse-collection window providers keyed by [`srui_semantic_tree::ModelId`] (§8, §22.7).
     pub(crate) model_range_providers: HashMap<srui_semantic_tree::ModelId, ModelRangeProvider>,
     pub(crate) text_edit_tracker: text_edit::TextEditTracker,
@@ -695,17 +716,41 @@ impl Session {
             .ok_or(SessionError::ReplayUnavailable)
     }
 
-    /// Registers an event handler for `node` and `event_type` (§29).
+    /// Registers an infallible event handler for `node` and `event_type` (§29).
     pub fn on<F>(&self, node: impl Into<NodeId>, event_type: TypeRef, handler: F)
     where
         F: Fn(&Session, &Event) + Send + Sync + 'static,
     {
+        self.register_handler(
+            node.into(),
+            event_type,
+            RegisteredHandler::Infallible(Arc::new(handler)),
+        );
+    }
+
+    /// Registers a fallible event handler for `node` and `event_type` (§29).
+    ///
+    /// An ordinary event whose handler returns an error remains retryable and is not acknowledged.
+    /// A committed text edit remains accepted because its authoritative mutation precedes handler
+    /// notification.
+    pub fn on_result<F>(&self, node: impl Into<NodeId>, event_type: TypeRef, handler: F)
+    where
+        F: Fn(&Session, &Event) -> Result<(), SessionError> + Send + Sync + 'static,
+    {
+        self.register_handler(
+            node.into(),
+            event_type,
+            RegisteredHandler::Fallible(Arc::new(handler)),
+        );
+    }
+
+    fn register_handler(&self, node: NodeId, event_type: TypeRef, handler: RegisteredHandler) {
         let mut guard = lock_or_recover(&self.inner);
         guard
             .handlers
-            .entry((node.into(), event_type))
+            .entry((node, event_type))
             .or_default()
-            .push(Arc::new(handler));
+            .push(handler);
     }
 
     /// Returns the number of registered handlers for a specific node and event type.
@@ -966,21 +1011,28 @@ impl Session {
             last_processed_event_seq,
         }
     }
-
     pub(crate) fn dispatch_admitted_event(
         &self,
         event: &Event,
-        handlers: &[HandlerFn],
+        handlers: &[RegisteredHandler],
         kind: HandlerDispatchKind,
     ) -> Result<EventOutcome, SessionError> {
         let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for handler in handlers {
-                handler(self, event);
+                handler.call(self, event)?;
             }
+            Ok(())
         }));
 
-        let panic_payload = match (kind, dispatch) {
-            (HandlerDispatchKind::Ordinary, Err(panic_payload)) => {
+        let dispatch_error = match dispatch {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) if kind == HandlerDispatchKind::Ordinary => {
+                let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+                guard.dedupe.abandon_event(event);
+                drop(guard);
+                return Err(error);
+            }
+            Err(panic_payload) if kind == HandlerDispatchKind::Ordinary => {
                 let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
                 guard.dedupe.abandon_event(event);
                 drop(guard);
@@ -988,11 +1040,14 @@ impl Session {
                     panic_payload.as_ref(),
                 )));
             }
-            (_, dispatch) => dispatch.err(),
+            Ok(Err(error)) => Some(error),
+            Err(panic_payload) => Some(SessionError::Panicked(panic_payload_message(
+                panic_payload.as_ref(),
+            ))),
         };
 
         // Sample after dispatch so the ACK includes every handler transaction. A TEXT_EDIT is
-        // already authoritative at this point, so even a notification-handler panic must settle
+        // already authoritative at this point, so even a notification-handler failure must settle
         // it as accepted before the infrastructure failure is surfaced.
         let (revision_after_effect, last_processed_event_seq) = {
             let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
@@ -1013,10 +1068,8 @@ impl Session {
             (revision_after_effect, last_processed_event_seq)
         };
 
-        if let Some(panic_payload) = panic_payload {
-            return Err(SessionError::Panicked(panic_payload_message(
-                panic_payload.as_ref(),
-            )));
+        if let Some(error) = dispatch_error {
+            return Err(error);
         }
 
         Ok(EventOutcome::Processed {
@@ -1026,6 +1079,7 @@ impl Session {
     }
 
     /// Returns the current committed semantic revision.
+    #[must_use]
     pub fn current_revision(&self) -> u64 {
         let guard = lock_or_recover(&self.inner);
         guard.store.revision().get()

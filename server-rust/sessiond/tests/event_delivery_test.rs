@@ -969,6 +969,34 @@ fn test_handler_panic_abandons_in_flight_admission_for_retry() {
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn fallible_handler_error_abandons_in_flight_admission_for_retry() {
+    let session = Session::new("fallible-handler-retry");
+    let btn = NodeId::new(1);
+    seed_button(&session, btn);
+    session.on_result(btn, ACTIVATE, |_, _| {
+        Err(SessionError::InvalidInput("handler failed".to_string()))
+    });
+
+    let event = Event::activate(1, "evt-error", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    assert!(matches!(
+        session.process_event(&event),
+        Err(SessionError::InvalidInput(message)) if message == "handler failed"
+    ));
+
+    session.clear_handlers();
+    session.on(btn, ACTIVATE, |_, _| {});
+    assert!(matches!(
+        session.process_event(&event),
+        Ok(EventOutcome::Processed {
+            last_processed_event_seq: 1,
+            ..
+        })
+    ));
+}
+
 #[tokio::test]
 async fn test_clearing_handlers_stops_dispatch() {
     let session = Arc::new(Session::new("clear-handlers"));

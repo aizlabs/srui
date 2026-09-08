@@ -85,25 +85,13 @@ impl Session {
     /// session namespace, and keeps the PTY alive across detach.
     ///
     /// v1 is handshake-scoped: live pumps and `extension_namespaces` are installed only
-    /// when a client attaches. Calling this after [`Session::is_attached`] is therefore
-    /// refused — spawn terminals before `handle_connection` accepts a transport.
+    /// when a client attaches. Calling this after any attachment or handshake is refused.
     pub fn create_terminal_node(
         &self,
         node_id: NodeId,
         parent: NodeId,
         spec: TerminalSpec,
     ) -> Result<TypeRef, SessionError> {
-        // `is_attached()` is not sufficient: dropping the last AttachmentGuard returns the
-        // session to Detached, yet a client that already handshook can resume without a second
-        // ServerWelcome and would then receive a Terminal node whose profile and namespace its
-        // negotiated capability set omits (§15, §21, §4 inv. 13).
-        if self.is_attached() || self.has_negotiated() {
-            return Err(SessionError::InvalidInput(
-                "v1 create_terminal_node must run before any client attaches or handshakes; \
-                 live pumps and extension_namespaces are handshake-only"
-                    .to_string(),
-            ));
-        }
         let (type_ref, rollback) = self.prepare_terminal_type()?;
         if let Err(error) = self.pty.spawn(node_id, spec) {
             self.rollback_terminal_type(rollback);
@@ -122,25 +110,40 @@ impl Session {
 
     fn prepare_terminal_type(&self) -> Result<(TypeRef, TerminalTypeRollback), SessionError> {
         let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        // The lifecycle check and all capability mutations share one critical section. Otherwise
+        // an attachment could complete between a check in create_terminal_node and this update.
+        if guard.attached_connections > 0 || guard.has_negotiated {
+            return Err(SessionError::InvalidInput(
+                "v1 create_terminal_node must run before any client attaches or handshakes; live pumps and extension_namespaces are handshake-only"
+                    .to_string(),
+            ));
+        }
+
         let profile = Profile::terminal_v1();
-        let was_required = guard.capabilities.required.contains(&profile);
-        let was_optional = guard.capabilities.optional.remove(&profile);
-        guard.capabilities.required.insert(profile);
-        let (namespace_id, created_namespace) = if let Some(existing) = guard
+        let existing_namespace = guard
             .extension_namespaces
             .iter()
             .find(|mapping| mapping.extension_uri == TERMINAL_PROFILE_URI)
-            .map(|mapping| mapping.namespace_id)
-        {
-            (existing, None)
-        } else {
-            let allocated = next_extension_namespace(&guard.extension_namespaces)?;
+            .map(|mapping| mapping.namespace_id);
+        // Allocate before mutating capabilities so even namespace exhaustion is atomic.
+        let (namespace_id, created_namespace) = match existing_namespace {
+            Some(namespace_id) => (namespace_id, None),
+            None => {
+                let namespace_id = next_extension_namespace(&guard.extension_namespaces)?;
+                (namespace_id, Some(namespace_id))
+            }
+        };
+
+        let was_required = guard.capabilities.required.contains(&profile);
+        let was_optional = guard.capabilities.optional.remove(&profile);
+        guard.capabilities.required.insert(profile);
+        if let Some(namespace_id) = created_namespace {
             guard.extension_namespaces.push(ExtensionNamespaceMapping {
                 extension_uri: TERMINAL_PROFILE_URI.to_string(),
-                namespace_id: allocated,
+                namespace_id,
             });
-            (allocated, Some(allocated))
-        };
+        }
+
         let rollback = TerminalTypeRollback {
             was_required,
             was_optional,
@@ -153,7 +156,12 @@ impl Session {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
-        if !self.pty.live_stream_ids().is_empty() {
+        // A concurrent handshake may have advertised this mapping while PTY creation was in
+        // progress. Preserve the advertised contract rather than rolling capabilities backward.
+        if guard.attached_connections > 0
+            || guard.has_negotiated
+            || !self.pty.live_stream_ids().is_empty()
+        {
             return;
         }
         let profile = Profile::terminal_v1();

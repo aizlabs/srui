@@ -33,6 +33,7 @@
 //
 
 import Foundation
+import Dispatch
 import SemanticModel
 import Protocol
 import TransportSSH
@@ -177,7 +178,9 @@ public final class SessionController: @unchecked Sendable {
     public let requiredServerProfiles: CapabilitySet
 
     private let lock = NSLock()
+    private let transactionRateLimits: TransactionRateLimits
     private var streamDecoder = SRUIMessageStreamDecoder()
+    private var transactionRateLimiter: TransactionRateLimiter
     private var receiveTask: Task<Void, Never>?
     /// The handshake send is published before it can enter Transport so stop() can cancel,
     /// close, and await it before admitting a restarted lifecycle.
@@ -298,7 +301,8 @@ public final class SessionController: @unchecked Sendable {
         resourceCache: ResourceCache = ResourceCache(),
         sessionId: String? = nil,
         clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1],
-        requiredServerProfiles: CapabilitySet = []
+        requiredServerProfiles: CapabilitySet = [],
+        transactionRateLimits: TransactionRateLimits = .standard
     ) {
         self.transport = transport
         self.applier = applier
@@ -309,6 +313,8 @@ public final class SessionController: @unchecked Sendable {
         self.currentSessionId = sessionId
         self.clientCapabilities = clientCapabilities
         self.requiredServerProfiles = requiredServerProfiles
+        self.transactionRateLimits = transactionRateLimits
+        self.transactionRateLimiter = TransactionRateLimiter(limits: transactionRateLimits)
     }
 
     private func withStateLock<T>(_ body: () -> T) -> T {
@@ -854,6 +860,7 @@ public final class SessionController: @unchecked Sendable {
                 "SessionController lifecycle generation exhausted"
             )
             self.lifecycleGeneration += 1
+            transactionRateLimiter.reset()
             isRunning = true
             eventDispatchEnabled = false
             phase = .idle
@@ -2720,6 +2727,19 @@ public final class SessionController: @unchecked Sendable {
     private func handleTransaction(_ wireTx: SRUITransaction) async {
         // A diverged replica cannot meaningfully apply anything until it resumes (§18).
         guard !isDiverged else { return }
+
+        let admitted = withStateLock {
+            transactionRateLimiter.admit(
+                atUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+            )
+        }
+        guard admitted else {
+            await reportFailure(.protocolViolation(
+                "Maximum semantic transaction update rate exceeded (\(transactionRateLimits.sustainedTransactionsPerSecond)/s sustained, \(transactionRateLimits.burstCapacity) burst; §26)"
+            ))
+            return
+        }
+
         guard let ownership = withStateLock({ () -> (
             EventOutboxConnectionBinding,
             EventOutboxSessionIncarnation

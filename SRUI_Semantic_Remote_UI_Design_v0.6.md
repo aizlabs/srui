@@ -1924,6 +1924,12 @@ legitimate bursts, while preserving the invariant that protocol traffic does not
 display refresh rate (§12.2, §31.3). It should be revised only if benchmarks demonstrate that
 legitimate workloads exceed it.
 
+`event_id` values are opaque retry/deduplication keys with a default maximum encoded length of 64
+bytes. Implementations MAY configure a smaller or larger ceiling, but MUST retain a finite positive
+bound and reject an oversized identifier before it can consume deduplication state. Sixty-four bytes
+comfortably holds UUIDs and comparable cryptographic identifiers while preventing attacker-chosen
+keys from turning the bounded event window into disproportionate memory retention.
+
 `maximum pending unacknowledged events` bounds the client's retry set, which is drained by
 `SERVER EVENT_ACK` (§18.2). Reaching the bound means events are being discarded before they were
 known to be processed, so an eviction there MUST be reported rather than silently dropped.
@@ -1957,6 +1963,14 @@ The macOS client SHOULD use Hardened Runtime and SHOULD isolate the VT parser/re
 - Side-effect events are deduplicated.
 - Resource and journal memory is bounded.
 - Application-specific authorization remains the application's responsibility, exactly as it would for a command executed in the user's SSH shell.
+
+The reference deployment uses one daemon, runtime directory, and socket per OS account. Both
+`srui-sessiond` and `srui-ssh-bridge` refuse effective UID 0; require the runtime directory and
+socket to be owned by their effective UID with no group/other access; and require the kernel-reported
+Unix-socket peer UID to match. These checks prevent one local account from crossing into another
+account's SRUI session without trusting path names or environment variables. Mapping the
+SSH-authenticated account to that effective UID remains an OpenSSH/service-manager deployment
+responsibility, because only that layer possesses the authenticated SSH identity.
 
 ---
 

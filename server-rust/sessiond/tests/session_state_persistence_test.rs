@@ -16,6 +16,7 @@ mod common;
 use common::*;
 
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -220,13 +221,17 @@ fn test_mint_session_id_produces_unique_tokens_in_process() {
 async fn test_sessiond_process_restart_mints_unique_session_ids() {
     let mut seen = HashSet::new();
     const ITERATIONS: usize = 5;
+    let unique = mint_session_id();
+    // Keep the complete Unix-socket path below sockaddr_un::sun_path (104 bytes on macOS).
+    // The final child, not shared /tmp itself, is the validated 0700 runtime directory.
+    let runtime_dir =
+        std::path::Path::new("/tmp").join(format!("srui-{}-{}", std::process::id(), &unique[..8]));
+    std::fs::create_dir(&runtime_dir).expect("create private test runtime directory");
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure test runtime directory");
 
     for iteration in 0..ITERATIONS {
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/srui-t-{}-{iteration}.sock",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&socket_path);
+        let socket_path = runtime_dir.join(format!("{iteration}.sock"));
 
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_srui-sessiond"))
             .arg("--socket")
@@ -259,8 +264,10 @@ async fn test_sessiond_process_restart_mints_unique_session_ids() {
         let status = child.wait().await.expect("wait for sessiond");
         assert!(!status.success(), "sessiond should exit after kill");
         let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(socket_path.with_extension("sock.lock"));
     }
 
+    std::fs::remove_dir(&runtime_dir).expect("remove private test runtime directory");
     assert_eq!(seen.len(), ITERATIONS);
 }
 

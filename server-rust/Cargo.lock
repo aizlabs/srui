@@ -944,6 +944,7 @@ name = "srui-ssh-bridge"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "libc",
  "srui-protocol",
  "thiserror 2.0.20",
  "tokio",

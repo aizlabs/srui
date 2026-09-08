@@ -10,6 +10,7 @@
 //!   trusted PTY (`/bin/sh -i` by default). There is no automatic tmux redraw after the
 //!   output ring is lost.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -335,6 +336,7 @@ async fn run_unix_server(
     }
 
     let listener = UnixListener::bind(&socket_path)?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
     info!("Listening on Unix domain socket: {:?}", socket_path);
 
     let session = Arc::new(Session::with_capabilities(

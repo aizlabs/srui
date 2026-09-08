@@ -268,16 +268,27 @@ async fn backpressure_preserves_message_order() {
 #[test]
 fn binary_stderr_contains_no_protocol_bytes() {
     use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
-    let socket_path = std::path::PathBuf::from(format!("/tmp/srui-bridge-{}", std::process::id()));
-    let _ = std::fs::remove_file(&socket_path);
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let runtime_dir =
+        std::path::Path::new("/tmp").join(format!("srui-b-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&runtime_dir).expect("create private bridge test runtime directory");
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure bridge test runtime directory");
+    let socket_path = runtime_dir.join("s");
 
     let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .expect("secure bridge test socket");
     let (accept_tx, accept_rx) = mpsc::channel();
 
     let accept_handle = thread::spawn(move || {
@@ -340,4 +351,5 @@ fn binary_stderr_contains_no_protocol_bytes() {
     );
 
     let _ = std::fs::remove_file(&socket_path);
+    std::fs::remove_dir(&runtime_dir).expect("remove bridge test runtime directory");
 }

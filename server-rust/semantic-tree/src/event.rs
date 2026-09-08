@@ -23,6 +23,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
 
+/// Default maximum encoded event identifier length (§7.7, §18.2, §26).
+pub const DEFAULT_MAX_EVENT_ID_BYTES: usize = 64;
+
 /// Globally unique event identifier for deduplication and retry-safety (§7.7, §16, §18.2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EventId(pub Vec<u8>);

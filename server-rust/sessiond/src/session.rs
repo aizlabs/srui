@@ -100,8 +100,8 @@ use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     AuthoritativeCommit, Event as DomainEvent, EventValidationError, NegotiationError, NodeId,
     Operation, ResourceHash, SemanticStore, ServerCapabilities, StoreError, TxnError, TypeRef,
-    DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH, DEFAULT_MAX_TRANSACTION_OPERATIONS,
-    DEFAULT_MAX_TREE_DEPTH,
+    DEFAULT_MAX_EVENT_ID_BYTES, DEFAULT_MAX_NODE_COUNT, DEFAULT_MAX_STRING_LENGTH,
+    DEFAULT_MAX_TRANSACTION_OPERATIONS, DEFAULT_MAX_TREE_DEPTH,
 };
 use thiserror::Error;
 
@@ -336,14 +336,17 @@ pub struct SessionConfig {
     /// Capacity of the bounded per-connection outbound transaction queue (§20.2).
     /// Must be positive; zero is rejected at session construction, like `journal_capacity`.
     pub outbound_queue_capacity: usize,
+    /// Maximum encoded client event identifier length (§7.7, §18.2, §26).
+    /// Must be positive so deduplication keys always have a finite bound.
+    pub max_event_id_bytes: usize,
 }
-
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             capabilities: ServerCapabilities::standard_widgets(),
             journal_capacity: DEFAULT_MAX_JOURNAL_ENTRIES,
             outbound_queue_capacity: DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+            max_event_id_bytes: DEFAULT_MAX_EVENT_ID_BYTES,
         }
     }
 }
@@ -354,6 +357,7 @@ pub struct Session {
     pub(crate) inner: Arc<Mutex<SessionInner>>,
     pub(crate) outbound_hub: Arc<OutboundHub>,
     pub(crate) outbound_queue_capacity: usize,
+    pub(crate) max_event_id_bytes: usize,
     /// PTY streams live outside `SessionInner` so blocking I/O never holds the semantic mutex (§21).
     pub(crate) pty: Arc<srui_pty::PTYManager>,
 }
@@ -414,9 +418,9 @@ impl Session {
     ///
     /// # Panics
     ///
-    /// Panics when `journal_capacity` or `outbound_queue_capacity` is zero. Both are refused rather
-    /// than clamped: a zero journal window silently degrades every reconnect to a snapshot resync
-    /// (§18.1), and a zero outbound capacity cannot deliver a single transaction (§20.2).
+    /// Panics when `journal_capacity`, `outbound_queue_capacity`, or `max_event_id_bytes` is
+    /// zero. All are refused rather than clamped: zero would either disable a security bound or
+    /// make the corresponding queue unable to retain a single valid entry.
     #[must_use]
     pub fn with_config(session_id: impl Into<String>, config: SessionConfig) -> Self {
         assert!(
@@ -428,6 +432,11 @@ impl Session {
             config.outbound_queue_capacity > 0,
             "SessionConfig::outbound_queue_capacity must be a positive integer (§20.2); \
              got 0. Use the default ({DEFAULT_OUTBOUND_QUEUE_CAPACITY}) or pass an explicit capacity."
+        );
+        assert!(
+            config.max_event_id_bytes > 0,
+            "SessionConfig::max_event_id_bytes must be a positive integer (§26); \
+             got 0. Use the default ({DEFAULT_MAX_EVENT_ID_BYTES}) or pass an explicit limit."
         );
         let limits = ServerLimits {
             max_frame_size: 16 * 1024 * 1024,
@@ -461,6 +470,7 @@ impl Session {
             inner: Arc::new(Mutex::new(inner)),
             outbound_hub: Arc::new(OutboundHub::new()),
             outbound_queue_capacity: config.outbound_queue_capacity,
+            max_event_id_bytes: config.max_event_id_bytes,
             pty: Arc::new(srui_pty::PTYManager::default()),
         }
     }
@@ -879,6 +889,14 @@ impl Session {
     /// connection down would make the client reconnect and replay the same invalid event forever.
     /// Infrastructure failures and invalid receive-window sequences remain `Err`.
     pub fn process_event(&self, event: &Event) -> Result<EventOutcome, SessionError> {
+        if event.event_id.len() > self.max_event_id_bytes {
+            return Err(SessionError::InvalidInput(format!(
+                "event_id is {} bytes; configured maximum is {} bytes (§26)",
+                event.event_id.len(),
+                self.max_event_id_bytes
+            )));
+        }
+
         // Cloning and decoding peer-controlled arguments may be proportional to the frame size,
         // so perform that work before entering the session-wide critical section. Admission is
         // still evaluated first semantically: receive-window errors win over a captured decode

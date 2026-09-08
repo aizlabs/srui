@@ -3,6 +3,8 @@
 //! Per-user persistent session daemon (§20.2).
 //! Manages durable UI state across transient SSH bridge connections.
 
+mod unix_security;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -11,7 +13,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use srui_sessiond::{handle_connection, Session, SessionConfig};
-
+use unix_security::{
+    default_socket_path as private_default_socket_path, effective_uid,
+    prepare_private_socket_parent, require_unprivileged_uid, validate_peer,
+    validate_private_socket,
+};
 /// Ignores `SIGHUP` so SSH session detach / controlling-terminal loss does not terminate
 /// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
 /// the process and defeats persistent session state.
@@ -33,10 +39,7 @@ fn ignore_sighup() -> Result<(), std::io::Error> {
 const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn default_socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("srui-sessiond.sock")
+    private_default_socket_path(effective_uid())
 }
 /// Parsed command line: socket path, optional built-in app adapter, and the §18.1 journal
 /// retention window (maximum retained transaction count).
@@ -313,9 +316,8 @@ async fn probe_socket_liveness(path: &std::path::Path) -> std::io::Result<Socket
 /// Binds a Unix domain socket, verifying parent directory permissions and unlinking any stale
 /// predecessor safely without disturbing a live server.
 async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let uid = effective_uid();
+    prepare_private_socket_parent(path, uid)?;
 
     let lock = acquire_socket_lock(path)?;
 
@@ -358,6 +360,7 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
     let bind_result = UnixListener::bind(path);
     unsafe { libc::umask(previous_umask) };
     let listener = bind_result?;
+    validate_private_socket(path, uid)?;
 
     let identity = socket_identity(path)?.ok_or_else(|| {
         std::io::Error::other(format!(
@@ -389,6 +392,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("Starting srui-sessiond daemon (§20.2)...");
+
+    let daemon_uid = effective_uid();
+    require_unprivileged_uid(daemon_uid)?;
 
     let config = parse_args().map_err(|message| {
         error!("{message}");
@@ -444,6 +450,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _peer_addr)) => {
+                        if let Err(error) = validate_peer(&stream, daemon_uid) {
+                            warn!(
+                                error = %error,
+                                "Rejecting Unix socket peer outside the authenticated user boundary"
+                            );
+                            continue;
+                        }
                         let session_clone = session.clone();
                         let shutdown_child = shutdown.child_token();
                         tasks.spawn(async move {

@@ -570,6 +570,19 @@ extension Transaction {
 
 // MARK: - Event <-> SRUIEvent
 
+/// Validates the opaque event identifier before it can become a retained deduplication key.
+func validateEventIDLength(
+    _ eventID: Data,
+    maximumBytes: Int = defaultMaxEventIDBytes
+) throws {
+    guard maximumBytes > 0, eventID.count <= maximumBytes else {
+        throw ProtocolDecodeError.eventIDSizeLimitExceeded(
+            limit: maximumBytes,
+            actual: eventID.count
+        )
+    }
+}
+
 /// Enforces the cross-language `edit_seq` shape before either Swift event decoder constructs
 /// a domain event. Protobuf's scalar default cannot distinguish omitted from explicit zero, so
 /// TEXT_EDIT requires a positive value and every other event requires the zero default.
@@ -588,6 +601,7 @@ func decodeEventEditSequence(_ rawValue: UInt64, eventType: TypeRef) throws -> E
 
 extension Event {
     public init(wire: SRUIEvent) throws {
+        try validateEventIDLength(wire.eventID)
         let clientInstanceId = wire.clientInstanceID.isEmpty ? nil : ClientInstanceId(wire.clientInstanceID)
         guard wire.hasEventType else {
             throw ProtocolDecodeError.missingField("Event.eventType")

@@ -18,7 +18,7 @@ scripts/run-conformance --suite 12
 **Rust**
 
 ```bash
-cargo test -p srui-semantic-tree --test conformance_toolkit_mapping_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_toolkit_mapping_test
 ```
 
 **Swift**

@@ -73,11 +73,22 @@ def load_manifest() -> dict:
         if status not in {"active", "known_gap"}:
             raise ManifestError(f"suite {suite.get('id')} has invalid status {status!r}")
         for gap in suite.get("gaps", []):
-            missing = {"scenario", "reason", "future_task"} - set(gap)
+            missing = {"scenario", "reason", "future_task", "gap_probe"} - set(gap)
             if missing:
                 raise ManifestError(
-                    f"suite {suite.get('id')} has a gap missing {sorted(missing)}; every gap "
-                    "must be documented with a reason and an owning task"
+                    f"suite {suite.get('id')} has a gap missing {sorted(missing)}; every gap must "
+                    "be documented with a reason, an owning task, and a probe that detects its "
+                    "closure — otherwise the gap can be silently fixed and still print GAP"
+                )
+            probe = gap["gap_probe"]
+            if not {"file", "absent_pattern"} <= set(probe):
+                raise ManifestError(
+                    f"suite {suite.get('id')} has a gap_probe missing 'file' or 'absent_pattern'"
+                )
+            if not (REPO_ROOT / probe["file"]).exists():
+                raise ManifestError(
+                    f"suite {suite.get('id')} gap_probe targets {probe['file']}, which does not "
+                    "exist; a probe that can never match cannot detect closure"
                 )
         if status == "known_gap" and not suite.get("gaps"):
             raise ManifestError(
@@ -191,39 +202,78 @@ def main() -> int:
             failures.append(f"suite {suite['id']} ({suite['slug']}): gap appears closed — {closed}")
             exit_code = 1
 
-        commands = [(lang, cmd) for lang in languages for cmd in suite.get(lang, [])]
+        not_applicable = suite.get("not_applicable", {})
 
-        if not commands:
-            if suite["status"] == "known_gap":
-                owner = suite["gaps"][0]["future_task"]
-                results.append((suite["id"], suite["slug"], GAP, f"awaiting {owner}"))
-            else:
-                results.append(
-                    (suite["id"], suite["slug"], SKIP, f"no {'/'.join(languages)} runner declared")
-                )
-            continue
+        # Every selected language must be accounted for *per language*. Flattening the languages
+        # into one command list would let one implementation hide the other's absence: a suite
+        # with only a Swift runner would report PASS under `--implementation both` even though
+        # nothing on the Rust side was ever executed.
+        missing_languages = [
+            lang
+            for lang in languages
+            if not suite.get(lang) and lang not in not_applicable
+        ]
+        for lang in missing_languages:
+            failures.append(
+                f"suite {suite['id']} ({suite['slug']}): no {lang} runner declared, and the "
+                f"manifest does not record {lang} as not applicable. Every §32 suite must be "
+                "runnable or explicitly account for why it is not."
+            )
+            exit_code = 1
+
+        commands = [(lang, cmd) for lang in languages for cmd in suite.get(lang, [])]
+        # Languages the manifest explicitly excuses, so the table can say so rather than imply
+        # coverage that does not exist.
+        excused = [lang for lang in languages if lang in not_applicable]
 
         # No fail-fast: every suite reports, so one failure does not hide the rest.
         suite_status = PASS
-        notes: list[str] = []
+        failed_languages: list[str] = []
         for lang, command in commands:
             ok, detail = run_command(command)
             if not ok:
                 suite_status = FAIL
                 exit_code = 1
-                notes.append(lang)
+                failed_languages.append(lang)
                 failures.append(
                     f"suite {suite['id']} ({suite['slug']}) [{lang}]: {' '.join(command)}\n{detail}"
                 )
 
-        note = ""
-        if suite_status == PASS:
-            declared = len(suite.get("gaps", []))
-            note = f"{len(commands)} runner(s)" + (
-                f", {declared} documented gap(s)" if declared else ""
-            )
+        if missing_languages:
+            suite_status = FAIL
+
+        gaps = suite.get("gaps", [])
+        if suite_status == FAIL:
+            reasons = sorted(set(failed_languages))
+            note = "failed: " + ", ".join(reasons) if reasons else ""
+            if missing_languages:
+                note = (note + "; " if note else "") + (
+                    f"undeclared missing runner: {', '.join(missing_languages)}"
+                )
+        elif not commands:
+            suite_status = GAP if suite["status"] == "known_gap" else SKIP
+            if gaps:
+                note = f"no runnable coverage; awaiting {gaps[0]['future_task']}"
+            else:
+                # Say *why*, so a SKIP is never mistaken for coverage that silently vanished.
+                reasons = "; ".join(
+                    not_applicable[lang] for lang in languages if lang in not_applicable
+                )
+                note = f"n/a for {'/'.join(languages)}: {reasons}" if reasons else (
+                    "no runnable coverage for " + "/".join(languages)
+                )
+        elif gaps:
+            # Runners pass, but the suite documents scenarios §32 requires and this base cannot
+            # exercise. Reporting PASS here would overstate coverage, which is exactly what the
+            # pass-or-known-gap acceptance criterion exists to prevent.
+            suite_status = GAP
+            note = f"{len(commands)} runner(s) pass; {len(gaps)} open gap: {gaps[0]['future_task']}"
+            if len(gaps) > 1:
+                note += f" (+{len(gaps) - 1} more)"
         else:
-            note = "failed: " + ", ".join(sorted(set(notes)))
+            note = f"{len(commands)} runner(s)"
+            if excused:
+                note += f"; {'/'.join(excused)} n/a"
         results.append((suite["id"], suite["slug"], suite_status, note))
 
     print()

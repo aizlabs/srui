@@ -38,10 +38,11 @@ struct FrameIndependenceConformanceTests {
     private static let mutationCount = 24
 
     private struct CadenceRun {
-        let finalText: String?
-        let textViewIdentity: ObjectIdentifier
-        let surfaceWindowIdentity: ObjectIdentifier
-        let nodeCount: Int
+        /// Read from the live NSTextField, not from a rebuilt store: a renderer that drops
+        /// updates would still satisfy an assertion made against a reconstructed store.
+        let renderedText: String?
+        let identitiesStable: Bool
+        let viewCount: Int
         let presentPasses: Int
         let classifications: [DirtyClassification]
     }
@@ -66,7 +67,14 @@ struct FrameIndependenceConformanceTests {
         let renderer = AppKitRenderer()
         try renderer.attach(store: store)
 
+        // Captured immediately after mount, so every presentation can be checked against them.
+        let initialTextView = try #require(renderer.registry.view(for: 2))
+        let initialWindow = try #require(renderer.registry.handle(for: 1)?.window)
+        let initialTextIdentity = ObjectIdentifier(initialTextView)
+        let initialWindowIdentity = ObjectIdentifier(initialWindow)
+
         var presentPasses = 0
+        var identitiesStable = true
         var pending: [SemanticModel.Operation] = []
         var allClassifications: [DirtyClassification] = []
         var currentRevision = store.revision
@@ -82,6 +90,18 @@ struct FrameIndependenceConformanceTests {
             currentRevision = newStore.revision
             presentPasses += 1
             pending.removeAll()
+
+            // §23: a scalar set mutates the view in place. Checked after *every* presentation,
+            // not once at the end, so a rebuild-then-restore cycle cannot slip through.
+            if let view = renderer.registry.view(for: 2),
+               let window = renderer.registry.handle(for: 1)?.window {
+                if ObjectIdentifier(view) != initialTextIdentity
+                    || ObjectIdentifier(window) != initialWindowIdentity {
+                    identitiesStable = false
+                }
+            } else {
+                identitiesStable = false
+            }
         }
 
         for i in 1...Self.mutationCount {
@@ -95,44 +115,53 @@ struct FrameIndependenceConformanceTests {
         }
         try present()
 
-        let finalStore = try makeStore(applied)
-        let textView = try #require(renderer.registry.view(for: 2))
-        let surfaceWindow = try #require(renderer.registry.handle(for: 1)?.window)
+        // Interrogate the native control the user would actually see.
+        let textField = try #require(renderer.registry.view(for: 2) as? NSTextField)
 
         return CadenceRun(
-            finalText: finalStore.node(for: 2)?.properties[.text]?.asString,
-            textViewIdentity: ObjectIdentifier(textView),
-            surfaceWindowIdentity: ObjectIdentifier(surfaceWindow),
-            nodeCount: finalStore.nodeCount,
+            renderedText: textField.stringValue,
+            identitiesStable: identitiesStable,
+            viewCount: renderer.registry.allHandles.count,
             presentPasses: presentPasses,
             classifications: allClassifications
         )
     }
 
-    /// §12.2: the renderer paces presentation independently, so every cadence lands on the same
-    /// semantic state — same final value, same node count.
+    /// §12.2: the renderer paces presentation independently, so every cadence must leave the
+    /// *native control* showing the same thing — read from the NSTextField, not from a store the
+    /// test rebuilt for itself.
     @Test
-    func everyCadenceConvergesOnTheSameSemanticState() throws {
+    func everyCadenceRendersTheSameFinalState() throws {
         let baseline = try run(cadence: 1)
+        #expect(
+            baseline.renderedText == "v\(Self.mutationCount)",
+            "the eager cadence must render the last mutation, got \(String(describing: baseline.renderedText))"
+        )
 
         for cadence in Self.cadences {
             let result = try run(cadence: cadence)
             #expect(
-                result.finalText == baseline.finalText,
-                "cadence \(cadence) converged on \(String(describing: result.finalText)) rather than \(String(describing: baseline.finalText))"
+                result.renderedText == baseline.renderedText,
+                "cadence \(cadence) rendered \(String(describing: result.renderedText)) rather than \(String(describing: baseline.renderedText)); a renderer that drops updates under coalescing would show up here"
             )
             #expect(
-                result.nodeCount == baseline.nodeCount,
-                "cadence \(cadence) produced a different node count")
+                result.viewCount == baseline.viewCount,
+                "cadence \(cadence) produced a different number of live view handles")
         }
     }
 
-    /// §23: a scalar property set mutates the existing view in place. Coalescing more commits per
-    /// present pass must not turn scalar updates into structural rebuilds.
+    /// §23: a scalar property set mutates the existing view in place. Identities are compared
+    /// after every presentation, so coalescing more commits per pass may not turn a scalar update
+    /// into a view rebuild.
     @Test
     func viewIdentityIsPreservedAtEveryCadence() throws {
         for cadence in Self.cadences {
             let result = try run(cadence: cadence)
+
+            #expect(
+                result.identitiesStable,
+                "cadence \(cadence) replaced the text view or surface window during presentation; a scalar stream must mutate in place (§23, §32.4)"
+            )
 
             let structural = result.classifications.filter {
                 if case .structureAffecting = $0 { return true }
@@ -140,7 +169,7 @@ struct FrameIndependenceConformanceTests {
             }
             #expect(
                 structural.isEmpty,
-                "cadence \(cadence) reported \(structural.count) structure-affecting classifications for a pure scalar stream; presentation pacing must not change how an operation is classified (§23, §32.4)"
+                "cadence \(cadence) reported \(structural.count) structure-affecting classifications for a pure scalar stream"
             )
         }
     }
@@ -157,11 +186,12 @@ struct FrameIndependenceConformanceTests {
             "presenting every commit must produce one pass per mutation")
         #expect(
             lazy.presentPasses < eager.presentPasses,
-            "a slower cadence must produce strictly fewer present passes (got \(lazy.presentPasses) vs \(eager.presentPasses)); if this no longer holds, the cadence variable is not reaching the renderer and the convergence assertions prove nothing"
+            "a slower cadence must produce strictly fewer present passes (got \(lazy.presentPasses) vs \(eager.presentPasses)); if this no longer holds, the cadence variable is not reaching the renderer and the assertions above prove nothing"
         )
 
-        // Local repaint pacing differs; the semantic result does not.
-        #expect(lazy.finalText == eager.finalText)
-        #expect(lazy.nodeCount == eager.nodeCount)
+        // Local repaint pacing differs; what the user ends up seeing does not.
+        #expect(lazy.renderedText == eager.renderedText)
+        #expect(lazy.viewCount == eager.viewCount)
+        #expect(lazy.identitiesStable && eager.identitiesStable)
     }
 }

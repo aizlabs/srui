@@ -19,6 +19,10 @@ Code-driven suite: no shared vectors. The runners are listed in [`../manifest.js
 
 ```bash
 swift test --package-path client-macos --filter AppKitRendererTests
+swift test --package-path client-macos --filter ControlFactoryTests
 swift test --package-path client-macos --filter ControlFactoryPropertyTests
 swift test --package-path client-macos --filter CollectionAdaptersTests
+swift test --package-path client-macos --filter NativeTextEditorAdapterTests
 ```
+
+**Rust** — not applicable: Renderer semantics are AppKit-only; RendererAppKit cannot build on Linux.

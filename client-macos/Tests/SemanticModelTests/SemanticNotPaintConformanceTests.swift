@@ -17,15 +17,19 @@ import Foundation
 
 final class SemanticNotPaintConformanceTests: XCTestCase {
 
-    /// Suite 3's vectors are count-pinned by the manifest; a fixture cannot silently vanish.
-    func testSemanticNotPaintVectorsPresent() throws {
+    /// Replays suite 3's vectors through the same engine suite 1 uses.
+    ///
+    /// The fixture moved here from the state-machine directory, so it must still be *executed*.
+    /// Parsing it and checking that `expected_outcome` exists would let the relocated vector rot
+    /// while both suites reported green.
+    func testSemanticNotPaintVectorsReplay() throws {
         let vectors = try ConformanceVectors.vectors(forSuite: 3)
+        XCTAssertFalse(vectors.isEmpty, "suite 3 declares no vectors")
+
+        let replayer = StateMachineConformanceTests()
         for url in vectors {
-            let data = try Data(contentsOf: url)
-            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            XCTAssertNotNil(
-                json?["expected_outcome"],
-                "Suite 3 vector \(url.lastPathComponent) is missing 'expected_outcome'")
+            print("  Replaying \(url.lastPathComponent)...")
+            try replayer.replayVectorFile(at: url)
         }
     }
 

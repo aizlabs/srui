@@ -18,11 +18,14 @@ Code-driven suite: no shared vectors. The runners are listed in [`../manifest.js
 **Rust**
 
 ```bash
-cargo test -p srui-sessiond --test conformance_reconnect_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-sessiond --test conformance_reconnect_test
 ```
 
 **Swift**
 
 ```bash
 swift test --package-path client-macos --filter ReconnectConformanceTests
+swift test --package-path client-macos --filter SessionResumeContinuityTests
+swift test --package-path client-macos --filter EventOutboxTests
+swift test --package-path client-macos --filter SessionControllerResyncTests
 ```

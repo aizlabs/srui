@@ -18,7 +18,7 @@ scripts/run-conformance --suite 5
 **Rust**
 
 ```bash
-cargo test -p srui-semantic-tree --test conformance_semantic_input_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_semantic_input_test
 ```
 
 **Swift**
@@ -29,6 +29,16 @@ swift test --package-path client-macos --filter SemanticInputConformanceTests
 
 ## Documented gaps
 
-- **The positive half of §32.5 — a coordinate event ACCEPTED for an explicitly subscribed custom scene node — cannot be exercised.**
-  - *Why:* POINTER_* events are registered in namespace 0, but no VectorScene node type, subscription model, or server-side 'coordinate event only for a subscribed scene' validation exists on this base.
-  - *Owner:* Task 36 (VectorScene profile, optional)
+The runner reports this suite as `GAP` rather than `PASS` while any of these remain open, and exits non-zero if a probe shows one has been closed without the manifest being updated.
+
+### Server event validation accepts POINTER_* events targeting ordinary Standard Widget nodes; the §32.5 rule that coordinates are refused outside a subscribed scene is unenforced.
+
+- **Why:** Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence, enabled/read-only state and TEXT_EDIT edit_seq, but never the event kind against the target node type. A POINTER_DOWN aimed at a Button validates successfully.
+- **Owner:** Task 36 (VectorScene profile) — the rule needs the subscription model to state what coordinates are legal for
+- **Closure probe:** `server-rust/semantic-tree/src/event.rs` matching `CoordinateEvent|coordinate event .*(subscrib|scene)|NodeNotSubscribed`
+
+### The positive half of §32.5 — a coordinate event ACCEPTED for an explicitly subscribed custom scene node — cannot be exercised.
+
+- **Why:** POINTER_* events are registered in namespace 0, but no VectorScene node type or subscription model exists on this base.
+- **Owner:** Task 36 (VectorScene profile, optional)
+- **Closure probe:** `protocol/registry.yaml` matching `name: VectorScene`

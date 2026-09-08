@@ -31,22 +31,23 @@ See `expected.json` for canonical hex and field declarations.
 
 [`suites/manifest.json`](suites/manifest.json) is the machine-readable index of the twelve
 conformance suites §32 requires. It is the single source for which suites exist, where their
-fixtures live, how many there are, which commands run them, and which scenarios are known gaps.
+fixtures live, how many there are, which commands run them, which implementations they apply to,
+and which scenarios are open gaps.
 
-| # | Directory | Suite (§32 item) | Status | Fixtures | Gap owner |
+| # | Directory | Suite (§32 item) | Current | Fixtures | Gap owner |
 |---|---|---|---|---|---|
-| 1 | [`01-core-state-machine/`](suites/01-core-state-machine/) | Core state-machine tests | `active` | 48 JSON vectors | — |
-| 2 | [`02-widget-semantics/`](suites/02-widget-semantics/) | Widget semantic tests | `active` | generated from `registry.yaml` | none — tier is a deliberate scope boundary, not a defect |
-| 3 | [`03-semantic-not-paint/`](suites/03-semantic-not-paint/) | Semantic-not-paint tests | `active` | 1 JSON vector | — |
-| 4 | [`04-frame-independence/`](suites/04-frame-independence/) | Frame-independence tests | `active` | code-driven | — |
-| 5 | [`05-semantic-input/`](suites/05-semantic-input/) | Semantic-input tests | `active` | generated from `registry.yaml` | Task 36 (VectorScene profile, optional) |
-| 6 | [`06-local-text-interaction/`](suites/06-local-text-interaction/) | Local text-interaction tests | `active` | code-driven | — |
-| 7 | [`07-extension-negotiation/`](suites/07-extension-negotiation/) | Extension-negotiation tests | `active` | code-driven | Task 31 merge (branch codex/task-31-coding-agent) |
-| 8 | [`08-reconnect/`](suites/08-reconnect/) | Reconnect tests | `active` | code-driven | — |
-| 9 | [`09-security-limits/`](suites/09-security-limits/) | Security limits | `active` | code-driven | — |
-| 10 | [`10-renderer-semantics/`](suites/10-renderer-semantics/) | Renderer semantic tests | `active` | code-driven | — |
-| 11 | [`11-semantic-inspection/`](suites/11-semantic-inspection/) | Semantic inspection tests | **`known_gap`** | code-driven | Task 35 (local semantic inspection and automation API) |
-| 12 | [`12-toolkit-mapping/`](suites/12-toolkit-mapping/) | Toolkit mapping tests | `active` | generated from `registry.yaml` | — |
+| 1 | [`01-core-state-machine/`](suites/01-core-state-machine/) | Core state-machine tests | `PASS` | 48 JSON vector(s) | — |
+| 2 | [`02-widget-semantics/`](suites/02-widget-semantics/) | Widget semantic tests | `GAP` | generated from `registry.yaml` | unowned |
+| 3 | [`03-semantic-not-paint/`](suites/03-semantic-not-paint/) | Semantic-not-paint tests | `PASS` | 1 JSON vector(s) | — |
+| 4 | [`04-frame-independence/`](suites/04-frame-independence/) | Frame-independence tests | `PASS` | code-driven | — |
+| 5 | [`05-semantic-input/`](suites/05-semantic-input/) | Semantic-input tests | `GAP` | generated from `registry.yaml` | Task 36 (VectorScene profile) |
+| 6 | [`06-local-text-interaction/`](suites/06-local-text-interaction/) | Local text-interaction tests | `PASS` | code-driven | — |
+| 7 | [`07-extension-negotiation/`](suites/07-extension-negotiation/) | Extension-negotiation tests | `GAP` | code-driven | Task 31 merge (branch codex/task-31-coding-agent) |
+| 8 | [`08-reconnect/`](suites/08-reconnect/) | Reconnect tests | `PASS` | code-driven | — |
+| 9 | [`09-security-limits/`](suites/09-security-limits/) | Security limits | `PASS` | code-driven | — |
+| 10 | [`10-renderer-semantics/`](suites/10-renderer-semantics/) | Renderer semantic tests | `PASS` | code-driven | — |
+| 11 | [`11-semantic-inspection/`](suites/11-semantic-inspection/) | Semantic inspection tests | `GAP` | code-driven | Task 35 (local semantic inspection and automation API) |
+| 12 | [`12-toolkit-mapping/`](suites/12-toolkit-mapping/) | Toolkit mapping tests | `PASS` | generated from `registry.yaml` | — |
 
 ### Running the suites
 
@@ -62,16 +63,21 @@ Result semantics:
 
 | Result | Meaning | Exit contribution |
 |---|---|---|
-| `PASS` | every declared runner for the suite succeeded | 0 |
-| `FAIL` | a runner failed, or its binary was missing | 1 |
-| `GAP` | a documented, manifest-declared gap with an owning task | 0 |
-| `SKIP` | no runner for the selected implementation (e.g. suite 10 under `--implementation rust`) | 0 |
+| `PASS` | every declared runner succeeded **and** the suite has no open gaps | 0 |
+| `GAP` | runners pass, but the suite documents §32 scenarios this base cannot exercise | 0 |
+| `FAIL` | a runner failed, or a selected implementation has no runner and no declared reason | 1 |
+| `SKIP` | the suite declares the selected implementation not applicable, with a reason | 0 |
 
-The runner also exits non-zero when the manifest is malformed, when a suite declares a vector
-directory or generated fixture that does not exist, **or when a declared gap turns out to be
-closed**. That last case matters: without it, suite 11 would stay labelled `GAP` forever after
-Task 35 lands. Gap entries carry a negative `gap_probe`, and a match means the manifest must be
-updated rather than the result quietly changing.
+A suite that documents an open gap reports `GAP`, never `PASS`. Reporting `PASS` alongside a
+missing required scenario is exactly the overstatement the pass-or-known-gap criterion exists to
+prevent.
+
+The runner exits non-zero when the manifest is malformed, when a declared vector directory or
+generated fixture is missing, when a selected implementation has no runner and no
+`not_applicable` reason, **or when a declared gap turns out to be closed**. That last case
+matters: without it a suite would stay labelled `GAP` forever after the owning task lands. Every
+gap carries a negative `gap_probe`, and a match means the manifest must be updated rather than
+the result quietly changing.
 
 A full Rust+Swift run needs macOS, because `RendererAppKit` cannot build on Linux.
 
@@ -87,6 +93,10 @@ A full Rust+Swift run needs macOS, because `RendererAppKit` cannot build on Linu
    still report green.
 3. Run `scripts/run-conformance --suite <id>`.
 
+Fixture replay is shared: `server-rust/semantic-tree/tests/common/fixture_replay.rs` and
+`StateMachineConformanceTests.replayVectorFile` are used by suites 1 and 3 alike, so a vector
+relocated between suites is still *executed* rather than merely parsed.
+
 ### Generated fixtures
 
 Suites 2, 5 and 12 consume fixtures generated from `protocol/registry.yaml` by
@@ -95,18 +105,26 @@ by `git diff --exit-code` in CI). Node tier, category and the `emits` matrix are
 and are never restated by hand, so promoting a widget from `should` to `required` cannot leave a
 stale copy behind in a test fixture.
 
+`emits` transcribes the §7.6 *Standard events* table exactly. A node absent from that table emits
+nothing, and no capability may be added to the registry without adding it to the design document
+first.
+
 The AppKit mapping table is the one part that is *not* registry-derived, and deliberately so:
 §22.4 makes native mappings informative, so they must not become protocol source of truth. It
 lives in the generator and fails codegen if the registry gains a node type it does not cover.
 
-### Known gaps
+### Open gaps
 
-- **Suite 5** — the positive half of §32.5 (coordinates *accepted* for a subscribed custom scene)
-  has no implementation: `POINTER_*` events are registered, but no `VectorScene` node type or
-  subscription model exists. Owned by **Task 36**.
+Each gap below makes its suite report `GAP`. Full text, closure probes and acceptance criteria
+are in the manifest and in each suite's README.
+
+- **Suite 2** — §7.6 assigns `EXPANSION_CHANGED` to `Tree` and `VIEWPORT_CHANGED` to `Surface`,
+  both required-tier, but `RendererAppKit/SemanticInteraction.swift` has no case that can
+  originate either, so the renderer cannot emit them.
+- **Suite 5** — server event validation accepts `POINTER_*` against ordinary widgets: the §32.5
+  rule that coordinates are refused outside a subscribed scene is **unenforced**, not merely
+  untested. The positive subscribed-scene half has no implementation either. Owned by **Task 36**.
 - **Suite 7** — capability negotiation and must-understand rejection are covered; the
   fallback-subtree half is **Task 31** work not yet merged to `origin/main`.
-- **Suite 11** — `client-macos/Accessibility` is a placeholder; the whole suite awaits **Task 35**,
-  whose acceptance criteria are recorded in the manifest and in
-  [`suites/11-semantic-inspection/README.md`](suites/11-semantic-inspection/README.md).
+- **Suite 11** — `client-macos/Accessibility` is a placeholder; the whole suite awaits **Task 35**.
 

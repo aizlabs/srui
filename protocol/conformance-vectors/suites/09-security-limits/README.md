@@ -11,13 +11,16 @@ scripts/run-conformance --suite 9
 
 ## Fixtures
 
+Code-driven suite: no shared vectors. The runners are listed in [`../manifest.json`](../manifest.json).
+
 ## Runners
 
 **Rust**
 
 ```bash
-cargo test -p srui-sessiond --test security_limits_test
-cargo test -p srui-protocol --test framing_decoder_matrix_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-sessiond --test security_limits_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-protocol --test framing_decoder_matrix_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_security_limits_test
 ```
 
 **Swift**

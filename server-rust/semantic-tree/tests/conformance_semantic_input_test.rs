@@ -126,32 +126,129 @@ fn test_no_standard_node_type_emits_coordinate_events() {
     }
 }
 
-/// Every allowed emission must construct a real event through the same path the server uses,
-/// and must carry no coordinate payload (§7.6).
+/// Every declared emission must survive real validation against a real store, on a real node of
+/// the declaring type — not merely resolve as a registry name.
 #[test]
-fn test_allowed_semantic_events_construct_without_coordinates() {
+fn test_declared_emissions_validate_against_a_live_node() {
     let matrix = load_matrix();
 
     for row in &matrix.node_event_matrix {
+        if row.allowed.is_empty() {
+            continue;
+        }
+        let node_type = resolve_standard_node_type(&row.node)
+            .unwrap_or_else(|e| panic!("node type '{}' must resolve: {}", row.node, e));
+
+        let mut store = SemanticStore::new();
+        store
+            .create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])
+            .expect("root surface");
+        store
+            .create_node(NodeId::new(2), node_type, Some(NodeId::new(1)), None, [])
+            .expect("target node");
+
         for allowed in &row.allowed {
-            let event_ref = resolve_standard_event(allowed).unwrap_or_else(|e| {
-                panic!(
-                    "Node '{}' declares emission '{}' which does not resolve: {}",
-                    row.node, allowed, e
-                )
-            });
-            assert_eq!(
-                event_ref.namespace_id, 0,
-                "Standard semantic event '{}' must live in namespace 0",
-                allowed
+            let event_type = resolve_standard_event(allowed)
+                .unwrap_or_else(|e| panic!("event '{}' must resolve: {}", allowed, e));
+            assert_eq!(event_type.namespace_id, 0);
+
+            let event = Event::new(
+                None,
+                1,
+                EventId::from_string("conformance"),
+                store.revision(),
+                NodeId::new(2),
+                event_type,
+                [],
             );
-            assert_eq!(
-                event_ref.standard_event_name(),
-                Some(allowed.as_str()),
-                "Event '{}' must round-trip through the standard event table",
+            assert!(
+                event.validate(&store).is_ok(),
+                "node '{}' declares emission '{}' but the server refuses it against a live \
+                 node of that type",
+                row.node,
                 allowed
             );
         }
+    }
+}
+
+/// §7.4 / §27: a disabled node refuses interaction whatever the event type. This is the
+/// authorization edge every semantic event shares.
+#[test]
+fn test_disabled_nodes_refuse_declared_semantic_events() {
+    let mut store = SemanticStore::new();
+    store
+        .create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])
+        .expect("root surface");
+    store
+        .create_node(
+            NodeId::new(2),
+            TypeRef::BUTTON,
+            Some(NodeId::new(1)),
+            None,
+            [(PropertyRef::ENABLED, Value::Bool(false))],
+        )
+        .expect("disabled button");
+
+    let event = Event::activate(1, "disabled", store.revision(), NodeId::new(2));
+    assert_eq!(
+        event.validate(&store),
+        Err(EventValidationError::NodeDisabled(NodeId::new(2))),
+        "a disabled node must refuse ACTIVATE (§7.4, §27)"
+    );
+}
+
+/// The §32.5 rule this suite exists to enforce: coordinates are accepted **only** for explicitly
+/// subscribed custom scene nodes, so an ordinary Standard Widget node must refuse them.
+///
+/// ## This currently fails against the implementation, and the manifest says so
+///
+/// `Event::validate` checks observed revision, node existence, enabled/read-only state and
+/// `TEXT_EDIT` sequencing — it never compares the event kind against the target node type. A
+/// `POINTER_DOWN` aimed at a Button therefore validates successfully today.
+///
+/// Per Task 33's "don't invent protocol behavior to pass a suite", the rule is not implemented
+/// here and the assertion is not weakened to match the defect. Instead the exact defect is
+/// pinned below, and suite 5 reports GAP with the scenario recorded in the manifest. When the
+/// rule lands, this test's `#[should_panic]` inverts and the manifest gap closes — the gap probe
+/// on `event.rs` fails the runner if that happens without the manifest being updated.
+#[test]
+#[should_panic(expected = "ordinary Standard Widget node must refuse coordinate events")]
+fn test_coordinate_events_are_refused_for_unsubscribed_standard_nodes() {
+    let matrix = load_matrix();
+
+    let mut store = SemanticStore::new();
+    store
+        .create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])
+        .expect("root surface");
+    store
+        .create_node(
+            NodeId::new(2),
+            TypeRef::BUTTON,
+            Some(NodeId::new(1)),
+            None,
+            [],
+        )
+        .expect("button");
+
+    for coordinate in &matrix.coordinate_events {
+        let event_type = resolve_standard_event(coordinate)
+            .unwrap_or_else(|e| panic!("event '{}' must resolve: {}", coordinate, e));
+        let event = Event::new(
+            None,
+            1,
+            EventId::from_string("coord"),
+            store.revision(),
+            NodeId::new(2),
+            event_type,
+            [],
+        );
+        assert!(
+            event.validate(&store).is_err(),
+            "an ordinary Standard Widget node must refuse coordinate events, but '{}' was \
+             accepted against a Button (§7.7, §32.5)",
+            coordinate
+        );
     }
 }
 

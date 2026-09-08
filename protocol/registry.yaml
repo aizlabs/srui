@@ -13,6 +13,10 @@ namespace_name: "org.srui.standard"
 version: "0.4.0"
 description: "Canonical standard registry for SRUI namespace 0 (standard widgets, properties, enums, events, operations)"
 
+# `emits` is the per-node semantic event matrix from the §7.6 "Standard events" table, which is
+# normative. It is transcribed exactly: a node absent from that table emits nothing, and no
+# capability may be added here without adding it to the design document first. Coordinate events
+# (§7.7) never appear — they are reserved for explicitly subscribed custom scenes.
 node_types:
   # Containers & Layout (§7.2)
   - id: 1
@@ -68,7 +72,7 @@ node_types:
     name: Scroll
     tier: required
     category: container
-    emits: [VIEWPORT_CHANGED]
+    emits: []
     description: "Scrollable viewport container"
 
   # Content & Basic Controls (§7.2, §7.3 Required Tier)
@@ -198,14 +202,14 @@ node_types:
     name: Menu
     tier: deferred
     category: shell
-    emits: [ACTIVATE]
+    emits: []
     description: "Command and action menu hierarchy"
 
   - id: 27
     name: Toolbar
     tier: deferred
     category: shell
-    emits: [ACTIVATE]
+    emits: []
     description: "Primary window or application command strip"
 
 properties:

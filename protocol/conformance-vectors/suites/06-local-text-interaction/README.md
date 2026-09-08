@@ -18,7 +18,7 @@ Code-driven suite: no shared vectors. The runners are listed in [`../manifest.js
 **Rust**
 
 ```bash
-cargo test -p srui-sessiond --test text_edit_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-sessiond --test text_edit_test
 ```
 
 **Swift**

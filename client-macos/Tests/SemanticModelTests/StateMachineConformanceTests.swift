@@ -41,7 +41,9 @@ final class StateMachineConformanceTests: XCTestCase {
         }
     }
 
-    private func replayVectorFile(at url: URL) throws {
+    /// Shared with `SemanticNotPaintConformanceTests`: a vector relocated between suites
+    /// must still be executed, not merely parsed.
+    func replayVectorFile(at url: URL) throws {
         let data = try Data(contentsOf: url)
         let jsonObject = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let json = try XCTUnwrap(jsonObject, "Invalid JSON in \(url.lastPathComponent)")

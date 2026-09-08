@@ -11,14 +11,14 @@ scripts/run-conformance --suite 3
 
 ## Fixtures
 
-`suites/03-semantic-not-paint/vectors/` — exactly **1** JSON vectors, count-pinned by [`../manifest.json`](../manifest.json). Adding or removing one without updating the manifest fails both the Rust and Swift loaders.
+`suites/03-semantic-not-paint/vectors/` — exactly **1** JSON vector(s), count-pinned by [`../manifest.json`](../manifest.json). Adding or removing one without updating the manifest fails both the Rust and Swift loaders.
 
 ## Runners
 
 **Rust**
 
 ```bash
-cargo test -p srui-semantic-tree --test conformance_semantic_not_paint_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_semantic_not_paint_test
 ```
 
 **Swift**

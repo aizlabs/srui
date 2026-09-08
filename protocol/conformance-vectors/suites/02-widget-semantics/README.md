@@ -18,7 +18,7 @@ scripts/run-conformance --suite 2
 **Rust**
 
 ```bash
-cargo test -p srui-semantic-tree --test conformance_widget_semantics_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_widget_semantics_test
 ```
 
 **Swift**
@@ -29,6 +29,10 @@ swift test --package-path client-macos --filter WidgetSemanticsConformanceTests
 
 ## Documented gaps
 
-- **SHOULD-tier and deferred-tier widgets (Select, ChoiceGroup, Slider, NumberInput, Tabs, Split, Dialog, Menu, Toolbar) have no renderer implementation.**
-  - *Why:* §7.3 marks these below the required tier; ControlFactory rejects them with unsupportedNodeType rather than degrading silently (§4 inv. 13). The suite asserts the rejection, which is the conformant behavior today.
-  - *Owner:* none — tier is a deliberate scope boundary, not a defect
+The runner reports this suite as `GAP` rather than `PASS` while any of these remain open, and exits non-zero if a probe shows one has been closed without the manifest being updated.
+
+### Tree EXPANSION_CHANGED and Surface VIEWPORT_CHANGED are declared in §7.6 but the renderer has no interaction path that can originate them.
+
+- **Why:** RendererAppKit/SemanticInteraction.swift models only activate, valueChanged, selectionChanged and textEdit. A required-tier widget can therefore never emit the disclosure or viewport events the registry declares for it.
+- **Owner:** unowned — needs a SemanticInteraction case plus the AppKit outline/window wiring
+- **Closure probe:** `client-macos/RendererAppKit/SemanticInteraction.swift` matching `case +(expansionChanged|viewportChanged)`

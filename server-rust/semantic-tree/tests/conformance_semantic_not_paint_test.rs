@@ -18,23 +18,18 @@ mod common;
 
 use srui_semantic_tree::*;
 
-/// Suite 3 declares its vectors in the manifest; assert they are present and count-pinned.
+/// Replays suite 3's vectors through the same engine suite 1 uses.
 ///
-/// The vector bodies themselves are replayed by the suite 1 runner's fixture engine, which is
-/// shared; this test guarantees the fixture cannot silently vanish from the tree.
+/// The fixture moved here from the state-machine directory, so it must still be *executed*:
+/// parsing it and checking that `expected_outcome` exists would let the relocated vector rot
+/// while both suites reported green.
 #[test]
-fn test_semantic_not_paint_vectors_present() {
+fn test_semantic_not_paint_vectors_replay() {
     let vectors = common::suite_vectors(3);
+    assert!(!vectors.is_empty(), "suite 3 declares no vectors");
     for path in &vectors {
-        let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Failed to read suite 3 vector {:?}: {}", path, e));
-        let parsed: serde_json::Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("Suite 3 vector {:?} is not valid JSON: {}", path, e));
-        assert!(
-            parsed.get("expected_outcome").is_some(),
-            "Suite 3 vector {:?} is missing 'expected_outcome'",
-            path
-        );
+        println!("  -> Replaying fixture: {:?}", path.file_name().unwrap());
+        common::fixture_replay::replay_fixture(path);
     }
 }
 

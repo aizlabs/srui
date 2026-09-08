@@ -112,9 +112,7 @@
     {
       "node": "Scroll",
       "tier": "required",
-      "allowed": [
-        "VIEWPORT_CHANGED"
-      ],
+      "allowed": [],
       "forbidden": [
         "POINTER_CANCEL",
         "POINTER_DOWN",
@@ -357,9 +355,7 @@
     {
       "node": "Menu",
       "tier": "deferred",
-      "allowed": [
-        "ACTIVATE"
-      ],
+      "allowed": [],
       "forbidden": [
         "POINTER_CANCEL",
         "POINTER_DOWN",
@@ -371,9 +367,7 @@
     {
       "node": "Toolbar",
       "tier": "deferred",
-      "allowed": [
-        "ACTIVATE"
-      ],
+      "allowed": [],
       "forbidden": [
         "POINTER_CANCEL",
         "POINTER_DOWN",

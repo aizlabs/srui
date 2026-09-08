@@ -7,6 +7,7 @@ runner, so a malformed manifest or a stale generated fixture fails in seconds.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,50 @@ def test_every_gap_documents_a_reason_and_owning_task(manifest: dict) -> None:
             assert gap.get("scenario"), f"suite {suite['id']} gap has no scenario"
             assert gap.get("reason"), f"suite {suite['id']} gap has no reason"
             assert gap.get("future_task"), f"suite {suite['id']} gap has no future_task"
+
+
+def test_every_gap_carries_a_closure_probe(manifest: dict) -> None:
+    """A gap with no probe can be silently fixed while the runner still prints GAP."""
+    for suite in manifest["suites"]:
+        for gap in suite.get("gaps", []):
+            probe = gap.get("gap_probe")
+            assert probe, (
+                f"suite {suite['id']} gap '{gap['scenario'][:60]}...' has no gap_probe"
+            )
+            assert probe.get("file") and probe.get("absent_pattern")
+            target = REPO_ROOT / probe["file"]
+            assert target.is_file(), (
+                f"suite {suite['id']} gap_probe targets {probe['file']}, which does not exist; "
+                "a probe that can never match cannot detect closure"
+            )
+            # The probe must not already match, or the gap is stale.
+            assert not re.search(probe["absent_pattern"], target.read_text(encoding="utf-8")), (
+                f"suite {suite['id']} gap_probe already matches {probe['file']}: the gap looks "
+                "closed and the manifest needs updating"
+            )
+
+
+def test_every_suite_accounts_for_both_implementations(manifest: dict) -> None:
+    """A suite must declare a runner per language, or record why that language is not applicable.
+
+    Without this, one language silently covers for the other's absence in a `both` run.
+    """
+    for suite in manifest["suites"]:
+        not_applicable = suite.get("not_applicable", {})
+        for language in ("rust", "swift"):
+            has_runner = bool(suite.get(language))
+            excused = language in not_applicable
+            assert has_runner or excused, (
+                f"suite {suite['id']} declares no {language} runner and does not record "
+                f"{language} as not applicable"
+            )
+            assert not (has_runner and excused), (
+                f"suite {suite['id']} both declares a {language} runner and calls it not applicable"
+            )
+            if excused:
+                assert not_applicable[language].strip(), (
+                    f"suite {suite['id']} must explain why {language} is not applicable"
+                )
 
 
 def test_known_gap_suites_document_their_gap(manifest: dict) -> None:

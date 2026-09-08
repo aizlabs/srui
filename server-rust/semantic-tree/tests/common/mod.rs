@@ -10,6 +10,8 @@
 
 #![allow(dead_code)]
 
+pub mod fixture_replay;
+
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};

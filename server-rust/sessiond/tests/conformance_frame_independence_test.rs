@@ -13,14 +13,20 @@
 //! from its outbound queue. That is a real, observable input, and this suite varies it across
 //! cadences equivalent to 60/120/144/240 Hz against a fixed 60-mutation stream.
 //!
+//! Assertions are anchored to the **frames the subscriber actually receives**, encoded with
+//! `encode_framed`. Comparing the journal across cadences would be circular: identical commits
+//! produce an identical journal by construction, whatever delivery does, so a journal comparison
+//! stays green even if delivery became frame-dependent.
+//!
 //! The properties asserted:
 //!
-//! 1. the committed journal is byte-identical across every drain cadence;
-//! 2. the authoritative store ends in the same state at the same revision;
-//! 3. a replica fed the delivered stream converges to that same state, even though the delivered
-//!    stream itself may be *shorter* under a slow drain because of §20.4 coalescing — which is
-//!    the point: coalescing changes local delivery pacing, never committed semantics;
-//! 4. the protocol vocabulary contains no frame or cadence concept at all.
+//! 1. a client that keeps up receives exactly the committed transaction stream, byte for byte;
+//! 2. delivered bytes are deterministic — the same mutation stream at the same cadence produces
+//!    the same frames, so no wall-clock or repaint tick can be influencing what is sent;
+//! 3. a slower cadence may only *coalesce* (§20.4), never amplify or alter, and never reaches the
+//!    authoritative history;
+//! 4. every cadence converges on the same replica state at the same revision;
+//! 5. the protocol vocabulary contains no frame or cadence concept at all.
 //!
 //! The complementary half — that a renderer's repaint count *does* vary with cadence while the
 //! wire traffic does not — lives in the Swift `FrameIndependenceConformanceTests`, because it
@@ -71,6 +77,10 @@ fn scalar_tx(base: u64, new_rev: u64, node_id: u64, value: &str) -> WireTransact
 
 struct CadenceRun {
     journal_bytes: Vec<Vec<u8>>,
+    /// Wire bytes of the frames the subscriber actually received, in delivery order. This is the
+    /// protocol traffic §32.4 is about; the journal is identical by construction for identical
+    /// commits and so proves nothing on its own.
+    delivered_bytes: Vec<Vec<u8>>,
     final_revision: u64,
     final_label: Option<srui_semantic_tree::Value>,
     node_count: usize,
@@ -105,17 +115,20 @@ fn run_at_cadence(name: &str, drain_every: u32) -> CadenceRun {
         .expect("initial tree");
 
     let mut replica = SemanticStore::new();
-    let mut delivered_count = 0usize;
+    let mut delivered_bytes: Vec<Vec<u8>> = Vec::new();
 
     let drain = |outbound: &mut srui_sessiond::OutboundReceiver,
                  replica: &mut SemanticStore,
-                 delivered_count: &mut usize| {
+                 delivered_bytes: &mut Vec<Vec<u8>>| {
         while let Some(item) = outbound
             .try_recv_class(LogicalChannelClass::Ui)
             .expect("outbound queue did not overflow")
         {
             if let Some(tx) = item.into_transaction() {
-                *delivered_count += 1;
+                // Encode exactly what would go on the wire, before applying it. This is the
+                // protocol traffic §32.4 constrains; the journal is identical by construction
+                // for identical commits and so proves nothing about delivery on its own.
+                delivered_bytes.push(encode_framed(&tx).expect("delivered frame encodes"));
                 replica
                     .apply_delivered_transaction(tx)
                     .expect("delivered transaction applies to the replica");
@@ -129,11 +142,11 @@ fn run_at_cadence(name: &str, drain_every: u32) -> CadenceRun {
             .commit_transaction(scalar_tx(rev, rev + 1, TEXT, &format!("v{i}")))
             .expect("scalar commit");
         if i % drain_every == 0 {
-            drain(&mut outbound, &mut replica, &mut delivered_count);
+            drain(&mut outbound, &mut replica, &mut delivered_bytes);
         }
     }
     // Every client eventually catches up, whatever its cadence.
-    drain(&mut outbound, &mut replica, &mut delivered_count);
+    drain(&mut outbound, &mut replica, &mut delivered_bytes);
 
     let journal_bytes = session
         .collect_replayed_transactions(0)
@@ -155,10 +168,11 @@ fn run_at_cadence(name: &str, drain_every: u32) -> CadenceRun {
 
     CadenceRun {
         journal_bytes,
+        delivered_count: delivered_bytes.len(),
+        delivered_bytes,
         final_revision,
         final_label,
         node_count,
-        delivered_count,
         replica_revision: replica.revision().get(),
         replica_label: replica
             .get_node(srui_semantic_tree::NodeId::new(TEXT))
@@ -167,34 +181,74 @@ fn run_at_cadence(name: &str, drain_every: u32) -> CadenceRun {
     }
 }
 
-/// The central §32.4 assertion: identical mutations produce byte-identical protocol traffic no
-/// matter how fast the client reads.
+/// The central §32.4 assertion, stated over the frames the client actually receives.
+///
+/// A client that keeps up must receive exactly the committed transaction stream, byte for byte.
+/// Comparing the *journal* across cadences would be circular — identical commits produce an
+/// identical journal by construction, whatever delivery does — so the comparison is anchored to
+/// delivered wire bytes on both sides.
 #[test]
-fn test_committed_traffic_is_byte_identical_across_drain_cadences() {
-    let baseline = run_at_cadence("frame-independence-baseline", 1);
+fn test_delivered_traffic_matches_the_commit_stream_for_a_client_that_keeps_up() {
+    let eager = run_at_cadence("frame-independence-eager", 1);
+
+    assert_eq!(
+        eager.delivered_bytes.len(),
+        eager.journal_bytes.len(),
+        "an eager client received {} frames for {} commits",
+        eager.delivered_bytes.len(),
+        eager.journal_bytes.len()
+    );
+    assert_eq!(
+        eager.delivered_bytes, eager.journal_bytes,
+        "the frames delivered to a client that keeps up must be the committed transactions, \
+         byte for byte (§4.16, §32.4)"
+    );
+}
+
+/// Delivery is a pure function of the mutation stream and the drain cadence: running the same
+/// stream twice at the same cadence must produce byte-identical frames. A frame-dependent
+/// implementation — one that let wall-clock timing or a repaint tick influence what it sent —
+/// would show up here as non-determinism.
+#[test]
+fn test_delivered_traffic_is_deterministic_at_every_cadence() {
+    for (name, drain_every) in CADENCES {
+        let first = run_at_cadence(&format!("{name}-a"), *drain_every);
+        let second = run_at_cadence(&format!("{name}-b"), *drain_every);
+
+        assert_eq!(
+            first.delivered_bytes, second.delivered_bytes,
+            "cadence {name} produced different wire bytes on two identical runs; protocol \
+             traffic must depend only on semantic mutations and read cadence (§4.16, §32.4)"
+        );
+        assert_eq!(first.journal_bytes, second.journal_bytes);
+    }
+}
+
+/// Across cadences the delivered frames may legitimately differ in *count* — §20.4 coalescing
+/// compacts scalar deltas behind a slow reader — but every frame a client receives must be a
+/// frame the server could have committed, and the stream must still end on the same revision.
+#[test]
+fn test_slower_cadences_only_coalesce_and_never_invent_traffic() {
+    let eager = run_at_cadence("frame-independence-baseline", 1);
 
     for (name, drain_every) in CADENCES {
         let run = run_at_cadence(name, *drain_every);
 
-        assert_eq!(
-            run.journal_bytes.len(),
-            baseline.journal_bytes.len(),
-            "cadence {name} committed {} transactions, baseline committed {}",
-            run.journal_bytes.len(),
-            baseline.journal_bytes.len()
+        assert!(
+            run.delivered_bytes.len() <= eager.delivered_bytes.len(),
+            "cadence {name} received more frames ({}) than an eager client ({}); a slower \
+             reader may coalesce, never amplify",
+            run.delivered_bytes.len(),
+            eager.delivered_bytes.len()
         );
         assert_eq!(
-            run.journal_bytes, baseline.journal_bytes,
-            "cadence {name} produced different wire bytes than the baseline; committed protocol \
-             traffic must not depend on client refresh rate (§4.16, §32.4)"
+            run.journal_bytes, eager.journal_bytes,
+            "cadence {name} changed what the server committed; read cadence must not reach the \
+             authoritative history (§12.2)"
         );
-        assert_eq!(
-            run.final_revision, baseline.final_revision,
-            "cadence {name} ended on revision {} rather than {}",
-            run.final_revision, baseline.final_revision
-        );
-        assert_eq!(run.final_label, baseline.final_label);
-        assert_eq!(run.node_count, baseline.node_count);
+        assert_eq!(run.final_revision, eager.final_revision);
+        assert_eq!(run.final_label, eager.final_label);
+        assert_eq!(run.node_count, eager.node_count);
     }
 }
 

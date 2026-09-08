@@ -99,4 +99,90 @@ struct WidgetSemanticsConformanceTests {
             }
         }
     }
+
+    // MARK: - Event/state meaning, exercised rather than described (§32.2)
+
+    /// §7.6: a Button press means ACTIVATE and nothing else — no value, no coordinates.
+    @Test
+    func buttonActivationEmitsActivateWithoutPayload() throws {
+        let factory = ControlFactory()
+        var emitted: [SemanticInteraction] = []
+        factory.onInteraction = { emitted.append($0) }
+
+        let handle = try factory.makeHandle(for: Node(id: 10, nodeType: .button))
+        let button = try #require(handle.view as? NSButton)
+        let trampoline = try #require(handle.actionTrampoline as? ActionTrampoline)
+        trampoline.performButtonAction(button)
+
+        #expect(emitted == [.activate(nodeID: 10)])
+    }
+
+    /// §7.6: a Toggle reports its new boolean *state*, not the fact that it was clicked.
+    @Test
+    func toggleEmitsBooleanValueChangeReflectingState() throws {
+        let factory = ControlFactory()
+        var emitted: [SemanticInteraction] = []
+        factory.onInteraction = { emitted.append($0) }
+
+        let handle = try factory.makeHandle(for: Node(id: 11, nodeType: .toggle))
+        let toggle = try #require(handle.view as? NSButton)
+        let trampoline = try #require(handle.actionTrampoline as? ActionTrampoline)
+
+        toggle.state = .on
+        trampoline.performToggleAction(toggle)
+        toggle.state = .off
+        trampoline.performToggleAction(toggle)
+
+        #expect(
+            emitted == [
+                .valueChanged(nodeID: 11, value: .bool(true)),
+                .valueChanged(nodeID: 11, value: .bool(false)),
+            ],
+            "Toggle must report the resulting state each time (§7.6)")
+    }
+
+    /// §7.4 / §27: a disabled widget originates nothing. Authorization is part of the widget's
+    /// meaning, not a detail of the transport.
+    @Test
+    func disabledWidgetsOriginateNoInteraction() throws {
+        let factory = ControlFactory()
+        var emitted: [SemanticInteraction] = []
+        factory.onInteraction = { emitted.append($0) }
+
+        let handle = try factory.makeHandle(
+            for: Node(id: 12, nodeType: .button, properties: [(.enabled, .bool(false))]))
+        let button = try #require(handle.view as? NSButton)
+
+        #expect(button.isEnabled == false, "a disabled Button must not be clickable (§7.4)")
+        #expect(emitted.isEmpty)
+    }
+
+    /// The emissions the registry declares must each have a `SemanticInteraction` case capable of
+    /// carrying them. This is what turns the declared matrix into a statement about behaviour.
+    ///
+    /// ## Two declared emissions currently have no interaction path, and the manifest says so
+    ///
+    /// `SemanticInteraction` models activate / valueChanged / selectionChanged / textEdit only.
+    /// §7.6 also assigns `EXPANSION_CHANGED` to `Tree` and `VIEWPORT_CHANGED` to `Surface`, both
+    /// required-tier, and the renderer has no case that can originate either. Rather than
+    /// weakening the matrix to match, the defect is pinned here and recorded as a suite 2 gap
+    /// with a probe on `SemanticInteraction.swift`; when a case is added, this inverts.
+    @Test
+    func everyDeclaredEmissionHasAnInteractionPath() throws {
+        let matrix = try ConformanceFixtures.widgetMatrix()
+
+        let carriedByInteraction: Set<String> = [
+            "ACTIVATE", "VALUE_CHANGED", "SELECTION_CHANGED", "TEXT_EDIT",
+        ]
+        let unroutable = matrix.nodeTypes
+            .filter { $0.expectConstructible }
+            .flatMap { row in row.emits.map { "\(row.name).\($0)" } }
+            .filter { pair in !carriedByInteraction.contains(pair.split(separator: ".").last.map(String.init) ?? "") }
+            .sorted()
+
+        #expect(
+            unroutable == ["Surface.VIEWPORT_CHANGED", "Tree.EXPANSION_CHANGED"],
+            "the set of required-tier emissions with no renderer interaction path changed: \(unroutable). Update the suite 2 gap in protocol/conformance-vectors/suites/manifest.json to match."
+        )
+    }
 }

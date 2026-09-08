@@ -2899,6 +2899,7 @@ public final class SessionController: @unchecked Sendable {
             sessionIncarnation: sessionIncarnation,
             clientInstanceId: ClientInstanceId(ack.clientInstanceID),
             eventId: eventId,
+            settledEventSeq: ack.settledEventSeq == 0 ? nil : ack.settledEventSeq,
             throughSeq: ack.lastProcessedEventSeq,
             sessionId: ack.sessionID,
             revisionAfterEffect: ack.revisionAfterEffect,

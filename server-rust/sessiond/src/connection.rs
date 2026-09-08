@@ -927,6 +927,7 @@ fn build_event_ack(
         revision_after_effect,
         reject_reason: crate::session::bound_diagnostic_string(reject_reason, max_string_length),
         session_id,
+        settled_event_seq: event.event_seq,
     })
 }
 
@@ -944,6 +945,31 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    #[test]
+    fn rejected_ack_names_oversized_event_sequence_without_reflecting_identifier() {
+        let event = srui_protocol::Event {
+            client_instance_id: b"oversized-client".to_vec(),
+            event_seq: 2,
+            event_id: vec![0x41; srui_semantic_tree::MAX_EVENT_ID_BYTES + 1],
+            ..Default::default()
+        };
+        let outcome = EventOutcome::Rejected {
+            error: srui_semantic_tree::EventValidationError::PolicyRejected(
+                "event_id exceeds limit".to_owned(),
+            ),
+            revision_after_effect: 0,
+            last_processed_event_seq: 0,
+        };
+
+        let ack = build_event_ack(&event, &outcome, 256, "session-a".to_owned())
+            .expect("terminal rejection must produce an acknowledgement");
+
+        assert_eq!(ack.settled_event_seq, event.event_seq);
+        assert_eq!(ack.last_processed_event_seq, 0);
+        assert_ne!(ack.event_id, event.event_id);
+        assert!(ack.event_id.len() <= srui_semantic_tree::MAX_EVENT_ID_BYTES);
     }
 
     fn overflow_client_queue(session: &Session) {

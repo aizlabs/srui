@@ -541,6 +541,7 @@ fn create_authored_event_ack() -> SruiMessage {
             revision_after_effect: 1843,
             reject_reason: String::new(),
             session_id: "s-91c".to_string(),
+            settled_event_seq: 593,
         })),
     }
 }
@@ -614,6 +615,10 @@ fn test_decode_golden_event_ack_against_expected_json() {
             // §18.2: the settling incarnation is required, so the oracle carries a real one.
             assert_eq!(ack.session_id, expected["session_id"].as_str().unwrap());
             assert!(!ack.session_id.is_empty());
+            assert_eq!(
+                ack.settled_event_seq,
+                expected["settled_event_seq"].as_u64().unwrap()
+            );
         }
         other => panic!("Expected ServerEventAck in framed message, got {:?}", other),
     }

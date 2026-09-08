@@ -2199,7 +2199,7 @@ public nonisolated struct Srui_Protocol_PendingTextEditRef: Sendable {
 /// Server acknowledgement settling exactly one client event (§18, §18.2, §19.2).
 ///
 /// The dedupe cache keyed on (client_instance_id, event_id) is the *idempotency*
-/// mechanism; this ack selectively settles event_id. The client raises
+/// mechanism; this ack selectively settles settled_event_seq. The client raises
 /// `ClientResume.last_acked_event_seq` only across a contiguous settled prefix.
 public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
@@ -2208,7 +2208,7 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
 
   public var clientInstanceID: Data = Data()
 
-  /// The event this ack settles (§18.2)
+  /// Normally echoes the event ID. A rejection of an oversized ID carries a bounded marker instead.
   public var eventID: Data = Data()
 
   /// Highest contiguous settled event_seq (§18.2)
@@ -2224,6 +2224,9 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
 
   /// Non-empty; incarnation that produced this acknowledgement (§18, §18.2)
   public var sessionID: String = String()
+
+  /// Exact positive sequence slot settled by this ack. Zero means a legacy sender omitted the field.
+  public var settledEventSeq: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -4520,7 +4523,7 @@ nonisolated extension Srui_Protocol_PendingTextEditRef: SwiftProtobuf.Message, S
 
 nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerEventAck"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_id\0\u{3}last_processed_event_seq\0\u{1}status\0\u{3}revision_after_effect\0\u{3}reject_reason\0\u{3}session_id\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_id\0\u{3}last_processed_event_seq\0\u{1}status\0\u{3}revision_after_effect\0\u{3}reject_reason\0\u{3}session_id\0\u{3}settled_event_seq\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4535,6 +4538,7 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.revisionAfterEffect) }()
       case 6: try { try decoder.decodeSingularStringField(value: &self.rejectReason) }()
       case 7: try { try decoder.decodeSingularStringField(value: &self.sessionID) }()
+      case 8: try { try decoder.decodeSingularUInt64Field(value: &self.settledEventSeq) }()
       default: break
       }
     }
@@ -4562,6 +4566,9 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
     if !self.sessionID.isEmpty {
       try visitor.visitSingularStringField(value: self.sessionID, fieldNumber: 7)
     }
+    if self.settledEventSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.settledEventSeq, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4573,6 +4580,7 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
     if lhs.revisionAfterEffect != rhs.revisionAfterEffect {return false}
     if lhs.rejectReason != rhs.rejectReason {return false}
     if lhs.sessionID != rhs.sessionID {return false}
+    if lhs.settledEventSeq != rhs.settledEventSeq {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

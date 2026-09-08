@@ -482,6 +482,7 @@ final class SRUITests: XCTestCase {
         ack.revisionAfterEffect = 1843
         ack.rejectReason = ""
         ack.sessionID = "s-91c"
+        ack.settledEventSeq = 593
 
         var msg = Srui_Protocol_SruiMessage()
         msg.serverEventAck = ack
@@ -525,6 +526,7 @@ final class SRUITests: XCTestCase {
         // §18.2: the settling incarnation is required, so the oracle carries a real one.
         XCTAssertEqual(ack.sessionID, expected["session_id"] as? String ?? "<missing>")
         XCTAssertFalse(ack.sessionID.isEmpty)
+        XCTAssertEqual(ack.settledEventSeq, UInt64(expected["settled_event_seq"] as? Int ?? -1))
 
         // 3. Re-encode and verify identical wire bytes
         let roundtripData = try SRUIFraming.encodeFramed(decoded)

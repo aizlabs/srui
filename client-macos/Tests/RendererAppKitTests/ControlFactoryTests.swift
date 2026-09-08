@@ -36,7 +36,14 @@ struct ControlFactoryTests {
             #expect(stack.edgeInsets.left == 20)
             #expect(stack.edgeInsets.bottom == 20)
             #expect(stack.edgeInsets.right == 20)
-            #expect(handle.window != nil)
+            let window = try #require(handle.window)
+            #expect(window.contentView !== stack)
+            #expect(stack.superview === window.contentView)
+            #expect(window.contentView?.autoresizingMask.contains(.width) == true)
+            #expect(window.contentView?.autoresizingMask.contains(.height) == true)
+            #expect(window.styleMask.contains(.resizable))
+            #expect(window.contentMaxSize.width == 10_000)
+            #expect(window.maxSize.width == 10_000)
             #expect(handle.modelAdapter == nil)
             #expect(handle.actionTrampoline == nil)
 
@@ -93,10 +100,17 @@ struct ControlFactoryTests {
             #expect(label.lineBreakMode == .byWordWrapping)
 
         case .richText:
-            let textView = try #require(handle.view as? NSTextView)
+            let scroll = try #require(handle.view as? NSScrollView)
+            #expect(scroll.hasVerticalScroller)
+            #expect(scroll.hasHorizontalScroller == false)
+            #expect(scroll.drawsBackground == false)
+            let textView = try #require(scroll.documentView as? NSTextView)
             #expect(textView.isEditable == false)
             #expect(textView.isSelectable)
             #expect(textView.drawsBackground == false)
+            #expect(textView.isVerticallyResizable)
+            #expect(textView.isHorizontallyResizable == false)
+            #expect(textView.textContainer?.widthTracksTextView == true)
 
         case .button:
             let button = try #require(handle.view as? NSButton)
@@ -560,9 +574,9 @@ struct ControlFactoryTests {
     }
 
     @Test
-    func unnegotiatedExtensionTypeIsRejected() {
+    func unsupportedExtensionWithoutFallbackIsRejected() {
         let typeRef = TypeRef(namespaceID: 4, localID: 1)
-        #expect(throws: ControlFactoryError.unnegotiatedTerminal(typeRef)) {
+        #expect(throws: ExtensionMountError.unsupportedExtensionWithoutFallback(typeRef)) {
             try ControlFactory().makeHandle(for: Node(id: 30, nodeType: typeRef))
         }
     }

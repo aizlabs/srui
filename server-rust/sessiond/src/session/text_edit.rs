@@ -18,8 +18,8 @@ use srui_semantic_tree::{
 
 use super::{
     bound_diagnostic_string, bounded_rejected_event_id, lock_or_recover, oversized_event_dedupe_id,
-    panic_payload_message, EventOutcome, HandlerDispatchKind, HandlerFn, Session, SessionError,
-    SessionInner,
+    panic_payload_message, EventOutcome, HandlerDispatchKind, RegisteredHandler, Session,
+    SessionError, SessionInner,
 };
 
 /// Default cap on tracked `(client_instance_id, node_id)` editor streams (§26).
@@ -789,7 +789,7 @@ struct PreparedTextEdit {
     request: TextEditRequest,
     generation: u64,
     policy: Option<TextEditPolicy>,
-    handlers: Vec<HandlerFn>,
+    handlers: Vec<RegisteredHandler>,
 }
 
 enum TextEditCommit {

@@ -6,12 +6,6 @@ import Terminal
 
 public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
-    case unnegotiatedTerminal(TypeRef)
-}
-
-/// Extension node kinds resolved from `ServerWelcome.extension_namespaces` (§15, §21).
-public enum ExtensionControlKind: Equatable, Sendable {
-    case terminal
 }
 
 /// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
@@ -62,70 +56,104 @@ public final class ControlFactory {
     public var onTerminalInput: (@MainActor (NodeId, Data) -> Void)?
     public var onTerminalResize: (@MainActor (NodeId, UInt32, UInt32, UInt32, UInt32) -> Void)?
 
-    private var extensionKinds: [TypeRef: ExtensionControlKind] = [:]
+    public let extensionMountResolver: ExtensionMountResolver
 
     public init(
         textEditingSession: TextEditingSession = TextEditingSession(),
-        terminalSession: TerminalSession = TerminalSession()
+        terminalSession: TerminalSession = TerminalSession(),
+        extensionMountResolver: ExtensionMountResolver = ExtensionMountResolver()
     ) {
         self.textEditingSession = textEditingSession
         self.terminalSession = terminalSession
+        self.extensionMountResolver = extensionMountResolver
         self.textEditingSession.onCommit = { [weak self] nodeID, text, seq, epoch in
             self?.onInteraction?(.textEdit(nodeID: nodeID, text: text, editSeq: seq, laneEpoch: epoch))
         }
     }
 
     public func registerExtension(typeRef: TypeRef, kind: ExtensionControlKind) throws {
-        guard typeRef.namespaceID != 0 else {
-            throw ControlFactoryError.unsupportedNodeType(typeRef)
-        }
-        if let existing = extensionKinds[typeRef], existing != kind {
-            throw ControlFactoryError.unsupportedNodeType(typeRef)
-        }
-        extensionKinds[typeRef] = kind
+        try extensionMountResolver.register(typeRef: typeRef, kind: kind)
     }
 
     public func resetExtensionRegistry() {
-        extensionKinds.removeAll()
+        extensionMountResolver.reset()
     }
 
     public func extensionKind(for typeRef: TypeRef) -> ExtensionControlKind? {
-        extensionKinds[typeRef]
+        extensionMountResolver.extensionKind(for: typeRef)
     }
 
     public func makeHandle(for node: Node, store: SemanticStore? = nil) throws -> RenderHandle {
+        try makeHandle(
+            for: node,
+            store: store,
+            mountDecision: extensionMountResolver.decision(for: node, in: store)
+        )
+    }
+
+    func makeHandle(
+        for node: Node,
+        store: SemanticStore?,
+        mountDecision: ExtensionMountDecision
+    ) throws -> RenderHandle {
         let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
         var textAdapter: NativeTextEditorAdapter?
 
-        if let kind = extensionKinds[node.nodeType] {
+        switch mountDecision {
+        case .native(let kind):
             switch kind {
             case .terminal:
                 let view = makeTerminalView(for: node)
                 result = (view, nil, nil, nil)
             }
-        } else if !node.nodeType.isStandard {
-            throw ControlFactoryError.unnegotiatedTerminal(node.nodeType)
-        } else {
-        switch node.nodeType {
+        case .fallback:
+            let stack = NSStackView()
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.distribution = .fill
+            stack.spacing = 8
+            result = (stack, nil, nil, nil)
+        case .rejected(let error):
+            throw error
+        case .standard:
+            switch node.nodeType {
         case .surface:
-            let contentView = NSStackView(frame: NSRect(x: 0, y: 0, width: 440, height: 320))
-            contentView.orientation = .vertical
-            contentView.alignment = .leading
-            contentView.distribution = .fill
-            contentView.spacing = 14
-            contentView.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+            let initialFrame = NSRect(x: 0, y: 0, width: 440, height: 320)
+            let surfaceView = NSStackView(frame: initialFrame)
+            surfaceView.orientation = .vertical
+            surfaceView.alignment = .leading
+            surfaceView.distribution = .fill
+            surfaceView.spacing = 14
+            surfaceView.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: 320),
+                contentRect: initialFrame,
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
             )
+            // Keep window geometry independent from the semantic stack's intrinsic fitting size.
+            // Otherwise content growth can resize the NSWindow and user resizing never reaches
+            // flexible descendants such as Terminal.
+            let windowContentView = NSView(frame: initialFrame)
+            windowContentView.autoresizingMask = [.width, .height]
+            window.contentView = windowContentView
+            // Semantic minimum-size constraints may raise the window's fitting minimum, but they
+            // must never collapse its maximum to that same value. Keep both resize axes open.
+            window.contentMaxSize = NSSize(width: 10_000, height: 10_000)
+            window.maxSize = NSSize(width: 10_000, height: 10_000)
+            surfaceView.translatesAutoresizingMaskIntoConstraints = false
+            windowContentView.addSubview(surfaceView)
+            NSLayoutConstraint.activate([
+                surfaceView.leadingAnchor.constraint(equalTo: windowContentView.leadingAnchor),
+                surfaceView.trailingAnchor.constraint(equalTo: windowContentView.trailingAnchor),
+                surfaceView.topAnchor.constraint(equalTo: windowContentView.topAnchor),
+                surfaceView.bottomAnchor.constraint(equalTo: windowContentView.bottomAnchor),
+            ])
             // RenderHandle keeps a strong reference and LayoutRenderer.tearDown() closes the
             // window on remount; AppKit's default would then release it a second time.
             window.isReleasedWhenClosed = false
-            window.contentView = contentView
             window.center()
-            result = (contentView, window, nil, nil)
+            result = (surfaceView, window, nil, nil)
 
         case .row:
             let stack = NSStackView()
@@ -167,13 +195,26 @@ public final class ControlFactory {
             result = (label, nil, nil, nil)
 
         case .richText:
+            let scrollView = NSScrollView(frame: .zero)
+            scrollView.hasVerticalScroller = true
+            scrollView.hasHorizontalScroller = false
+            scrollView.drawsBackground = false
             let textView = NSTextView(frame: .zero)
             textView.isEditable = false
             textView.isSelectable = true
             textView.drawsBackground = false
+            textView.isVerticallyResizable = true
+            textView.isHorizontallyResizable = false
+            textView.autoresizingMask = [.width]
+            textView.textContainer?.widthTracksTextView = true
+            textView.textContainer?.containerSize = NSSize(
+                width: 0,
+                height: CGFloat.greatestFiniteMagnitude
+            )
             textView.textContainerInset = NSSize(width: 0, height: 4)
-            textView.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
-            result = (textView, nil, nil, nil)
+            scrollView.documentView = textView
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
+            result = (scrollView, nil, nil, nil)
 
         case .button:
             let button = NSButton(title: "Button", target: nil, action: nil)
@@ -304,7 +345,7 @@ public final class ControlFactory {
         node.propertyEntries.sorted { $0.0 < $1.0 }
     }
 
-    /// Editors with a canonical `.value` ignore `.text` so incremental and full applies agree.
+    /// Returns whether canonical editor `.value` should suppress the legacy `.text` fallback.
     public static func shouldSkipTextFallback(for handle: RenderHandle, node: Node) -> Bool {
         handle.textAdapter != nil && node.getProperty(.value) != nil
     }
@@ -499,12 +540,14 @@ public final class ControlFactory {
             applyAlignment(to: handle)
 
         case .grow:
-            let priority: NSLayoutConstraint.Priority = (value?.asBool ?? false) ? .defaultLow : .defaultHigh
+            let priority: NSLayoutConstraint.Priority =
+                (numericValue(value) ?? 0) > 0 ? Self.flexibleHuggingPriority : Self.rigidHuggingPriority
             handle.view.setContentHuggingPriority(priority, for: .horizontal)
             handle.view.setContentHuggingPriority(priority, for: .vertical)
 
         case .shrink:
-            let priority: NSLayoutConstraint.Priority = (value?.asBool ?? false) ? .defaultLow : .defaultHigh
+            let priority: NSLayoutConstraint.Priority =
+                (numericValue(value) ?? 0) > 0 ? .defaultLow : .defaultHigh
             handle.view.setContentCompressionResistancePriority(priority, for: .horizontal)
             handle.view.setContentCompressionResistancePriority(priority, for: .vertical)
 
@@ -700,13 +743,14 @@ public final class ControlFactory {
         let scrollView = NSScrollView(frame: .zero)
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
-
         let outlineView = NSOutlineView(frame: .zero)
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("tree"))
         column.title = "Tree"
-        column.width = 360
+        column.width = 180
+        column.minWidth = 120
+        column.resizingMask = .autoresizingMask
+        outlineView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         outlineView.addTableColumn(column)
-        outlineView.outlineTableColumn = column
         outlineView.headerView = nil
 
         let modelID = node.modelRef
@@ -731,7 +775,7 @@ public final class ControlFactory {
         outlineView.dataSource = adapter
         outlineView.delegate = adapter
         scrollView.documentView = outlineView
-        scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
+        scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
         let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
         minHeight.isActive = true
         adapter.minHeightConstraint = minHeight
@@ -779,6 +823,7 @@ public final class ControlFactory {
     private func outlineView(in handle: RenderHandle) -> NSOutlineView? {
         (handle.view as? NSScrollView)?.documentView as? NSOutlineView
     }
+
 
     private func textView(in handle: RenderHandle) -> NSTextView? {
         if let textView = handle.view as? NSTextView {
@@ -964,10 +1009,23 @@ public final class ControlFactory {
         handle.propertyConstraints[property] = constraints
     }
 
+    private static let flexibleHuggingPriority = NSLayoutConstraint.Priority(
+        rawValue: NSLayoutConstraint.Priority.defaultLow.rawValue - 1
+    )
+
+    /// Hugging for `grow == 0`. AppKit pins a window's current size in the layout engine at
+    /// `windowSizeStayPut` (500), so any content hugging above that overrules an interactive
+    /// resize and snaps the window back to its fitting size on the next layout pass. Staying
+    /// below 500 keeps `grow` a sibling-ordering hint (it still outranks
+    /// `flexibleHuggingPriority`) instead of a hard cap on the surface window.
+    private static let rigidHuggingPriority = NSLayoutConstraint.Priority(
+        rawValue: NSLayoutConstraint.Priority.windowSizeStayPut.rawValue - 1
+    )
+
     private func makeTerminalView(for node: Node) -> TerminalView {
         let view = TerminalView(nodeID: node.id)
-        view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        view.setContentHuggingPriority(.defaultLow, for: .vertical)
+        view.setContentHuggingPriority(Self.flexibleHuggingPriority, for: .horizontal)
+        view.setContentHuggingPriority(Self.flexibleHuggingPriority, for: .vertical)
         view.heightAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
         view.onInput = { [weak self] data in
             self?.onTerminalInput?(node.id, data)

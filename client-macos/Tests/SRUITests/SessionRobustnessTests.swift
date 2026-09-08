@@ -605,6 +605,22 @@ struct SessionRobustnessTests {
         welcomeMsg.serverWelcome = welcome
         await controller.handleIncomingMessage(welcomeMsg)
 
+        // The revision-zero welcome states that the new session holds nothing, so it also empties
+        // the replica: the next session rebuilds from its own revision 1 rather than continuing
+        // the abandoned one's numbering (§18).
+        #expect(applier.lastAppliedRevision == .initial)
+
+        var rebuild = SRUIMessage()
+        rebuild.transaction = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: Self.surfaceAndText("Count: 0")
+        ).toWire()
+        await controller.handleIncomingMessage(rebuild)
+
+        // A surviving `pendingResync` would take this down the snapshot path, where a nonzero
+        // `base_revision` is rejected outright — so this still fails closed on a stuck latch,
+        // exactly as the old `Revision(1) -> Revision(2)` delta did.
         var msg = SRUIMessage()
         msg.transaction = Transaction(
             baseRevision: Revision(1),

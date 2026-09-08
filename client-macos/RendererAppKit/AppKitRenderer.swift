@@ -68,6 +68,10 @@ public final class AppKitRenderer {
         controlFactory.resetExtensionRegistry()
     }
 
+    public func validateExtensionMounts(in store: SemanticStore) throws {
+        try layoutRenderer.validateExtensionMounts(in: store)
+    }
+
     public func attach(store: SemanticStore) throws {
         try layoutRenderer.mount(store: store)
     }

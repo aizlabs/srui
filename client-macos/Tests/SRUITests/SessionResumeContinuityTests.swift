@@ -987,6 +987,35 @@ struct SessionResumeContinuityTests {
         await seedServer.close()
         await server.close()
     }
+
+    /// A server that refuses a replaced incarnation — because CLIENT_RESUME cannot prove the peer
+    /// negotiated the profiles it requires — answers with nothing at all (§11.1, §15). Retaining
+    /// the session id would make every reconnect re-send the same doomed resume forever.
+    @Test("A failure with CLIENT_RESUME unanswered invalidates the resume identity")
+    func unansweredResumeFailureForcesFreshHello() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            sessionId: "replaced-incarnation",
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+        try await controller.start()
+        #expect(controller.sessionId == "replaced-incarnation")
+
+        // Any failure before RESUME_OK or RESYNC_REQUIRED answers the attempt is equivalent here.
+        var hello = SRUIClientHello()
+        hello.coreVersion = SRUICoreVersion
+        var helloMessage = SRUIMessage()
+        helloMessage.clientHello = hello
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(helloMessage))
+
+        try await AsyncTestSupport.eventually(description: "resume identity invalidated") {
+            controller.isDiverged && controller.sessionId == nil
+        }
+
+        await controller.stop()
+        await serverTransport.close()
+    }
 }
 
 /// Transport whose `send` records the frame and then suspends until the test releases it, so a

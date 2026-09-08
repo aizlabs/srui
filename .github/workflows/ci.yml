@@ -182,12 +182,12 @@ jobs:
           cargo test --workspace --all-targets
           cargo clippy --workspace --all-targets -- -D warnings
         working-directory: server-rust
-      # The pidfd termination path is cfg(target_os = "linux") and is the safety-critical remote
-      # kill path on the expected server platform, so it must be compiled, linted and tested here.
       - name: Build and test examples
         run: |
           cargo test --manifest-path ../examples/process-monitor/Cargo.toml
           cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path ../examples/coding-agent-demo/Cargo.toml
+          cargo clippy --manifest-path ../examples/coding-agent-demo/Cargo.toml --all-targets -- -D warnings
         working-directory: server-rust
 
   # libFuzzer and its sanitizers are best supported on Linux, and nothing in the decoders is
@@ -267,7 +267,9 @@ jobs:
       - name: Type-check the non-Linux process-monitor fallback
         run: cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
       - name: Build example servers for integration tests
-        run: cargo build --manifest-path examples/counter/Cargo.toml
+        run: |
+          cargo build --manifest-path examples/counter/Cargo.toml
+          cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
       # `Text` owns TextEditingSession, the toolkit-free half of native text editing (§18.3,
       # §22.6); NativeTextEditorAdapter in RendererAppKit is the only AppKit-touching half.
       # `Terminal` owns the VT parser and grid; TerminalView in RendererAppKit is the only

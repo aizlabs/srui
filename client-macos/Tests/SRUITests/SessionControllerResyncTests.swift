@@ -116,6 +116,101 @@ struct SessionControllerResyncTests {
         await serverTransport.close()
     }
 
+    @Test("Invalid extension resync is rejected before replacing the replica")
+    @MainActor
+    func invalidExtensionResyncPreservesCommittedReplica() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let failures = ResyncFailureRecorder()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "invalid-extension-resync"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+
+        let surfaceID = NodeId(1)
+        let textID = NodeId(2)
+        let initial = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(
+                    id: textID,
+                    nodeType: .text,
+                    parentID: surfaceID,
+                    properties: [(.text, .string("Retained state"))]
+                ),
+            ]
+        )
+        var initialMessage = SRUIMessage()
+        initialMessage.transaction = initial.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(initialMessage))
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "initial replica committed"
+        ) {
+            applier.lastAppliedRevision == Revision(1)
+        }
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = "invalid-extension-resync"
+        resync.snapshotRevision = 2
+        resync.reason = "force extension validation"
+        resync.continuity = .sameSession
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMessage))
+
+        let unsupportedType = TypeRef(namespaceID: 7, localID: 1)
+        let invalidSnapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [
+                .createNode(id: NodeId(10), nodeType: .surface),
+                .createNode(id: NodeId(11), nodeType: unsupportedType, parentID: NodeId(10)),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = invalidSnapshot.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        let failure = await failures.wait()
+        guard case .protocolViolation(let description) = failure else {
+            Issue.record(
+                "invalid extension snapshot must report .protocolViolation, got \(failure)"
+            )
+            await controller.stop()
+            await serverTransport.close()
+            return
+        }
+        #expect(description.contains("unsupported required extension semantics"))
+        #expect(applier.lastAppliedRevision == Revision(1))
+        let retainedStore = applier.currentSnapshot.store
+        #expect(retainedStore.getNode(textID)?.getProperty(.text) == .string("Retained state"))
+        #expect(retainedStore.getNode(NodeId(11)) == nil)
+        #expect(controller.isDiverged)
+        #expect(controller.isEventDispatchEnabled == false)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     @Test("Renderer failure during resync fails the session and releases render ownership")
     @MainActor
     func resyncRendererFailureIsTerminal() async throws {

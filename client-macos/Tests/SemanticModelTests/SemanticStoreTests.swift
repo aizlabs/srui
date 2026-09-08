@@ -31,7 +31,7 @@ final class SemanticStoreTests: XCTestCase {
             id: colID,
             nodeType: .column,
             parentID: rootID,
-            properties: [(.spacingRole, .unsignedInt(2))]
+            properties: [(.spacingRole, .enumToken(.spacingRoleTight))]
         )
 
         // 3. Create Text (#3) and Button (#4) under Column (#2)

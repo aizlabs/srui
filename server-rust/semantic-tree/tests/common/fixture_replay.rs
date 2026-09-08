@@ -179,20 +179,28 @@ fn resolve_type_ref(val: &JsonValue) -> TypeRef {
         JsonValue::String(s) => resolve_standard_node_type(s)
             .unwrap_or_else(|e| panic!("Unknown node type {}: {}", s, e)),
         JsonValue::Object(map) => {
+            // `try_from` rather than `as`: a narrowing cast would silently wrap an out-of-range
+            // fixture id into a valid-looking ref instead of failing the vector.
             let ns = map
                 .get("namespace_id")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let local = map
-                .get("local_id")
-                .and_then(|v| v.as_u64())
-                .expect("type_ref object missing numeric local_id field")
-                as u32;
+                .map_or(0, |v| {
+                    u32::try_from(v).expect("type_ref namespace_id must fit in u32")
+                });
+            let local = u32::try_from(
+                map.get("local_id")
+                    .and_then(|v| v.as_u64())
+                    .expect("type_ref object missing numeric local_id field"),
+            )
+            .expect("type_ref local_id must fit in u32");
             TypeRef::new(ns, local)
         }
         JsonValue::Number(n) => TypeRef::standard(
-            n.as_u64()
-                .expect("type_ref number must be a non-negative integer") as u32,
+            u32::try_from(
+                n.as_u64()
+                    .expect("type_ref number must be a non-negative integer"),
+            )
+            .expect("type_ref number must fit in u32"),
         ),
         other => panic!("Invalid type_ref JSON: {:?}", other),
     }
@@ -205,17 +213,23 @@ fn resolve_property_ref(val: &JsonValue) -> PropertyRef {
             let ns = map
                 .get("namespace_id")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let local = map
-                .get("local_id")
-                .and_then(|v| v.as_u64())
-                .expect("property_ref object missing numeric local_id field")
-                as u32;
+                .map_or(0, |v| {
+                    u32::try_from(v).expect("property_ref namespace_id must fit in u32")
+                });
+            let local = u32::try_from(
+                map.get("local_id")
+                    .and_then(|v| v.as_u64())
+                    .expect("property_ref object missing numeric local_id field"),
+            )
+            .expect("property_ref local_id must fit in u32");
             PropertyRef::new(ns, local)
         }
         JsonValue::Number(n) => PropertyRef::standard(
-            n.as_u64()
-                .expect("property_ref number must be a non-negative integer") as u32,
+            u32::try_from(
+                n.as_u64()
+                    .expect("property_ref number must be a non-negative integer"),
+            )
+            .expect("property_ref number must fit in u32"),
         ),
         other => panic!("Invalid property_ref JSON: {:?}", other),
     }
@@ -602,12 +616,21 @@ fn take_snapshot(store: &SemanticStore) -> StoreSnapshot {
     }
 }
 
+/// Recurses the tree, guarding against a parent/child cycle.
+///
+/// A well-formed store is acyclic, but this walks whatever a fixture produced: if a malformed or
+/// future fixture ever introduced a cycle, an unguarded recursion would blow the stack instead of
+/// failing the vector. `nodes` doubles as the visited set, since a revisited id is by definition
+/// already recorded.
 fn collect_nodes_snapshot(
     store: &SemanticStore,
     id: NodeId,
     nodes: &mut BTreeMap<NodeId, NodeSnapshot>,
 ) {
     if let Some(n) = store.get_node(id) {
+        if nodes.contains_key(&id) {
+            return;
+        }
         nodes.insert(
             id,
             (

@@ -31,7 +31,6 @@
 //! 13. selective settlement removes sequence 2 but does not cross the sequence-1 gap
 //! 14. wrong session / wrong client acknowledgements cannot settle the active outbox
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -430,14 +429,26 @@ fn scenario_10_overlapping_delivery_is_not_acknowledged_while_in_flight() {
     let session = counter_session("conformance-in-flight", SessionConfig::default());
     let client = b"client-overlap".to_vec();
 
+    // Releases the blocked handler while unwinding as well as on the happy path. Without it a
+    // failing assertion below would leave the background thread parked on the condvar forever, so
+    // the test would hang instead of reporting the failure.
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (lock, wake) = &*self.0;
+            *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+    }
+
     // The handler blocks so the first delivery is provably still dispatching when the overlapping
-    // copy arrives on another thread.
-    let started = Arc::new(AtomicBool::new(false));
+    // copy arrives on another thread. The rendezvous channel is a deterministic handshake: the
+    // handler's send completes only once the main thread receives, with no spinning.
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(0);
     let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let handler_started = Arc::clone(&started);
     let handler_release = Arc::clone(&release);
     session.on(NodeId::new(BUTTON), ACTIVATE, move |_, _| {
-        handler_started.store(true, Ordering::SeqCst);
+        let _ = started_tx.send(());
         let (lock, wake) = &*handler_release;
         let mut released = lock.lock().unwrap_or_else(|error| error.into_inner());
         while !*released {
@@ -453,9 +464,10 @@ fn scenario_10_overlapping_delivery_is_not_acknowledged_while_in_flight() {
         std::thread::spawn(move || session.process_event(&event(&client, "evt-overlap", 1, BUTTON)))
     };
 
-    while !started.load(Ordering::SeqCst) {
-        std::thread::yield_now();
-    }
+    started_rx
+        .recv()
+        .expect("handler signals that the original delivery is in flight");
+    let release_guard = ReleaseOnDrop(Arc::clone(&release));
 
     let overlapping = session
         .process_event(&event(&client, "evt-overlap", 1, BUTTON))
@@ -470,9 +482,7 @@ fn scenario_10_overlapping_delivery_is_not_acknowledged_while_in_flight() {
         "a Pending outcome must not advance the settled frontier"
     );
 
-    let (lock, wake) = &*release;
-    *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
-    wake.notify_all();
+    drop(release_guard);
 
     let settled = original
         .join()
@@ -595,6 +605,12 @@ fn scenario_14_other_clients_cannot_settle_this_clients_outbox() {
     let cross = session
         .process_event(&event(&alice, "bob-1", 1, BUTTON))
         .expect("cross-client replay");
+    assert_eq!(
+        last_seq(&cross),
+        2,
+        "settling sequence 1 must close Alice's gap and carry her frontier through the sequence 2 \
+         she had already settled"
+    );
     assert!(
         matches!(cross, EventOutcome::Processed { .. }),
         "dedupe windows are per client instance, got {cross:?}"

@@ -408,11 +408,23 @@ fn test_no_standard_property_can_carry_executable_payload() {
         }
     }
 
+    // Node type names are UpperCamelCase, so they are split on case boundaries and matched whole,
+    // exactly as the snake_case properties above are split on '_'. A raw substring test would
+    // report a future `Subscription` or `Description` as a scripting surface.
     for &(id, name) in STANDARD_NODE_TYPES {
-        let lowered = name.to_lowercase();
+        let mut words: Vec<String> = Vec::new();
+        for ch in name.chars() {
+            if ch.is_uppercase() || words.is_empty() {
+                words.push(String::new());
+            }
+            words
+                .last_mut()
+                .expect("a word is always pushed before the first character")
+                .push(ch.to_ascii_lowercase());
+        }
         for concept in ["script", "webview", "browser", "plugin", "canvas"] {
             assert!(
-                !lowered.contains(concept),
+                !words.iter().any(|word| word == concept),
                 "standard node type {id} ('{name}') implies an execution surface ('{concept}'); \
                  the base client hosts no scripting environment (§27, §4 inv. 10)"
             );

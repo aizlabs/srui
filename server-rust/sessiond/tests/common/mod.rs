@@ -305,8 +305,19 @@ pub fn client_resume(session_id: &str, last_applied: u64) -> SruiMessage {
 pub struct ResumeConnection {
     pub read: FramedRead<tokio::io::ReadHalf<tokio::io::DuplexStream>, SruiCodec>,
     pub write: FramedWrite<tokio::io::WriteHalf<tokio::io::DuplexStream>, SruiCodec>,
-    server_task: tokio::task::JoinHandle<Result<(), ConnectionError>>,
+    // `Option` so `close` can take the handle: a type implementing `Drop` cannot have fields
+    // moved out of it, and the `Drop` below is what makes a panicking test safe.
+    server_task: Option<tokio::task::JoinHandle<Result<(), ConnectionError>>>,
     shutdown: CancellationToken,
+}
+
+/// Cancels the spawned connection handler even when a test panics before reaching `close()`.
+/// Without this an assertion failure leaves the handler running until socket EOF, so one failing
+/// scenario can strand a task that later scenarios are still talking to.
+impl Drop for ResumeConnection {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 impl ResumeConnection {
@@ -324,7 +335,7 @@ impl ResumeConnection {
         Self {
             read: FramedRead::new(client_read, SruiCodec::new()),
             write: FramedWrite::new(client_write, SruiCodec::new()),
-            server_task,
+            server_task: Some(server_task),
             shutdown,
         }
     }
@@ -455,9 +466,13 @@ impl ResumeConnection {
         }
     }
 
-    pub async fn close(self) {
+    pub async fn close(mut self) {
         self.shutdown.cancel();
-        let res = self.server_task.await.expect("server task join");
+        let task = self
+            .server_task
+            .take()
+            .expect("close consumes the connection, so the task is taken exactly once");
+        let res = task.await.expect("server task join");
         assert!(res.is_ok(), "connection handler failed: {:?}", res);
     }
 }

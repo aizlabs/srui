@@ -10,6 +10,47 @@ import Foundation
 import Darwin
 #endif
 
+/// Tracks sshd processes that `launchSSHD` started and `terminate` has not yet reaped.
+///
+/// swift-testing exits the test binary as soon as the last test finishes, which can cut a `defer`
+/// in a still-unwinding test short and reliably strands a listener or two per run. They are inert
+/// once their stdio is detached, but each holds a port and a /tmp fixture directory and they
+/// accumulate across runs. `atexit` runs on that normal exit, so it is the one hook that sees
+/// every straggler regardless of which test lost the race.
+private final class SSHDRegistry: @unchecked Sendable {
+    static let shared = SSHDRegistry()
+
+    private let lock = NSLock()
+    private var pids: Set<pid_t> = []
+    private var hookInstalled = false
+
+    func add(_ pid: pid_t) {
+        lock.lock()
+        defer { lock.unlock() }
+        pids.insert(pid)
+        guard !hookInstalled else { return }
+        hookInstalled = true
+        atexit { SSHDRegistry.shared.killAll() }
+    }
+
+    /// Drops a pid the caller has already killed and waited on, so the exit hook can never signal
+    /// a number the kernel has since handed to an unrelated process.
+    func remove(_ pid: pid_t) {
+        lock.lock()
+        defer { lock.unlock() }
+        pids.remove(pid)
+    }
+
+    func killAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        for pid in pids {
+            kill(pid, SIGKILL)
+        }
+        pids.removeAll()
+    }
+}
+
 enum SSHTestSupport {
     static func findFreePort() -> UInt16 {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
@@ -99,6 +140,7 @@ enum SSHTestSupport {
             String(port),
         ]
         try sshd.run()  // stdio: detached by the shell redirection above
+        SSHDRegistry.shared.add(sshd.processIdentifier)
         return sshd
     }
 
@@ -110,9 +152,11 @@ enum SSHTestSupport {
     /// safe — Foundation has not reaped the child yet, so its pid cannot have been recycled, and
     /// signalling an already-dead pid just returns ESRCH.
     static func terminate(_ sshd: Process) {
+        let pid = sshd.processIdentifier
         sshd.terminate()
-        kill(sshd.processIdentifier, SIGKILL)
+        kill(pid, SIGKILL)
         sshd.waitUntilExit()
+        SSHDRegistry.shared.remove(pid)
     }
 
     static func generateEd25519Key(at path: String) throws {

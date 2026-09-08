@@ -45,8 +45,8 @@ const ROOT: u64 = 1;
 const TEXT: u64 = 2;
 const MUTATIONS: u32 = 60;
 
-/// Synthetic client refresh rates. The value is how many commits land between drains: a 240 Hz
-/// client reading a 60 Hz mutation stream drains every commit; a 60 Hz client drains every 4th.
+/// Synthetic client refresh rates. The value is how many commits land between drains: reading a
+/// 240 Hz mutation stream, a 240 Hz client drains every commit and a 60 Hz client every 4th.
 const CADENCES: &[(&str, u32)] = &[
     ("240Hz", 1),
     ("144Hz", 2),
@@ -342,10 +342,17 @@ fn test_protocol_envelope_carries_no_frame_or_cadence_concept() {
         | Msg::TerminalResyncRequired(_) => {}
     }
 
-    // An event acknowledgement is likewise a pure state-consistency signal.
-    let ack = ServerEventAck::default();
-    assert!(
-        ack.event_id.is_empty() && ack.revision_after_effect == 0,
-        "ServerEventAck must carry correlation and revision state only, never frame identity"
-    );
+    // An event acknowledgement is likewise a pure state-consistency signal. Destructured
+    // exhaustively rather than asserted over `default()`: every prost field defaults to empty or
+    // zero, so a value assertion would pass unchanged if a `frame_id` were added to the message.
+    // Naming every field means a new one fails to compile until this invariant is revisited.
+    let ServerEventAck {
+        client_instance_id: _,
+        event_id: _,
+        last_processed_event_seq: _,
+        status: _,
+        revision_after_effect: _,
+        reject_reason: _,
+        session_id: _,
+    } = ServerEventAck::default();
 }

@@ -183,19 +183,58 @@ fn test_events_targeting_missing_nodes_are_refused() {
 /// here and the assertion is not weakened to match the defect. When the rule lands, this
 /// `#[should_panic]` inverts and the manifest's probe on `event.rs` fails the runner if the gap
 /// is closed without the manifest being updated.
-#[test]
-#[should_panic(expected = "ordinary Standard Widget node must refuse coordinate events")]
-fn test_coordinate_events_are_refused_for_unsubscribed_standard_nodes() {
-    let (store, target) = store_with(TypeRef::BUTTON, vec![]);
+/// One test per coordinate event, not a loop: `#[should_panic]` stops at the first failing
+/// assertion, so a loop would only ever exercise `POINTER_DOWN` — and worse, would keep
+/// reporting green after a partial fix, because the second iteration panics with the same
+/// message. Split this way, each event inverts independently when it is fixed.
+macro_rules! coordinate_event_is_refused {
+    ($name:ident, $event:literal) => {
+        #[test]
+        #[should_panic(expected = "ordinary Standard Widget node must refuse coordinate events")]
+        fn $name() {
+            let (store, target) = store_with(TypeRef::BUTTON, vec![]);
+            let event = event_of(&store, target, $event);
+            assert!(
+                event.validate(&store).is_err(),
+                "an ordinary Standard Widget node must refuse coordinate events, but '{}' was \
+                 accepted against a Button (§7.7, §32.5)",
+                $event
+            );
+        }
+    };
+}
 
-    for coordinate in COORDINATE_EVENTS {
-        let event = event_of(&store, target, coordinate);
-        assert!(
-            event.validate(&store).is_err(),
-            "an ordinary Standard Widget node must refuse coordinate events, but '{coordinate}' \
-             was accepted against a Button (§7.7, §32.5)"
-        );
-    }
+coordinate_event_is_refused!(
+    test_pointer_down_is_refused_for_unsubscribed_standard_nodes,
+    "POINTER_DOWN"
+);
+coordinate_event_is_refused!(
+    test_pointer_up_is_refused_for_unsubscribed_standard_nodes,
+    "POINTER_UP"
+);
+coordinate_event_is_refused!(
+    test_pointer_move_is_refused_for_unsubscribed_standard_nodes,
+    "POINTER_MOVE"
+);
+coordinate_event_is_refused!(
+    test_pointer_cancel_is_refused_for_unsubscribed_standard_nodes,
+    "POINTER_CANCEL"
+);
+coordinate_event_is_refused!(
+    test_pointer_scroll_is_refused_for_unsubscribed_standard_nodes,
+    "POINTER_SCROLL"
+);
+
+/// The macro invocations above are hand-written, so a sixth coordinate event would otherwise
+/// gain no pinning test. This fails the moment the family changes.
+#[test]
+fn test_every_coordinate_event_has_a_pinning_test() {
+    assert_eq!(
+        COORDINATE_EVENTS.len(),
+        5,
+        "COORDINATE_EVENTS changed; add or remove a `coordinate_event_is_refused!` invocation \
+         so every §7.7 event keeps its own pinning test"
+    );
 }
 
 /// §7.6 gives each node type a defined set of events it can originate. A node with no interactive
@@ -206,20 +245,26 @@ fn test_coordinate_events_are_refused_for_unsubscribed_standard_nodes() {
 /// Same root cause as the coordinate gap above: `Event::validate` never compares event type
 /// against target node type, so `ACTIVATE` aimed at a `Text` node validates today. Pinned rather
 /// than weakened; the suite 5 gap probe on `event.rs` covers both.
-#[test]
-#[should_panic(expected = "non-interactive node must refuse ACTIVATE")]
-fn test_semantic_events_are_refused_for_incompatible_node_types() {
-    for node_type in [
-        TypeRef::TEXT,
-        TypeRef::PROGRESS,
-        TypeRef::IMAGE,
-        TypeRef::SEPARATOR,
-    ] {
-        let (store, target) = store_with(node_type, vec![]);
-        let event = Event::activate(1, "wrong-node", store.revision(), target);
-        assert!(
-            event.validate(&store).is_err(),
-            "a non-interactive node must refuse ACTIVATE, but {node_type:?} accepted it (§7.6)"
-        );
-    }
+/// Split per node type for the same reason as the coordinate tests above: under
+/// `#[should_panic]` a loop would only ever reach `Text`, and would stay green if `Text` alone
+/// were fixed.
+macro_rules! activate_is_refused_by {
+    ($name:ident, $node_type:expr) => {
+        #[test]
+        #[should_panic(expected = "non-interactive node must refuse ACTIVATE")]
+        fn $name() {
+            let node_type = $node_type;
+            let (store, target) = store_with(node_type, vec![]);
+            let event = Event::activate(1, "wrong-node", store.revision(), target);
+            assert!(
+                event.validate(&store).is_err(),
+                "a non-interactive node must refuse ACTIVATE, but {node_type:?} accepted it (§7.6)"
+            );
+        }
+    };
 }
+
+activate_is_refused_by!(test_text_refuses_activate, TypeRef::TEXT);
+activate_is_refused_by!(test_progress_refuses_activate, TypeRef::PROGRESS);
+activate_is_refused_by!(test_image_refuses_activate, TypeRef::IMAGE);
+activate_is_refused_by!(test_separator_refuses_activate, TypeRef::SEPARATOR);

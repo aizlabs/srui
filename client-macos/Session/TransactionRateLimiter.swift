@@ -112,10 +112,17 @@ struct TransactionRateLimiter: Sendable {
 
 /// Session-owned ingress gate. Waiting here keeps transport acknowledgement withheld, propagating
 /// backpressure to both live traffic and journal replay without silently dropping either.
-actor TransactionIngressGate {
+///
+/// §26 bounds the update rate *per session*, but reconnect recovery replaces the
+/// `SessionController` while continuing the same logical session. The budget therefore has to be
+/// ownable by the caller and handed to the replacement controller, exactly as `EventOutbox` and
+/// `ResourceCache` already are; a controller that constructs its own gate would hand back a full
+/// burst on every reconnect. The type is public so it can be passed across controller instances,
+/// but it has no public operations: only the owning controller drives it.
+public actor TransactionIngressGate {
     private var limiter: TransactionRateLimiter
 
-    init(limits: TransactionRateLimits = .standard) {
+    public init(limits: TransactionRateLimits = .standard) {
         self.limiter = TransactionRateLimiter(limits: limits)
     }
 

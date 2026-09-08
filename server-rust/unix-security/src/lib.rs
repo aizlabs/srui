@@ -130,6 +130,16 @@ fn open_directory_at(directory: RawFd, component: &CString) -> io::Result<OwnedF
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
+/// `Path::parent()` returns `Some("")` for a single-component relative path such as `runtime`,
+/// not `None`, so an empty parent has to be normalized to the working directory explicitly or the
+/// missing-ancestor walk stalls on a cursor it can never take a file name from.
+fn parent_or_current_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 fn resolve_intermediate_symlinks(path: &Path) -> io::Result<PathBuf> {
     if path == Path::new("/") {
         return Ok(path.to_path_buf());
@@ -153,10 +163,7 @@ fn resolve_intermediate_symlinks(path: &Path) -> io::Result<PathBuf> {
     let Some(final_name) = path.file_name() else {
         return std::fs::canonicalize(path);
     };
-    let mut cursor = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
+    let mut cursor = parent_or_current_dir(path);
     let mut missing: Vec<OsString> = Vec::new();
     let canonical_prefix = loop {
         match std::fs::symlink_metadata(&cursor) {
@@ -169,10 +176,7 @@ fn resolve_intermediate_symlinks(path: &Path) -> io::Result<PathBuf> {
                     )
                 })?;
                 missing.push(name.to_os_string());
-                cursor = cursor
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
+                cursor = parent_or_current_dir(&cursor);
             }
             Err(error) => return Err(error),
         }
@@ -552,6 +556,17 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
 
+    /// Serializes the tests that read or replace the process-wide working directory. Cargo runs
+    /// tests in threads of one process, so a concurrent `set_current_dir` would otherwise change
+    /// what a relative socket path resolves to underneath another test.
+    static WORKING_DIRECTORY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_working_directory() -> std::sync::MutexGuard<'static, ()> {
+        WORKING_DIRECTORY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn unique_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "srui-unix-security-{}-{label}-{}",
@@ -688,6 +703,7 @@ mod tests {
 
         // `bare.sock` has no parent component; it must be judged on the working directory's own
         // ownership and mode, which is a diagnosis the operator can act on.
+        let _working_directory = lock_working_directory();
         let relative = prepare_private_socket_parent(Path::new("bare.sock"), uid);
         match relative {
             Ok(parent) => assert_eq!(
@@ -703,5 +719,48 @@ mod tests {
                 "unhelpful diagnostic for a relative socket path: {error}"
             ),
         }
+    }
+
+    /// A relative socket path whose own parent components do not exist yet must be created under
+    /// the working directory. `Path::parent()` yields `Some("")` rather than `None` there, so the
+    /// missing-ancestor walk needs an explicit normalization to `.` (§27).
+    #[test]
+    fn relative_socket_parents_are_created_under_the_working_directory() {
+        let uid = effective_uid();
+        let sandbox = unique_path("relative-cwd");
+        std::fs::create_dir(&sandbox).expect("create sandbox");
+        std::fs::set_permissions(
+            &sandbox,
+            std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("restrict sandbox");
+        let _working_directory = lock_working_directory();
+        let restore = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&sandbox).expect("enter sandbox");
+
+        let single = prepare_private_socket_parent(Path::new("runtime/session.sock"), uid)
+            .expect("single missing relative component is created");
+        assert_eq!(
+            std::fs::metadata("runtime")
+                .expect("runtime metadata")
+                .mode()
+                & 0o777,
+            PRIVATE_DIRECTORY_MODE
+        );
+        drop(single);
+
+        let nested = prepare_private_socket_parent(Path::new("deep/a/b/session.sock"), uid)
+            .expect("several missing relative components are created");
+        assert_eq!(
+            std::fs::metadata("deep/a/b")
+                .expect("nested metadata")
+                .mode()
+                & 0o777,
+            PRIVATE_DIRECTORY_MODE
+        );
+        drop(nested);
+
+        std::env::set_current_dir(&restore).expect("restore working directory");
+        std::fs::remove_dir_all(&sandbox).expect("remove sandbox");
     }
 }

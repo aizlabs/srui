@@ -233,6 +233,114 @@ struct TransactionRateLimiterTests {
         await serverTransport.close()
     }
 
+    /// Reconnect recovery replaces the controller while continuing the same session (the shape
+    /// `SessionControllerResyncTests` uses: new controller, shared applier/outbox/session id). The
+    /// budget has to be handed over with them, or replacement restores a full burst per reconnect.
+    @Test("A replacement controller resuming the same session inherits the remaining budget")
+    func replacementControllerInheritsSessionBudget() async throws {
+        let capacity: UInt64 = 3
+        let limits = try #require(TransactionRateLimits(
+            sustainedTransactionsPerSecond: 1,
+            burstCapacity: capacity
+        ))
+        let gate = TransactionIngressGate(limits: limits)
+
+        func spendOneToken(on controller: SessionController, revision: UInt64) async {
+            var envelope = SRUIMessage()
+            envelope.transaction = Transaction(
+                baseRevision: Revision(revision - 1),
+                newRevision: Revision(revision),
+                operations: [.createNode(id: NodeId(revision), nodeType: .surface)]
+            ).toWire()
+            await controller.handleIncomingMessage(envelope)
+        }
+
+        let (firstClient, firstServer) = await PipeTransport.createPair()
+        let first = SessionController(
+            transport: firstClient,
+            transactionIngressGate: gate
+        )
+        try await first.start()
+        await first.handleIncomingMessage(
+            HandshakeFixtures.welcomeMessage(sessionId: "shared-budget")
+        )
+        await spendOneToken(on: first, revision: 1)
+        let remaining = await first.availableTransactionIngressCredit
+        #expect(remaining < capacity)
+        await first.stop()
+        await firstServer.close()
+
+        // The replacement continues the same session, so it must start from the spent budget.
+        let (replacementClient, replacementServer) = await PipeTransport.createPair()
+        let replacement = SessionController(
+            transport: replacementClient,
+            sessionId: "shared-budget",
+            transactionIngressGate: gate
+        )
+        #expect(await replacement.availableTransactionIngressCredit == remaining)
+
+        // A controller that is *not* given the gate is starting a new session and gets a new
+        // budget — the default has to stay correct for that case.
+        let (freshClient, freshServer) = await PipeTransport.createPair()
+        let fresh = SessionController(
+            transport: freshClient,
+            transactionRateLimits: limits
+        )
+        #expect(await fresh.availableTransactionIngressCredit == capacity)
+
+        await replacementServer.close()
+        await freshServer.close()
+    }
+
+    /// A minimal transaction costs a handful of wire bytes, so the transport's byte gate cannot
+    /// bound how many decoded transactions the ordered lane holds. Queue depth is capped too.
+    @Test("The queued transaction lane is bounded independently of the byte gate")
+    func queuedTransactionLaneIsDepthBounded() async throws {
+        // One token, refilled at 1/s: every transaction after the first parks on the lane.
+        let limits = try #require(TransactionRateLimits(
+            sustainedTransactionsPerSecond: 1,
+            burstCapacity: 1
+        ))
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            transactionRateLimits: limits
+        )
+        try await controller.start()
+        try await serverTransport.send(
+            data: try SRUIFraming.encodeFramed(
+                HandshakeFixtures.welcomeMessage(sessionId: "depth-bound")
+            )
+        )
+        try await AsyncTestSupport.eventually(description: "welcome completes") {
+            controller.isHandshakeComplete
+        }
+
+        // Well past the cap, and a tiny payload: this is the amplification being bounded.
+        let flood = 6000
+        var payload = Data()
+        for revision in 1...flood {
+            var envelope = SRUIMessage()
+            envelope.transaction = Transaction(
+                baseRevision: Revision(UInt64(revision - 1)),
+                newRevision: Revision(UInt64(revision)),
+                operations: [.createNode(id: NodeId(UInt64(revision)), nodeType: .surface)]
+            ).toWire()
+            payload.append(try SRUIFraming.encodeFramed(envelope))
+        }
+        #expect(payload.count < 1_000_000, "the flood must fit well inside the byte gate")
+        try await serverTransport.send(data: payload)
+
+        // Give the receive loop time to decode and enqueue as much as it is willing to hold.
+        try await Task.sleep(for: .milliseconds(750))
+        let queued = await controller.queuedTransactionCountForTesting
+        #expect(queued <= SessionController.maxQueuedIngressTransactionsForTesting)
+        #expect(queued < flood)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     /// Control traffic may overtake the throttled transaction lane, but a message that *replaces*
     /// the replica may not. `SERVER RESUME_OK` and `SERVER RESYNC_REQUIRED` must observe every
     /// transaction the server sent before them, or a queued transaction would be evaluated against

@@ -187,6 +187,14 @@ public final class SessionController: @unchecked Sendable {
     /// unacknowledged-byte gate remains the hard memory bound while this lane is throttled.
     private var transactionIngressTail: Task<Void, Never>?
     private var transactionIngressTasks: [UUID: Task<Void, Never>] = [:]
+    /// FIFO of queued task ids, so the receive loop can free exactly one slot at a time.
+    private var transactionIngressOrder: [UUID] = []
+    /// Maximum decoded transactions parked on the ordered lane before the receive loop blocks.
+    ///
+    /// Must exceed the server's journal replay window (`DEFAULT_MAX_JOURNAL_ENTRIES`, 1024) so a
+    /// legitimate full replay is never throttled by queue depth, while still capping the per
+    /// transaction task/UUID/dictionary overhead that the transport's byte gate cannot bound.
+    private static let maxQueuedIngressTransactions = 2048
     private var streamDecoder = SRUIMessageStreamDecoder()
     private var receiveTask: Task<Void, Never>?
     /// The handshake send is published before it can enter Transport so stop() can cancel,
@@ -309,7 +317,13 @@ public final class SessionController: @unchecked Sendable {
         sessionId: String? = nil,
         clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1],
         requiredServerProfiles: CapabilitySet = [],
-        transactionRateLimits: TransactionRateLimits = .standard
+        transactionRateLimits: TransactionRateLimits = .standard,
+        /// Inject a shared gate across reconnecting controller instances so §26's update-rate
+        /// budget stays scoped to the *session*; the default constructs a fresh budget, which is
+        /// only correct for a controller that is starting a new session rather than resuming one.
+        /// Without this, replacing the controller on reconnect hands the server a full burst again
+        /// (§26, §18).
+        transactionIngressGate: TransactionIngressGate? = nil
     ) {
         self.transport = transport
         self.applier = applier
@@ -320,7 +334,8 @@ public final class SessionController: @unchecked Sendable {
         self.currentSessionId = sessionId
         self.clientCapabilities = clientCapabilities
         self.requiredServerProfiles = requiredServerProfiles
-        self.transactionIngressGate = TransactionIngressGate(limits: transactionRateLimits)
+        self.transactionIngressGate = transactionIngressGate
+            ?? TransactionIngressGate(limits: transactionRateLimits)
     }
 
     private func withStateLock<T>(_ body: () -> T) -> T {
@@ -1396,6 +1411,13 @@ public final class SessionController: @unchecked Sendable {
                 for message in messages {
                     guard !Task.isCancelled else { break }
                     if case .transaction(let transaction)? = message.msg {
+                        // The transport's byte gate cannot bound *object* count: a minimal valid
+                        // transaction costs a handful of wire bytes, so an authenticated server
+                        // could fit hundreds of thousands of them inside the byte allowance and
+                        // materialize one task, UUID and dictionary entry for each while the lane
+                        // drains at the configured rate. Cap the queue depth as well (§26).
+                        await awaitTransactionIngressQueueCapacity()
+                        guard !Task.isCancelled else { break }
                         if let completion = await enqueueIncomingTransaction(transaction) {
                             transactionCompletions.append(completion)
                         }
@@ -1410,7 +1432,8 @@ public final class SessionController: @unchecked Sendable {
                 }
 
                 // Keep control traffic responsive while the ordered transaction lane waits for
-                // rate credit. The transport's outstanding-byte gate remains the memory bound.
+                // rate credit. Retained memory stays bounded by the transport's outstanding-byte
+                // gate together with the queue-depth cap above.
                 if transactionCompletions.isEmpty {
                     await transport.acknowledgeReceived(byteCount: chunk.count)
                 } else {
@@ -1472,6 +1495,7 @@ public final class SessionController: @unchecked Sendable {
                 )
             }
             transactionIngressTasks[taskID] = task
+            transactionIngressOrder.append(taskID)
             transactionIngressTail = task
             return task
         }
@@ -1522,9 +1546,29 @@ public final class SessionController: @unchecked Sendable {
     private func finishQueuedTransaction(_ taskID: UUID) {
         withStateLock {
             transactionIngressTasks.removeValue(forKey: taskID)
+            if let index = transactionIngressOrder.firstIndex(of: taskID) {
+                transactionIngressOrder.remove(at: index)
+            }
             if transactionIngressTasks.isEmpty {
                 transactionIngressTail = nil
             }
+        }
+    }
+
+    /// Blocks the receive loop until the ordered lane has room for one more transaction.
+    ///
+    /// Queued tasks complete in FIFO order (each awaits its predecessor), so awaiting the oldest
+    /// frees exactly one slot rather than draining the whole lane — which would reintroduce the
+    /// multi-second stall that putting transactions on their own lane exists to avoid.
+    private func awaitTransactionIngressQueueCapacity() async {
+        while true {
+            let oldest = withStateLock { () -> Task<Void, Never>? in
+                guard transactionIngressTasks.count >= Self.maxQueuedIngressTransactions,
+                      let oldestID = transactionIngressOrder.first else { return nil }
+                return transactionIngressTasks[oldestID]
+            }
+            guard let oldest else { return }
+            await oldest.value
         }
     }
 
@@ -1560,6 +1604,12 @@ public final class SessionController: @unchecked Sendable {
     /// `RESYNC_REQUIRED` that *replaces* the session starts a new budget — both already cost the
     /// server a full replica replacement. `RESUME_OK` and same-session resync retain the bucket,
     /// which refills on wall-clock time regardless of how often the connection is torn down.
+    ///
+    /// The other half of "per session" is ownership: reconnect recovery *replaces* the controller
+    /// while continuing the same session, so a caller that reconnects must hand the replacement
+    /// the same `transactionIngressGate` it gave the original, alongside the shared `outbox` and
+    /// `resourceCache`. A replacement that constructs its own gate starts at full capacity and
+    /// reopens exactly the hole this method exists to close.
     private func adoptFreshSessionIngressBudget() async {
         await transactionIngressGate.reset()
     }
@@ -1570,6 +1620,13 @@ public final class SessionController: @unchecked Sendable {
     var availableTransactionIngressCredit: UInt64 {
         get async { await transactionIngressGate.availableTokens() }
     }
+
+    /// Test seam for the queue-depth bound: decoded transactions currently parked on the lane.
+    var queuedTransactionCountForTesting: Int {
+        withStateLock { transactionIngressTasks.count }
+    }
+
+    static var maxQueuedIngressTransactionsForTesting: Int { maxQueuedIngressTransactions }
 
     /// Awaits every transaction queued before this point.
     ///
@@ -3336,6 +3393,7 @@ public final class SessionController: @unchecked Sendable {
             activeReplayRetryGeneration = nil
             let transactionTasks = Array(transactionIngressTasks.values)
             transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressOrder.removeAll(keepingCapacity: false)
             transactionIngressTail = nil
             return SessionFailureTeardownState(
                 handler: _onFailure ?? { _ in },
@@ -3527,6 +3585,7 @@ public final class SessionController: @unchecked Sendable {
         let remaining = withStateLock {
             let tasks = Array(transactionIngressTasks.values)
             transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressOrder.removeAll(keepingCapacity: false)
             transactionIngressTail = nil
             return tasks
         }
@@ -3658,6 +3717,7 @@ public final class SessionController: @unchecked Sendable {
             handshakeSendOwnership = nil
             receiveTask = nil
             transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressOrder.removeAll(keepingCapacity: false)
             transactionIngressTail = nil
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
             // mount state may survive.

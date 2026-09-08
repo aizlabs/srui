@@ -71,9 +71,9 @@ public struct EventAcknowledgementSettlement: Equatable, Sendable {
     /// Whether the controller connection that delivered the acknowledgement still owns the outbox.
     public var connectionBound: Bool
     public var bound: Bool
-    /// Event named by event_id, when it was still retained.
+    /// Event named by the acknowledgement's ID or explicit sequence slot, when still retained.
     public var event: Event?
-    /// Every event retired by the cumulative frontier or the selective event_id.
+    /// Every event retired by the cumulative frontier or selective acknowledgement.
     public var settledEvents: [Event]
 
     public static let staleConnection = EventAcknowledgementSettlement(
@@ -1139,7 +1139,7 @@ public actor EventOutbox {
         }
     }
 
-    /// Selectively acknowledges one event ID. A later sequence does not cross an earlier gap.
+    /// Selectively acknowledges one event. A later sequence does not cross an earlier gap.
     ///
     /// Private: settling an intent mutates state whose ownership depends on wire identity, so
     /// `settleAcknowledgement` is the only way in from the wire (§18.2).
@@ -1905,6 +1905,7 @@ public actor EventOutbox {
         sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
         clientInstanceId ackClientInstanceId: ClientInstanceId,
         eventId: EventId,
+        settledEventSeq: UInt64? = nil,
         throughSeq seq: UInt64,
         sessionId: String,
         revisionAfterEffect: UInt64? = nil,
@@ -1923,7 +1924,31 @@ public actor EventOutbox {
               sessionId == activeSessionId else {
             return .unbound
         }
-        let event = pendingEvents[eventId]
+        if let settledEventSeq, settledEventSeq > currentEventSeq {
+            return .unbound
+        }
+        let eventById = pendingEvents[eventId]
+        let eventBySequence = settledEventSeq.flatMap { settledSeq in
+            pendingEvents.values.first { $0.eventSeq == settledSeq }
+        }
+        let event: Event?
+        if let settledEventSeq {
+            if textEditRejected {
+                // The bounded marker for an invalid ID is not an identity key and may equal some
+                // other valid event ID. The explicit sequence is authoritative for rejections.
+                event = eventBySequence
+            } else if let eventById {
+                guard eventById.eventSeq == settledEventSeq else { return .unbound }
+                event = eventById
+            } else {
+                // A normal ack may already name an event retired by an earlier cumulative ack, but
+                // it must not use a sequence to retire a different still-pending identifier.
+                guard eventBySequence == nil else { return .unbound }
+                event = nil
+            }
+        } else {
+            event = eventById
+        }
         // The cumulative frontier is normative settlement (§18.2). Keeping covered text edits in
         // the retry set can outlive the server's bounded result record and turn replay into a
         // permanent OutsideReceiveWindow reconnect loop.
@@ -1953,7 +1978,7 @@ public actor EventOutbox {
             }
         }
 
-        acknowledgeEvent(id: eventId)
+        acknowledgeEvent(id: event?.eventId ?? eventId)
         return EventAcknowledgementSettlement(
             connectionBound: true,
             bound: true,

@@ -163,3 +163,9 @@ incarnation or by a connection that is still draining. An ack that omits it can 
 intent, so the event would stay pending forever — replayed on every retry, answered `DUPLICATE`,
 never settled — until the contiguous send window is exhausted. A client that receives one fails the
 session explicitly rather than degrading silently (§4 inv. 13).
+
+`ServerEventAck.settled_event_seq` identifies the exact positive sequence slot settled by an ack;
+`last_processed_event_seq` remains only the contiguous cumulative frontier. This distinction lets a
+`REJECTED` ack carry a bounded marker instead of reflecting an oversized `event_id` while still
+removing an out-of-order event from the retry set. Zero is accepted only as the legacy omitted
+value, in which case settlement requires an exact `event_id` match.

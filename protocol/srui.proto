@@ -483,16 +483,19 @@ enum EventAckStatus {
 // Server acknowledgement settling exactly one client event (§18, §18.2, §19.2).
 //
 // The dedupe cache keyed on (client_instance_id, event_id) is the *idempotency*
-// mechanism; this ack selectively settles event_id. The client raises
+// mechanism; this ack selectively settles settled_event_seq. The client raises
 // `ClientResume.last_acked_event_seq` only across a contiguous settled prefix.
 message ServerEventAck {
   bytes client_instance_id = 1;
-  bytes event_id = 2; // The event this ack settles (§18.2)
+  // Normally echoes the event ID. A rejection of an oversized ID carries a bounded marker instead.
+  bytes event_id = 2;
   uint64 last_processed_event_seq = 3; // Highest contiguous settled event_seq (§18.2)
   EventAckStatus status = 4;
   uint64 revision_after_effect = 5; // Store revision after side effects (Appendix B)
   string reject_reason = 6; // Diagnostic only, bounded by max_string_length (§26)
   string session_id = 7; // Non-empty; incarnation that produced this acknowledgement (§18, §18.2)
+  // Exact positive sequence slot settled by this ack. Zero means a legacy sender omitted the field.
+  uint64 settled_event_seq = 8;
 }
 
 // -----------------------------------------------------------------------------

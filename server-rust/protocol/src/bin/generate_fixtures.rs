@@ -158,6 +158,7 @@ fn main() {
             revision_after_effect: 1843,
             reject_reason: String::new(),
             session_id: "s-91c".to_string(),
+            settled_event_seq: 593,
         })),
     };
     let event_ack_bytes = encode_framed(&event_ack).expect("encode framed ServerEventAck");

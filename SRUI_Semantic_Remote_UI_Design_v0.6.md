@@ -1122,6 +1122,7 @@ SERVER EVENT_ACK
   session_id = abc
   client_instance_id = c17
   event_id = e123
+  settled_event_seq = 593
   last_processed_event_seq = 593
   status = PROCESSED
   revision_after_effect = 1843
@@ -1275,9 +1276,14 @@ Rules:
   be answered with exactly one `SERVER EVENT_ACK` on the connection that carried that delivery.
   Acks are control-class traffic (§19.2) and are never coalesced or dropped behind lower-priority
   traffic.
-- Each terminal ack is a selective acknowledgement for its `event_id`. The client removes that
-  event from its retry set even when an earlier sequence remains pending, but it MUST NOT advance
-  `last_acked_event_seq` across the gap.
+- Each terminal ack is a selective acknowledgement for its positive `settled_event_seq`. The
+  client removes the event occupying that exact sequence slot from its retry set even when an
+  earlier sequence remains pending, but it MUST NOT advance `last_acked_event_seq` across the gap.
+  A legacy ack that omits this field may still settle by an exactly matching `event_id`.
+- A valid `event_id` is echoed unchanged. If a peer sends an oversized identifier, its `REJECTED`
+  ack MUST use a bounded marker instead of reflecting the peer-controlled bytes and MUST retain the
+  original slot in `settled_event_seq`, allowing selective settlement without retaining the invalid
+  key. An ID/sequence contradiction on a non-rejected ack settles neither event.
 - `last_processed_event_seq` is the highest **contiguous** settled sequence, analogous to a TCP
   cumulative ACK; it is never merely the largest sequence observed. If sequence 2 settles while
   sequence 1 is pending, an ack for sequence 2 reports frontier 0. When sequence 1 later settles,
@@ -1285,8 +1291,8 @@ Rules:
 - A server that settles events out of order tracks the bounded set beyond the contiguous frontier.
   A client likewise tracks selectively acknowledged sequences beyond `last_acked_event_seq`.
   Either side advances its frontier only while the next sequence is known settled.
-- The ack carries the session incarnation, bound `client_instance_id`, settled `event_id`,
-  contiguous `last_processed_event_seq`, status, and `revision_after_effect` recorded in the
+- The ack carries the session incarnation, bound `client_instance_id`, settled `event_id`, exact
+  `settled_event_seq`, contiguous `last_processed_event_seq`, status, and `revision_after_effect` recorded in the
   result cache (Appendix B). A client MUST ignore an ack whose session or `client_instance_id`
   does not match its active outbox; this prevents a draining old connection from settling events
   allocated after a replacement session reset.
@@ -1297,7 +1303,7 @@ Rules:
 - `REJECTED` — refused by event validation (unknown node, disabled node, future
   `observed_revision`). This is a terminal rejection of that event, not a protocol violation.
 - An event without a stable non-empty `event_id` is a protocol error and MUST be rejected before allocating persistent per-client dedupe state.
-- Acks are optional to consume: an unknown optional status still settles its `event_id`, but never
+- Acks are optional to consume: an unknown optional status still settles its named event, but never
   authorizes the client to cross a sequence gap.
 ### 18.3 Pending text edits
 

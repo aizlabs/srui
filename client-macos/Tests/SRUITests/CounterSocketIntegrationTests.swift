@@ -19,6 +19,53 @@ import Resources
 @Suite("Counter Socket Integration Tests")
 struct CounterSocketIntegrationTests {
 
+    /// The reference consumer must publish its endpoint under the same §27 layout the daemon does:
+    /// a 0600 socket owned by the effective UID inside a 0700 parent it created itself. App authors
+    /// copy this example, so an incomplete boundary here propagates.
+    @Test("Counter publishes a 0600 socket inside a parent it creates as 0700")
+    @MainActor
+    func counterPublishesAPrivateEndpoint() async throws {
+        let repoRoot = Self.repositoryRoot()
+        let counterBinary = repoRoot
+            .appendingPathComponent("examples/counter/target/debug/counter")
+        guard FileManager.default.fileExists(atPath: counterBinary.path) else { return }
+
+        // Deliberately *not* pre-created: the server must build the private parent itself.
+        let runtimeDirectory = URL(fileURLWithPath: "/tmp/srui-counter-private-\(UUID().uuidString)")
+        let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
+        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+
+        let server = Process()
+        server.executableURL = counterBinary
+        server.arguments = ["--socket", socketPath]
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+        try server.run()
+        defer {
+            if server.isRunning { server.terminate() }
+            server.waitUntilExit()
+        }
+
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
+
+        var socketStat = stat()
+        try #require(socketPath.withCString { lstat($0, &socketStat) } == 0)
+        #expect(socketStat.st_mode & S_IFMT == S_IFSOCK)
+        #expect(socketStat.st_mode & 0o777 == 0o600)
+        #expect(socketStat.st_uid == geteuid())
+
+        var parentStat = stat()
+        try #require(runtimeDirectory.path.withCString { lstat($0, &parentStat) } == 0)
+        #expect(parentStat.st_mode & S_IFMT == S_IFDIR)
+        #expect(parentStat.st_mode & 0o777 == 0o700)
+        #expect(parentStat.st_uid == geteuid())
+
+        // A client that enforces the same rules must accept the endpoint the server published.
+        let transport = UnixSocketTransport(socketPath: socketPath)
+        try await transport.connect()
+        await transport.close()
+    }
+
     @Test("Three activate cycles over Unix socket against live counter server")
     @MainActor
     func threeActivateCyclesOverUnixSocket() async throws {

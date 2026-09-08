@@ -924,6 +924,7 @@ dependencies = [
  "futures",
  "getrandom",
  "libc",
+ "sha2",
  "srui-event-dedupe",
  "srui-journal",
  "srui-protocol",

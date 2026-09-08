@@ -21,6 +21,7 @@ srui-resources = { path = "../resources" }
 srui-pty = { path = "../pty" }
 srui-unix-security = { path = "../unix-security" }
 getrandom = "0.4"
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

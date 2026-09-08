@@ -25,6 +25,10 @@
 // - §8 / §22.7 Sparse collections: `ClientModelRangeRequest` is sent on the `.ui` lane and is
 //   not an Event. A copy arriving from the server is a protocol violation.
 // - §4 inv. 13: unrecoverable divergence fails explicitly instead of degrading silently.
+// - §26 Client attack-surface controls: inbound transactions are metered by a token bucket on
+//   their own ordered lane, so a hostile update rate propagates backpressure through the
+//   transport's unacknowledged-byte gate instead of stalling control traffic; and every wire
+//   `event_id` this controller adopts is length-checked before it becomes a retained key.
 // - §21 Terminal compatibility: `TerminalData` / `TerminalResyncRequired` update the local
 //   VT actor only. They never enter the semantic `ServerResyncRequired` path, discard
 //   pending text edits, mutate EventOutbox, reset revision, disable dispatch, or mark
@@ -185,6 +189,7 @@ public final class SessionController: @unchecked Sendable {
     private var transactionIngressTasks: [UUID: Task<Void, Never>] = [:]
     private var streamDecoder = SRUIMessageStreamDecoder()
     private var receiveTask: Task<Void, Never>?
+    /// The handshake send is published before it can enter Transport so stop() can cancel,
     /// close, and await it before admitting a restarted lifecycle.
     private var handshakeSendOwnership: HandshakeSendOwnership?
     private var isRunning = false
@@ -1393,6 +1398,11 @@ public final class SessionController: @unchecked Sendable {
                             transactionCompletions.append(completion)
                         }
                     } else {
+                        // Splitting transactions into their own lane must not let a message that
+                        // *replaces* the replica overtake transactions the server sent before it.
+                        if requiresTransactionLaneOrdering(message) {
+                            await awaitQueuedTransactionLane()
+                        }
                         await handleIncomingMessage(message)
                     }
                 }
@@ -1420,15 +1430,20 @@ public final class SessionController: @unchecked Sendable {
         // A clean EOF can arrive while final decoded transactions remain queued. Normal EOF waits
         // for them; intentional stop drains them separately under the same bounded grace period.
         if !Task.isCancelled, !withStateLock({ isStopping }) {
-            let transactionTail = withStateLock { transactionIngressTail }
-            await transactionTail?.value
+            await awaitQueuedTransactionLane()
         }
 
+        // A peer that closes cleanly finishes the stream *without* throwing (socket EOF calls
+        // `continuation.finish()`), so falling out of the loop here is the common disconnect, not a
+        // normal shutdown. Unless `stop()` asked for the teardown, this is terminal for the replica
+        // and must be reported so the caller reconnects and resumes rather than sitting on a live
+        // session with no reader (§18, §4 inv. 13).
         let stoppedIntentionally = Task.isCancelled || withStateLock { isStopping || !isRunning }
         guard !stoppedIntentionally else { return }
         await reportFailure(.transportEnded("receive stream closed by peer"))
     }
 
+    /// Places one decoded transaction on the ordered data-plane lane and returns its completion.
     ///
     /// The receive loop does not await this task, so acknowledgements and other control traffic can
     /// be consumed while rate credit refills. Public direct dispatch still awaits the returned task.
@@ -1480,11 +1495,14 @@ public final class SessionController: @unchecked Sendable {
 
         do {
             try await transactionIngressGate.waitForAdmission()
+        } catch is CancellationError {
+            // Teardown cancelled the wait. The transaction is intentionally dropped along with the
+            // rest of the connection; there is no replica to diverge from.
+            return
         } catch {
-            guard !Task.isCancelled,
-                  ownsTransactionIngressLifecycle(lifecycleGeneration) else {
-                return
-            }
+            // Anything else means the gate refused to admit an already-decoded transaction, which
+            // would silently skip a revision. That must be reported, not swallowed (§4 inv. 13).
+            guard ownsTransactionIngressLifecycle(lifecycleGeneration) else { return }
             await reportFailure(.protocolViolation(
                 "Transaction ingress admission failed: \(error)"
             ))
@@ -1507,6 +1525,40 @@ public final class SessionController: @unchecked Sendable {
             }
         }
     }
+
+    /// Whether `message` must observe every transaction the server sent before it.
+    ///
+    /// Rate-gating transactions on their own lane deliberately lets control traffic overtake them,
+    /// so the exemption has to be justified per message class:
+    ///
+    /// - `SERVER RESUME_OK` and `SERVER RESYNC_REQUIRED` *replace or rebase* the replica. Handling
+    ///   one ahead of a queued transaction would apply that transaction against a store the server
+    ///   never based it on, and its `base_revision` mismatch would force a further resync (§18).
+    /// - `SERVER EVENT_ACK` is already ordered by `revision_after_effect`: a processed ack installs
+    ///   a revision barrier and promotes successors only once transactions carry the store past it
+    ///   (§18.2), so arrival order carries no additional meaning.
+    /// - Resource metadata/chunks are keyed by resource id and guarded by an ownership epoch, and
+    ///   terminal frames are a separate logical channel (§11.1, §21). Neither is sequenced against
+    ///   the semantic revision chain.
+    private func requiresTransactionLaneOrdering(_ message: SRUIMessage) -> Bool {
+        switch message.msg {
+        case .serverResumeOk, .serverResyncRequired:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Awaits every transaction queued before this point.
+    ///
+    /// Each queued task awaits its own predecessor, so awaiting the current tail transitively
+    /// awaits the whole prefix. Only the receive loop enqueues while it is draining a chunk, so no
+    /// new predecessor can appear behind the captured tail.
+    private func awaitQueuedTransactionLane() async {
+        let tail = withStateLock { transactionIngressTail }
+        await tail?.value
+    }
+
     /// Processes a single wire envelope, dispatching on handshake phase (§12.1, §15, §22.2).
     public func handleIncomingMessage(_ message: SRUIMessage) async {
         guard let payload = message.msg else { return }
@@ -1557,6 +1609,8 @@ public final class SessionController: @unchecked Sendable {
                 }
                 do {
                     try await transactionIngressGate.waitForAdmission()
+                } catch is CancellationError {
+                    return
                 } catch {
                     await reportFailure(.protocolViolation(
                         "Transaction ingress admission failed: \(error)"
@@ -3491,7 +3545,9 @@ public final class SessionController: @unchecked Sendable {
 
         guard stoppedState.shouldStop else { return }
         stoppedState.handshakeSendTask?.cancel()
-        await retainNativeTextBeforeDisconnect(binding: stoppedState.connectionBinding)
+        await retainNativeTextBeforeDisconnect(
+            binding: stoppedState.connectionBinding
+        )
         await terminalPump.disconnect()
         stopRangeRequestPump()
         await MainActor.run {
@@ -3500,12 +3556,17 @@ public final class SessionController: @unchecked Sendable {
             self.renderer?.clearCollectionRangeTrackers()
         }
 
+        // Restart stays inadmissible until this close and receive drain complete, so the old
+        // teardown can never close a newly started attempt on the same Transport instance.
         await transport.close()
 
         if let handshakeSendTask = stoppedState.handshakeSendTask {
             _ = try? await handshakeSendTask.value
         }
         if let receiveTask = stoppedState.receiveTask {
+            // Bound the drain. `Transport` is a public protocol: a conformer whose `close()` never
+            // finishes its stream continuation would otherwise hang `stop()` forever, with no
+            // cancellation to break it.
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await receiveTask.value }
                 group.addTask {
@@ -3527,6 +3588,8 @@ public final class SessionController: @unchecked Sendable {
             await outbox.stopResumeWork(generation: replayGeneration)
         }
 
+        // An active disconnect drops only its own in-flight assemblies. A stale controller
+        // cannot clear transfers already started by a replacement cache owner.
         if let connectionBinding = stoppedState.connectionBinding {
             _ = await resourceCache.clearPartials(
                 ownerEpoch: connectionBinding.resourceOwnershipEpoch
@@ -3556,7 +3619,9 @@ public final class SessionController: @unchecked Sendable {
                 epoch: connectionBinding.resourceOwnershipEpoch
             )
         }
-        _ = clearSessionStateAfterStop(generation: stoppedState.lifecycleGeneration)
+        _ = clearSessionStateAfterStop(
+            generation: stoppedState.lifecycleGeneration
+        )
     }
 
     @discardableResult

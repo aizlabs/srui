@@ -1,4 +1,10 @@
-//! Shared Unix-account and private-socket security boundary (§25, §27).
+//! Shared Unix-account and private-socket security boundary (§27).
+//!
+//! Implements the reference deployment's per-account rules: refuse effective UID 0, require the
+//! runtime directory and socket to be owned by the effective UID with no group/other access, and
+//! require the kernel-reported peer UID to match. Mapping the SSH-authenticated account onto that
+//! effective UID is an OpenSSH/service-manager responsibility (§25); this crate only enforces the
+//! local boundary once that mapping has happened.
 
 use std::ffi::{CString, OsString};
 use std::io;
@@ -141,12 +147,12 @@ fn resolve_intermediate_symlinks(path: &Path) -> io::Result<PathBuf> {
         ));
     }
 
-    let final_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} does not name a directory", path.display()),
-        )
-    })?;
+    // `.` (a bare relative socket name) and any other parent-less form already name an existing
+    // directory. Canonicalizing it directly keeps the caller's diagnostic on the owner/mode check
+    // that actually refuses it, instead of an opaque "does not name a directory".
+    let Some(final_name) = path.file_name() else {
+        return std::fs::canonicalize(path);
+    };
     let mut cursor = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -235,7 +241,10 @@ fn open_directory_tree(path: &Path, create_missing: bool) -> io::Result<OwnedFd>
                 return Err(io::Error::new(
                     error.kind(),
                     format!(
-                        "cannot open private runtime directory {} without following symlinks: {error}",
+                        "cannot open private runtime directory {} without following symlinks \
+                         ({error}); point --socket at a per-user directory such as \
+                         $XDG_RUNTIME_DIR or $TMPDIR/srui-<uid>/, whose final component is a real \
+                         0700 directory rather than a symlink",
                         path.display()
                     ),
                 ));
@@ -308,7 +317,9 @@ impl PrivateSocketParent {
         &self.socket_path
     }
 
-    pub fn socket_identity(&self) -> io::Result<Option<SocketIdentity>> {
+    /// Stats the socket name relative to the retained directory descriptor, never by path and
+    /// never through a symlink.
+    fn stat_socket_entry(&self) -> io::Result<Option<libc::stat>> {
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         // SAFETY: the descriptor and name are live; AT_SYMLINK_NOFOLLOW inspects the exact entry.
         let result = unsafe {
@@ -327,7 +338,46 @@ impl PrivateSocketParent {
             return Err(error);
         }
         // SAFETY: successful fstatat(2) initialized stat.
-        let stat = unsafe { stat.assume_init() };
+        Ok(Some(unsafe { stat.assume_init() }))
+    }
+
+    /// Requires the entry to exist, be a socket, and be owned by this account. Deliberately does
+    /// *not* check the mode: it runs before [`Self::secure_bound_socket`] narrows a freshly bound
+    /// endpoint, where the umask-derived mode is still whatever `bind(2)` produced.
+    fn require_own_socket(&self) -> io::Result<libc::stat> {
+        let stat = self.stat_socket_entry()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not present", self.socket_path.display()),
+            )
+        })?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists and is not a Unix socket",
+                    self.socket_path.display()
+                ),
+            ));
+        }
+        if stat.st_uid != self.uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "Unix socket {} is owned by uid {}, expected uid {}",
+                    self.socket_path.display(),
+                    stat.st_uid,
+                    self.uid
+                ),
+            ));
+        }
+        Ok(stat)
+    }
+
+    pub fn socket_identity(&self) -> io::Result<Option<SocketIdentity>> {
+        let Some(stat) = self.stat_socket_entry()? else {
+            return Ok(None);
+        };
         if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -352,40 +402,34 @@ impl PrivateSocketParent {
         Ok(())
     }
 
+    /// Re-validates the parent inode through the retained descriptor and then the socket entry's
+    /// type, owner, and mode. Every check is descriptor-relative, so none of them can be answered
+    /// by a path that was re-pointed after [`prepare_private_socket_parent`] returned.
     pub fn validate_socket(&self) -> io::Result<SocketIdentity> {
         validate_directory_fd(&self.directory, &self.parent_path, self.uid)?;
-        let identity = self.socket_identity()?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{} is not present", self.socket_path.display()),
-            )
-        })?;
-
-        let mut stat = MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: socket_identity already proved this descriptor-relative entry exists.
-        if unsafe {
-            libc::fstatat(
-                self.directory.as_raw_fd(),
-                self.socket_name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful fstatat(2) initialized stat.
-        let stat = unsafe { stat.assume_init() };
+        let stat = self.require_own_socket()?;
         validate_owner_and_mode(
             &format!("Unix socket {}", self.socket_path.display()),
             self.uid,
             stat.st_uid,
             stat.st_mode,
         )?;
-        Ok(identity)
+        Ok(SocketIdentity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        })
     }
 
+    /// Narrows a freshly bound endpoint to 0600 and then validates it.
+    ///
+    /// `fchmodat` follows symlinks and cannot be told not to: `AT_SYMLINK_NOFOLLOW` is not
+    /// portable for it (Linux returns `ENOTSUP`), so a symlink planted under this name would
+    /// otherwise have its *target* relaxed to 0600. [`Self::require_own_socket`] therefore proves
+    /// the entry is this account's own socket before the mode is touched, and the full validation
+    /// afterwards fails closed if anything replaced it in between. The parent is 0700 and owned by
+    /// `uid`, so no other account can create that entry in the first place.
     pub fn secure_bound_socket(&self) -> io::Result<SocketIdentity> {
+        self.require_own_socket()?;
         // SAFETY: descriptor and name identify the entry inside the retained private directory.
         if unsafe {
             libc::fchmodat(
@@ -402,7 +446,9 @@ impl PrivateSocketParent {
     }
 
     /// Binds inside the private parent, then immediately restricts and descriptor-validates the
-    /// endpoint. The parent itself is 0700, so no other account can reach the socket during the
+    /// endpoint. The parent itself is 0700 and owned by `uid`, so no other account can reach the
+    /// socket during the window between `bind(2)` and the 0600 narrowing; a failure in either step
+    /// unlinks the half-published endpoint rather than leaving it listening (§4 inv. 13).
     pub fn bind(&self) -> io::Result<std::os::unix::net::UnixListener> {
         let listener = std::os::unix::net::UnixListener::bind(&self.socket_path)?;
         if let Err(error) = self.secure_bound_socket() {
@@ -587,8 +633,75 @@ mod tests {
         let (peer, _other) = UnixStream::pair().expect("Unix socket pair");
         assert_eq!(peer_effective_uid(&peer).expect("peer uid"), uid);
         validate_peer(&peer, uid).expect("same account peer accepted");
+        // The descriptor-based path must refuse a foreign account, not just `require_same_uid`:
+        // this is the exact call every accept loop makes (§25, §27).
+        assert_eq!(
+            validate_peer(&peer, uid.wrapping_add(1))
+                .expect_err("cross-account peer must be refused")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
 
         std::fs::remove_file(&socket).expect("remove socket");
         std::fs::remove_dir(&runtime).expect("remove runtime");
+    }
+
+    /// A shared or symlinked parent must fail with a diagnostic that names the remedy, and a
+    /// parent-less relative path must reach the owner/mode check rather than an opaque error.
+    #[test]
+    fn refused_socket_parents_explain_the_required_layout() {
+        let uid = effective_uid();
+
+        let shared = unique_path("shared");
+        std::fs::create_dir(&shared).expect("create shared directory");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755))
+            .expect("widen shared directory");
+        let shared_error = prepare_private_socket_parent(&shared.join("session.sock"), uid)
+            .expect_err("group/other-accessible parent must be refused");
+        assert_eq!(shared_error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            shared_error.to_string().contains("per-user 0700 directory"),
+            "unhelpful diagnostic: {shared_error}"
+        );
+        std::fs::remove_dir(&shared).expect("remove shared directory");
+
+        let target = unique_path("symlink-target");
+        std::fs::create_dir(&target).expect("create symlink target");
+        std::fs::set_permissions(
+            &target,
+            std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .expect("restrict symlink target");
+        let link = unique_path("symlink-parent");
+        symlink(&target, &link).expect("create parent symlink");
+        let symlink_error = prepare_private_socket_parent(&link.join("session.sock"), uid)
+            .expect_err("symlinked final parent must be refused");
+        assert!(
+            symlink_error
+                .to_string()
+                .contains("without following symlinks")
+                && symlink_error.to_string().contains("$XDG_RUNTIME_DIR"),
+            "unhelpful diagnostic: {symlink_error}"
+        );
+        std::fs::remove_file(&link).expect("remove parent symlink");
+        std::fs::remove_dir(&target).expect("remove symlink target");
+
+        // `bare.sock` has no parent component; it must be judged on the working directory's own
+        // ownership and mode, which is a diagnosis the operator can act on.
+        let relative = prepare_private_socket_parent(Path::new("bare.sock"), uid);
+        match relative {
+            Ok(parent) => assert_eq!(
+                std::fs::metadata(parent.socket_path().parent().unwrap_or(Path::new(".")))
+                    .expect("cwd metadata")
+                    .mode()
+                    & 0o077,
+                0,
+                "a relative parent is only accepted when it is genuinely private"
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("per-user 0700 directory"),
+                "unhelpful diagnostic for a relative socket path: {error}"
+            ),
+        }
     }
 }

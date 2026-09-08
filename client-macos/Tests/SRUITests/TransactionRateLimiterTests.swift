@@ -159,6 +159,92 @@ struct TransactionRateLimiterTests {
         await serverTransport.close()
     }
 
+    /// Control traffic may overtake the throttled transaction lane, but a message that *replaces*
+    /// the replica may not. `SERVER RESUME_OK` and `SERVER RESYNC_REQUIRED` must observe every
+    /// transaction the server sent before them, or a queued transaction would be evaluated against
+    /// a store the server never based it on (§18).
+    ///
+    /// The probe is a `RESUME_OK` with no outstanding resume: it is an unconditional protocol
+    /// violation, and the teardown it triggers cancels the queued lane. If the resume were
+    /// dispatched ahead of the parked transaction, that transaction would be cancelled and the
+    /// replica would stop at revision 1.
+    @Test("A replica-replacing control message waits for transactions the server sent before it")
+    func replicaReplacingControlMessageWaitsForQueuedTransactions() async throws {
+        let limits = try #require(TransactionRateLimits(
+            sustainedTransactionsPerSecond: 1,
+            burstCapacity: 1
+        ))
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            transactionRateLimits: limits
+        )
+        let failures = TransactionRateFailureLog()
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+
+        try await controller.start()
+        try await serverTransport.send(
+            data: try SRUIFraming.encodeFramed(
+                HandshakeFixtures.welcomeMessage(sessionId: "resume-ordering")
+            )
+        )
+        try await AsyncTestSupport.eventually(description: "welcome completes") {
+            controller.isHandshakeComplete
+        }
+
+        // One chunk: two transactions and the replica-replacing message. Burst capacity is 1, so
+        // the second transaction is still parked on rate credit when the resume is dispatched.
+        var combined = Data()
+        let first = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [.createNode(id: NodeId(1), nodeType: .surface)]
+        )
+        let second = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(
+                    id: NodeId(1),
+                    property: .label,
+                    value: .string("sent-before-resume")
+                ),
+            ]
+        )
+        for transaction in [first, second] {
+            var envelope = SRUIMessage()
+            envelope.transaction = transaction.toWire()
+            combined.append(try SRUIFraming.encodeFramed(envelope))
+        }
+        var resumeOK = SRUIServerResumeOk()
+        resumeOK.sessionID = "resume-ordering"
+        var resumeEnvelope = SRUIMessage()
+        resumeEnvelope.serverResumeOk = resumeOK
+        combined.append(try SRUIFraming.encodeFramed(resumeEnvelope))
+        try await serverTransport.send(data: combined)
+
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(5),
+            description: "the out-of-phase resume is refused"
+        ) {
+            await failures.contains("Unexpected SERVER RESUME_OK")
+        }
+
+        // Both transactions were sent before the resume, so both must already be applied.
+        #expect(applier.lastAppliedRevision == Revision(2))
+        #expect(
+            applier.store.node(for: NodeId(1))?.getProperty(.label)
+                == .string("sent-before-resume")
+        )
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     @Test("Control messages bypass a throttled transaction lane and reject oversized ACK IDs")
     func controlMessagesRemainResponsiveDuringThrottle() async throws {
         let limits = try #require(TransactionRateLimits(

@@ -343,6 +343,12 @@ impl TryFrom<srui_protocol::Event> for Event {
         } else {
             Some(ClientInstanceId::new(wire.client_instance_id))
         };
+        // `srui.proto` declares `event_id` non-empty, and it is the deduplication key: an absent
+        // one cannot be retried or acknowledged coherently. Swift's decoder refuses it too, so
+        // both languages reject the same wire bytes (§18.2, §4 inv. 13).
+        if wire.event_id.is_empty() {
+            return Err(WireError::MissingField("Event.event_id"));
+        }
         let event_id =
             EventId::try_new(wire.event_id).map_err(|error| WireError::EventIdTooLong {
                 actual: error.actual(),

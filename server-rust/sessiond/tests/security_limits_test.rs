@@ -63,6 +63,8 @@ fn oversized_event_id_is_settled_as_rejected_without_blocking_the_frontier() {
         }
     ));
 
+    // The internal marker is digest-bound, so replaying *this* identifier is a genuine replay and
+    // is answered from the result cache, exactly as a valid identifier would be.
     let replay = session
         .process_event(&oversized)
         .expect("replayed oversized event returns its settled outcome");
@@ -74,4 +76,59 @@ fn oversized_event_id_is_settled_as_rejected_without_blocking_the_frontier() {
             ..
         }
     ));
+}
+
+/// Two *different* oversized identifiers at one `event_seq` must not collapse onto one internal
+/// identity. A pair of valid identifiers in that position raises `SequenceAlreadyAssigned`;
+/// malformed input has to fail the same way rather than being answered `Duplicate` (§4 inv. 13).
+#[test]
+fn distinct_oversized_event_ids_at_one_sequence_do_not_coalesce() {
+    let session = Session::new("event-id-collision");
+    session
+        .transaction(|ui| {
+            Button::builder(1).create(ui)?;
+            Ok(())
+        })
+        .expect("seed interactive node");
+
+    let first = session
+        .process_event(&event(1, vec![0x41; MAX_EVENT_ID_BYTES + 1]))
+        .expect("first oversized event settles");
+    assert!(matches!(first, EventOutcome::Rejected { .. }));
+
+    let conflict = session
+        .process_event(&event(1, vec![0x42; MAX_EVENT_ID_BYTES + 9]))
+        .expect_err("a different identifier at an assigned sequence is a client protocol error");
+    assert!(
+        conflict.to_string().contains("already assigned"),
+        "expected the same conflict a pair of valid identifiers raises, got: {conflict}"
+    );
+
+    // The valid-identifier control: identical wire shape, identical outcome.
+    let session = Session::new("event-id-control");
+    session
+        .transaction(|ui| {
+            Button::builder(1).create(ui)?;
+            Ok(())
+        })
+        .expect("seed interactive node");
+    session
+        .process_event(&event(1, b"bounded-a".to_vec()))
+        .expect("first bounded event settles");
+    let valid_conflict = session
+        .process_event(&event(1, b"bounded-b".to_vec()))
+        .expect_err("distinct valid identifiers at one sequence conflict");
+    assert_eq!(valid_conflict.to_string(), conflict.to_string());
+}
+
+/// `srui.proto` declares `event_id` non-empty. Rust and Swift must refuse the same wire bytes,
+/// so an absent identifier is a decode failure rather than a zero-length deduplication key.
+#[test]
+fn wire_conversion_refuses_empty_event_id() {
+    let error = DomainEvent::try_from(event(1, Vec::new()))
+        .expect_err("an empty event_id must not construct a domain EventId");
+    assert!(
+        matches!(error, WireError::MissingField("Event.event_id")),
+        "unexpected error: {error}"
+    );
 }

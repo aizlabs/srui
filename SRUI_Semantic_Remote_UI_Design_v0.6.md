@@ -2006,7 +2006,6 @@ srui/
 │   ├── Accessibility/
 │   └── Tests/
 ├── server-rust/
-├── server-rust/
 │   ├── ssh-bridge/
 │   ├── sessiond/
 │   ├── unix-security/          # shared Unix socket ownership, mode, and peer checks
@@ -2017,6 +2016,7 @@ srui/
 │   ├── pty/
 │   ├── sdk/
 │   └── examples/
+├── sdk/
 │   └── second-language/       # early second implementation to catch Rust assumptions
 ├── examples/
 │   ├── counter/

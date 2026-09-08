@@ -675,19 +675,22 @@ impl Session {
                     limit = MAX_EVENT_ID_BYTES,
                     "settling oversized pending TEXT_EDIT event_id through a bounded identity"
                 );
-                oversized_event_dedupe_id(reference.event_seq)
+                oversized_event_dedupe_id(reference.event_seq, &reference.event_id)
             } else {
                 reference.event_id.clone()
             };
             let response_event_id = if oversized {
-                bounded_rejected_event_id(reference.event_seq)
+                bounded_rejected_event_id(reference.event_seq, &reference.event_id)
             } else {
                 reference.event_id.clone()
             };
 
-            // Check the identities the server will actually retain and return. Distinct raw
-            // oversized values at one sequence normalize to one rejection and must not silently
-            // collapse; a response-marker collision would make the discard list ambiguous.
+            // Check the identities the server will actually retain and return, not just the raw
+            // bytes. Both normalized forms are digest-bound, so distinct oversized values stay
+            // distinct; this guard catches a genuine repeat, whose intended settlement is
+            // ambiguous and would desynchronize the echoed discard list from the client's assigned
+            // set. Malformed input fails explicitly rather than being silently coalesced
+            // (§4 inv. 13).
             if !seen_dedupe_ids.insert(dedupe_event_id.clone())
                 || !seen_response_ids.insert(response_event_id.clone())
             {
@@ -926,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_resume_ids_are_bounded_and_deduplicated_after_normalization() {
+    fn pending_resume_ids_are_bounded_and_stay_distinct_after_normalization() {
         let refs = [
             srui_protocol::PendingTextEditRef {
                 event_id: vec![b'a'; MAX_EVENT_ID_BYTES + 1],
@@ -941,20 +944,33 @@ mod tests {
                 edit_seq: 2,
             },
         ];
-        let error = Session::validate_pending_text_edit_refs(&refs)
-            .expect_err("normalized oversized identities must not collapse");
+
+        let validated = Session::validate_pending_text_edit_refs(&refs)
+            .expect("distinct oversized identifiers are each settled through their own marker");
+        assert_eq!(validated.len(), 2);
+        for (validated, original) in validated.iter().zip(refs.iter()) {
+            // Neither the retained nor the echoed identity may carry the peer's bytes...
+            assert!(validated.reference.event_id.len() <= MAX_EVENT_ID_BYTES);
+            assert_ne!(validated.reference.event_id, original.event_id);
+            assert_eq!(validated.dedupe_event_id.len(), MAX_EVENT_ID_BYTES + 1);
+        }
+        // ...and two different oversized identifiers at one sequence must not collapse onto one
+        // internal identity or one echoed discard entry (§4 inv. 13).
+        assert_ne!(validated[0].dedupe_event_id, validated[1].dedupe_event_id);
+        assert_ne!(
+            validated[0].reference.event_id,
+            validated[1].reference.event_id
+        );
+
+        // A genuine repeat of one identifier is still ambiguous and still fails explicitly.
+        let repeated = [refs[0].clone(), refs[0].clone()];
+        let error = Session::validate_pending_text_edit_refs(&repeated)
+            .expect_err("a repeated oversized identifier must fail explicitly");
         assert!(matches!(
             error,
             SessionError::InvalidInput(message)
                 if message.contains("normalized event_id")
         ));
-
-        let single = Session::validate_pending_text_edit_refs(&refs[..1])
-            .expect("one oversized reference is settled through a marker");
-        assert_eq!(single.len(), 1);
-        assert!(single[0].reference.event_id.len() <= MAX_EVENT_ID_BYTES);
-        assert_ne!(single[0].reference.event_id, refs[0].event_id);
-        assert_eq!(single[0].dedupe_event_id.len(), MAX_EVENT_ID_BYTES + 1);
     }
 
     #[test]

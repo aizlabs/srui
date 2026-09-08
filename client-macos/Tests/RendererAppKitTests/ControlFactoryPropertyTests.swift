@@ -426,15 +426,23 @@ struct ControlFactoryPropertyTests {
 
         factory.apply(property: .grow, value: nil, to: handle)
         factory.apply(property: .shrink, value: nil, to: handle)
-        #expect(handle.view.contentHuggingPriority(for: .horizontal) == .defaultHigh)
-        #expect(handle.view.contentHuggingPriority(for: .vertical) == .defaultHigh)
+        // A non-growing node hugs below `windowSizeStayPut` (500) so it cannot overrule an
+        // interactive window resize, while still outranking the flexible growth priority.
+        for axis in [NSLayoutConstraint.Orientation.horizontal, .vertical] {
+            let hugging = handle.view.contentHuggingPriority(for: axis).rawValue
+            #expect(hugging < NSLayoutConstraint.Priority.windowSizeStayPut.rawValue)
+            #expect(hugging > NSLayoutConstraint.Priority.defaultLow.rawValue)
+        }
         #expect(handle.view.contentCompressionResistancePriority(for: .horizontal) == .defaultHigh)
         #expect(handle.view.contentCompressionResistancePriority(for: .vertical) == .defaultHigh)
 
         // The registry contract is float64. A wrong-family value must not accidentally opt in.
         factory.apply(property: .grow, value: .bool(true), to: handle)
         factory.apply(property: .shrink, value: .bool(true), to: handle)
-        #expect(handle.view.contentHuggingPriority(for: .horizontal) == .defaultHigh)
+        #expect(
+            handle.view.contentHuggingPriority(for: .horizontal).rawValue
+                > NSLayoutConstraint.Priority.defaultLow.rawValue
+        )
         #expect(handle.view.contentCompressionResistancePriority(for: .vertical) == .defaultHigh)
     }
 

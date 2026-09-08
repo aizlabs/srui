@@ -1040,6 +1040,56 @@ struct LayoutRendererTests {
         #expect(renderer.registry.view(for: 4) == nil)
     }
 
+    /// A `grow == 0` sibling must not veto an interactive window resize. AppKit holds the window's
+    /// current size at `windowSizeStayPut` (500), so content hugging above that snaps the window
+    /// back to its fitting width on the next layout pass — and a fill-aligned column welds every
+    /// sibling to the same width, so one over-eager hugger caps the whole surface.
+    @Test
+    func widenedSurfaceWindowSurvivesTheNextLayoutPass() throws {
+        let renderer = LayoutRenderer()
+        let store = try makeStore([
+            .createNode(
+                id: 1,
+                nodeType: .surface,
+                properties: [(.horizontalAlignment, .enumToken(.horizontalAlignmentFill))]
+            ),
+            .createNode(
+                id: 2,
+                nodeType: .column,
+                parentID: 1,
+                properties: [
+                    (.horizontalAlignment, .enumToken(.horizontalAlignmentFill)),
+                    (.grow, .float64(1)),
+                ]
+            ),
+            // grow == 0: the node that used to pin the window to its fitting width.
+            .createNode(
+                id: 3,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("Activity")), (.grow, .float64(0))]
+            ),
+            .createNode(
+                id: 4,
+                nodeType: .richText,
+                parentID: 2,
+                properties: [(.text, .string("Body")), (.grow, .float64(1))]
+            ),
+        ])
+        try renderer.mount(store: store)
+
+        let window = try #require(renderer.registry.handle(for: 1)?.window)
+        window.setContentSize(NSSize(width: 1200, height: 700))
+        // A live edge drag runs a layout pass per mouse-moved event; this is that pass.
+        window.layoutIfNeeded()
+
+        #expect(abs(window.contentLayoutRect.width - 1200) < 1)
+        let hugging = renderer.registry.view(for: 3)?
+            .contentHuggingPriority(for: .horizontal).rawValue
+        #expect((hugging ?? .greatestFiniteMagnitude)
+            < NSLayoutConstraint.Priority.windowSizeStayPut.rawValue)
+    }
+
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {
         var store = SemanticStore()
         for operation in operations {

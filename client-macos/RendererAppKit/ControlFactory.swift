@@ -541,7 +541,7 @@ public final class ControlFactory {
 
         case .grow:
             let priority: NSLayoutConstraint.Priority =
-                (numericValue(value) ?? 0) > 0 ? Self.flexibleHuggingPriority : .defaultHigh
+                (numericValue(value) ?? 0) > 0 ? Self.flexibleHuggingPriority : Self.rigidHuggingPriority
             handle.view.setContentHuggingPriority(priority, for: .horizontal)
             handle.view.setContentHuggingPriority(priority, for: .vertical)
 
@@ -1011,6 +1011,15 @@ public final class ControlFactory {
 
     private static let flexibleHuggingPriority = NSLayoutConstraint.Priority(
         rawValue: NSLayoutConstraint.Priority.defaultLow.rawValue - 1
+    )
+
+    /// Hugging for `grow == 0`. AppKit pins a window's current size in the layout engine at
+    /// `windowSizeStayPut` (500), so any content hugging above that overrules an interactive
+    /// resize and snaps the window back to its fitting size on the next layout pass. Staying
+    /// below 500 keeps `grow` a sibling-ordering hint (it still outranks
+    /// `flexibleHuggingPriority`) instead of a hard cap on the surface window.
+    private static let rigidHuggingPriority = NSLayoutConstraint.Priority(
+        rawValue: NSLayoutConstraint.Priority.windowSizeStayPut.rawValue - 1
     )
 
     private func makeTerminalView(for node: Node) -> TerminalView {

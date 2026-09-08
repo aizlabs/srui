@@ -35,11 +35,14 @@ struct WidgetSemanticsConformanceTests {
     /// outright rather than silently substituted (§4 inv. 13).
     @Test
     func rendererImplementsExactlyTheRequiredTier() throws {
-        let requiredTier: Set<TypeRef> = [
-            .surface, .row, .column, .grid, .spacer, .separator, .scroll,
-            .text, .richText, .button, .toggle, .textInput, .textArea,
-            .progress, .image, .list, .table, .tree,
-        ]
+        // Tier comes from `standardNodeTypesTable`, which generate_swift_registry.py emits from
+        // registry.yaml. Listing the required types by hand here would invert silently on a tier
+        // change: a node promoted to `required` but not yet implemented would land in the "must be
+        // refused" branch below and the suite would pass for exactly the wrong reason.
+        let requiredTier = Set(
+            standardNodeTypesTable
+                .filter { $0.tier == "required" }
+                .map { TypeRef.standard($0.id) })
         #expect(requiredTier.count == 18, "§7.3 defines 18 required-tier node types")
 
         let factory = ControlFactory()

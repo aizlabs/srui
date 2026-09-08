@@ -145,11 +145,15 @@ def generate_swift_registry(registry_path: Path, output_path: Path) -> None:
         "",
         "// MARK: - Registry Tables",
         "",
-        "public let standardNodeTypesTable: [(id: UInt32, name: String)] = [",
+        "public let standardNodeTypesTable: [(id: UInt32, name: String, tier: String)] = [",
     ]
 
+    # `tier` travels with the table so conformance suites can branch on the registry rather than
+    # on a hand-written list. A hardcoded tier set silently inverts when a node is promoted:
+    # the newly-required widget falls into the "must be refused" branch and the suite passes for
+    # the wrong reason.
     for item in node_types:
-        lines.append(f'    ({item["id"]}, "{item["name"]}"),')
+        lines.append(f'    ({item["id"]}, "{item["name"]}", "{item["tier"]}"),')
     lines.append("]")
     lines.append("")
 

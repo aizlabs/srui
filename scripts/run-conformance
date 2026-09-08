@@ -173,6 +173,19 @@ def run_command(command: list[str], timeout: int) -> tuple[bool, str]:
     if completed.returncode != 0:
         tail = (completed.stdout + completed.stderr).strip().splitlines()
         return False, "\n".join(tail[-25:]) if tail else "command failed with no output"
+
+    # `swift test --filter` takes a regular expression and exits 0 when it matches nothing,
+    # printing only a warning. Without this check, renaming or deleting a Swift test class listed
+    # in the manifest turns its suite green while exercising none of the coverage it claims —
+    # exactly the false-positive class this runner exists to eliminate.
+    output = completed.stdout + completed.stderr
+    if "No matching test cases were run" in output:
+        return False, (
+            "the runner exited 0 but executed no tests: SwiftPM reported 'No matching test cases \
+ were run'. A manifest filter no longer matches any test, so this suite was claiming coverage \
+ it never ran. Update the filter in "
+            "protocol/conformance-vectors/suites/manifest.json to the current test name."
+        )
     return True, ""
 
 

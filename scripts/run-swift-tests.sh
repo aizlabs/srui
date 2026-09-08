@@ -18,22 +18,29 @@ cd "$repo_root"
 timeout_seconds=${SRUI_TEST_TIMEOUT:-300}
 package=client-macos
 
-# Anything a test fixture starts, matched by the /tmp fixture paths the fixtures use.
-survivor_pattern='sshd_config|/tmp/srui-|target/debug/counter|srui-sessiond --socket|coding-agent-demo --socket'
+# Job control puts the test run in its own process group. Everything a fixture spawns inherits
+# that group, and — crucially — a process keeps its group when it is orphaned and reparented to
+# init. So the group is an exact handle on "processes this invocation created", which a
+# `pgrep -f` pattern is not: matching command lines would also kill another checkout's servers, a
+# developer's sshd, or a concurrent test run on the same host.
+set -m
+swift test --package-path "$package" "$@" &
+test_pid=$!
+set +m
 
-sweep_survivors() {
-    local label=$1 pids
-    pids=$(pgrep -f "$survivor_pattern" 2>/dev/null | tr '\n' ' ')
-    if [ -n "${pids// /}" ]; then
-        echo "note: killing $label test servers:$(echo " $pids" | sed 's/ *$//')" >&2
-        # shellcheck disable=SC2086
-        kill -9 $pids 2>/dev/null || true
-    fi
+# Members of our own process group only, excluding the leader.
+group_survivors() {
+    pgrep -g "$test_pid" 2>/dev/null | grep -vx "$test_pid" || true
 }
 
-# A wedge in a previous run leaves servers holding sockets and ports; clear them so this run is
-# not diagnosed for someone else's mess.
-sweep_survivors "leftover"
+reap_group() {
+    local pids
+    pids=$(group_survivors | tr '\n' ' ')
+    if [ -n "${pids// /}" ]; then
+        echo "note: killing test servers left by this run:$(echo " $pids" | sed 's/ *$//')" >&2
+        kill -9 -- "-$test_pid" 2>/dev/null || true
+    fi
+}
 
 diagnose_wedge() {
     local pid=$1
@@ -49,16 +56,15 @@ diagnose_wedge() {
     echo >&2
     echo "--- who holds swift-test's stdout/stderr pipes ---" >&2
     # lsof prints a pipe as: FD TYPE DEVICE SIZE NODE ->PEER. The holder of the write end shows the
-    # reader's PEER as its own DEVICE, so match this process's peers against every survivor's
+    # reader's PEER as its own DEVICE, so match this process's peers against each survivor's
     # device column.
     local peers
     peers=$(lsof -p "$pid" 2>/dev/null | awk '$5=="PIPE" {sub(/^->/,"",$NF); print $NF}')
     if [ -z "$peers" ]; then
         echo "  (none open — the stall is not pipe inheritance)" >&2
     else
-        local found=0 sp
-        for sp in $(pgrep -f "$survivor_pattern" 2>/dev/null); do
-            local devices peer
+        local found=0 sp devices peer
+        for sp in $(group_survivors); do
             devices=$(lsof -p "$sp" 2>/dev/null | awk '$5=="PIPE" {print $6}')
             for peer in $peers; do
                 if echo "$devices" | grep -qx "$peer"; then
@@ -68,7 +74,7 @@ diagnose_wedge() {
                 fi
             done
         done
-        [ "$found" -eq 0 ] && echo "  (no surviving test server holds them)" >&2
+        [ "$found" -eq 0 ] && echo "  (no surviving test server in this run's process group holds them)" >&2
     fi
 
     echo >&2
@@ -76,16 +82,14 @@ diagnose_wedge() {
     sample "$pid" 1 -mayDie 2>/dev/null | grep -E "^ +[0-9]+ (Thread|read|__psynch|wait4)" | head -20 >&2
 }
 
-swift test --package-path "$package" "$@" &
-test_pid=$!
-
 (
     sleep "$timeout_seconds"
     kill -0 "$test_pid" 2>/dev/null || exit 0
-    swift_test_pid=$(pgrep -x swift-test 2>/dev/null | head -1)
+    # The leader is `swift test`; the process actually parked on the pipes is the `swift-test`
+    # child it execs, so prefer that one for the stack and descriptor dump.
+    swift_test_pid=$(pgrep -g "$test_pid" -x swift-test 2>/dev/null | head -1)
     diagnose_wedge "${swift_test_pid:-$test_pid}"
-    kill -9 "$test_pid" 2>/dev/null
-    [ -n "$swift_test_pid" ] && kill -9 "$swift_test_pid" 2>/dev/null
+    kill -9 -- "-$test_pid" 2>/dev/null
 ) &
 watchdog_pid=$!
 
@@ -94,9 +98,9 @@ status=$?
 kill "$watchdog_pid" 2>/dev/null
 wait "$watchdog_pid" 2>/dev/null
 
-# Fixtures can still leak a listener when the binary exits before every `defer` completes. They are
-# harmless once their stdio is detached, but they hold ports and /tmp directories, so clear them.
-sweep_survivors "leftover"
+# Fixtures can still strand a server when the binary exits before every `defer` completes. They
+# are harmless once their stdio is detached, but they hold ports and /tmp directories.
+reap_group
 
 if [ "$status" -ne 0 ]; then
     echo "swift test failed with status $status." >&2

@@ -38,12 +38,19 @@ final class SemanticNotPaintConformanceTests: XCTestCase {
     func testNoFrameCadenceVocabulary() {
         let frameConcepts = ["frame", "vsync", "refresh_rate", "swap_chain", "present_"]
 
-        for entry in standardNodeTypesTable + standardPropertiesTable + standardOperationsTable {
-            let name = entry.name.lowercased()
+        // Projected to names first: the node type table also carries `tier`, so the three tables
+        // no longer share a tuple type and cannot be concatenated directly.
+        let registryNames =
+            standardNodeTypesTable.map(\.name)
+            + standardPropertiesTable.map(\.name)
+            + standardOperationsTable.map(\.name)
+
+        for entryName in registryNames {
+            let name = entryName.lowercased()
             for forbidden in frameConcepts {
                 XCTAssertFalse(
                     name.contains(forbidden),
-                    "Registry entry '\(entry.name)' introduces display frame cadence '\(forbidden)'; commits are state-consistency boundaries, not render frames (§4.16, §12.2, §32.3)"
+                    "Registry entry '\(entryName)' introduces display frame cadence '\(forbidden)'; commits are state-consistency boundaries, not render frames (§4.16, §12.2, §32.3)"
                 )
             }
         }

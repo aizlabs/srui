@@ -22,6 +22,12 @@ MANIFEST = REPO_ROOT / "protocol/conformance-vectors/suites/manifest.json"
 
 TRUE = [sys.executable, "-c", "raise SystemExit(0)"]
 FALSE = [sys.executable, "-c", "raise SystemExit(1)"]
+# What `swift test --filter` does when its regex matches nothing: warn, run nothing, exit 0.
+NO_TESTS = [
+    sys.executable,
+    "-c",
+    "print('warning: No matching test cases were run'); raise SystemExit(0)",
+]
 
 
 @pytest.fixture
@@ -115,6 +121,17 @@ def test_failing_runner_is_reported_without_fail_fast(manifest_backup) -> None:
     assert result.returncode == 1
     # Both failures reported: one failing suite must not hide another.
     assert result.stdout.count("FAIL") >= 2
+
+
+def test_runner_that_executes_no_tests_is_a_failure(manifest_backup) -> None:
+    """A filter matching nothing exits 0, so a renamed test would silently turn a suite green."""
+    suites = [suite(i) for i in range(1, 13)]
+    suites[3]["swift"] = [NO_TESTS]
+    write_manifest(suites)
+
+    result = run()
+    assert result.returncode == 1, "a suite that ran no tests must not report PASS"
+    assert "executed no tests" in result.stdout
 
 
 def test_open_gap_reports_gap_not_pass(manifest_backup) -> None:

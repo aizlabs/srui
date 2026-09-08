@@ -235,10 +235,147 @@ struct SessionControllerTerminalTests {
             return
         }
         #expect(message.contains("capability renegotiation"))
+        #expect(controller.sessionId == nil)
         #expect(renderer.registry.view(for: NodeId(30)) === mountedTerminal)
 
         await controller.stop()
         await serverTransport.close()
+    }
+
+    @Test("Replacement rejects loss of a client-required extension profile")
+    @MainActor
+    func replacementRejectsMissingClientRequiredProfile() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let renderer = AppKitRenderer()
+        let failures = SessionFailureRecorder()
+        let controller = SessionController(
+            transport: clientTransport,
+            renderer: renderer,
+            requiredServerProfiles: [Profile.terminalV1]
+        )
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "required-terminal"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        await controller.handleIncomingMessage(welcomeMessage)
+        #expect(controller.isHandshakeComplete)
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = "replacement-without-negotiation"
+        resync.continuity = .replaced
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        await controller.handleIncomingMessage(resyncMessage)
+
+        let failure = try #require(await failures.wait())
+        guard case .protocolViolation(let message) = failure else {
+            Issue.record("Expected protocolViolation, got \(failure)")
+            await controller.stop()
+            await serverTransport.close()
+            return
+        }
+        #expect(message.contains("client required profiles"))
+        #expect(message.contains("CLIENT_HELLO/SERVER_WELCOME"))
+        #expect(controller.sessionId == nil)
+        #expect(controller.isDiverged)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    @Test("A recreated Terminal renderer forces a fresh hello without namespace state")
+    @MainActor
+    func recreatedRendererWithoutNamespaceStateSendsFreshHello() async throws {
+        let (firstClientTransport, firstServerTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let outbox = EventOutbox()
+        let firstRenderer = AppKitRenderer()
+        let firstController = SessionController(
+            transport: firstClientTransport,
+            applier: applier,
+            outbox: outbox,
+            renderer: firstRenderer
+        )
+        firstController.attachRenderer(firstRenderer)
+        try await firstController.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "recreated-terminal-controller"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        await firstController.handleIncomingMessage(welcomeMessage)
+
+        let transaction = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: NodeId(1), nodeType: .surface),
+                .createNode(
+                    id: NodeId(30),
+                    nodeType: TypeRef(namespaceID: 3, localID: 1),
+                    parentID: NodeId(1)
+                ),
+            ]
+        )
+        var transactionMessage = SRUIMessage()
+        transactionMessage.transaction = transaction.toWire()
+        await firstController.handleIncomingMessage(transactionMessage)
+        #expect(applier.lastAppliedRevision == Revision(1))
+        await firstController.stop()
+        await firstServerTransport.close()
+
+        let (secondClientTransport, secondServerTransport) = await PipeTransport.createPair()
+        let secondRenderer = AppKitRenderer()
+        let secondController = SessionController(
+            transport: secondClientTransport,
+            applier: applier,
+            outbox: outbox,
+            renderer: secondRenderer,
+            sessionId: "recreated-terminal-controller"
+        )
+        secondController.attachRenderer(secondRenderer)
+        try await secondController.start()
+
+        let serverStream = secondServerTransport.receiveStream()
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var sentFreshHello = false
+        for try await chunk in serverStream {
+            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
+                switch message.msg {
+                case .clientHello:
+                    sentFreshHello = true
+                case .clientResume:
+                    Issue.record("Expected CLIENT_HELLO when Terminal namespace state is unavailable")
+                default:
+                    break
+                }
+            }
+            if sentFreshHello { break }
+        }
+
+        #expect(sentFreshHello)
+        #expect(secondController.sessionId == nil)
+
+        await secondController.stop()
+        await secondServerTransport.close()
     }
 
     @Test("Only the negotiated terminal namespace is registered when local IDs collide")

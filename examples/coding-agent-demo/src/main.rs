@@ -194,6 +194,11 @@ async fn run_server(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    warn!(error = %error, "client connection task failed");
+                }
+            }
             _ = tokio::signal::ctrl_c() => break,
         }
     }

@@ -319,6 +319,20 @@ public final class SessionController: @unchecked Sendable {
         return body()
     }
 
+    /// Whether resuming the committed tree requires a session-assigned extension namespace.
+    private func committedStoreContainsExtensionNodes() -> Bool {
+        let store = applier.currentSnapshot.store
+        for rootID in store.rootIDs {
+            guard let subtree = store.subtreeNodeIDs(rootedAt: rootID) else { continue }
+            if subtree.contains(where: { nodeID in
+                store.getNode(nodeID)?.nodeType.isStandard == false
+            }) {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Whether user events may be sent. False during handshake and while a catch-up or
     /// resync snapshot is still outstanding (§15, §18).
     public var isEventDispatchEnabled: Bool {
@@ -909,8 +923,24 @@ public final class SessionController: @unchecked Sendable {
             }
 
             let clientInstanceId = outbox.clientInstanceId
-            let requestedId = withStateLock {
-                currentSessionId ?? requestedSessionId
+            let resumeNeedsNamespaceMapping = renderer != nil
+                && committedStoreContainsExtensionNodes()
+            let requestedId = withStateLock { () -> String? in
+                let requestedId = currentSessionId ?? requestedSessionId
+                guard requestedId != nil else { return nil }
+
+                // A controller-local welcome is the only authoritative source for negotiated
+                // profiles and session-assigned extension namespaces. A recreated controller can
+                // safely resume standard-only state, but must use a fresh hello when it needs
+                // profile validation or Terminal registration and no negotiation was retained.
+                let requiresFreshNegotiation = retainedCapabilities == nil
+                    && (!requiredServerProfiles.isEmpty || resumeNeedsNamespaceMapping)
+                if requiresFreshNegotiation {
+                    currentSessionId = nil
+                    self.requestedSessionId = nil
+                    return nil
+                }
+                return requestedId
             }
             let limits = makeClientLimits()
             let knownResourceHashes = await resourceCache.knownHashes().map(\.bytes)
@@ -2045,6 +2075,11 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                guard let replacementCapabilities = await validatedReplacementCapabilities(
+                    from: negotiated
+                ) else {
+                    return
+                }
                 let accepted = await outbox.prepareReplacedSession(
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq,
@@ -2063,9 +2098,7 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
-                let replacementCapabilities = discardExtensionNegotiationForReplacement(
-                    from: negotiated
-                )
+                adoptReplacementCapabilities(replacementCapabilities)
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
@@ -2145,6 +2178,11 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                guard let replacementCapabilities = await validatedReplacementCapabilities(
+                    from: negotiated
+                ) else {
+                    return
+                }
                 guard await outbox.applyReplacementFrontier(
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq,
@@ -2160,9 +2198,7 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                let replacementCapabilities = discardExtensionNegotiationForReplacement(
-                    from: negotiated
-                )
+                adoptReplacementCapabilities(replacementCapabilities)
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
                     await MainActor.run { renderer.resetExtensionRegistry() }
@@ -2199,17 +2235,43 @@ public final class SessionController: @unchecked Sendable {
     }
 
     /// A replacement incarnation has not negotiated extension profiles or session-local IDs.
-    private func discardExtensionNegotiationForReplacement(
+    ///
+    /// Standard widgets remain usable because their namespace is fixed. Any client-required
+    /// extension instead makes the replacement unusable until a fresh WELCOME supplies both the
+    /// profile result and its session-assigned namespace.
+    private func validatedReplacementCapabilities(
         from negotiated: CapabilitySet
-    ) -> CapabilitySet {
+    ) async -> CapabilitySet? {
         let baseCapabilities = CapabilitySet(
             negotiated.filter { $0.name == StandardProfiles.standardWidgets }
         )
-        withStateLock {
-            retainedCapabilities = baseCapabilities
-            negotiatedTerminalTypeRef = nil
+        guard baseCapabilities.isSuperset(of: requiredServerProfiles) else {
+            let missing = requiredServerProfiles.subtracting(baseCapabilities)
+            requireFreshHelloOnReconnect()
+            await reportFailure(.protocolViolation(
+                "replacement session cannot satisfy client required profiles \(missing); "
+                    + "reconnect must use CLIENT_HELLO/SERVER_WELCOME"
+            ))
+            return nil
         }
         return baseCapabilities
+    }
+
+    private func adoptReplacementCapabilities(_ capabilities: CapabilitySet) {
+        withStateLock {
+            retainedCapabilities = capabilities
+            negotiatedTerminalTypeRef = nil
+        }
+    }
+
+    /// Invalidates resume identity when only a fresh WELCOME can restore required semantics.
+    private func requireFreshHelloOnReconnect() {
+        withStateLock {
+            currentSessionId = nil
+            requestedSessionId = nil
+            retainedCapabilities = nil
+            negotiatedTerminalTypeRef = nil
+        }
     }
 
     private func enterAwaitingSnapshot(sessionId: String, negotiated: CapabilitySet) {
@@ -2828,6 +2890,7 @@ public final class SessionController: @unchecked Sendable {
                 )
             } catch {
                 withStateLock { self.pendingResync = false }
+                requireFreshHelloOnReconnect()
                 await reportFailure(.protocolViolation(
                     "resync snapshot contains unsupported required extension semantics: \(error); "
                         + "a replacement session must complete CLIENT_HELLO/SERVER_WELCOME "

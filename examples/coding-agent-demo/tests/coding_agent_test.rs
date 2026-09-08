@@ -20,7 +20,7 @@ fn tree_composition_and_extension_fallback_are_complete_before_attach() {
                 .get_node(MAIN_COLUMN_ID)
                 .expect("main")
                 .ordered_children,
-            vec![HEADER_ROW_ID, CONTENT_ROW_ID, PROMPT_ID]
+            vec![HEADER_ROW_ID, CONTENT_ROW_ID, PROMPT_LABEL_ID, PROMPT_ID]
         );
         assert_eq!(
             store
@@ -28,7 +28,9 @@ fn tree_composition_and_extension_fallback_are_complete_before_attach() {
                 .expect("right")
                 .ordered_children,
             vec![
+                ACTIVITY_HEADING_ID,
                 CONVERSATION_ID,
+                ACTIVITY_SEPARATOR_ID,
                 DIFF_EXTENSION_ID,
                 TERMINAL_ID,
                 ACTION_ROW_ID

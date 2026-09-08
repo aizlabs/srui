@@ -357,6 +357,12 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
     case maxTransactionOperationsExceeded(limit: Int, actual: Int)
     /// Invalid model delete parameters (e.g. combined identity and range selectors, §8, §13).
     case invalidModelDelete(String)
+    /// A standard property carried a value variant that disagrees with the canonical registry.
+    case invalidPropertyValueType(
+        property: PropertyRef,
+        expected: StandardPropertyValueType,
+        actual: String
+    )
     /// The specified child insertion index is out of bounds for the parent's current children list.
     case childIndexOutOfBounds(index: Int, count: Int)
     /// Attempted to create a model using a `ModelId` that was already used in this session (§6.2, §8).
@@ -406,6 +412,8 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
             return "transaction operations limit exceeded: max allowed is \(limit), actual count is \(actual)"
         case .invalidModelDelete(let reason):
             return "invalid model delete: \(reason)"
+        case .invalidPropertyValueType(let property, let expected, let actual):
+            return "property \(property) requires \(expected.rawValue), got \(actual)"
         case .childIndexOutOfBounds(let index, let count):
             return "child index \(index) out of bounds (current child count: \(count))"
         case .modelIdAlreadyUsed(let id):
@@ -442,6 +450,7 @@ public enum StoreError: Error, Equatable, Sendable, CustomStringConvertible {
         case .maxItemsPerModelOperationExceeded: return "max_items_per_model_operation_exceeded"
         case .maxTransactionOperationsExceeded: return "max_operations_exceeded"
         case .invalidModelDelete: return "invalid_model_delete"
+        case .invalidPropertyValueType: return "invalid_property_value_type"
         case .childIndexOutOfBounds: return "child_index_out_of_bounds"
         case .modelIdAlreadyUsed: return "model_id_already_used"
         case .modelNotFound: return "model_not_found"
@@ -886,7 +895,37 @@ public struct SemanticStore: Equatable, Sendable {
 
     // MARK: - Low-Level Mutation Primitives (§13, §26)
 
-    /// Validates referential integrity for semantic properties (e.g. ensuring `PropertyRef.modelRef` references an existing model).
+    /// Rejects standard-property values whose runtime variant disagrees with the canonical registry.
+    ///
+    /// Extension properties remain registry-defined and are validated by their negotiated handler.
+    private func validatePropertyValueType(property: PropertyRef, value: Value) throws {
+        guard let expected = standardPropertyValueType(property), expected != .any else {
+            return
+        }
+
+        let matches = switch (expected, value) {
+        case (.bool, .bool),
+             (.enumToken, .enumToken),
+             (.float64, .float64),
+             (.list, .list),
+             (.resourceHash, .resourceHash),
+             (.size, .size),
+             (.string, .string),
+             (.unsignedInt, .unsignedInt):
+            true
+        default:
+            false
+        }
+        guard matches else {
+            throw StoreError.invalidPropertyValueType(
+                property: property,
+                expected: expected,
+                actual: value.runtimeTypeName
+            )
+        }
+    }
+
+    /// Validates referential integrity for semantic properties (e.g. model_ref references an existing model).
     private func validatePropertyReferences(property: PropertyRef, value: Value) throws {
         if property == .modelRef || property == .MODEL_REF {
             let modelID: ModelId
@@ -950,9 +989,10 @@ public struct SemanticStore: Equatable, Sendable {
             )
         }
 
-        // 4. Validate all properties, limits, and referential integrity (§26)
+        // 4. Validate all properties, limits, types, and referential integrity (§26)
         for (prop, val) in properties {
             try limitsValue.validate(value: val)
+            try validatePropertyValueType(property: prop, value: val)
             try validatePropertyReferences(property: prop, value: val)
         }
 
@@ -1069,6 +1109,7 @@ public struct SemanticStore: Equatable, Sendable {
         value: Value
     ) throws -> Value? {
         try limitsValue.validate(value: value)
+        try validatePropertyValueType(property: property, value: value)
         try validatePropertyReferences(property: property, value: value)
         guard nodes[nodeID] != nil else {
             throw StoreError.nodeNotFound(nodeID)
@@ -1097,6 +1138,7 @@ public struct SemanticStore: Equatable, Sendable {
     ) throws {
         for (prop, val) in properties {
             try limitsValue.validate(value: val)
+            try validatePropertyValueType(property: prop, value: val)
             try validatePropertyReferences(property: prop, value: val)
         }
         guard nodes[nodeID] != nil else {

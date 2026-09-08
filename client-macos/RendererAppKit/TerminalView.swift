@@ -12,6 +12,9 @@ import Terminal
 /// Monospace PTY surface. Local echo is forbidden: glyphs come only from `TerminalSnapshot`.
 @MainActor
 public final class TerminalView: NSView {
+    public static let conventionalColumns: UInt32 = 80
+    public static let conventionalRows: UInt32 = 24
+
     public let nodeID: NodeId
     public var onInput: ((Data) -> Void)?
     public var onResize: ((UInt32, UInt32, UInt32, UInt32) -> Void)?
@@ -31,6 +34,7 @@ public final class TerminalView: NSView {
         super.init(frame: NSRect(x: 0, y: 0, width: 640, height: 384))
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
+        layer?.masksToBounds = true
         setAccessibilityRole(.textArea)
         setAccessibilityLabel("Terminal")
         setAccessibilityElement(true)
@@ -63,8 +67,15 @@ public final class TerminalView: NSView {
 
     public override var acceptsFirstResponder: Bool { true }
     public override var isFlipped: Bool { true }
-    public override var canBecomeKeyView: Bool { true }
-
+    /// A terminal has no AppKit-provided intrinsic size. Prefer the conventional 80×24
+    /// terminal geometry while allowing semantic `shrink` to compress it on smaller displays.
+    /// Stack-layout growth priorities allocate any additional space to the terminal.
+    public override var intrinsicContentSize: NSSize {
+        NSSize(
+            width: cellSize.width * CGFloat(Self.conventionalColumns),
+            height: cellSize.height * CGFloat(Self.conventionalRows)
+        )
+    }
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         scheduleResize()
@@ -76,14 +87,16 @@ public final class TerminalView: NSView {
     }
 
     public override func draw(_ dirtyRect: NSRect) {
+        let paintRect = clippedDirtyRect(dirtyRect)
+        guard !paintRect.isNull, !paintRect.isEmpty else { return }
         NSColor.black.setFill()
-        dirtyRect.fill()
+        paintRect.fill()
         guard let snapshot else { return }
         let attrs = defaultDrawingAttributes()
         for (row, line) in snapshot.cells.enumerated() {
             for (col, cell) in line.enumerated() {
                 let rect = cellRect(column: col, row: row)
-                if !rect.intersects(dirtyRect) { continue }
+                if !rect.intersects(paintRect) { continue }
                 var fg = color(for: cell.attributes.foreground, fallback: .white)
                 var bg = color(for: cell.attributes.background, fallback: .black)
                 if cell.attributes.inverse { swap(&fg, &bg) }
@@ -246,6 +259,10 @@ public final class TerminalView: NSView {
     private func measureCells() {
         let advance = ("M" as NSString).size(withAttributes: [.font: font])
         cellSize = NSSize(width: max(advance.width, 1), height: max(font.boundingRectForFont.height, font.pointSize + 4))
+    }
+
+    func clippedDirtyRect(_ dirtyRect: NSRect) -> NSRect {
+        bounds.intersection(dirtyRect)
     }
 
     private func cellRect(column: Int, row: Int) -> NSRect {

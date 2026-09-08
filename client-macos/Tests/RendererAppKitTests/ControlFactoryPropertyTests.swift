@@ -411,10 +411,16 @@ struct ControlFactoryPropertyTests {
         let factory = ControlFactory()
         let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .text))
 
-        factory.apply(property: .grow, value: .bool(true), to: handle)
-        factory.apply(property: .shrink, value: .bool(true), to: handle)
-        #expect(handle.view.contentHuggingPriority(for: .horizontal) == .defaultLow)
-        #expect(handle.view.contentHuggingPriority(for: .vertical) == .defaultLow)
+        factory.apply(property: .grow, value: .float64(1), to: handle)
+        factory.apply(property: .shrink, value: .float64(1), to: handle)
+        #expect(
+            handle.view.contentHuggingPriority(for: .horizontal).rawValue
+                < NSLayoutConstraint.Priority.defaultLow.rawValue
+        )
+        #expect(
+            handle.view.contentHuggingPriority(for: .vertical).rawValue
+                < NSLayoutConstraint.Priority.defaultLow.rawValue
+        )
         #expect(handle.view.contentCompressionResistancePriority(for: .horizontal) == .defaultLow)
         #expect(handle.view.contentCompressionResistancePriority(for: .vertical) == .defaultLow)
 
@@ -423,6 +429,12 @@ struct ControlFactoryPropertyTests {
         #expect(handle.view.contentHuggingPriority(for: .horizontal) == .defaultHigh)
         #expect(handle.view.contentHuggingPriority(for: .vertical) == .defaultHigh)
         #expect(handle.view.contentCompressionResistancePriority(for: .horizontal) == .defaultHigh)
+        #expect(handle.view.contentCompressionResistancePriority(for: .vertical) == .defaultHigh)
+
+        // The registry contract is float64. A wrong-family value must not accidentally opt in.
+        factory.apply(property: .grow, value: .bool(true), to: handle)
+        factory.apply(property: .shrink, value: .bool(true), to: handle)
+        #expect(handle.view.contentHuggingPriority(for: .horizontal) == .defaultHigh)
         #expect(handle.view.contentCompressionResistancePriority(for: .vertical) == .defaultHigh)
     }
 

@@ -53,6 +53,25 @@ struct CodingAgentFallbackSocketTests {
             renderer.registry.handle(for: NodeId(18)) != nil
         }
 
+        let surfaceWindow = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        #expect(surfaceWindow.styleMask.contains(.resizable))
+        #expect(surfaceWindow.contentMaxSize.width > surfaceWindow.contentMinSize.width)
+        surfaceWindow.setContentSize(NSSize(width: 900, height: 900))
+        surfaceWindow.contentView?.layoutSubtreeIfNeeded()
+        for nodeID in [
+            NodeId(4), NodeId(5), NodeId(7), NodeId(9), NodeId(12),
+            NodeId(13), NodeId(14), NodeId(15), NodeId(17), NodeId(18), NodeId(19),
+            NodeId(20), NodeId(21),
+        ] {
+            let view = try #require(
+                renderer.registry.view(for: nodeID),
+                "Expected a native view for node \(nodeID)"
+            )
+            #expect(view.frame.width > 0, "Node \(nodeID) must have visible width")
+            #expect(view.frame.height > 0, "Node \(nodeID) must have visible height")
+            #expect(view.visibleRect.isEmpty == false, "Node \(nodeID) must not be clipped away")
+        }
+
         let diffProfile = try Profile.parse("org.example.diff/1")
         #expect(controller.negotiatedCapabilities?.contains(diffProfile) == false)
         #expect(renderer.registry.view(for: NodeId(10)) is NSStackView)
@@ -60,19 +79,111 @@ struct CodingAgentFallbackSocketTests {
             (renderer.registry.view(for: NodeId(12)) as? NSTextField)?.stringValue
                 == "Proposed Changes: src/auth.rs"
         )
-        #expect(
-            (renderer.registry.view(for: NodeId(13)) as? NSTextView)?.string
-                .contains("validate_token") == true
+        let diffScroll = try #require(
+            renderer.registry.view(for: NodeId(13)) as? NSScrollView
         )
-        #expect(renderer.registry.view(for: NodeId(14)) is TerminalView)
+        let diffView = try #require(diffScroll.documentView as? NSTextView)
+        #expect(diffView.string.contains("validate_token"))
+        let diffContainer = try #require(diffView.textContainer)
+        diffView.layoutManager?.ensureLayout(for: diffContainer)
+        let requiredDiffHeight = (diffView.layoutManager?.usedRect(for: diffContainer).height ?? 0)
+            + (2 * diffView.textContainerInset.height)
+        #expect(requiredDiffHeight <= diffView.bounds.height)
+        let terminalView = try #require(
+            renderer.registry.view(for: NodeId(14)) as? TerminalView
+        )
+        #expect(
+            applier.store.getNode(NodeId(1))?.getProperty(.horizontalAlignment)?.asEnumToken
+                == .horizontalAlignmentFill
+        )
+        #expect(
+            applier.store.getNode(NodeId(6))?.getProperty(.verticalAlignment)?.asEnumToken
+                == .verticalAlignmentFill
+        )
+        #expect(
+            applier.store.getNode(NodeId(8))?.getProperty(.horizontalAlignment)?.asEnumToken
+                == .horizontalAlignmentFill
+        )
+        #expect(
+            applier.store.getNode(NodeId(14))?.getProperty(.grow)?.asFloat64 == 1
+        )
+        #expect(
+            applier.store.getNode(NodeId(14))?.getProperty(.minimumSize)?.asSize
+                == Size(width: 656, height: 480)
+        )
+        #expect(
+            applier.store.getNode(NodeId(7))?.getProperty(.maximumSize)?.asSize?.width == 220
+        )
         #expect(renderer.controlFactory.extensionKind(for: TypeRef(namespaceID: 1, localID: 1)) == nil)
+        let initialTerminalSize = terminalView.bounds.size
+        #expect(initialTerminalSize.width >= 656)
+        #expect(initialTerminalSize.height >= 480)
+        var reportedTerminalSizes: [(columns: UInt32, rows: UInt32)] = []
+        let forwardResize = terminalView.onResize
+        terminalView.onResize = { columns, rows, width, height in
+            reportedTerminalSizes.append((columns, rows))
+            forwardResize?(columns, rows, width, height)
+        }
+        terminalView.layout()
+        let terminalResizeDeadline = Date().addingTimeInterval(3)
+        while Date() < terminalResizeDeadline,
+              !reportedTerminalSizes.contains(where: {
+                  $0.columns >= TerminalView.conventionalColumns
+                      && $0.rows >= TerminalView.conventionalRows
+              }) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(
+            reportedTerminalSizes.contains {
+                $0.columns >= TerminalView.conventionalColumns
+                    && $0.rows >= TerminalView.conventionalRows
+            },
+            "Terminal did not publish the minimum PTY size: \(reportedTerminalSizes)"
+        )
 
-        _ = try await controller.sendActivate(nodeId: NodeId(17))
+        let approveButton = try #require(
+            renderer.registry.view(for: NodeId(17)) as? NSButton
+        )
+        approveButton.performClick(nil)
         try await Self.waitForRevision(applier, expected: Revision(4))
         try await AsyncTestSupport.eventually(description: "approval rendered") {
-            (renderer.registry.view(for: NodeId(9)) as? NSTextView)?.string
-                .contains("approved") == true
+            let conversation = (renderer.registry.view(for: NodeId(9)) as? NSScrollView)?
+                .documentView as? NSTextView
+            return conversation?.string.contains("approved") == true
+                && (renderer.registry.view(for: NodeId(5)) as? NSProgressIndicator)?.doubleValue
+                    == 0.75
         }
+        surfaceWindow.contentView?.layoutSubtreeIfNeeded()
+        let conversationScroll = try #require(
+            renderer.registry.view(for: NodeId(9)) as? NSScrollView
+        )
+        let conversation = try #require(conversationScroll.documentView as? NSTextView)
+        #expect(conversation.string.contains("approved"))
+
+        let stableWindowSize = surfaceWindow.frame.size
+        let rejectButton = try #require(
+            renderer.registry.view(for: NodeId(18)) as? NSButton
+        )
+        var expectedRevision: UInt64 = 4
+        for index in 0..<10 {
+            let isReject = index.isMultiple(of: 2)
+            (isReject ? rejectButton : approveButton).performClick(nil)
+            expectedRevision += 1
+            try await Self.waitForRevision(
+                applier,
+                expected: Revision(expectedRevision)
+            )
+        }
+        surfaceWindow.contentView?.layoutSubtreeIfNeeded()
+        #expect(abs(surfaceWindow.frame.width - stableWindowSize.width) < 1)
+        #expect(abs(surfaceWindow.frame.height - stableWindowSize.height) < 1)
+        #expect(conversationScroll.hasVerticalScroller)
+        #expect(conversation.string.components(separatedBy: "User approved").count - 1 == 6)
+        #expect(conversation.string.components(separatedBy: "User rejected").count - 1 == 5)
+        #expect(
+            (renderer.registry.view(for: NodeId(5)) as? NSProgressIndicator)?.doubleValue
+                == 0.75
+        )
 
         let promptHandle = try #require(renderer.registry.handle(for: NodeId(15)))
         let promptAdapter = try #require(promptHandle.textAdapter)
@@ -82,7 +193,7 @@ struct CodingAgentFallbackSocketTests {
         promptView.string = "Add an expiry test"
         promptAdapter.notifyTextDidChangeForTests()
         promptAdapter.notifyEndEditingForTests()
-        try await Self.waitForRevision(applier, expected: Revision(5))
+        try await Self.waitForRevision(applier, expected: Revision(15))
         #expect(
             applier.store.getNode(NodeId(15))?.getProperty(.value)?.asString
                 == "Add an expiry test"

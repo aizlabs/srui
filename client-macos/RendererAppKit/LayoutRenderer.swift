@@ -151,7 +151,6 @@ public final class LayoutRenderer {
     public func validateExtensionMounts(in store: SemanticStore) throws {
         try controlFactory.extensionMountResolver.validateMountableExtensions(in: store)
     }
-
     private func mount(nodeID: NodeId, from store: SemanticStore) throws {
         guard let node = store.getNode(nodeID) else {
             throw LayoutRendererError.missingSemanticNode(nodeID)
@@ -186,6 +185,7 @@ public final class LayoutRenderer {
     private func attach(_ child: NSView, to parent: RenderHandle) {
         if let stack = parent.view as? NSStackView {
             stack.addArrangedSubview(child)
+            reconcileFillConstraints(for: parent)
             return
         }
 
@@ -242,9 +242,54 @@ public final class LayoutRenderer {
             to: handle,
             store: store
         )
+        if property == .horizontalAlignment || property == .verticalAlignment {
+            reconcileFillConstraints(for: handle)
+        }
         RendererDiagnostics.log(
             "updated node=\(nodeID) property=\(property) view=\(ObjectIdentifier(handle.view))"
         )
+    }
+
+    private func reconcileFillConstraints(for handle: RenderHandle) {
+        guard let stack = handle.view as? NSStackView else { return }
+        let property: PropertyRef
+        let shouldFill: Bool
+        let inset: CGFloat
+        if stack.orientation == .vertical {
+            property = .horizontalAlignment
+            shouldFill = handle.layoutMetadata.horizontalAlignment == .horizontalAlignmentFill
+                || !handle.nodeType.isStandard
+            inset = stack.edgeInsets.left + stack.edgeInsets.right
+        } else {
+            property = .verticalAlignment
+            shouldFill = handle.layoutMetadata.verticalAlignment == .verticalAlignmentFill
+            inset = stack.edgeInsets.top + stack.edgeInsets.bottom
+        }
+
+        handle.propertyConstraints[property]?.forEach { $0.isActive = false }
+        guard shouldFill else {
+            handle.propertyConstraints[property] = []
+            return
+        }
+
+        let constraints = stack.arrangedSubviews.map { child in
+            let constraint: NSLayoutConstraint
+            if stack.orientation == .vertical {
+                constraint = child.widthAnchor.constraint(
+                    equalTo: stack.widthAnchor,
+                    constant: -inset
+                )
+            } else {
+                constraint = child.heightAnchor.constraint(
+                    equalTo: stack.heightAnchor,
+                    constant: -inset
+                )
+            }
+            constraint.priority = .init(999)
+            return constraint
+        }
+        NSLayoutConstraint.activate(constraints)
+        handle.propertyConstraints[property] = constraints
     }
 
     private func isCollectionProperty(_ property: PropertyRef) -> Bool {

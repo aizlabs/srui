@@ -311,6 +311,29 @@ public enum Value: Hashable, Equatable, Sendable, CustomStringConvertible {
         return nil
     }
 
+    /// Stable name of the active runtime variant, used in protocol-boundary diagnostics.
+    public var runtimeTypeName: String {
+        switch self {
+        case .null: "null"
+        case .bool: "bool"
+        case .signedInt: "int64"
+        case .unsignedInt: "uint64"
+        case .float64: "float64"
+        case .string: "string"
+        case .nodeID: "node_id"
+        case .itemID: "item_id"
+        case .resourceHash: "resource_hash"
+        case .enumToken: "enum"
+        case .size: "size"
+        case .point: "point"
+        case .range: "range"
+        case .rect: "rect"
+        case .edgeInsets: "edge_insets"
+        case .list: "list"
+        case .record: "record"
+        }
+    }
+
     public var description: String {
         switch self {
         case .null:

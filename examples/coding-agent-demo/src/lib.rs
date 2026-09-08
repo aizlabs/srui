@@ -27,6 +27,9 @@ pub const PROMPT_ID: NodeId = NodeId::new(15);
 pub const ACTION_ROW_ID: NodeId = NodeId::new(16);
 pub const APPROVE_ID: NodeId = NodeId::new(17);
 pub const REJECT_ID: NodeId = NodeId::new(18);
+pub const PROMPT_LABEL_ID: NodeId = NodeId::new(19);
+pub const ACTIVITY_HEADING_ID: NodeId = NodeId::new(20);
+pub const ACTIVITY_SEPARATOR_ID: NodeId = NodeId::new(21);
 pub const FILE_MODEL_ID: ModelId = ModelId::new(1);
 
 const INITIAL_CONVERSATION: &str = "Agent: I implemented token validation in src/auth.rs.";
@@ -74,16 +77,19 @@ impl CodingAgentApp {
 
             Surface::builder(SURFACE_ID)
                 .label("Agent session — myproject")
+                .horizontal_alignment(HorizontalAlignment::Fill)
                 .create(ui)?;
             Column::builder(MAIN_COLUMN_ID)
                 .parent(SURFACE_ID)
                 .spacing_role(SpacingRole::Normal)
                 .padding_role(PaddingRole::Normal)
+                .horizontal_alignment(HorizontalAlignment::Fill)
                 .grow(1.0)
                 .create(ui)?;
             Row::builder(HEADER_ROW_ID)
                 .parent(MAIN_COLUMN_ID)
                 .spacing_role(SpacingRole::Normal)
+                .grow(0.0)
                 .create(ui)?;
             Text::builder(HEADING_ID)
                 .parent(HEADER_ROW_ID)
@@ -99,6 +105,7 @@ impl CodingAgentApp {
             Row::builder(CONTENT_ROW_ID)
                 .parent(MAIN_COLUMN_ID)
                 .spacing_role(SpacingRole::Normal)
+                .vertical_alignment(VerticalAlignment::Fill)
                 .grow(1.0)
                 .create(ui)?;
             Tree::builder(FILE_TREE_ID)
@@ -106,16 +113,33 @@ impl CodingAgentApp {
                 .model_ref(FILE_MODEL_ID)
                 .selection_mode(SelectionMode::Single)
                 .label("Project files")
+                .maximum_size(Size::new(220.0, 10_000.0))
+                .grow(0.0)
+                .shrink(1.0)
                 .create(ui)?;
             Column::builder(RIGHT_COLUMN_ID)
                 .parent(CONTENT_ROW_ID)
                 .spacing_role(SpacingRole::Normal)
+                .horizontal_alignment(HorizontalAlignment::Fill)
                 .grow(1.0)
+                .create(ui)?;
+            Text::builder(ACTIVITY_HEADING_ID)
+                .parent(RIGHT_COLUMN_ID)
+                .text("Activity")
+                .role(TextRole::Heading)
+                .grow(0.0)
                 .create(ui)?;
             RichText::builder(CONVERSATION_ID)
                 .parent(RIGHT_COLUMN_ID)
                 .text(INITIAL_CONVERSATION)
+                .role(TextRole::Body)
                 .read_only(true)
+                .maximum_size(Size::new(10_000.0, 104.0))
+                .grow(0.0)
+                .shrink(1.0)
+                .create(ui)?;
+            Separator::builder(ACTIVITY_SEPARATOR_ID)
+                .parent(RIGHT_COLUMN_ID)
                 .create(ui)?;
             ui.create_node(
                 DIFF_EXTENSION_ID,
@@ -124,9 +148,12 @@ impl CodingAgentApp {
                 None,
                 [],
             )?;
+            ui.set(DIFF_EXTENSION_ID, GROW, 0.0)?;
             Column::builder(FALLBACK_COLUMN_ID)
                 .parent(DIFF_EXTENSION_ID)
                 .spacing_role(SpacingRole::Tight)
+                .horizontal_alignment(HorizontalAlignment::Fill)
+                .grow(0.0)
                 .create(ui)?;
             Text::builder(FALLBACK_HEADING_ID)
                 .parent(FALLBACK_COLUMN_ID)
@@ -136,26 +163,50 @@ impl CodingAgentApp {
             RichText::builder(FALLBACK_DIFF_ID)
                 .parent(FALLBACK_COLUMN_ID)
                 .text(FALLBACK_DIFF)
+                .role(TextRole::Code)
                 .read_only(true)
+                .minimum_size(Size::new(0.0, 96.0))
+                .maximum_size(Size::new(10_000.0, 128.0))
+                .grow(0.0)
+                .shrink(1.0)
+                .create(ui)?;
+            Text::builder(PROMPT_LABEL_ID)
+                .parent(MAIN_COLUMN_ID)
+                .text("Agent prompt (synchronized to the demo server)")
+                .role(TextRole::Caption)
+                .grow(0.0)
                 .create(ui)?;
             TextArea::builder(PROMPT_ID)
                 .parent(MAIN_COLUMN_ID)
                 .value("")
                 .placeholder("Ask the agent…")
+                .label("Agent prompt")
+                .accessible_description(
+                    "Demo input synchronized through TEXT_EDIT; no language model is connected",
+                )
                 .role(InputRole::Command)
                 .action_key("prompt")
+                .maximum_size(Size::new(10_000.0, 120.0))
+                .grow(0.0)
+                .shrink(1.0)
                 .create(ui)?;
             Ok(())
         })?;
 
         // Revision 2: create_terminal_node owns its PTY spawn and semantic transaction.
+        // Revision 2: create_terminal_node owns its PTY spawn and semantic transaction.
         session.create_terminal_node(TERMINAL_ID, RIGHT_COLUMN_ID, terminal_spec)?;
 
         // Revision 3: appending actions after Terminal preserves the §30 child order.
         session.transaction(|ui| {
+            ui.set(TERMINAL_ID, GROW, 1.0)?;
+            // This demo preserves at least the conventional 80×24 grid for the AppKit
+            // terminal's fixed 13-point font metrics.
+            ui.set(TERMINAL_ID, MINIMUM_SIZE, Size::new(656.0, 480.0))?;
             Row::builder(ACTION_ROW_ID)
                 .parent(RIGHT_COLUMN_ID)
                 .spacing_role(SpacingRole::Normal)
+                .grow(0.0)
                 .create(ui)?;
             Button::builder(APPROVE_ID)
                 .parent(ACTION_ROW_ID)

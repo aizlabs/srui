@@ -68,6 +68,57 @@ public let standardPropertiesTable: [(id: UInt32, name: String)] = [
     (30, "selection_mode"),
 ]
 
+/// Runtime value kinds declared by the standard property registry.
+public enum StandardPropertyValueType: String, Sendable {
+    case any = "value"
+    case bool
+    case enumToken = "enum"
+    case float64
+    case list
+    case resourceHash = "resource_hash"
+    case size
+    case string
+    case unsignedInt = "uint64"
+}
+
+/// Returns the canonical runtime value kind for a standard property.
+public func standardPropertyValueType(_ property: PropertyRef) -> StandardPropertyValueType? {
+    guard property.isStandard else { return nil }
+    switch property.localID {
+    case 1: return .string
+    case 2: return .string
+    case 3: return .enumToken
+    case 4: return .string
+    case 5: return .list
+    case 6: return .enumToken
+    case 7: return .bool
+    case 8: return .bool
+    case 9: return .bool
+    case 10: return .bool
+    case 11: return .enumToken
+    case 12: return .string
+    case 13: return .any
+    case 14: return .string
+    case 15: return .resourceHash
+    case 16: return .list
+    case 17: return .unsignedInt
+    case 18: return .enumToken
+    case 19: return .enumToken
+    case 20: return .float64
+    case 21: return .float64
+    case 22: return .size
+    case 23: return .size
+    case 24: return .size
+    case 25: return .enumToken
+    case 26: return .enumToken
+    case 27: return .enumToken
+    case 28: return .string
+    case 29: return .list
+    case 30: return .enumToken
+    default: return nil
+    }
+}
+
 public let standardEventsTable: [(id: UInt32, name: String)] = [
     (1, "ACTIVATE"),
     (2, "VALUE_CHANGED"),

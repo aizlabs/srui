@@ -242,7 +242,11 @@ public final class LayoutRenderer {
             to: handle,
             store: store
         )
-        if property == .horizontalAlignment || property == .verticalAlignment {
+        // `.paddingRole` rewrites the stack's `edgeInsets`, and the fill constraints hold that
+        // inset as a constant: without a rebuild children stay sized for the previous padding.
+        if property == .horizontalAlignment
+            || property == .verticalAlignment
+            || property == .paddingRole {
             reconcileFillConstraints(for: handle)
         }
         RendererDiagnostics.log(

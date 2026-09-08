@@ -373,6 +373,12 @@ struct SessionControllerTerminalTests {
 
         #expect(sentFreshHello)
         #expect(secondController.sessionId == nil)
+        // A revision-zero WELCOME carries no snapshot, so nothing after the hello would clear the
+        // replica this controller inherited from the session it just abandoned: stale windows
+        // would stay mounted and could emit events for nodes the new server never created (§18).
+        #expect(applier.lastAppliedRevision == .initial)
+        #expect(applier.currentSnapshot.store.rootIDs.isEmpty)
+        #expect(secondRenderer.registry.count == 0)
 
         await secondController.stop()
         await secondServerTransport.close()

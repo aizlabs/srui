@@ -476,4 +476,18 @@ public final class TransactionApplier: @unchecked Sendable {
         _lastAppliedRevision = prepared.revision
         return .success(TransactionSnapshot(store: _store, revision: _lastAppliedRevision))
     }
+
+    /// Discards the replica for a session that will be renegotiated from scratch (§18).
+    ///
+    /// This is the one sanctioned way to regress the committed revision, and only a caller that
+    /// has abandoned the session the replica mirrored may use it: a revision-zero `SERVER WELCOME`
+    /// carries no snapshot, so nothing else will ever overwrite a tree inherited from a session
+    /// that no longer exists. Every other path — including `applyResyncSnapshot` — keeps the
+    /// monotonic revision guard of §12.1.
+    public func resetReplica() {
+        lock.lock()
+        defer { lock.unlock() }
+        _store = SemanticStore(limits: _store.limits, revision: .initial)
+        _lastAppliedRevision = .initial
+    }
 }

@@ -1040,6 +1040,50 @@ struct LayoutRendererTests {
         #expect(renderer.registry.view(for: 4) == nil)
     }
 
+    /// `padding_role` is layout-affecting, not structural, so it mutates `edgeInsets` in place.
+    /// The fill constraints carry that inset as a constant, so they must be rebuilt with it or
+    /// children stay sized for the previous padding.
+    @Test
+    func paddingChangeRebuildsFillConstraints() throws {
+        let renderer = LayoutRenderer()
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .column,
+                parentID: 1,
+                properties: [
+                    (.horizontalAlignment, .enumToken(.horizontalAlignmentFill)),
+                    (.paddingRole, .enumToken(.paddingRoleTight)),
+                ]
+            ),
+            .createNode(id: 3, nodeType: .text, parentID: 2),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: 2))
+        // Tight padding is 4 points per edge.
+        #expect(handle.propertyConstraints[.horizontalAlignment]?.first?.constant == -8)
+
+        let update = SemanticModel.Operation.setProperty(
+            id: 2,
+            property: .paddingRole,
+            value: .enumToken(.paddingRoleRelaxed)
+        )
+        let newStore = try makeStore(base + [update])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [update]),
+            newStore: newStore
+        )
+
+        let afterHandle = try #require(renderer.registry.handle(for: 2))
+        let stack = try #require(afterHandle.view as? NSStackView)
+        #expect(stack.edgeInsets.left == 16)
+        // Relaxed padding is 16 points per edge; a stale constant would still read -8.
+        #expect(afterHandle.propertyConstraints[.horizontalAlignment]?.first?.constant == -32)
+    }
+
     /// A `grow == 0` sibling must not veto an interactive window resize. AppKit holds the window's
     /// current size at `windowSizeStayPut` (500), so content hugging above that snaps the window
     /// back to its fitting width on the next layout pass — and a fill-aligned column welds every

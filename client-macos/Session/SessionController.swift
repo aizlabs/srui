@@ -925,9 +925,10 @@ public final class SessionController: @unchecked Sendable {
             let clientInstanceId = outbox.clientInstanceId
             let resumeNeedsNamespaceMapping = renderer != nil
                 && committedStoreContainsExtensionNodes()
-            let requestedId = withStateLock { () -> String? in
+            let (requestedId, abandonedUnresumableSession) = withStateLock {
+                () -> (String?, Bool) in
                 let requestedId = currentSessionId ?? requestedSessionId
-                guard requestedId != nil else { return nil }
+                guard requestedId != nil else { return (nil, false) }
 
                 // A controller-local welcome is the only authoritative source for negotiated
                 // profiles and session-assigned extension namespaces. A recreated controller can
@@ -938,9 +939,12 @@ public final class SessionController: @unchecked Sendable {
                 if requiresFreshNegotiation {
                     currentSessionId = nil
                     self.requestedSessionId = nil
-                    return nil
+                    return (nil, true)
                 }
-                return requestedId
+                return (requestedId, false)
+            }
+            if abandonedUnresumableSession {
+                await discardReplicaForFreshNegotiation()
             }
             let limits = makeClientLimits()
             let knownResourceHashes = await resourceCache.knownHashes().map(\.bytes)
@@ -2264,6 +2268,32 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// Drops replica state that the fresh CLIENT_HELLO replacing an abandoned resume cannot repair.
+    ///
+    /// A revision-zero `SERVER WELCOME` deliberately carries no snapshot (§18), and `handleWelcome`
+    /// only activates the session. A recreated controller that shares a nonempty applier — the
+    /// Terminal case, where `resumeNeedsNamespaceMapping` forces renegotiation — would therefore
+    /// keep the abandoned session's store and its mounted windows alive across the hello: active
+    /// controls that can emit events for nodes the new server has never heard of (§4 inv. 13).
+    ///
+    /// Runs before the handshake is sent, so no transaction can race the teardown.
+    private func discardReplicaForFreshNegotiation() async {
+        guard applier.lastAppliedRevision > .initial else { return }
+        applier.resetReplica()
+        let emptyStore = applier.currentSnapshot.store
+        await MainActor.run {
+            self.advanceInteractionIncarnation()
+            self.renderer?.textEditingSession.resetForReplacementSession()
+            // An empty store unmounts every surface; the next session mounts from its own state.
+            try? self.renderer?.attach(store: emptyStore)
+            self.hasMountedInitialTree = false
+            self.lastRenderedRevision = 0
+        }
+        SessionDiagnostics.log(
+            "Discarded replica state for a session that can only be renegotiated with CLIENT_HELLO"
+        )
+    }
+
     /// Invalidates resume identity when only a fresh WELCOME can restore required semantics.
     private func requireFreshHelloOnReconnect() {
         withStateLock {
@@ -3229,6 +3259,19 @@ public final class SessionController: @unchecked Sendable {
             phase = .failed
             let replayGeneration = resumeGeneration ?? activeReplayRetryGeneration
             activeReplayRetryGeneration = nil
+
+            // A CLIENT_RESUME that failed before RESUME_OK or RESYNC_REQUIRED answered it is the
+            // server refusing this identity outright — a replaced incarnation whose required
+            // profiles this client never negotiated here is rejected with no replacement response
+            // at all (§11.1, §15). Keeping the session id would make every reconnect re-send the
+            // same doomed resume, so the next connect must renegotiate from CLIENT_HELLO. A
+            // transport flap mid-resume costs one snapshot; the alternative is an unbreakable loop.
+            if resumeGeneration != nil {
+                currentSessionId = nil
+                requestedSessionId = nil
+                retainedCapabilities = nil
+                negotiatedTerminalTypeRef = nil
+            }
             return SessionFailureTeardownState(
                 handler: _onFailure ?? { _ in },
                 replayGeneration: replayGeneration,

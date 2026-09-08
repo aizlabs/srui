@@ -12,14 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from generate_conformance_matrix import (
-    APPKIT_MAPPINGS,
-    build_event_matrix,
-    build_toolkit_mappings,
-    build_widget_matrix,
-    generate_conformance_matrix,
-)
-
 PROTOCOL_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = PROTOCOL_DIR.parent
 VECTORS_DIR = PROTOCOL_DIR / "conformance-vectors"
@@ -212,90 +204,68 @@ def test_the_49_original_state_machine_vectors_are_all_still_present(manifest: d
 
 
 # ---------------------------------------------------------------------------
-# Generated conformance matrix (§32 suites 2, 5, 12)
+# Registry-derived event matrix (§7.6)
 # ---------------------------------------------------------------------------
 
 
-def test_conformance_matrix_codegen_is_deterministic(registry_path: Path, tmp_path: Path) -> None:
-    first = generate_conformance_matrix(registry_path, tmp_path / "first")
-    second = generate_conformance_matrix(registry_path, tmp_path / "second")
+def test_emits_matches_the_section_7_6_table(canonical_registry: dict) -> None:
+    """`emits` transcribes §7.6 exactly; nothing may be added without amending the design doc.
 
-    for (first_path, first_payload), (_, second_payload) in zip(
-        sorted(first.items()), sorted(second.items())
-    ):
-        assert first_payload == second_payload, f"non-deterministic output for {first_path.name}"
+    This is the one place the §7.6 table is restated, and it is restated against the registry
+    rather than against a generated fixture. Suites 2 and 5 assert behaviour, not this table.
+    """
+    expected = {
+        "Surface": ["VIEWPORT_CHANGED"],
+        "Button": ["ACTIVATE"],
+        "Toggle": ["VALUE_CHANGED"],
+        "TextInput": ["TEXT_EDIT"],
+        "TextArea": ["TEXT_EDIT"],
+        "List": ["SELECTION_CHANGED"],
+        "Table": ["SELECTION_CHANGED"],
+        "Tree": ["SELECTION_CHANGED", "EXPANSION_CHANGED"],
+        "Select": ["SELECTION_CHANGED"],
+        "ChoiceGroup": ["SELECTION_CHANGED"],
+        "Slider": ["VALUE_CHANGED"],
+        "NumberInput": ["VALUE_CHANGED"],
+        "Tabs": ["SELECTION_CHANGED"],
+        "Split": ["VALUE_CHANGED"],
+    }
 
-
-def test_conformance_matrix_matches_committed_output(registry_path: Path, tmp_path: Path) -> None:
-    """The freshness gate CI also enforces via `git diff` after generate_proto.sh."""
-    generated = generate_conformance_matrix(registry_path, tmp_path)
-
-    for path, _ in generated.items():
-        committed = SUITES_DIR / path.relative_to(tmp_path)
-        assert committed.exists(), f"missing committed fixture: {committed}"
-        assert path.read_bytes() == committed.read_bytes(), (
-            f"{committed} is stale; run ./protocol/generate_proto.sh and commit the result"
+    for entry in canonical_registry["node_types"]:
+        declared = list(entry.get("emits", []))
+        assert declared == expected.get(entry["name"], []), (
+            f"node type '{entry['name']}' declares emits={declared}, which disagrees with the "
+            "§7.6 Standard events table"
         )
 
 
-def test_appkit_mapping_table_covers_every_registry_node_type(canonical_registry: dict) -> None:
-    """A registry node type with no mapping must fail codegen, not produce a partial fixture."""
-    registry_names = {entry["name"] for entry in canonical_registry["node_types"]}
-    missing = registry_names - set(APPKIT_MAPPINGS)
-    assert not missing, (
-        f"APPKIT_MAPPINGS is missing {sorted(missing)}; add an informative mapping in "
-        "protocol/generate_conformance_matrix.py"
-    )
+def test_coordinate_events_are_never_emitted_by_a_node_type(canonical_registry: dict) -> None:
+    coordinate = {
+        event["name"]
+        for event in canonical_registry["events"]
+        if event.get("kind") == "coordinate"
+    }
+    assert coordinate, "§7.7 declares a coordinate event family"
 
-    stale = set(APPKIT_MAPPINGS) - registry_names
-    assert not stale, f"APPKIT_MAPPINGS has entries for unknown node types: {sorted(stale)}"
-
-
-def test_widget_matrix_is_derived_from_the_registry(canonical_registry: dict) -> None:
-    matrix = build_widget_matrix(canonical_registry)
-    registry_by_name = {e["name"]: e for e in canonical_registry["node_types"]}
-
-    assert len(matrix["node_types"]) == len(registry_by_name)
-    for row in matrix["node_types"]:
-        source = registry_by_name[row["name"]]
-        assert row["id"] == source["id"]
-        assert row["tier"] == source["tier"]
-        assert row["category"] == source["category"]
-        assert row["emits"] == list(source["emits"])
-
-
-def test_event_matrix_forbids_coordinates_for_every_standard_node(canonical_registry: dict) -> None:
-    matrix = build_event_matrix(canonical_registry)
-
-    assert matrix["coordinate_events"], "§7.7 declares a coordinate event family"
-    for row in matrix["node_event_matrix"]:
-        assert row["forbidden"] == matrix["coordinate_events"]
-        overlap = set(row["allowed"]) & set(matrix["coordinate_events"])
+    for entry in canonical_registry["node_types"]:
+        overlap = set(entry.get("emits", [])) & coordinate
         assert not overlap, (
-            f"node '{row['node']}' is allowed to emit coordinate events {sorted(overlap)}; "
-            "coordinates are reserved for subscribed custom scenes (§7.7, §32.5)"
+            f"node type '{entry['name']}' emits coordinate events {sorted(overlap)}; coordinates "
+            "are reserved for subscribed custom scenes (§7.7, §32.5)"
         )
 
 
-def test_toolkit_mapping_is_marked_informative(canonical_registry: dict) -> None:
-    mappings = build_toolkit_mappings(canonical_registry)
-    assert mappings["normative"] is False, "§22.4 makes native mappings informative"
-    assert len(mappings["mappings"]) == len(canonical_registry["node_types"])
-
-
-def test_generator_fails_closed_on_an_unmapped_node_type(canonical_registry: dict) -> None:
-    """Adding a node type without an AppKit mapping must break codegen loudly."""
-    registry = dict(canonical_registry)
-    registry["node_types"] = canonical_registry["node_types"] + [
-        {
-            "id": 999,
-            "name": "HypotheticalWidget",
-            "tier": "should",
-            "category": "control",
-            "emits": [],
-            "description": "not in APPKIT_MAPPINGS",
-        }
+def test_the_coordinate_family_matches_the_suite_constants(canonical_registry: dict) -> None:
+    """Cross-checks the constant both language suites hard-code against the registry."""
+    coordinate = sorted(
+        event["name"]
+        for event in canonical_registry["events"]
+        if event.get("kind") == "coordinate"
+    )
+    assert coordinate == [
+        "POINTER_CANCEL",
+        "POINTER_DOWN",
+        "POINTER_MOVE",
+        "POINTER_SCROLL",
+        "POINTER_UP",
     ]
-
-    with pytest.raises(KeyError, match="HypotheticalWidget"):
-        build_toolkit_mappings(registry)

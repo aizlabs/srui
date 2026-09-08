@@ -14,9 +14,14 @@ prints a pass/fail/gap table.
 
 Exit status:
 
-    0  every executable suite passed and only declared gaps remain
-    1  a suite failed, a runner was missing, the manifest was malformed, or a declared gap
-       turned out to be closed (which requires a manifest update, not a silent pass)
+    0  every executable suite passed, and what remains is only declared gaps or documented
+       platform exclusions
+    1  a suite failed, a selected implementation had no runner and no documented reason, the
+       manifest was malformed, or a declared gap turned out to be closed (which requires a
+       manifest update, not a silent pass)
+
+Results: PASS (all runners green, no open gaps), GAP (runners green but §32 scenarios remain
+unproven), FAIL, and N/A (the manifest documents why this implementation has no half).
 
 Commands come from the manifest as argument arrays and are executed without a shell, so nothing
 in the manifest is shell-evaluated.
@@ -38,7 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = REPO_ROOT / "protocol/conformance-vectors/suites/manifest.json"
 EXPECTED_SUITE_COUNT = 12
 
-PASS, FAIL, GAP, SKIP = "PASS", "FAIL", "GAP", "SKIP"
+PASS, FAIL, GAP, NA = "PASS", "FAIL", "GAP", "N/A"
 
 
 class ManifestError(Exception):
@@ -134,13 +139,37 @@ def check_gap_probes(suite: dict) -> list[str]:
     return closed
 
 
-def run_command(command: list[str]) -> tuple[bool, str]:
+def run_command(command: list[str], timeout: int) -> tuple[bool, str]:
+    """Runs one suite command under a watchdog.
+
+    A hung runner is a failure, not a reason to wait forever. AppKit tests can block on the
+    window server (real drawing in an unattended process pins at 0% CPU and never returns), and a
+    socket integration test can wait on a peer that never arrives. Without a bound, one of those
+    stalls the whole conformance run — and in CI, the job's own limit is the only thing that ends
+    it, with no indication of which suite was responsible.
+    """
     try:
         completed = subprocess.run(
-            command, cwd=REPO_ROOT, capture_output=True, text=True, check=False
+            command,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
         )
     except FileNotFoundError:
         return False, f"runner not found: {command[0]}"
+    except subprocess.TimeoutExpired as expired:
+        captured = ""
+        for stream in (expired.stdout, expired.stderr):
+            if stream:
+                captured += stream.decode() if isinstance(stream, bytes) else stream
+        tail = captured.strip().splitlines()[-15:]
+        return False, (
+            f"TIMED OUT after {timeout}s and was killed. A runner that does not finish is a "
+            "failure: check for a test blocking on AppKit drawing, a socket peer, or a lock.\n"
+            + "\n".join(tail)
+        )
     if completed.returncode != 0:
         tail = (completed.stdout + completed.stderr).strip().splitlines()
         return False, "\n".join(tail[-25:]) if tail else "command failed with no output"
@@ -161,6 +190,16 @@ def main() -> int:
     )
     parser.add_argument(
         "--list", action="store_true", help="list the suites and exit without running anything"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help=(
+            "per-command watchdog in seconds (default: 300). Actual test execution here takes "
+            "seconds; the rest is build time. A runner that exceeds this is killed and reported "
+            "as FAIL rather than hanging the run."
+        ),
     )
     args = parser.parse_args()
 
@@ -230,7 +269,7 @@ def main() -> int:
         suite_status = PASS
         failed_languages: list[str] = []
         for lang, command in commands:
-            ok, detail = run_command(command)
+            ok, detail = run_command(command, args.timeout)
             if not ok:
                 suite_status = FAIL
                 exit_code = 1
@@ -251,17 +290,16 @@ def main() -> int:
                     f"undeclared missing runner: {', '.join(missing_languages)}"
                 )
         elif not commands:
-            suite_status = GAP if suite["status"] == "known_gap" else SKIP
+            suite_status = GAP if suite["status"] == "known_gap" else NA
             if gaps:
                 note = f"no runnable coverage; awaiting {gaps[0]['future_task']}"
             else:
-                # Say *why*, so a SKIP is never mistaken for coverage that silently vanished.
+                # `N/A` is a documented platform exclusion, never a silently skipped suite: the
+                # manifest must say why, and that reason is printed here.
                 reasons = "; ".join(
                     not_applicable[lang] for lang in languages if lang in not_applicable
                 )
-                note = f"n/a for {'/'.join(languages)}: {reasons}" if reasons else (
-                    "no runnable coverage for " + "/".join(languages)
-                )
+                note = reasons or "no runnable coverage for " + "/".join(languages)
         elif gaps:
             # Runners pass, but the suite documents scenarios §32 requires and this base cannot
             # exercise. Reporting PASS here would overstate coverage, which is exactly what the
@@ -285,10 +323,10 @@ def main() -> int:
         print(f"{suite_id:>2}  {slug:<24} {status:<7} {note}")
     print("=" * 78)
 
-    counts = {status: sum(1 for r in results if r[2] == status) for status in (PASS, FAIL, GAP, SKIP)}
+    counts = {status: sum(1 for r in results if r[2] == status) for status in (PASS, FAIL, GAP, NA)}
     print(
         f"{counts[PASS]} passed, {counts[FAIL]} failed, "
-        f"{counts[GAP]} documented gap(s), {counts[SKIP]} skipped"
+        f"{counts[GAP]} documented gap(s), {counts[NA]} not applicable"
     )
 
     if failures:

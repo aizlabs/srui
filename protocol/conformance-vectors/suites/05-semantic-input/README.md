@@ -11,7 +11,7 @@ scripts/run-conformance --suite 5
 
 ## Fixtures
 
-`events.generated.json` — **generated** from `protocol/registry.yaml` by `protocol/generate_conformance_matrix.py`. Do not edit by hand; run `./protocol/generate_proto.sh` and commit the result. CI fails on any diff.
+Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
 ## Runners
 
@@ -25,20 +25,15 @@ cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test c
 
 ```bash
 swift test --package-path client-macos --filter SemanticInputConformanceTests
+swift test --package-path client-macos --filter WidgetSemanticsConformanceTests
 ```
 
-## Documented gaps
+## Open gaps
 
-The runner reports this suite as `GAP` rather than `PASS` while any of these remain open, and exits non-zero if a probe shows one has been closed without the manifest being updated.
+This suite reports `GAP`, not `PASS`, while any of these is open. The runner exits non-zero if a probe shows one has been closed without the manifest being updated.
 
-### Server event validation accepts POINTER_* events targeting ordinary Standard Widget nodes; the §32.5 rule that coordinates are refused outside a subscribed scene is unenforced.
+### Event validation performs no event-type/node-type compatibility check: POINTER_* is accepted against an ordinary Button, and ACTIVATE is accepted against non-interactive Text/Progress/Image/Separator nodes.
 
-- **Why:** Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence, enabled/read-only state and TEXT_EDIT edit_seq, but never the event kind against the target node type. A POINTER_DOWN aimed at a Button validates successfully.
-- **Owner:** Task 36 (VectorScene profile) — the rule needs the subscription model to state what coordinates are legal for
+- **Why:** Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence and enabled state, but never compares the event type against the target node type. §32.5's rule that coordinates are refused outside a subscribed scene, and §7.6's per-node event sets, are therefore unenforced. Both are pinned by #[should_panic] tests in conformance_semantic_input_test.rs rather than papered over.
+- **Owner:** Task 36 (VectorScene) for the coordinate half; the event-type/node-type check is unowned
 - **Closure probe:** `server-rust/semantic-tree/src/event.rs` matching `CoordinateEvent|coordinate event .*(subscrib|scene)|NodeNotSubscribed`
-
-### The positive half of §32.5 — a coordinate event ACCEPTED for an explicitly subscribed custom scene node — cannot be exercised.
-
-- **Why:** POINTER_* events are registered in namespace 0, but no VectorScene node type or subscription model exists on this base.
-- **Owner:** Task 36 (VectorScene profile, optional)
-- **Closure probe:** `protocol/registry.yaml` matching `name: VectorScene`

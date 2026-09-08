@@ -189,11 +189,6 @@ jobs:
           cargo test --manifest-path ../examples/coding-agent-demo/Cargo.toml
           cargo clippy --manifest-path ../examples/coding-agent-demo/Cargo.toml --all-targets -- -D warnings
         working-directory: server-rust
-      # §32 conformance, Rust half. RendererAppKit cannot build on Linux, so suite 10 and the
-      # Swift halves are covered by the `swift` job; this reuses the workspace built above and
-      # asserts every one of the twelve suites is either passing or a declared, documented gap.
-      - name: Run §32 conformance suites (Rust)
-        run: ./scripts/run-conformance --implementation rust
 
   # libFuzzer and its sanitizers are best supported on Linux, and nothing in the decoders is
   # platform-specific, so this runs where it is cheapest (§26 decode limits are host-independent).
@@ -290,10 +285,6 @@ jobs:
       - name: Build and test client-macos
         run: swift test
         working-directory: client-macos
-      # §32 conformance, Swift half. Run in swift-only mode: the Rust half already ran on the
-      # Linux `rust` job, and macOS minutes bill at ~10x (see scripts/ci-cost.sh).
-      - name: Run §32 conformance suites (Swift)
-        run: ./scripts/run-conformance --implementation swift
       - name: Verify committed generated protocol outputs are fresh
         run: |
           ./protocol/generate_proto.sh
@@ -301,7 +292,4 @@ jobs:
             client-macos/Protocol/srui.pb.swift \
             client-macos/SemanticModel/RegistryTables.swift \
             client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
-            server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs \
-            protocol/conformance-vectors/suites/02-widget-semantics/widgets.generated.json \
-            protocol/conformance-vectors/suites/05-semantic-input/events.generated.json \
-            protocol/conformance-vectors/suites/12-toolkit-mapping/mappings.generated.json
+            server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs

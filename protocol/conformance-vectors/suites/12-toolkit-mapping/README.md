@@ -11,18 +11,14 @@ scripts/run-conformance --suite 12
 
 ## Fixtures
 
-`mappings.generated.json` — **generated** from `protocol/registry.yaml` by `protocol/generate_conformance_matrix.py`. Do not edit by hand; run `./protocol/generate_proto.sh` and commit the result. CI fails on any diff.
+Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
 ## Runners
-
-**Rust**
-
-```bash
-cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_toolkit_mapping_test
-```
 
 **Swift**
 
 ```bash
-swift test --package-path client-macos --filter ToolkitMappingConformanceTests
+swift test --package-path client-macos --filter ControlFactoryTests
 ```
+
+**Rust** — `N/A`: Native toolkit mapping is renderer-side and informative (§22.4); the server has no half.

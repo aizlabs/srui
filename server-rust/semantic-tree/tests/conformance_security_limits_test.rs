@@ -155,14 +155,11 @@ fn test_collection_valued_properties_are_bounded() {
     );
 }
 
-/// §26: model count and per-model item budgets are bounded, so a collection cannot be used to
-/// exhaust client memory.
+/// §26: `max_model_count` is asserted on its own, so no other limit can mask it.
 #[test]
-fn test_model_limits_are_bounded() {
+fn test_max_model_count_is_bounded() {
     let mut store = store_with(StoreLimits {
         max_model_count: 1,
-        max_cached_items_per_model: 2,
-        max_items_per_model_operation: 2,
         ..StoreLimits::default()
     });
 
@@ -176,16 +173,71 @@ fn test_model_limits_are_bounded() {
         ),
         "a second model must be refused when max_model_count is 1"
     );
+}
 
-    let too_many: Vec<ModelItem> = (0..3)
+/// §26: `max_items_per_model_operation` bounds a single mutation.
+#[test]
+fn test_max_items_per_model_operation_is_bounded() {
+    let mut store = store_with(StoreLimits {
+        max_items_per_model_operation: 2,
+        ..StoreLimits::default()
+    });
+    store
+        .create_model(ModelId::new(1), TypeRef::standard(1), 100)
+        .expect("model");
+
+    let items: Vec<ModelItem> = (0..3)
         .map(|i| ModelItem::new(ItemId::new(i), Value::SignedInt(i as i64), []))
         .collect();
     assert!(
         matches!(
-            store.model_insert(ModelId::new(1), 0, too_many),
+            store.model_insert(ModelId::new(1), 0, items),
             Err(StoreError::MaxItemsPerModelOperationExceeded { .. })
         ),
         "an insert past max_items_per_model_operation must be refused"
+    );
+}
+
+/// §26: `max_cached_items_per_model` bounds the *aggregate* cache, across many individually
+/// legal operations. The per-operation limit is set high here deliberately, so it cannot be the
+/// thing doing the refusing — otherwise this test would pass without the aggregate limit
+/// existing at all.
+#[test]
+fn test_max_cached_items_per_model_bounds_the_aggregate_not_one_operation() {
+    let mut store = store_with(StoreLimits {
+        max_cached_items_per_model: 5,
+        // Deliberately larger than the cache ceiling: every individual insert below is legal.
+        max_items_per_model_operation: 100,
+        ..StoreLimits::default()
+    });
+    store
+        .create_model(ModelId::new(1), TypeRef::standard(1), 1_000)
+        .expect("model");
+
+    // Five items in two legal operations: still within the cache budget.
+    for batch in 0..2u64 {
+        let items: Vec<ModelItem> = (0..2)
+            .map(|i| {
+                let id = batch * 2 + i;
+                ModelItem::new(ItemId::new(id), Value::SignedInt(id as i64), [])
+            })
+            .collect();
+        store
+            .model_insert(ModelId::new(1), batch * 2, items)
+            .unwrap_or_else(|e| panic!("batch {batch} is within budget: {e:?}"));
+    }
+
+    // One more legal-sized operation crosses the aggregate ceiling.
+    let overflow: Vec<ModelItem> = (10..14)
+        .map(|i| ModelItem::new(ItemId::new(i), Value::SignedInt(i as i64), []))
+        .collect();
+    assert!(
+        matches!(
+            store.model_insert(ModelId::new(1), 4, overflow),
+            Err(StoreError::MaxCachedItemsPerModelExceeded { .. })
+        ),
+        "the aggregate cached-item ceiling must refuse growth even when every single operation \
+         is within max_items_per_model_operation"
     );
 }
 
@@ -222,16 +274,114 @@ fn test_max_transaction_operations_is_a_precheck() {
     assert_eq!(store.node_count(), 0, "no operation may have been applied");
 }
 
-/// §27 / §4 inv. 10 & 18: the semantic profile has no way to express executable client code.
+/// §27 / §4 inv. 10 & 18: script-looking payloads survive the store as inert data.
 ///
-/// This is a payload-*class* assertion rather than a filter: conformance here means the protocol
-/// offers no field in which a script, bytecode, shader, or plug-in could be delivered, so there
-/// is nothing for a client to be tricked into running. `action_key` is data interpreted only
-/// inside the server's authorization domain (§7.6), never a client-side program.
+/// Name scanning alone proves nothing, so this drives real script-shaped strings through the
+/// store and reads them back: they must round-trip byte-for-byte as `Value::String`, never be
+/// parsed, evaluated, or reclassified into anything with a dispatch path.
+#[test]
+fn test_script_shaped_payloads_round_trip_as_inert_data() {
+    let payloads = [
+        "<script>alert('x')</script>",
+        "javascript:void(0)",
+        "${jndi:ldap://example.invalid/a}",
+        "'; DROP TABLE nodes; --",
+        "$(rm -rf /)",
+        "\u{1b}]0;title\u{7}",
+        "data:text/html;base64,PHNjcmlwdD4=",
+    ];
+
+    let (mut store, target) = {
+        let mut store = SemanticStore::new();
+        store
+            .create_node(NodeId::new(1), TypeRef::SURFACE, None, None, [])
+            .expect("root");
+        store
+            .create_node(
+                NodeId::new(2),
+                TypeRef::TEXT,
+                Some(NodeId::new(1)),
+                None,
+                [],
+            )
+            .expect("text node");
+        (store, NodeId::new(2))
+    };
+
+    for payload in payloads {
+        store
+            .set_property(
+                target,
+                PropertyRef::TEXT,
+                Value::String(payload.to_string()),
+            )
+            .unwrap_or_else(|e| panic!("payload must be storable as data: {e:?}"));
+
+        let stored = store
+            .get_node(target)
+            .and_then(|n| n.get_property(PropertyRef::TEXT))
+            .cloned();
+
+        assert_eq!(
+            stored,
+            Some(Value::String(payload.to_string())),
+            "a script-shaped payload must round-trip unchanged as inert text (§27)"
+        );
+        // It stays a string. Nothing promotes it to a reference, resource, or callable.
+        assert!(
+            matches!(stored, Some(Value::String(_))),
+            "a script-shaped payload must never be reclassified out of Value::String"
+        );
+    }
+}
+
+/// §27: the value type system has no variant that could name executable content — no code,
+/// script, callable, or URL-with-scheme variant a renderer could be induced to dispatch.
+///
+/// `Value` is exhaustively matched here, so adding such a variant fails to compile.
+#[test]
+fn test_value_type_system_has_no_executable_variant() {
+    let inhabitants = [
+        Value::Null,
+        Value::Bool(true),
+        Value::SignedInt(1),
+        Value::UnsignedInt(1),
+        Value::Float64(1.0),
+        Value::String(String::new()),
+        Value::List(vec![]),
+    ];
+
+    for value in inhabitants {
+        match value {
+            // Data variants only. A `Value::Script`/`Value::Code`/`Value::Callable` addition
+            // breaks this match, which is the point (§27, §4 inv. 10).
+            Value::Null
+            | Value::Bool(_)
+            | Value::SignedInt(_)
+            | Value::UnsignedInt(_)
+            | Value::Float64(_)
+            | Value::String(_)
+            | Value::NodeId(_)
+            | Value::ItemId(_)
+            | Value::ResourceHash(_)
+            | Value::EnumToken(_)
+            | Value::Size(_)
+            | Value::Point(_)
+            | Value::Range(_)
+            | Value::Rect(_)
+            | Value::EdgeInsets(_)
+            | Value::List(_)
+            | Value::Record(_) => {}
+        }
+    }
+}
+
+/// §27 / §4 inv. 10: no standard property or node type *names* an execution surface either.
+///
+/// Matched against whole snake_case segments, not raw substrings: "accessible_description"
+/// legitimately contains "script".
 #[test]
 fn test_no_standard_property_can_carry_executable_payload() {
-    // Matched against whole snake_case segments, not raw substrings: "accessible_description"
-    // legitimately contains "script".
     let executable_concepts = [
         "script",
         "javascript",

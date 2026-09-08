@@ -11,7 +11,7 @@ scripts/run-conformance --suite 9
 
 ## Fixtures
 
-Code-driven suite: no shared vectors. The runners are listed in [`../manifest.json`](../manifest.json).
+Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
 ## Runners
 
@@ -30,4 +30,5 @@ swift test --package-path client-macos --filter FramingDecoderMatrixTests
 swift test --package-path client-macos --filter DecoderTests
 swift test --package-path client-macos --filter SSHTransportPostureTests
 swift test --package-path client-macos --filter TransactionRateLimiterTests
+swift test --package-path client-macos --filter SecurityLimitsConformanceTests
 ```

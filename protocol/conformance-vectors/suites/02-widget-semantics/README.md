@@ -11,25 +11,27 @@ scripts/run-conformance --suite 2
 
 ## Fixtures
 
-`widgets.generated.json` — **generated** from `protocol/registry.yaml` by `protocol/generate_conformance_matrix.py`. Do not edit by hand; run `./protocol/generate_proto.sh` and commit the result. CI fails on any diff.
+Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
 ## Runners
 
 **Rust**
 
 ```bash
-cargo test --manifest-path server-rust/Cargo.toml -p srui-semantic-tree --test conformance_widget_semantics_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-sdk --test widgets_test
 ```
 
 **Swift**
 
 ```bash
 swift test --package-path client-macos --filter WidgetSemanticsConformanceTests
+swift test --package-path client-macos --filter ControlFactoryTests
+swift test --package-path client-macos --filter ControlFactoryPropertyTests
 ```
 
-## Documented gaps
+## Open gaps
 
-The runner reports this suite as `GAP` rather than `PASS` while any of these remain open, and exits non-zero if a probe shows one has been closed without the manifest being updated.
+This suite reports `GAP`, not `PASS`, while any of these is open. The runner exits non-zero if a probe shows one has been closed without the manifest being updated.
 
 ### Tree EXPANSION_CHANGED and Surface VIEWPORT_CHANGED are declared in §7.6 but the renderer has no interaction path that can originate them.
 

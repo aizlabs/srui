@@ -11,7 +11,7 @@ scripts/run-conformance --suite 8
 
 ## Fixtures
 
-Code-driven suite: no shared vectors. The runners are listed in [`../manifest.json`](../manifest.json).
+Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
 ## Runners
 
@@ -19,6 +19,8 @@ Code-driven suite: no shared vectors. The runners are listed in [`../manifest.js
 
 ```bash
 cargo test --manifest-path server-rust/Cargo.toml -p srui-sessiond --test conformance_reconnect_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-sessiond --test text_edit_test
+cargo test --manifest-path server-rust/Cargo.toml -p srui-sessiond --test session_resume_test
 ```
 
 **Swift**

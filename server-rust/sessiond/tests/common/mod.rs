@@ -273,6 +273,20 @@ pub fn make_tx(base: u64) -> Transaction {
     }
 }
 
+/// A `ClientResume` declaring unacknowledged text edits, so resume reconciliation (§18.3) can
+/// actually be exercised: without these the pending-edit path is never entered.
+pub fn client_resume_with_pending_edits(
+    session_id: &str,
+    last_applied: u64,
+    pending: Vec<srui_protocol::PendingTextEditRef>,
+) -> SruiMessage {
+    let mut message = client_resume(session_id, last_applied);
+    if let Some(srui_message::Msg::ClientResume(resume)) = message.msg.as_mut() {
+        resume.pending_text_edits = pending;
+    }
+    message
+}
+
 pub fn client_resume(session_id: &str, last_applied: u64) -> SruiMessage {
     SruiMessage {
         msg: Some(srui_message::Msg::ClientResume(ClientResume {
@@ -312,6 +326,51 @@ impl ResumeConnection {
             write: FramedWrite::new(client_write, SruiCodec::new()),
             server_task,
             shutdown,
+        }
+    }
+
+    /// Sends a `ClientResume` declaring unacknowledged text edits (§18.3).
+    pub async fn send_resume_with_pending_edits(
+        &mut self,
+        session_id: &str,
+        last_applied: u64,
+        pending: Vec<srui_protocol::PendingTextEditRef>,
+    ) {
+        self.write
+            .send(client_resume_with_pending_edits(
+                session_id,
+                last_applied,
+                pending,
+            ))
+            .await
+            .expect("send ClientResume with pending edits");
+    }
+
+    /// Reads one `ServerResyncRequired` and returns the text edits it discarded (§18.3).
+    ///
+    /// §18.3 requires the server to echo the client's declared `pending_text_edits` so they can
+    /// be settled without opening a global `event_seq` gap; a mismatch fails closed.
+    pub async fn expect_resync_discarding(
+        &mut self,
+        expected_session_id: &str,
+        expected_continuity: SessionContinuity,
+    ) -> Vec<srui_protocol::PendingTextEditRef> {
+        let msg = self
+            .read
+            .next()
+            .await
+            .expect("resync-required frame")
+            .expect("decode");
+        match msg.msg {
+            Some(srui_message::Msg::ServerResyncRequired(resync)) => {
+                assert_eq!(resync.session_id, expected_session_id);
+                assert_eq!(
+                    SessionContinuity::try_from(resync.continuity),
+                    Ok(expected_continuity)
+                );
+                resync.discarded_text_edits
+            }
+            other => panic!("expected ServerResyncRequired, got {:?}", other),
         }
     }
 

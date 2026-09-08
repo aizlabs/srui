@@ -11,7 +11,7 @@ scripts/run-conformance --suite 10
 
 ## Fixtures
 
-Code-driven suite: no shared vectors. The runners are listed in [`../manifest.json`](../manifest.json).
+Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
 ## Runners
 
@@ -25,4 +25,4 @@ swift test --package-path client-macos --filter CollectionAdaptersTests
 swift test --package-path client-macos --filter NativeTextEditorAdapterTests
 ```
 
-**Rust** — not applicable: Renderer semantics are AppKit-only; RendererAppKit cannot build on Linux.
+**Rust** — `N/A`: Renderer semantics are AppKit-only; RendererAppKit cannot build on Linux.

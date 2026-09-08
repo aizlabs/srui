@@ -24,7 +24,7 @@
 //!  6. `SAME_SESSION` continuity keeps pending events alive
 //!  7. `REPLACED` continuity abandons events and edits
 //!  8. an unrecognized continuity fails closed
-//!  9. a newer resume generation supersedes a delayed older response
+//!  9. resume-attempt supersession (run via the continuity suites — see the note below)
 //! 10. overlapping delivery stays unacknowledged while the original is in flight
 //! 11. sequence 2 settling before sequence 1 leaves the frontier at 0
 //! 12. settling sequence 1 advances the frontier directly through sequence 2
@@ -204,11 +204,23 @@ async fn scenario_03_partial_transaction_never_journaled_or_replayed() {
 // 4–5. Pending edits and the event result cache (§18.2, §18.3)
 // ==============================================================================
 
-/// Scenario 4: a text edit committed before the disconnect is authoritative afterwards; the
-/// client's own pending edit does not resurrect stale text on reconnect.
+/// Scenario 4: a client reconnects still holding unacknowledged text edits. §18.3 requires the
+/// server to echo those exact edits back as `discarded_text_edits`, so the client can settle them
+/// without opening a global `event_seq` gap — and the authoritative text wins.
+///
+/// Declaring the edits is the whole point: a resume with an empty `pending_text_edits` never
+/// enters the reconciliation path at all.
 #[tokio::test]
-async fn scenario_04_pending_text_edit_reconciles_to_authoritative_state() {
-    let session = counter_session("conformance-pending-edit", SessionConfig::default());
+async fn scenario_04_pending_text_edits_are_reconciled_on_resync() {
+    let session = counter_session(
+        "conformance-pending-edit",
+        SessionConfig {
+            // Small journal so the reconnect below is forced onto the snapshot/resync path,
+            // which is where §18.3 cancellation happens.
+            journal_capacity: 2,
+            ..SessionConfig::default()
+        },
+    );
 
     session
         .transaction(|ui| {
@@ -220,28 +232,40 @@ async fn scenario_04_pending_text_edit_reconciles_to_authoritative_state() {
             Ok(())
         })
         .expect("server-side correction");
+    for base in session.current_revision()..session.current_revision() + 6 {
+        session.commit_transaction(make_tx(base)).expect("commit");
+    }
 
-    let authoritative = session.with_store(|store| {
-        store
-            .get_node(srui_semantic_tree::NodeId::new(TEXT_NODE))
-            .and_then(|n| n.get_property(PropertyRef::LABEL))
-            .cloned()
-    });
+    let pending = vec![srui_protocol::PendingTextEditRef {
+        event_id: b"pending-edit-1".to_vec(),
+        event_seq: 1,
+        node_id: TEXT_NODE,
+        edit_seq: 7,
+    }];
 
-    let revision = session.current_revision();
     let mut conn = ResumeConnection::open(session.clone()).await;
-    conn.send_resume("conformance-pending-edit", revision).await;
-    conn.expect_resume_ok("conformance-pending-edit", revision)
+    conn.send_resume_with_pending_edits("conformance-pending-edit", 0, pending.clone())
+        .await;
+    let discarded = conn
+        .expect_resync_discarding("conformance-pending-edit", SessionContinuity::SameSession)
         .await;
     conn.close().await;
+
+    assert_eq!(
+        discarded, pending,
+        "§18.3: a same-session forced resync must echo the client's declared pending text edits \
+         so they can be settled without opening an event_seq gap"
+    );
 
     assert_eq!(
         session.with_store(|store| store
             .get_node(srui_semantic_tree::NodeId::new(TEXT_NODE))
             .and_then(|n| n.get_property(PropertyRef::LABEL))
             .cloned()),
-        authoritative,
-        "reconnect must converge on the authoritative text, not a replayed client edit"
+        Some(srui_semantic_tree::Value::String(
+            "server-authoritative".to_string()
+        )),
+        "reconnect must converge on the authoritative text, never a replayed client edit"
     );
 }
 
@@ -378,32 +402,21 @@ async fn scenario_08_unknown_continuity_fails_closed() {
     conn.close().await;
 }
 
-/// Scenario 9: a newer resume attempt supersedes an older one. The session's answer is bound to
-/// the incarnation that is actually live, so a delayed older response cannot contradict it.
-#[tokio::test]
-async fn scenario_09_newer_resume_supersedes_delayed_older_attempt() {
-    let session = Arc::new(Session::new("conformance-supersede"));
-    session.commit_transaction(make_tx(0)).expect("commit");
-
-    // Two overlapping resume attempts against the same live incarnation.
-    let mut older = ResumeConnection::open(session.clone()).await;
-    let mut newer = ResumeConnection::open(session.clone()).await;
-
-    newer.send_resume("conformance-supersede", 1).await;
-    newer.expect_resume_ok("conformance-supersede", 1).await;
-
-    older.send_resume("conformance-supersede", 1).await;
-    older.expect_resume_ok("conformance-supersede", 1).await;
-
-    // Both attempts describe the same authoritative revision: a later attempt never rolls the
-    // session backwards, and an earlier one never overrides what the newer one established.
-    session.commit_transaction(make_tx(1)).expect("commit");
-    newer.expect_transaction(1, 2).await;
-    older.expect_transaction(1, 2).await;
-
-    newer.close().await;
-    older.close().await;
-}
+// Scenario 9 (resume-attempt supersession) is deliberately not re-implemented here.
+//
+// Two resume attempts against the same live incarnation both legitimately receive RESUME_OK and
+// both keep receiving broadcasts, so a server-side "older attempt is superseded" assertion has
+// nothing to observe — an earlier version of this file asserted exactly that and proved nothing.
+//
+// The behaviour is real, and it is proven where it lives:
+//   * client-side attempt supersession — `SessionResumeContinuityTests` ("A superseded REPLACED
+//     response cannot abandon intents bound to a newer attempt", "A superseded RESUME_OK never
+//     replays, rebinds, or re-enables event allocation");
+//   * server-side generation supersession — `text_edit_test.rs`, which drives
+//     `EventValidationError::SupersededGeneration`.
+//
+// Both are listed as suite 8 runners in protocol/conformance-vectors/suites/manifest.json, so the
+// named suite executes them rather than restating them.
 
 // ==============================================================================
 // 10–14. Event settlement and frontier ordering (§18.2, Task 24)

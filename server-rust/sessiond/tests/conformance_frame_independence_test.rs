@@ -317,15 +317,29 @@ fn test_protocol_envelope_carries_no_frame_or_cadence_concept() {
         "transaction encoding must be a pure function of its semantic content"
     );
 
-    // The payload variants a server may send a client are enumerable, and none of them is a
-    // frame boundary marker. This fails to compile if a frame-ish payload is ever added, which
-    // is the intent: §4.16 is a structural property, not a naming convention.
+    // Exhaustively enumerate every payload a peer may send. There is no wildcard arm, so adding
+    // a `START_FRAME`/`END_FRAME`-style variant fails to compile here rather than silently
+    // passing — which is what makes this an invariant rather than a spot check (§4.16).
     let envelope = SruiMessage {
         msg: Some(Msg::Transaction(tx)),
     };
-    match envelope.msg.as_ref().expect("payload present") {
-        Msg::Transaction(_) => {}
-        other => panic!("unexpected payload variant in a state update: {other:?}"),
+    match envelope.msg.expect("payload present") {
+        // State replication and its handshake.
+        Msg::ClientHello(_)
+        | Msg::ServerWelcome(_)
+        | Msg::ClientResume(_)
+        | Msg::ServerResumeOk(_)
+        | Msg::ServerResyncRequired(_)
+        | Msg::Transaction(_) => {}
+        // Interaction and its acknowledgement.
+        Msg::Event(_) | Msg::ServerEventAck(_) => {}
+        // Content delivery, paced by the client's own requests.
+        Msg::ResourceMetadata(_) | Msg::ResourceChunk(_) | Msg::ClientModelRangeRequest(_) => {}
+        // Terminal extension byte streams (§21) — a byte stream, not a frame cadence.
+        Msg::TerminalData(_)
+        | Msg::TerminalInput(_)
+        | Msg::TerminalResize(_)
+        | Msg::TerminalResyncRequired(_) => {}
     }
 
     // An event acknowledgement is likewise a pure state-consistency signal.

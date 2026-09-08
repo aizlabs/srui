@@ -82,17 +82,15 @@ echo "Generated Swift protobuf code -> ${SWIFT_OUT}/srui.pb.swift"
 echo "Rust code generation is handled automatically at build time via server-rust/protocol/build.rs (prost-build)."
 
 # 4. Generate Swift Registry Tables and the shared logical-channel policy
-echo "=== Generating SRUI Registry Tables, Logical-Channel Policy and Conformance Matrix ==="
+echo "=== Generating SRUI Registry Tables and Logical-Channel Policy ==="
 if command -v uv >/dev/null 2>&1; then
     uv run python "${REPO_ROOT}/protocol/generate_swift_registry.py"
     uv run python "${REPO_ROOT}/protocol/generate_logical_channel_policy.py"
-    uv run python "${REPO_ROOT}/protocol/generate_conformance_matrix.py"
 elif command -v python3 >/dev/null 2>&1; then
     python3 "${REPO_ROOT}/protocol/generate_swift_registry.py"
     python3 "${REPO_ROOT}/protocol/generate_logical_channel_policy.py"
-    python3 "${REPO_ROOT}/protocol/generate_conformance_matrix.py"
 else
-    echo "Warning: Python 3 not found to regenerate registry, scheduling policy or conformance matrix."
+    echo "Warning: Python 3 not found to regenerate registry or scheduling policy."
 fi
 
 echo "=== SRUI Codegen Complete ==="

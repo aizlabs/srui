@@ -11,17 +11,17 @@ scripts/run-conformance --suite 11
 
 ## Fixtures
 
-Code-driven suite: no shared vectors. The runners are listed in [`../manifest.json`](../manifest.json).
+Code-driven suite: no shared fixtures. This suite asserts behaviour against the registry tables `build.rs` and `generate_swift_registry.py` already generate, rather than introducing a second copy of the registry.
 
 ## Runners
 
-**Rust** — not applicable: Semantic inspection is a client-side API (§24, §25); there is no server half.
+**Rust** — `N/A`: Semantic inspection is a client-side API (§24, §25); there is no server half.
 
-**Swift** — not applicable: No implementation exists yet — the whole suite is the Task 35 gap.
+**Swift** — `N/A`: No implementation exists yet — the whole suite is the Task 35 gap.
 
-## Documented gaps
+## Open gaps
 
-The runner reports this suite as `GAP` rather than `PASS` while any of these remain open, and exits non-zero if a probe shows one has been closed without the manifest being updated.
+This suite reports `GAP`, not `PASS`, while any of these is open. The runner exits non-zero if a probe shows one has been closed without the manifest being updated.
 
 ### Inspection exposes semantic identity rather than AppKit object identity; automation actions route through the normal event/authorization path.
 

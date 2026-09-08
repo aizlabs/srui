@@ -29,6 +29,9 @@ import Testing
 
 @testable import RendererAppKit
 
+// A renderer test that blocks on the window server would otherwise pin at 0% CPU
+// forever; bound it so a hang is a failure, not a stalled run.
+@Suite(.timeLimit(.minutes(1)))
 @MainActor
 struct FrameIndependenceConformanceTests {
 
@@ -55,14 +58,19 @@ struct FrameIndependenceConformanceTests {
         return store
     }
 
-    /// Applies the same mutation stream, presenting once every `cadence` commits.
+    /// Applies one fixed, cadence-independent transaction stream, varying only how often the
+    /// renderer is asked to *present* what it has already applied.
+    ///
+    /// Transaction boundaries are deliberately held constant: batching mutations into
+    /// cadence-sized transactions would change the semantic commit stream itself, so behaviour
+    /// wrongly coupled to transaction or revision boundaries could pass a "frame-independence"
+    /// suite that never varied presentation at all.
     private func run(cadence: Int) throws -> CadenceRun {
         let base: [SemanticModel.Operation] = [
             .createNode(id: 1, nodeType: .surface),
             .createNode(
                 id: 2, nodeType: .text, parentID: 1, properties: [(.text, .string("v0"))]),
         ]
-        var applied = base
         let store = try makeStore(base)
         let renderer = AppKitRenderer()
         try renderer.attach(store: store)
@@ -73,26 +81,38 @@ struct FrameIndependenceConformanceTests {
         let initialTextIdentity = ObjectIdentifier(initialTextView)
         let initialWindowIdentity = ObjectIdentifier(initialWindow)
 
+        var applied = base
         var presentPasses = 0
         var identitiesStable = true
-        var pending: [SemanticModel.Operation] = []
         var allClassifications: [DirtyClassification] = []
         var currentRevision = store.revision
 
-        func present() throws {
-            guard !pending.isEmpty else { return }
-            let newStore = try makeStore(applied)
-            let classifications = try renderer.apply(
-                transaction: Transaction(baseRevision: currentRevision, operations: pending),
-                newStore: newStore
-            )
-            allClassifications.append(contentsOf: classifications)
-            currentRevision = newStore.revision
+        // Presentation: force the layout pass over what has already been applied. This is the
+        // only thing `cadence` controls.
+        //
+        // Deliberately *not* `displayIfNeeded()`: real drawing blocks on the window server in an
+        // unattended test process, and drawing is not what this suite is about. Layout is the
+        // observable per-present work; whether AppKit then rasterises is its own business.
+        func present() {
+            initialWindow.contentView?.layoutSubtreeIfNeeded()
             presentPasses += 1
-            pending.removeAll()
+        }
 
-            // §23: a scalar set mutates the view in place. Checked after *every* presentation,
-            // not once at the end, so a rebuild-then-restore cycle cannot slip through.
+        for i in 1...Self.mutationCount {
+            // One mutation, one transaction — identical at every cadence.
+            let mutation = SemanticModel.Operation.setProperty(
+                id: 2, property: .text, value: .string("v\(i)"))
+            applied.append(mutation)
+            let newStore = try makeStore(applied)
+
+            allClassifications.append(
+                contentsOf: try renderer.apply(
+                    transaction: Transaction(baseRevision: currentRevision, operations: [mutation]),
+                    newStore: newStore))
+            currentRevision = newStore.revision
+
+            // §23: a scalar set mutates the view in place. Checked after every apply, so a
+            // rebuild-then-restore cycle cannot slip through.
             if let view = renderer.registry.view(for: 2),
                let window = renderer.registry.handle(for: 1)?.window {
                 if ObjectIdentifier(view) != initialTextIdentity
@@ -102,18 +122,10 @@ struct FrameIndependenceConformanceTests {
             } else {
                 identitiesStable = false
             }
-        }
 
-        for i in 1...Self.mutationCount {
-            let mutation = SemanticModel.Operation.setProperty(
-                id: 2, property: .text, value: .string("v\(i)"))
-            applied.append(mutation)
-            pending.append(mutation)
-            if i % cadence == 0 {
-                try present()
-            }
+            if i % cadence == 0 { present() }
         }
-        try present()
+        if Self.mutationCount % cadence != 0 { present() }
 
         // Interrogate the native control the user would actually see.
         let textField = try #require(renderer.registry.view(for: 2) as? NSTextField)
@@ -147,6 +159,10 @@ struct FrameIndependenceConformanceTests {
             #expect(
                 result.viewCount == baseline.viewCount,
                 "cadence \(cadence) produced a different number of live view handles")
+            #expect(
+                result.classifications == baseline.classifications,
+                "cadence \(cadence) classified the identical transaction stream differently; presentation pacing must not reach the semantic apply path (§12.2, §32.4)"
+            )
         }
     }
 

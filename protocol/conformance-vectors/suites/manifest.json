@@ -54,12 +54,6 @@
         "§32.2"
       ],
       "status": "active",
-      "vectors": {
-        "dir": "suites/02-widget-semantics",
-        "generated": [
-          "widgets.generated.json"
-        ]
-      },
       "rust": [
         [
           "cargo",
@@ -67,9 +61,9 @@
           "--manifest-path",
           "server-rust/Cargo.toml",
           "-p",
-          "srui-semantic-tree",
+          "srui-sdk",
           "--test",
-          "conformance_widget_semantics_test"
+          "widgets_test"
         ]
       ],
       "swift": [
@@ -80,6 +74,22 @@
           "client-macos",
           "--filter",
           "WidgetSemanticsConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryPropertyTests"
         ]
       ],
       "gaps": [
@@ -183,12 +193,6 @@
         "§32.5"
       ],
       "status": "active",
-      "vectors": {
-        "dir": "suites/05-semantic-input",
-        "generated": [
-          "events.generated.json"
-        ]
-      },
       "rust": [
         [
           "cargo",
@@ -209,27 +213,25 @@
           "client-macos",
           "--filter",
           "SemanticInputConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "WidgetSemanticsConformanceTests"
         ]
       ],
       "gaps": [
         {
-          "scenario": "Server event validation accepts POINTER_* events targeting ordinary Standard Widget nodes; the §32.5 rule that coordinates are refused outside a subscribed scene is unenforced.",
-          "reason": "Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence, enabled/read-only state and TEXT_EDIT edit_seq, but never the event kind against the target node type. A POINTER_DOWN aimed at a Button validates successfully.",
-          "future_task": "Task 36 (VectorScene profile) — the rule needs the subscription model to state what coordinates are legal for",
+          "scenario": "Event validation performs no event-type/node-type compatibility check: POINTER_* is accepted against an ordinary Button, and ACTIVATE is accepted against non-interactive Text/Progress/Image/Separator nodes.",
+          "reason": "Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence and enabled state, but never compares the event type against the target node type. §32.5's rule that coordinates are refused outside a subscribed scene, and §7.6's per-node event sets, are therefore unenforced. Both are pinned by #[should_panic] tests in conformance_semantic_input_test.rs rather than papered over.",
+          "future_task": "Task 36 (VectorScene) for the coordinate half; the event-type/node-type check is unowned",
           "gap_probe": {
             "file": "server-rust/semantic-tree/src/event.rs",
             "absent_pattern": "CoordinateEvent|coordinate event .*(subscrib|scene)|NodeNotSubscribed",
             "explanation": "Matches once event validation gains a coordinate-vs-node-type rule. A match means suite 5 must assert the rejection instead of documenting its absence."
-          }
-        },
-        {
-          "scenario": "The positive half of §32.5 — a coordinate event ACCEPTED for an explicitly subscribed custom scene node — cannot be exercised.",
-          "reason": "POINTER_* events are registered in namespace 0, but no VectorScene node type or subscription model exists on this base.",
-          "future_task": "Task 36 (VectorScene profile, optional)",
-          "gap_probe": {
-            "file": "protocol/registry.yaml",
-            "absent_pattern": "name: VectorScene",
-            "explanation": "Matches once a subscribed scene node type is registered."
           }
         }
       ]
@@ -331,19 +333,23 @@
           "client-macos",
           "--filter",
           "HandshakeNegotiationTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "CodingAgentFallbackSocketTests"
         ]
-      ],
-      "gaps": [
-        {
-          "scenario": "Extension fallback subtrees — an un-negotiated extension node degrading to a declared Standard Widget Profile fallback subtree rather than failing.",
-          "reason": "Capability negotiation and must-understand rejection are implemented and covered; the fallback-subtree half of §32.7 is Task 31 work that has not been merged to origin/main.",
-          "future_task": "Task 31 merge (branch codex/task-31-coding-agent)",
-          "gap_probe": {
-            "file": "server-rust/semantic-tree/src/capability.rs",
-            "absent_pattern": "fallback_subtree|must_understand|FallbackSubtree",
-            "explanation": "Matches once extension fallback/must-understand lands (Task 31). A match means suite 7 must assert fallback behaviour instead of documenting its absence."
-          }
-        }
       ]
     },
     {
@@ -368,6 +374,46 @@
           "srui-sessiond",
           "--test",
           "conformance_reconnect_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "session_resume_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "session_resync_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "text_edit_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "event_delivery_test"
         ]
       ],
       "swift": [
@@ -483,6 +529,14 @@
           "client-macos",
           "--filter",
           "TransactionRateLimiterTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SecurityLimitsConformanceTests"
         ]
       ]
     },
@@ -587,24 +641,6 @@
       ],
       "status": "active",
       "normative": false,
-      "vectors": {
-        "dir": "suites/12-toolkit-mapping",
-        "generated": [
-          "mappings.generated.json"
-        ]
-      },
-      "rust": [
-        [
-          "cargo",
-          "test",
-          "--manifest-path",
-          "server-rust/Cargo.toml",
-          "-p",
-          "srui-semantic-tree",
-          "--test",
-          "conformance_toolkit_mapping_test"
-        ]
-      ],
       "swift": [
         [
           "swift",
@@ -612,9 +648,12 @@
           "--package-path",
           "client-macos",
           "--filter",
-          "ToolkitMappingConformanceTests"
+          "ControlFactoryTests"
         ]
-      ]
+      ],
+      "not_applicable": {
+        "rust": "Native toolkit mapping is renderer-side and informative (§22.4); the server has no half."
+      }
     }
   ]
 }

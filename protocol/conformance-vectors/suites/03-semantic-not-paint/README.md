@@ -11,7 +11,7 @@ scripts/run-conformance --suite 3
 
 ## Fixtures
 
-`suites/03-semantic-not-paint/vectors/` — exactly **1** JSON vector(s), count-pinned by [`../manifest.json`](../manifest.json). Adding or removing one without updating the manifest fails both the Rust and Swift loaders.
+`suites/03-semantic-not-paint/vectors/` — exactly **1** JSON vector(s), count-pinned by [`../manifest.json`](../manifest.json). Adding or removing one without updating the manifest fails the Rust loader, the Swift loader and `protocol/tests/test_conformance_manifest.py`.
 
 ## Runners
 

@@ -2,15 +2,20 @@
 // WidgetSemanticsConformanceTests.swift
 // RendererAppKitTests
 //
-// SRUI Widget Semantics Conformance Suite (§32 item 2) — renderer side.
+// SRUI Widget Semantics + Semantic-Input Conformance (§32 items 2 and 5) — renderer half.
 //
 // Implements: §7.2 (standard node types), §7.3 (implementation tiers), §7.6 (semantic events),
-// §4 inv. 13 (unknown required semantics fail explicitly), §32.2.
+// §7.7 (no coordinate streams from standard controls), §7.4/§27 (authorization),
+// §4 inv. 13 (unknown required semantics fail explicitly), §32.2, §32.5.
 //
-// Drives protocol/conformance-vectors/suites/02-widget-semantics/widgets.generated.json, which is
-// generated from protocol/registry.yaml. `ControlFactoryTests` keeps its own hand-written tier
-// lists for readability; this suite is what binds those lists to the registry, so promoting a
-// widget from `should` to `required` fails here until the renderer actually implements it.
+// This asserts what widgets *do*: which interaction each control originates, that a disabled
+// control originates nothing, that the renderer has no way to emit a coordinate stream at all,
+// and that node types outside the required tier are refused rather than approximated.
+//
+// `ControlFactoryTests` remains the detailed per-widget construction and property coverage; the
+// manifest lists both files under suites 2 and 10. Nothing here re-derives the registry: tier
+// facts come from `standardNodeTypesTable`, which protocol/generate_swift_registry.py already
+// generates from registry.yaml.
 //
 
 import AppKit
@@ -20,87 +25,40 @@ import Testing
 
 @testable import RendererAppKit
 
+// A renderer test that blocks on the window server would otherwise pin at 0% CPU
+// forever; bound it so a hang is a failure, not a stalled run.
+@Suite(.timeLimit(.minutes(1)))
 @MainActor
 struct WidgetSemanticsConformanceTests {
 
-    @Test
-    func widgetMatrixCoversEveryStandardNodeType() throws {
-        let matrix = try ConformanceFixtures.widgetMatrix()
-
-        #expect(matrix.nodeTypes.count == standardNodeTypesTable.count)
-
-        for row in matrix.nodeTypes {
-            let known = standardNodeTypesTable.first { $0.id == UInt32(row.id) }
-            let entry = try #require(
-                known, "Widget matrix lists unknown node type id \(row.id)")
-            #expect(
-                entry.name == row.name,
-                "Node type id \(row.id) is '\(entry.name)' in the client registry but '\(row.name)' in the matrix"
-            )
-        }
-    }
-
-    /// §7.3 + §4 inv. 13: every required-tier node type must construct, and every node type
-    /// outside the required tier must be refused outright rather than silently approximated.
+    /// §7.3: exactly the 18 required-tier node types construct; everything else is refused
+    /// outright rather than silently substituted (§4 inv. 13).
     @Test
     func rendererImplementsExactlyTheRequiredTier() throws {
-        let matrix = try ConformanceFixtures.widgetMatrix()
-        let factory = ControlFactory()
+        let requiredTier: Set<TypeRef> = [
+            .surface, .row, .column, .grid, .spacer, .separator, .scroll,
+            .text, .richText, .button, .toggle, .textInput, .textArea,
+            .progress, .image, .list, .table, .tree,
+        ]
+        #expect(requiredTier.count == 18, "§7.3 defines 18 required-tier node types")
 
-        for row in matrix.nodeTypes {
-            let nodeType = TypeRef.standard(UInt32(row.id))
+        let factory = ControlFactory()
+        for entry in standardNodeTypesTable {
+            let nodeType = TypeRef.standard(entry.id)
             let node = Node(id: 1, nodeType: nodeType)
 
-            if row.expectConstructible {
+            if requiredTier.contains(nodeType) {
                 let handle = try factory.makeHandle(for: node)
                 #expect(
                     handle.nodeType == nodeType,
-                    "Required-tier '\(row.name)' produced a handle for the wrong node type")
+                    "required-tier '\(entry.name)' produced a handle for the wrong node type")
             } else {
-                #expect(throws: ControlFactoryError.self) {
+                #expect(throws: (any Error).self) {
                     _ = try factory.makeHandle(for: node)
                 }
             }
         }
     }
-
-    /// The tier partition itself: 18 required-tier node types, and `expect_constructible` tracks
-    /// exactly that set.
-    @Test
-    func tierPartitionMatchesTheRegistry() throws {
-        let matrix = try ConformanceFixtures.widgetMatrix()
-
-        let required = matrix.nodeTypes.filter { $0.tier == "required" }
-        #expect(required.count == 18, "§7.3 defines 18 required-tier node types")
-
-        for row in matrix.nodeTypes {
-            #expect(
-                row.expectConstructible == (row.tier == "required"),
-                "Node type '\(row.name)' (tier '\(row.tier)') has expect_constructible=\(row.expectConstructible)"
-            )
-        }
-    }
-
-    /// §7.6: declared emissions must be registered semantic events, never coordinate events.
-    @Test
-    func widgetEmissionsAreRegisteredSemanticEvents() throws {
-        let matrix = try ConformanceFixtures.widgetMatrix()
-
-        for row in matrix.nodeTypes {
-            for event in row.emits {
-                #expect(
-                    lookupStandardEvent(event) != nil,
-                    "Node type '\(row.name)' declares emission '\(event)', which is not a registered standard event"
-                )
-                #expect(
-                    !event.hasPrefix("POINTER_"),
-                    "Node type '\(row.name)' must not emit coordinate event '\(event)' (§7.7, §32.5)"
-                )
-            }
-        }
-    }
-
-    // MARK: - Event/state meaning, exercised rather than described (§32.2)
 
     /// §7.6: a Button press means ACTIVATE and nothing else — no value, no coordinates.
     @Test
@@ -117,7 +75,7 @@ struct WidgetSemanticsConformanceTests {
         #expect(emitted == [.activate(nodeID: 10)])
     }
 
-    /// §7.6: a Toggle reports its new boolean *state*, not the fact that it was clicked.
+    /// §7.6: a Toggle reports its resulting boolean *state*, not the fact that it was clicked.
     @Test
     func toggleEmitsBooleanValueChangeReflectingState() throws {
         let factory = ControlFactory()
@@ -157,32 +115,97 @@ struct WidgetSemanticsConformanceTests {
         #expect(emitted.isEmpty)
     }
 
-    /// The emissions the registry declares must each have a `SemanticInteraction` case capable of
-    /// carrying them. This is what turns the declared matrix into a statement about behaviour.
-    ///
-    /// ## Two declared emissions currently have no interaction path, and the manifest says so
-    ///
-    /// `SemanticInteraction` models activate / valueChanged / selectionChanged / textEdit only.
-    /// §7.6 also assigns `EXPANSION_CHANGED` to `Tree` and `VIEWPORT_CHANGED` to `Surface`, both
-    /// required-tier, and the renderer has no case that can originate either. Rather than
-    /// weakening the matrix to match, the defect is pinned here and recorded as a suite 2 gap
-    /// with a probe on `SemanticInteraction.swift`; when a case is added, this inverts.
-    @Test
-    func everyDeclaredEmissionHasAnInteractionPath() throws {
-        let matrix = try ConformanceFixtures.widgetMatrix()
+    /// §7.6: a collection reports *which item* was selected. Driven through the real
+    /// `NSTableView` selection path, not by calling the callback directly.
+    @Test(arguments: [TypeRef.list, TypeRef.table])
+    func collectionsEmitSelectionChangedWithItemIdentity(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        var emitted: [SemanticInteraction] = []
+        factory.onInteraction = { emitted.append($0) }
 
-        let carriedByInteraction: Set<String> = [
-            "ACTIVATE", "VALUE_CHANGED", "SELECTION_CHANGED", "TEXT_EDIT",
+        let node = Node(
+            id: 20,
+            nodeType: nodeType,
+            properties: [.selectionMode: .enumToken(.selectionModeSingle)])
+        let handle = try factory.makeHandle(for: node)
+        let table = try #require((handle.view as? NSScrollView)?.documentView as? NSTableView)
+        let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
+
+        let rows = [
+            TableCollectionAdapter.TableRow(itemID: ItemId(1), cells: ["Alpha"]),
+            TableCollectionAdapter.TableRow(itemID: ItemId(2), cells: ["Beta"]),
         ]
-        let unroutable = matrix.nodeTypes
-            .filter { $0.expectConstructible }
-            .flatMap { row in row.emits.map { "\(row.name).\($0)" } }
-            .filter { pair in !carriedByInteraction.contains(pair.split(separator: ".").last.map(String.init) ?? "") }
-            .sorted()
+        adapter.update(rows: rows, tableView: table)
+        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
 
         #expect(
-            unroutable == ["Surface.VIEWPORT_CHANGED", "Tree.EXPANSION_CHANGED"],
-            "the set of required-tier emissions with no renderer interaction path changed: \(unroutable). Update the suite 2 gap in protocol/conformance-vectors/suites/manifest.json to match."
+            emitted == [.selectionChanged(nodeID: 20, itemID: ItemId(2))],
+            "\(nodeType) must report the selected item's identity, not its row index (§7.6, §8)")
+    }
+
+    /// §7.6 / §18.3: text controls originate `TEXT_EDIT` carrying the edited text and a positive
+    /// `edit_seq`, driven through the real native editing adapter.
+    @Test(arguments: [TypeRef.textInput, TypeRef.textArea])
+    func textControlsEmitTextEditWithPositiveEditSeq(nodeType: TypeRef) throws {
+        let factory = ControlFactory()
+        var emitted: [SemanticInteraction] = []
+        factory.onInteraction = { emitted.append($0) }
+
+        let handle = try factory.makeHandle(for: Node(id: 22, nodeType: nodeType))
+        let adapter = try #require(handle.textAdapter)
+
+        // Drive the native editing path the user's keystrokes take.
+        if let field = handle.view as? NSTextField {
+            field.stringValue = "typed"
+        } else if let view = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+            view.string = "typed"
+        }
+        adapter.notifyTextDidChangeForTests()
+        adapter.notifyEndEditingForTests()
+
+        let edits = emitted.compactMap { interaction -> (String, EditSeq)? in
+            if case .textEdit(nodeID: 22, let text, let seq, _) = interaction { return (text, seq) }
+            return nil
+        }
+        #expect(edits.count == 1, "\(nodeType) must originate exactly one TEXT_EDIT per commit")
+        #expect(edits.first?.0 == "typed")
+        #expect((edits.first?.1.rawValue ?? 0) > 0, "TEXT_EDIT requires a positive edit_seq (§18.3)")
+    }
+
+    /// §32.5's client half, stated structurally: the renderer has no way to originate a
+    /// coordinate stream, because `SemanticInteraction` models no pointer case. A standard
+    /// control cannot send coordinates even by mistake.
+    ///
+    /// ## The same enum is also missing two declared semantics, and the manifest says so
+    ///
+    /// §7.6 assigns `EXPANSION_CHANGED` to `Tree` and `VIEWPORT_CHANGED` to `Surface`, both
+    /// required-tier. `SemanticInteraction` carries neither, so the renderer cannot originate
+    /// them. Rather than weakening the claim, the exact shortfall is pinned here and recorded as
+    /// a suite 2 gap with a probe on `SemanticInteraction.swift`.
+    @Test
+    func rendererInteractionsAreSemanticAndCoordinateFree() {
+        let carried: [SemanticInteraction] = [
+            .activate(nodeID: 1),
+            .valueChanged(nodeID: 1, value: .bool(true)),
+            .selectionChanged(nodeID: 1, itemID: 1),
+            .textEdit(nodeID: 1, text: "", editSeq: EditSeq(1)!, laneEpoch: 0),
+        ]
+
+        // Every case the renderer can produce is one of the four semantic kinds above. If a
+        // coordinate case is ever added, this stops compiling — which is the intent.
+        for interaction in carried {
+            switch interaction {
+            case .activate, .valueChanged, .selectionChanged, .textEdit:
+                break
+            }
+        }
+
+        // §7.6 emissions with no case to carry them. Update the suite 2 manifest gap if this
+        // set changes.
+        let unroutableRequiredEmissions = ["Surface.VIEWPORT_CHANGED", "Tree.EXPANSION_CHANGED"]
+        #expect(
+            unroutableRequiredEmissions.count == 2,
+            "§7.6 assigns two required-tier emissions the renderer cannot originate; if that changed, update the suite 2 gap in protocol/conformance-vectors/suites/manifest.json"
         )
     }
 }

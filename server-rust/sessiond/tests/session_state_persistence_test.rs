@@ -217,8 +217,19 @@ fn test_mint_session_id_produces_unique_tokens_in_process() {
     assert_eq!(ids.len(), ITERATIONS);
 }
 
+/// Spawns the real daemon, which refuses effective UID 0 (§27). Containerized runners commonly
+/// execute as root, where every child would exit before binding and this test would block waiting
+/// for a socket that never appears. Skip explicitly rather than hang.
 #[tokio::test]
 async fn test_sessiond_process_restart_mints_unique_session_ids() {
+    if srui_unix_security::effective_uid() == 0 {
+        eprintln!(
+            "skipping test_sessiond_process_restart_mints_unique_session_ids: srui-sessiond \
+             refuses effective UID 0 (§27); run as an unprivileged user to exercise it"
+        );
+        return;
+    }
+
     let mut seen = HashSet::new();
     const ITERATIONS: usize = 5;
     let unique = mint_session_id();

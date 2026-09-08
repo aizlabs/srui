@@ -159,6 +159,80 @@ struct TransactionRateLimiterTests {
         await serverTransport.close()
     }
 
+    /// §26 bounds the update rate per session, so continuing the same session must not hand back a
+    /// full burst — otherwise a server could disconnect and resume repeatedly to replay one burst
+    /// per connection. Only adopting a *different* session refills the budget.
+    @Test("The ingress budget follows the session, not the connection")
+    func ingressBudgetIsScopedToTheSession() async throws {
+        // Sustained credit is deliberately slow (1/s) and the bucket small, so a single admission
+        // leaves the budget measurably below capacity. Reading credit never refills it, so every
+        // assertion below is deterministic rather than wall-clock dependent.
+        let capacity: UInt64 = 3
+        let limits = try #require(TransactionRateLimits(
+            sustainedTransactionsPerSecond: 1,
+            burstCapacity: capacity
+        ))
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            transactionRateLimits: limits
+        )
+        try await controller.start()
+
+        func deliverTransaction(newRevision: UInt64) async {
+            var envelope = SRUIMessage()
+            envelope.transaction = Transaction(
+                baseRevision: Revision(newRevision - 1),
+                newRevision: Revision(newRevision),
+                operations: [.createNode(id: NodeId(newRevision), nodeType: .surface)]
+            ).toWire()
+            await controller.handleIncomingMessage(envelope)
+        }
+
+        func deliverResync(sessionId: String, continuity: Srui_Protocol_SessionContinuity) async {
+            var resync = SRUIServerResyncRequired()
+            resync.sessionID = sessionId
+            resync.snapshotRevision = 1
+            resync.reason = "budget probe"
+            resync.continuity = continuity
+            var envelope = SRUIMessage()
+            envelope.serverResyncRequired = resync
+            await controller.handleIncomingMessage(envelope)
+        }
+
+        // A fresh SERVER WELCOME session is adopted with a full budget.
+        await controller.handleIncomingMessage(
+            HandshakeFixtures.welcomeMessage(sessionId: "budget-session")
+        )
+        #expect(await controller.availableTransactionIngressCredit == capacity)
+
+        // Admitting one transaction spends one token.
+        await deliverTransaction(newRevision: 1)
+        let spent = await controller.availableTransactionIngressCredit
+        #expect(spent < capacity)
+
+        // Same-session resync continues the same session, so the spent budget is retained.
+        await deliverResync(sessionId: "budget-session", continuity: .sameSession)
+        #expect(await controller.availableTransactionIngressCredit == spent)
+
+        // A replacement is a different session and legitimately starts a new budget.
+        await deliverResync(sessionId: "budget-session-2", continuity: .replaced)
+        #expect(await controller.availableTransactionIngressCredit == capacity)
+
+        // Restarting the connection is not adopting a session, so it must not refill either. The
+        // restart cannot complete over a closed pipe, but `start()` reaches its own setup before
+        // the handshake send, which is where a per-connection reset would live.
+        await deliverTransaction(newRevision: 2)
+        let beforeRestart = await controller.availableTransactionIngressCredit
+        #expect(beforeRestart < capacity)
+        await controller.stop()
+        try? await controller.start()
+        #expect(await controller.availableTransactionIngressCredit == beforeRestart)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     /// Control traffic may overtake the throttled transaction lane, but a message that *replaces*
     /// the replica may not. `SERVER RESUME_OK` and `SERVER RESYNC_REQUIRED` must observe every
     /// transaction the server sent before them, or a queued transaction would be evaluated against

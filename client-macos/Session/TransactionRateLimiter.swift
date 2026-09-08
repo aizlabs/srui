@@ -55,6 +55,11 @@ enum TransactionAdmission: Equatable {
 struct TransactionRateLimiter: Sendable {
     static let unitsPerToken: UInt64 = 1_000_000_000
 
+    /// Whole tokens currently credited. Does not refill; reports the value the last admission left.
+    var availableTokens: UInt64 {
+        availableUnits / Self.unitsPerToken
+    }
+
     private let limits: TransactionRateLimits
     private let capacityUnits: UInt64
     private var availableUnits: UInt64
@@ -116,6 +121,14 @@ actor TransactionIngressGate {
 
     func reset() {
         limiter.reset()
+    }
+
+    /// Test seam: whole tokens currently available.
+    ///
+    /// Reading does not advance the refill clock, so a value observed after an admission is stable
+    /// until the next one. That lets the budget's *scope* be asserted without wall-clock timing.
+    func availableTokens() -> UInt64 {
+        limiter.availableTokens
     }
 
     func waitForAdmission() async throws {

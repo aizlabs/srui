@@ -872,7 +872,9 @@ public final class SessionController: @unchecked Sendable {
             return self.lifecycleGeneration
         }
         guard let lifecycleGeneration else { return }
-        await transactionIngressGate.reset()
+        // The ingress budget is deliberately *not* reset here. See
+        // `adoptFreshSessionIngressBudget()`: §26's update rate is bounded per session, and
+        // resetting per connection would let a server replay a full burst after every disconnect.
         var activatedResourceOwnerEpoch: UInt64?
 
         startRangeRequestPump()
@@ -1549,6 +1551,26 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// Grants a full ingress budget to a session the client is adopting for the first time.
+    ///
+    /// §26 bounds the update rate *per session*, so the bucket must not be refilled per
+    /// connection: a server that repeatedly disconnects and lets the client resume the same
+    /// session would otherwise replay a full 240-transaction burst on every reconnect, turning a
+    /// per-session bound into a per-connection one. Only a fresh `SERVER WELCOME` session or a
+    /// `RESYNC_REQUIRED` that *replaces* the session starts a new budget — both already cost the
+    /// server a full replica replacement. `RESUME_OK` and same-session resync retain the bucket,
+    /// which refills on wall-clock time regardless of how often the connection is torn down.
+    private func adoptFreshSessionIngressBudget() async {
+        await transactionIngressGate.reset()
+    }
+
+    /// Test seam for the budget's scope: whole transactions of ingress credit still available.
+    /// Internal rather than public — it exists so the per-session bound can be asserted without
+    /// wall-clock timing, not as part of the client API.
+    var availableTransactionIngressCredit: UInt64 {
+        get async { await transactionIngressGate.availableTokens() }
+    }
+
     /// Awaits every transaction queued before this point.
     ///
     /// Each queued task awaits its own predecessor, so awaiting the current tail transitively
@@ -1789,6 +1811,7 @@ public final class SessionController: @unchecked Sendable {
             ))
             return
         }
+        await adoptFreshSessionIngressBudget()
 
         withStateLock {
             self.currentSessionId = welcome.sessionID
@@ -2243,6 +2266,7 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
+                await adoptFreshSessionIngressBudget()
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
@@ -2334,6 +2358,7 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                await adoptFreshSessionIngressBudget()
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
                     await MainActor.run { renderer.resetExtensionRegistry() }

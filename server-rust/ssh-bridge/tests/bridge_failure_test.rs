@@ -265,8 +265,20 @@ async fn backpressure_preserves_message_order() {
 }
 
 /// The binary routes tracing to stderr so stdout stays a pure protocol stream (§19.1, §20.1).
+///
+/// Spawns the real binary, which refuses effective UID 0 (§27). Containerized runners commonly
+/// execute as root, where the child would exit before accepting and this test would block on
+/// `accept(2)` until the harness timed out. Skip explicitly rather than hang.
 #[test]
 fn binary_stderr_contains_no_protocol_bytes() {
+    if srui_unix_security::effective_uid() == 0 {
+        eprintln!(
+            "skipping binary_stderr_contains_no_protocol_bytes: srui-ssh-bridge refuses \
+             effective UID 0 (§27); run as an unprivileged user to exercise it"
+        );
+        return;
+    }
+
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;

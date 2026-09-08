@@ -97,21 +97,26 @@ Fixture replay is shared: `server-rust/semantic-tree/tests/common/fixture_replay
 `StateMachineConformanceTests.replayVectorFile` are used by suites 1 and 3 alike, so a vector
 relocated between suites is still *executed* rather than merely parsed.
 
-### Generated fixtures
+### Registry-derived suites
 
-Suites 2, 5 and 12 consume fixtures generated from `protocol/registry.yaml` by
-`protocol/generate_conformance_matrix.py` (wired into `./protocol/generate_proto.sh`, and gated
-by `git diff --exit-code` in CI). Node tier, category and the `emits` matrix are registry-owned
-and are never restated by hand, so promoting a widget from `should` to `required` cannot leave a
-stale copy behind in a test fixture.
+Suites 2, 5 and 12 have **no fixture files**. They read the registry through the tables that
+`./protocol/generate_proto.sh` already generates — `standardNodeTypesTable` (id, name and `tier`)
+and `STANDARD_EVENTS` in `client-macos/SemanticModel/RegistryTables.swift` and
+`server-rust/semantic-tree`'s build output — and drive real code against them.
+
+An earlier revision generated a JSON fixture per suite from `registry.yaml` instead. That only
+proved the generator agreed with itself: it could not fail when the *implementation* diverged from
+the registry. Node tier, category and the `emits` matrix stay registry-owned, but they are
+consumed from the existing generated tables rather than copied into a second oracle, so there is
+no third artefact to keep fresh.
 
 `emits` transcribes the §7.6 *Standard events* table exactly. A node absent from that table emits
 nothing, and no capability may be added to the registry without adding it to the design document
 first.
 
-The AppKit mapping table is the one part that is *not* registry-derived, and deliberately so:
-§22.4 makes native mappings informative, so they must not become protocol source of truth. It
-lives in the generator and fails codegen if the registry gains a node type it does not cover.
+The AppKit mapping is the one part that is *not* registry-derived, and deliberately so: §22.4
+makes native mappings informative, so they must not become protocol source of truth. Suite 12
+asserts it directly against `ControlFactory`, which is the mapping's only real definition.
 
 ### Open gaps
 

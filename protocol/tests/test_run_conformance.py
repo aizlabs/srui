@@ -141,6 +141,7 @@ def test_open_gap_reports_gap_not_pass(manifest_backup) -> None:
             "scenario": "something required is unproven",
             "reason": "because",
             "future_task": "Task 99",
+            "languages": ["rust", "swift"],
             "gap_probe": {
                 "file": "protocol/registry.yaml",
                 "absent_pattern": "name: DefinitelyNotARealNodeType",
@@ -163,6 +164,7 @@ def test_closed_gap_exits_nonzero(manifest_backup) -> None:
             "scenario": "already fixed",
             "reason": "because",
             "future_task": "Task 99",
+            "languages": ["rust", "swift"],
             "gap_probe": {
                 "file": "protocol/registry.yaml",
                 "absent_pattern": "node_types:",  # certain to match
@@ -178,12 +180,49 @@ def test_closed_gap_exits_nonzero(manifest_backup) -> None:
 
 def test_gap_without_probe_is_rejected(manifest_backup) -> None:
     suites = [suite(i) for i in range(1, 13)]
-    suites[4]["gaps"] = [{"scenario": "s", "reason": "r", "future_task": "t"}]
+    suites[4]["gaps"] = [
+        {"scenario": "s", "reason": "r", "future_task": "t", "languages": ["rust"]}
+    ]
     write_manifest(suites)
 
     result = run("--list")
     assert result.returncode == 1
     assert "gap_probe" in (result.stdout + result.stderr)
+
+
+def test_gap_only_applies_to_a_run_that_selects_its_language(manifest_backup) -> None:
+    """A Swift-side gap must not be reported against a Rust-only run, but must be against Swift."""
+    suites = [suite(i) for i in range(1, 13)]
+    del suites[4]["rust"]
+    del suites[4]["swift"]
+    suites[4]["status"] = "known_gap"
+    # Both languages are excused so the missing-runner rule is satisfied; the gap below is what
+    # distinguishes "no server half" from "the client half is not written yet".
+    suites[4]["not_applicable"] = {
+        "rust": "client-side API; no server half",
+        "swift": "no implementation yet",
+    }
+    suites[4]["gaps"] = [
+        {
+            "scenario": "the client half does not exist yet",
+            "reason": "because",
+            "future_task": "Task 99",
+            "languages": ["swift"],
+            "gap_probe": {
+                "file": "protocol/registry.yaml",
+                "absent_pattern": "name: DefinitelyNotARealNodeType",
+            },
+        }
+    ]
+    write_manifest(suites)
+
+    rust_only = run("--implementation", "rust", "--suite", "5")
+    assert rust_only.returncode == 0
+    assert "N/A" in rust_only.stdout, "a Swift-only gap is a platform exclusion for a Rust run"
+    assert "no server half" in rust_only.stdout
+
+    swift_only = run("--implementation", "swift", "--suite", "5")
+    assert "GAP" in swift_only.stdout, "the run that selects the blocked language must see the gap"
 
 
 @pytest.mark.parametrize("count", [11, 13])

@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -78,12 +80,20 @@ def load_manifest() -> dict:
         if status not in {"active", "known_gap"}:
             raise ManifestError(f"suite {suite.get('id')} has invalid status {status!r}")
         for gap in suite.get("gaps", []):
-            missing = {"scenario", "reason", "future_task", "gap_probe"} - set(gap)
+            missing = {"scenario", "reason", "future_task", "gap_probe", "languages"} - set(gap)
             if missing:
                 raise ManifestError(
                     f"suite {suite.get('id')} has a gap missing {sorted(missing)}; every gap must "
-                    "be documented with a reason, an owning task, and a probe that detects its "
-                    "closure — otherwise the gap can be silently fixed and still print GAP"
+                    "be documented with a reason, an owning task, the languages it blocks, and a "
+                    "probe that detects its closure — otherwise the gap can be silently fixed and "
+                    "still print GAP"
+                )
+            unknown = set(gap["languages"]) - {"rust", "swift"}
+            if unknown or not gap["languages"]:
+                raise ManifestError(
+                    f"suite {suite.get('id')} has a gap with invalid 'languages' "
+                    f"{gap['languages']!r}; it must name at least one of rust/swift so a run that "
+                    "selects neither is not told about a gap it cannot exercise"
                 )
             probe = gap["gap_probe"]
             if not {"file", "absent_pattern"} <= set(probe):
@@ -148,28 +158,38 @@ def run_command(command: list[str], timeout: int) -> tuple[bool, str]:
     stalls the whole conformance run — and in CI, the job's own limit is the only thing that ends
     it, with no indication of which suite was responsible.
     """
+    # `start_new_session` puts the runner in its own process group. Killing only the `cargo` or
+    # `swift` parent on timeout would leave the test binary and every fixture server it spawned
+    # alive, holding ports and sockets while later suites run — which defeats the watchdog. A
+    # process keeps its group when it is orphaned, so the group kills the whole tree.
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(  # noqa: S603 - commands come from the checked-in manifest
             command,
             cwd=REPO_ROOT,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=timeout,
+            start_new_session=True,
         )
     except FileNotFoundError:
         return False, f"runner not found: {command[0]}"
-    except subprocess.TimeoutExpired as expired:
-        captured = ""
-        for stream in (expired.stdout, expired.stderr):
-            if stream:
-                captured += stream.decode() if isinstance(stream, bytes) else stream
-        tail = captured.strip().splitlines()[-15:]
+
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
+        stdout, stderr = process.communicate()
+        tail = ((stdout or "") + (stderr or "")).strip().splitlines()[-15:]
         return False, (
-            f"TIMED OUT after {timeout}s and was killed. A runner that does not finish is a "
-            "failure: check for a test blocking on AppKit drawing, a socket peer, or a lock.\n"
-            + "\n".join(tail)
+            f"TIMED OUT after {timeout}s; the runner's whole process group was killed. A runner "
+            "that does not finish is a failure: check for a test blocking on AppKit drawing, a "
+            "socket peer, or a lock.\n" + "\n".join(tail)
         )
+
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if completed.returncode != 0:
         tail = (completed.stdout + completed.stderr).strip().splitlines()
         return False, "\n".join(tail[-25:]) if tail else "command failed with no output"
@@ -303,8 +323,17 @@ def main() -> int:
                     f"undeclared missing runner: {', '.join(missing_languages)}"
                 )
         elif not commands:
-            suite_status = GAP if suite["status"] == "known_gap" else NA
-            if gaps:
+            # A gap only concerns a run that selected the language it blocks. Suite 11's gap is a
+            # Swift-side client API, so `--implementation rust` is a documented platform exclusion
+            # (N/A with the manifest's reason), while a Swift or combined run must still report
+            # GAP rather than quietly excusing the missing work.
+            if gaps and any(set(gap["languages"]) & set(languages) for gap in gaps):
+                suite_status = GAP
+            elif bool(languages) and all(lang in not_applicable for lang in languages):
+                suite_status = NA
+            else:
+                suite_status = GAP if suite["status"] == "known_gap" else NA
+            if gaps and suite_status == GAP:
                 note = f"no runnable coverage; awaiting {gaps[0]['future_task']}"
             else:
                 # `N/A` is a documented platform exclusion, never a silently skipped suite: the

@@ -1,19 +1,19 @@
 {
   "version": 1,
-  "spec_section": "§32",
-  "description": "Machine-readable index of the twelve SRUI conformance suites required by §32. Consumed by scripts/run-conformance, by protocol/tests/test_conformance_manifest.py, and by the Rust and Swift vector loaders (which assert the declared vector counts exactly).",
+  "spec_section": "\u00a732",
+  "description": "Machine-readable index of the twelve SRUI conformance suites required by \u00a732. Consumed by scripts/run-conformance, by protocol/tests/test_conformance_manifest.py, and by the Rust and Swift vector loaders (which assert the declared vector counts exactly).",
   "suites": [
     {
       "id": 1,
       "slug": "core-state-machine",
       "name": "Core state-machine tests",
       "spec_sections": [
-        "§12.1",
-        "§12.2",
-        "§6.2",
-        "§13",
-        "§26",
-        "§32.1"
+        "\u00a712.1",
+        "\u00a712.2",
+        "\u00a76.2",
+        "\u00a713",
+        "\u00a726",
+        "\u00a732.1"
       ],
       "status": "active",
       "vectors": {
@@ -48,10 +48,10 @@
       "slug": "widget-semantics",
       "name": "Widget semantic tests",
       "spec_sections": [
-        "§7.2",
-        "§7.3",
-        "§7.6",
-        "§32.2"
+        "\u00a77.2",
+        "\u00a77.3",
+        "\u00a77.6",
+        "\u00a732.2"
       ],
       "status": "active",
       "rust": [
@@ -94,14 +94,17 @@
       ],
       "gaps": [
         {
-          "scenario": "Tree EXPANSION_CHANGED and Surface VIEWPORT_CHANGED are declared in §7.6 but the renderer has no interaction path that can originate them.",
+          "scenario": "Tree EXPANSION_CHANGED and Surface VIEWPORT_CHANGED are declared in \u00a77.6 but the renderer has no interaction path that can originate them.",
           "reason": "RendererAppKit/SemanticInteraction.swift models only activate, valueChanged, selectionChanged and textEdit. A required-tier widget can therefore never emit the disclosure or viewport events the registry declares for it.",
-          "future_task": "unowned — needs a SemanticInteraction case plus the AppKit outline/window wiring",
+          "future_task": "unowned \u2014 needs a SemanticInteraction case plus the AppKit outline/window wiring",
           "gap_probe": {
             "file": "client-macos/RendererAppKit/SemanticInteraction.swift",
             "absent_pattern": "case +(expansionChanged|viewportChanged)",
             "explanation": "Matches once the renderer can originate disclosure or viewport events. A match means suite 2 must assert the behaviour instead of documenting its absence."
-          }
+          },
+          "languages": [
+            "swift"
+          ]
         }
       ]
     },
@@ -110,12 +113,12 @@
       "slug": "semantic-not-paint",
       "name": "Semantic-not-paint tests",
       "spec_sections": [
-        "§4.7",
-        "§4.16",
-        "§4.17",
-        "§7.1",
-        "§10",
-        "§32.3"
+        "\u00a74.7",
+        "\u00a74.16",
+        "\u00a74.17",
+        "\u00a77.1",
+        "\u00a710",
+        "\u00a732.3"
       ],
       "status": "active",
       "vectors": {
@@ -150,10 +153,10 @@
       "slug": "frame-independence",
       "name": "Frame-independence tests",
       "spec_sections": [
-        "§4.16",
-        "§12.2",
-        "§23",
-        "§32.4"
+        "\u00a74.16",
+        "\u00a712.2",
+        "\u00a723",
+        "\u00a732.4"
       ],
       "status": "active",
       "vectors": {
@@ -187,10 +190,10 @@
       "slug": "semantic-input",
       "name": "Semantic-input tests",
       "spec_sections": [
-        "§7.6",
-        "§7.7",
-        "§18.3",
-        "§32.5"
+        "\u00a77.6",
+        "\u00a77.7",
+        "\u00a718.3",
+        "\u00a732.5"
       ],
       "status": "active",
       "rust": [
@@ -226,13 +229,17 @@
       "gaps": [
         {
           "scenario": "Event validation performs no event-type/node-type compatibility check: POINTER_* is accepted against an ordinary Button, and ACTIVATE is accepted against non-interactive Text/Progress/Image/Separator nodes.",
-          "reason": "Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence and enabled state, but never compares the event type against the target node type. §32.5's rule that coordinates are refused outside a subscribed scene, and §7.6's per-node event sets, are therefore unenforced. Both are pinned by #[should_panic] tests in conformance_semantic_input_test.rs rather than papered over.",
+          "reason": "Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence and enabled state, but never compares the event type against the target node type. \u00a732.5's rule that coordinates are refused outside a subscribed scene, and \u00a77.6's per-node event sets, are therefore unenforced. Both are pinned by #[should_panic] tests in conformance_semantic_input_test.rs rather than papered over.",
           "future_task": "Task 36 (VectorScene) for the coordinate half; the event-type/node-type check is unowned",
           "gap_probe": {
             "file": "server-rust/semantic-tree/src/event.rs",
             "absent_pattern": "CoordinateEvent|coordinate event .*(subscrib|scene)|NodeNotSubscribed",
             "explanation": "Matches once event validation gains a coordinate-vs-node-type rule. A match means suite 5 must assert the rejection instead of documenting its absence."
-          }
+          },
+          "languages": [
+            "rust",
+            "swift"
+          ]
         }
       ]
     },
@@ -241,10 +248,10 @@
       "slug": "local-text-interaction",
       "name": "Local text-interaction tests",
       "spec_sections": [
-        "§9",
-        "§18.3",
-        "§22.6",
-        "§32.6"
+        "\u00a79",
+        "\u00a718.3",
+        "\u00a722.6",
+        "\u00a732.6"
       ],
       "status": "active",
       "rust": [
@@ -299,10 +306,10 @@
       "slug": "extension-negotiation",
       "name": "Extension-negotiation tests",
       "spec_sections": [
-        "§5",
-        "§17",
-        "§22.4",
-        "§32.7"
+        "\u00a75",
+        "\u00a717",
+        "\u00a722.4",
+        "\u00a732.7"
       ],
       "status": "active",
       "rust": [
@@ -357,11 +364,11 @@
       "slug": "reconnect",
       "name": "Reconnect tests",
       "spec_sections": [
-        "§18",
-        "§18.2",
-        "§18.3",
-        "§21",
-        "§32.8"
+        "\u00a718",
+        "\u00a718.2",
+        "\u00a718.3",
+        "\u00a721",
+        "\u00a732.8"
       ],
       "status": "active",
       "rust": [
@@ -456,10 +463,10 @@
       "slug": "security-limits",
       "name": "Security limits",
       "spec_sections": [
-        "§26",
-        "§20.1",
-        "§27",
-        "§32.9"
+        "\u00a726",
+        "\u00a720.1",
+        "\u00a727",
+        "\u00a732.9"
       ],
       "status": "active",
       "vectors": {
@@ -545,10 +552,10 @@
       "slug": "renderer-semantics",
       "name": "Renderer semantic tests",
       "spec_sections": [
-        "§22",
-        "§23",
-        "§24",
-        "§32.10"
+        "\u00a722",
+        "\u00a723",
+        "\u00a724",
+        "\u00a732.10"
       ],
       "status": "active",
       "swift": [
@@ -602,9 +609,9 @@
       "slug": "semantic-inspection",
       "name": "Semantic inspection tests",
       "spec_sections": [
-        "§24",
-        "§25",
-        "§32.11"
+        "\u00a724",
+        "\u00a725",
+        "\u00a732.11"
       ],
       "status": "known_gap",
       "gaps": [
@@ -623,12 +630,15 @@
             "file": "client-macos/Accessibility/Accessibility.swift",
             "absent_pattern": "public (struct|final class|protocol|func) +(Semantic)?Inspect",
             "explanation": "Matches once Task 35 lands a public inspection API. A match means this suite must move from known_gap to active."
-          }
+          },
+          "languages": [
+            "swift"
+          ]
         }
       ],
       "not_applicable": {
-        "rust": "Semantic inspection is a client-side API (§24, §25); there is no server half.",
-        "swift": "No implementation exists yet — the whole suite is the Task 35 gap."
+        "rust": "Semantic inspection is a client-side API (\u00a724, \u00a725); there is no server half.",
+        "swift": "No implementation exists yet \u2014 the whole suite is the Task 35 gap."
       }
     },
     {
@@ -636,8 +646,8 @@
       "slug": "toolkit-mapping",
       "name": "Toolkit mapping tests",
       "spec_sections": [
-        "§22.4",
-        "§32.12"
+        "\u00a722.4",
+        "\u00a732.12"
       ],
       "status": "active",
       "normative": false,
@@ -652,7 +662,7 @@
         ]
       ],
       "not_applicable": {
-        "rust": "Native toolkit mapping is renderer-side and informative (§22.4); the server has no half."
+        "rust": "Native toolkit mapping is renderer-side and informative (\u00a722.4); the server has no half."
       }
     }
   ]

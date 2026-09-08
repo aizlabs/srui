@@ -1906,6 +1906,17 @@ public final class SessionController: @unchecked Sendable {
         }
         await adoptFreshSessionIngressBudget()
 
+        // A revision-zero WELCOME carries no snapshot (§18), which makes it the authoritative
+        // statement that the new session holds no state. Anything left in the replica belongs to
+        // a session this controller no longer has, and `start()` cannot always see that: a resume
+        // that failed unanswered erases the session identity, so the next start finds nothing to
+        // abandon and never reaches its own discard. Emptying here — before the phase turns active
+        // — is the one point every path passes through, so no stale control survives to emit
+        // events for nodes the new server never created (§4 inv. 13).
+        if welcome.initialRevision == 0 {
+            await discardReplicaForFreshNegotiation()
+        }
+
         withStateLock {
             self.currentSessionId = welcome.sessionID
             self.requestedSessionId = nil
@@ -2532,15 +2543,19 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
-    /// Drops replica state that the fresh CLIENT_HELLO replacing an abandoned resume cannot repair.
+    /// Drops replica state that the fresh CLIENT_HELLO replacing an abandoned session cannot repair.
     ///
-    /// A revision-zero `SERVER WELCOME` deliberately carries no snapshot (§18), and `handleWelcome`
-    /// only activates the session. A recreated controller that shares a nonempty applier — the
-    /// Terminal case, where `resumeNeedsNamespaceMapping` forces renegotiation — would therefore
-    /// keep the abandoned session's store and its mounted windows alive across the hello: active
-    /// controls that can emit events for nodes the new server has never heard of (§4 inv. 13).
+    /// A revision-zero `SERVER WELCOME` deliberately carries no snapshot (§18), so a controller
+    /// that shares a nonempty applier would otherwise keep the abandoned session's store and its
+    /// mounted windows alive across the hello: active controls that can emit events for nodes the
+    /// new server has never heard of (§4 inv. 13).
     ///
-    /// Runs before the handshake is sent, so no transaction can race the teardown.
+    /// Called from two points, both before anything can observe the stale tree as current:
+    /// `start()` discards as soon as it decides a session cannot be resumed — the Terminal case,
+    /// where `resumeNeedsNamespaceMapping` forces renegotiation — and `handleWelcome` discards on
+    /// any revision-zero welcome, which also covers the paths `start()` cannot see, such as a
+    /// resume that failed unanswered and erased the session identity before the next start.
+    /// Idempotent: an already-empty replica returns immediately.
     private func discardReplicaForFreshNegotiation() async {
         guard applier.lastAppliedRevision > .initial else { return }
         applier.resetReplica()

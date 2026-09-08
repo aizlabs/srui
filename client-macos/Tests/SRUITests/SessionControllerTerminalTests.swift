@@ -446,4 +446,80 @@ struct SessionControllerTerminalTests {
         await controller.stop()
         await serverTransport.close()
     }
+
+    /// `start()` can only discard the replica for a session it can still name. A resume that fails
+    /// unanswered erases the session identity (`unansweredResumeFailureForcesFreshHello`), so the
+    /// next start finds nothing to abandon — which is the state this test reproduces by starting a
+    /// controller with no session id over a nonempty shared applier. A revision-zero WELCOME
+    /// carries no snapshot, so it must empty the replica itself (§18).
+    @Test("A revision-zero WELCOME empties a replica left by an abandoned session")
+    @MainActor
+    func revisionZeroWelcomeDiscardsAbandonedReplica() async throws {
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let outbox = EventOutbox()
+
+        let (seedClient, seedServer) = await PipeTransport.createPair()
+        let seedController = SessionController(
+            transport: seedClient,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+        seedController.attachRenderer(renderer)
+        try await seedController.start()
+        await seedController.handleIncomingMessage(welcomeMessage(sessionID: "seeded-session"))
+
+        let seeded = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: NodeId(1), nodeType: .surface),
+                .createNode(id: NodeId(2), nodeType: .button, parentID: NodeId(1)),
+            ]
+        )
+        var seededMessage = SRUIMessage()
+        seededMessage.transaction = seeded.toWire()
+        await seedController.handleIncomingMessage(seededMessage)
+        try await AsyncTestSupport.eventually(description: "seeded tree mounted") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.handle(for: NodeId(2)) != nil
+        }
+        await seedController.stop()
+        await seedServer.close()
+
+        // No session id: exactly what a failed unanswered resume leaves behind.
+        let (freshClient, freshServer) = await PipeTransport.createPair()
+        let freshController = SessionController(
+            transport: freshClient,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+        freshController.attachRenderer(renderer)
+        try await freshController.start()
+        #expect(freshController.sessionId == nil)
+        await freshController.handleIncomingMessage(welcomeMessage(sessionID: "replacement-session"))
+
+        #expect(applier.lastAppliedRevision == .initial)
+        #expect(applier.currentSnapshot.store.rootIDs.isEmpty)
+        #expect(renderer.registry.count == 0)
+
+        await freshController.stop()
+        await freshServer.close()
+    }
+
+    /// A fresh session at revision 0: the server sends no snapshot with it (§18).
+    private func welcomeMessage(sessionID: String) -> SRUIMessage {
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = sessionID
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 0
+        var message = SRUIMessage()
+        message.serverWelcome = welcome
+        return message
+    }
 }

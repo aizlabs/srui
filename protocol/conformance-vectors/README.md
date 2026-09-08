@@ -27,26 +27,109 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 
 See `expected.json` for canonical hex and field declarations.
 
-## 2. Core State-Machine Fixtures (`state-machine/`)
+## 2. The Twelve §32 Suites (`suites/`)
 
-Human-readable declarative JSON test vectors validating the **Protocol Core State Machine** (§32 item 1) and **Semantic-Not-Paint Invariants** (§32 item 3, §4).
+[`suites/manifest.json`](suites/manifest.json) is the machine-readable index of the twelve
+conformance suites §32 requires. It is the single source for which suites exist, where their
+fixtures live, how many there are, which commands run them, which implementations they apply to,
+and which scenarios are open gaps.
 
-See [`state-machine/README.md`](state-machine/README.md) for format specifications, error codes, and schema rules.
+| # | Directory | Suite (§32 item) | Current | Fixtures | Gap owner |
+|---|---|---|---|---|---|
+| 1 | [`01-core-state-machine/`](suites/01-core-state-machine/) | Core state-machine tests | `PASS` | 48 JSON vector(s) | — |
+| 2 | [`02-widget-semantics/`](suites/02-widget-semantics/) | Widget semantic tests | `GAP` | generated from `registry.yaml` | unowned |
+| 3 | [`03-semantic-not-paint/`](suites/03-semantic-not-paint/) | Semantic-not-paint tests | `PASS` | 1 JSON vector(s) | — |
+| 4 | [`04-frame-independence/`](suites/04-frame-independence/) | Frame-independence tests | `PASS` | code-driven | — |
+| 5 | [`05-semantic-input/`](suites/05-semantic-input/) | Semantic-input tests | `GAP` | generated from `registry.yaml` | Task 36 (VectorScene profile) |
+| 6 | [`06-local-text-interaction/`](suites/06-local-text-interaction/) | Local text-interaction tests | `PASS` | code-driven | — |
+| 7 | [`07-extension-negotiation/`](suites/07-extension-negotiation/) | Extension-negotiation tests | `GAP` | code-driven | Task 31 merge (branch codex/task-31-coding-agent) |
+| 8 | [`08-reconnect/`](suites/08-reconnect/) | Reconnect tests | `PASS` | code-driven | — |
+| 9 | [`09-security-limits/`](suites/09-security-limits/) | Security limits | `PASS` | code-driven | — |
+| 10 | [`10-renderer-semantics/`](suites/10-renderer-semantics/) | Renderer semantic tests | `PASS` | code-driven | — |
+| 11 | [`11-semantic-inspection/`](suites/11-semantic-inspection/) | Semantic inspection tests | `GAP` | code-driven | Task 35 (local semantic inspection and automation API) |
+| 12 | [`12-toolkit-mapping/`](suites/12-toolkit-mapping/) | Toolkit mapping tests | `PASS` | generated from `registry.yaml` | — |
 
-| Fixture | Scenario / Architectural Invariant |
-|---|---|
-| `01_valid_multi_op_transaction.json` | Valid atomic multi-op transaction (rev 0 -> 1) |
-| `02_reused_node_id_rejected.json` | Reused session-scoped `NodeId` rejection (§6.2) |
-| `03_orphan_parent_rejected.json` | Non-existent parent reference rejection (§13) |
-| `04_mid_transaction_rollback.json` | Intermediate op failure and complete transaction rollback (§12.1) |
-| `05_stale_base_revision_rejected.json` | Stale / mismatched `base_revision` rejection (§12.1) |
-| `06_exceed_max_node_count_rejected.json` | `max_node_count` limit enforcement (§26) |
-| `07_exceed_max_tree_depth_rejected.json` | `max_tree_depth` limit enforcement (§26) |
-| `08_exceed_max_operations_rejected.json` | `max_transaction_operations` pre-check limit (§26) |
-| `09_valid_model_operations.json` | Collection model operations (`CREATE_MODEL`, `INSERT`, `UPDATE`, `RESET`, `DELETE`) (§8, §13) |
-| `10_invalid_model_item_not_found_rejected.json` | Model update referencing non-existent `item_id` rejection (§8, §13) |
-| `11_semantic_not_paint_widget_properties.json` | Semantic intent vs paint commands / frame cadence (§4.7, §4.16, §4.17, §32.3) |
-| `12_reused_deleted_node_id_rejected.json` | `NodeId` cannot be reused even after deletion (§6.2) |
-| `13_sequential_transactions.json` | Monotonic sequential revisions (0 -> 1 -> 2 -> 3) (§12.1) |
-| `14_move_node_cycle_prevention.json` | Moving ancestor under descendant cycle prevention (§13) |
-| `15_invalid_new_revision_rejected.json` | `new_revision != base_revision + 1` rejection (§12.1) |
+### Running the suites
+
+```bash
+scripts/run-conformance                       # all twelve, Rust + Swift (macOS)
+scripts/run-conformance --suite 8             # one suite by id
+scripts/run-conformance --suite reconnect     # one suite by slug
+scripts/run-conformance --implementation rust # Linux-viable subset
+scripts/run-conformance --list                # index only, runs nothing
+```
+
+Result semantics:
+
+| Result | Meaning | Exit contribution |
+|---|---|---|
+| `PASS` | every declared runner succeeded **and** the suite has no open gaps | 0 |
+| `GAP` | runners pass, but the suite documents §32 scenarios this base cannot exercise | 0 |
+| `FAIL` | a runner failed, or a selected implementation has no runner and no declared reason | 1 |
+| `SKIP` | the suite declares the selected implementation not applicable, with a reason | 0 |
+
+A suite that documents an open gap reports `GAP`, never `PASS`. Reporting `PASS` alongside a
+missing required scenario is exactly the overstatement the pass-or-known-gap criterion exists to
+prevent.
+
+The runner exits non-zero when the manifest is malformed, when a declared vector directory or
+generated fixture is missing, when a selected implementation has no runner and no
+`not_applicable` reason, **or when a declared gap turns out to be closed**. That last case
+matters: without it a suite would stay labelled `GAP` forever after the owning task lands. Every
+gap carries a negative `gap_probe`, and a match means the manifest must be updated rather than
+the result quietly changing.
+
+A full Rust+Swift run needs macOS, because `RendererAppKit` cannot build on Linux.
+
+### Adding a fixture
+
+1. Add the `.json` file under the suite's `vectors/` directory.
+2. **Bump that suite's `vectors.count` in `suites/manifest.json` in the same commit.** The Rust
+   loader (`server-rust/semantic-tree/tests/common/mod.rs`), the Swift loader
+   (`client-macos/Tests/SemanticModelTests/ConformanceManifest.swift`) and
+   `protocol/tests/test_conformance_manifest.py` all assert the count *exactly*, in both
+   directions — a fixture that is not declared fails just as loudly as one that went missing.
+   This is deliberate: a floor assertion would let a reorganization drop most of a corpus and
+   still report green.
+3. Run `scripts/run-conformance --suite <id>`.
+
+Fixture replay is shared: `server-rust/semantic-tree/tests/common/fixture_replay.rs` and
+`StateMachineConformanceTests.replayVectorFile` are used by suites 1 and 3 alike, so a vector
+relocated between suites is still *executed* rather than merely parsed.
+
+### Registry-derived suites
+
+Suites 2, 5 and 12 have **no fixture files**. They read the registry through the tables that
+`./protocol/generate_proto.sh` already generates — `standardNodeTypesTable` (id, name and `tier`)
+and `STANDARD_EVENTS` in `client-macos/SemanticModel/RegistryTables.swift` and
+`server-rust/semantic-tree`'s build output — and drive real code against them.
+
+An earlier revision generated a JSON fixture per suite from `registry.yaml` instead. That only
+proved the generator agreed with itself: it could not fail when the *implementation* diverged from
+the registry. Node tier, category and the `emits` matrix stay registry-owned, but they are
+consumed from the existing generated tables rather than copied into a second oracle, so there is
+no third artefact to keep fresh.
+
+`emits` transcribes the §7.6 *Standard events* table exactly. A node absent from that table emits
+nothing, and no capability may be added to the registry without adding it to the design document
+first.
+
+The AppKit mapping is the one part that is *not* registry-derived, and deliberately so: §22.4
+makes native mappings informative, so they must not become protocol source of truth. Suite 12
+asserts it directly against `ControlFactory`, which is the mapping's only real definition.
+
+### Open gaps
+
+Each gap below makes its suite report `GAP`. Full text, closure probes and acceptance criteria
+are in the manifest and in each suite's README.
+
+- **Suite 2** — §7.6 assigns `EXPANSION_CHANGED` to `Tree` and `VIEWPORT_CHANGED` to `Surface`,
+  both required-tier, but `RendererAppKit/SemanticInteraction.swift` has no case that can
+  originate either, so the renderer cannot emit them.
+- **Suite 5** — server event validation accepts `POINTER_*` against ordinary widgets: the §32.5
+  rule that coordinates are refused outside a subscribed scene is **unenforced**, not merely
+  untested. The positive subscribed-scene half has no implementation either. Owned by **Task 36**.
+- **Suite 7** — capability negotiation and must-understand rejection are covered; the
+  fallback-subtree half is **Task 31** work not yet merged to `origin/main`.
+- **Suite 11** — `client-macos/Accessibility` is a placeholder; the whole suite awaits **Task 35**.
+

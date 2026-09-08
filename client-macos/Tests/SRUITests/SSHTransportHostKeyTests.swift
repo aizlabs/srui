@@ -52,20 +52,12 @@ struct SSHTransportHostKeyTests {
         """
         try configContent.write(to: URL(fileURLWithPath: sshdConfigPath), atomically: true, encoding: .utf8)
 
-        let sshdProc = Process()
-        sshdProc.executableURL = URL(fileURLWithPath: "/usr/sbin/sshd")
-        sshdProc.arguments = [
-            "-f", sshdConfigPath,
-            "-h", realHostKeyPath,
-            "-d",
-            "-p", String(port),
-        ]
-        try sshdProc.run()
-        defer {
-            if sshdProc.isRunning {
-                sshdProc.terminate()
-            }
-        }
+        let sshdProc = try SSHTestSupport.launchSSHD(
+            configPath: sshdConfigPath,
+            hostKeyPath: realHostKeyPath,
+            port: port,
+            debug: true)
+        defer { SSHTestSupport.terminate(sshdProc) }
 
         try await Task.sleep(nanoseconds: 200_000_000)
 

@@ -486,7 +486,8 @@ final class StoreTraceTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
 
-        let outDir = repoRoot.appendingPathComponent("protocol/conformance-vectors/state-machine")
+        let outDir = repoRoot.appendingPathComponent(
+            "protocol/conformance-vectors/suites/01-core-state-machine/vectors")
         let fileName = String(format: "99_trace_seed_%llx_step_%d.json", mismatch.seed, mismatch.step)
         let path = outDir.appendingPathComponent(fileName)
 

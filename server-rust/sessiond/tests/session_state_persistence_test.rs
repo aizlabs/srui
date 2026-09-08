@@ -12,6 +12,7 @@
 //! 5. Replaced continuity: resuming against a restarted session daemon with an old session ID receives
 //!    `ServerResyncRequired` with `continuity: REPLACED` and the fresh session ID.
 
+#[allow(dead_code)]
 mod common;
 use common::*;
 

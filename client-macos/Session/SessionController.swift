@@ -2063,6 +2063,9 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
+                let replacementCapabilities = discardExtensionNegotiationForReplacement(
+                    from: negotiated
+                )
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
@@ -2078,7 +2081,10 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
-                enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
+                enterAwaitingSnapshot(
+                    sessionId: resync.sessionID,
+                    negotiated: replacementCapabilities
+                )
 
             case .unspecified:
                 await reportFailure(.protocolViolation(
@@ -2154,6 +2160,9 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                let replacementCapabilities = discardExtensionNegotiationForReplacement(
+                    from: negotiated
+                )
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
                     await MainActor.run { renderer.resetExtensionRegistry() }
@@ -2166,7 +2175,10 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
+                enterAwaitingSnapshot(
+                    sessionId: resync.sessionID,
+                    negotiated: replacementCapabilities
+                )
 
             case .unspecified:
                 await reportFailure(.protocolViolation(
@@ -2184,6 +2196,20 @@ public final class SessionController: @unchecked Sendable {
         SessionDiagnostics.log(
             "Server resync required at revision \(resync.snapshotRevision): \(resync.reason)"
         )
+    }
+
+    /// A replacement incarnation has not negotiated extension profiles or session-local IDs.
+    private func discardExtensionNegotiationForReplacement(
+        from negotiated: CapabilitySet
+    ) -> CapabilitySet {
+        let baseCapabilities = CapabilitySet(
+            negotiated.filter { $0.name == StandardProfiles.standardWidgets }
+        )
+        withStateLock {
+            retainedCapabilities = baseCapabilities
+            negotiatedTerminalTypeRef = nil
+        }
+        return baseCapabilities
     }
 
     private func enterAwaitingSnapshot(sessionId: String, negotiated: CapabilitySet) {
@@ -2244,7 +2270,7 @@ public final class SessionController: @unchecked Sendable {
     }
 
     @discardableResult
-    private func registerTerminalTypes(from store: SemanticStore) async -> Set<NodeId> {
+    private func terminalNodeIDs(in store: SemanticStore) async -> Set<NodeId> {
         let (negotiated, terminalType) = withStateLock { () -> (CapabilitySet?, TypeRef?) in
             let capabilities: CapabilitySet?
             switch phase {
@@ -2258,17 +2284,14 @@ public final class SessionController: @unchecked Sendable {
         guard negotiated?.contains(.terminalV1) == true,
               let terminalType,
               renderer != nil else { return [] }
-        var terminalNodeIDs = Set<NodeId>()
-        var pending = store.rootIDs
-        var seen = Set<NodeId>()
-        while let id = pending.popLast() {
-            guard seen.insert(id).inserted, let node = store.getNode(id) else { continue }
-            if node.nodeType == terminalType {
-                terminalNodeIDs.insert(id)
+        var matchingNodeIDs = Set<NodeId>()
+        for rootID in store.rootIDs {
+            guard let subtree = store.subtreeNodeIDs(rootedAt: rootID) else { continue }
+            for nodeID in subtree where store.getNode(nodeID)?.nodeType == terminalType {
+                matchingNodeIDs.insert(nodeID)
             }
-            pending.append(contentsOf: node.orderedChildren)
         }
-        return terminalNodeIDs
+        return matchingNodeIDs
     }
 
     /// Local terminal apply only. Never touches semantic phase, revision, outbox, or text drafts.
@@ -2847,7 +2870,36 @@ public final class SessionController: @unchecked Sendable {
                let interceptor = liveTransactionPublishedInterceptorForTesting {
                 await interceptor()
             }
-            let terminalNodeIDs = await registerTerminalTypes(from: snapshot.store)
+            if isResyncSnapshot, let renderer {
+                do {
+                    try await MainActor.run {
+                        try renderer.validateExtensionMounts(in: snapshot.store)
+                    }
+                } catch {
+                    guard await outbox.abortResyncRender(
+                        generation: outstandingGeneration,
+                        binding: connectionBinding,
+                        renderToken: renderToken
+                    ) else {
+                        let context = "invalid resync extension semantics lost renderer ownership"
+                        if let outstandingGeneration {
+                            await failRefusedResumeDecision(outstandingGeneration, context)
+                        } else {
+                            await reportFailure(.superseded(context))
+                        }
+                        return
+                    }
+                    withStateLock { self.pendingResync = false }
+                    await reportFailure(.protocolViolation(
+                        "resync snapshot contains unsupported required extension semantics: \(error); "
+                            + "a replacement session must complete CLIENT_HELLO/SERVER_WELCOME "
+                            + "capability renegotiation before mounting extensions"
+                    ))
+                    return
+                }
+            }
+
+            let terminalNodeIDs = await terminalNodeIDs(in: snapshot.store)
             await terminalPump.prune(retainedStreamIDs: terminalNodeIDs)
             let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,

@@ -780,6 +780,7 @@ public struct SemanticStore: Equatable, Sendable {
     }
 
     /// Calculates the maximum depth of any node within the subtree rooted at `id` (relative to `id`, root of subtree is 1).
+    /// Calculates the maximum depth of any node within the subtree rooted at `id` (relative to `id`, root of subtree is 1).
     public func subtreeDepth(_ id: NodeId) -> Int {
         var maxChildDepth = 0
         if let node = nodes[id] {
@@ -793,9 +794,25 @@ public struct SemanticStore: Equatable, Sendable {
         return 1 + maxChildDepth
     }
 
-    // MARK: - Staging & Atomic Batch Execution (§12.1, §13)
+    /// Returns a stable pre-order walk of the subtree, or `nil` if its graph is incomplete.
+    ///
+    /// The store normally guarantees a proper tree. Returning `nil` on a missing or repeated
+    /// node keeps consumers that validate extension fallbacks fail-closed (§11.1, §26).
+    public func subtreeNodeIDs(rootedAt rootID: NodeId) -> [NodeId]? {
+        guard nodes[rootID] != nil else { return nil }
 
-    /// Creates a private staging clone of the store for atomic batch application (§12.1).
+        var ordered: [NodeId] = []
+        var pending = [rootID]
+        var seen = Set<NodeId>()
+        while let nodeID = pending.popLast() {
+            guard seen.insert(nodeID).inserted, let node = nodes[nodeID] else {
+                return nil
+            }
+            ordered.append(nodeID)
+            pending.append(contentsOf: node.orderedChildren.reversed())
+        }
+        return ordered
+    }
     public func cloneStaging() -> SemanticStore {
         SemanticStore(
             nodes: self.nodes,

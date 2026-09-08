@@ -6,13 +6,6 @@ import Terminal
 
 public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
-    case unnegotiatedTerminal(TypeRef)
-    case invalidExtensionFallback(TypeRef)
-}
-
-/// Extension node kinds resolved from `ServerWelcome.extension_namespaces` (§15, §21).
-public enum ExtensionControlKind: Equatable, Sendable {
-    case terminal
 }
 
 /// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
@@ -63,61 +56,66 @@ public final class ControlFactory {
     public var onTerminalInput: (@MainActor (NodeId, Data) -> Void)?
     public var onTerminalResize: (@MainActor (NodeId, UInt32, UInt32, UInt32, UInt32) -> Void)?
 
-    private var extensionKinds: [TypeRef: ExtensionControlKind] = [:]
+    public let extensionMountResolver: ExtensionMountResolver
 
     public init(
         textEditingSession: TextEditingSession = TextEditingSession(),
-        terminalSession: TerminalSession = TerminalSession()
+        terminalSession: TerminalSession = TerminalSession(),
+        extensionMountResolver: ExtensionMountResolver = ExtensionMountResolver()
     ) {
         self.textEditingSession = textEditingSession
         self.terminalSession = terminalSession
+        self.extensionMountResolver = extensionMountResolver
         self.textEditingSession.onCommit = { [weak self] nodeID, text, seq, epoch in
             self?.onInteraction?(.textEdit(nodeID: nodeID, text: text, editSeq: seq, laneEpoch: epoch))
         }
     }
 
     public func registerExtension(typeRef: TypeRef, kind: ExtensionControlKind) throws {
-        guard typeRef.namespaceID != 0 else {
-            throw ControlFactoryError.unsupportedNodeType(typeRef)
-        }
-        if let existing = extensionKinds[typeRef], existing != kind {
-            throw ControlFactoryError.unsupportedNodeType(typeRef)
-        }
-        extensionKinds[typeRef] = kind
+        try extensionMountResolver.register(typeRef: typeRef, kind: kind)
     }
 
     public func resetExtensionRegistry() {
-        extensionKinds.removeAll()
+        extensionMountResolver.reset()
     }
 
     public func extensionKind(for typeRef: TypeRef) -> ExtensionControlKind? {
-        extensionKinds[typeRef]
+        extensionMountResolver.extensionKind(for: typeRef)
     }
 
     public func makeHandle(for node: Node, store: SemanticStore? = nil) throws -> RenderHandle {
+        try makeHandle(
+            for: node,
+            store: store,
+            mountDecision: extensionMountResolver.decision(for: node, in: store)
+        )
+    }
+
+    func makeHandle(
+        for node: Node,
+        store: SemanticStore?,
+        mountDecision: ExtensionMountDecision
+    ) throws -> RenderHandle {
         let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
         var textAdapter: NativeTextEditorAdapter?
 
-        if let kind = extensionKinds[node.nodeType] {
+        switch mountDecision {
+        case .native(let kind):
             switch kind {
             case .terminal:
                 let view = makeTerminalView(for: node)
                 result = (view, nil, nil, nil)
             }
-        } else if !node.nodeType.isStandard {
-            guard hasValidStandardFallback(for: node, store: store) else {
-                if node.orderedChildren.isEmpty {
-                    throw ControlFactoryError.unnegotiatedTerminal(node.nodeType)
-                }
-                throw ControlFactoryError.invalidExtensionFallback(node.nodeType)
-            }
+        case .fallback:
             let stack = NSStackView()
             stack.orientation = .vertical
             stack.alignment = .leading
             stack.distribution = .fill
             stack.spacing = 8
             result = (stack, nil, nil, nil)
-        } else {
+        case .rejected(let error):
+            throw error
+        case .standard:
             switch node.nodeType {
         case .surface:
             let contentView = NSStackView(frame: NSRect(x: 0, y: 0, width: 440, height: 320))
@@ -314,23 +312,6 @@ public final class ControlFactory {
     /// otherwise resolve nondeterministically; ascending `PropertyRef` order fixes the outcome.
     public static func orderedPropertyEntries(of node: Node) -> [(PropertyRef, Value)] {
         node.propertyEntries.sorted { $0.0 < $1.0 }
-    }
-
-    /// v1 fallback convention: one ordered child roots a namespace-0-only subtree (§11.1).
-    /// A nonempty but malformed subtree must not turn unknown required semantics into content.
-    private func hasValidStandardFallback(for node: Node, store: SemanticStore?) -> Bool {
-        guard node.orderedChildren.count == 1, let store else { return false }
-        var pending = node.orderedChildren
-        var seen = Set<NodeId>()
-        while let nodeID = pending.popLast() {
-            guard seen.insert(nodeID).inserted,
-                  let fallbackNode = store.getNode(nodeID),
-                  fallbackNode.nodeType.isStandard else {
-                return false
-            }
-            pending.append(contentsOf: fallbackNode.orderedChildren)
-        }
-        return true
     }
 
     /// Property entries of `node` in the order they are applied to a handle.

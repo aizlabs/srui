@@ -560,9 +560,9 @@ struct ControlFactoryTests {
     }
 
     @Test
-    func unnegotiatedExtensionTypeIsRejected() {
+    func unsupportedExtensionWithoutFallbackIsRejected() {
         let typeRef = TypeRef(namespaceID: 4, localID: 1)
-        #expect(throws: ControlFactoryError.unnegotiatedTerminal(typeRef)) {
+        #expect(throws: ExtensionMountError.unsupportedExtensionWithoutFallback(typeRef)) {
             try ControlFactory().makeHandle(for: Node(id: 30, nodeType: typeRef))
         }
     }

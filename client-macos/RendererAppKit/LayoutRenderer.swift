@@ -15,8 +15,6 @@ public final class LayoutRenderer {
     public let registry: RenderRegistry
     public let controlFactory: ControlFactory
 
-    /// Fallback descendants hidden behind a locally supported extension view (§11.1).
-    private var suppressedFallbackNodeIDs = Set<NodeId>()
     /// Whether surfaces have been ordered on screen, so a remount can restore visibility.
     private var surfacesShown = false
 
@@ -83,7 +81,10 @@ public final class LayoutRenderer {
             switch operation {
             case .setProperty(let nodeID, let property, _),
                  .clearProperty(let nodeID, let property):
-                guard !suppressedFallbackNodeIDs.contains(nodeID) else { continue }
+                guard !controlFactory.extensionMountResolver.isSuppressedFallbackNode(
+                    nodeID,
+                    in: newStore
+                ) else { continue }
                 if isCollectionProperty(property) {
                     affectedCollectionNodeIDs.insert(nodeID)
                 } else {
@@ -91,7 +92,10 @@ public final class LayoutRenderer {
                 }
 
             case .batchPropertySet(let nodeID, let properties):
-                guard !suppressedFallbackNodeIDs.contains(nodeID) else { continue }
+                guard !controlFactory.extensionMountResolver.isSuppressedFallbackNode(
+                    nodeID,
+                    in: newStore
+                ) else { continue }
                 for property in properties {
                     if isCollectionProperty(property.property) {
                         affectedCollectionNodeIDs.insert(nodeID)
@@ -139,12 +143,22 @@ public final class LayoutRenderer {
         }
     }
 
+    /// Validates extension negotiation and fallback structure without mutating AppKit state.
+    public func validateExtensionMounts(in store: SemanticStore) throws {
+        try controlFactory.extensionMountResolver.validateMountableExtensions(in: store)
+    }
+
     private func mount(nodeID: NodeId, from store: SemanticStore) throws {
         guard let node = store.getNode(nodeID) else {
             throw LayoutRendererError.missingSemanticNode(nodeID)
         }
 
-        let handle = try controlFactory.makeHandle(for: node, store: store)
+        let mountDecision = controlFactory.extensionMountResolver.decision(for: node, in: store)
+        let handle = try controlFactory.makeHandle(
+            for: node,
+            store: store,
+            mountDecision: mountDecision
+        )
         try registry.register(handle)
         RendererDiagnostics.log(
             "mounted node=\(node.id) type=\(node.nodeType) parent=\(node.parentID?.description ?? "root")"
@@ -156,9 +170,7 @@ public final class LayoutRenderer {
             }
             attach(handle.view, to: parentHandle)
         }
-        if !node.nodeType.isStandard,
-           controlFactory.extensionKind(for: node.nodeType) != nil {
-            suppressFallbackDescendants(of: node, in: store)
+        if case .native = mountDecision {
             return
         }
         for childID in node.orderedChildren {
@@ -256,17 +268,7 @@ public final class LayoutRenderer {
         return false
     }
 
-    private func suppressFallbackDescendants(of node: Node, in store: SemanticStore) {
-        var pending = node.orderedChildren
-        while let nodeID = pending.popLast() {
-            guard suppressedFallbackNodeIDs.insert(nodeID).inserted,
-                  let child = store.getNode(nodeID) else { continue }
-            pending.append(contentsOf: child.orderedChildren)
-        }
-    }
-
     private func tearDown() {
-        suppressedFallbackNodeIDs.removeAll(keepingCapacity: true)
         let handles = registry.removeAll()
         for handle in handles {
             handle.view.removeFromSuperview()

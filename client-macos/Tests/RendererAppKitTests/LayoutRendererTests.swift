@@ -946,7 +946,7 @@ struct LayoutRendererTests {
         ])
         let renderer = LayoutRenderer()
 
-        #expect(throws: ControlFactoryError.invalidExtensionFallback(extensionType)) {
+        #expect(throws: ExtensionMountError.invalidExtensionFallback(extensionType)) {
             try renderer.mount(store: store)
         }
     }

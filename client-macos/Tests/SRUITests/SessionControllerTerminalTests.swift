@@ -157,6 +157,90 @@ struct SessionControllerTerminalTests {
         await serverTransport.close()
     }
 
+    @Test("Replacement resync requires fresh extension negotiation before Terminal remount")
+    @MainActor
+    func replacementResyncRejectsTerminalSnapshotBeforeRemount() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let failures = SessionFailureRecorder()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.onFailure = { failure in
+            Task { await failures.record(failure) }
+        }
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-before-replacement"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        await controller.handleIncomingMessage(welcomeMessage)
+
+        let terminalType = TypeRef(namespaceID: 3, localID: 1)
+        let initial = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: NodeId(1), nodeType: .surface),
+                .createNode(id: NodeId(30), nodeType: terminalType, parentID: NodeId(1)),
+            ]
+        )
+        var initialMessage = SRUIMessage()
+        initialMessage.transaction = initial.toWire()
+        await controller.handleIncomingMessage(initialMessage)
+
+        let mountedTerminal = try #require(renderer.registry.view(for: NodeId(30)))
+        #expect(mountedTerminal is TerminalView)
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = "terminal-after-replacement"
+        resync.snapshotRevision = 2
+        resync.reason = "replacement"
+        resync.continuity = .replaced
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        await controller.handleIncomingMessage(resyncMessage)
+
+        #expect(controller.negotiatedCapabilities == [Profile.standardWidgetsV1])
+        #expect(renderer.controlFactory.extensionKind(for: terminalType) == nil)
+
+        let replacement = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [
+                .createNode(id: NodeId(1), nodeType: .surface),
+                .createNode(id: NodeId(30), nodeType: terminalType, parentID: NodeId(1)),
+            ]
+        )
+        var replacementMessage = SRUIMessage()
+        replacementMessage.transaction = replacement.toWire()
+        await controller.handleIncomingMessage(replacementMessage)
+
+        let failure = try #require(await failures.wait())
+        guard case .protocolViolation(let message) = failure else {
+            Issue.record("Expected protocolViolation, got \(failure)")
+            await controller.stop()
+            await serverTransport.close()
+            return
+        }
+        #expect(message.contains("capability renegotiation"))
+        #expect(renderer.registry.view(for: NodeId(30)) === mountedTerminal)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     @Test("Only the negotiated terminal namespace is registered when local IDs collide")
     @MainActor
     func exactTerminalNamespaceWinsLocalIDCollision() async throws {

@@ -785,6 +785,22 @@ final class SemanticStoreTests: XCTestCase {
         XCTAssertTrue(store.isIDUsed(NodeId(4)))
     }
 
+    func testSubtreeNodeIDsReturnsStablePreorderAndRejectsMissingRoots() throws {
+        var store = SemanticStore()
+        try store.createNode(id: NodeId(1), nodeType: .surface)
+        try store.createNode(id: NodeId(2), nodeType: .column, parentID: NodeId(1))
+        try store.createNode(id: NodeId(3), nodeType: .text, parentID: NodeId(1))
+        try store.createNode(id: NodeId(4), nodeType: .button, parentID: NodeId(2))
+        try store.createNode(id: NodeId(5), nodeType: .surface)
+
+        XCTAssertEqual(
+            store.subtreeNodeIDs(rootedAt: NodeId(1)),
+            [NodeId(1), NodeId(2), NodeId(4), NodeId(3)]
+        )
+        XCTAssertEqual(store.subtreeNodeIDs(rootedAt: NodeId(5)), [NodeId(5)])
+        XCTAssertNil(store.subtreeNodeIDs(rootedAt: NodeId(99)))
+    }
+
     func testReferencedResourceHashesIncludeNestedAndModelItems() throws {
         var store = SemanticStore()
         let nodeHash = try ResourceHash(rawBytes: Array(repeating: 0x01, count: 32))

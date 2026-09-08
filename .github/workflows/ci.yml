@@ -181,6 +181,7 @@ jobs:
         run: |
           cargo test --workspace --all-targets
           cargo clippy --workspace --all-targets -- -D warnings
+        working-directory: server-rust
       - name: Build and test examples
         run: |
           cargo test --manifest-path ../examples/process-monitor/Cargo.toml
@@ -269,6 +270,7 @@ jobs:
         run: |
           cargo build --manifest-path examples/counter/Cargo.toml
           cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
+      # `Text` owns TextEditingSession, the toolkit-free half of native text editing (§18.3,
       # §22.6); NativeTextEditorAdapter in RendererAppKit is the only AppKit-touching half.
       # `Terminal` owns the VT parser and grid; TerminalView in RendererAppKit is the only
       # AppKit-touching half of the terminal island (§21).

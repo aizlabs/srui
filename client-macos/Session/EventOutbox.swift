@@ -1365,8 +1365,29 @@ public actor EventOutbox {
     }
 
     /// Publishes a resync snapshot while the reconnect latch still blocks event allocation (§18).
+    func commitResyncSnapshot<T: Sendable>(
+        generation: UInt64?,
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
+        onSessionIncarnationAdvanced: ReplacementTextEditingResetHandler? = nil,
+        publish: @Sendable () -> T,
+        committed: @Sendable (T) -> Bool
+    ) async -> ResyncSnapshotCommit<T>? {
+        await commitValidatedResyncSnapshot(
+            generation: generation,
+            binding: binding,
+            sessionIncarnation: suppliedIncarnation,
+            onSessionIncarnationAdvanced: onSessionIncarnationAdvanced,
+            preflight: {},
+            publish: publish,
+            committed: committed
+        )
+    }
+
+    /// Validates and publishes a resync snapshot while reconnect blocks event allocation (§18).
     ///
-    /// The supersession check and publish share this single actor-isolated critical section.
+    /// The supersession check and publish share this actor-isolated boundary. An asynchronous
+    /// preflight is re-checked for ownership after its suspension before state can be published.
     /// The controller releases the latch only after the snapshot has also mounted and the text
     /// resync boundary has reached this actor, preventing stale drafts from escaping in between.
     ///
@@ -1377,19 +1398,38 @@ public actor EventOutbox {
     /// A `nil` generation means "this controller has no attempt outstanding", which is the
     /// live-resync case: it matches only while no other controller holds the latch either.
     /// Returns `nil` when a newer attempt owns the latch and nothing was published.
-    func commitResyncSnapshot<T: Sendable>(
+    func commitValidatedResyncSnapshot<T: Sendable>(
         generation: UInt64?,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation suppliedIncarnation: EventOutboxSessionIncarnation? = nil,
         onSessionIncarnationAdvanced: ReplacementTextEditingResetHandler? = nil,
+        preflight: @Sendable () async throws -> Void,
         publish: @Sendable () -> T,
         committed: @Sendable (T) -> Bool
-    ) async -> ResyncSnapshotCommit<T>? {
+    ) async rethrows -> ResyncSnapshotCommit<T>? {
         guard ownsResyncScope(generation: generation, binding: binding),
               let currentIncarnation = activeSessionIncarnation,
               suppliedIncarnation == nil || suppliedIncarnation == currentIncarnation else {
             return nil
         }
+
+        // Renderer preflight may hop to MainActor, making this actor reentrant. A newer reconnect
+        // can take ownership during that suspension, so both success and failure paths re-check
+        // the complete resync scope before publishing state or reporting a current-session error.
+        do {
+            try await preflight()
+        } catch {
+            guard ownsResyncScope(generation: generation, binding: binding),
+                  activeSessionIncarnation == currentIncarnation else {
+                return nil
+            }
+            throw error
+        }
+        guard ownsResyncScope(generation: generation, binding: binding),
+              activeSessionIncarnation == currentIncarnation else {
+            return nil
+        }
+
         let result = publish()
         guard committed(result) else {
             return ResyncSnapshotCommit(

@@ -780,7 +780,6 @@ public struct SemanticStore: Equatable, Sendable {
     }
 
     /// Calculates the maximum depth of any node within the subtree rooted at `id` (relative to `id`, root of subtree is 1).
-    /// Calculates the maximum depth of any node within the subtree rooted at `id` (relative to `id`, root of subtree is 1).
     public func subtreeDepth(_ id: NodeId) -> Int {
         var maxChildDepth = 0
         if let node = nodes[id] {
@@ -813,6 +812,10 @@ public struct SemanticStore: Equatable, Sendable {
         }
         return ordered
     }
+
+    // MARK: - Staging & Atomic Batch Execution (§12.1, §13)
+
+    /// Creates a private staging clone of the store for atomic batch application (§12.1).
     public func cloneStaging() -> SemanticStore {
         SemanticStore(
             nodes: self.nodes,

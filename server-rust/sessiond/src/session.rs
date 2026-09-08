@@ -730,9 +730,9 @@ impl Session {
 
     /// Registers a fallible event handler for `node` and `event_type` (§29).
     ///
-    /// An ordinary event whose handler returns an error remains retryable and is not acknowledged.
-    /// A committed text edit remains accepted because its authoritative mutation precedes handler
-    /// notification.
+    /// An ordinary event whose handler returns an error is settled as rejected and acknowledged,
+    /// so a deterministic application error cannot cause a reconnect/retry loop. A committed text
+    /// edit remains accepted because its authoritative mutation precedes handler notification.
     pub fn on_result<F>(&self, node: impl Into<NodeId>, event_type: TypeRef, handler: F)
     where
         F: Fn(&Session, &Event) -> Result<(), SessionError> + Send + Sync + 'static,
@@ -1027,10 +1027,10 @@ impl Session {
         let dispatch_error = match dispatch {
             Ok(Ok(())) => None,
             Ok(Err(error)) if kind == HandlerDispatchKind::Ordinary => {
+                let rejection =
+                    EventValidationError::PolicyRejected(format!("event handler failed: {error}"));
                 let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-                guard.dedupe.abandon_event(event);
-                drop(guard);
-                return Err(error);
+                return Ok(Self::settle_rejected_event(&mut guard, event, rejection));
             }
             Err(panic_payload) if kind == HandlerDispatchKind::Ordinary => {
                 let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;

@@ -69,6 +69,10 @@ public final class LayoutRenderer {
             return classifications
         }
 
+        RendererDiagnostics.log(
+            "transaction revision=\(transaction.newRevision) non-structural operations=\(transaction.operations.count)"
+        )
+
         let changedModelIDs = Set(classifications.compactMap { classification -> ModelId? in
             if case .modelContent(let modelID) = classification {
                 return modelID

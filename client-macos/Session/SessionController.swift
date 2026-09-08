@@ -2803,21 +2803,39 @@ public final class SessionController: @unchecked Sendable {
                 await handleTransactionRejection(error, isResyncSnapshot: true)
                 return
             }
-            guard let published = await outbox.commitResyncSnapshot(
-                generation: outstandingGeneration,
-                binding: connectionBinding,
-                sessionIncarnation: deliveredIncarnation,
-                onSessionIncarnationAdvanced: { [weak self] sessionIncarnation in
-                    self?.adoptFullResyncInteractionBoundary(
-                        sessionIncarnation: sessionIncarnation
-                    )
-                },
-                publish: { self.applier.publishResyncSnapshot(prepared) },
-                committed: { result in
-                    guard case .success = result else { return false }
-                    return true
-                }
-            ) else {
+            let renderer = renderer
+            let published: ResyncSnapshotCommit<Result<TransactionSnapshot, TxnError>>?
+            do {
+                published = try await outbox.commitValidatedResyncSnapshot(
+                    generation: outstandingGeneration,
+                    binding: connectionBinding,
+                    sessionIncarnation: deliveredIncarnation,
+                    onSessionIncarnationAdvanced: { [weak self] sessionIncarnation in
+                        self?.adoptFullResyncInteractionBoundary(
+                            sessionIncarnation: sessionIncarnation
+                        )
+                    },
+                    preflight: {
+                        if let renderer {
+                            try await renderer.validateExtensionMounts(in: prepared.storeForValidation)
+                        }
+                    },
+                    publish: { self.applier.publishResyncSnapshot(prepared) },
+                    committed: { result in
+                        guard case .success = result else { return false }
+                        return true
+                    }
+                )
+            } catch {
+                withStateLock { self.pendingResync = false }
+                await reportFailure(.protocolViolation(
+                    "resync snapshot contains unsupported required extension semantics: \(error); "
+                        + "a replacement session must complete CLIENT_HELLO/SERVER_WELCOME "
+                        + "capability renegotiation before mounting extensions"
+                ))
+                return
+            }
+            guard let published else {
                 let context = "resync snapshot arrived after a newer reconnect attempt"
                 if let outstandingGeneration {
                     await failRefusedResumeDecision(outstandingGeneration, context)
@@ -2870,35 +2888,6 @@ public final class SessionController: @unchecked Sendable {
                let interceptor = liveTransactionPublishedInterceptorForTesting {
                 await interceptor()
             }
-            if isResyncSnapshot, let renderer {
-                do {
-                    try await MainActor.run {
-                        try renderer.validateExtensionMounts(in: snapshot.store)
-                    }
-                } catch {
-                    guard await outbox.abortResyncRender(
-                        generation: outstandingGeneration,
-                        binding: connectionBinding,
-                        renderToken: renderToken
-                    ) else {
-                        let context = "invalid resync extension semantics lost renderer ownership"
-                        if let outstandingGeneration {
-                            await failRefusedResumeDecision(outstandingGeneration, context)
-                        } else {
-                            await reportFailure(.superseded(context))
-                        }
-                        return
-                    }
-                    withStateLock { self.pendingResync = false }
-                    await reportFailure(.protocolViolation(
-                        "resync snapshot contains unsupported required extension semantics: \(error); "
-                            + "a replacement session must complete CLIENT_HELLO/SERVER_WELCOME "
-                            + "capability renegotiation before mounting extensions"
-                    ))
-                    return
-                }
-            }
-
             let terminalNodeIDs = await terminalNodeIDs(in: snapshot.store)
             await terminalPump.prune(retainedStreamIDs: terminalNodeIDs)
             let rendererUpdate = await updateRenderer(

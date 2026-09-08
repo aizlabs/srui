@@ -179,6 +179,11 @@ public struct PreparedResyncSnapshot: Sendable {
     fileprivate let store: SemanticStore
     fileprivate let revision: Revision
 
+    /// Immutable rebuilt state exposed only for validation before publication.
+    public var storeForValidation: SemanticStore {
+        store
+    }
+
     fileprivate init(store: SemanticStore, revision: Revision) {
         self.store = store
         self.revision = revision

@@ -969,32 +969,31 @@ fn test_handler_panic_abandons_in_flight_admission_for_retry() {
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn fallible_handler_error_abandons_in_flight_admission_for_retry() {
-    let session = Session::new("fallible-handler-retry");
+#[tokio::test]
+async fn fallible_handler_error_is_rejected_without_tearing_down_the_connection() {
+    let session = Arc::new(Session::new("fallible-handler-rejection"));
     let btn = NodeId::new(1);
     seed_button(&session, btn);
     session.on_result(btn, ACTIVATE, |_, _| {
         Err(SessionError::InvalidInput("handler failed".to_string()))
     });
 
-    let event = Event::activate(1, "evt-error", 1, btn)
-        .with_client_instance_id(CLIENT_A)
-        .to_wire();
-    assert!(matches!(
-        session.process_event(&event),
-        Err(SessionError::InvalidInput(message)) if message == "handler failed"
-    ));
+    let shutdown = CancellationToken::new();
+    let (mut client_write, mut client_read, server_task) =
+        connect_client(session, shutdown, CLIENT_A).await;
 
-    session.clear_handlers();
-    session.on(btn, ACTIVATE, |_, _| {});
-    assert!(matches!(
-        session.process_event(&event),
-        Ok(EventOutcome::Processed {
-            last_processed_event_seq: 1,
-            ..
-        })
-    ));
+    send_activate(&mut client_write, CLIENT_A, 1, "evt-error", 1, btn).await;
+    let first_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(first_ack.status(), EventAckStatus::Rejected);
+    assert!(first_ack.reject_reason.contains("handler failed"));
+
+    send_activate(&mut client_write, CLIENT_A, 1, "evt-error", 1, btn).await;
+    let replay_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(replay_ack.status(), EventAckStatus::Rejected);
+    assert_eq!(replay_ack.reject_reason, first_ack.reject_reason);
+    assert_eq!(replay_ack.last_processed_event_seq, 1);
+
+    assert_connection_survived(client_write, client_read, server_task).await;
 }
 
 #[tokio::test]

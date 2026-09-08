@@ -935,6 +935,59 @@ struct LayoutRendererTests {
     }
 
     @Test
+    func unsupportedExtensionMountsMultipleFallbackRoots() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(
+                id: 3,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("First fallback"))]
+            ),
+            .createNode(
+                id: 4,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("Second fallback"))]
+            ),
+        ])
+        let renderer = LayoutRenderer()
+
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is NSStackView)
+        #expect((renderer.registry.view(for: 3) as? NSTextField)?.stringValue == "First fallback")
+        #expect((renderer.registry.view(for: 4) as? NSTextField)?.stringValue == "Second fallback")
+    }
+
+    @Test
+    func unsupportedExtensionFallbackCanContainNegotiatedExtension() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let nestedExtension = TypeRef(namespaceID: 5, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(
+                id: 3,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("Standard fallback"))]
+            ),
+            .createNode(id: 4, nodeType: nestedExtension, parentID: 2),
+        ])
+        let renderer = LayoutRenderer()
+        try renderer.controlFactory.registerExtension(typeRef: nestedExtension, kind: .terminal)
+
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is NSStackView)
+        #expect((renderer.registry.view(for: 3) as? NSTextField)?.stringValue == "Standard fallback")
+        #expect(renderer.registry.view(for: 4) is TerminalView)
+    }
+
+    @Test
     func malformedExtensionFallbackIsRejected() throws {
         let extensionType = TypeRef(namespaceID: 4, localID: 1)
         let nestedExtension = TypeRef(namespaceID: 5, localID: 1)
@@ -946,7 +999,7 @@ struct LayoutRendererTests {
         ])
         let renderer = LayoutRenderer()
 
-        #expect(throws: ExtensionMountError.invalidExtensionFallback(extensionType)) {
+        #expect(throws: ExtensionMountError.unsupportedExtensionWithoutFallback(nestedExtension)) {
             try renderer.mount(store: store)
         }
     }

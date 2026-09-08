@@ -314,7 +314,7 @@ public final class ControlFactory {
         node.propertyEntries.sorted { $0.0 < $1.0 }
     }
 
-    /// Property entries of `node` in the order they are applied to a handle.
+    /// Returns whether canonical editor `.value` should suppress the legacy `.text` fallback.
     public static func shouldSkipTextFallback(for handle: RenderHandle, node: Node) -> Bool {
         handle.textAdapter != nil && node.getProperty(.value) != nil
     }

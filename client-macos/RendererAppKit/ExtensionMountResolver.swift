@@ -31,7 +31,7 @@ public enum ExtensionControlKind: Equatable, Sendable {
 public enum ExtensionMountDecision: Equatable, Sendable {
     case standard
     case native(ExtensionControlKind)
-    case fallback(root: NodeId)
+    case fallback(roots: [NodeId])
     case rejected(ExtensionMountError)
 }
 
@@ -74,16 +74,14 @@ public final class ExtensionMountResolver {
         guard !node.orderedChildren.isEmpty else {
             return .rejected(.unsupportedExtensionWithoutFallback(node.nodeType))
         }
-        guard node.orderedChildren.count == 1,
-              let store,
-              let fallbackRoot = node.orderedChildren.first,
-              let subtree = store.subtreeNodeIDs(rootedAt: fallbackRoot),
-              subtree.allSatisfy({ nodeID in
-                  store.getNode(nodeID)?.nodeType.isStandard == true
-              }) else {
+        guard let store,
+              node.orderedChildren.allSatisfy({ store.getNode($0) != nil }) else {
             return .rejected(.invalidExtensionFallback(node.nodeType))
         }
-        return .fallback(root: fallbackRoot)
+        // Each fallback child is validated when the renderer reaches it. This permits multiple
+        // standard roots and negotiated nested extensions while still rejecting any unsupported
+        // descendant that lacks its own fallback.
+        return .fallback(roots: node.orderedChildren)
     }
 
     /// Preflights the portion of the tree the renderer would mount.

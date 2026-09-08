@@ -32,6 +32,10 @@ struct SSHTransportLiveIntegrationTests {
 
         let tempDir = URL(fileURLWithPath: "/tmp/srui-live-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempDir.path
+        )
         defer {
             try? FileManager.default.removeItem(at: tempDir)
         }

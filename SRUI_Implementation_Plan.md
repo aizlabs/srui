@@ -1516,8 +1516,9 @@ count), Task 5 (max ops), Task 15 (decode-time limits), Task 24 (max pending una
 events, via the event send/receive windows), Task 26 (resource size/dimensions). Inspect all of
 it before starting — this task is a consolidation and gap-closing pass, not a from-scratch build.
 
-Read: §26 (client attack-surface controls) and §27 (server security controls) in full, plus
-Appendix C (security equivalence table) as a sanity check of what guarantees should hold. Note
+Read: §26 (client attack-surface controls) and §27 (server security controls) in full, plus the
+security equivalence table at the end of Appendix B as a sanity check of what guarantees should
+hold. Note
 §26's new clarification that "maximum pending unacknowledged events" bounds the client's Task 24
 retry set, and that reaching it must be reported, not silently and invisibly dropped.
 

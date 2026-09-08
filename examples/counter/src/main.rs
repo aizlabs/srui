@@ -21,6 +21,9 @@ use srui_example_counter::CounterApp;
 use srui_sdk::*;
 use srui_semantic_tree::{ItemId, ModelId, ModelItem, Operation, TypeRef, Value};
 use srui_sessiond::{handle_connection, ModelRangeProvider, Session, TerminalSpec};
+use srui_unix_security::{
+    effective_uid, prepare_private_socket_parent, require_unprivileged_uid, validate_peer,
+};
 
 /// Deterministic valid 1×1 RGB PNG (69 bytes); shared with Swift ResourceCacheTests.
 fn fixture_png() -> Vec<u8> {
@@ -309,7 +312,6 @@ async fn initialize_large_collection_fixture(session: &Arc<Session>) {
         PRELOAD
     );
 }
-
 async fn run_unix_server(
     socket_path: PathBuf,
     capabilities: ServerCapabilities,
@@ -327,14 +329,17 @@ async fn run_unix_server(
 
     info!("Starting SRUI Counter Unix Socket Server...");
 
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
-    }
-    if let Some(parent) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let uid = effective_uid();
+    require_unprivileged_uid(uid, "counter")?;
+    let socket_parent = prepare_private_socket_parent(&socket_path, uid)?;
+    if socket_parent.socket_identity()?.is_some() {
+        socket_parent.remove_socket()?;
     }
 
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = UnixListener::from_std(socket_parent.bind()?)?;
+    let bound_identity = socket_parent
+        .socket_identity()?
+        .ok_or("counter socket vanished immediately after bind")?;
     info!("Listening on Unix domain socket: {:?}", socket_path);
 
     let session = Arc::new(Session::with_capabilities(
@@ -356,6 +361,13 @@ async fn run_unix_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
+                        if let Err(error) = validate_peer(&stream, uid) {
+                            warn!(
+                                error = %error,
+                                "rejecting Unix socket peer outside the authenticated user boundary"
+                            );
+                            continue;
+                        }
                         let session_clone = session.clone();
                         let shutdown_child = shutdown.child_token();
                         tokio::spawn(async move {
@@ -376,7 +388,9 @@ async fn run_unix_server(
         }
     }
 
-    let _ = std::fs::remove_file(&socket_path);
+    if socket_parent.socket_identity()? == Some(bound_identity) {
+        socket_parent.remove_socket()?;
+    }
     Ok(())
 }
 

@@ -8,14 +8,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use srui_ssh_bridge::bridge_streams;
-
+use srui_unix_security::{
+    default_socket_path as private_default_socket_path, effective_uid, require_unprivileged_uid,
+    validate_peer, validate_private_socket,
+};
 fn default_socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("srui-sessiond.sock")
+    private_default_socket_path(effective_uid())
 }
-
 fn parse_socket_path() -> Result<PathBuf, String> {
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--socket") {
@@ -46,16 +45,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting srui-ssh-bridge proxy (§19, §19.1, §20.1)...");
 
+    let bridge_uid = effective_uid();
+    require_unprivileged_uid(bridge_uid, "srui-ssh-bridge")?;
+
     let socket_path = parse_socket_path().map_err(|message| {
         error!("{message}");
         message
     })?;
+    validate_private_socket(&socket_path, bridge_uid)?;
 
     info!("Connecting to session daemon socket at {:?}", socket_path);
     let session_stream = UnixStream::connect(&socket_path).await.map_err(|e| {
         error!("Failed to connect to srui-sessiond socket: {}", e);
         e
     })?;
+    validate_peer(&session_stream, bridge_uid)?;
 
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
@@ -70,7 +74,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("srui-ssh-bridge exited cleanly.");
     Ok(())
 }
-
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};

@@ -265,19 +265,42 @@ async fn backpressure_preserves_message_order() {
 }
 
 /// The binary routes tracing to stderr so stdout stays a pure protocol stream (§19.1, §20.1).
+///
+/// Spawns the real binary, which refuses effective UID 0 (§27). Containerized runners commonly
+/// execute as root, where the child would exit before accepting and this test would block on
+/// `accept(2)` until the harness timed out. Skip explicitly rather than hang.
 #[test]
 fn binary_stderr_contains_no_protocol_bytes() {
+    if srui_unix_security::effective_uid() == 0 {
+        eprintln!(
+            "skipping binary_stderr_contains_no_protocol_bytes: srui-ssh-bridge refuses \
+             effective UID 0 (§27); run as an unprivileged user to exercise it"
+        );
+        return;
+    }
+
     use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
-    let socket_path = std::path::PathBuf::from(format!("/tmp/srui-bridge-{}", std::process::id()));
-    let _ = std::fs::remove_file(&socket_path);
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let runtime_dir =
+        std::path::Path::new("/tmp").join(format!("srui-b-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&runtime_dir).expect("create private bridge test runtime directory");
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("secure bridge test runtime directory");
+    let socket_path = runtime_dir.join("s");
 
     let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        .expect("secure bridge test socket");
     let (accept_tx, accept_rx) = mpsc::channel();
 
     let accept_handle = thread::spawn(move || {
@@ -340,4 +363,5 @@ fn binary_stderr_contains_no_protocol_bytes() {
     );
 
     let _ = std::fs::remove_file(&socket_path);
+    std::fs::remove_dir(&runtime_dir).expect("remove bridge test runtime directory");
 }

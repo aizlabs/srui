@@ -641,6 +641,7 @@ final class DecoderTests: XCTestCase {
 
         // 3. Missing eventType in Event
         var wireEvent = SRUIEvent()
+        wireEvent.eventID = Data("missing-type".utf8)
         wireEvent.nodeID = 10
         XCTAssertThrowsError(try Event(wire: wireEvent)) { error in
             guard case ProtocolDecodeError.missingField(let field) = error else {
@@ -701,8 +702,29 @@ final class DecoderTests: XCTestCase {
         XCTAssertEqual(store.nodeCount, originalSnapshot.nodeCount)
     }
 
-    // MARK: - Event edit-sequence conformance
+    // MARK: - Event identifier limit
 
+    func testOversizedEventIdentifierRejectedByBothSwiftDecoders() throws {
+        var wireEvent = SRUIEvent()
+        wireEvent.eventID = Data(repeating: 0x41, count: maxEventIDBytes + 1)
+        wireEvent.eventType = TypeRef.EVENT_ACTIVATE.toWire()
+
+        for decode in [
+            { try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent) },
+            { try Event(wire: wireEvent) },
+        ] {
+            XCTAssertThrowsError(try decode()) { error in
+                guard case ProtocolDecodeError.eventIDSizeLimitExceeded(let limit, let actual) = error else {
+                    XCTFail("Expected eventIDSizeLimitExceeded, got \(error)")
+                    return
+                }
+                XCTAssertEqual(limit, maxEventIDBytes)
+                XCTAssertEqual(actual, maxEventIDBytes + 1)
+            }
+        }
+    }
+
+    // MARK: - Event edit-sequence conformance
     func testGoldenTextEditEventAcceptedByBothSwiftDecoders() throws {
         let fileURL = conformanceVectorsDir.appendingPathComponent("golden_text_edit_event.bin")
         let message = try decodeFramedMessage(from: Data(contentsOf: fileURL))

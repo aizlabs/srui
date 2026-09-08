@@ -25,6 +25,10 @@
 // - §8 / §22.7 Sparse collections: `ClientModelRangeRequest` is sent on the `.ui` lane and is
 //   not an Event. A copy arriving from the server is a protocol violation.
 // - §4 inv. 13: unrecoverable divergence fails explicitly instead of degrading silently.
+// - §26 Client attack-surface controls: inbound transactions are metered by a token bucket on
+//   their own ordered lane, so a hostile update rate propagates backpressure through the
+//   transport's unacknowledged-byte gate instead of stalling control traffic; and every wire
+//   `event_id` this controller adopts is length-checked before it becomes a retained key.
 // - §21 Terminal compatibility: `TerminalData` / `TerminalResyncRequired` update the local
 //   VT actor only. They never enter the semantic `ServerResyncRequired` path, discard
 //   pending text edits, mutate EventOutbox, reset revision, disable dispatch, or mark
@@ -134,6 +138,7 @@ private struct SessionFailureTeardownState: Sendable {
     var replayGeneration: UInt64?
     var connectionBinding: EventOutboxConnectionBinding?
     var lifecycleGeneration: UInt64
+    var transactionTasks: [Task<Void, Never>]
 }
 
 private actor ReceiveLoopStartGate {
@@ -177,6 +182,19 @@ public final class SessionController: @unchecked Sendable {
     public let requiredServerProfiles: CapabilitySet
 
     private let lock = NSLock()
+    private let transactionIngressGate: TransactionIngressGate
+    /// Ordered data-plane work runs separately from control-message dispatch. The transport's
+    /// unacknowledged-byte gate remains the hard memory bound while this lane is throttled.
+    private var transactionIngressTail: Task<Void, Never>?
+    private var transactionIngressTasks: [UUID: Task<Void, Never>] = [:]
+    /// FIFO of queued task ids, so the receive loop can free exactly one slot at a time.
+    private var transactionIngressOrder: [UUID] = []
+    /// Maximum decoded transactions parked on the ordered lane before the receive loop blocks.
+    ///
+    /// Must exceed the server's journal replay window (`DEFAULT_MAX_JOURNAL_ENTRIES`, 1024) so a
+    /// legitimate full replay is never throttled by queue depth, while still capping the per
+    /// transaction task/UUID/dictionary overhead that the transport's byte gate cannot bound.
+    private static let maxQueuedIngressTransactions = 2048
     private var streamDecoder = SRUIMessageStreamDecoder()
     private var receiveTask: Task<Void, Never>?
     /// The handshake send is published before it can enter Transport so stop() can cancel,
@@ -298,7 +316,14 @@ public final class SessionController: @unchecked Sendable {
         resourceCache: ResourceCache = ResourceCache(),
         sessionId: String? = nil,
         clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1],
-        requiredServerProfiles: CapabilitySet = []
+        requiredServerProfiles: CapabilitySet = [],
+        transactionRateLimits: TransactionRateLimits = .standard,
+        /// Inject a shared gate across reconnecting controller instances so §26's update-rate
+        /// budget stays scoped to the *session*; the default constructs a fresh budget, which is
+        /// only correct for a controller that is starting a new session rather than resuming one.
+        /// Without this, replacing the controller on reconnect hands the server a full burst again
+        /// (§26, §18).
+        transactionIngressGate: TransactionIngressGate? = nil
     ) {
         self.transport = transport
         self.applier = applier
@@ -309,6 +334,8 @@ public final class SessionController: @unchecked Sendable {
         self.currentSessionId = sessionId
         self.clientCapabilities = clientCapabilities
         self.requiredServerProfiles = requiredServerProfiles
+        self.transactionIngressGate = transactionIngressGate
+            ?? TransactionIngressGate(limits: transactionRateLimits)
     }
 
     private func withStateLock<T>(_ body: () -> T) -> T {
@@ -860,6 +887,9 @@ public final class SessionController: @unchecked Sendable {
             return self.lifecycleGeneration
         }
         guard let lifecycleGeneration else { return }
+        // The ingress budget is deliberately *not* reset here. See
+        // `adoptFreshSessionIngressBudget()`: §26's update rate is bounded per session, and
+        // resetting per connection would let a server replay a full burst after every disconnect.
         var activatedResourceOwnerEpoch: UInt64?
 
         startRangeRequestPump()
@@ -1072,6 +1102,17 @@ public final class SessionController: @unchecked Sendable {
     private func ownsRunningLifecycle(_ generation: UInt64) -> Bool {
         withStateLock {
             lifecycleGeneration == generation && isRunning && !isStopping
+        }
+    }
+
+    /// Transactions already read from the transport may finish during the bounded stop drain.
+    private func ownsTransactionIngressLifecycle(_ generation: UInt64) -> Bool {
+        withStateLock {
+            guard isRunning else { return false }
+            if lifecycleGeneration == generation { return true }
+            return isStopping
+                && generation < UInt64.max
+                && lifecycleGeneration == generation + 1
         }
     }
 
@@ -1366,21 +1407,55 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
 
-                for msg in messages {
+                var transactionCompletions: [Task<Void, Never>] = []
+                for message in messages {
                     guard !Task.isCancelled else { break }
-                    await handleIncomingMessage(msg)
+                    if case .transaction(let transaction)? = message.msg {
+                        // The transport's byte gate cannot bound *object* count: a minimal valid
+                        // transaction costs a handful of wire bytes, so an authenticated server
+                        // could fit hundreds of thousands of them inside the byte allowance and
+                        // materialize one task, UUID and dictionary entry for each while the lane
+                        // drains at the configured rate. Cap the queue depth as well (§26).
+                        await awaitTransactionIngressQueueCapacity()
+                        guard !Task.isCancelled else { break }
+                        if let completion = await enqueueIncomingTransaction(transaction) {
+                            transactionCompletions.append(completion)
+                        }
+                    } else {
+                        // Splitting transactions into their own lane must not let a message that
+                        // *replaces* the replica overtake transactions the server sent before it.
+                        if requiresTransactionLaneOrdering(message) {
+                            await awaitQueuedTransactionLane()
+                        }
+                        await handleIncomingMessage(message)
+                    }
                 }
 
-                // Release half of inbound backpressure (§26): acknowledged only after the chunk
-                // has been decoded *and* applied, so a slow renderer throttles the socket instead
-                // of letting the transport buffer committed transactions without bound. Reporting
-                // it earlier would make the bound meaningless, since rendering is the slow step.
-                await transport.acknowledgeReceived(byteCount: chunk.count)
+                // Keep control traffic responsive while the ordered transaction lane waits for
+                // rate credit. Retained memory stays bounded by the transport's outstanding-byte
+                // gate together with the queue-depth cap above.
+                if transactionCompletions.isEmpty {
+                    await transport.acknowledgeReceived(byteCount: chunk.count)
+                } else {
+                    let transport = self.transport
+                    Task {
+                        for completion in transactionCompletions {
+                            await completion.value
+                        }
+                        await transport.acknowledgeReceived(byteCount: chunk.count)
+                    }
+                }
             }
         } catch {
             guard !Task.isCancelled else { return }
             await reportFailure(.transportEnded("\(error)"))
             return
+        }
+
+        // A clean EOF can arrive while final decoded transactions remain queued. Normal EOF waits
+        // for them; intentional stop drains them separately under the same bounded grace period.
+        if !Task.isCancelled, !withStateLock({ isStopping }) {
+            await awaitQueuedTransactionLane()
         }
 
         // A peer that closes cleanly finishes the stream *without* throwing (socket EOF calls
@@ -1391,6 +1466,176 @@ public final class SessionController: @unchecked Sendable {
         let stoppedIntentionally = Task.isCancelled || withStateLock { isStopping || !isRunning }
         guard !stoppedIntentionally else { return }
         await reportFailure(.transportEnded("receive stream closed by peer"))
+    }
+
+    /// Places one decoded transaction on the ordered data-plane lane and returns its completion.
+    ///
+    /// The receive loop does not await this task, so acknowledgements and other control traffic can
+    /// be consumed while rate credit refills. Public direct dispatch still awaits the returned task.
+    private func enqueueIncomingTransaction(
+        _ wireTransaction: SRUITransaction
+    ) async -> Task<Void, Never>? {
+        var rejectedPhase: ProtocolPhase?
+        let taskID = UUID()
+        let completion = withStateLock { () -> Task<Void, Never>? in
+            let currentPhase = phase
+            guard allowsDataPlane(currentPhase) else {
+                rejectedPhase = currentPhase
+                return nil
+            }
+            let generation = lifecycleGeneration
+            let predecessor = transactionIngressTail
+            let task = Task { [weak self] in
+                guard let self else { return }
+                await self.runQueuedTransaction(
+                    wireTransaction,
+                    taskID: taskID,
+                    predecessor: predecessor,
+                    lifecycleGeneration: generation
+                )
+            }
+            transactionIngressTasks[taskID] = task
+            transactionIngressOrder.append(taskID)
+            transactionIngressTail = task
+            return task
+        }
+        if rejectedPhase != nil {
+            await reportFailure(.protocolViolation(
+                "Received Transaction before handshake completed"
+            ))
+        }
+        return completion
+    }
+
+    private func runQueuedTransaction(
+        _ wireTransaction: SRUITransaction,
+        taskID: UUID,
+        predecessor: Task<Void, Never>?,
+        lifecycleGeneration: UInt64
+    ) async {
+        defer { finishQueuedTransaction(taskID) }
+        await predecessor?.value
+        guard !Task.isCancelled, ownsTransactionIngressLifecycle(lifecycleGeneration) else {
+            return
+        }
+
+        do {
+            try await transactionIngressGate.waitForAdmission()
+        } catch is CancellationError {
+            // Teardown cancelled the wait. The transaction is intentionally dropped along with the
+            // rest of the connection; there is no replica to diverge from.
+            return
+        } catch {
+            // Anything else means the gate refused to admit an already-decoded transaction, which
+            // would silently skip a revision. That must be reported, not swallowed (§4 inv. 13).
+            guard ownsTransactionIngressLifecycle(lifecycleGeneration) else { return }
+            await reportFailure(.protocolViolation(
+                "Transaction ingress admission failed: \(error)"
+            ))
+            return
+        }
+
+        guard !Task.isCancelled,
+              ownsTransactionIngressLifecycle(lifecycleGeneration),
+              allowsDataPlane(withStateLock({ phase })) else {
+            return
+        }
+        await handleTransaction(wireTransaction)
+    }
+
+    private func finishQueuedTransaction(_ taskID: UUID) {
+        withStateLock {
+            transactionIngressTasks.removeValue(forKey: taskID)
+            if let index = transactionIngressOrder.firstIndex(of: taskID) {
+                transactionIngressOrder.remove(at: index)
+            }
+            if transactionIngressTasks.isEmpty {
+                transactionIngressTail = nil
+            }
+        }
+    }
+
+    /// Blocks the receive loop until the ordered lane has room for one more transaction.
+    ///
+    /// Queued tasks complete in FIFO order (each awaits its predecessor), so awaiting the oldest
+    /// frees exactly one slot rather than draining the whole lane — which would reintroduce the
+    /// multi-second stall that putting transactions on their own lane exists to avoid.
+    private func awaitTransactionIngressQueueCapacity() async {
+        while true {
+            let oldest = withStateLock { () -> Task<Void, Never>? in
+                guard transactionIngressTasks.count >= Self.maxQueuedIngressTransactions,
+                      let oldestID = transactionIngressOrder.first else { return nil }
+                return transactionIngressTasks[oldestID]
+            }
+            guard let oldest else { return }
+            await oldest.value
+        }
+    }
+
+    /// Whether `message` must observe every transaction the server sent before it.
+    ///
+    /// Rate-gating transactions on their own lane deliberately lets control traffic overtake them,
+    /// so the exemption has to be justified per message class:
+    ///
+    /// - `SERVER RESUME_OK` and `SERVER RESYNC_REQUIRED` *replace or rebase* the replica. Handling
+    ///   one ahead of a queued transaction would apply that transaction against a store the server
+    ///   never based it on, and its `base_revision` mismatch would force a further resync (§18).
+    /// - `SERVER EVENT_ACK` is already ordered by `revision_after_effect`: a processed ack installs
+    ///   a revision barrier and promotes successors only once transactions carry the store past it
+    ///   (§18.2), so arrival order carries no additional meaning.
+    /// - Resource metadata/chunks are keyed by resource id and guarded by an ownership epoch, and
+    ///   terminal frames are a separate logical channel (§11.1, §21). Neither is sequenced against
+    ///   the semantic revision chain.
+    private func requiresTransactionLaneOrdering(_ message: SRUIMessage) -> Bool {
+        switch message.msg {
+        case .serverResumeOk, .serverResyncRequired:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Grants a full ingress budget to a session the client is adopting for the first time.
+    ///
+    /// §26 bounds the update rate *per session*, so the bucket must not be refilled per
+    /// connection: a server that repeatedly disconnects and lets the client resume the same
+    /// session would otherwise replay a full 240-transaction burst on every reconnect, turning a
+    /// per-session bound into a per-connection one. Only a fresh `SERVER WELCOME` session or a
+    /// `RESYNC_REQUIRED` that *replaces* the session starts a new budget — both already cost the
+    /// server a full replica replacement. `RESUME_OK` and same-session resync retain the bucket,
+    /// which refills on wall-clock time regardless of how often the connection is torn down.
+    ///
+    /// The other half of "per session" is ownership: reconnect recovery *replaces* the controller
+    /// while continuing the same session, so a caller that reconnects must hand the replacement
+    /// the same `transactionIngressGate` it gave the original, alongside the shared `outbox` and
+    /// `resourceCache`. A replacement that constructs its own gate starts at full capacity and
+    /// reopens exactly the hole this method exists to close.
+    private func adoptFreshSessionIngressBudget() async {
+        await transactionIngressGate.reset()
+    }
+
+    /// Test seam for the budget's scope: whole transactions of ingress credit still available.
+    /// Internal rather than public — it exists so the per-session bound can be asserted without
+    /// wall-clock timing, not as part of the client API.
+    var availableTransactionIngressCredit: UInt64 {
+        get async { await transactionIngressGate.availableTokens() }
+    }
+
+    /// Test seam for the queue-depth bound: decoded transactions currently parked on the lane.
+    var queuedTransactionCountForTesting: Int {
+        withStateLock { transactionIngressTasks.count }
+    }
+
+    static var maxQueuedIngressTransactionsForTesting: Int { maxQueuedIngressTransactions }
+
+    /// Awaits every transaction queued before this point.
+    ///
+    /// Each queued task awaits its own predecessor, so awaiting the current tail transitively
+    /// awaits the whole prefix. Only the receive loop enqueues while it is draining a chunk, so no
+    /// new predecessor can appear behind the captured tail.
+    private func awaitQueuedTransactionLane() async {
+        let tail = withStateLock { transactionIngressTail }
+        await tail?.value
     }
 
     /// Processes a single wire envelope, dispatching on handshake phase (§12.1, §15, §22.2).
@@ -1430,14 +1675,30 @@ public final class SessionController: @unchecked Sendable {
                 ))
             }
 
-        case .transaction(let wireTx):
-            guard allowsDataPlane(phase) else {
-                await reportFailure(.protocolViolation(
-                    "Received Transaction before handshake completed"
-                ))
-                return
+        case .transaction(let transaction):
+            if withStateLock({ isRunning }) {
+                guard let completion = await enqueueIncomingTransaction(transaction) else { return }
+                await completion.value
+            } else {
+                guard allowsDataPlane(phase) else {
+                    await reportFailure(.protocolViolation(
+                        "Received Transaction before handshake completed"
+                    ))
+                    return
+                }
+                do {
+                    try await transactionIngressGate.waitForAdmission()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    await reportFailure(.protocolViolation(
+                        "Transaction ingress admission failed: \(error)"
+                    ))
+                    return
+                }
+                guard allowsDataPlane(withStateLock({ self.phase })) else { return }
+                await handleTransaction(transaction)
             }
-            await handleTransaction(wireTx)
 
         case .event:
             guard allowsDataPlane(phase) else {
@@ -1607,6 +1868,7 @@ public final class SessionController: @unchecked Sendable {
             ))
             return
         }
+        await adoptFreshSessionIngressBudget()
 
         withStateLock {
             self.currentSessionId = welcome.sessionID
@@ -2061,6 +2323,7 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
+                await adoptFreshSessionIngressBudget()
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
@@ -2152,6 +2415,7 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                await adoptFreshSessionIngressBudget()
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
                     await MainActor.run { renderer.resetExtensionRegistry() }
@@ -2455,7 +2719,15 @@ public final class SessionController: @unchecked Sendable {
     /// refuses must be dropped here: leaving it pending would replay it on the next resume, which
     /// the server would refuse again, forever.
     private func handleEventAck(_ ack: SRUIServerEventAck) async {
-        let eventId = EventId(ack.eventID)
+        let eventId: EventId
+        do {
+            eventId = try validateAndConvertEventID(ack.eventID)
+        } catch {
+            await reportFailure(.protocolViolation(
+                "SERVER EVENT_ACK contains an invalid event_id: \(error)"
+            ))
+            return
+        }
         guard let ownership = withStateLock({ () -> (
             EventOutboxConnectionBinding,
             EventOutboxSessionIncarnation
@@ -2720,6 +2992,7 @@ public final class SessionController: @unchecked Sendable {
     private func handleTransaction(_ wireTx: SRUITransaction) async {
         // A diverged replica cannot meaningfully apply anything until it resumes (§18).
         guard !isDiverged else { return }
+
         guard let ownership = withStateLock({ () -> (
             EventOutboxConnectionBinding,
             EventOutboxSessionIncarnation
@@ -3118,11 +3391,16 @@ public final class SessionController: @unchecked Sendable {
             phase = .failed
             let replayGeneration = resumeGeneration ?? activeReplayRetryGeneration
             activeReplayRetryGeneration = nil
+            let transactionTasks = Array(transactionIngressTasks.values)
+            transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressOrder.removeAll(keepingCapacity: false)
+            transactionIngressTail = nil
             return SessionFailureTeardownState(
                 handler: _onFailure ?? { _ in },
                 replayGeneration: replayGeneration,
                 connectionBinding: outboxConnectionBinding,
-                lifecycleGeneration: lifecycleGeneration
+                lifecycleGeneration: lifecycleGeneration,
+                transactionTasks: transactionTasks
             )
         }
     }
@@ -3136,6 +3414,9 @@ public final class SessionController: @unchecked Sendable {
         _ failure: SessionFailure,
         state: SessionFailureTeardownState
     ) async {
+        for task in state.transactionTasks {
+            task.cancel()
+        }
         await retainNativeTextBeforeDisconnect(
             binding: state.connectionBinding
         )
@@ -3293,6 +3574,29 @@ public final class SessionController: @unchecked Sendable {
     /// How long `stop()` lets the receive loop drain closed-transport frames before cancelling it.
     private static let receiveDrainGraceNanoseconds: UInt64 = 2_000_000_000
 
+    private func drainTransactionIngressTasks() async {
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            + Self.receiveDrainGraceNanoseconds
+        while withStateLock({ !transactionIngressTasks.isEmpty }),
+              DispatchTime.now().uptimeNanoseconds < deadline {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        let remaining = withStateLock {
+            let tasks = Array(transactionIngressTasks.values)
+            transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressOrder.removeAll(keepingCapacity: false)
+            transactionIngressTail = nil
+            return tasks
+        }
+        for task in remaining {
+            task.cancel()
+        }
+        for task in remaining {
+            await task.value
+        }
+    }
+
     /// Stops the session coordinator and closes the underlying transport.
     public func stop() async {
         let stoppedState: (
@@ -3359,6 +3663,7 @@ public final class SessionController: @unchecked Sendable {
             receiveTask.cancel()
             await receiveTask.value
         }
+        await drainTransactionIngressTasks()
 
         let replayGeneration = withStateLock {
             resumeGeneration ?? activeReplayRetryGeneration
@@ -3411,6 +3716,9 @@ public final class SessionController: @unchecked Sendable {
             }
             handshakeSendOwnership = nil
             receiveTask = nil
+            transactionIngressTasks.removeAll(keepingCapacity: false)
+            transactionIngressOrder.removeAll(keepingCapacity: false)
+            transactionIngressTail = nil
             // A restarted session re-handshakes and re-mounts from scratch, so no partial frame or
             // mount state may survive.
             streamDecoder = SRUIMessageStreamDecoder()

@@ -703,26 +703,35 @@ async fn handle_incoming_message(
             let outcome = session.process_event(&event)?;
             match &outcome {
                 EventOutcome::Processed { .. } => {
-                    debug!("Handled event {:?}", event.event_id);
+                    debug!(
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        "Handled event"
+                    );
                 }
                 EventOutcome::Pending { .. } => {
                     debug!(
-                        "Event {:?} (seq {}) is already in flight",
-                        event.event_id, event.event_seq
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        "Event is already in flight"
                     );
                 }
                 EventOutcome::Duplicate { .. } => {
                     debug!(
-                        "Ignored duplicate event {:?} (seq {})",
-                        event.event_id, event.event_seq
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        "Ignored duplicate event"
                     );
                 }
                 EventOutcome::Rejected { error, .. } => {
-                    // Not connection-fatal: a rejected event that closed the stream would be
-                    // replayed on the next resume and close it again, forever (§18, §18.2).
+                    // Never log the peer-controlled identifier itself. Oversized identifiers land
+                    // here deliberately, and formatting them would turn rejection into log
+                    // amplification.
                     warn!(
-                        "Rejecting event {:?} (seq {}): {}",
-                        event.event_id, event.event_seq, error
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        error = %error,
+                        "Rejecting event"
                     );
                 }
             }
@@ -912,7 +921,7 @@ fn build_event_ack(
 
     Some(ServerEventAck {
         client_instance_id: event.client_instance_id.clone(),
-        event_id: event.event_id.clone(),
+        event_id: crate::session::bounded_event_id_for_response(event),
         last_processed_event_seq,
         status: status as i32,
         revision_after_effect,

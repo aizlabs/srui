@@ -104,6 +104,59 @@ final class SocketReadLatch: @unchecked Sendable {
         }
     }
 }
+private struct UnixSocketIdentity: Equatable {
+    var device: dev_t
+    var inode: ino_t
+}
+
+private func validateUnixSocketPath(_ path: String, expectedUID: uid_t) throws -> UnixSocketIdentity {
+    var metadata = stat()
+    guard path.withCString({ lstat($0, &metadata) }) == 0 else {
+        throw TransportError.connectionFailed(
+            "Cannot inspect Unix socket \(path): \(String(cString: strerror(errno)))"
+        )
+    }
+    guard metadata.st_mode & S_IFMT == S_IFSOCK else {
+        throw TransportError.connectionFailed("\(path) is not a Unix socket")
+    }
+    guard metadata.st_uid == expectedUID else {
+        throw TransportError.connectionFailed(
+            "Unix socket \(path) is owned by UID \(metadata.st_uid), expected \(expectedUID)"
+        )
+    }
+    guard metadata.st_mode & 0o077 == 0 else {
+        throw TransportError.connectionFailed(
+            "Unix socket \(path) grants group or other permissions; expected mode 0600"
+        )
+    }
+    return UnixSocketIdentity(device: metadata.st_dev, inode: metadata.st_ino)
+}
+
+private func validateConnectedUnixPeer(
+    descriptor: Int32,
+    path: String,
+    expectedUID: uid_t,
+    expectedIdentity: UnixSocketIdentity
+) throws {
+    var peerUID: uid_t = 0
+    var peerGID: gid_t = 0
+    guard getpeereid(descriptor, &peerUID, &peerGID) == 0 else {
+        throw TransportError.connectionFailed(
+            "Cannot inspect Unix peer credentials: \(String(cString: strerror(errno)))"
+        )
+    }
+    guard peerUID == expectedUID else {
+        throw TransportError.connectionFailed(
+            "Unix peer UID \(peerUID) does not match effective UID \(expectedUID)"
+        )
+    }
+    let connectedIdentity = try validateUnixSocketPath(path, expectedUID: expectedUID)
+    guard connectedIdentity == expectedIdentity else {
+        throw TransportError.connectionFailed(
+            "Unix socket \(path) changed while the connection was established"
+        )
+    }
+}
 
 /// Transport adapter actor communicating with a local Unix domain socket daemon (`srui-sessiond`, §20.2).
 public actor UnixSocketTransport: Transport {
@@ -157,6 +210,17 @@ public actor UnixSocketTransport: Transport {
             return
         }
 
+        let effectiveUID = geteuid()
+        guard effectiveUID != 0 else {
+            throw TransportError.connectionFailed(
+                "Refusing Unix socket transport with root effective UID"
+            )
+        }
+        let expectedIdentity = try validateUnixSocketPath(
+            socketPath,
+            expectedUID: effectiveUID
+        )
+
         let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
             throw TransportError.connectionFailed("Failed to create socket: \(String(cString: strerror(errno)))")
@@ -193,6 +257,18 @@ public actor UnixSocketTransport: Transport {
             let err = errno
             Darwin.close(fd)
             throw TransportError.connectionFailed("Failed to connect to \(socketPath): \(String(cString: strerror(err)))")
+        }
+
+        do {
+            try validateConnectedUnixPeer(
+                descriptor: fd,
+                path: socketPath,
+                expectedUID: effectiveUID,
+                expectedIdentity: expectedIdentity
+            )
+        } catch {
+            Darwin.close(fd)
+            throw error
         }
 
         self.socketFD = fd

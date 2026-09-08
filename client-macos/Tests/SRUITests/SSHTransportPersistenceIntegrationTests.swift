@@ -33,6 +33,10 @@ struct SSHTransportPersistenceIntegrationTests {
 
         let tempDir = URL(fileURLWithPath: "/tmp/srui-persist-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempDir.path
+        )
         defer {
             try? FileManager.default.removeItem(at: tempDir)
         }
@@ -234,6 +238,10 @@ struct SSHTransportPersistenceIntegrationTests {
 
         let tempDir = URL(fileURLWithPath: "/tmp/srui-restarts-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempDir.path
+        )
         defer {
             try? FileManager.default.removeItem(at: tempDir)
         }

@@ -13,12 +13,13 @@ use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     AuthoritativeCommit, ClientInstanceId, EditSeq, Event as DomainEvent, EventId,
     EventValidationError, NodeId, PropertyRef, Revision, SemanticStore, StandardValidationState,
-    StoreError, TypeRef, Value,
+    StoreError, TypeRef, Value, MAX_EVENT_ID_BYTES,
 };
 
 use super::{
-    bound_diagnostic_string, lock_or_recover, panic_payload_message, EventOutcome,
-    HandlerDispatchKind, HandlerFn, Session, SessionError, SessionInner,
+    bound_diagnostic_string, bounded_rejected_event_id, lock_or_recover, oversized_event_dedupe_id,
+    panic_payload_message, EventOutcome, HandlerDispatchKind, HandlerFn, Session, SessionError,
+    SessionInner,
 };
 
 /// Default cap on tracked `(client_instance_id, node_id)` editor streams (§26).
@@ -649,7 +650,7 @@ impl Session {
 
     pub(crate) fn validate_pending_text_edit_refs(
         refs: &[srui_protocol::PendingTextEditRef],
-    ) -> Result<Vec<ValidatedPendingTextEditRef<'_>>, SessionError> {
+    ) -> Result<Vec<ValidatedPendingTextEditRef>, SessionError> {
         if refs.len() > MAX_TEXT_EDIT_STREAMS {
             return Err(SessionError::InvalidInput(format!(
                 "pending_text_edits has {} entries; at most {MAX_TEXT_EDIT_STREAMS} are accepted (§18.3, §26)",
@@ -658,19 +659,43 @@ impl Session {
         }
 
         let mut validated = Vec::with_capacity(refs.len());
-        let mut seen_event_ids: HashSet<&[u8]> = HashSet::with_capacity(refs.len());
+        let mut seen_dedupe_ids: HashSet<Vec<u8>> = HashSet::with_capacity(refs.len());
+        let mut seen_response_ids: HashSet<Vec<u8>> = HashSet::with_capacity(refs.len());
         for reference in refs {
             if reference.event_id.is_empty() || reference.event_seq == 0 {
                 return Err(SessionError::InvalidInput(
                     "pending TEXT_EDIT ref is missing event_id or event_seq".into(),
                 ));
             }
-            // `event_id` is the dedupe key, so a repeat makes the intended settlement ambiguous
-            // and would desynchronize the echoed discard list from the client's assigned set.
-            // Malformed input fails explicitly rather than being silently coalesced (§4 inv. 13).
-            if !seen_event_ids.insert(reference.event_id.as_slice()) {
+            let oversized = reference.event_id.len() > MAX_EVENT_ID_BYTES;
+            let dedupe_event_id = if oversized {
+                tracing::warn!(
+                    event_seq = reference.event_seq,
+                    actual = reference.event_id.len(),
+                    limit = MAX_EVENT_ID_BYTES,
+                    "settling oversized pending TEXT_EDIT event_id through a bounded identity"
+                );
+                oversized_event_dedupe_id(reference.event_seq, &reference.event_id)
+            } else {
+                reference.event_id.clone()
+            };
+            let response_event_id = if oversized {
+                bounded_rejected_event_id(reference.event_seq, &reference.event_id)
+            } else {
+                reference.event_id.clone()
+            };
+
+            // Check the identities the server will actually retain and return, not just the raw
+            // bytes. Both normalized forms are digest-bound, so distinct oversized values stay
+            // distinct; this guard catches a genuine repeat, whose intended settlement is
+            // ambiguous and would desynchronize the echoed discard list from the client's assigned
+            // set. Malformed input fails explicitly rather than being silently coalesced
+            // (§4 inv. 13).
+            if !seen_dedupe_ids.insert(dedupe_event_id.clone())
+                || !seen_response_ids.insert(response_event_id.clone())
+            {
                 return Err(SessionError::InvalidInput(
-                    "pending_text_edits repeats an event_id".into(),
+                    "pending_text_edits repeats a normalized event_id".into(),
                 ));
             }
             let edit_seq = EditSeq::new(reference.edit_seq).ok_or_else(|| {
@@ -678,18 +703,20 @@ impl Session {
                     "pending TEXT_EDIT ref requires a positive edit_seq".into(),
                 )
             })?;
+            let mut bounded_reference = reference.clone();
+            bounded_reference.event_id = response_event_id;
             validated.push(ValidatedPendingTextEditRef {
-                reference,
+                reference: bounded_reference,
+                dedupe_event_id,
                 edit_seq,
             });
         }
         Ok(validated)
     }
-
     pub(crate) fn prepare_pending_text_edit_cancellation(
         inner: &SessionInner,
         client_instance_id: &[u8],
-        refs: &[ValidatedPendingTextEditRef<'_>],
+        refs: &[ValidatedPendingTextEditRef],
     ) -> PendingTextEditCancellation {
         let revision_after_effect = inner.store.revision().get();
         let max_string_length = inner.store.limits().max_string_length;
@@ -709,11 +736,11 @@ impl Session {
         let mut staged_dedupe = inner.dedupe.clone();
         let mut discarded = Vec::with_capacity(refs.len());
         for validated in refs {
-            let reference = validated.reference;
+            let reference = &validated.reference;
             let placeholder = WireEvent {
                 client_instance_id: client_instance_id.to_vec(),
                 event_seq: reference.event_seq,
-                event_id: reference.event_id.clone(),
+                event_id: validated.dedupe_event_id.clone(),
                 node_id: reference.node_id,
                 event_type: Some(TypeRef::EVENT_TEXT_EDIT.into()),
                 edit_seq: validated.edit_seq.get(),
@@ -739,8 +766,8 @@ impl Session {
                     }
                 }
                 Err(error) => {
-                    // A bad replay reference must not make every subsequent resume fail. Echo it
-                    // as discarded, but leave the authoritative dedupe entry untouched.
+                    // A bad replay reference must not make every subsequent resume fail. Echo its
+                    // bounded rejection marker, but leave the authoritative dedupe entry untouched.
                     tracing::warn!(
                         %error,
                         event_seq = reference.event_seq,
@@ -757,6 +784,7 @@ impl Session {
         }
     }
 }
+
 struct PreparedTextEdit {
     request: TextEditRequest,
     generation: u64,
@@ -769,8 +797,10 @@ enum TextEditCommit {
     DispatchAccepted,
 }
 
-pub(crate) struct ValidatedPendingTextEditRef<'a> {
-    reference: &'a srui_protocol::PendingTextEditRef,
+#[derive(Debug)]
+pub(crate) struct ValidatedPendingTextEditRef {
+    reference: srui_protocol::PendingTextEditRef,
+    dedupe_event_id: Vec<u8>,
     edit_seq: EditSeq,
 }
 
@@ -896,6 +926,51 @@ mod tests {
 
     fn seq(n: u64) -> EditSeq {
         EditSeq::new(n).expect("positive")
+    }
+
+    #[test]
+    fn pending_resume_ids_are_bounded_and_stay_distinct_after_normalization() {
+        let refs = [
+            srui_protocol::PendingTextEditRef {
+                event_id: vec![b'a'; MAX_EVENT_ID_BYTES + 1],
+                event_seq: 7,
+                node_id: 1,
+                edit_seq: 1,
+            },
+            srui_protocol::PendingTextEditRef {
+                event_id: vec![b'b'; MAX_EVENT_ID_BYTES + 2],
+                event_seq: 7,
+                node_id: 1,
+                edit_seq: 2,
+            },
+        ];
+
+        let validated = Session::validate_pending_text_edit_refs(&refs)
+            .expect("distinct oversized identifiers are each settled through their own marker");
+        assert_eq!(validated.len(), 2);
+        for (validated, original) in validated.iter().zip(refs.iter()) {
+            // Neither the retained nor the echoed identity may carry the peer's bytes...
+            assert!(validated.reference.event_id.len() <= MAX_EVENT_ID_BYTES);
+            assert_ne!(validated.reference.event_id, original.event_id);
+            assert_eq!(validated.dedupe_event_id.len(), MAX_EVENT_ID_BYTES + 1);
+        }
+        // ...and two different oversized identifiers at one sequence must not collapse onto one
+        // internal identity or one echoed discard entry (§4 inv. 13).
+        assert_ne!(validated[0].dedupe_event_id, validated[1].dedupe_event_id);
+        assert_ne!(
+            validated[0].reference.event_id,
+            validated[1].reference.event_id
+        );
+
+        // A genuine repeat of one identifier is still ambiguous and still fails explicitly.
+        let repeated = [refs[0].clone(), refs[0].clone()];
+        let error = Session::validate_pending_text_edit_refs(&repeated)
+            .expect_err("a repeated oversized identifier must fail explicitly");
+        assert!(matches!(
+            error,
+            SessionError::InvalidInput(message)
+                if message.contains("normalized event_id")
+        ));
     }
 
     #[test]

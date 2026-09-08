@@ -16,7 +16,9 @@ from typing import Any
 FIXTURE = (
     Path(__file__).resolve().parent.parent
     / "conformance-vectors"
-    / "state-machine"
+    / "suites"
+    / "01-core-state-machine"
+    / "vectors"
     / "13_sequential_transactions.json"
 )
 

@@ -529,8 +529,8 @@ fn persist_failing_trace(mismatch: &TraceMismatch) {
     }
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let out_dir =
-        PathBuf::from(manifest_dir).join("../../protocol/conformance-vectors/state-machine");
+    let out_dir = PathBuf::from(manifest_dir)
+        .join("../../protocol/conformance-vectors/suites/01-core-state-machine/vectors");
     let file_name = format!(
         "99_trace_seed_{:x}_step_{}.json",
         mismatch.seed, mismatch.step

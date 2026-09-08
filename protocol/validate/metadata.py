@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from validate.conformance import (
+    COORDINATE_EVENTS,
     EVENT_KINDS,
     EXPECTED_NODE_TIERS,
     NODE_CATEGORIES,
@@ -9,6 +10,7 @@ from validate.conformance import (
     PROPERTY_CATEGORIES,
     PROPERTY_ENUM_REFERENCES,
     PROPERTY_VALUE_TYPES,
+    SEMANTIC_EVENTS,
 )
 
 
@@ -39,6 +41,40 @@ def validate_node_type_entry(entry: dict, errors: list[str]) -> None:
     category = entry.get("category")
     if category not in NODE_CATEGORIES:
         errors.append(f"[node_types] Entry '{name}' has invalid category '{category}'.")
+
+    validate_node_emits(entry, errors)
+
+
+def validate_node_emits(entry: dict, errors: list[str]) -> None:
+    """Validate a node type's semantic event emission list (§7.6, §7.7, §32.5).
+
+    Every node type must declare `emits` explicitly — an empty list means "originates no
+    semantic events", which is a different and weaker claim than "nobody wrote the field yet".
+    Coordinate events (§7.7) may never appear: they are reserved for explicitly subscribed
+    custom scene nodes, never for Standard Widget Profile controls.
+    """
+    name = entry.get("name", "<unknown>")
+    emits = entry.get("emits")
+
+    if not isinstance(emits, list):
+        errors.append(
+            f"[node_types] Entry '{name}' must declare an 'emits' list (use [] for none)."
+        )
+        return
+
+    if len(set(emits)) != len(emits):
+        errors.append(f"[node_types] Entry '{name}' has duplicate entries in 'emits'.")
+
+    for event_name in emits:
+        if event_name in COORDINATE_EVENTS:
+            errors.append(
+                f"[node_types] Entry '{name}' emits coordinate event '{event_name}'; "
+                "coordinate events are reserved for subscribed custom scenes (§7.7, §32.5)."
+            )
+        elif event_name not in SEMANTIC_EVENTS:
+            errors.append(
+                f"[node_types] Entry '{name}' emits unknown event '{event_name}'."
+            )
 
 
 def validate_property_entry(entry: dict, enum_names: set[str], errors: list[str]) -> None:

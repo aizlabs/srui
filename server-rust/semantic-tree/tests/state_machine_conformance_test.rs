@@ -1,8 +1,16 @@
-//! SRUI Core State-Machine Conformance Test Runner (§32 items 1 & 3, §4).
+//! SRUI Core State-Machine Conformance Test Runner (§32 item 1, §4).
 //!
-//! Loads and executes declarative conformance vectors from `protocol/conformance-vectors/state-machine/*.json`,
-//! validating atomic transactions, identity invariants, safety limits, model operations, rollback behavior,
-//! and the "semantic-not-paint" architectural invariant.
+//! Implements: §6.2 (identity scoping), §12.1 (atomic transactions/revisions), §13 (operations),
+//! §26 (safety limits), §32.1 (core state-machine suite).
+//!
+//! Loads and executes declarative conformance vectors from
+//! `protocol/conformance-vectors/suites/01-core-state-machine/vectors/*.json`, validating atomic
+//! transactions, identity invariants, safety limits, model operations, and rollback behavior.
+//!
+//! The semantic-not-paint invariant (§32 item 3) is a separate, independently runnable suite in
+//! `conformance_semantic_not_paint_test.rs`.
+
+mod common;
 
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -546,28 +554,9 @@ fn build_store_limits(fl: &Option<FixtureLimits>) -> StoreLimits {
     limits
 }
 
+/// Suite 1 vectors, count-pinned by `protocol/conformance-vectors/suites/manifest.json`.
 fn get_fixture_files() -> Vec<PathBuf> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dir = Path::new(manifest_dir).join("../../protocol/conformance-vectors/state-machine");
-    let mut files = Vec::new();
-    for entry in
-        fs::read_dir(&dir).unwrap_or_else(|e| panic!("Failed to read dir {:?}: {}", dir, e))
-    {
-        let entry =
-            entry.unwrap_or_else(|e| panic!("Failed to read directory entry in {:?}: {}", dir, e));
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            files.push(path);
-        }
-    }
-    files.sort();
-    assert!(
-        files.len() >= 15,
-        "Expected at least 15 conformance fixtures in {:?}, found {}",
-        dir,
-        files.len()
-    );
-    files
+    common::suite_vectors(1)
 }
 
 // ==============================================================================
@@ -943,89 +932,5 @@ fn test_all_state_machine_conformance_fixtures() {
     for path in &fixture_paths {
         println!("  -> Replaying fixture: {:?}", path.file_name().unwrap());
         replay_fixture(path);
-    }
-}
-
-#[test]
-fn test_semantic_not_paint_architectural_invariants() {
-    // §32 item 3 & §4 Invariants:
-    // Assert that the Protocol Core and Standard Widget Profile contain zero notions of:
-    // 1. Frame cadence (no start_frame, end_frame, frame_id, vsync)
-    // 2. Paint / drawing commands (no draw_rect, fill_path, set_pixel, draw_text)
-    // 3. Mandatory absolute pixel geometry (no pixel_x, pixel_y, width_px, height_px)
-
-    // 1. Verify Standard Node Types
-    for &(id, name) in STANDARD_NODE_TYPES {
-        assert!(
-            !name.to_lowercase().contains("frame"),
-            "Node type {} ({}) must not contain frame concepts (§4.16)",
-            id,
-            name
-        );
-        assert!(
-            !name.to_lowercase().contains("paint"),
-            "Node type {} ({}) must not contain paint concepts (§4.7)",
-            id,
-            name
-        );
-        assert!(
-            !name.to_lowercase().contains("raster"),
-            "Node type {} ({}) must not contain raster concepts (§4.7)",
-            id,
-            name
-        );
-    }
-
-    // 2. Verify Standard Properties
-    for &(id, name) in STANDARD_PROPERTIES {
-        assert!(
-            !name.contains("pixel_x") && !name.contains("pixel_y") && !name.contains("px"),
-            "Standard property {} ({}) must not require absolute pixel coordinates (§4.17)",
-            id,
-            name
-        );
-        assert!(
-            !name.contains("color_hex")
-                && !name.contains("background_color")
-                && !name.contains("brush"),
-            "Standard property {} ({}) must not prescribe direct painting brushes (§4.7)",
-            id,
-            name
-        );
-        assert!(
-            !name.contains("font_family") && !name.contains("font_size"),
-            "Standard property {} ({}) must not dictate renderer fonts in v0.1 (§3.2, §4.7)",
-            id,
-            name
-        );
-    }
-
-    // 3. Verify Standard Operations
-    for &(id, name) in STANDARD_OPERATIONS {
-        let name_lower = name.to_lowercase();
-        assert!(
-            !name_lower.contains("frame"),
-            "Operation {} ({}) must not introduce display frame cadence (§4.16, §12.2)",
-            id,
-            name
-        );
-        assert!(
-            !name_lower.contains("paint")
-                && !name_lower.contains("draw")
-                && !name_lower.contains("render"),
-            "Operation {} ({}) must not be a paint or drawing command (§4.7, §7.1)",
-            id,
-            name
-        );
-    }
-
-    // 4. Verify Standard Events
-    for &(id, name) in STANDARD_EVENTS {
-        assert!(
-            !name.to_lowercase().contains("mouse_move") && !name.to_lowercase().contains("raw_pointer"),
-            "Standard event {} ({}) must route semantic intent rather than raw pointer streams (§7.6, §7.7)",
-            id,
-            name
-        );
     }
 }

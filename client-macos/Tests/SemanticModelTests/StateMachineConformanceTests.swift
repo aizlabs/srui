@@ -12,60 +12,27 @@ import Foundation
 
 final class StateMachineConformanceTests: XCTestCase {
 
-    private func findConformanceVectorsDirectory() -> URL? {
-        // Look relative to this source file
-        let currentFile = URL(fileURLWithPath: #filePath)
-        let repoRoot = currentFile
-            .deletingLastPathComponent() // Tests/SemanticModelTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // client-macos
-            .deletingLastPathComponent() // repo root (srui)
-
-        let vectorsDir = repoRoot.appendingPathComponent("protocol/conformance-vectors/state-machine")
-        if FileManager.default.fileExists(atPath: vectorsDir.path) {
-            return vectorsDir
-        }
-
-        // Fallback: search relative to process working directory
-        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        let cwdVectors = cwd.appendingPathComponent("protocol/conformance-vectors/state-machine")
-        if FileManager.default.fileExists(atPath: cwdVectors.path) {
-            return cwdVectors
-        }
-
-        let parentVectors = cwd.appendingPathComponent("../protocol/conformance-vectors/state-machine")
-        if FileManager.default.fileExists(atPath: parentVectors.path) {
-            return parentVectors
-        }
-
-        return nil
-    }
-
     func testReplayAllStateMachineConformanceVectors() throws {
-        guard let vectorsDir = findConformanceVectorsDirectory() else {
-            XCTFail("Could not locate protocol/conformance-vectors/state-machine directory")
-            return
+        // Count-pinned by protocol/conformance-vectors/suites/manifest.json: the exact-count
+        // assertion lives in ConformanceVectors.vectors(forSuite:) and runs before any filtering,
+        // so an env-var subset can never mask a missing fixture.
+        let allVectors = try ConformanceVectors.vectors(forSuite: 1)
+
+        let fileURLs = allVectors.filter { fileURL in
+            let name = fileURL.lastPathComponent
+            if let filter = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_VECTOR"] {
+                return name == filter
+            }
+            if let from = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_FROM"] {
+                if name < from { return false }
+            }
+            if let to = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_TO"] {
+                if name > to { return false }
+            }
+            return true
         }
 
-        let fileManager = FileManager.default
-        let fileURLs = try fileManager.contentsOfDirectory(at: vectorsDir, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "json" }
-            .filter { fileURL in
-                let name = fileURL.lastPathComponent
-                if let filter = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_VECTOR"] {
-                    return name == filter
-                }
-                if let from = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_FROM"] {
-                    if name < from { return false }
-                }
-                if let to = ProcessInfo.processInfo.environment["SRUI_CONFORMANCE_TO"] {
-                    if name > to { return false }
-                }
-                return true
-            }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-
-        XCTAssertFalse(fileURLs.isEmpty, "Found 0 conformance vector JSON files in \(vectorsDir.path)")
+        XCTAssertFalse(fileURLs.isEmpty, "Found 0 conformance vector JSON files for suite 1")
         print("Found \(fileURLs.count) conformance vector fixtures to replay:")
 
         for fileURL in fileURLs {
@@ -829,37 +796,5 @@ final class StateMachineConformanceTests: XCTestCase {
             return .record(SmallRecord(typeRef: typeRef, properties: properties))
         }
         throw StoreError.operationError("Unrecognized structured value object in fixture: \(dict)")
-    }
-    // MARK: - Invariant Verification (§4.7, §4.16, §4.17, §7.1, §10, §32.3)
-
-    /// Verifies the semantic-not-paint invariant: standard widget profile trees define portable meaning,
-    /// roles, and layout intent without display frames, paint instructions, or mandatory absolute pixel geometry.
-    func testSemanticNotPaintArchitecturalInvariants() {
-        // Assert standard registry tables contain zero display frame, paint command, or absolute pixel coordinate concepts
-        let forbiddenConcepts = [
-            "paint", "draw_rect", "draw_line", "fill_path", "rasterize",
-            "framebuffer", "pixel_buffer", "render_pass", "gpu_texture",
-            "display_list", "paint_layer", "skia_canvas"
-        ]
-
-        for entry in standardNodeTypesTable {
-            let name = entry.name.lowercased()
-            for forbidden in forbiddenConcepts {
-                XCTAssertFalse(
-                    name.contains(forbidden),
-                    "Standard node type '\(entry.name)' violates semantic-not-paint invariant by containing forbidden paint keyword '\(forbidden)' (§4.7, §32.3)"
-                )
-            }
-        }
-
-        for entry in standardPropertiesTable {
-            let name = entry.name.lowercased()
-            for forbidden in forbiddenConcepts {
-                XCTAssertFalse(
-                    name.contains(forbidden),
-                    "Standard property '\(entry.name)' violates semantic-not-paint invariant by containing forbidden paint keyword '\(forbidden)' (§4.7, §32.3)"
-                )
-            }
-        }
     }
 }

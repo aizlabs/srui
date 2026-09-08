@@ -12,6 +12,7 @@ from validate.conformance import (
     REQUIRED_PROPERTIES_SECTION_7_4,
     REQUIRED_STANDARD_PROPERTIES,
     REQUIRED_TIER_NODE_COUNT,
+    SEMANTIC_EVENTS,
     SHOULD_NODE_TYPES,
     SHOULD_TIER_NODE_COUNT,
     TOTAL_NODE_TYPE_COUNT,
@@ -166,6 +167,20 @@ def validate_registry_data(registry: dict, *, check_proto: bool = True) -> Valid
     missing_events = REQUIRED_EVENTS - set(event_names.keys())
     if missing_events:
         errors.append(f"[events] Missing standard event types (§7.6, §7.7): {sorted(missing_events)}")
+
+    # §32.5: every semantic event must have at least one standard node type that originates it,
+    # otherwise the registry declares an event no conformance suite can ever exercise.
+    emitted_anywhere = {
+        event
+        for entry in node_types
+        if isinstance(entry, dict)
+        for event in entry.get("emits", []) or []
+    }
+    unemitted = SEMANTIC_EVENTS - emitted_anywhere
+    if unemitted:
+        errors.append(
+            f"[node_types] Semantic events declared but emitted by no node type: {sorted(unemitted)}"
+        )
 
     operations = registry.get("operations", [])
     if not operations:

@@ -19,48 +19,56 @@ node_types:
     name: Surface
     tier: required
     category: container
+    emits: [VIEWPORT_CHANGED]
     description: "Top-level content/window surface"
 
   - id: 2
     name: Dialog
     tier: standard
     category: container
+    emits: []
     description: "Transient modal or modeless surface"
 
   - id: 3
     name: Row
     tier: required
     category: layout
+    emits: []
     description: "Ordered horizontal layout container"
 
   - id: 4
     name: Column
     tier: required
     category: layout
+    emits: []
     description: "Ordered vertical layout container"
 
   - id: 5
     name: Grid
     tier: required
     category: layout
+    emits: []
     description: "Two-dimensional row/column layout container"
 
   - id: 6
     name: Spacer
     tier: required
     category: layout
+    emits: []
     description: "Flexible empty layout item for adjusting spacing and alignment"
 
   - id: 7
     name: Separator
     tier: required
     category: layout
+    emits: []
     description: "Semantic visual grouping line or divider"
 
   - id: 8
     name: Scroll
     tier: required
     category: container
+    emits: [VIEWPORT_CHANGED]
     description: "Scrollable viewport container"
 
   # Content & Basic Controls (§7.2, §7.3 Required Tier)
@@ -68,48 +76,56 @@ node_types:
     name: Text
     tier: required
     category: text
+    emits: []
     description: "Non-editable static or dynamic text label"
 
   - id: 10
     name: RichText
     tier: required
     category: text
+    emits: []
     description: "Selectable structured text with semantic annotations"
 
   - id: 11
     name: Button
     tier: required
     category: control
+    emits: [ACTIVATE]
     description: "Momentary action trigger"
 
   - id: 12
     name: Toggle
     tier: required
     category: control
+    emits: [VALUE_CHANGED]
     description: "User-editable boolean state control (rendered as checkbox, switch, or platform default)"
 
   - id: 13
     name: TextInput
     tier: required
     category: control
+    emits: [TEXT_EDIT]
     description: "Single-line text editing field"
 
   - id: 14
     name: TextArea
     tier: required
     category: control
+    emits: [TEXT_EDIT]
     description: "Multi-line text editing view"
 
   - id: 15
     name: Progress
     tier: required
     category: control
+    emits: []
     description: "Determinate or indeterminate progress indicator"
 
   - id: 16
     name: Image
     tier: required
     category: content
+    emits: []
     description: "Raster or vector image resource display"
 
   # Collections (§7.2, §7.3 Required Tier)
@@ -117,18 +133,21 @@ node_types:
     name: List
     tier: required
     category: collection
+    emits: [SELECTION_CHANGED]
     description: "Virtualized one-dimensional collection of items"
 
   - id: 18
     name: Table
     tier: required
     category: collection
+    emits: [SELECTION_CHANGED]
     description: "Multi-column row-based collection view"
 
   - id: 19
     name: Tree
     tier: required
     category: collection
+    emits: [SELECTION_CHANGED, EXPANSION_CHANGED]
     description: "Hierarchical outline collection view with expandable nodes"
 
   # Advanced Controls (§7.2, §7.3 SHOULD Tier)
@@ -136,36 +155,42 @@ node_types:
     name: Select
     tier: should
     category: control
+    emits: [SELECTION_CHANGED]
     description: "Choose a single option from a compact dropdown/popup set"
 
   - id: 21
     name: ChoiceGroup
     tier: should
     category: control
+    emits: [SELECTION_CHANGED]
     description: "Mutually exclusive visible choices (e.g. radio button group, segmented control)"
 
   - id: 22
     name: Slider
     tier: should
     category: control
+    emits: [VALUE_CHANGED]
     description: "Continuous or stepped numeric value selection from a range"
 
   - id: 23
     name: NumberInput
     tier: should
     category: control
+    emits: [VALUE_CHANGED]
     description: "Editable numeric value with constraints, step increments, and optional stepper"
 
   - id: 24
     name: Tabs
     tier: should
     category: container
+    emits: [SELECTION_CHANGED]
     description: "Mutually exclusive page container with tab strip"
 
   - id: 25
     name: Split
     tier: should
     category: container
+    emits: [VALUE_CHANGED]
     description: "User-resizable pane division container"
 
   # Shell / Command Strips (§7.2, §7.3 Deferred Tier)
@@ -173,12 +198,14 @@ node_types:
     name: Menu
     tier: deferred
     category: shell
+    emits: [ACTIVATE]
     description: "Command and action menu hierarchy"
 
   - id: 27
     name: Toolbar
     tier: deferred
     category: shell
+    emits: [ACTIVATE]
     description: "Primary window or application command strip"
 
 properties:

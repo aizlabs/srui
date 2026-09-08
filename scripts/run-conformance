@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""
+SRUI conformance suite runner (§32).
+
+Runs the twelve §32 conformance suites declared in
+protocol/conformance-vectors/suites/manifest.json against the Rust and Swift implementations and
+prints a pass/fail/gap table.
+
+    scripts/run-conformance                      # every suite, both implementations
+    scripts/run-conformance --suite 8            # one suite by id
+    scripts/run-conformance --suite reconnect    # one suite by slug
+    scripts/run-conformance --implementation rust    # Linux-viable subset
+    scripts/run-conformance --implementation swift
+
+Exit status:
+
+    0  every executable suite passed and only declared gaps remain
+    1  a suite failed, a runner was missing, the manifest was malformed, or a declared gap
+       turned out to be closed (which requires a manifest update, not a silent pass)
+
+Commands come from the manifest as argument arrays and are executed without a shell, so nothing
+in the manifest is shell-evaluated.
+
+A full Rust+Swift run requires macOS: RendererAppKit cannot build on Linux. `--implementation
+rust` is the Linux CI mode.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MANIFEST_PATH = REPO_ROOT / "protocol/conformance-vectors/suites/manifest.json"
+EXPECTED_SUITE_COUNT = 12
+
+PASS, FAIL, GAP, SKIP = "PASS", "FAIL", "GAP", "SKIP"
+
+
+class ManifestError(Exception):
+    """The manifest is malformed; conformance cannot be evaluated."""
+
+
+def load_manifest() -> dict:
+    if not MANIFEST_PATH.exists():
+        raise ManifestError(f"conformance manifest not found: {MANIFEST_PATH}")
+    try:
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ManifestError(f"conformance manifest is not valid JSON: {exc}") from exc
+
+    suites = manifest.get("suites")
+    if not isinstance(suites, list):
+        raise ManifestError("manifest 'suites' must be a list")
+    if len(suites) != EXPECTED_SUITE_COUNT:
+        raise ManifestError(
+            f"§32 defines exactly {EXPECTED_SUITE_COUNT} suites, manifest declares {len(suites)}"
+        )
+
+    ids = [s.get("id") for s in suites]
+    if sorted(ids) != list(range(1, EXPECTED_SUITE_COUNT + 1)):
+        raise ManifestError(f"suite ids must be exactly 1..{EXPECTED_SUITE_COUNT}, got {ids}")
+    slugs = [s.get("slug") for s in suites]
+    if len(set(slugs)) != len(slugs):
+        raise ManifestError(f"suite slugs must be unique, got {slugs}")
+
+    for suite in suites:
+        status = suite.get("status")
+        if status not in {"active", "known_gap"}:
+            raise ManifestError(f"suite {suite.get('id')} has invalid status {status!r}")
+        for gap in suite.get("gaps", []):
+            missing = {"scenario", "reason", "future_task"} - set(gap)
+            if missing:
+                raise ManifestError(
+                    f"suite {suite.get('id')} has a gap missing {sorted(missing)}; every gap "
+                    "must be documented with a reason and an owning task"
+                )
+        if status == "known_gap" and not suite.get("gaps"):
+            raise ManifestError(
+                f"suite {suite.get('id')} is marked known_gap but documents no gap"
+            )
+        # Declared vector directories must exist, or the suite is silently absent.
+        vectors = suite.get("vectors")
+        if vectors:
+            directory = REPO_ROOT / "protocol/conformance-vectors" / vectors["dir"]
+            if not directory.is_dir():
+                raise ManifestError(
+                    f"suite {suite.get('id')} declares vector dir {vectors['dir']} which does not exist"
+                )
+            for generated in vectors.get("generated", []):
+                if not (directory / generated).is_file():
+                    raise ManifestError(
+                        f"suite {suite.get('id')} declares generated fixture {generated} "
+                        "which does not exist; run ./protocol/generate_proto.sh"
+                    )
+
+    return manifest
+
+
+def check_gap_probes(suite: dict) -> list[str]:
+    """Returns descriptions of gaps that appear to have been closed.
+
+    A gap that quietly starts passing is as much a manifest bug as one that regresses: suite 11
+    would otherwise stay labelled GAP forever after Task 35 lands. Probes are negative — a match
+    means the missing capability now exists.
+    """
+    closed = []
+    for gap in suite.get("gaps", []):
+        probe = gap.get("gap_probe")
+        if not probe:
+            continue
+        target = REPO_ROOT / probe["file"]
+        if not target.exists():
+            continue
+        if re.search(probe["absent_pattern"], target.read_text(encoding="utf-8")):
+            closed.append(
+                f"{gap['scenario']} — {probe.get('explanation', 'gap probe matched')}"
+            )
+    return closed
+
+
+def run_command(command: list[str]) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            command, cwd=REPO_ROOT, capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        return False, f"runner not found: {command[0]}"
+    if completed.returncode != 0:
+        tail = (completed.stdout + completed.stderr).strip().splitlines()
+        return False, "\n".join(tail[-25:]) if tail else "command failed with no output"
+    return True, ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run the twelve SRUI §32 conformance suites.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--suite", help="suite id (1-12) or slug; default: all")
+    parser.add_argument(
+        "--implementation",
+        choices=["rust", "swift", "both"],
+        default="both",
+        help="which implementation(s) to run; default: both",
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="list the suites and exit without running anything"
+    )
+    args = parser.parse_args()
+
+    try:
+        manifest = load_manifest()
+    except ManifestError as exc:
+        print(f"conformance manifest error: {exc}", file=sys.stderr)
+        return 1
+
+    suites = sorted(manifest["suites"], key=lambda s: s["id"])
+
+    if args.list:
+        for suite in suites:
+            print(f"{suite['id']:>2}  {suite['slug']:<24} {suite['status']:<10} {suite['name']}")
+        return 0
+
+    if args.suite:
+        selector = args.suite.strip()
+        selected = [
+            s for s in suites if str(s["id"]) == selector or s["slug"] == selector
+        ]
+        if not selected:
+            print(
+                f"no suite matches {selector!r}; run --list to see the twelve suites",
+                file=sys.stderr,
+            )
+            return 1
+        suites = selected
+
+    languages = ["rust", "swift"] if args.implementation == "both" else [args.implementation]
+
+    results: list[tuple[int, str, str, str]] = []
+    failures: list[str] = []
+    exit_code = 0
+
+    for suite in suites:
+        # A closed gap is a manifest bug, whatever the suite's commands do.
+        for closed in check_gap_probes(suite):
+            failures.append(f"suite {suite['id']} ({suite['slug']}): gap appears closed — {closed}")
+            exit_code = 1
+
+        commands = [(lang, cmd) for lang in languages for cmd in suite.get(lang, [])]
+
+        if not commands:
+            if suite["status"] == "known_gap":
+                owner = suite["gaps"][0]["future_task"]
+                results.append((suite["id"], suite["slug"], GAP, f"awaiting {owner}"))
+            else:
+                results.append(
+                    (suite["id"], suite["slug"], SKIP, f"no {'/'.join(languages)} runner declared")
+                )
+            continue
+
+        # No fail-fast: every suite reports, so one failure does not hide the rest.
+        suite_status = PASS
+        notes: list[str] = []
+        for lang, command in commands:
+            ok, detail = run_command(command)
+            if not ok:
+                suite_status = FAIL
+                exit_code = 1
+                notes.append(lang)
+                failures.append(
+                    f"suite {suite['id']} ({suite['slug']}) [{lang}]: {' '.join(command)}\n{detail}"
+                )
+
+        note = ""
+        if suite_status == PASS:
+            declared = len(suite.get("gaps", []))
+            note = f"{len(commands)} runner(s)" + (
+                f", {declared} documented gap(s)" if declared else ""
+            )
+        else:
+            note = "failed: " + ", ".join(sorted(set(notes)))
+        results.append((suite["id"], suite["slug"], suite_status, note))
+
+    print()
+    print(f"SRUI §32 conformance — {args.implementation}")
+    print("=" * 78)
+    print(f"{'#':>2}  {'suite':<24} {'result':<7} notes")
+    print("-" * 78)
+    for suite_id, slug, status, note in results:
+        print(f"{suite_id:>2}  {slug:<24} {status:<7} {note}")
+    print("=" * 78)
+
+    counts = {status: sum(1 for r in results if r[2] == status) for status in (PASS, FAIL, GAP, SKIP)}
+    print(
+        f"{counts[PASS]} passed, {counts[FAIL]} failed, "
+        f"{counts[GAP]} documented gap(s), {counts[SKIP]} skipped"
+    )
+
+    if failures:
+        print()
+        print("Failures")
+        print("-" * 78)
+        for failure in failures:
+            print(failure)
+            print()
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

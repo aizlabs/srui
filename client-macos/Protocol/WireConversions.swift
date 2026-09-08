@@ -571,13 +571,10 @@ extension Transaction {
 // MARK: - Event <-> SRUIEvent
 
 /// Validates the opaque event identifier before it can become a retained deduplication key.
-func validateEventIDLength(
-    _ eventID: Data,
-    maximumBytes: Int = defaultMaxEventIDBytes
-) throws {
-    guard maximumBytes > 0, eventID.count <= maximumBytes else {
+func validateEventIDLength(_ eventID: Data) throws {
+    guard eventID.count <= maxEventIDBytes else {
         throw ProtocolDecodeError.eventIDSizeLimitExceeded(
-            limit: maximumBytes,
+            limit: maxEventIDBytes,
             actual: eventID.count
         )
     }
@@ -601,31 +598,7 @@ func decodeEventEditSequence(_ rawValue: UInt64, eventType: TypeRef) throws -> E
 
 extension Event {
     public init(wire: SRUIEvent) throws {
-        try validateEventIDLength(wire.eventID)
-        let clientInstanceId = wire.clientInstanceID.isEmpty ? nil : ClientInstanceId(wire.clientInstanceID)
-        guard wire.hasEventType else {
-            throw ProtocolDecodeError.missingField("Event.eventType")
-        }
-        let eventType = TypeRef(wire: wire.eventType)
-        let editSeq = try decodeEventEditSequence(wire.editSeq, eventType: eventType)
-
-        var args: [PropertyRef: Value] = [:]
-        args.reserveCapacity(wire.arguments.count)
-        for p in wire.arguments {
-            let prop = try Property(wire: p)
-            args[prop.property] = prop.value
-        }
-
-        self.init(
-            clientInstanceId: clientInstanceId,
-            eventSeq: wire.eventSeq,
-            eventId: EventId(wire.eventID),
-            observedRevision: Revision(wire.observedRevision),
-            nodeId: NodeId(wire.nodeID),
-            eventType: eventType,
-            arguments: args,
-            editSeq: editSeq
-        )
+        self = try ProtocolDecoder().validateAndConvertEvent(wire: wire)
     }
 
     public func toWire() -> SRUIEvent {

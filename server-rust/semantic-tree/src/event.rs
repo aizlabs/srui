@@ -23,15 +23,55 @@ use std::collections::HashMap;
 use std::fmt;
 use std::num::NonZeroU64;
 
-/// Default maximum encoded event identifier length (§7.7, §18.2, §26).
-pub const DEFAULT_MAX_EVENT_ID_BYTES: usize = 64;
+/// Protocol-wide maximum encoded event identifier length (§7.7, §18.2, §26).
+pub const MAX_EVENT_ID_BYTES: usize = 64;
+
+/// A peer supplied an event identifier that cannot be retained safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventIdLengthError {
+    actual: usize,
+}
+
+impl EventIdLengthError {
+    #[must_use]
+    pub const fn actual(self) -> usize {
+        self.actual
+    }
+
+    #[must_use]
+    pub const fn limit(self) -> usize {
+        MAX_EVENT_ID_BYTES
+    }
+}
+
+impl fmt::Display for EventIdLengthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "event_id is {} bytes; at most {} are accepted (§26)",
+            self.actual, MAX_EVENT_ID_BYTES
+        )
+    }
+}
+
+impl std::error::Error for EventIdLengthError {}
 
 /// Globally unique event identifier for deduplication and retry-safety (§7.7, §16, §18.2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EventId(pub Vec<u8>);
 
 impl EventId {
-    /// Constructs a new `EventId` from a raw byte vector.
+    /// Constructs an event identifier at a wire boundary, enforcing the protocol-wide bound.
+    pub fn try_new(bytes: Vec<u8>) -> Result<Self, EventIdLengthError> {
+        if bytes.len() > MAX_EVENT_ID_BYTES {
+            return Err(EventIdLengthError {
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Constructs a trusted in-process `EventId` from a raw byte vector.
     pub const fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }

@@ -1918,15 +1918,18 @@ maximum terminal escape payload lengths
 `maximum update rate` is enforced per session with a token bucket: 120 semantic transactions per
 second sustained, with a 240-transaction burst capacity. These are the default limits and MAY be
 locally configurable, but implementations MUST enforce finite bounds. When the bucket is
-exhausted, the receiver MUST apply backpressure or fail explicitly; it MUST NOT silently discard
-transactions. This default is high enough for ordinary semantic UI traffic and admits short
+exhausted, the reference client pauses transaction ingress and withholds transport acknowledgement,
+propagating backpressure without discarding live traffic or a legitimate journal replay. This
+default is high enough for ordinary semantic UI traffic and admits short
 legitimate bursts, while preserving the invariant that protocol traffic does not scale with
 display refresh rate (§12.2, §31.3). It should be revised only if benchmarks demonstrate that
 legitimate workloads exceed it.
 
-`event_id` values are opaque retry/deduplication keys with a default maximum encoded length of 64
-bytes. Implementations MAY configure a smaller or larger ceiling, but MUST retain a finite positive
-bound and reject an oversized identifier before it can consume deduplication state. Sixty-four bytes
+`event_id` values are opaque retry/deduplication keys with a protocol-wide maximum encoded length
+of 64 bytes in the reference implementation. Every wire-to-domain conversion MUST enforce the same
+bound. An oversized identifier is settled as a rejected event and acknowledged so it cannot create
+a reconnect/retry loop; only a bounded internal rejection identity may enter deduplication state.
+Sixty-four bytes
 comfortably holds UUIDs and comparable cryptographic identifiers while preventing attacker-chosen
 keys from turning the bounded event window into disproportionate memory retention.
 
@@ -2005,10 +2008,10 @@ srui/
 ├── server-rust/
 │   ├── ssh-bridge/
 │   ├── sessiond/
+│   ├── sessiond/
+│   ├── unix-security/          # shared Unix socket ownership, mode, and peer checks
 │   ├── semantic-tree/
 │   ├── journal/
-│   ├── event-dedupe/
-│   ├── resources/
 │   ├── pty/
 │   ├── sdk/
 │   └── examples/

@@ -17,46 +17,50 @@ private actor TransactionRateFailureLog {
         messages.append(failure.description)
     }
 
-    func contains(_ fragment: String) -> Bool {
-        messages.contains { $0.contains(fragment) }
+    var isEmpty: Bool {
+        messages.isEmpty
     }
 }
 
 @Suite("Transaction rate security limits")
 struct TransactionRateLimiterTests {
-    @Test("Default bucket admits 240 transaction burst and rejects the next")
+    @Test("Default bucket admits 240 transaction burst then requests backpressure")
     func defaultBurstBoundary() {
         var limiter = TransactionRateLimiter()
         for _ in 0..<TransactionRateLimits.defaultBurstCapacity {
-            let admitted = limiter.admit(atUptimeNanoseconds: 10)
-            #expect(admitted)
+            #expect(limiter.admission(atUptimeNanoseconds: 10) == .admitted)
         }
-        let overBurst = limiter.admit(atUptimeNanoseconds: 10)
-        #expect(!overBurst)
+        let overBurst = limiter.admission(atUptimeNanoseconds: 10)
+        guard case .wait(let nanoseconds) = overBurst else {
+            Issue.record("Expected ingress delay after burst exhaustion")
+            return
+        }
+        #expect(nanoseconds > 0)
     }
 
     @Test("Default bucket refills at 120 transactions per second and stays bounded")
     func sustainedRefillAndCapacity() {
         var limiter = TransactionRateLimiter()
         for _ in 0..<TransactionRateLimits.defaultBurstCapacity {
-            let admitted = limiter.admit(atUptimeNanoseconds: 0)
-            #expect(admitted)
+            #expect(limiter.admission(atUptimeNanoseconds: 0) == .admitted)
         }
 
         for _ in 0..<TransactionRateLimits.defaultSustainedTransactionsPerSecond {
-            let admitted = limiter.admit(atUptimeNanoseconds: 1_000_000_000)
-            #expect(admitted)
+            #expect(limiter.admission(atUptimeNanoseconds: 1_000_000_000) == .admitted)
         }
-        let overSustained = limiter.admit(atUptimeNanoseconds: 1_000_000_000)
-        #expect(!overSustained)
+        guard case .wait = limiter.admission(atUptimeNanoseconds: 1_000_000_000) else {
+            Issue.record("Expected ingress delay after sustained credit was consumed")
+            return
+        }
 
         // A very long idle interval saturates at burst capacity without arithmetic overflow.
         for _ in 0..<TransactionRateLimits.defaultBurstCapacity {
-            let admitted = limiter.admit(atUptimeNanoseconds: UInt64.max)
-            #expect(admitted)
+            #expect(limiter.admission(atUptimeNanoseconds: UInt64.max) == .admitted)
         }
-        let overRefilledBurst = limiter.admit(atUptimeNanoseconds: UInt64.max)
-        #expect(!overRefilledBurst)
+        guard case .wait = limiter.admission(atUptimeNanoseconds: UInt64.max) else {
+            Issue.record("Expected a bounded bucket after long-idle refill")
+            return
+        }
     }
 
     @Test("Invalid local rate configurations fail closed")
@@ -75,18 +79,19 @@ struct TransactionRateLimiterTests {
         ) == nil)
     }
 
-    @Test("Controller reports update-rate exhaustion and leaves the excess transaction unapplied")
-    func controllerFailsExplicitly() async throws {
+    @Test("A 241-transaction same-session replay is backpressured, not failed")
+    func journalReplayBeyondBurstCompletes() async throws {
+        let outbox = EventOutbox()
+        let seedBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "rate-limit-resume", binding: seedBinding))
+
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
-        let configuredLimits = try #require(TransactionRateLimits(
-            sustainedTransactionsPerSecond: 1,
-            burstCapacity: 1
-        ))
         let applier = TransactionApplier()
         let controller = SessionController(
             transport: clientTransport,
             applier: applier,
-            transactionRateLimits: configuredLimits
+            outbox: outbox,
+            sessionId: "rate-limit-resume"
         )
         let failures = TransactionRateFailureLog()
         controller.onFailure = { failure in
@@ -95,53 +100,56 @@ struct TransactionRateLimiterTests {
 
         try await controller.start()
 
-        var welcome = SRUIServerWelcome()
-        welcome.coreVersion = SRUICoreVersion
-        welcome.sessionID = "rate-limit-test"
-        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
-        var welcomeEnvelope = SRUIMessage()
-        welcomeEnvelope.serverWelcome = welcome
-        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeEnvelope))
+        var resumeOK = SRUIServerResumeOk()
+        resumeOK.sessionID = "rate-limit-resume"
+        resumeOK.replayFromRevision = 0
+        var resumeEnvelope = SRUIMessage()
+        resumeEnvelope.serverResumeOk = resumeOK
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeEnvelope))
 
-        for _ in 0..<200 where !controller.isHandshakeComplete {
-            try await Task.sleep(for: .milliseconds(10))
+        try await AsyncTestSupport.eventually(description: "resume handshake completes") {
+            controller.isHandshakeComplete
         }
-        #expect(controller.isHandshakeComplete)
 
-        let first = Transaction(
-            baseRevision: .initial,
-            newRevision: Revision(1),
-            operations: [.createNode(id: NodeId(1), nodeType: .surface)]
-        )
-        let excess = Transaction(
-            baseRevision: Revision(1),
-            newRevision: Revision(2),
-            operations: [
-                .setProperty(
-                    id: NodeId(1),
-                    property: .label,
-                    value: .string("must not apply")
-                ),
-            ]
-        )
-        var firstEnvelope = SRUIMessage()
-        firstEnvelope.transaction = first.toWire()
-        var excessEnvelope = SRUIMessage()
-        excessEnvelope.transaction = excess.toWire()
-        var combined = try SRUIFraming.encodeFramed(firstEnvelope)
-        combined.append(try SRUIFraming.encodeFramed(excessEnvelope))
-        try await serverTransport.send(data: combined)
-
-        for _ in 0..<200 {
-            if await failures.contains("Maximum semantic transaction update rate exceeded") {
-                break
+        var replay = Data()
+        for revision in 1...241 {
+            let transaction: Transaction
+            if revision == 1 {
+                transaction = Transaction(
+                    baseRevision: .initial,
+                    newRevision: Revision(1),
+                    operations: [.createNode(id: NodeId(1), nodeType: .surface)]
+                )
+            } else {
+                transaction = Transaction(
+                    baseRevision: Revision(UInt64(revision - 1)),
+                    newRevision: Revision(UInt64(revision)),
+                    operations: [
+                        .setProperty(
+                            id: NodeId(1),
+                            property: .label,
+                            value: .string("revision-\(revision)")
+                        ),
+                    ]
+                )
             }
-            try await Task.sleep(for: .milliseconds(10))
+            var envelope = SRUIMessage()
+            envelope.transaction = transaction.toWire()
+            replay.append(try SRUIFraming.encodeFramed(envelope))
         }
+        try await serverTransport.send(data: replay)
 
-        #expect(await failures.contains("1/s sustained, 1 burst"))
-        #expect(applier.lastAppliedRevision == Revision(1))
-        #expect(applier.store.node(for: NodeId(1))?.getProperty(.label) == nil)
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(3),
+            description: "all 241 replay transactions apply through ingress backpressure"
+        ) {
+            applier.lastAppliedRevision == Revision(241)
+        }
+        #expect(await failures.isEmpty)
+        #expect(
+            applier.store.node(for: NodeId(1))?.getProperty(.label)
+                == .string("revision-241")
+        )
 
         await controller.stop()
         await serverTransport.close()

@@ -2,9 +2,10 @@
 // TransactionRateLimiter.swift
 // Session
 //
-// Per-session semantic transaction rate enforcement (§12.2, §26).
+// Per-session semantic transaction ingress backpressure (§12.2, §26).
 //
 
+import Dispatch
 import Foundation
 
 /// Finite local policy for semantic transaction admission (§26).
@@ -20,8 +21,8 @@ public struct TransactionRateLimits: Equatable, Sendable {
     public let sustainedTransactionsPerSecond: UInt64
     public let burstCapacity: UInt64
 
-    /// Returns nil for zero or unrepresentably large limits instead of silently disabling or
-    /// weakening the bound.
+    /// Returns nil for zero or unrepresentably large limits instead of silently disabling the
+    /// bound.
     public init?(sustainedTransactionsPerSecond: UInt64, burstCapacity: UInt64) {
         guard sustainedTransactionsPerSecond > 0,
               burstCapacity > 0,
@@ -42,6 +43,11 @@ public struct TransactionRateLimits: Equatable, Sendable {
         self.sustainedTransactionsPerSecond = validatedSustainedTransactionsPerSecond
         self.burstCapacity = burstCapacity
     }
+}
+
+enum TransactionAdmission: Equatable {
+    case admitted
+    case wait(nanoseconds: UInt64)
 }
 
 /// Integer token bucket. Credit is measured in token-nanoseconds so refill remains deterministic
@@ -66,28 +72,62 @@ struct TransactionRateLimiter: Sendable {
         lastRefillUptimeNanoseconds = nil
     }
 
-    mutating func admit(atUptimeNanoseconds now: UInt64) -> Bool {
-        if let previous = lastRefillUptimeNanoseconds, now > previous {
-            let elapsed = now - previous
-            let (refill, refillOverflow) = elapsed.multipliedReportingOverflow(
-                by: limits.sustainedTransactionsPerSecond
-            )
-            let boundedRefill = refillOverflow ? capacityUnits : min(refill, capacityUnits)
-            let (refilled, additionOverflow) = availableUnits.addingReportingOverflow(
-                boundedRefill
-            )
-            availableUnits = additionOverflow ? capacityUnits : min(refilled, capacityUnits)
+    mutating func admission(atUptimeNanoseconds now: UInt64) -> TransactionAdmission {
+        refill(atUptimeNanoseconds: now)
+        guard availableUnits >= Self.unitsPerToken else {
+            let deficit = Self.unitsPerToken - availableUnits
+            let rate = limits.sustainedTransactionsPerSecond
+            return .wait(nanoseconds: (deficit + rate - 1) / rate)
         }
-        if let previous = lastRefillUptimeNanoseconds {
-            if now > previous {
+        availableUnits -= Self.unitsPerToken
+        return .admitted
+    }
+
+    private mutating func refill(atUptimeNanoseconds now: UInt64) {
+        defer {
+            if let previous = lastRefillUptimeNanoseconds {
+                if now > previous {
+                    lastRefillUptimeNanoseconds = now
+                }
+            } else {
                 lastRefillUptimeNanoseconds = now
             }
-        } else {
-            lastRefillUptimeNanoseconds = now
         }
+        guard let previous = lastRefillUptimeNanoseconds, now > previous else { return }
 
-        guard availableUnits >= Self.unitsPerToken else { return false }
-        availableUnits -= Self.unitsPerToken
-        return true
+        let elapsed = now - previous
+        let (refill, refillOverflow) = elapsed.multipliedReportingOverflow(
+            by: limits.sustainedTransactionsPerSecond
+        )
+        let boundedRefill = refillOverflow ? capacityUnits : min(refill, capacityUnits)
+        let (refilled, additionOverflow) = availableUnits.addingReportingOverflow(boundedRefill)
+        availableUnits = additionOverflow ? capacityUnits : min(refilled, capacityUnits)
+    }
+}
+
+/// Session-owned ingress gate. Waiting here keeps transport acknowledgement withheld, propagating
+/// backpressure to both live traffic and journal replay without silently dropping either.
+actor TransactionIngressGate {
+    private var limiter: TransactionRateLimiter
+
+    init(limits: TransactionRateLimits = .standard) {
+        self.limiter = TransactionRateLimiter(limits: limits)
+    }
+
+    func reset() {
+        limiter.reset()
+    }
+
+    func waitForAdmission() async throws {
+        while true {
+            switch limiter.admission(
+                atUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+            ) {
+            case .admitted:
+                return
+            case .wait(let nanoseconds):
+                try await Task.sleep(for: .nanoseconds(Int64(nanoseconds)))
+            }
+        }
     }
 }

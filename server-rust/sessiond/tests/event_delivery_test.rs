@@ -700,11 +700,17 @@ async fn malformed_events_are_rejected_without_tearing_down_the_connection() {
             value: Some(srui_protocol::Value { value: None }),
         });
 
+    let mut oversized_event_id = Event::activate(5, "placeholder", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    oversized_event_id.event_id = vec![0x41; srui_semantic_tree::MAX_EVENT_ID_BYTES + 1];
+
     let malformed = [
         missing_event_type,
         missing_edit_seq,
         unexpected_edit_seq,
         undecodable_argument,
+        oversized_event_id,
     ];
     for (index, event) in malformed.iter().enumerate() {
         client_write
@@ -739,7 +745,7 @@ async fn malformed_events_are_rejected_without_tearing_down_the_connection() {
     send_activate(
         &mut client_write,
         CLIENT_A,
-        5,
+        6,
         "valid-after-malformed",
         1,
         btn,
@@ -747,7 +753,7 @@ async fn malformed_events_are_rejected_without_tearing_down_the_connection() {
     .await;
     let ack = recv_event_ack(&mut client_read).await;
     assert_eq!(ack.status(), EventAckStatus::Processed);
-    assert_eq!(ack.last_processed_event_seq, 5);
+    assert_eq!(ack.last_processed_event_seq, 6);
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
 
     assert_connection_survived(client_write, client_read, server_task).await;

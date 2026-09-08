@@ -13,12 +13,12 @@ use srui_sdk::UiTransaction;
 use srui_semantic_tree::{
     AuthoritativeCommit, ClientInstanceId, EditSeq, Event as DomainEvent, EventId,
     EventValidationError, NodeId, PropertyRef, Revision, SemanticStore, StandardValidationState,
-    StoreError, TypeRef, Value,
+    StoreError, TypeRef, Value, MAX_EVENT_ID_BYTES,
 };
 
 use super::{
-    bound_diagnostic_string, lock_or_recover, panic_payload_message, EventOutcome,
-    HandlerDispatchKind, HandlerFn, Session, SessionError, SessionInner,
+    bound_diagnostic_string, lock_or_recover, oversized_event_dedupe_id, panic_payload_message,
+    EventOutcome, HandlerDispatchKind, HandlerFn, Session, SessionError, SessionInner,
 };
 
 /// Default cap on tracked `(client_instance_id, node_id)` editor streams (§26).
@@ -710,10 +710,21 @@ impl Session {
         let mut discarded = Vec::with_capacity(refs.len());
         for validated in refs {
             let reference = validated.reference;
+            let event_id = if reference.event_id.len() > MAX_EVENT_ID_BYTES {
+                tracing::warn!(
+                    event_seq = reference.event_seq,
+                    actual = reference.event_id.len(),
+                    limit = MAX_EVENT_ID_BYTES,
+                    "settling oversized pending TEXT_EDIT event_id through a bounded identity"
+                );
+                oversized_event_dedupe_id(reference.event_seq)
+            } else {
+                reference.event_id.clone()
+            };
             let placeholder = WireEvent {
                 client_instance_id: client_instance_id.to_vec(),
                 event_seq: reference.event_seq,
-                event_id: reference.event_id.clone(),
+                event_id,
                 node_id: reference.node_id,
                 event_type: Some(TypeRef::EVENT_TEXT_EDIT.into()),
                 edit_seq: validated.edit_seq.get(),

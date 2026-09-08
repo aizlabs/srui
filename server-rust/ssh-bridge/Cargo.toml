@@ -10,7 +10,7 @@ tokio-util = { workspace = true }
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-libc = "0.2"
+srui-unix-security = { path = "../unix-security" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }

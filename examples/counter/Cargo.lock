@@ -844,6 +844,7 @@ dependencies = [
  "srui-sdk",
  "srui-semantic-tree",
  "srui-sessiond",
+ "srui-unix-security",
  "tokio",
  "tokio-util",
  "tracing",
@@ -930,11 +931,19 @@ dependencies = [
  "srui-resources",
  "srui-sdk",
  "srui-semantic-tree",
+ "srui-unix-security",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "srui-unix-security"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

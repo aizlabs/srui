@@ -19,6 +19,7 @@ srui-journal = { path = "../journal" }
 srui-event-dedupe = { path = "../event-dedupe" }
 srui-resources = { path = "../resources" }
 srui-pty = { path = "../pty" }
+srui-unix-security = { path = "../unix-security" }
 getrandom = "0.4"
 
 [target.'cfg(unix)'.dependencies]

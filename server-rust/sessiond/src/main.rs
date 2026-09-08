@@ -3,8 +3,6 @@
 //! Per-user persistent session daemon (§20.2).
 //! Manages durable UI state across transient SSH bridge connections.
 
-mod unix_security;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -13,10 +11,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use srui_sessiond::{handle_connection, Session, SessionConfig};
-use unix_security::{
+use srui_unix_security::{
     default_socket_path as private_default_socket_path, effective_uid,
-    prepare_private_socket_parent, require_unprivileged_uid, validate_peer,
-    validate_private_socket,
+    prepare_private_socket_parent, require_unprivileged_uid, secure_bound_socket, validate_peer,
 };
 /// Ignores `SIGHUP` so SSH session detach / controlling-terminal loss does not terminate
 /// the daemon (§17, §20.2). Omitting a handler leaves the default disposition, which kills
@@ -360,7 +357,7 @@ async fn bind_owned_socket(path: &std::path::Path) -> std::io::Result<(UnixListe
     let bind_result = UnixListener::bind(path);
     unsafe { libc::umask(previous_umask) };
     let listener = bind_result?;
-    validate_private_socket(path, uid)?;
+    secure_bound_socket(path, uid)?;
 
     let identity = socket_identity(path)?.ok_or_else(|| {
         std::io::Error::other(format!(
@@ -394,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting srui-sessiond daemon (§20.2)...");
 
     let daemon_uid = effective_uid();
-    require_unprivileged_uid(daemon_uid)?;
+    require_unprivileged_uid(daemon_uid, "srui-sessiond")?;
 
     let config = parse_args().map_err(|message| {
         error!("{message}");

@@ -22,8 +22,8 @@ import SemanticModel
 public typealias Operation = SemanticModel.StoreOperation
 
 // MARK: - Protocol Decode Error (§16, §26)
-/// Default maximum encoded event identifier length (§7.7, §18.2, §26).
-public let defaultMaxEventIDBytes = 64
+/// Protocol-wide maximum encoded event identifier length (§7.7, §18.2, §26).
+public let maxEventIDBytes = 64
 
 /// Typed errors returned during wire decoding and §26 safety limits validation (§16, §26).
 public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvertible {
@@ -49,7 +49,7 @@ public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvert
     case maxRecordPropertiesExceeded(limit: Int, actual: Int)
     /// Model operation items count exceeds allowable limit (§26).
     case maxItemsPerModelOperationExceeded(limit: Int, actual: Int)
-    /// Event identifier byte length exceeds the configured limit (§26).
+    /// Event identifier byte length exceeds the protocol-wide limit (§26).
     case eventIDSizeLimitExceeded(limit: Int, actual: Int)
     /// Resource hash byte length is invalid (expected 32 bytes).
     case invalidResourceHashLength(Int)
@@ -123,18 +123,13 @@ public struct ProtocolDecoder: Sendable {
     public var limits: StoreLimits
     /// Maximum allowed wire frame size in bytes (§26).
     public var maxFrameSize: Int
-    /// Maximum encoded event identifier length in bytes (§26).
-    public var maxEventIDBytes: Int
-
     /// Constructs a `ProtocolDecoder` with the specified limits.
     public init(
         limits: StoreLimits = StoreLimits(),
-        maxFrameSize: Int = defaultMaxFrameSize,
-        maxEventIDBytes: Int = defaultMaxEventIDBytes
+        maxFrameSize: Int = defaultMaxFrameSize
     ) {
         self.limits = limits
         self.maxFrameSize = maxFrameSize
-        self.maxEventIDBytes = maxEventIDBytes
     }
 
     // MARK: - Decode Operations (§16, §26)
@@ -460,7 +455,7 @@ public struct ProtocolDecoder: Sendable {
     }
 
     public func validateAndConvertEvent(wire: SRUIEvent) throws -> Event {
-        try validateEventIDLength(wire.eventID, maximumBytes: maxEventIDBytes)
+        try validateEventIDLength(wire.eventID)
         let clientInstanceId = wire.clientInstanceID.isEmpty ? nil : ClientInstanceId(wire.clientInstanceID)
         guard wire.hasEventType else {
             throw ProtocolDecodeError.missingField("Event.eventType")

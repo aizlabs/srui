@@ -33,7 +33,8 @@ pub use capability::{
 };
 
 pub use event::{
-    ClientInstanceId, EditSeq, Event, EventId, EventValidationError, DEFAULT_MAX_EVENT_ID_BYTES,
+    ClientInstanceId, EditSeq, Event, EventId, EventIdLengthError, EventValidationError,
+    MAX_EVENT_ID_BYTES,
 };
 pub use ids::{
     lookup_standard_enum, lookup_standard_enum_value, lookup_standard_event,

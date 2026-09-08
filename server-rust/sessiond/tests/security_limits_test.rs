@@ -1,51 +1,67 @@
-//! Task 32 server-side event identifier limits (§26).
+//! Task 32 server-side event identifier limits (§18.2, §26).
 
 use srui_protocol::Event;
-use srui_semantic_tree::DEFAULT_MAX_EVENT_ID_BYTES;
-use srui_sessiond::{Session, SessionConfig, SessionError};
+use srui_semantic_tree::{Event as DomainEvent, WireError, MAX_EVENT_ID_BYTES};
+use srui_sessiond::{EventOutcome, Session};
 
-#[test]
-fn oversized_event_id_is_rejected_before_deduplication_or_dispatch() {
-    let session = Session::new("event-id-limit");
-    let event = Event {
-        event_id: vec![0x41; DEFAULT_MAX_EVENT_ID_BYTES + 1],
+fn event(sequence: u64, event_id: Vec<u8>) -> Event {
+    Event {
+        client_instance_id: b"event-limit-client".to_vec(),
+        event_seq: sequence,
+        event_id,
         ..Event::default()
-    };
-
-    let error = session
-        .process_event(&event)
-        .expect_err("oversized event id must fail closed");
-    assert!(matches!(error, SessionError::InvalidInput(_)));
-    assert!(error.to_string().contains("event_id"));
+    }
 }
 
 #[test]
-fn event_id_limit_is_locally_configurable_but_must_remain_finite() {
-    let session = Session::with_config(
-        "tight-event-id-limit",
-        SessionConfig {
-            max_event_id_bytes: 4,
-            ..SessionConfig::default()
-        },
-    );
-    let event = Event {
-        event_id: vec![0x41; 5],
-        ..Event::default()
-    };
+fn wire_conversion_refuses_oversized_event_id_before_domain_construction() {
+    let error = DomainEvent::try_from(event(1, vec![0x41; MAX_EVENT_ID_BYTES + 1]))
+        .expect_err("oversized event id must not construct a domain EventId");
     assert!(matches!(
-        session.process_event(&event),
-        Err(SessionError::InvalidInput(_))
+        error,
+        WireError::EventIdTooLong {
+            actual,
+            limit: MAX_EVENT_ID_BYTES
+        } if actual == MAX_EVENT_ID_BYTES + 1
     ));
 }
 
 #[test]
-#[should_panic(expected = "max_event_id_bytes must be a positive integer")]
-fn zero_event_id_limit_is_rejected_at_construction() {
-    let _ = Session::with_config(
-        "invalid-event-id-limit",
-        SessionConfig {
-            max_event_id_bytes: 0,
-            ..SessionConfig::default()
-        },
-    );
+fn oversized_event_id_is_settled_as_rejected_without_blocking_the_frontier() {
+    let session = Session::new("event-id-limit");
+    let oversized = event(1, vec![0x41; MAX_EVENT_ID_BYTES + 1]);
+
+    let rejected = session
+        .process_event(&oversized)
+        .expect("oversized event is a settled validation rejection");
+    assert!(matches!(
+        rejected,
+        EventOutcome::Rejected {
+            last_processed_event_seq: 1,
+            ..
+        }
+    ));
+
+    let later = session
+        .process_event(&event(2, b"bounded-id".to_vec()))
+        .expect("later bounded event remains processable");
+    assert!(matches!(
+        later,
+        EventOutcome::Rejected {
+            last_processed_event_seq: 2,
+            ..
+        }
+    ));
+
+    let replay = session
+        .process_event(&oversized)
+        .expect("replayed oversized event returns its settled outcome");
+    assert!(matches!(
+        replay,
+        EventOutcome::Duplicate {
+            accepted: false,
+            last_processed_event_seq: 2,
+            ..
+        }
+    ));
 }

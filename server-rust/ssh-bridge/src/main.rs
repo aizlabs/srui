@@ -2,15 +2,13 @@
 //!
 //! Ephemeral proxy invoked by SSH subsystem to forward standard I/O to `srui-sessiond` (§20.1).
 
-mod unix_security;
-
 use std::path::PathBuf;
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use srui_ssh_bridge::bridge_streams;
-use unix_security::{
+use srui_unix_security::{
     default_socket_path as private_default_socket_path, effective_uid, require_unprivileged_uid,
     validate_peer, validate_private_socket,
 };
@@ -48,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting srui-ssh-bridge proxy (§19, §19.1, §20.1)...");
 
     let bridge_uid = effective_uid();
-    require_unprivileged_uid(bridge_uid)?;
+    require_unprivileged_uid(bridge_uid, "srui-ssh-bridge")?;
 
     let socket_path = parse_socket_path().map_err(|message| {
         error!("{message}");

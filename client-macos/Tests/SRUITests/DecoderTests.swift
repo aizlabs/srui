@@ -705,7 +705,7 @@ final class DecoderTests: XCTestCase {
 
     func testOversizedEventIdentifierRejectedByBothSwiftDecoders() throws {
         var wireEvent = SRUIEvent()
-        wireEvent.eventID = Data(repeating: 0x41, count: defaultMaxEventIDBytes + 1)
+        wireEvent.eventID = Data(repeating: 0x41, count: maxEventIDBytes + 1)
         wireEvent.eventType = TypeRef.EVENT_ACTIVATE.toWire()
 
         for decode in [
@@ -717,23 +717,10 @@ final class DecoderTests: XCTestCase {
                     XCTFail("Expected eventIDSizeLimitExceeded, got \(error)")
                     return
                 }
-                XCTAssertEqual(limit, defaultMaxEventIDBytes)
-                XCTAssertEqual(actual, defaultMaxEventIDBytes + 1)
+                XCTAssertEqual(limit, maxEventIDBytes)
+                XCTAssertEqual(actual, maxEventIDBytes + 1)
             }
         }
-    }
-
-    func testEventIdentifierLimitIsConfigurable() throws {
-        var wireEvent = SRUIEvent()
-        wireEvent.eventID = Data(repeating: 0x41, count: 5)
-        wireEvent.eventType = TypeRef.EVENT_ACTIVATE.toWire()
-
-        XCTAssertThrowsError(
-            try ProtocolDecoder(maxEventIDBytes: 4).validateAndConvertEvent(wire: wireEvent)
-        )
-        XCTAssertNoThrow(
-            try ProtocolDecoder(maxEventIDBytes: 5).validateAndConvertEvent(wire: wireEvent)
-        )
     }
 
     // MARK: - Event edit-sequence conformance

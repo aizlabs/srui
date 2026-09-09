@@ -6,5 +6,7 @@ selection, marked-text IME composition, scrolling, hover/pressed feedback, and l
 preparation. It also exercises a 1 MiB/s bandwidth limit, a deterministic lost-frame retry, and a
 controlled interruption.
 
-Every local interaction has a one-frame 16.67 ms reporting target, and the largest latency delta
-relative to zero RTT is reported explicitly.
+Every local interaction is compared with the runtime `display.frame_budget` target: one frame at
+the active display's measured refresh rate (for example, 16.67 ms at 60 Hz or 8.33 ms at 120 Hz),
+with a documented 60 Hz fallback when the host does not report a refresh rate. The largest latency
+delta relative to zero RTT is reported explicitly.

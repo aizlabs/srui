@@ -1,10 +1,36 @@
 name: Benchmarks
 
 on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+    paths:
+      - ".github/workflows/benchmarks.yml"
+      - "benchmarks/rust-driver/**"
+      - "server-rust/**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  rust-driver:
+    name: Rust benchmark driver unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compile and test standalone benchmark driver
+        run: cargo test --locked --manifest-path benchmarks/rust-driver/Cargo.toml
+
+  # Measurements remain opt-in: runner load and display state make hosted PR-run numbers noisy.
   smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
     runs-on: macos-14
     timeout-minutes: 45
     steps:

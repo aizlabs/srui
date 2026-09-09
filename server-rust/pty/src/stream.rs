@@ -70,6 +70,7 @@ pub(crate) struct TerminalStream {
     command_tx: CommandSender,
     child: ChildSlot,
     child_pid: Arc<Mutex<Option<u32>>>,
+    exit_success: Arc<Mutex<Option<bool>>>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     command_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -136,6 +137,7 @@ impl TerminalStream {
             .or(child_pid);
 
         let child_pid = Arc::new(Mutex::new(child_pid));
+        let exit_success = Arc::new(Mutex::new(None));
         let ring = Arc::new(Mutex::new(OutputRing::new(spec.ring_capacity)));
         let (next_offset_watch, _) = watch::channel(0_u64);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
@@ -149,6 +151,7 @@ impl TerminalStream {
             command_tx: Arc::clone(&command_tx),
             child: Arc::clone(&child),
             child_pid: Arc::clone(&child_pid),
+            exit_success: Arc::clone(&exit_success),
             reader_thread: Mutex::new(None),
             command_thread: Mutex::new(None),
         });
@@ -157,6 +160,7 @@ impl TerminalStream {
         let reader_watch = next_offset_watch;
         let reader_child = Arc::clone(&child);
         let reader_child_pid = Arc::clone(&child_pid);
+        let reader_exit_success = Arc::clone(&exit_success);
         let reader = thread::Builder::new()
             .name(format!("srui-pty-read-{}", id.get()))
             .spawn(move || {
@@ -166,6 +170,7 @@ impl TerminalStream {
                     reader_watch,
                     reader_child,
                     reader_child_pid,
+                    reader_exit_success,
                     command_tx,
                 )
             })
@@ -219,6 +224,13 @@ impl TerminalStream {
     pub(crate) fn snapshot_offsets(&self) -> (u64, u64) {
         let ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         (ring.retained_start(), ring.next_offset())
+    }
+
+    pub(crate) fn exit_success(&self) -> Option<bool> {
+        *self
+            .exit_success
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     pub(crate) fn subscribe(
@@ -290,7 +302,12 @@ impl TerminalStream {
             signal_child_tree(pid);
             if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = child.kill();
-                let _ = child.wait();
+                if let Ok(status) = child.wait() {
+                    *self
+                        .exit_success
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(status.success());
+                }
             }
             // Command thread owns the master PTY. Join it first so dropping the master
             // forces EOF/EIO on the reader if any leftover slave holders remain.
@@ -341,6 +358,7 @@ fn read_loop(
     watch: watch::Sender<u64>,
     child: ChildSlot,
     child_pid: Arc<Mutex<Option<u32>>>,
+    exit_success: Arc<Mutex<Option<bool>>>,
     command_tx: CommandSender,
 ) {
     let mut buf = vec![0_u8; PTY_READ_CHUNK];
@@ -361,7 +379,11 @@ fn read_loop(
         }
     }
     if let Some(mut child) = child.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        let _ = child.wait();
+        if let Ok(status) = child.wait() {
+            *exit_success
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(status.success());
+        }
         *child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     // Natural exit: close the command worker so it does not sit on blocking_recv

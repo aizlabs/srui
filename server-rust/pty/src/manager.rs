@@ -208,6 +208,14 @@ impl PTYManager {
             .map(|stream| stream.snapshot_offsets())
     }
 
+    /// Returns the terminal process's exit result once natural EOF has been reaped.
+    ///
+    /// `Ok(None)` means the process is still running. A process terminated by
+    /// [`Self::close`] or [`Self::shutdown`] may report failure.
+    pub fn exit_success(&self, id: NodeId) -> Result<Option<bool>, PTYManagerError> {
+        Ok(self.stream(id)?.exit_success())
+    }
+
     #[cfg(test)]
     pub(crate) fn process_id(&self, id: NodeId) -> Option<u32> {
         self.lock()
@@ -616,15 +624,22 @@ mod tests {
         wait_for_output(&manager, id, b"SRUI_EXIT_OK");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut reaped = false;
+        let mut exit_success = None;
         while std::time::Instant::now() < deadline {
-            if is_child_reaped(pid) {
-                reaped = true;
+            reaped = is_child_reaped(pid);
+            exit_success = manager.exit_success(id).unwrap();
+            if reaped && exit_success.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         manager.close(id).unwrap();
         assert!(reaped, "child {pid} was not reaped by natural exit");
+        assert_eq!(
+            exit_success,
+            Some(true),
+            "natural zero exit must remain observable after reap"
+        );
     }
 
     fn is_child_reaped(pid: u32) -> bool {

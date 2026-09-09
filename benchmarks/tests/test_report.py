@@ -3,13 +3,15 @@ from __future__ import annotations
 import importlib.util
 import json
 import signal
-import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "run.py"
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("benchmark_run", MODULE_PATH)
 assert SPEC and SPEC.loader
 benchmark_run = importlib.util.module_from_spec(SPEC)
@@ -79,10 +81,21 @@ def valid_manifest() -> dict[str, Any]:
         ],
         "verification_commands": [
             {
-                "name": "reconnect",
+                "name": "production reconnect boundary suite",
                 "section": "31.5",
-                "command": ["verify"],
-                "timeout": 10,
+                "command": [
+                    "scripts/run-conformance",
+                    "--suite",
+                    "8",
+                    "--implementation",
+                    "both",
+                ],
+                "timeout": 1200,
+                "required_output": [
+                    "8  reconnect",
+                    "PASS    9 runner(s)",
+                    "1 passed, 0 failed",
+                ],
             }
         ],
     }
@@ -144,6 +157,40 @@ def test_manifest_enforces_driver_declarations() -> None:
         benchmark_run.validate_manifest(manifest)
 
 
+def test_manifest_rejects_substitute_reconnect_command() -> None:
+    manifest = valid_manifest()
+    manifest["verification_commands"][0]["command"] = ["true"]
+    with pytest.raises(
+        benchmark_run.BenchmarkError,
+        match="production suite 8 command",
+    ):
+        benchmark_run.validate_manifest(manifest)
+
+
+def test_zero_exit_without_conformance_contract_fails_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = SimpleNamespace(
+        returncode=0,
+        stdout="",
+        stderr="",
+        child_pid=123,
+    )
+    monkeypatch.setattr(
+        benchmark_run,
+        "run_managed_command",
+        lambda *_args, **_kwargs: result,
+    )
+    monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
+
+    _elapsed, passed, detail = benchmark_run.run_verification(
+        valid_manifest()["verification_commands"][0],
+        default_timeout=1,
+    )
+    assert passed is False
+    assert "missing required output" in detail
+
+
 def test_driver_output_must_match_declared_sections() -> None:
     driver = valid_manifest()["drivers"][0]
     payload = {
@@ -169,105 +216,6 @@ def test_canonical_parity_compares_digest_and_byte_count() -> None:
     )
     assert sections["31.2"]["assertions"][-1]["passed"] is True
     assert "exact bytes" in sections["31.2"]["assertions"][-1]["detail"]
-
-
-class InterruptingProcess:
-    pid = 424242
-
-    def __init__(self, raised: BaseException) -> None:
-        self.raised = raised
-        self.returncode: int | None = None
-        self.communications = 0
-        self.signals: list[int] = []
-
-    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
-        self.communications += 1
-        if self.communications == 1:
-            raise self.raised
-        return "", ""
-
-    def poll(self) -> int | None:
-        return self.returncode
-
-    def send_signal(self, signum: int) -> None:
-        self.signals.append(signum)
-        self.returncode = -signum
-
-
-@pytest.mark.parametrize(
-    "raised",
-    [KeyboardInterrupt(), SystemExit(7), RuntimeError("unexpected")],
-)
-def test_driver_reaps_process_group_after_every_base_exception(
-    monkeypatch: pytest.MonkeyPatch,
-    raised: BaseException,
-    tmp_path: Path,
-) -> None:
-    process = InterruptingProcess(raised)
-    sent: list[int] = []
-
-    monkeypatch.setattr(benchmark_run.subprocess, "Popen", lambda *args, **kwargs: process)
-
-    def killpg(_pid: int, signum: int) -> None:
-        sent.append(signum)
-        process.returncode = -signum
-
-    monkeypatch.setattr(benchmark_run.os, "killpg", killpg)
-    driver = {
-        "name": "rust",
-        "command": ["driver"],
-        "sections": ["31.2", "31.5", "31.6"],
-    }
-    with pytest.raises(type(raised)):
-        benchmark_run.run_driver(driver, tmp_path / "fixture", "smoke", 1)
-    assert sent == [signal.SIGTERM]
-    assert process.communications == 2
-
-
-def test_verification_reaps_process_group_after_base_exception(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    process = InterruptingProcess(RuntimeError("unexpected"))
-    sent: list[int] = []
-    monkeypatch.setattr(benchmark_run.subprocess, "Popen", lambda *args, **kwargs: process)
-
-    def killpg(_pid: int, signum: int) -> None:
-        sent.append(signum)
-        process.returncode = -signum
-
-    monkeypatch.setattr(benchmark_run.os, "killpg", killpg)
-    with pytest.raises(RuntimeError, match="unexpected"):
-        benchmark_run.run_verification({"command": ["verify"]}, 1)
-    assert sent == [signal.SIGTERM]
-    assert process.communications == 2
-
-
-def test_timeout_escalates_to_sigkill(monkeypatch: pytest.MonkeyPatch) -> None:
-    process = InterruptingProcess(subprocess.TimeoutExpired(["driver"], 1))
-    sent: list[int] = []
-
-    def communicate(timeout: float | None = None) -> tuple[str, str]:
-        process.communications += 1
-        if process.communications <= 2:
-            raise subprocess.TimeoutExpired(["driver"], timeout)
-        return "", ""
-
-    process.communicate = communicate  # type: ignore[method-assign]
-    monkeypatch.setattr(benchmark_run.subprocess, "Popen", lambda *args, **kwargs: process)
-
-    def killpg(_pid: int, signum: int) -> None:
-        sent.append(signum)
-        process.returncode = -signum
-
-    monkeypatch.setattr(benchmark_run.os, "killpg", killpg)
-    driver = {
-        "name": "rust",
-        "command": ["driver"],
-        "sections": ["31.2", "31.5", "31.6"],
-    }
-    with pytest.raises(benchmark_run.BenchmarkError, match="timed out"):
-        benchmark_run.run_driver(driver, Path("fixture"), "smoke", 1)
-    assert sent == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_smoke_profile_cannot_record_baseline(
@@ -352,29 +300,6 @@ def test_xctrace_profiles_all_processes() -> None:
     assert "--all-processes" in command
     assert "--launch" not in command
     assert "--notify-tracing-started" in command
-
-
-def test_xctrace_cleanup_escalates_to_sigkill(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    process = InterruptingProcess(subprocess.TimeoutExpired(["xctrace"], 1))
-    sent: list[int] = []
-
-    def communicate(timeout: float | None = None) -> tuple[str, str]:
-        process.communications += 1
-        if process.communications == 1:
-            raise subprocess.TimeoutExpired(["xctrace"], timeout)
-        return "", ""
-
-    process.communicate = communicate  # type: ignore[method-assign]
-
-    def killpg(_pid: int, signum: int) -> None:
-        sent.append(signum)
-        process.returncode = -signum
-
-    monkeypatch.setattr(benchmark_xctrace.os, "killpg", killpg)
-    benchmark_xctrace.terminate_process_group(process, grace_seconds=0.01)
-    assert sent == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_committed_baseline_has_every_required_section() -> None:

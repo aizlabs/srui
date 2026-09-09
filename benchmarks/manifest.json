@@ -20,7 +20,12 @@
       "name": "production reconnect boundary suite",
       "section": "31.5",
       "command": ["scripts/run-conformance", "--suite", "8", "--implementation", "both"],
-      "timeout": 1200
+      "timeout": 1200,
+      "required_output": [
+        "8  reconnect",
+        "PASS    9 runner(s)",
+        "1 passed, 0 failed"
+      ]
     }
   ]
 }

@@ -11,8 +11,8 @@ import json
 import math
 import os
 import platform
+import shutil
 import signal
-import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
+
+from process_control import ManagedCommandError, ManagedCommandTimeout, run_managed_command
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "benchmarks/manifest.json"
@@ -29,6 +31,18 @@ EXPECTED_DRIVER_SECTIONS = {
     "rust": {"31.2", "31.5", "31.6"},
     "macos": {"31.1", "31.3", "31.4", "31.5", "31.6"},
 }
+EXPECTED_RECONNECT_VERIFICATION = {
+    "name": "production reconnect boundary suite",
+    "section": "31.5",
+    "command": ["scripts/run-conformance", "--suite", "8", "--implementation", "both"],
+    "timeout": 1200,
+    "required_output": [
+        "8  reconnect",
+        "PASS    9 runner(s)",
+        "1 passed, 0 failed",
+    ],
+}
+DEFAULT_MIN_FREE_BYTES = 12 * 1024 * 1024 * 1024
 
 
 class BenchmarkError(RuntimeError):
@@ -103,44 +117,37 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     covered = set().union(*(set(driver["sections"]) for driver in manifest["drivers"]))
     if covered != set(EXPECTED_SECTIONS):
         raise BenchmarkError("driver declarations must cover every §31 subsection")
-    if not any(
-        verification["section"] == "31.5"
-        for verification in manifest["verification_commands"]
-    ):
-        raise BenchmarkError("manifest must verify the production reconnect boundary suite")
+    if manifest["verification_commands"] != [EXPECTED_RECONNECT_VERIFICATION]:
+        raise BenchmarkError(
+            "manifest reconnect verification must use the production suite 8 command "
+            "and required PASS contract"
+        )
 
 
-def _signal_process_group(process: subprocess.Popen[str], signum: int) -> None:
+def configured_byte_limit(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
     try:
-        os.killpg(process.pid, signum)
-        return
-    except ProcessLookupError:
-        return
-    except PermissionError:
-        pass
-
-    if process.poll() is None:
-        try:
-            process.send_signal(signum)
-        except ProcessLookupError:
-            pass
+        value = int(raw)
+    except ValueError as error:
+        raise BenchmarkError(f"{name} must be a positive integer byte count") from error
+    if value <= 0:
+        raise BenchmarkError(f"{name} must be a positive integer byte count")
+    return value
 
 
-def terminate_process_group(
-    process: subprocess.Popen[str],
-    grace_seconds: float = 5.0,
-) -> tuple[str, str]:
-    """Terminate and reap a subprocess plus every descendant in its new session."""
-
-    _signal_process_group(process, signal.SIGTERM)
-    try:
-        return process.communicate(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        _signal_process_group(process, signal.SIGKILL)
-        try:
-            return process.communicate(timeout=grace_seconds)
-        except subprocess.TimeoutExpired as error:
-            raise BenchmarkError(f"could not reap process group {process.pid}") from error
+def ensure_free_space(path: Path, minimum_bytes: int | None = None) -> None:
+    required = minimum_bytes or configured_byte_limit(
+        "SRUI_BENCHMARK_MIN_FREE_BYTES",
+        DEFAULT_MIN_FREE_BYTES,
+    )
+    free = shutil.disk_usage(path).free
+    if free < required:
+        raise BenchmarkError(
+            f"benchmark requires at least {required} free bytes at {path}; "
+            f"only {free} bytes are available"
+        )
 
 
 def validate_driver_output(payload: Any, driver: dict[str, Any]) -> dict[str, Any]:
@@ -173,37 +180,32 @@ def run_driver(
         "--output",
         str(output_path),
     ]
-    process: subprocess.Popen[str] | None = None
-    completed_successfully = False
+    ensure_free_space(ROOT)
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired as error:
+            result = run_managed_command(
+                command,
+                cwd=ROOT,
+                timeout=timeout,
+                label=f"{driver['name']} driver",
+                poll_hook=lambda _process: ensure_free_space(ROOT),
+            )
+        except ManagedCommandTimeout as error:
             raise BenchmarkError(f"{driver['name']} timed out after {timeout}s") from error
+        except ManagedCommandError as error:
+            raise BenchmarkError(f"{driver['name']} process supervision failed: {error}") from error
 
-        if process.returncode:
-            detail = (stderr or stdout).strip()
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
             raise BenchmarkError(
-                f"{driver['name']} failed ({process.returncode}): {detail[-4000:]}"
+                f"{driver['name']} failed ({result.returncode}): {detail[-4000:]}"
             )
         try:
             payload = json.loads(output_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise BenchmarkError(f"{driver['name']} did not write valid result JSON") from error
-        validated = validate_driver_output(payload, driver)
-        completed_successfully = True
-        return validated
+        return validate_driver_output(payload, driver)
     finally:
-        if process is not None and not completed_successfully:
-            terminate_process_group(process)
         output_path.unlink(missing_ok=True)
 
 
@@ -212,37 +214,37 @@ def run_verification(
     default_timeout: int,
 ) -> tuple[float, bool, str]:
     started = dt.datetime.now(dt.timezone.utc)
-    process: subprocess.Popen[str] | None = None
-    completed_successfully = False
     timeout = spec.get("timeout", default_timeout)
+    ensure_free_space(ROOT)
     try:
-        process = subprocess.Popen(
+        result = run_managed_command(
             spec["command"],
             cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
+            timeout=timeout,
+            label=spec["name"],
+            poll_hook=lambda _process: ensure_free_space(ROOT),
         )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            elapsed = (dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1_000
-            return elapsed, False, f"timed out after {timeout}s"
-
+    except ManagedCommandTimeout:
         elapsed = (dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1_000
-        combined = (stdout + "\n" + stderr).strip()
-        passed = process.returncode == 0 and "executed no tests" not in combined
-        detail = (
-            f"exit {process.returncode}; {combined[-500:]}"
-            if combined
-            else f"exit {process.returncode}"
-        )
-        completed_successfully = process.returncode == 0
-        return elapsed, passed, detail
-    finally:
-        if process is not None and not completed_successfully:
-            terminate_process_group(process)
+        return elapsed, False, f"timed out after {timeout}s"
+    except ManagedCommandError as error:
+        elapsed = (dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1_000
+        return elapsed, False, f"process supervision failed: {error}"
+
+    elapsed = (dt.datetime.now(dt.timezone.utc) - started).total_seconds() * 1_000
+    combined = (result.stdout + "\n" + result.stderr).strip()
+    missing_output = [
+        required
+        for required in spec["required_output"]
+        if required not in combined
+    ]
+    passed = result.returncode == 0 and not missing_output
+    detail_parts = [f"exit {result.returncode}"]
+    if missing_output:
+        detail_parts.append("missing required output: " + ", ".join(missing_output))
+    if combined:
+        detail_parts.append(combined[-500:])
+    return elapsed, passed, "; ".join(detail_parts)
 
 
 def validate_report(report: dict[str, Any], required: list[str]) -> None:
@@ -421,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     fixture = ROOT / manifest["fixture"]
     if not fixture.is_file():
         raise BenchmarkError(f"benchmark fixture does not exist: {fixture}")
+    ensure_free_space(ROOT)
 
     sections: dict[str, dict[str, Any]] = {}
     driver_artifacts: dict[str, dict[str, Any]] = {}
@@ -491,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = args.output_dir or ROOT / ".benchmark-results"
         stem = "latest"
 
+    ensure_free_space(ROOT)
     markdown_path, json_path = write_report(report, output_dir, stem)
     print(markdown_path)
     print(json_path)

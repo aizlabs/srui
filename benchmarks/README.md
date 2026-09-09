@@ -10,9 +10,11 @@ Run a repeatable smoke measurement from the repository root:
 Results go to .benchmark-results/latest.json and latest.md. The command runs native release
 drivers, writes each driver result to a private temporary file, validates the manifest, native
 driver payloads, and merged report against benchmarks/schema.json, enforces process-group
-timeouts, merges the measurements, and then times the production §32 reconnect suite. Correctness
-failures make the command fail. Performance misses remain successful measurements and are called
-out as follow-up work when they exceed a §23 target by more than 2x.
+timeouts, merges the measurements, and then times the production §32 reconnect suite. The harness
+requires 12 GiB of free space before and during a run by default; set
+`SRUI_BENCHMARK_MIN_FREE_BYTES` to another positive byte count for a constrained benchmark host.
+Correctness failures make the command fail. Performance misses remain successful measurements and
+are called out as follow-up work when they exceed a §23 target by more than 2x.
 
 For a logged-in macOS session with WindowServer, use:
 
@@ -36,11 +38,18 @@ process with:
     benchmarks/parse-render/profile-allocations.sh /tmp/srui-allocations.trace
 
 The helper records the Allocations template with xctrace `--all-processes`, starts the driver only
-after xctrace reports that recording began, and cleans up the recorder, notification watcher, and
-driver on timeout or interruption. Filter the trace by `BenchmarkDriver` and the WebKit helper
-processes when comparing renderer allocations; unrelated system processes are present because the
-capture is intentionally system-wide. The trace is host-specific and is not committed or folded
-into the JSON report.
+after xctrace reports that recording began, and stops/finalizes the recorder as soon as the driver
+finishes. It cleans up the recorder, notification watcher, driver, and incomplete trace on every
+failure or interruption. The default live limits are a 2 GiB trace, a 256 MiB allocation export,
+and a 4 GiB free-space reserve; override them with `SRUI_XCTRACE_MAX_BYTES`,
+`SRUI_XCTRACE_MAX_EXPORT_BYTES`, and `SRUI_XCTRACE_MIN_FREE_BYTES`.
+
+A successful capture also writes `TRACE.summary.json`. That machine-readable sidecar contains
+cumulative allocation counts and bytes only for rows xctrace attributes to the exact
+`BenchmarkDriver` PID and exact WebKit helper PIDs; unattributed rows are counted rather than
+guessed. Unrelated system processes remain in the host-specific trace because capture is
+intentionally system-wide. Neither the trace nor its sidecar is committed or folded into the main
+benchmark report.
 
 Measurement policy:
 

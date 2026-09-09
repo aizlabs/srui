@@ -166,7 +166,7 @@
     "verification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "section", "command", "timeout"],
+      "required": ["name", "section", "command", "timeout", "required_output"],
       "properties": {
         "name": {"type": "string", "minLength": 1},
         "section": {
@@ -177,7 +177,13 @@
           "minItems": 1,
           "items": {"type": "string", "minLength": 1}
         },
-        "timeout": {"type": "integer", "minimum": 1}
+        "timeout": {"type": "integer", "minimum": 1},
+        "required_output": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
       }
     },
     "manifest": {

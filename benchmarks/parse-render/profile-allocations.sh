@@ -15,4 +15,5 @@ uv run --frozen python "$repo_root/benchmarks/parse-render/run_xctrace.py" \
     "$result_path"
 
 echo "$trace_path"
+echo "${trace_path}.summary.json"
 echo "$result_path"

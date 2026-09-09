@@ -2,4 +2,4 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
-exec python3 "$repo_root/benchmarks/run.py" "$@"
+exec uv run --frozen python "$repo_root/benchmarks/run.py" "$@"

@@ -1,23 +1,217 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "SRUI benchmark report",
-  "type": "object",
-  "required": ["schema_version", "generated_at", "profile", "environment", "sections"],
-  "properties": {
-    "schema_version": {"const": 1},
-    "generated_at": {"type": "string"},
-    "profile": {"enum": ["smoke", "full"]},
-    "environment": {"type": "object"},
-    "sections": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["id", "name", "metrics", "assertions"],
-        "properties": {
-          "id": {"pattern": "^31\\.[1-6]$"},
-          "name": {"type": "string"},
-          "metrics": {"type": "array"},
-          "assertions": {"type": "array"}
+  "$id": "https://srui.dev/schemas/benchmark-report-v1.json",
+  "title": "SRUI benchmark schema bundle",
+  "$ref": "#/$defs/report",
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_transaction_sha256",
+        "canonical_transaction_bytes"
+      ],
+      "properties": {
+        "canonical_transaction_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "canonical_transaction_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "unit", "statistic"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "value": {"type": "number"},
+        "unit": {"type": "string", "minLength": 1},
+        "statistic": {"type": "string", "minLength": 1},
+        "target": {"type": "number", "minimum": 0},
+        "target_direction": {"enum": ["max", "min"]}
+      },
+      "dependentRequired": {
+        "target": ["target_direction"],
+        "target_direction": ["target"]
+      }
+    },
+    "assertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "passed"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "passed": {"type": "boolean"},
+        "detail": {"type": "string"}
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "metrics", "assertions"],
+      "properties": {
+        "id": {
+          "enum": ["31.1", "31.2", "31.3", "31.4", "31.5", "31.6"]
+        },
+        "name": {"type": "string", "minLength": 1},
+        "metrics": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/metric"}
+        },
+        "assertions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/assertion"}
+        },
+        "notes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "driver_output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifacts", "sections"],
+      "properties": {
+        "artifacts": {"$ref": "#/$defs/artifact"},
+        "sections": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "items": {"$ref": "#/$defs/section"}
+        }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "generated_at",
+        "profile",
+        "fixture",
+        "environment",
+        "driver_artifacts",
+        "sections"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "generated_at": {"type": "string", "format": "date-time"},
+        "profile": {"enum": ["smoke", "full"]},
+        "fixture": {"type": "string", "minLength": 1},
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["platform", "machine", "python"],
+          "properties": {
+            "platform": {"type": "string", "minLength": 1},
+            "machine": {"type": "string", "minLength": 1},
+            "python": {"type": "string", "minLength": 1}
+          }
+        },
+        "driver_artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rust", "macos"],
+          "properties": {
+            "rust": {"$ref": "#/$defs/artifact"},
+            "macos": {"$ref": "#/$defs/artifact"}
+          }
+        },
+        "sections": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/section"},
+          "allOf": [
+            {"contains": {"type": "object", "properties": {"id": {"const": "31.1"}}, "required": ["id"]}, "minContains": 1, "maxContains": 1},
+            {"contains": {"type": "object", "properties": {"id": {"const": "31.2"}}, "required": ["id"]}, "minContains": 1, "maxContains": 1},
+            {"contains": {"type": "object", "properties": {"id": {"const": "31.3"}}, "required": ["id"]}, "minContains": 1, "maxContains": 1},
+            {"contains": {"type": "object", "properties": {"id": {"const": "31.4"}}, "required": ["id"]}, "minContains": 1, "maxContains": 1},
+            {"contains": {"type": "object", "properties": {"id": {"const": "31.5"}}, "required": ["id"]}, "minContains": 1, "maxContains": 1},
+            {"contains": {"type": "object", "properties": {"id": {"const": "31.6"}}, "required": ["id"]}, "minContains": 1, "maxContains": 1}
+          ]
+        }
+      }
+    },
+    "driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sections", "command"],
+      "properties": {
+        "name": {"enum": ["rust", "macos"]},
+        "sections": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["31.1", "31.2", "31.3", "31.4", "31.5", "31.6"]
+          }
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "platform": {"enum": ["darwin"]}
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "section", "command", "timeout"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "section": {
+          "enum": ["31.1", "31.2", "31.3", "31.4", "31.5", "31.6"]
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "timeout": {"type": "integer", "minimum": 1}
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "fixture",
+        "required_sections",
+        "drivers",
+        "verification_commands"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "fixture": {"type": "string", "minLength": 1},
+        "required_sections": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["31.1", "31.2", "31.3", "31.4", "31.5", "31.6"]
+          }
+        },
+        "drivers": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/driver"}
+        },
+        "verification_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/verification"}
         }
       }
     }

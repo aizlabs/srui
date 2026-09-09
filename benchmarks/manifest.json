@@ -10,7 +10,7 @@
     },
     {
       "name": "macos",
-      "sections": ["31.1", "31.3", "31.4", "31.6"],
+      "sections": ["31.1", "31.3", "31.4", "31.5", "31.6"],
       "platform": "darwin",
       "command": ["swift", "run", "--package-path", "client-macos", "-c", "release", "BenchmarkDriver"]
     }

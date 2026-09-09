@@ -161,8 +161,8 @@ jobs:
         run: uv sync --extra dev
       - name: Validate protocol/registry.yaml
         run: uv run python protocol/validate_registry.py
-      - name: Run registry validator tests
-        run: uv run pytest protocol/tests
+      - name: Run Python unit tests
+        run: uv run --frozen pytest
 
   # The server workspace is built and tested on Linux only. It was previously also built on
   # macOS, but that job ran an identical command set at ~10x the per-minute price, and the one

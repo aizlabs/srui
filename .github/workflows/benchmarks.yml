@@ -11,6 +11,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: astral-sh/setup-uv@v6
+      - name: Install Python tooling
+        run: uv sync --extra dev
+      - name: Test benchmark harness
+        run: uv run --frozen pytest benchmarks/tests
       - name: Run layered benchmark smoke suite
         run: scripts/run-benchmarks --profile smoke --output-dir benchmark-artifacts --timeout 1200
       - uses: actions/upload-artifact@v4

@@ -807,12 +807,13 @@ def wait_for_attributed_processes_to_exit(
 
 
 def _cleanup_failure(label: str, error: BaseException) -> BaseException:
+    if isinstance(error, BaseExceptionGroup):
+        error.add_note(f"{label} failed; detailed recovery members are preserved")
+        return error
     if termination_exceptions(error):
         error.add_note(f"{label} was attempted before this termination propagated")
         return error
-    failure = CaptureError(f"{label}: {type(error).__name__}: {error}")
-    failure.__cause__ = error
-    return failure
+    return CaptureError(f"{label}: {type(error).__name__}: {error}")
 
 
 

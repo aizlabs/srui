@@ -459,7 +459,7 @@ def test_capture_cleanup_retries_every_managed_resource_and_retains_handles(
         (driver, recorder, watcher),
         strict=True,
     ):
-        cleanup_group = error.__cause__
+        cleanup_group = error
         assert isinstance(cleanup_group, BaseExceptionGroup)
         retained = [
             nested

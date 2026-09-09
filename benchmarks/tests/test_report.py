@@ -683,21 +683,40 @@ def test_benchmark_cli_reports_companion_failure_with_signal_exit(
     assert "benchmark interrupted by SIGTERM" in stderr
 
 
-def test_xctrace_cli_reports_companion_failure_with_signal_exit(
+def test_xctrace_cli_reports_actual_cleanup_recovery_with_signal_exit(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
-    recovery = benchmark_xctrace.CaptureError(
-        "watcher cleanup failed; retained supervisor/PGID 456; "
-        "control directory /tmp/watcher"
+    recovery_directory = tmp_path / "watcher-controls"
+
+    class PersistentWatcher:
+        closed = False
+        label = "notification watcher"
+        supervisor = SimpleNamespace(pid=456)
+        ready_path = recovery_directory / "ready.json"
+
+        @staticmethod
+        def terminate() -> None:
+            raise RuntimeError("synthetic persistent watcher cleanup failure")
+
+    cleanup_errors = benchmark_xctrace.cleanup_capture(
+        driver=None,
+        recorder=None,
+        watcher=PersistentWatcher(),
+        trace=tmp_path / "capture.trace",
+        sidecar=tmp_path / "capture.trace.summary.json",
+        retain_outputs=False,
     )
+    assert len(cleanup_errors) == 1
+    assert isinstance(cleanup_errors[0], BaseExceptionGroup)
 
     def fail() -> int:
         raise BaseExceptionGroup(
             "termination plus watcher failure",
             [
                 benchmark_xctrace.TerminationRequested(signal.SIGINT),
-                recovery,
+                *cleanup_errors,
             ],
         )
 
@@ -706,7 +725,7 @@ def test_xctrace_cli_reports_companion_failure_with_signal_exit(
     stderr = capsys.readouterr().err
     assert "allocation capture failures accompanying interruption" in stderr
     assert "retained supervisor/PGID 456" in stderr
-    assert "control directory /tmp/watcher" in stderr
+    assert f"control directory {recovery_directory}" in stderr
     assert "allocation capture interrupted by SIGINT" in stderr
 
 

@@ -358,6 +358,144 @@ fn activate_message(
     }
 }
 
+async fn wire_pre_receipt_disconnect(sample: usize) -> Result<(f64, bool), String> {
+    let session = Arc::new(Session::new(format!("benchmark-wire-pre-receipt-{sample}")));
+    let button = NodeId::new(2);
+    session
+        .transaction(|ui| {
+            Surface::builder(NodeId::new(1)).create(ui)?;
+            Button::builder(button)
+                .parent(NodeId::new(1))
+                .label("Run")
+                .create(ui)?;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+
+    let side_effects = Arc::new(AtomicUsize::new(0));
+    let handler_side_effects = Arc::clone(&side_effects);
+    session.on(button, ACTIVATE, move |context, _| {
+        handler_side_effects.fetch_add(1, Ordering::SeqCst);
+        context
+            .transaction(|ui| {
+                ui.set(button, LABEL, "Clicked")?;
+                Ok(())
+            })
+            .expect("pre-receipt benchmark handler transaction");
+    });
+
+    let client_instance_id = format!("wire-pre-receipt-client-{sample}").into_bytes();
+    let event_id = "benchmark-pre-receipt";
+    let shutdown = CancellationToken::new();
+    let (mut first_write, mut first_read, first_task) =
+        open_wire_connection(Arc::clone(&session), shutdown.clone());
+    first_write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::ClientHello(ClientHello {
+                core_version: CORE_VERSION.to_string(),
+                profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                client_instance_id: client_instance_id.clone(),
+                ..ClientHello::default()
+            })),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let welcome = read_wire_message(&mut first_read).await?;
+    let snapshot = read_wire_message(&mut first_read).await?;
+    let fresh_correct = matches!(
+        welcome.msg,
+        Some(srui_message::Msg::ServerWelcome(value))
+            if value.session_id == session.session_id() && value.initial_revision == 1
+    ) && matches!(
+        snapshot.msg,
+        Some(srui_message::Msg::Transaction(transaction))
+            if transaction.base_revision == 0 && transaction.new_revision == 1
+    );
+
+    // Start immediately before the complete EVENT could be received. The first transport is
+    // closed without sending any event bytes; the replacement must resume, admit one complete
+    // event, and expose its resulting transaction before this measurement stops.
+    let start = Instant::now();
+    drop(first_write);
+    drop(first_read);
+    join_interrupted_connection(first_task, "pre-receipt EVENT").await?;
+    let first_connection_inert = session.is_detached()
+        && side_effects.load(Ordering::SeqCst) == 0
+        && session.current_revision() == 1
+        && session.with_store(|store| {
+            Button::from_store(store, button).and_then(|value| value.label(store)) == Some("Run")
+        });
+
+    let (mut resumed_write, mut resumed_read, resumed_task) =
+        open_wire_connection(Arc::clone(&session), shutdown.clone());
+    resumed_write
+        .send(SruiMessage {
+            msg: Some(srui_message::Msg::ClientResume(ClientResume {
+                session_id: session.session_id(),
+                client_instance_id: client_instance_id.clone(),
+                last_applied_revision: 1,
+                last_acked_event_seq: 0,
+                ..ClientResume::default()
+            })),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let resume = read_wire_message(&mut resumed_read).await?;
+    let resume_correct = matches!(
+        resume.msg,
+        Some(srui_message::Msg::ServerResumeOk(value))
+            if value.session_id == session.session_id()
+                && value.replay_from_revision == 1
+                && value.last_processed_event_seq == 0
+    );
+
+    resumed_write
+        .send(activate_message(&client_instance_id, event_id, 1, button))
+        .await
+        .map_err(|error| error.to_string())?;
+    let processed_ack = read_wire_message(&mut resumed_read).await?;
+    let handler_transaction = read_wire_message(&mut resumed_read).await?;
+    let processed_once = matches!(
+        processed_ack.msg,
+        Some(srui_message::Msg::ServerEventAck(ack))
+            if ack.status() == EventAckStatus::Processed
+                && ack.client_instance_id == client_instance_id
+                && ack.event_id == event_id.as_bytes()
+                && ack.revision_after_effect == 2
+                && ack.last_processed_event_seq == 1
+    ) && matches!(
+        handler_transaction.msg,
+        Some(srui_message::Msg::Transaction(transaction))
+            if transaction.base_revision == 1 && transaction.new_revision == 2
+    ) && side_effects.load(Ordering::SeqCst) == 1
+        && session.current_revision() == 2
+        && session.with_store(|store| {
+            Button::from_store(store, button).and_then(|value| value.label(store))
+                == Some("Clicked")
+        });
+    let no_second_effect = timeout(Duration::from_millis(5), resumed_read.next())
+        .await
+        .is_err();
+    let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+
+    shutdown.cancel();
+    let resumed_finished = timeout(Duration::from_secs(2), resumed_task)
+        .await
+        .map_err(|_| "resumed pre-receipt connection did not terminate".to_string())?
+        .map_err(|error| error.to_string())?
+        .is_ok();
+
+    Ok((
+        elapsed,
+        fresh_correct
+            && first_connection_inert
+            && resume_correct
+            && processed_once
+            && no_second_effect
+            && resumed_finished,
+    ))
+}
+
 async fn wire_lost_ack_reconnect(sample: usize) -> Result<(f64, bool), String> {
     let session = Arc::new(Session::new(format!("benchmark-wire-event-{sample}")));
     let button = NodeId::new(2);
@@ -785,6 +923,7 @@ async fn reconnect(iterations: usize) -> Result<Section, String> {
     let mut transaction_replay_correct = true;
     let mut wire_transaction_replay_correct = true;
     let mut event_boundary_correct = true;
+    let mut wire_pre_receipt_correct = true;
     let mut wire_partial_event_correct = true;
     let mut duplicate_correct = true;
     let mut wire_duplicate_correct = true;
@@ -887,9 +1026,8 @@ async fn reconnect(iterations: usize) -> Result<Section, String> {
                     if replayed == vec![committed]
             );
 
-        // Use Session's production event admission, validation, handler dispatch, settlement,
-        // and cached result path. Dropping the attachment models loss immediately before receipt;
-        // replaying after Processed models loss after the side effect but before EVENT_ACK.
+        // Keep the direct admission/result-cache timings as component measurements. The
+        // pre-receipt reconnect itself is measured separately below over handle_connection.
         let event_session = Session::new(format!("benchmark-event-{sample}"));
         event_session
             .transaction(|ui| {
@@ -918,12 +1056,7 @@ async fn reconnect(iterations: usize) -> Result<Section, String> {
         let pre_receipt_attachment = event_session
             .attach()
             .ok_or_else(|| "event session refused attachment".to_string())?;
-        let start = Instant::now();
         drop(pre_receipt_attachment);
-        timings
-            .entry("disconnect immediately before event receipt")
-            .or_default()
-            .push(start.elapsed().as_secs_f64() * 1_000.0);
         event_boundary_correct &=
             event_session.is_detached() && side_effects.load(Ordering::SeqCst) == 0;
 
@@ -1015,6 +1148,13 @@ async fn reconnect(iterations: usize) -> Result<Section, String> {
 
     let wire_sample_count = iterations.min(50);
     for sample in 0..wire_sample_count {
+        let (elapsed, correct) = wire_pre_receipt_disconnect(sample).await?;
+        timings
+            .entry("disconnect immediately before event receipt")
+            .or_default()
+            .push(elapsed);
+        wire_pre_receipt_correct &= correct;
+
         let (elapsed, correct) = wire_lost_ack_reconnect(sample).await?;
         timings
             .entry("lost ACK wire reconnect through DUPLICATE acknowledgement")
@@ -1063,10 +1203,12 @@ async fn reconnect(iterations: usize) -> Result<Section, String> {
             },
             Assertion {
                 id: "partial_event_wire_once",
-                name: "partial EVENT disconnect is inert before one processed replay",
-                passed: event_boundary_correct && wire_partial_event_correct,
+                name: "pre-receipt and partial EVENT disconnects are inert before one processed replay",
+                passed: event_boundary_correct
+                    && wire_pre_receipt_correct
+                    && wire_partial_event_correct,
                 detail: format!(
-                    "{wire_sample_count} capacity-one handle_connection streams dispatched zero partial events; reconnect sent one full event and decoded one Processed acknowledgement"
+                    "{wire_sample_count} pre-receipt and capacity-one partial-frame handle_connection reconnects each dispatched zero events on the interrupted connection, then decoded one Processed acknowledgement and one resulting transaction"
                 ),
             },
             Assertion {
@@ -1430,6 +1572,12 @@ mod tests {
     fn partial_srui_transaction_frame_is_not_decoded() {
         let transaction = empty_wire_transaction(0);
         assert!(partial_transaction_frame_is_buffered(&transaction).unwrap());
+    }
+
+    #[tokio::test]
+    async fn pre_receipt_wire_reconnect_dispatches_only_after_resume() {
+        let (_, correct) = wire_pre_receipt_disconnect(0).await.unwrap();
+        assert!(correct);
     }
 
     #[tokio::test]

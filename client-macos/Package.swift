@@ -93,7 +93,10 @@ let package = Package(
             dependencies: [
                 "Protocol",
                 "SemanticModel",
+                "Session",
+                "TransportSSH",
                 "RendererAppKit",
+                "Resources",
                 "Terminal",
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],

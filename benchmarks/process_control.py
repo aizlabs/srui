@@ -123,6 +123,34 @@ def _cleanup_detail(errors: list[tuple[str, BaseException]]) -> str:
     )
 
 
+def termination_exceptions(error: BaseException) -> list[BaseException]:
+    """Return non-Exception termination requests, including nested groups."""
+
+    if isinstance(error, BaseExceptionGroup):
+        return [
+            termination
+            for nested in error.exceptions
+            for termination in termination_exceptions(nested)
+        ]
+    return [error] if not isinstance(error, Exception) else []
+
+
+def raise_termination_exceptions(
+    errors: list[BaseException],
+    *,
+    label: str,
+) -> None:
+    terminations = [
+        termination
+        for error in errors
+        for termination in termination_exceptions(error)
+    ]
+    if len(terminations) == 1:
+        raise terminations[0]
+    if terminations:
+        raise BaseExceptionGroup(label, terminations)
+
+
 def terminate_supervised_process(
     process: subprocess.Popen[str],
     grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
@@ -178,22 +206,30 @@ def terminate_supervised_process(
         except BaseException as error:
             recoverable_errors.append(("process-group enumeration", error))
 
-    final_errors: list[tuple[str, BaseException]] = []
-    group_killed = False
     try:
-        # Do not use _signal_group here: ProcessLookupError is material while the
-        # stopped sentinel is supposed to pin this exact group.
+        # A failed final group kill leaves the stopped sentinel alive. Its unreaped
+        # PID is the only proof that a retry still addresses the original group.
         os.killpg(process_group, signal.SIGKILL)
-        group_killed = True
     except BaseException as error:
-        final_errors.append(("pinned-group SIGKILL", error))
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        except BaseException as direct_error:
-            final_errors.append(("direct supervisor SIGKILL", direct_error))
+        errors = [*recoverable_errors, ("pinned-group SIGKILL", error)]
+        failure = ManagedCommandError(
+            f"could not confirm cleanup of supervised process group {process_group}: "
+            f"{_cleanup_detail(errors)}; stopped sentinel retained for retry"
+        )
+        terminations = [
+            termination
+            for _label, item in errors
+            for termination in termination_exceptions(item)
+        ]
+        if terminations:
+            raise BaseExceptionGroup(
+                f"termination requested while process group {process_group} "
+                "remains pinned for retry",
+                [*terminations, failure],
+            )
+        raise failure from error
 
+    final_errors: list[tuple[str, BaseException]] = []
     output: tuple[str, str] | None = None
     try:
         output = process.communicate(timeout=5)
@@ -210,15 +246,30 @@ def terminate_supervised_process(
         except BaseException as reap_error:
             final_errors.append(("fallback supervisor reap", reap_error))
 
-    if not group_killed or output is None or process.poll() is None:
-        errors = [*recoverable_errors, *final_errors]
-        raise ManagedCommandError(
+    errors = [*recoverable_errors, *final_errors]
+    if output is None or process.poll() is None:
+        failure = ManagedCommandError(
             f"could not confirm cleanup of supervised process group {process_group}: "
             f"{_cleanup_detail(errors)}"
         )
+        terminations = [
+            termination
+            for _label, item in errors
+            for termination in termination_exceptions(item)
+        ]
+        if terminations:
+            raise BaseExceptionGroup(
+                f"termination requested and process group {process_group} cleanup failed",
+                [*terminations, failure],
+            )
+        raise failure
 
-    # Graceful termination or enumeration may fail transiently. A successful
-    # SIGKILL of the still-pinned group plus waitpid is the authoritative fallback.
+    # Ordinary graceful-cleanup failures are superseded by the authoritative
+    # pinned-group SIGKILL/reap. Termination requests still propagate afterward.
+    raise_termination_exceptions(
+        [error for _label, error in errors],
+        label=f"multiple termination requests while cleaning process group {process_group}",
+    )
     return output
 
 
@@ -315,20 +366,20 @@ class ManagedProcess:
                 f"({self.supervisor.returncode}): {(stderr or stdout).strip()[-2000:]}"
             )
         return None
-
-    def signal(self, signum: int) -> None:
-        if self._reaped or self.supervisor is None or self.supervisor.poll() is not None:
-            return
-        _signal_group(self.supervisor.pid, signum)
-
     def _reap(self) -> None:
         if self._reaped:
             return
-        if self.supervisor is not None:
-            self._supervisor_output = terminate_supervised_process(
-                self.supervisor,
-                self.cleanup_grace_seconds,
-            )
+        try:
+            if self.supervisor is not None:
+                self._supervisor_output = terminate_supervised_process(
+                    self.supervisor,
+                    self.cleanup_grace_seconds,
+                )
+        except BaseException:
+            # An interruption may be re-raised after an authoritative group reap.
+            if self.supervisor is None or self.supervisor.poll() is not None:
+                self._reaped = True
+            raise
         self._reaped = True
 
     def _discard_controls(self) -> None:
@@ -338,12 +389,16 @@ class ManagedProcess:
         self._controls_cleaned = True
 
     def terminate(self) -> None:
-        if self._reaped:
-            self._discard_controls()
-            return
-        self._reap()
-        # Control files are retained if _reap raises, so a caller can diagnose and
-        # retry cleanup. They are deleted only after reaping has been confirmed.
+        # Defer handled signals until group cleanup and the control-file decision
+        # complete. A pending handler runs when this context exits.
+        with blocked_termination_signals():
+            try:
+                if not self._reaped:
+                    self._reap()
+            finally:
+                # A failed group kill preserves the stopped sentinel and controls.
+                if self._reaped:
+                    self._discard_controls()
         self._discard_controls()
 
     def wait(
@@ -431,4 +486,27 @@ def run_managed_command(
         label=label,
         cleanup_grace_seconds=cleanup_grace_seconds,
     )
-    return process.wait(timeout, poll_hook=poll_hook)
+    try:
+        return process.wait(timeout, poll_hook=poll_hook)
+    except BaseException as primary:
+        cleanup_errors: list[BaseException] = []
+        if not process.closed:
+            try:
+                # wait() already tried once. Retry while the sentinel still pins
+                # the original group; terminate() remains bounded.
+                process.terminate()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+
+        errors = [primary, *cleanup_errors]
+        if process.closed:
+            raise_termination_exceptions(
+                errors,
+                label=f"multiple termination requests while cleaning {label}",
+            )
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                f"{label} failed and bounded cleanup retry also failed",
+                errors,
+            )
+        raise

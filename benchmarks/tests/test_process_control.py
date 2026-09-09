@@ -175,7 +175,12 @@ def test_failed_reap_keeps_control_files_until_retry(
         "retry cleanup",
         0.05,
     )
-    managed.supervisor = object()  # type: ignore[assignment]
+    class UnreapedSupervisor:
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    managed.supervisor = UnreapedSupervisor()  # type: ignore[assignment]
     controls = managed.ready_path.parent
     attempts = 0
 
@@ -199,6 +204,107 @@ def test_failed_reap_keeps_control_files_until_retry(
     managed.terminate()
     assert managed.closed
     assert not controls.exists()
+
+
+def test_failed_group_kill_preserves_real_sentinel_and_child_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "failed-kill-child.pid"
+    managed = ManagedProcess.start(
+        [sys.executable, "-c", SLEEPER, str(pid_file)],
+        cwd=tmp_path,
+        label="failed group kill",
+        cleanup_grace_seconds=0.05,
+    )
+    child_pid = wait_for_pid(pid_file)
+    controls = managed.ready_path.parent
+    original_killpg = process_control.os.killpg
+    failures_remaining = 1
+
+    def fail_first_group_kill(process_group: int, signum: int) -> None:
+        nonlocal failures_remaining
+        if signum == signal.SIGKILL and failures_remaining:
+            failures_remaining -= 1
+            raise PermissionError("synthetic group kill failure")
+        original_killpg(process_group, signum)
+
+    monkeypatch.setattr(process_control.os, "killpg", fail_first_group_kill)
+    try:
+        with pytest.raises(ManagedCommandError, match="pinned-group SIGKILL"):
+            managed.terminate()
+
+        assert not managed.closed
+        assert controls.exists()
+        assert managed.supervisor is not None
+        assert managed.supervisor.poll() is None
+        os.kill(child_pid, 0)
+
+        managed.terminate()
+        assert managed.closed
+        assert not controls.exists()
+        assert_process_gone(child_pid)
+    finally:
+        monkeypatch.setattr(process_control.os, "killpg", original_killpg)
+        if not managed.closed:
+            managed.terminate()
+
+
+def test_run_managed_command_retries_transient_group_kill_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "wrapper-retry-child.pid"
+    original_killpg = process_control.os.killpg
+    failed = False
+    kill_attempts = 0
+
+    def fail_first_group_kill(process_group: int, signum: int) -> None:
+        nonlocal failed, kill_attempts
+        if signum == signal.SIGKILL:
+            kill_attempts += 1
+            if not failed:
+                failed = True
+                raise PermissionError("synthetic group kill failure")
+        original_killpg(process_group, signum)
+
+    monkeypatch.setattr(process_control.os, "killpg", fail_first_group_kill)
+    with pytest.raises(BaseExceptionGroup, match="cleanup"):
+        run_managed_command(
+            [sys.executable, "-c", SLEEPER, str(pid_file)],
+            cwd=tmp_path,
+            timeout=0.2,
+            label="wrapper cleanup retry",
+            cleanup_grace_seconds=0.05,
+        )
+
+    assert kill_attempts == 2
+    assert_process_gone(wait_for_pid(pid_file))
+
+
+def test_termination_during_cleanup_is_reraised_after_real_group_reap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "cleanup-interruption-child.pid"
+    managed = ManagedProcess.start(
+        [sys.executable, "-c", SLEEPER, str(pid_file)],
+        cwd=tmp_path,
+        label="cleanup interruption",
+        cleanup_grace_seconds=0.05,
+    )
+    child_pid = wait_for_pid(pid_file)
+
+    def interrupt_enumeration(_process_group: int) -> set[int]:
+        raise RequestedTermination
+
+    monkeypatch.setattr(process_control, "process_group_members", interrupt_enumeration)
+    with pytest.raises(RequestedTermination):
+        managed.terminate()
+
+    assert managed.closed
+    assert not managed.ready_path.parent.exists()
+    assert_process_gone(child_pid)
 
 
 def test_successful_command_reaps_residual_descendant(tmp_path: Path) -> None:

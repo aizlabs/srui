@@ -21,7 +21,12 @@ from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from process_control import ManagedCommandError, ManagedCommandTimeout, run_managed_command
+from process_control import (
+    ManagedCommandError,
+    ManagedCommandTimeout,
+    run_managed_command,
+    termination_exceptions,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "benchmarks/manifest.json"
@@ -44,24 +49,49 @@ EXPECTED_RECONNECT_VERIFICATION = {
 }
 DEFAULT_MIN_FREE_BYTES = 12 * 1024 * 1024 * 1024
 DISTRIBUTION = ("p50", "p95", "p99")
+LOCAL_INTERACTIONS = (
+    "text_entry",
+    "caret_movement",
+    "text_selection",
+    "ime_composition",
+    "scrolling",
+    "hover_pressed",
+    "menu_opening",
+)
+MetricIdentity = tuple[str, str]
+MetricMetadata = tuple[str, float | None, str | None]
 
 
 def _metric_inventory(
-    specification: dict[str, tuple[str, ...]],
-) -> frozenset[tuple[str, str]]:
-    return frozenset(
+    specification: dict[str, tuple[str, tuple[str, ...]]],
+    targets: dict[MetricIdentity, tuple[float, str]] | None = None,
+) -> dict[MetricIdentity, MetricMetadata]:
+    target_contracts = targets or {}
+    identities = {
         (metric_id, statistic)
-        for metric_id, statistics in specification.items()
+        for metric_id, (_unit, statistics) in specification.items()
         for statistic in statistics
-    )
+    }
+    unknown_targets = set(target_contracts) - identities
+    if unknown_targets:
+        raise ValueError(f"targets reference unknown metrics: {sorted(unknown_targets)!r}")
+    return {
+        identity: (
+            specification[identity[0]][0],
+            target_contracts[identity][0] if identity in target_contracts else None,
+            target_contracts[identity][1] if identity in target_contracts else None,
+        )
+        for identity in identities
+    }
 
 
 def _coverage(
-    metrics: dict[str, tuple[str, ...]],
+    metrics: dict[str, tuple[str, tuple[str, ...]]],
     assertions: tuple[str, ...],
-) -> dict[str, frozenset[Any]]:
+    targets: dict[MetricIdentity, tuple[float, str]] | None = None,
+) -> dict[str, Any]:
     return {
-        "metrics": _metric_inventory(metrics),
+        "metrics": _metric_inventory(metrics, targets),
         "assertions": frozenset(assertions),
     }
 
@@ -70,15 +100,15 @@ EXPECTED_DRIVER_INVENTORY = {
     "rust": {
         "31.2": _coverage(
             {
-                "abstract_state_generation_ms": DISTRIBUTION,
-                "protobuf_serialization_ms": DISTRIBUTION,
-                "serialized_transaction_bytes": ("exact",),
+                "abstract_state_generation_ms": ("ms", DISTRIBUTION),
+                "protobuf_serialization_ms": ("ms", DISTRIBUTION),
+                "serialized_transaction_bytes": ("bytes", ("exact",)),
             },
             ("fixture_protobuf_valid",),
         ),
         "31.5": _coverage(
             {
-                metric_id: DISTRIBUTION
+                metric_id: ("ms", DISTRIBUTION)
                 for metric_id in (
                     "disconnect_before_event_receipt_ms",
                     "event_to_settled_side_effect_ms",
@@ -102,11 +132,11 @@ EXPECTED_DRIVER_INVENTORY = {
         ),
         "31.6": _coverage(
             {
-                "embedded_pty_interaction_ms": DISTRIBUTION,
-                "standalone_pty_interaction_ms": DISTRIBUTION,
-                "terminal_retention_loss_ms": ("sample",),
-                "terminal_payload_bytes": ("exact",),
-                "embedded_terminal_frame_count": DISTRIBUTION,
+                "embedded_pty_interaction_ms": ("ms", DISTRIBUTION),
+                "standalone_pty_interaction_ms": ("ms", DISTRIBUTION),
+                "terminal_retention_loss_ms": ("ms", ("sample",)),
+                "terminal_payload_bytes": ("bytes", ("exact",)),
+                "embedded_terminal_frame_count": ("messages", DISTRIBUTION),
             },
             (
                 "pty_payload_identical",
@@ -120,21 +150,21 @@ EXPECTED_DRIVER_INVENTORY = {
     "macos": {
         "31.1": _coverage(
             {
-                "srui.first_paint": ("p50", "p95"),
-                "srui.complete_paint": DISTRIBUTION,
-                "srui.cpu": ("p50", "p95"),
-                "srui.host_retained_allocations": ("p50",),
-                "srui.process_footprint_peak": ("max",),
-                "srui.process_footprint_growth": ("last-first",),
-                "webkit.first_paint": ("p50", "p95"),
-                "webkit.complete_paint": ("p50", "p95"),
-                "webkit.cpu": ("p50",),
-                "webkit.host_retained_allocations": ("p50",),
-                "webkit.process_footprint_peak": ("max",),
-                "webkit.process_footprint_growth": ("last-first",),
-                "representation.srui_bytes": ("exact",),
-                "representation.html_bytes": ("exact",),
-                "paint.capture_authorization": ("exact",),
+                "srui.first_paint": ("ms", ("p50", "p95")),
+                "srui.complete_paint": ("ms", DISTRIBUTION),
+                "srui.cpu": ("ms", ("p50", "p95")),
+                "srui.host_retained_allocations": ("allocations", ("p50",)),
+                "srui.process_footprint_peak": ("MiB", ("max",)),
+                "srui.process_footprint_growth": ("MiB", ("last-first",)),
+                "webkit.first_paint": ("ms", ("p50", "p95")),
+                "webkit.complete_paint": ("ms", ("p50", "p95")),
+                "webkit.cpu": ("ms", ("p50",)),
+                "webkit.host_retained_allocations": ("allocations", ("p50",)),
+                "webkit.process_footprint_peak": ("MiB", ("max",)),
+                "webkit.process_footprint_growth": ("MiB", ("last-first",)),
+                "representation.srui_bytes": ("bytes", ("exact",)),
+                "representation.html_bytes": ("bytes", ("exact",)),
+                "paint.capture_authorization": ("boolean", ("exact",)),
             },
             (
                 "semantic_representation_parity",
@@ -145,22 +175,35 @@ EXPECTED_DRIVER_INVENTORY = {
         "31.3": _coverage(
             {
                 **{
-                    f"updates.{count}.{measurement}": DISTRIBUTION
+                    f"updates.{count}.semantic": ("ms", DISTRIBUTION)
                     for count in (1, 100, 1000)
-                    for measurement in ("semantic", "visible")
                 },
                 **{
-                    f"updates.{count}.{measurement}": ("exact",)
+                    f"updates.{count}.visible": ("ms", DISTRIBUTION)
                     for count in (1, 100, 1000)
-                    for measurement in ("bytes", "messages")
                 },
                 **{
-                    f"cadence.{cadence}.{measurement}": ("exact",)
+                    f"updates.{count}.bytes": ("bytes", ("exact",))
+                    for count in (1, 100, 1000)
+                },
+                **{
+                    f"updates.{count}.messages": ("messages", ("exact",))
+                    for count in (1, 100, 1000)
+                },
+                **{
+                    f"cadence.{cadence}.bytes": ("bytes", ("exact",))
                     for cadence in (60, 120, 144, 240)
-                    for measurement in ("bytes", "messages", "repaints")
                 },
-                "idle.bytes": ("observed max",),
-                "idle.messages": ("observed max",),
+                **{
+                    f"cadence.{cadence}.messages": ("messages", ("exact",))
+                    for cadence in (60, 120, 144, 240)
+                },
+                **{
+                    f"cadence.{cadence}.repaints": ("repaints", ("exact",))
+                    for cadence in (60, 120, 144, 240)
+                },
+                "idle.bytes": ("bytes", ("observed max",)),
+                "idle.messages": ("messages", ("observed max",)),
             },
             (
                 "mutation_raster_completion",
@@ -169,34 +212,30 @@ EXPECTED_DRIVER_INVENTORY = {
                 "cadence_repaint_independent",
                 "cadence_state_event_order",
             ),
+            {
+                ("updates.100.semantic", "p50"): (1.0, "max"),
+                ("updates.1000.semantic", "p50"): (5.0, "max"),
+            },
         ),
         "31.4": _coverage(
             {
                 **{
-                    f"interaction.{interaction}.rtt.{rtt}": DISTRIBUTION
-                    for interaction in (
-                        "text_entry",
-                        "caret_movement",
-                        "text_selection",
-                        "ime_composition",
-                        "scrolling",
-                        "hover_pressed",
-                        "menu_opening",
-                    )
+                    f"interaction.{interaction}.rtt.{rtt}": ("ms", DISTRIBUTION)
+                    for interaction in LOCAL_INTERACTIONS
                     for rtt in (0, 100, 300, 600)
                 },
                 **{
-                    f"server_feedback.rtt.{rtt}": DISTRIBUTION
+                    f"server_feedback.rtt.{rtt}": ("ms", DISTRIBUTION)
                     for rtt in (0, 100, 300, 600)
                 },
-                "impairment.bandwidth_transfer": ("p50", "p95"),
-                "impairment.bandwidth_delivered_bytes": ("exact",),
-                "impairment.loss_attempts": ("exact",),
-                "impairment.loss_delivered_messages": ("exact",),
-                "impairment.interruption_detection": ("p50",),
-                "session_wire.bytes": ("exact",),
-                "session_wire.messages": ("exact",),
-                "local_rtt_delta": DISTRIBUTION,
+                "impairment.bandwidth_transfer": ("ms", ("p50", "p95")),
+                "impairment.bandwidth_delivered_bytes": ("bytes", ("exact",)),
+                "impairment.loss_attempts": ("messages", ("exact",)),
+                "impairment.loss_delivered_messages": ("messages", ("exact",)),
+                "impairment.interruption_detection": ("ms", ("p50",)),
+                "session_wire.bytes": ("bytes", ("exact",)),
+                "session_wire.messages": ("messages", ("exact",)),
+                "local_rtt_delta": ("ms", DISTRIBUTION),
             },
             (
                 "local_latency_independent",
@@ -204,12 +243,23 @@ EXPECTED_DRIVER_INVENTORY = {
                 "no_sync_rtt",
                 "impairments_use_session",
             ),
+            {
+                **{
+                    (f"interaction.{interaction}.rtt.{rtt}", "p50"): (
+                        16.67,
+                        "max",
+                    )
+                    for interaction in LOCAL_INTERACTIONS
+                    for rtt in (0, 100, 300, 600)
+                },
+                ("local_rtt_delta", "p50"): (16.67, "max"),
+            },
         ),
         "31.5": _coverage(
             {
-                "mid_resource_recovery": ("p50", "p95"),
-                "superseded_response": ("p50", "p95"),
-                "active_response": ("p50", "p95"),
+                "mid_resource_recovery": ("ms", ("p50", "p95")),
+                "superseded_response": ("ms", ("p50", "p95")),
+                "active_response": ("ms", ("p50", "p95")),
             },
             (
                 "mid_resource_recovery",
@@ -218,10 +268,10 @@ EXPECTED_DRIVER_INVENTORY = {
         ),
         "31.6": _coverage(
             {
-                "client_terminal.decode_visible": DISTRIBUTION,
-                "client_terminal.draw_only": DISTRIBUTION,
-                "client_terminal.frame_bytes": ("exact",),
-                "client_terminal.raster_completions": ("exact",),
+                "client_terminal.decode_visible": ("ms", DISTRIBUTION),
+                "client_terminal.draw_only": ("ms", DISTRIBUTION),
+                "client_terminal.frame_bytes": ("bytes", ("exact",)),
+                "client_terminal.raster_completions": ("frames", ("exact",)),
             },
             (
                 "terminal_offsets_exact",
@@ -430,15 +480,30 @@ def validate_driver_output(
             for metric in section["metrics"]
         ]
         metric_set = frozenset(metric_items)
+        expected_metrics = expected["metrics"]
+        expected_metric_set = frozenset(expected_metrics)
         if len(metric_items) != len(metric_set):
             raise BenchmarkError(
                 f"{driver['name']} §{section['id']} emitted duplicate metric identities"
             )
-        if metric_set != expected["metrics"]:
+        if metric_set != expected_metric_set:
             raise BenchmarkError(
                 f"{driver['name']} §{section['id']} metric inventory: "
-                f"{_inventory_difference(expected['metrics'], metric_set)}"
+                f"{_inventory_difference(expected_metric_set, metric_set)}"
             )
+        for metric in section["metrics"]:
+            identity = (metric["id"], metric["statistic"])
+            actual_metadata = (
+                metric["unit"],
+                metric.get("target"),
+                metric.get("target_direction"),
+            )
+            if actual_metadata != expected_metrics[identity]:
+                raise BenchmarkError(
+                    f"{driver['name']} §{section['id']} metric metadata for "
+                    f"{identity!r}: expected {expected_metrics[identity]!r}, "
+                    f"got {actual_metadata!r}"
+                )
 
         assertion_items = [assertion["id"] for assertion in section["assertions"]]
         assertion_set = frozenset(assertion_items)
@@ -843,6 +908,19 @@ def cli(argv: list[str] | None = None) -> int:
         print(f"benchmark error: {error}", file=sys.stderr)
         return 2
     except BaseExceptionGroup as error:
+        terminations = termination_exceptions(error)
+        if terminations:
+            first = terminations[0]
+            if isinstance(first, TerminationRequested):
+                print(
+                    f"benchmark interrupted by {signal.Signals(first.signum).name}",
+                    file=sys.stderr,
+                )
+                return 128 + first.signum
+            if isinstance(first, KeyboardInterrupt):
+                print("benchmark interrupted by SIGINT", file=sys.stderr)
+                return 130
+            raise first
         print(
             f"benchmark failed during process cleanup: {exception_group_detail(error)}",
             file=sys.stderr,

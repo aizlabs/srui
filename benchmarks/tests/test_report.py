@@ -211,10 +211,20 @@ def payload_for_driver(driver: dict[str, Any]) -> dict[str, Any]:
                         "id": metric_id,
                         "name": metric_id,
                         "value": 1.0,
-                        "unit": "ms",
+                        "unit": metadata[0],
                         "statistic": statistic,
+                        **(
+                            {
+                                "target": metadata[1],
+                                "target_direction": metadata[2],
+                            }
+                            if metadata[1] is not None
+                            else {}
+                        ),
                     }
-                    for metric_id, statistic in sorted(inventory["metrics"])
+                    for (metric_id, statistic), metadata in sorted(
+                        inventory["metrics"].items()
+                    )
                 ],
                 "assertions": [
                     {
@@ -264,6 +274,47 @@ def test_driver_inventory_accepts_only_complete_declared_measurements(
 
     payload["sections"][0]["metrics"].pop()
     with pytest.raises(benchmark_run.BenchmarkError, match="metric inventory"):
+        benchmark_run.validate_driver_output(payload, driver)
+
+
+def test_driver_inventory_constrains_units_and_required_target_metadata() -> None:
+    driver = next(
+        item for item in valid_manifest()["drivers"] if item["name"] == "macos"
+    )
+
+    payload = payload_for_driver(driver)
+    serialized = next(
+        metric
+        for section in payload["sections"]
+        for metric in section["metrics"]
+        if metric["id"] == "updates.1.bytes"
+    )
+    serialized["unit"] = "ms"
+    with pytest.raises(benchmark_run.BenchmarkError, match="metric metadata"):
+        benchmark_run.validate_driver_output(payload, driver)
+
+    payload = payload_for_driver(driver)
+    targeted = next(
+        metric
+        for section in payload["sections"]
+        for metric in section["metrics"]
+        if metric["id"] == "updates.100.semantic"
+        and metric["statistic"] == "p50"
+    )
+    targeted.pop("target")
+    targeted.pop("target_direction")
+    with pytest.raises(benchmark_run.BenchmarkError, match="metric metadata"):
+        benchmark_run.validate_driver_output(payload, driver)
+
+    payload = payload_for_driver(driver)
+    targeted = next(
+        metric
+        for section in payload["sections"]
+        for metric in section["metrics"]
+        if metric["id"] == "local_rtt_delta" and metric["statistic"] == "p50"
+    )
+    targeted["target_direction"] = "min"
+    with pytest.raises(benchmark_run.BenchmarkError, match="metric metadata"):
         benchmark_run.validate_driver_output(payload, driver)
 
 

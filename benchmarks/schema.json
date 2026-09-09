@@ -66,7 +66,18 @@
         },
         "name": {"type": "string", "minLength": 1},
         "value": {"type": "number"},
-        "unit": {"type": "string", "minLength": 1},
+        "unit": {
+          "enum": [
+            "ms",
+            "bytes",
+            "messages",
+            "allocations",
+            "MiB",
+            "repaints",
+            "boolean",
+            "frames"
+          ]
+        },
         "statistic": {"type": "string", "minLength": 1},
         "target": {"type": "number", "minimum": 0},
         "target_direction": {"enum": ["max", "min"]}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import os
 import re
@@ -26,7 +27,9 @@ from process_control import (  # noqa: E402
     ManagedCommandTimeout,
     ManagedProcess,
     blocked_termination_signals,
+    raise_termination_exceptions,
     run_managed_command,
+    termination_exceptions,
 )
 
 DEFAULT_MAX_TRACE_BYTES = 2 * 1024 * 1024 * 1024
@@ -172,16 +175,24 @@ def terminate_direct_process(
         return process.communicate(timeout=grace_seconds)
 
     graceful_errors: list[BaseException] = []
+    output: tuple[str, str] | None = None
     try:
         _signal_direct_group(process, signal.SIGTERM)
     except BaseException as error:
         graceful_errors.append(error)
     try:
-        return process.communicate(timeout=grace_seconds)
+        output = process.communicate(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
         pass
     except BaseException as error:
         graceful_errors.append(error)
+
+    if output is not None:
+        raise_termination_exceptions(
+            graceful_errors,
+            label=f"multiple termination requests while cleaning process {process.pid}",
+        )
+        return output
 
     final_errors: list[BaseException] = []
     group_killed = False
@@ -202,14 +213,28 @@ def terminate_direct_process(
         final_errors.append(error)
         output = None
 
+    errors = [*graceful_errors, *final_errors]
     if not group_killed or output is None or process.poll() is None:
-        details = "; ".join(
-            f"{type(error).__name__}: {error}"
-            for error in [*graceful_errors, *final_errors]
+        failure = CaptureError(
+            f"could not confirm reap of direct process group {process.pid}: "
+            + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
         )
-        raise CaptureError(
-            f"could not confirm reap of direct process group {process.pid}: {details}"
-        )
+        terminations = [
+            termination
+            for error in errors
+            for termination in termination_exceptions(error)
+        ]
+        if terminations:
+            raise BaseExceptionGroup(
+                f"termination requested and direct process group {process.pid} cleanup failed",
+                [*terminations, failure],
+            )
+        raise failure
+
+    raise_termination_exceptions(
+        errors,
+        label=f"multiple termination requests while cleaning process {process.pid}",
+    )
     return output
 
 
@@ -339,6 +364,49 @@ def _schema_names(toc: str) -> list[str]:
     ]
 
 
+_XCTRACE_START_DATE = re.compile(
+    r"^(?P<clock>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d{1,9}))?"
+    r"(?P<zone>Z|[+-]\d{2}:?\d{2})$"
+)
+
+
+def trace_start_unix_ns(toc: str) -> int:
+    """Convert xctrace's run start-date to exact Unix epoch nanoseconds."""
+
+    try:
+        root = ET.fromstring(toc)
+    except ET.ParseError as error:
+        raise CaptureError(f"xctrace TOC is invalid XML: {error}") from error
+    values = [
+        (element.text or "").strip()
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "start-date"
+        and (element.text or "").strip()
+    ]
+    if len(values) != 1:
+        raise CaptureError(
+            "xctrace TOC must contain exactly one timestamped run start-date"
+        )
+    match = _XCTRACE_START_DATE.fullmatch(values[0])
+    if match is None:
+        raise CaptureError(f"xctrace start-date is not ISO-8601: {values[0]!r}")
+    zone = match.group("zone")
+    if zone == "Z":
+        zone = "+00:00"
+    elif ":" not in zone:
+        zone = f"{zone[:3]}:{zone[3:]}"
+    try:
+        parsed = dt.datetime.fromisoformat(f"{match.group('clock')}{zone}")
+    except ValueError as error:
+        raise CaptureError(f"xctrace start-date is invalid: {values[0]!r}") from error
+    utc = parsed.astimezone(dt.timezone.utc)
+    delta = utc - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    whole_seconds = delta.days * 86_400 + delta.seconds
+    fraction = (match.group("fraction") or "").ljust(9, "0")
+    return whole_seconds * 1_000_000_000 + (int(fraction) if fraction else 0)
+
+
 def _element_text(element: ET.Element) -> str | None:
     formatted = element.attrib.get("fmt") or element.attrib.get("name")
     if formatted:
@@ -384,6 +452,27 @@ def _numeric_value(element: ET.Element, identities: dict[str, ET.Element]) -> in
             }[match.group(2).lower()]
             return int(float(match.group(1)) * multiplier)
     return None
+
+
+def _timestamp_value(
+    element: ET.Element,
+    identities: dict[str, ET.Element],
+) -> int | None:
+    """Read xctrace engineering time, whose raw integer unit is nanoseconds."""
+
+    resolved = _resolve(element, identities)
+    raw = resolved.text.strip() if resolved.text and resolved.text.strip() else None
+    if raw is None or re.fullmatch(r"[0-9]+", raw) is None:
+        return None
+    return int(raw)
+
+
+def _timestamp_column(columns: dict[str, str]) -> tuple[str, str]:
+    for preferred in ("start-time", "event-time", "time", "timestamp"):
+        for logical, engineering in columns.items():
+            if preferred in {logical.lower(), engineering.lower()}:
+                return logical, engineering
+    raise CaptureError("allocation export schema has no nanosecond timestamp column")
 
 
 def _parse_process_label(value: str) -> tuple[str, int | None]:
@@ -523,6 +612,7 @@ def parse_allocation_totals(
     xml_path: Path,
     *,
     candidate_attribution: list[dict[str, Any]],
+    trace_started_unix_ns: int,
 ) -> dict[str, Any]:
     try:
         root = ET.parse(xml_path).getroot()
@@ -551,9 +641,17 @@ def parse_allocation_totals(
             engineering = column.findtext("engineering-type")
             if mnemonic:
                 columns[mnemonic] = engineering or mnemonic
+    timestamp_logical, timestamp_engineering = _timestamp_column(columns)
 
+    claimed_intervals = {
+        pid: (item["started_unix_ns"], item["ended_unix_ns"])
+        for item in candidate_attribution
+        for pid in [item["host_pid"], *item["helper_pids"]]
+    }
     aggregates: dict[int, dict[str, Any]] = {}
     unattributed_rows = 0
+    excluded_unrelated_rows = 0
+    excluded_outside_interval_rows = 0
     total_rows = 0
     for row in root.iter():
         if row.tag.rsplit("}", 1)[-1] != "row":
@@ -577,11 +675,37 @@ def parse_allocation_totals(
         size = _numeric_value(size_element, identities)
         if size is None:
             continue
+
+        timestamp_element = cells.get(timestamp_logical)
+        if timestamp_element is None:
+            timestamp_element = cells.get(timestamp_engineering)
+        timestamp_relative_ns = (
+            _timestamp_value(timestamp_element, identities)
+            if timestamp_element is not None
+            else None
+        )
+        if timestamp_relative_ns is None:
+            raise CaptureError(
+                "allocation export row has an unavailable or unparseable "
+                "nanosecond timestamp"
+            )
+        timestamp_unix_ns = trace_started_unix_ns + timestamp_relative_ns
         total_rows += 1
+
         name, pid = _process_identity(row, identities)
         if pid is None:
             unattributed_rows += 1
             continue
+        interval = claimed_intervals.get(pid)
+        if interval is None:
+            excluded_unrelated_rows += 1
+            continue
+        if not interval[0] <= timestamp_unix_ns <= interval[1]:
+            # Numeric PIDs can be reused during an all-process capture. Rows from
+            # outside the candidate's explicit lifetime are never attributed.
+            excluded_outside_interval_rows += 1
+            continue
+
         aggregate = aggregates.setdefault(
             pid,
             {
@@ -596,18 +720,13 @@ def parse_allocation_totals(
         aggregate["cumulative_allocations"] += 1
         aggregate["cumulative_bytes"] += size
 
-    related_pids = {
-        pid
-        for item in candidate_attribution
-        for pid in [item["host_pid"], *item["helper_pids"]]
-    }
     candidates: list[dict[str, Any]] = []
     for item in candidate_attribution:
         host_pid = item["host_pid"]
         if host_pid not in aggregates:
             raise CaptureError(
-                f"allocation export contains no rows for {item['candidate']} "
-                f"candidate host pid {host_pid}"
+                f"allocation export contains no in-interval rows for "
+                f"{item['candidate']} candidate host pid {host_pid}"
             )
         helper_totals = [
             aggregates[pid]
@@ -628,15 +747,15 @@ def parse_allocation_totals(
             }
         )
 
-    excluded_rows = sum(
-        aggregate["cumulative_allocations"]
-        for pid, aggregate in aggregates.items()
-        if pid not in related_pids
-    )
     return {
         "allocation_rows": total_rows,
+        "allocation_timestamp_basis": (
+            "xctrace relative nanoseconds added to trace start-date"
+        ),
+        "trace_started_unix_ns": trace_started_unix_ns,
         "unattributed_rows": unattributed_rows,
-        "excluded_unrelated_process_rows": excluded_rows,
+        "excluded_unrelated_process_rows": excluded_unrelated_rows,
+        "excluded_outside_candidate_interval_rows": excluded_outside_interval_rows,
         "processes_with_allocations": len(aggregates),
         "candidate_processes": sorted(
             candidates,
@@ -660,6 +779,7 @@ def export_allocation_summary(
         maximum_output_bytes=4 * 1024 * 1024,
     )
     schemas = _schema_names(toc)
+    trace_started_unix_ns = trace_start_unix_ns(toc)
     allocation_schema = next(
         (schema for schema in schemas if schema == "allocations"),
         next((schema for schema in schemas if "allocation" in schema.lower()), None),
@@ -709,6 +829,7 @@ def export_allocation_summary(
         attribution = parse_allocation_totals(
             export_path,
             candidate_attribution=candidate_attribution,
+            trace_started_unix_ns=trace_started_unix_ns,
         )
     finally:
         export_path.unlink(missing_ok=True)
@@ -732,7 +853,10 @@ def export_allocation_summary(
         temporary.unlink(missing_ok=True)
 
 
-def _cleanup_failure(label: str, error: BaseException) -> CaptureError:
+def _cleanup_failure(label: str, error: BaseException) -> BaseException:
+    if termination_exceptions(error):
+        error.add_note(f"{label} was attempted before this termination propagated")
+        return error
     return CaptureError(f"{label}: {type(error).__name__}: {error}")
 
 
@@ -940,6 +1064,19 @@ def cli() -> int:
         print(f"allocation capture failed: {error}", file=sys.stderr)
         return 2
     except BaseExceptionGroup as error:
+        terminations = termination_exceptions(error)
+        if terminations:
+            first = terminations[0]
+            if isinstance(first, TerminationRequested):
+                print(
+                    f"allocation capture interrupted by {signal.Signals(first.signum).name}",
+                    file=sys.stderr,
+                )
+                return 128 + first.signum
+            if isinstance(first, KeyboardInterrupt):
+                print("allocation capture interrupted by SIGINT", file=sys.stderr)
+                return 130
+            raise first
         print(
             f"allocation capture cleanup failed: {exception_group_detail(error)}",
             file=sys.stderr,

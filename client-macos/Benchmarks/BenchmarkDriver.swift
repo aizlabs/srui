@@ -1151,6 +1151,11 @@ private func runWebCandidate(
         )
         window.isReleasedWhenClosed = false
         window.contentView = webView
+        if fullPaint {
+            window.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            pumpRunLoop(for: 0.02)
+        }
 
         let warmResult = try await loadAndObserveWebView(
             webView,

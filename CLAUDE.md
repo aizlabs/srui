@@ -21,7 +21,7 @@ cargo test -p srui-semantic-tree apply_transaction       # one test by name subs
 cargo fmt -p srui-sessiond                              # format only the crate you changed
 ```
 
-Never run `cargo fmt --all` (or bare `cargo fmt`) from `server-rust/`. That workspace has nine members; `--all` rewrites every crate and dirties files you did not touch. Format with `cargo fmt -p <crate>` (repeat `-p` for each crate you edited).
+Never run `cargo fmt --all` (or bare `cargo fmt`) from `server-rust/`. That workspace has ten members; `--all` rewrites every crate and dirties files you did not touch. Format with `cargo fmt -p <crate>` (repeat `-p` for each crate you edited).
 
 # Swift client — from client-macos/
 swift build
@@ -83,7 +83,7 @@ Dependency direction is strictly one-way: `protocol` → `semantic-tree` → {`j
 - `sessiond` — the long-lived daemon: `session.rs` (authoritative state, transaction broadcast, resume) + `connection.rs` (handshake with timeout, per-connection loop).
 - `ssh-bridge` — ephemeral proxy invoked as an SSH subsystem, forwarding stdio to the `sessiond` unix socket (§20.1). **stdout is the binary protocol stream**; all logging must go to stderr.
 - `sdk` — ergonomic server-side builders and `PropertyRef`/`TypeRef` constants for app authors; `examples/counter/` is the reference consumer.
-- `pty`, `resources` — currently skeletons.
+- `pty`, `resources` — bounded terminal/PTY streaming and content-addressed resource delivery.
 
 ### Client (`client-macos/`, SwiftPM, swift-tools 6.0, macOS 14+)
 
@@ -108,6 +108,6 @@ Layering is enforced by CI, not just convention:
 - Rust format/lint: `cargo fmt -p <crate>` and `cargo clippy -p <crate> --all-targets -- -D warnings`. Do not `cargo fmt --all`.
 - Rust module docs open with a `//!` block listing the spec sections implemented; keep that list current when a module gains or loses responsibility.
 - Swift files carry an equivalent header comment, plus the AppKit prohibition note in `SemanticModel`.
-- `benchmarks/*` and `examples/coding-agent-demo`, `examples/process-monitor` are README-only placeholders; only `examples/counter` is real code.
+- `benchmarks/` contains the §31 native benchmark drivers, orchestration, and committed report. `examples/coding-agent-demo`, `examples/process-monitor`, and `examples/counter` are executable reference applications.
 - A Swift test that spawns a process **must** set both `standardOutput` and `standardError` before `run()`. `swift-test` reads the test binary's stdout/stderr through pipes and returns only on EOF, so a server that inherits them and outlives the binary wedges the whole run with every test already passed and nothing printed. `scripts/check-test-process-stdio.sh` enforces this; `SSHTestSupport.launchSSHD`/`terminate` are the sshd choke point (sshd re-execs itself, so only shell-level redirection survives).
 - The `mcp__lc__edit` tool preserves mtimes and SwiftPM keys off mtime, so `touch` any edited Swift file before `swift test` or you will verify a stale binary.

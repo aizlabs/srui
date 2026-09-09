@@ -15,14 +15,16 @@ set -euo pipefail
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-tests=client-macos/Tests
-if [ ! -d "$tests" ]; then
-    echo "error: $tests does not exist" >&2
-    exit 1
-fi
+scan_roots=(client-macos/Tests client-macos/Benchmarks)
+for scan_root in "${scan_roots[@]}"; do
+    if [ ! -d "$scan_root" ]; then
+        echo "error: $scan_root does not exist" >&2
+        exit 1
+    fi
+done
 
 violations=$(
-    find "$tests" -name '*.swift' -print0 |
+    find "${scan_roots[@]}" -name '*.swift' -print0 |
         xargs -0 awk '
         FNR == 1 { delete declared; delete out; delete err }
 

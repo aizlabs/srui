@@ -1,0 +1,20 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - name: Run layered benchmark smoke suite
+        run: scripts/run-benchmarks --profile smoke --output-dir benchmark-artifacts --timeout 1200
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: srui-benchmark-report
+          path: benchmark-artifacts

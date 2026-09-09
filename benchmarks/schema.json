@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SRUI benchmark report",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "profile", "environment", "sections"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string"},
+    "profile": {"enum": ["smoke", "full"]},
+    "environment": {"type": "object"},
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "metrics", "assertions"],
+        "properties": {
+          "id": {"pattern": "^31\\.[1-6]$"},
+          "name": {"type": "string"},
+          "metrics": {"type": "array"},
+          "assertions": {"type": "array"}
+        }
+      }
+    }
+  }
+}

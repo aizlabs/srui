@@ -1,0 +1,907 @@
+{
+  "environment": {
+    "machine": "arm64",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.14.6"
+  },
+  "fixture": "benchmarks/fixtures/coding-agent-ui.json",
+  "generated_at": "2026-09-08T23:55:46.472585+00:00",
+  "profile": "full",
+  "schema_version": 1,
+  "sections": [
+    {
+      "assertions": [
+        {
+          "detail": "20 nodes encoded into 890 bytes",
+          "name": "shared fixture produced SRUI protobuf",
+          "passed": true
+        },
+        {
+          "detail": "890 bytes on both paths",
+          "name": "renderer and serializer consume the same abstract state",
+          "passed": true
+        }
+      ],
+      "id": "31.2",
+      "metrics": [
+        {
+          "name": "abstract state generation",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.0026249999999999997
+        },
+        {
+          "name": "abstract state generation",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.003875
+        },
+        {
+          "name": "abstract state generation",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.008708
+        },
+        {
+          "name": "protobuf serialization",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.010042
+        },
+        {
+          "name": "protobuf serialization",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.014083
+        },
+        {
+          "name": "protobuf serialization",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.022500000000000003
+        },
+        {
+          "name": "serialized transaction size",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 890.0
+        }
+      ],
+      "name": "Serialization",
+      "notes": [
+        "PTY spawn and renderer work are excluded from server serialization timing."
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "detail": "partial state discarded; retained replay/resync split preserved",
+          "name": "all reconnect boundary outcomes are deterministic",
+          "passed": true
+        },
+        {
+          "detail": "cached accepted result at revision 2; side-effect count remained 1",
+          "name": "lost ACK replay is DUPLICATE without a second side effect",
+          "passed": true
+        },
+        {
+          "detail": "attempt-token model is backed by the measured production reconnect suite",
+          "name": "superseded resume response is inert",
+          "passed": true
+        },
+        {
+          "detail": "exit 0; SRUI \u00a732 conformance \u2014 both\n==============================================================================\n #  suite                    result  notes\n------------------------------------------------------------------------------\n 8  reconnect                PASS    9 runner(s)\n==============================================================================\n1 passed, 0 failed, 0 documented gap(s), 0 not applicable",
+          "name": "production reconnect boundary suite",
+          "passed": true
+        }
+      ],
+      "id": "31.5",
+      "metrics": [
+        {
+          "name": "beyond journal retention",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 4.2e-05
+        },
+        {
+          "name": "immediately after event receipt",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.000833
+        },
+        {
+          "name": "immediately before event receipt",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 4.2e-05
+        },
+        {
+          "name": "lost ACK duplicate response",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.00025
+        },
+        {
+          "name": "mid-resource discard",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.004959
+        },
+        {
+          "name": "mid-transaction rollback",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.000917
+        },
+        {
+          "name": "superseded resume response",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 8.3e-05
+        },
+        {
+          "name": "within journal retention",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.00020800000000000001
+        },
+        {
+          "name": "production reconnect boundary suite",
+          "statistic": "wall",
+          "unit": "ms",
+          "value": 17415.984
+        }
+      ],
+      "name": "Reconnect",
+      "notes": []
+    },
+    {
+      "assertions": [
+        {
+          "detail": "6912 bytes compared with standalone shell PTY",
+          "name": "embedded replay preserves the complete retained byte stream",
+          "passed": true
+        },
+        {
+          "detail": "request before retained_start returned RangeUnavailable",
+          "name": "reconnect ring-buffer exhaustion is explicit",
+          "passed": true
+        },
+        {
+          "detail": "final offset 138240",
+          "name": "embedded terminal offsets remain contiguous",
+          "passed": true
+        }
+      ],
+      "id": "31.6",
+      "metrics": [
+        {
+          "name": "standalone PTY echo roundtrip",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 6.075375
+        },
+        {
+          "name": "standalone PTY echo roundtrip",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 6.491541
+        },
+        {
+          "name": "SRUI output ring append and frame",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.00025
+        },
+        {
+          "name": "SRUI output ring append and frame",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.000375
+        },
+        {
+          "name": "terminal payload",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 6912.0
+        },
+        {
+          "name": "embedded Terminal decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.84425
+        },
+        {
+          "name": "embedded Terminal decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 1.006875
+        },
+        {
+          "name": "embedded terminal frame",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 6912
+        }
+      ],
+      "name": "Terminal",
+      "notes": [
+        "The embedded measurement includes VT parsing, TerminalView snapshot apply, and local layout."
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "detail": "20 AppKit render handles",
+          "name": "representative fixture mounts all nodes",
+          "passed": true
+        },
+        {
+          "detail": "first progress and navigation completion observed",
+          "name": "warm WKWebView completed representative load",
+          "passed": true
+        }
+      ],
+      "id": "31.1",
+      "metrics": [
+        {
+          "name": "SRUI first visible paint",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 20.03525
+        },
+        {
+          "name": "SRUI first visible paint",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 23.060708
+        },
+        {
+          "name": "SRUI complete paint",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 20.072667
+        },
+        {
+          "name": "SRUI complete paint",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 23.101917
+        },
+        {
+          "name": "SRUI complete paint",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 25.920875
+        },
+        {
+          "name": "SRUI CPU time",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 16.811999999999827
+        },
+        {
+          "name": "SRUI CPU time",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 18.958000000000474
+        },
+        {
+          "name": "SRUI live allocation delta",
+          "statistic": "p50",
+          "unit": "allocations",
+          "value": 12099
+        },
+        {
+          "name": "SRUI process resident peak",
+          "statistic": "p50",
+          "unit": "MiB",
+          "value": 80.265625
+        },
+        {
+          "name": "renderer short-soak net heap growth",
+          "statistic": "last-first",
+          "unit": "MiB",
+          "value": 10.821365356445312
+        },
+        {
+          "name": "WKWebView first visible paint",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.537791
+        },
+        {
+          "name": "WKWebView complete paint",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.9415
+        },
+        {
+          "name": "WKWebView host-process CPU time",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 1.026999999999667
+        },
+        {
+          "name": "WKWebView host-process live allocation delta",
+          "statistic": "p50",
+          "unit": "allocations",
+          "value": 0
+        },
+        {
+          "name": "WKWebView host-process resident peak",
+          "statistic": "p50",
+          "unit": "MiB",
+          "value": 116.765625
+        },
+        {
+          "name": "SRUI representation",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 890
+        },
+        {
+          "name": "HTML representation",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 1082
+        }
+      ],
+      "name": "Local renderer",
+      "notes": [
+        "Full profile forces AppKit display after layout.",
+        "Live allocation delta is a process allocator sample; authoritative allocation attribution uses the documented xctrace full-profile command.",
+        "WKWebView host-process CPU and memory exclude WebContent helpers; the Instruments trace provides cross-process attribution.",
+        "A positive short-soak heap delta is an Instruments follow-up signal, not by itself a leak classification."
+      ]
+    },
+    {
+      "assertions": [
+        {
+          "detail": "no transaction is produced without a semantic mutation",
+          "name": "idle semantic UI emits zero SRUI traffic",
+          "passed": true
+        },
+        {
+          "detail": "598 bytes and 24 messages at every cadence",
+          "name": "wire bytes and message count are cadence independent",
+          "passed": true
+        },
+        {
+          "detail": "repaint counts [6, 12, 12, 24]",
+          "name": "local repaint count may vary independently",
+          "passed": true
+        },
+        {
+          "detail": "all cadences rendered progress 1.0 without structural invalidation",
+          "name": "coalesced presentation preserves final state and scalar classification",
+          "passed": true
+        }
+      ],
+      "id": "31.3",
+      "metrics": [
+        {
+          "name": "1 updates semantic decode/apply",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.007625
+        },
+        {
+          "name": "1 updates semantic decode/apply",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.015375
+        },
+        {
+          "name": "1 updates semantic decode/apply",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.105125
+        },
+        {
+          "name": "1 updates decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 8.352584
+        },
+        {
+          "name": "1 updates decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 8.758458
+        },
+        {
+          "name": "1 updates wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 23
+        },
+        {
+          "name": "1 updates message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "name": "100 updates semantic decode/apply",
+          "statistic": "p50",
+          "target": 1,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.08775
+        },
+        {
+          "name": "100 updates semantic decode/apply",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.098167
+        },
+        {
+          "name": "100 updates semantic decode/apply",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.108458
+        },
+        {
+          "name": "100 updates decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 8.465334
+        },
+        {
+          "name": "100 updates decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 9.204084
+        },
+        {
+          "name": "100 updates wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 2102
+        },
+        {
+          "name": "100 updates message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "name": "1000 updates semantic decode/apply",
+          "statistic": "p50",
+          "target": 5,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.788417
+        },
+        {
+          "name": "1000 updates semantic decode/apply",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.831
+        },
+        {
+          "name": "1000 updates semantic decode/apply",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.859125
+        },
+        {
+          "name": "1000 updates decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 9.813
+        },
+        {
+          "name": "1000 updates decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 10.453375
+        },
+        {
+          "name": "1000 updates wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 21002
+        },
+        {
+          "name": "1000 updates message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "name": "60Hz wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 598
+        },
+        {
+          "name": "60Hz message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 24
+        },
+        {
+          "name": "60Hz repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 6
+        },
+        {
+          "name": "120Hz wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 598
+        },
+        {
+          "name": "120Hz message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 24
+        },
+        {
+          "name": "120Hz repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 12
+        },
+        {
+          "name": "144Hz wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 598
+        },
+        {
+          "name": "144Hz message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 24
+        },
+        {
+          "name": "144Hz repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 12
+        },
+        {
+          "name": "240Hz wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 598
+        },
+        {
+          "name": "240Hz message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 24
+        },
+        {
+          "name": "240Hz repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 24
+        },
+        {
+          "name": "idle UI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 0
+        },
+        {
+          "name": "idle UI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 0
+        }
+      ],
+      "name": "Mutation and frame independence",
+      "notes": []
+    },
+    {
+      "assertions": [
+        {
+          "detail": "largest p50 increase was 0.0218 ms",
+          "name": "local interactions do not acquire one RTT",
+          "passed": true
+        },
+        {
+          "detail": "controlled waits tracked 100/300/600ms RTT",
+          "name": "injected transport delay affects server-dependent feedback",
+          "passed": true
+        },
+        {
+          "detail": "network waits occur only in the separately measured server-dependent path",
+          "name": "render and local-feedback paths perform no synchronous network RTT",
+          "passed": true
+        },
+        {
+          "detail": "1MiB/s serialization, one 100ms retry, and a 50ms interruption",
+          "name": "bandwidth, loss, and interruption controls were exercised",
+          "passed": true
+        }
+      ],
+      "id": "31.4",
+      "metrics": [
+        {
+          "name": "IME composition at 0ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.145292
+        },
+        {
+          "name": "caret movement at 0ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.026833
+        },
+        {
+          "name": "hover and pressed at 0ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.005541
+        },
+        {
+          "name": "menu opening at 0ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.003917
+        },
+        {
+          "name": "scrolling at 0ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.024
+        },
+        {
+          "name": "text entry at 0ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.00125
+        },
+        {
+          "name": "text selection at 0ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.026791
+        },
+        {
+          "name": "server-dependent round trip at 0ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 12.02075
+        },
+        {
+          "name": "IME composition at 100ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.155625
+        },
+        {
+          "name": "caret movement at 100ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.028708
+        },
+        {
+          "name": "hover and pressed at 100ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.005917
+        },
+        {
+          "name": "menu opening at 100ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.00425
+        },
+        {
+          "name": "scrolling at 100ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.026
+        },
+        {
+          "name": "text entry at 100ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.001375
+        },
+        {
+          "name": "text selection at 100ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.028459
+        },
+        {
+          "name": "server-dependent round trip at 100ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 307.714166
+        },
+        {
+          "name": "IME composition at 300ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.161625
+        },
+        {
+          "name": "caret movement at 300ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.028333
+        },
+        {
+          "name": "hover and pressed at 300ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.006083
+        },
+        {
+          "name": "menu opening at 300ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.004375
+        },
+        {
+          "name": "scrolling at 300ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.037708
+        },
+        {
+          "name": "text entry at 300ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.001375
+        },
+        {
+          "name": "text selection at 300ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.02975
+        },
+        {
+          "name": "server-dependent round trip at 300ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 304.3335
+        },
+        {
+          "name": "IME composition at 600ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.167083
+        },
+        {
+          "name": "caret movement at 600ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.031167
+        },
+        {
+          "name": "hover and pressed at 600ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.006167
+        },
+        {
+          "name": "menu opening at 600ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.0045
+        },
+        {
+          "name": "scrolling at 600ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.029333
+        },
+        {
+          "name": "text entry at 600ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.001417
+        },
+        {
+          "name": "text selection at 600ms RTT",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.029334
+        },
+        {
+          "name": "server-dependent round trip at 600ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 636.044959
+        },
+        {
+          "name": "1MiB/s bandwidth-limited 16KiB transfer",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 23.40425
+        },
+        {
+          "name": "deterministic lost-frame retry penalty",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 109.923958
+        },
+        {
+          "name": "controlled transport interruption",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 52.175459
+        },
+        {
+          "name": "maximum RTT-induced local latency delta",
+          "statistic": "p50",
+          "target": 16.67,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.021791000000000005
+        }
+      ],
+      "name": "Network and local interaction",
+      "notes": [
+        "Menu measurement covers local NSPopUpButton menu preparation without entering a blocking tracking loop."
+      ]
+    }
+  ]
+}

@@ -18,6 +18,7 @@ let package = Package(
         .library(name: "Resources", targets: ["Resources"]),
         .library(name: "Accessibility", targets: ["Accessibility"]),
         .executable(name: "RendererDemoApp", targets: ["RendererDemoApp"]),
+        .executable(name: "BenchmarkDriver", targets: ["BenchmarkDriver"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.2"),
@@ -86,6 +87,17 @@ let package = Package(
                 "Resources",
             ],
             path: "RendererDemoApp"
+        ),
+        .executableTarget(
+            name: "BenchmarkDriver",
+            dependencies: [
+                "Protocol",
+                "SemanticModel",
+                "RendererAppKit",
+                "Terminal",
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            path: "Benchmarks"
         ),
         .target(
             name: "Collections",

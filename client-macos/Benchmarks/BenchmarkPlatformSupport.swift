@@ -368,26 +368,38 @@ func benchmarkObserveOnScreenPaint(_ window: NSWindow) async throws -> OnScreenP
         throw BenchmarkFailure.message("benchmark window has no display")
     }
     let framebufferBeforeSubmission = screen.lastDisplayUpdateTimestamp
+    NSApplication.shared.activate(ignoringOtherApps: true)
     window.makeKeyAndOrderFront(nil)
+    window.orderFrontRegardless()
     window.contentView?.layoutSubtreeIfNeeded()
     window.contentView?.needsDisplay = true
     window.displayIfNeeded()
     CATransaction.flush()
 
+    let windowID = CGWindowID(window.windowNumber)
     let visibilityDeadline = Date().addingTimeInterval(2)
+    var windowServerOnscreen = windowServerReportsOnscreen(windowID)
     while (
         window.isVisible == false
             || window.occlusionState.contains(.visible) == false
-            || windowServerReportsOnscreen(CGWindowID(window.windowNumber)) == false
+            || windowServerOnscreen == false
     ) && Date() < visibilityDeadline {
+        // Activation and ordering can be asynchronous for accessory applications. Reassert the
+        // same real presentation request while retaining every WindowServer visibility gate.
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
+        CATransaction.flush()
         try await Task.sleep(for: .milliseconds(1))
+        windowServerOnscreen = windowServerReportsOnscreen(windowID)
     }
-    let windowID = CGWindowID(window.windowNumber)
-    guard window.isVisible,
-          window.occlusionState.contains(.visible),
-          windowServerReportsOnscreen(windowID) else {
+    let occlusionVisible = window.occlusionState.contains(.visible)
+    guard window.isVisible, occlusionVisible, windowServerOnscreen else {
         throw BenchmarkFailure.message(
-            "WindowServer did not report benchmark window \(windowID) visible and unoccluded"
+            "WindowServer did not report benchmark window \(windowID) visible and unoccluded "
+                + "(NSWindow visible=\(window.isVisible), occlusionVisible=\(occlusionVisible), "
+                + "CGWindow onscreen=\(windowServerOnscreen), applicationActive=\(NSApplication.shared.isActive))"
         )
     }
     try benchmarkAwaitFramebufferAdvance(

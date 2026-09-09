@@ -140,44 +140,65 @@ def wait_for_process_identities_gone(
     timeout: float = DEFAULT_IDENTITY_EXIT_TIMEOUT_SECONDS,
     identity_reader: Callable[[int], int | None] | None = None,
 ) -> None:
-    """Wait until every original process identity exits, without signaling raw PIDs."""
+    """Drain exact identities before propagating handled termination signals."""
 
-    if timeout < 0:
-        raise ValueError("process identity timeout must be non-negative")
-    expected: dict[int, int] = {}
-    for pid, birth_unix_ns in identities:
-        if (
-            isinstance(pid, bool)
-            or not isinstance(pid, int)
-            or pid <= 0
-            or isinstance(birth_unix_ns, bool)
-            or not isinstance(birth_unix_ns, int)
-            or birth_unix_ns <= 0
-        ):
-            raise ManagedCommandError(f"{label} contains an invalid process identity")
-        if pid in expected:
-            raise ManagedCommandError(f"{label} contains duplicate process PID {pid}")
-        expected[pid] = birth_unix_ns
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
+    postcondition_error: BaseException | None = None
+    try:
+        if timeout < 0:
+            raise ValueError("process identity timeout must be non-negative")
+        expected: dict[int, int] = {}
+        for pid, birth_unix_ns in identities:
+            if (
+                isinstance(pid, bool)
+                or not isinstance(pid, int)
+                or pid <= 0
+                or isinstance(birth_unix_ns, bool)
+                or not isinstance(birth_unix_ns, int)
+                or birth_unix_ns <= 0
+            ):
+                raise ManagedCommandError(f"{label} contains an invalid process identity")
+            if pid in expected:
+                raise ManagedCommandError(f"{label} contains duplicate process PID {pid}")
+            expected[pid] = birth_unix_ns
 
-    reader = identity_reader or process_birth_unix_ns
-    deadline = time.monotonic() + timeout
-    pending = dict(expected)
-    while pending:
-        for pid, original_birth in list(pending.items()):
-            current_birth = reader(pid)
-            if current_birth is None or current_birth != original_birth:
-                del pending[pid]
-        if not pending:
-            return
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            details = ", ".join(
-                f"{pid}@{birth}" for pid, birth in sorted(pending.items())
-            )
-            raise ManagedCommandError(
-                f"{label} still has original process identities alive: {details}"
-            )
-        time.sleep(min(POLL_SECONDS, remaining))
+        reader = identity_reader or process_birth_unix_ns
+        deadline = time.monotonic() + timeout
+        pending = dict(expected)
+        while pending:
+            for pid, original_birth in list(pending.items()):
+                current_birth = reader(pid)
+                if current_birth is None or current_birth != original_birth:
+                    del pending[pid]
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                details = ", ".join(
+                    f"{pid}@{birth}" for pid, birth in sorted(pending.items())
+                )
+                raise ManagedCommandError(
+                    f"{label} still has original process identities alive: {details}"
+                )
+            time.sleep(min(POLL_SECONDS, remaining))
+    except BaseException as error:
+        postcondition_error = error
+
+    deferred_termination: BaseException | None = None
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException as error:
+        deferred_termination = error
+
+    if postcondition_error is not None and deferred_termination is not None:
+        raise BaseExceptionGroup(
+            f"{label} identity postcondition and deferred termination both failed",
+            [postcondition_error, deferred_termination],
+        )
+    if postcondition_error is not None:
+        raise postcondition_error
+    if deferred_termination is not None:
+        raise deferred_termination
 
 
 def spawn_supervisor(

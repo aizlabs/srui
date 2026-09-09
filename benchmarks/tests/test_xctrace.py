@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -412,6 +413,13 @@ def test_capture_cleanup_attempts_every_resource_and_removes_failed_capture(
 ) -> None:
     attempted: list[str] = []
 
+    class FailingWatcher:
+        pid = 999
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
     class FailingManaged:
         closed = False
 
@@ -435,17 +443,33 @@ def test_capture_cleanup_attempts_every_resource_and_removes_failed_capture(
         raise RuntimeError("watcher failed")
 
     monkeypatch.setattr(benchmark_xctrace, "terminate_direct_process", fail_watcher)
+    watcher = FailingWatcher()
     errors = benchmark_xctrace.cleanup_capture(
         driver=FailingManaged("driver"),
         recorder=FailingManaged("recorder"),
-        watcher=object(),
+        watcher=watcher,
         trace=trace,
         sidecar=sidecar,
         retain_outputs=True,
     )
 
-    assert attempted == ["driver", "driver", "recorder", "recorder", "watcher"]
+    assert attempted == [
+        "driver",
+        "driver",
+        "recorder",
+        "recorder",
+        "watcher",
+        "watcher",
+    ]
     assert len(errors) == 3
+    watcher_group = errors[2].__cause__
+    assert isinstance(watcher_group, BaseExceptionGroup)
+    retained = [
+        error
+        for error in watcher_group.exceptions
+        if getattr(error, "process_handle", None) is watcher
+    ]
+    assert len(retained) == 1
     assert not trace.exists()
     assert not sidecar.exists()
 
@@ -509,12 +533,103 @@ time.sleep(60)
             managed.terminate()
 
 
+def test_capture_cleanup_retries_real_notification_watcher(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ready_path = tmp_path / "notification-watcher.ready"
+    watcher = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,signal,sys,time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "pathlib.Path(sys.argv[1]).write_text('ready'); "
+                "time.sleep(60)"
+            ),
+            str(ready_path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + 2
+    while not ready_path.exists():
+        if time.monotonic() >= deadline:
+            watcher.kill()
+            watcher.wait(timeout=2)
+            pytest.fail("notification watcher did not install its signal handler")
+        time.sleep(0.01)
+
+    original_killpg = benchmark_xctrace.os.killpg
+    original_kill = watcher.kill
+    original_terminate = benchmark_xctrace.terminate_direct_process
+    group_kill_attempts = 0
+    direct_kill_attempts = 0
+
+    def fail_first_group_kill(process_group: int, signum: int) -> None:
+        nonlocal group_kill_attempts
+        if signum == signal.SIGKILL:
+            group_kill_attempts += 1
+            if group_kill_attempts == 1:
+                raise PermissionError("synthetic watcher group kill failure")
+        original_killpg(process_group, signum)
+
+    def fail_first_direct_kill() -> None:
+        nonlocal direct_kill_attempts
+        direct_kill_attempts += 1
+        if direct_kill_attempts == 1:
+            raise PermissionError("synthetic watcher direct kill failure")
+        original_kill()
+
+    def fast_terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
+        return original_terminate(process, grace_seconds=0.03)
+
+    monkeypatch.setattr(benchmark_xctrace.os, "killpg", fail_first_group_kill)
+    monkeypatch.setattr(watcher, "kill", fail_first_direct_kill)
+    monkeypatch.setattr(
+        benchmark_xctrace,
+        "terminate_direct_process",
+        fast_terminate,
+    )
+    try:
+        errors = benchmark_xctrace.cleanup_capture(
+            driver=None,
+            recorder=None,
+            watcher=watcher,
+            trace=tmp_path / "capture.trace",
+            sidecar=tmp_path / "capture.trace.summary.json",
+            retain_outputs=False,
+        )
+        assert errors == []
+        assert group_kill_attempts == 2
+        assert watcher.poll() is not None
+        assert_process_gone(watcher.pid)
+    finally:
+        monkeypatch.setattr(benchmark_xctrace.os, "killpg", original_killpg)
+        monkeypatch.setattr(watcher, "kill", original_kill)
+        if watcher.poll() is None:
+            watcher.kill()
+            watcher.communicate(timeout=2)
+
+
 def test_capture_cleanup_preserves_termination_class_after_all_attempts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     class CleanupTermination(BaseException):
         pass
+
+    class FailingWatcher:
+        pid = 998
+
+        @staticmethod
+        def poll() -> None:
+            return None
 
     interruption = CleanupTermination()
     trace = tmp_path / "capture.trace"
@@ -533,12 +648,16 @@ def test_capture_cleanup_preserves_termination_class_after_all_attempts(
     errors = benchmark_xctrace.cleanup_capture(
         driver=None,
         recorder=None,
-        watcher=object(),
+        watcher=FailingWatcher(),
         trace=trace,
         sidecar=sidecar,
         retain_outputs=False,
     )
 
-    assert errors == [interruption]
+    assert len(errors) == 1
+    assert benchmark_xctrace.termination_exceptions(errors[0]) == [
+        interruption,
+        interruption,
+    ]
     assert not trace.exists()
     assert not sidecar.exists()

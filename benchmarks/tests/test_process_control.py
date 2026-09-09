@@ -95,6 +95,96 @@ def test_process_identity_wait_rejects_same_identity_persistence() -> None:
         )
 
 
+def test_identity_wait_defers_real_sigterm_until_real_process_exits() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.15)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    first_lookup = threading.Event()
+    caller_thread = threading.get_ident()
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def identity_reader(pid: int) -> int | None:
+        assert pid == child.pid
+        first_lookup.set()
+        return 456 if child.poll() is None else None
+
+    def send_during_wait() -> None:
+        assert first_lookup.wait(timeout=2)
+        signal.pthread_kill(caller_thread, signal.SIGTERM)
+
+    def raise_termination(_signum: int, _frame: object) -> None:
+        raise RequestedTermination
+
+    sender = threading.Thread(target=send_during_wait)
+    signal.signal(signal.SIGTERM, raise_termination)
+    sender.start()
+    try:
+        with pytest.raises(RequestedTermination):
+            process_control.wait_for_process_identities_gone(
+                [(child.pid, 456)],
+                label="real exiting candidate",
+                timeout=2,
+                identity_reader=identity_reader,
+            )
+    finally:
+        sender.join(timeout=2)
+        signal.signal(signal.SIGTERM, previous_handler)
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+    assert child.returncode == 0
+
+
+def test_identity_wait_preserves_timeout_and_deferred_termination() -> None:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    first_lookup = threading.Event()
+    caller_thread = threading.get_ident()
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def identity_reader(pid: int) -> int | None:
+        assert pid == child.pid
+        first_lookup.set()
+        return 789
+
+    def send_during_wait() -> None:
+        assert first_lookup.wait(timeout=2)
+        signal.pthread_kill(caller_thread, signal.SIGTERM)
+
+    def raise_termination(_signum: int, _frame: object) -> None:
+        raise RequestedTermination
+
+    sender = threading.Thread(target=send_during_wait)
+    signal.signal(signal.SIGTERM, raise_termination)
+    sender.start()
+    try:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            process_control.wait_for_process_identities_gone(
+                [(child.pid, 789)],
+                label="real persistent candidate",
+                timeout=0.1,
+                identity_reader=identity_reader,
+            )
+    finally:
+        sender.join(timeout=2)
+        signal.signal(signal.SIGTERM, previous_handler)
+        child.kill()
+        child.wait(timeout=2)
+
+    nested = raised.value.exceptions
+    assert any(isinstance(error, ManagedCommandError) for error in nested)
+    assert any(isinstance(error, RequestedTermination) for error in nested)
+
+
 def test_finished_supervisor_pid_is_never_treated_as_a_live_process_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

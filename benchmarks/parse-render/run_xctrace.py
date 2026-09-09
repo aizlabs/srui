@@ -26,6 +26,7 @@ from process_control import (  # noqa: E402
     ManagedCommandError,
     ManagedCommandTimeout,
     ManagedProcess,
+    TERMINATION_SIGNALS,
     blocked_termination_signals,
     raise_termination_exceptions,
     run_managed_command,
@@ -899,7 +900,9 @@ def _cleanup_failure(label: str, error: BaseException) -> BaseException:
     if termination_exceptions(error):
         error.add_note(f"{label} was attempted before this termination propagated")
         return error
-    return CaptureError(f"{label}: {type(error).__name__}: {error}")
+    failure = CaptureError(f"{label}: {type(error).__name__}: {error}")
+    failure.__cause__ = error
+    return failure
 
 
 def _terminate_managed_with_retry(
@@ -931,12 +934,91 @@ def _terminate_managed_with_retry(
         f"{label} remains pinned after two bounded cleanup attempts; "
         f"supervisor PID {supervisor_pid}, controls {process.ready_path.parent}"
     )
+    failure.process_handle = process  # type: ignore[attr-defined]
     if errors:
         raise BaseExceptionGroup(
             f"{label} cleanup retry failed",
             [*errors, failure],
         )
     raise failure
+
+
+def _drain_direct_process_with_retry(
+    process: subprocess.Popen[str],
+    *,
+    label: str,
+) -> None:
+    errors: list[BaseException] = []
+    for _attempt in range(2):
+        try:
+            terminate_direct_process(process)
+        except BaseException as error:
+            errors.append(error)
+        else:
+            raise_termination_exceptions(
+                errors,
+                label=f"multiple termination requests while cleaning {label}",
+            )
+            return
+
+        try:
+            reaped = process.poll() is not None
+        except BaseException as error:
+            errors.append(error)
+            continue
+        if reaped:
+            try:
+                process.communicate(timeout=2)
+            except BaseException as error:
+                errors.append(error)
+            else:
+                raise_termination_exceptions(
+                    errors,
+                    label=f"multiple termination requests while cleaning {label}",
+                )
+                return
+
+    failure = CaptureError(
+        f"{label} remains alive after two bounded cleanup attempts; "
+        f"process PID {process.pid} retained"
+    )
+    failure.process_handle = process  # type: ignore[attr-defined]
+    raise BaseExceptionGroup(
+        f"{label} cleanup retry failed",
+        [*errors, failure],
+    )
+
+
+def _terminate_direct_with_retry(
+    process: subprocess.Popen[str],
+    *,
+    label: str,
+) -> None:
+    previous_mask = signal.pthread_sigmask(
+        signal.SIG_BLOCK,
+        TERMINATION_SIGNALS,
+    )
+    cleanup_error: BaseException | None = None
+    try:
+        _drain_direct_process_with_retry(process, label=label)
+    except BaseException as error:
+        cleanup_error = error
+
+    deferred_termination: BaseException | None = None
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException as error:
+        deferred_termination = error
+
+    if cleanup_error is not None and deferred_termination is not None:
+        raise BaseExceptionGroup(
+            f"{label} cleanup and deferred termination both failed",
+            [cleanup_error, deferred_termination],
+        )
+    if cleanup_error is not None:
+        raise cleanup_error
+    if deferred_termination is not None:
+        raise deferred_termination
 
 
 def cleanup_capture(
@@ -972,7 +1054,13 @@ def cleanup_capture(
         )
     if watcher is not None:
         process_actions.append(
-            ("notification watcher cleanup", lambda: terminate_direct_process(watcher))
+            (
+                "notification watcher cleanup",
+                lambda: _terminate_direct_with_retry(
+                    watcher,
+                    label="notification watcher",
+                ),
+            )
         )
 
     for label, action in process_actions:

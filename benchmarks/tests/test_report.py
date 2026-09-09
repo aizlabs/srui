@@ -25,7 +25,13 @@ XCTRACE_SPEC.loader.exec_module(benchmark_xctrace)
 
 
 def metric(name: str = "measurement") -> dict[str, Any]:
-    return {"name": name, "value": 1.0, "unit": "ms", "statistic": "p50"}
+    return {
+        "id": "measurement",
+        "name": name,
+        "value": 1.0,
+        "unit": "ms",
+        "statistic": "p50",
+    }
 
 
 def section(section_id: str) -> dict[str, Any]:
@@ -33,7 +39,7 @@ def section(section_id: str) -> dict[str, Any]:
         "id": section_id,
         "name": f"Section {section_id}",
         "metrics": [metric()],
-        "assertions": [{"name": "correct", "passed": True}],
+        "assertions": [{"id": "correct", "name": "correct", "passed": True}],
         "notes": [],
     }
 
@@ -191,6 +197,95 @@ def test_zero_exit_without_conformance_contract_fails_verification(
     assert "missing required output" in detail
 
 
+def payload_for_driver(driver: dict[str, Any]) -> dict[str, Any]:
+    expected = benchmark_run.EXPECTED_DRIVER_INVENTORY[driver["name"]]
+    sections = []
+    for section_id in driver["sections"]:
+        inventory = expected[section_id]
+        sections.append(
+            {
+                "id": section_id,
+                "name": f"Section {section_id}",
+                "metrics": [
+                    {
+                        "id": metric_id,
+                        "name": metric_id,
+                        "value": 1.0,
+                        "unit": "ms",
+                        "statistic": statistic,
+                    }
+                    for metric_id, statistic in sorted(inventory["metrics"])
+                ],
+                "assertions": [
+                    {
+                        "id": assertion_id,
+                        "name": assertion_id,
+                        "passed": True,
+                    }
+                    for assertion_id in sorted(inventory["assertions"])
+                ],
+                "notes": [],
+            }
+        )
+    artifacts = artifact()
+    if driver["name"] == "macos":
+        artifacts["renderer_process_attribution"] = [
+            {
+                "candidate": "srui",
+                "driver_pid": 42,
+                "host_pid": 43,
+                "helper_pids": [],
+                "started_unix_ns": 1,
+                "ended_unix_ns": 2,
+                "helper_pid_source": "no helper processes",
+            },
+            {
+                "candidate": "webkit",
+                "driver_pid": 42,
+                "host_pid": 44,
+                "helper_pids": [45],
+                "started_unix_ns": 3,
+                "ended_unix_ns": 4,
+                "helper_pid_source": "WKWebView diagnostic process identifiers",
+            },
+        ]
+    return {"artifacts": artifacts, "sections": sections}
+
+
+@pytest.mark.parametrize("driver_name", ["rust", "macos"])
+def test_driver_inventory_accepts_only_complete_declared_measurements(
+    driver_name: str,
+) -> None:
+    driver = next(
+        item for item in valid_manifest()["drivers"] if item["name"] == driver_name
+    )
+    payload = payload_for_driver(driver)
+    benchmark_run.validate_driver_output(payload, driver)
+
+    payload["sections"][0]["metrics"].pop()
+    with pytest.raises(benchmark_run.BenchmarkError, match="metric inventory"):
+        benchmark_run.validate_driver_output(payload, driver)
+
+
+def test_macos_attribution_is_bound_to_launched_driver_pid() -> None:
+    driver = next(
+        item for item in valid_manifest()["drivers"] if item["name"] == "macos"
+    )
+    payload = payload_for_driver(driver)
+    benchmark_run.validate_driver_output(payload, driver, launched_pid=42)
+
+    with pytest.raises(benchmark_run.BenchmarkError, match="does not match launched"):
+        benchmark_run.validate_driver_output(payload, driver, launched_pid=99)
+
+
+def test_driver_schema_requires_stable_measurement_ids() -> None:
+    driver = valid_manifest()["drivers"][0]
+    payload = payload_for_driver(driver)
+    del payload["sections"][0]["metrics"][0]["id"]
+    with pytest.raises(benchmark_run.BenchmarkError, match="schema violation"):
+        benchmark_run.validate_driver_output(payload, driver)
+
+
 def test_driver_output_must_match_declared_sections() -> None:
     driver = valid_manifest()["drivers"][0]
     payload = {
@@ -210,9 +305,11 @@ def test_canonical_parity_compares_digest_and_byte_count() -> None:
     assert sections["31.2"]["assertions"][-1]["passed"] is False
 
     sections = {"31.2": section("31.2")}
+    macos_artifact = artifact()
+    macos_artifact["renderer_process_attribution"] = []
     benchmark_run.append_parity_assertion(
         sections,
-        {"rust": artifact(), "macos": artifact()},
+        {"rust": artifact(), "macos": macos_artifact},
     )
     assert sections["31.2"]["assertions"][-1]["passed"] is True
     assert "exact bytes" in sections["31.2"]["assertions"][-1]["detail"]
@@ -268,7 +365,11 @@ def test_full_failed_run_leaves_existing_baseline_untouched(
         emitted = []
         for section_id in driver["sections"]:
             item = section(section_id)
+            item["metrics"][0]["id"] = f"{driver['name']}_{section_id.replace('.', '_')}"
             item["metrics"][0]["name"] = f"{driver['name']} measurement"
+            item["assertions"][0]["id"] = (
+                f"{driver['name']}_{section_id.replace('.', '_')}_correct"
+            )
             if driver["name"] == "rust" and section_id == "31.2":
                 item["assertions"][0]["passed"] = False
             emitted.append(item)

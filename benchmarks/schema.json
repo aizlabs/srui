@@ -4,6 +4,32 @@
   "title": "SRUI benchmark schema bundle",
   "$ref": "#/$defs/report",
   "$defs": {
+    "renderer_process_attribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "driver_pid",
+        "host_pid",
+        "helper_pids",
+        "started_unix_ns",
+        "ended_unix_ns",
+        "helper_pid_source"
+      ],
+      "properties": {
+        "candidate": {"enum": ["srui", "webkit"]},
+        "driver_pid": {"type": "integer", "minimum": 1},
+        "host_pid": {"type": "integer", "minimum": 1},
+        "helper_pids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "started_unix_ns": {"type": "integer", "minimum": 1},
+        "ended_unix_ns": {"type": "integer", "minimum": 1},
+        "helper_pid_source": {"type": "string", "minLength": 1}
+      }
+    },
     "artifact": {
       "type": "object",
       "additionalProperties": false,
@@ -19,14 +45,25 @@
         "canonical_transaction_bytes": {
           "type": "integer",
           "minimum": 1
+        },
+        "renderer_process_attribution": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/renderer_process_attribution"}
         }
       }
     },
     "metric": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "value", "unit", "statistic"],
+      "required": ["id", "name", "value", "unit", "statistic"],
       "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[._][a-z0-9]+)*$"
+        },
         "name": {"type": "string", "minLength": 1},
         "value": {"type": "number"},
         "unit": {"type": "string", "minLength": 1},
@@ -42,8 +79,12 @@
     "assertion": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "passed"],
+      "required": ["id", "name", "passed"],
       "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[._][a-z0-9]+)*$"
+        },
         "name": {"type": "string", "minLength": 1},
         "passed": {"type": "boolean"},
         "detail": {"type": "string"}

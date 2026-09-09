@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -13,7 +14,12 @@ BENCHMARKS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BENCHMARKS))
 
 import process_control  # noqa: E402
-from process_control import ManagedCommandTimeout, run_managed_command  # noqa: E402
+from process_control import (  # noqa: E402
+    ManagedCommandError,
+    ManagedCommandTimeout,
+    ManagedProcess,
+    run_managed_command,
+)
 
 SLEEPER = """
 import os
@@ -92,6 +98,107 @@ def test_finished_supervisor_pid_is_never_treated_as_a_live_process_group(
     monkeypatch.setattr(process_control, "_signal_group", forbidden)
 
     assert process_control.terminate_supervised_process(FinishedSupervisor()) == ("", "")
+
+
+def test_spawn_signal_window_registers_then_reaps_real_process_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "spawn-window-child.pid"
+    supervisor_pids: list[int] = []
+    child_pids: list[int] = []
+    original_spawn = process_control.spawn_supervisor
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def raise_termination(_signum: int, _frame: object) -> None:
+        raise RequestedTermination
+
+    def spawn_then_signal(
+        command: list[str],
+        **kwargs: object,
+    ) -> subprocess.Popen[str]:
+        process = original_spawn(command, **kwargs)
+        supervisor_pids.append(process.pid)
+        child_pids.append(wait_for_pid(pid_file))
+        signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+        return process
+
+    signal.signal(signal.SIGTERM, raise_termination)
+    monkeypatch.setattr(process_control, "spawn_supervisor", spawn_then_signal)
+    try:
+        with pytest.raises(RequestedTermination):
+            ManagedProcess.start(
+                [sys.executable, "-c", SLEEPER, str(pid_file)],
+                cwd=tmp_path,
+                label="spawn signal window",
+                cleanup_grace_seconds=0.05,
+            )
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+    assert len(supervisor_pids) == 1
+    assert len(child_pids) == 1
+    assert_process_gone(supervisor_pids[0])
+    assert_process_gone(child_pids[0])
+
+
+def test_enumeration_failure_still_kills_and_reaps_pinned_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "enumeration-child.pid"
+    managed = ManagedProcess.start(
+        [sys.executable, "-c", SLEEPER, str(pid_file)],
+        cwd=tmp_path,
+        label="enumeration failure",
+        cleanup_grace_seconds=0.05,
+    )
+    child_pid = wait_for_pid(pid_file)
+
+    def fail_enumeration(_process_group: int) -> set[int]:
+        raise ManagedCommandError("synthetic ps failure")
+
+    monkeypatch.setattr(process_control, "process_group_members", fail_enumeration)
+    managed.terminate()
+
+    assert managed.closed
+    assert_process_gone(child_pid)
+
+
+def test_failed_reap_keeps_control_files_until_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    managed = ManagedProcess(
+        [sys.executable, "-c", "pass"],
+        tmp_path,
+        "retry cleanup",
+        0.05,
+    )
+    managed.supervisor = object()  # type: ignore[assignment]
+    controls = managed.ready_path.parent
+    attempts = 0
+
+    def flaky_reap(
+        _process: object,
+        _grace_seconds: float,
+    ) -> tuple[str, str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ManagedCommandError("synthetic reap failure")
+        return "", ""
+
+    monkeypatch.setattr(process_control, "terminate_supervised_process", flaky_reap)
+    with pytest.raises(ManagedCommandError, match="synthetic reap failure"):
+        managed.terminate()
+
+    assert not managed.closed
+    assert controls.exists()
+
+    managed.terminate()
+    assert managed.closed
+    assert not controls.exists()
 
 
 def test_successful_command_reaps_residual_descendant(tmp_path: Path) -> None:

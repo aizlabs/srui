@@ -9,8 +9,9 @@ Run a repeatable smoke measurement from the repository root:
 
 Results go to .benchmark-results/latest.json and latest.md. The command runs native release
 drivers, writes each driver result to a private temporary file, validates the manifest, native
-driver payloads, and merged report against benchmarks/schema.json, enforces process-group
-timeouts, merges the measurements, and then times the production §32 reconnect suite. The harness
+driver payloads, and merged report against benchmarks/schema.json, enforces each driver's exact
+stable metric/assertion-ID inventory, enforces process-group timeouts, merges the measurements,
+and then times the production §32 reconnect suite. The harness
 requires 12 GiB of free space before and during a run by default; set
 `SRUI_BENCHMARK_MIN_FREE_BYTES` to another positive byte count for a constrained benchmark host.
 Correctness failures make the command fail. Performance misses remain successful measurements and
@@ -44,10 +45,13 @@ failure or interruption. The default live limits are a 2 GiB trace, a 256 MiB al
 and a 4 GiB free-space reserve; override them with `SRUI_XCTRACE_MAX_BYTES`,
 `SRUI_XCTRACE_MAX_EXPORT_BYTES`, and `SRUI_XCTRACE_MIN_FREE_BYTES`.
 
-A successful capture also writes `TRACE.summary.json`. That machine-readable sidecar contains
-cumulative allocation counts and bytes only for rows xctrace attributes to the exact
-`BenchmarkDriver` PID and exact WebKit helper PIDs; unattributed rows are counted rather than
-guessed. Unrelated system processes remain in the host-specific trace because capture is
+A successful capture also writes `TRACE.summary.json`. Each renderer runs in a fresh child
+process and reports its host PID, benchmark interval, outer-driver PID, and helper-PID source. The
+sidecar contains cumulative allocation counts and bytes only for those explicitly reported
+candidate PIDs. WebKit helper rows are accepted only for the diagnostic process identifiers
+reported by that candidate; a same-named WebKit process elsewhere on the system is classified as
+unrelated, never attributed by name. Missing helper rows and unattributed rows are reported rather
+than guessed. Unrelated system processes remain in the host-specific trace because capture is
 intentionally system-wide. Neither the trace nor its sidecar is committed or folded into the main
 benchmark report.
 

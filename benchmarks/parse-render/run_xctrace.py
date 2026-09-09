@@ -25,6 +25,7 @@ from process_control import (  # noqa: E402
     ManagedCommandError,
     ManagedCommandTimeout,
     ManagedProcess,
+    blocked_termination_signals,
     run_managed_command,
 )
 
@@ -36,6 +37,20 @@ POLL_SECONDS = 0.1
 
 class CaptureError(RuntimeError):
     pass
+
+
+def exception_group_detail(error: BaseExceptionGroup) -> str:
+    details: list[str] = []
+
+    def collect(item: BaseException) -> None:
+        if isinstance(item, BaseExceptionGroup):
+            for nested in item.exceptions:
+                collect(nested)
+        else:
+            details.append(f"{type(item).__name__}: {item}")
+
+    collect(error)
+    return "; ".join(details)
 
 
 class TerminationRequested(BaseException):
@@ -121,6 +136,17 @@ def remove_capture(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def spawn_notification_watcher(notification: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ["notifyutil", "-1", notification],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
 def _signal_direct_group(process: subprocess.Popen[str], signum: int) -> None:
     if process.poll() is not None:
         return
@@ -142,16 +168,49 @@ def terminate_direct_process(
     process: subprocess.Popen[str],
     grace_seconds: float = 2.0,
 ) -> tuple[str, str]:
-    if process.poll() is None:
+    if process.poll() is not None:
+        return process.communicate(timeout=grace_seconds)
+
+    graceful_errors: list[BaseException] = []
+    try:
         _signal_direct_group(process, signal.SIGTERM)
+    except BaseException as error:
+        graceful_errors.append(error)
     try:
         return process.communicate(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
+        pass
+    except BaseException as error:
+        graceful_errors.append(error)
+
+    final_errors: list[BaseException] = []
+    group_killed = False
+    try:
         _signal_direct_group(process, signal.SIGKILL)
+        group_killed = True
+    except BaseException as error:
+        final_errors.append(error)
         try:
-            return process.communicate(timeout=grace_seconds)
-        except subprocess.TimeoutExpired as error:
-            raise CaptureError(f"could not reap process group {process.pid}") from error
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except BaseException as direct_error:
+            final_errors.append(direct_error)
+    try:
+        output = process.communicate(timeout=grace_seconds)
+    except BaseException as error:
+        final_errors.append(error)
+        output = None
+
+    if not group_killed or output is None or process.poll() is None:
+        details = "; ".join(
+            f"{type(error).__name__}: {error}"
+            for error in [*graceful_errors, *final_errors]
+        )
+        raise CaptureError(
+            f"could not confirm reap of direct process group {process.pid}: {details}"
+        )
+    return output
 
 
 def wait_for_recording_notification(
@@ -365,10 +424,105 @@ def _process_identity(
     return "unattributed", None
 
 
+ATTRIBUTION_KEYS = {
+    "candidate",
+    "driver_pid",
+    "host_pid",
+    "helper_pids",
+    "started_unix_ns",
+    "ended_unix_ns",
+    "helper_pid_source",
+}
+
+
+def load_renderer_process_attribution(
+    result_path: Path,
+    *,
+    driver_pid: int,
+) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        attribution = payload["artifacts"]["renderer_process_attribution"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise CaptureError(
+            "BenchmarkDriver result lacks renderer_process_attribution"
+        ) from error
+    if not isinstance(attribution, list) or len(attribution) != 2:
+        raise CaptureError(
+            "renderer_process_attribution must contain exactly srui and webkit"
+        )
+
+    validated: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    claimed_pids: set[int] = set()
+    for item in attribution:
+        if not isinstance(item, dict) or set(item) != ATTRIBUTION_KEYS:
+            raise CaptureError(
+                "renderer_process_attribution item has an invalid field contract"
+            )
+        candidate = item["candidate"]
+        if candidate not in {"srui", "webkit"} or candidate in seen_candidates:
+            raise CaptureError(
+                "renderer_process_attribution candidates must be unique srui and webkit"
+            )
+        integer_fields = (
+            item["driver_pid"],
+            item["host_pid"],
+            item["started_unix_ns"],
+            item["ended_unix_ns"],
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in integer_fields
+        ):
+            raise CaptureError(
+                f"{candidate} renderer process attribution has invalid PID/timestamp values"
+            )
+        if item["driver_pid"] != driver_pid:
+            raise CaptureError(
+                f"{candidate} attribution driver_pid {item['driver_pid']} "
+                f"does not match launched BenchmarkDriver pid {driver_pid}"
+            )
+        if item["host_pid"] == driver_pid or item["host_pid"] in claimed_pids:
+            raise CaptureError(f"{candidate} attribution has an invalid candidate host PID")
+        if item["started_unix_ns"] > item["ended_unix_ns"]:
+            raise CaptureError(f"{candidate} attribution interval is reversed")
+        helper_pids = item["helper_pids"]
+        if (
+            not isinstance(helper_pids, list)
+            or any(
+                isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+                for pid in helper_pids
+            )
+            or len(helper_pids) != len(set(helper_pids))
+            or item["host_pid"] in helper_pids
+        ):
+            raise CaptureError(f"{candidate} attribution helper_pids are invalid")
+        if candidate == "srui" and helper_pids:
+            raise CaptureError("srui attribution must not claim helper processes")
+        item_pids = {item["host_pid"], *helper_pids}
+        if item_pids & claimed_pids:
+            raise CaptureError("renderer process attribution reuses a claimed PID")
+        if (
+            not isinstance(item["helper_pid_source"], str)
+            or not item["helper_pid_source"].strip()
+        ):
+            raise CaptureError(f"{candidate} attribution helper_pid_source is empty")
+        seen_candidates.add(candidate)
+        claimed_pids.update(item_pids)
+        validated.append(item)
+
+    if seen_candidates != {"srui", "webkit"}:
+        raise CaptureError(
+            "renderer_process_attribution must contain exactly srui and webkit"
+        )
+    return sorted(validated, key=lambda item: item["candidate"])
+
+
 def parse_allocation_totals(
     xml_path: Path,
     *,
-    target_pid: int,
+    candidate_attribution: list[dict[str, Any]],
 ) -> dict[str, Any]:
     try:
         root = ET.parse(xml_path).getroot()
@@ -398,7 +552,7 @@ def parse_allocation_totals(
             if mnemonic:
                 columns[mnemonic] = engineering or mnemonic
 
-    aggregates: dict[tuple[str, int | None], dict[str, Any]] = {}
+    aggregates: dict[int, dict[str, Any]] = {}
     unattributed_rows = 0
     total_rows = 0
     for row in root.iter():
@@ -425,48 +579,69 @@ def parse_allocation_totals(
             continue
         total_rows += 1
         name, pid = _process_identity(row, identities)
-        if pid is None and name == "unattributed":
+        if pid is None:
             unattributed_rows += 1
             continue
-        key = (name, pid)
         aggregate = aggregates.setdefault(
-            key,
+            pid,
             {
-                "name": name,
                 "pid": pid,
+                "names": [],
                 "cumulative_allocations": 0,
                 "cumulative_bytes": 0,
             },
         )
+        if name not in aggregate["names"]:
+            aggregate["names"].append(name)
         aggregate["cumulative_allocations"] += 1
         aggregate["cumulative_bytes"] += size
 
-    target = [
-        aggregate
-        for aggregate in aggregates.values()
-        if aggregate["pid"] == target_pid
-    ]
-    helpers = [
-        aggregate
-        for aggregate in aggregates.values()
-        if aggregate["pid"] is not None
-        and "webkit" in aggregate["name"].lower()
-    ]
-    if not target:
-        raise CaptureError(
-            f"allocation export contains no rows attributable to BenchmarkDriver pid {target_pid}"
+    related_pids = {
+        pid
+        for item in candidate_attribution
+        for pid in [item["host_pid"], *item["helper_pids"]]
+    }
+    candidates: list[dict[str, Any]] = []
+    for item in candidate_attribution:
+        host_pid = item["host_pid"]
+        if host_pid not in aggregates:
+            raise CaptureError(
+                f"allocation export contains no rows for {item['candidate']} "
+                f"candidate host pid {host_pid}"
+            )
+        helper_totals = [
+            aggregates[pid]
+            for pid in item["helper_pids"]
+            if pid in aggregates
+        ]
+        candidates.append(
+            {
+                **item,
+                "host_process_totals": aggregates[host_pid],
+                "helper_process_totals": sorted(
+                    helper_totals,
+                    key=lambda value: value["pid"],
+                ),
+                "helpers_without_allocation_rows": sorted(
+                    pid for pid in item["helper_pids"] if pid not in aggregates
+                ),
+            }
         )
 
-    key = lambda item: (
-        item["name"],
-        item["pid"] if item["pid"] is not None else -1,
+    excluded_rows = sum(
+        aggregate["cumulative_allocations"]
+        for pid, aggregate in aggregates.items()
+        if pid not in related_pids
     )
     return {
         "allocation_rows": total_rows,
         "unattributed_rows": unattributed_rows,
+        "excluded_unrelated_process_rows": excluded_rows,
         "processes_with_allocations": len(aggregates),
-        "target_processes": sorted(target, key=key),
-        "webkit_helper_processes": sorted(helpers, key=key),
+        "candidate_processes": sorted(
+            candidates,
+            key=lambda item: item["candidate"],
+        ),
     }
 
 
@@ -474,7 +649,7 @@ def export_allocation_summary(
     trace: Path,
     sidecar: Path,
     *,
-    target_pid: int,
+    candidate_attribution: list[dict[str, Any]],
     max_export_bytes: int,
     min_remaining_bytes: int,
 ) -> None:
@@ -531,7 +706,10 @@ def export_allocation_summary(
             )
         _bounded_file(export_path, max_export_bytes, "allocation XML export")
         ensure_free_reserve(trace.parent, min_remaining_bytes)
-        attribution = parse_allocation_totals(export_path, target_pid=target_pid)
+        attribution = parse_allocation_totals(
+            export_path,
+            candidate_attribution=candidate_attribution,
+        )
     finally:
         export_path.unlink(missing_ok=True)
 
@@ -541,7 +719,6 @@ def export_allocation_summary(
         "trace": str(trace),
         "trace_bytes": trace_size_bytes(trace),
         "allocation_schema": allocation_schema,
-        "target_pid": target_pid,
         **attribution,
     }
     temporary = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.tmp")
@@ -553,6 +730,48 @@ def export_allocation_summary(
         os.replace(temporary, sidecar)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _cleanup_failure(label: str, error: BaseException) -> CaptureError:
+    return CaptureError(f"{label}: {type(error).__name__}: {error}")
+
+
+def cleanup_capture(
+    *,
+    driver: ManagedProcess | None,
+    recorder: ManagedProcess | None,
+    watcher: subprocess.Popen[str] | None,
+    trace: Path,
+    sidecar: Path,
+    retain_outputs: bool,
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    process_actions: list[tuple[str, Any]] = []
+    if driver is not None and not driver.closed:
+        process_actions.append(("BenchmarkDriver cleanup", driver.terminate))
+    if recorder is not None and not recorder.closed:
+        process_actions.append(("xctrace recorder cleanup", recorder.terminate))
+    if watcher is not None:
+        process_actions.append(
+            ("notification watcher cleanup", lambda: terminate_direct_process(watcher))
+        )
+
+    for label, action in process_actions:
+        try:
+            action()
+        except BaseException as error:
+            errors.append(_cleanup_failure(label, error))
+
+    if not retain_outputs or errors:
+        for label, path in (
+            ("incomplete trace removal", trace),
+            ("incomplete sidecar removal", sidecar),
+        ):
+            try:
+                remove_capture(path)
+            except BaseException as error:
+                errors.append(_cleanup_failure(label, error))
+    return errors
 
 
 def run(
@@ -577,6 +796,7 @@ def run(
     recorder: ManagedProcess | None = None
     driver: ManagedProcess | None = None
     capture_complete = False
+    failure: BaseException | None = None
 
     def monitor(_process: ManagedProcess) -> None:
         ensure_capture_budget(
@@ -586,14 +806,12 @@ def run(
         )
 
     try:
-        watcher = subprocess.Popen(
-            ["notifyutil", "-1", notification],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-            close_fds=True,
-        )
+        # The CLI installs handled signal exceptions. Defer them until the real
+        # watcher handle is assigned so every spawned process remains reachable.
+        with blocked_termination_signals():
+            spawned_watcher = spawn_notification_watcher(notification)
+            watcher = spawned_watcher
+
         recorder = ManagedProcess.start(
             trace_command(trace, notification),
             cwd=trace.parent,
@@ -612,18 +830,17 @@ def run(
             cwd=trace.parent,
             label="BenchmarkDriver allocation workload",
         )
-        try:
-            driver_result = driver.wait(55, poll_hook=monitor)
-        finally:
-            if not driver.closed:
-                driver.terminate()
+        driver_result = driver.wait(55, poll_hook=monitor)
         if driver_result.returncode:
             detail = (driver_result.stderr or driver_result.stdout).strip()
             raise CaptureError(
                 f"BenchmarkDriver failed ({driver_result.returncode}): {detail[-2000:]}"
             )
 
-        target_pid = driver_result.child_pid
+        candidate_attribution = load_renderer_process_attribution(
+            result,
+            driver_pid=driver_result.child_pid,
+        )
         recorder.signal(signal.SIGINT)
         recorder_result = recorder.wait(60, poll_hook=monitor)
         if recorder_result.returncode:
@@ -642,22 +859,28 @@ def run(
         export_allocation_summary(
             trace,
             sidecar,
-            target_pid=target_pid,
+            candidate_attribution=candidate_attribution,
             max_export_bytes=max_export_bytes,
             min_remaining_bytes=min_remaining_bytes,
         )
         capture_complete = True
-        return 0
-    finally:
-        if driver is not None and not driver.closed:
-            driver.terminate()
-        if recorder is not None and not recorder.closed:
-            recorder.terminate()
-        if watcher is not None:
-            terminate_direct_process(watcher)
-        if not capture_complete:
-            remove_capture(trace)
-            remove_capture(sidecar)
+    except BaseException as error:
+        failure = error
+
+    cleanup_errors = cleanup_capture(
+        driver=driver,
+        recorder=recorder,
+        watcher=watcher,
+        trace=trace,
+        sidecar=sidecar,
+        retain_outputs=capture_complete and failure is None,
+    )
+    errors = ([failure] if failure is not None else []) + cleanup_errors
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("allocation capture and cleanup failed", errors)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -715,6 +938,12 @@ def cli() -> int:
         return 130
     except (CaptureError, ManagedCommandError, ManagedCommandTimeout, OSError) as error:
         print(f"allocation capture failed: {error}", file=sys.stderr)
+        return 2
+    except BaseExceptionGroup as error:
+        print(
+            f"allocation capture cleanup failed: {exception_group_detail(error)}",
+            file=sys.stderr,
+        )
         return 2
 
 

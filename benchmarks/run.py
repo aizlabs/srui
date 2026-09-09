@@ -43,10 +43,212 @@ EXPECTED_RECONNECT_VERIFICATION = {
     ],
 }
 DEFAULT_MIN_FREE_BYTES = 12 * 1024 * 1024 * 1024
+DISTRIBUTION = ("p50", "p95", "p99")
+
+
+def _metric_inventory(
+    specification: dict[str, tuple[str, ...]],
+) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        (metric_id, statistic)
+        for metric_id, statistics in specification.items()
+        for statistic in statistics
+    )
+
+
+def _coverage(
+    metrics: dict[str, tuple[str, ...]],
+    assertions: tuple[str, ...],
+) -> dict[str, frozenset[Any]]:
+    return {
+        "metrics": _metric_inventory(metrics),
+        "assertions": frozenset(assertions),
+    }
+
+
+EXPECTED_DRIVER_INVENTORY = {
+    "rust": {
+        "31.2": _coverage(
+            {
+                "abstract_state_generation_ms": DISTRIBUTION,
+                "protobuf_serialization_ms": DISTRIBUTION,
+                "serialized_transaction_bytes": ("exact",),
+            },
+            ("fixture_protobuf_valid",),
+        ),
+        "31.5": _coverage(
+            {
+                metric_id: DISTRIBUTION
+                for metric_id in (
+                    "disconnect_before_event_receipt_ms",
+                    "event_to_settled_side_effect_ms",
+                    "cached_duplicate_response_ms",
+                    "lost_ack_wire_duplicate_ms",
+                    "mid_resource_reconnect_ms",
+                    "mid_transaction_codec_replay_ms",
+                    "mid_transaction_wire_replay_ms",
+                    "partial_event_wire_replay_ms",
+                    "resume_beyond_retention_ms",
+                    "resume_within_retention_ms",
+                )
+            },
+            (
+                "mid_resource_exact_restart",
+                "mid_transaction_wire_atomic",
+                "partial_event_wire_once",
+                "lost_ack_wire_duplicate_once",
+                "journal_retention_boundary",
+            ),
+        ),
+        "31.6": _coverage(
+            {
+                "embedded_pty_interaction_ms": DISTRIBUTION,
+                "standalone_pty_interaction_ms": DISTRIBUTION,
+                "terminal_retention_loss_ms": ("sample",),
+                "terminal_payload_bytes": ("exact",),
+                "embedded_terminal_frame_count": DISTRIBUTION,
+            },
+            (
+                "pty_payload_identical",
+                "standalone_pty_exit_success",
+                "embedded_pty_eof_exact",
+                "embedded_terminal_frame_bounds",
+                "terminal_ring_retention_loss",
+            ),
+        ),
+    },
+    "macos": {
+        "31.1": _coverage(
+            {
+                "srui.first_paint": ("p50", "p95"),
+                "srui.complete_paint": DISTRIBUTION,
+                "srui.cpu": ("p50", "p95"),
+                "srui.host_retained_allocations": ("p50",),
+                "srui.process_footprint_peak": ("max",),
+                "srui.process_footprint_growth": ("last-first",),
+                "webkit.first_paint": ("p50", "p95"),
+                "webkit.complete_paint": ("p50", "p95"),
+                "webkit.cpu": ("p50",),
+                "webkit.host_retained_allocations": ("p50",),
+                "webkit.process_footprint_peak": ("max",),
+                "webkit.process_footprint_growth": ("last-first",),
+                "representation.srui_bytes": ("exact",),
+                "representation.html_bytes": ("exact",),
+                "paint.capture_authorization": ("exact",),
+            },
+            (
+                "semantic_representation_parity",
+                "paint_completion_observed",
+                "webkit_helpers_attributed",
+            ),
+        ),
+        "31.3": _coverage(
+            {
+                **{
+                    f"updates.{count}.{measurement}": DISTRIBUTION
+                    for count in (1, 100, 1000)
+                    for measurement in ("semantic", "visible")
+                },
+                **{
+                    f"updates.{count}.{measurement}": ("exact",)
+                    for count in (1, 100, 1000)
+                    for measurement in ("bytes", "messages")
+                },
+                **{
+                    f"cadence.{cadence}.{measurement}": ("exact",)
+                    for cadence in (60, 120, 144, 240)
+                    for measurement in ("bytes", "messages", "repaints")
+                },
+                "idle.bytes": ("observed max",),
+                "idle.messages": ("observed max",),
+            },
+            (
+                "mutation_raster_completion",
+                "idle_zero_traffic",
+                "cadence_wire_invariant",
+                "cadence_repaint_independent",
+                "cadence_state_event_order",
+            ),
+        ),
+        "31.4": _coverage(
+            {
+                **{
+                    f"interaction.{interaction}.rtt.{rtt}": DISTRIBUTION
+                    for interaction in (
+                        "text_entry",
+                        "caret_movement",
+                        "text_selection",
+                        "ime_composition",
+                        "scrolling",
+                        "hover_pressed",
+                        "menu_opening",
+                    )
+                    for rtt in (0, 100, 300, 600)
+                },
+                **{
+                    f"server_feedback.rtt.{rtt}": DISTRIBUTION
+                    for rtt in (0, 100, 300, 600)
+                },
+                "impairment.bandwidth_transfer": ("p50", "p95"),
+                "impairment.bandwidth_delivered_bytes": ("exact",),
+                "impairment.loss_attempts": ("exact",),
+                "impairment.loss_delivered_messages": ("exact",),
+                "impairment.interruption_detection": ("p50",),
+                "session_wire.bytes": ("exact",),
+                "session_wire.messages": ("exact",),
+                "local_rtt_delta": DISTRIBUTION,
+            },
+            (
+                "local_latency_independent",
+                "server_latency_tracks_rtt",
+                "no_sync_rtt",
+                "impairments_use_session",
+            ),
+        ),
+        "31.5": _coverage(
+            {
+                "mid_resource_recovery": ("p50", "p95"),
+                "superseded_response": ("p50", "p95"),
+                "active_response": ("p50", "p95"),
+            },
+            (
+                "mid_resource_recovery",
+                "superseded_response_inert",
+            ),
+        ),
+        "31.6": _coverage(
+            {
+                "client_terminal.decode_visible": DISTRIBUTION,
+                "client_terminal.draw_only": DISTRIBUTION,
+                "client_terminal.frame_bytes": ("exact",),
+                "client_terminal.raster_completions": ("exact",),
+            },
+            (
+                "terminal_offsets_exact",
+                "terminal_draw_completion",
+                "terminal_fresh_state",
+            ),
+        ),
+    },
+}
 
 
 class BenchmarkError(RuntimeError):
     pass
+
+
+def exception_group_detail(error: BaseExceptionGroup) -> str:
+    details: list[str] = []
+
+    def collect(item: BaseException) -> None:
+        if isinstance(item, BaseExceptionGroup):
+            for nested in item.exceptions:
+                collect(nested)
+        else:
+            details.append(f"{type(item).__name__}: {item}")
+
+    collect(error)
+    return "; ".join(details)
 
 
 class TerminationRequested(BaseException):
@@ -150,8 +352,67 @@ def ensure_free_space(path: Path, minimum_bytes: int | None = None) -> None:
         )
 
 
-def validate_driver_output(payload: Any, driver: dict[str, Any]) -> dict[str, Any]:
+def _inventory_difference(
+    expected: frozenset[Any],
+    actual: frozenset[Any],
+) -> str:
+    details = []
+    if expected - actual:
+        details.append(f"missing {sorted(expected - actual)!r}")
+    if actual - expected:
+        details.append(f"unexpected {sorted(actual - expected)!r}")
+    return "; ".join(details)
+
+
+def validate_renderer_process_attribution(
+    artifacts: dict[str, Any],
+    *,
+    expected_driver_pid: int | None,
+) -> None:
+    items = artifacts.get("renderer_process_attribution")
+    if not isinstance(items, list):
+        raise BenchmarkError("macos driver must emit renderer_process_attribution")
+    candidates = [item["candidate"] for item in items]
+    if sorted(candidates) != ["srui", "webkit"]:
+        raise BenchmarkError(
+            "renderer_process_attribution must contain exactly srui and webkit"
+        )
+    claimed_pids: set[int] = set()
+    for item in items:
+        candidate = item["candidate"]
+        if expected_driver_pid is not None and item["driver_pid"] != expected_driver_pid:
+            raise BenchmarkError(
+                f"{candidate} attribution driver_pid {item['driver_pid']} does not "
+                f"match launched BenchmarkDriver pid {expected_driver_pid}"
+            )
+        if item["host_pid"] == item["driver_pid"]:
+            raise BenchmarkError(f"{candidate} candidate must run in a child process")
+        if item["started_unix_ns"] > item["ended_unix_ns"]:
+            raise BenchmarkError(f"{candidate} process attribution interval is reversed")
+        if item["host_pid"] in item["helper_pids"]:
+            raise BenchmarkError(f"{candidate} helper PIDs include its host PID")
+        if candidate == "srui" and item["helper_pids"]:
+            raise BenchmarkError("srui candidate must not claim helper processes")
+        item_pids = {item["host_pid"], *item["helper_pids"]}
+        if item_pids & claimed_pids:
+            raise BenchmarkError("renderer process attribution reuses a claimed PID")
+        claimed_pids.update(item_pids)
+
+
+def validate_driver_output(
+    payload: Any,
+    driver: dict[str, Any],
+    *,
+    launched_pid: int | None = None,
+) -> dict[str, Any]:
     validate_document(payload, "driver_output", f"{driver['name']} driver output")
+    if driver["name"] == "macos":
+        validate_renderer_process_attribution(
+            payload["artifacts"],
+            expected_driver_pid=launched_pid,
+        )
+    elif "renderer_process_attribution" in payload["artifacts"]:
+        raise BenchmarkError("rust driver must not emit renderer process attribution")
     actual = [section["id"] for section in payload["sections"]]
     if len(actual) != len(set(actual)):
         raise BenchmarkError(f"{driver['name']} driver emitted duplicate sections")
@@ -160,6 +421,36 @@ def validate_driver_output(payload: Any, driver: dict[str, Any]) -> dict[str, An
             f"{driver['name']} driver emitted {', '.join(sorted(actual))}; "
             f"manifest declares {', '.join(sorted(driver['sections']))}"
         )
+
+    expected_sections = EXPECTED_DRIVER_INVENTORY[driver["name"]]
+    for section in payload["sections"]:
+        expected = expected_sections[section["id"]]
+        metric_items = [
+            (metric["id"], metric["statistic"])
+            for metric in section["metrics"]
+        ]
+        metric_set = frozenset(metric_items)
+        if len(metric_items) != len(metric_set):
+            raise BenchmarkError(
+                f"{driver['name']} §{section['id']} emitted duplicate metric identities"
+            )
+        if metric_set != expected["metrics"]:
+            raise BenchmarkError(
+                f"{driver['name']} §{section['id']} metric inventory: "
+                f"{_inventory_difference(expected['metrics'], metric_set)}"
+            )
+
+        assertion_items = [assertion["id"] for assertion in section["assertions"]]
+        assertion_set = frozenset(assertion_items)
+        if len(assertion_items) != len(assertion_set):
+            raise BenchmarkError(
+                f"{driver['name']} §{section['id']} emitted duplicate assertion IDs"
+            )
+        if assertion_set != expected["assertions"]:
+            raise BenchmarkError(
+                f"{driver['name']} §{section['id']} assertion inventory: "
+                f"{_inventory_difference(expected['assertions'], assertion_set)}"
+            )
     return payload
 
 
@@ -204,7 +495,11 @@ def run_driver(
             payload = json.loads(output_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise BenchmarkError(f"{driver['name']} did not write valid result JSON") from error
-        return validate_driver_output(payload, driver)
+        return validate_driver_output(
+            payload,
+            driver,
+            launched_pid=result.child_pid,
+        )
     finally:
         output_path.unlink(missing_ok=True)
 
@@ -270,12 +565,16 @@ def validate_report(report: dict[str, Any], required: list[str]) -> None:
                 raise BenchmarkError(f"{section['id']}.{metric['name']} is not numeric")
             if not math.isfinite(value):
                 raise BenchmarkError(f"{section['id']}.{metric['name']} is not finite")
-            key = (metric["name"], metric["statistic"])
+            key = (metric["id"], metric["statistic"])
             if key in metric_keys:
                 raise BenchmarkError(
-                    f"{section['id']} duplicates metric {metric['name']} ({metric['statistic']})"
+                    f"{section['id']} duplicates metric ID {metric['id']} "
+                    f"({metric['statistic']})"
                 )
             metric_keys.add(key)
+        assertion_ids = [assertion["id"] for assertion in section["assertions"]]
+        if len(assertion_ids) != len(set(assertion_ids)):
+            raise BenchmarkError(f"{section['id']} duplicates an assertion ID")
 
 
 def append_parity_assertion(
@@ -284,7 +583,11 @@ def append_parity_assertion(
 ) -> None:
     rust = artifacts["rust"]
     macos = artifacts["macos"]
-    matches = rust == macos
+    canonical_keys = (
+        "canonical_transaction_sha256",
+        "canonical_transaction_bytes",
+    )
+    matches = all(rust[key] == macos[key] for key in canonical_keys)
     if matches:
         detail = (
             f"{rust['canonical_transaction_sha256']} / "
@@ -299,6 +602,7 @@ def append_parity_assertion(
         )
     sections["31.2"]["assertions"].append(
         {
+            "id": "canonical_transaction_parity",
             "name": "renderer and serializer canonical transaction bytes match",
             "passed": matches,
             "detail": detail,
@@ -456,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         section = sections[verification["section"]]
         section["metrics"].append(
             {
+                "id": "production_reconnect_suite_ms",
                 "name": verification["name"],
                 "value": elapsed,
                 "unit": "ms",
@@ -464,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         section["assertions"].append(
             {
+                "id": "production_reconnect_suite",
                 "name": verification["name"],
                 "passed": passed,
                 "detail": detail,
@@ -535,6 +841,12 @@ def cli(argv: list[str] | None = None) -> int:
         return 130
     except BenchmarkError as error:
         print(f"benchmark error: {error}", file=sys.stderr)
+        return 2
+    except BaseExceptionGroup as error:
+        print(
+            f"benchmark failed during process cleanup: {exception_group_detail(error)}",
+            file=sys.stderr,
+        )
         return 2
 
 

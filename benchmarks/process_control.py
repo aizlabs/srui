@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from typing import Any
 RUNNER = Path(__file__).resolve().with_name("process_group_runner.py")
 DEFAULT_CLEANUP_GRACE_SECONDS = 1.0
 POLL_SECONDS = 0.02
+TERMINATION_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM))
 
 
 class ManagedCommandError(RuntimeError):
@@ -33,6 +35,51 @@ class CommandResult:
     stdout: str
     stderr: str
     child_pid: int
+
+
+@contextlib.contextmanager
+def blocked_termination_signals() -> Iterator[None]:
+    """Defer handled termination until a spawned process handle is registered."""
+
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def spawn_supervisor(
+    command: list[str],
+    *,
+    cwd: Path,
+    ready_path: Path,
+    status_path: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--ready",
+            str(ready_path),
+            "--status",
+            str(status_path),
+            "--stdout",
+            str(stdout_path),
+            "--stderr",
+            str(stderr_path),
+            "--",
+            *command,
+        ],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        close_fds=True,
+    )
 
 
 def process_group_members(process_group: int) -> set[int]:
@@ -70,11 +117,17 @@ def _signal_group(process_group: int, signum: int) -> None:
         pass
 
 
+def _cleanup_detail(errors: list[tuple[str, BaseException]]) -> str:
+    return "; ".join(
+        f"{label}: {type(error).__name__}: {error}" for label, error in errors
+    )
+
+
 def terminate_supervised_process(
     process: subprocess.Popen[str],
     grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
 ) -> tuple[str, str]:
-    """Reap a sentinel-pinned process group without ever signaling a reused group id."""
+    """Kill and reap a sentinel-pinned group, even if graceful cleanup fails."""
 
     if process.poll() is not None:
         # Once waitpid has reaped the sentinel, its numeric PID no longer pins the
@@ -86,33 +139,87 @@ def terminate_supervised_process(
     except ProcessLookupError:
         return process.communicate(timeout=5)
     if process_group != process.pid:
-        process.kill()
-        process.communicate(timeout=5)
+        try:
+            process.kill()
+        finally:
+            process.communicate(timeout=5)
         raise ManagedCommandError(
             f"supervisor {process.pid} is not its process-group leader ({process_group})"
         )
 
-    # Freeze the live sentinel before signaling the group. Its unreaped PID pins the
-    # group identity throughout both membership checks, so PID reuse cannot redirect
-    # either signal to an unrelated process tree.
-    os.kill(process.pid, signal.SIGSTOP)
-    _signal_group(process_group, signal.SIGTERM)
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        members = process_group_members(process_group)
-        if members <= {process.pid}:
-            break
-        time.sleep(POLL_SECONDS)
-
-    members = process_group_members(process_group)
-    if members:
-        _signal_group(process_group, signal.SIGKILL)
     try:
+        # The stopped, unreaped sentinel pins the group ID until the final group kill.
+        os.kill(process.pid, signal.SIGSTOP)
+    except ProcessLookupError:
         return process.communicate(timeout=5)
-    except subprocess.TimeoutExpired as error:
+    except BaseException as error:
+        try:
+            process.kill()
+        finally:
+            process.communicate(timeout=5)
         raise ManagedCommandError(
-            f"could not reap supervised process group {process_group}"
+            f"could not pin supervised process group {process_group}: "
+            f"{type(error).__name__}: {error}"
         ) from error
+
+    recoverable_errors: list[tuple[str, BaseException]] = []
+    try:
+        _signal_group(process_group, signal.SIGTERM)
+    except BaseException as error:
+        recoverable_errors.append(("SIGTERM", error))
+
+    if not recoverable_errors:
+        try:
+            deadline = time.monotonic() + grace_seconds
+            while time.monotonic() < deadline:
+                if process_group_members(process_group) <= {process.pid}:
+                    break
+                time.sleep(POLL_SECONDS)
+        except BaseException as error:
+            recoverable_errors.append(("process-group enumeration", error))
+
+    final_errors: list[tuple[str, BaseException]] = []
+    group_killed = False
+    try:
+        # Do not use _signal_group here: ProcessLookupError is material while the
+        # stopped sentinel is supposed to pin this exact group.
+        os.killpg(process_group, signal.SIGKILL)
+        group_killed = True
+    except BaseException as error:
+        final_errors.append(("pinned-group SIGKILL", error))
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except BaseException as direct_error:
+            final_errors.append(("direct supervisor SIGKILL", direct_error))
+
+    output: tuple[str, str] | None = None
+    try:
+        output = process.communicate(timeout=5)
+    except BaseException as error:
+        final_errors.append(("supervisor reap", error))
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except BaseException as direct_error:
+            final_errors.append(("fallback supervisor SIGKILL", direct_error))
+        try:
+            output = process.communicate(timeout=5)
+        except BaseException as reap_error:
+            final_errors.append(("fallback supervisor reap", reap_error))
+
+    if not group_killed or output is None or process.poll() is None:
+        errors = [*recoverable_errors, *final_errors]
+        raise ManagedCommandError(
+            f"could not confirm cleanup of supervised process group {process_group}: "
+            f"{_cleanup_detail(errors)}"
+        )
+
+    # Graceful termination or enumeration may fail transiently. A successful
+    # SIGKILL of the still-pinned group plus waitpid is the authoritative fallback.
+    return output
 
 
 class ManagedProcess:
@@ -135,7 +242,8 @@ class ManagedProcess:
         self.stderr_path = directory / "stderr"
         self.supervisor: subprocess.Popen[str] | None = None
         self._supervisor_output = ("", "")
-        self._closed = False
+        self._reaped = False
+        self._controls_cleaned = False
 
     @classmethod
     def start(
@@ -148,37 +256,38 @@ class ManagedProcess:
     ) -> ManagedProcess:
         managed = cls(command, cwd, label, cleanup_grace_seconds)
         try:
-            managed.supervisor = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(RUNNER),
-                    "--ready",
-                    str(managed.ready_path),
-                    "--status",
-                    str(managed.status_path),
-                    "--stdout",
-                    str(managed.stdout_path),
-                    "--stderr",
-                    str(managed.stderr_path),
-                    "--",
-                    *command,
-                ],
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-                close_fds=True,
-            )
-        except BaseException:
-            managed._temporary.cleanup()
+            # Signals handled by the caller are deferred across both Popen and
+            # registration. A pending handler can run only after supervisor is set.
+            with blocked_termination_signals():
+                supervisor = spawn_supervisor(
+                    command,
+                    cwd=cwd,
+                    ready_path=managed.ready_path,
+                    status_path=managed.status_path,
+                    stdout_path=managed.stdout_path,
+                    stderr_path=managed.stderr_path,
+                )
+                managed.supervisor = supervisor
+        except BaseException as primary:
+            cleanup_errors: list[BaseException] = []
+            try:
+                if managed.supervisor is None:
+                    managed._discard_controls()
+                else:
+                    managed.terminate()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    f"{label} spawn and cleanup failed",
+                    [primary, *cleanup_errors],
+                )
             raise
         return managed
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        return self._reaped
 
     @property
     def child_pid(self) -> int | None:
@@ -208,22 +317,34 @@ class ManagedProcess:
         return None
 
     def signal(self, signum: int) -> None:
-        if self._closed or self.supervisor is None or self.supervisor.poll() is not None:
+        if self._reaped or self.supervisor is None or self.supervisor.poll() is not None:
             return
         _signal_group(self.supervisor.pid, signum)
 
-    def terminate(self) -> None:
-        if self._closed:
+    def _reap(self) -> None:
+        if self._reaped:
             return
-        try:
-            if self.supervisor is not None:
-                self._supervisor_output = terminate_supervised_process(
-                    self.supervisor,
-                    self.cleanup_grace_seconds,
-                )
-        finally:
-            self._closed = True
-            self._temporary.cleanup()
+        if self.supervisor is not None:
+            self._supervisor_output = terminate_supervised_process(
+                self.supervisor,
+                self.cleanup_grace_seconds,
+            )
+        self._reaped = True
+
+    def _discard_controls(self) -> None:
+        if self._controls_cleaned:
+            return
+        self._temporary.cleanup()
+        self._controls_cleaned = True
+
+    def terminate(self) -> None:
+        if self._reaped:
+            self._discard_controls()
+            return
+        self._reap()
+        # Control files are retained if _reap raises, so a caller can diagnose and
+        # retry cleanup. They are deleted only after reaping has been confirmed.
+        self._discard_controls()
 
     def wait(
         self,
@@ -231,7 +352,7 @@ class ManagedProcess:
         *,
         poll_hook: Callable[[ManagedProcess], None] | None = None,
     ) -> CommandResult:
-        if self._closed:
+        if self._reaped:
             raise ManagedCommandError(f"{self.label} is already closed")
         deadline = time.monotonic() + timeout
         payload: dict[str, Any] | None = None
@@ -247,31 +368,38 @@ class ManagedProcess:
                         f"{self.label} timed out after {timeout:g}s"
                     )
                 time.sleep(POLL_SECONDS)
-        finally:
+        except BaseException as primary:
             try:
-                if self.supervisor is not None:
-                    self._supervisor_output = terminate_supervised_process(
-                        self.supervisor,
-                        self.cleanup_grace_seconds,
-                    )
-            finally:
-                stdout = (
-                    self.stdout_path.read_text(encoding="utf-8", errors="replace")
-                    if self.stdout_path.exists()
-                    else ""
+                self.terminate()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    f"{self.label} failed and cleanup also failed",
+                    [primary, cleanup_error],
                 )
-                stderr = (
-                    self.stderr_path.read_text(encoding="utf-8", errors="replace")
-                    if self.stderr_path.exists()
-                    else ""
-                )
-                self._closed = True
-                self._temporary.cleanup()
+            raise
+
+        try:
+            self._reap()
+            stdout = (
+                self.stdout_path.read_text(encoding="utf-8", errors="replace")
+                if self.stdout_path.exists()
+                else ""
+            )
+            stderr = (
+                self.stderr_path.read_text(encoding="utf-8", errors="replace")
+                if self.stderr_path.exists()
+                else ""
+            )
+        finally:
+            if self._reaped:
+                self._discard_controls()
 
         if payload is None:
             raise ManagedCommandError(f"{self.label} produced no status")
         if "error" in payload:
-            supervisor_detail = (self._supervisor_output[1] or self._supervisor_output[0]).strip()
+            supervisor_detail = (
+                self._supervisor_output[1] or self._supervisor_output[0]
+            ).strip()
             raise ManagedCommandError(
                 f"{self.label} supervisor failed: {payload['error']}; "
                 f"{supervisor_detail[-1000:]}"

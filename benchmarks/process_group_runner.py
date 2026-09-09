@@ -77,6 +77,12 @@ def supervise(arguments: list[str]) -> int:
 
 
 def main() -> int:
+    # ManagedProcess blocks handled termination signals across Popen and handle
+    # registration. The child does not inherit that parent-only critical section.
+    signal.pthread_sigmask(
+        signal.SIG_UNBLOCK,
+        {signal.SIGINT, signal.SIGTERM},
+    )
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--exec":
         return exec_command(arguments[1:])

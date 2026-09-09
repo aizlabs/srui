@@ -15,6 +15,9 @@ import pytest
 
 BENCHMARKS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BENCHMARKS))
+
+import process_control  # noqa: E402
+
 MODULE_PATH = BENCHMARKS / "parse-render/run_xctrace.py"
 SPEC = importlib.util.spec_from_file_location("benchmark_xctrace_tests", MODULE_PATH)
 assert SPEC and SPEC.loader
@@ -39,6 +42,9 @@ def attribution(driver_pid: int = 42) -> list[dict[str, Any]]:
             "started_unix_ns": TRACE_STARTED_UNIX_NS + 1_000,
             "ended_unix_ns": TRACE_STARTED_UNIX_NS + 2_000,
             "helper_pid_source": "no helper processes",
+            "process_identities": [
+                {"pid": 123, "birth_unix_ns": 101},
+            ],
         },
         {
             "candidate": "webkit",
@@ -48,6 +54,10 @@ def attribution(driver_pid: int = 42) -> list[dict[str, Any]]:
             "started_unix_ns": TRACE_STARTED_UNIX_NS + 3_000,
             "ended_unix_ns": TRACE_STARTED_UNIX_NS + 4_000,
             "helper_pid_source": "WKWebView diagnostic process identifiers",
+            "process_identities": [
+                {"pid": 456, "birth_unix_ns": 102},
+                {"pid": 789, "birth_unix_ns": 103},
+            ],
         },
     ]
 
@@ -60,6 +70,15 @@ def test_trace_command_is_bounded_and_system_wide() -> None:
     assert command[command.index("--window") + 1] == "30s"
     assert "--no-prompt" in command
     assert "--notify-tracing-started" in command
+
+
+def test_driver_command_scopes_allocation_capture_to_parse_render() -> None:
+    command = benchmark_xctrace.driver_command(
+        Path("BenchmarkDriver"),
+        Path("fixture.json"),
+        Path("result.json"),
+    )
+    assert command[command.index("--only-section") + 1] == "31.1"
 
 
 def test_preflight_reserves_trace_export_and_free_space(
@@ -112,6 +131,37 @@ def test_renderer_attribution_is_tied_to_launched_driver(tmp_path: Path) -> None
             result,
             driver_pid=43,
         )
+
+    invalid = attribution(driver_pid=42)
+    invalid[1]["process_identities"].pop()
+    result.write_text(
+        json.dumps({"artifacts": {"renderer_process_attribution": invalid}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(benchmark_xctrace.CaptureError, match="exactly cover"):
+        benchmark_xctrace.load_renderer_process_attribution(result, driver_pid=42)
+
+
+def test_xctrace_exit_postcondition_checks_every_exact_birth_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[int, int]] = []
+
+    def observe(
+        identities: list[tuple[int, int]],
+        *,
+        label: str,
+    ) -> None:
+        assert label == "renderer allocation candidates"
+        observed.extend(identities)
+
+    monkeypatch.setattr(
+        benchmark_xctrace,
+        "wait_for_process_identities_gone",
+        observe,
+    )
+    benchmark_xctrace.wait_for_attributed_processes_to_exit(attribution())
+    assert sorted(observed) == [(123, 101), (456, 102), (789, 103)]
 
 
 def test_trace_start_date_converts_to_exact_unix_nanoseconds() -> None:
@@ -367,6 +417,8 @@ def test_capture_cleanup_attempts_every_resource_and_removes_failed_capture(
 
         def __init__(self, name: str) -> None:
             self.name = name
+            self.supervisor = None
+            self.ready_path = tmp_path / name / "ready.json"
 
         def terminate(self) -> None:
             attempted.append(self.name)
@@ -392,10 +444,69 @@ def test_capture_cleanup_attempts_every_resource_and_removes_failed_capture(
         retain_outputs=True,
     )
 
-    assert attempted == ["driver", "recorder", "watcher"]
+    assert attempted == ["driver", "driver", "recorder", "recorder", "watcher"]
     assert len(errors) == 3
     assert not trace.exists()
     assert not sidecar.exists()
+
+
+def test_capture_cleanup_retries_real_transient_final_group_kill(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_path = tmp_path / "capture-cleanup-child.pid"
+    sleeper = """
+import os
+import signal
+import sys
+import time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(str(os.getpid()))
+    output.flush()
+time.sleep(60)
+"""
+    managed = process_control.ManagedProcess.start(
+        [sys.executable, "-c", sleeper, str(pid_path)],
+        cwd=tmp_path,
+        label="capture cleanup retry",
+        cleanup_grace_seconds=0.05,
+    )
+    deadline = __import__("time").monotonic() + 5
+    while not pid_path.exists():
+        if __import__("time").monotonic() >= deadline:
+            pytest.fail("capture cleanup child did not start")
+        __import__("time").sleep(0.01)
+    child_pid = int(pid_path.read_text(encoding="utf-8"))
+    original_killpg = process_control.os.killpg
+    kill_attempts = 0
+
+    def fail_first_sigkill(process_group: int, signum: int) -> None:
+        nonlocal kill_attempts
+        if signum == signal.SIGKILL:
+            kill_attempts += 1
+            if kill_attempts == 1:
+                raise PermissionError("synthetic final group kill failure")
+        original_killpg(process_group, signum)
+
+    monkeypatch.setattr(process_control.os, "killpg", fail_first_sigkill)
+    try:
+        errors = benchmark_xctrace.cleanup_capture(
+            driver=managed,
+            recorder=None,
+            watcher=None,
+            trace=tmp_path / "capture.trace",
+            sidecar=tmp_path / "capture.trace.summary.json",
+            retain_outputs=False,
+        )
+        assert errors == []
+        assert kill_attempts == 2
+        assert managed.closed
+        assert_process_gone(child_pid)
+    finally:
+        monkeypatch.setattr(process_control.os, "killpg", original_killpg)
+        if not managed.closed:
+            managed.terminate()
 
 
 def test_capture_cleanup_preserves_termination_class_after_all_attempts(

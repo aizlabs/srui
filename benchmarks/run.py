@@ -24,8 +24,10 @@ from jsonschema import Draft202012Validator, FormatChecker
 from process_control import (
     ManagedCommandError,
     ManagedCommandTimeout,
+    blocked_termination_signals,
     run_managed_command,
     termination_exceptions,
+    wait_for_process_identities_gone,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -59,12 +61,14 @@ LOCAL_INTERACTIONS = (
     "menu_opening",
 )
 MetricIdentity = tuple[str, str]
-MetricMetadata = tuple[str, float | None, str | None]
+LOCAL_FRAME_BUDGET_ID = "display.frame_budget"
+MetricTarget = float | str | None
+MetricMetadata = tuple[str, MetricTarget, str | None]
 
 
 def _metric_inventory(
     specification: dict[str, tuple[str, tuple[str, ...]]],
-    targets: dict[MetricIdentity, tuple[float, str]] | None = None,
+    targets: dict[MetricIdentity, tuple[float | str, str]] | None = None,
 ) -> dict[MetricIdentity, MetricMetadata]:
     target_contracts = targets or {}
     identities = {
@@ -88,7 +92,7 @@ def _metric_inventory(
 def _coverage(
     metrics: dict[str, tuple[str, tuple[str, ...]]],
     assertions: tuple[str, ...],
-    targets: dict[MetricIdentity, tuple[float, str]] | None = None,
+    targets: dict[MetricIdentity, tuple[float | str, str]] | None = None,
 ) -> dict[str, Any]:
     return {
         "metrics": _metric_inventory(metrics, targets),
@@ -236,6 +240,7 @@ EXPECTED_DRIVER_INVENTORY = {
                 "session_wire.bytes": ("bytes", ("exact",)),
                 "session_wire.messages": ("messages", ("exact",)),
                 "local_rtt_delta": ("ms", DISTRIBUTION),
+                LOCAL_FRAME_BUDGET_ID: ("ms", ("exact",)),
             },
             (
                 "local_latency_independent",
@@ -246,13 +251,13 @@ EXPECTED_DRIVER_INVENTORY = {
             {
                 **{
                     (f"interaction.{interaction}.rtt.{rtt}", "p50"): (
-                        16.67,
+                        LOCAL_FRAME_BUDGET_ID,
                         "max",
                     )
                     for interaction in LOCAL_INTERACTIONS
                     for rtt in (0, 100, 300, 600)
                 },
-                ("local_rtt_delta", "p50"): (16.67, "max"),
+                ("local_rtt_delta", "p50"): (LOCAL_FRAME_BUDGET_ID, "max"),
             },
         ),
         "31.5": _coverage(
@@ -281,6 +286,42 @@ EXPECTED_DRIVER_INVENTORY = {
         ),
     },
 }
+
+
+def _merged_report_inventory() -> dict[str, dict[str, Any]]:
+    merged = {
+        section_id: {"metrics": {}, "assertions": set()}
+        for section_id in EXPECTED_SECTIONS
+    }
+    for driver_sections in EXPECTED_DRIVER_INVENTORY.values():
+        for section_id, inventory in driver_sections.items():
+            section = merged[section_id]
+            duplicate_metrics = set(section["metrics"]) & set(inventory["metrics"])
+            duplicate_assertions = section["assertions"] & set(inventory["assertions"])
+            if duplicate_metrics or duplicate_assertions:
+                raise ValueError(
+                    f"driver inventories overlap in §{section_id}: "
+                    f"{sorted(duplicate_metrics)!r}, {sorted(duplicate_assertions)!r}"
+                )
+            section["metrics"].update(inventory["metrics"])
+            section["assertions"].update(inventory["assertions"])
+    merged["31.2"]["assertions"].add("canonical_transaction_parity")
+    merged["31.5"]["metrics"][("production_reconnect_suite_ms", "wall")] = (
+        "ms",
+        None,
+        None,
+    )
+    merged["31.5"]["assertions"].add("production_reconnect_suite")
+    return {
+        section_id: {
+            "metrics": inventory["metrics"],
+            "assertions": frozenset(inventory["assertions"]),
+        }
+        for section_id, inventory in merged.items()
+    }
+
+
+EXPECTED_REPORT_INVENTORY = _merged_report_inventory()
 
 
 class BenchmarkError(RuntimeError):
@@ -414,6 +455,89 @@ def _inventory_difference(
     return "; ".join(details)
 
 
+def _validate_section_inventory(
+    section: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    metric_items = [
+        (metric["id"], metric["statistic"])
+        for metric in section["metrics"]
+    ]
+    metric_set = frozenset(metric_items)
+    expected_metrics = expected["metrics"]
+    expected_metric_set = frozenset(expected_metrics)
+    if len(metric_items) != len(metric_set):
+        raise BenchmarkError(f"{label} emitted duplicate metric identities")
+    if metric_set != expected_metric_set:
+        raise BenchmarkError(
+            f"{label} metric inventory: "
+            f"{_inventory_difference(expected_metric_set, metric_set)}"
+        )
+
+    frame_budget: float | int | None = None
+    if any(
+        metadata[1] == LOCAL_FRAME_BUDGET_ID
+        for metadata in expected_metrics.values()
+    ):
+        budget_metric = next(
+            metric
+            for metric in section["metrics"]
+            if (metric["id"], metric["statistic"])
+            == (LOCAL_FRAME_BUDGET_ID, "exact")
+        )
+        budget_value = budget_metric["value"]
+        if (
+            isinstance(budget_value, bool)
+            or not isinstance(budget_value, (int, float))
+            or not math.isfinite(budget_value)
+            or budget_value <= 0
+        ):
+            raise BenchmarkError(f"{label} local display frame budget must be positive")
+        frame_budget = budget_value
+
+    for metric in section["metrics"]:
+        value = metric["value"]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise BenchmarkError(
+                f"{label}.{metric['id']} ({metric['statistic']}) is not finite numeric"
+            )
+        identity = (metric["id"], metric["statistic"])
+        expected_unit, expected_target, expected_direction = expected_metrics[identity]
+        if expected_target == LOCAL_FRAME_BUDGET_ID:
+            expected_target = frame_budget
+        actual_metadata = (
+            metric["unit"],
+            metric.get("target"),
+            metric.get("target_direction"),
+        )
+        expected_metadata = (
+            expected_unit,
+            expected_target,
+            expected_direction,
+        )
+        if actual_metadata != expected_metadata:
+            raise BenchmarkError(
+                f"{label} metric metadata for {identity!r}: "
+                f"expected {expected_metadata!r}, got {actual_metadata!r}"
+            )
+
+    assertion_items = [assertion["id"] for assertion in section["assertions"]]
+    assertion_set = frozenset(assertion_items)
+    if len(assertion_items) != len(assertion_set):
+        raise BenchmarkError(f"{label} emitted duplicate assertion IDs")
+    if assertion_set != expected["assertions"]:
+        raise BenchmarkError(
+            f"{label} assertion inventory: "
+            f"{_inventory_difference(expected['assertions'], assertion_set)}"
+        )
+
+
 def validate_renderer_process_attribution(
     artifacts: dict[str, Any],
     *,
@@ -444,9 +568,41 @@ def validate_renderer_process_attribution(
         if candidate == "srui" and item["helper_pids"]:
             raise BenchmarkError("srui candidate must not claim helper processes")
         item_pids = {item["host_pid"], *item["helper_pids"]}
+        identities = item["process_identities"]
+        identity_pids = [identity["pid"] for identity in identities]
+        if len(identity_pids) != len(set(identity_pids)):
+            raise BenchmarkError(f"{candidate} process identities contain duplicate PIDs")
+        if set(identity_pids) != item_pids:
+            raise BenchmarkError(
+                f"{candidate} process identities must exactly cover host and helper PIDs"
+            )
         if item_pids & claimed_pids:
             raise BenchmarkError("renderer process attribution reuses a claimed PID")
         claimed_pids.update(item_pids)
+
+
+def renderer_process_identities(
+    artifacts: dict[str, Any],
+) -> list[tuple[int, int]]:
+    return [
+        (identity["pid"], identity["birth_unix_ns"])
+        for item in artifacts["renderer_process_attribution"]
+        for identity in item["process_identities"]
+    ]
+
+
+def wait_for_renderer_processes_to_exit(
+    artifacts: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    try:
+        wait_for_process_identities_gone(
+            renderer_process_identities(artifacts),
+            label=label,
+        )
+    except ManagedCommandError as error:
+        raise BenchmarkError(str(error)) from error
 
 
 def validate_driver_output(
@@ -474,48 +630,11 @@ def validate_driver_output(
 
     expected_sections = EXPECTED_DRIVER_INVENTORY[driver["name"]]
     for section in payload["sections"]:
-        expected = expected_sections[section["id"]]
-        metric_items = [
-            (metric["id"], metric["statistic"])
-            for metric in section["metrics"]
-        ]
-        metric_set = frozenset(metric_items)
-        expected_metrics = expected["metrics"]
-        expected_metric_set = frozenset(expected_metrics)
-        if len(metric_items) != len(metric_set):
-            raise BenchmarkError(
-                f"{driver['name']} §{section['id']} emitted duplicate metric identities"
-            )
-        if metric_set != expected_metric_set:
-            raise BenchmarkError(
-                f"{driver['name']} §{section['id']} metric inventory: "
-                f"{_inventory_difference(expected_metric_set, metric_set)}"
-            )
-        for metric in section["metrics"]:
-            identity = (metric["id"], metric["statistic"])
-            actual_metadata = (
-                metric["unit"],
-                metric.get("target"),
-                metric.get("target_direction"),
-            )
-            if actual_metadata != expected_metrics[identity]:
-                raise BenchmarkError(
-                    f"{driver['name']} §{section['id']} metric metadata for "
-                    f"{identity!r}: expected {expected_metrics[identity]!r}, "
-                    f"got {actual_metadata!r}"
-                )
-
-        assertion_items = [assertion["id"] for assertion in section["assertions"]]
-        assertion_set = frozenset(assertion_items)
-        if len(assertion_items) != len(assertion_set):
-            raise BenchmarkError(
-                f"{driver['name']} §{section['id']} emitted duplicate assertion IDs"
-            )
-        if assertion_set != expected["assertions"]:
-            raise BenchmarkError(
-                f"{driver['name']} §{section['id']} assertion inventory: "
-                f"{_inventory_difference(expected['assertions'], assertion_set)}"
-            )
+        _validate_section_inventory(
+            section,
+            expected_sections[section["id"]],
+            label=f"{driver['name']} §{section['id']}",
+        )
     return payload
 
 
@@ -560,11 +679,17 @@ def run_driver(
             payload = json.loads(output_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise BenchmarkError(f"{driver['name']} did not write valid result JSON") from error
-        return validate_driver_output(
+        validated = validate_driver_output(
             payload,
             driver,
             launched_pid=result.child_pid,
         )
+        if driver["name"] == "macos":
+            wait_for_renderer_processes_to_exit(
+                validated["artifacts"],
+                label="macos renderer candidates",
+            )
+        return validated
     finally:
         output_path.unlink(missing_ok=True)
 
@@ -622,24 +747,38 @@ def validate_report(report: dict[str, Any], required: list[str]) -> None:
             detail.append("unexpected " + ", ".join(sorted(unexpected)))
         raise BenchmarkError("benchmark report sections: " + "; ".join(detail))
 
-    for section in report["sections"]:
-        metric_keys: set[tuple[str, str]] = set()
-        for metric in section["metrics"]:
-            value = metric["value"]
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise BenchmarkError(f"{section['id']}.{metric['name']} is not numeric")
-            if not math.isfinite(value):
-                raise BenchmarkError(f"{section['id']}.{metric['name']} is not finite")
-            key = (metric["id"], metric["statistic"])
-            if key in metric_keys:
-                raise BenchmarkError(
-                    f"{section['id']} duplicates metric ID {metric['id']} "
-                    f"({metric['statistic']})"
-                )
-            metric_keys.add(key)
-        assertion_ids = [assertion["id"] for assertion in section["assertions"]]
-        if len(assertion_ids) != len(set(assertion_ids)):
-            raise BenchmarkError(f"{section['id']} duplicates an assertion ID")
+    sections_by_id = {section["id"]: section for section in report["sections"]}
+    for section_id, section in sections_by_id.items():
+        _validate_section_inventory(
+            section,
+            EXPECTED_REPORT_INVENTORY[section_id],
+            label=f"report §{section_id}",
+        )
+
+    artifacts = report["driver_artifacts"]
+    if "renderer_process_attribution" in artifacts["rust"]:
+        raise BenchmarkError("rust report artifact must not claim renderer processes")
+    validate_renderer_process_attribution(
+        artifacts["macos"],
+        expected_driver_pid=None,
+    )
+    canonical_keys = (
+        "canonical_transaction_sha256",
+        "canonical_transaction_bytes",
+    )
+    artifacts_match = all(
+        artifacts["rust"][key] == artifacts["macos"][key]
+        for key in canonical_keys
+    )
+    parity = next(
+        assertion
+        for assertion in sections_by_id["31.2"]["assertions"]
+        if assertion["id"] == "canonical_transaction_parity"
+    )
+    if parity["passed"] is not artifacts_match:
+        raise BenchmarkError(
+            "canonical_transaction_parity is inconsistent with driver artifacts"
+        )
 
 
 def append_parity_assertion(
@@ -751,6 +890,10 @@ def failed_assertions(report: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def ensure_baseline_recordable(report: dict[str, Any]) -> None:
+    if report.get("profile") != "full":
+        raise BenchmarkError(
+            "refusing to overwrite the committed baseline with a non-full profile"
+        )
     failures = failed_assertions(report)
     if failures:
         formatted = ", ".join(f"§{section} {name}" for section, name in failures)
@@ -759,15 +902,120 @@ def ensure_baseline_recordable(report: dict[str, Any]) -> None:
         )
 
 
+def _stage_report_file(path: Path, content: str) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.stage-",
+    )
+    temporary = Path(raw_path)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def _reserve_report_backup(path: Path) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.backup-",
+    )
+    os.close(descriptor)
+    backup = Path(raw_path)
+    backup.unlink()
+    return backup
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def write_report(report: dict[str, Any], output_dir: Path, stem: str) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{stem}.json"
     markdown_path = output_dir / f"{stem}.md"
-    json_path.write_text(
-        json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
+    paths_and_content = (
+        (
+            json_path,
+            json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        ),
+        (markdown_path, markdown(report)),
     )
-    markdown_path.write_text(markdown(report), encoding="utf-8")
+    staged: dict[Path, Path] = {}
+    backups: dict[Path, Path] = {}
+    installed: set[Path] = set()
+    preserve_backups = False
+    try:
+        for path, content in paths_and_content:
+            staged[path] = _stage_report_file(path, content)
+            backups[path] = _reserve_report_backup(path)
+        _fsync_directory(output_dir)
+
+        with blocked_termination_signals():
+            try:
+                for path, _content in paths_and_content:
+                    if path.exists():
+                        os.replace(path, backups[path])
+                for path, _content in paths_and_content:
+                    os.replace(staged[path], path)
+                    installed.add(path)
+                _fsync_directory(output_dir)
+            except BaseException as primary:
+                rollback_errors: list[BaseException] = []
+                for path, _content in reversed(paths_and_content):
+                    try:
+                        if backups[path].exists():
+                            os.replace(backups[path], path)
+                        elif path in installed:
+                            path.unlink(missing_ok=True)
+                    except BaseException as rollback_error:
+                        rollback_errors.append(rollback_error)
+                try:
+                    _fsync_directory(output_dir)
+                except BaseException as rollback_error:
+                    rollback_errors.append(rollback_error)
+                if rollback_errors:
+                    preserve_backups = True
+                    recovery = BenchmarkError(
+                        "report rollback is incomplete; recovery backups retained at "
+                        + ", ".join(str(path) for path in backups.values() if path.exists())
+                    )
+                    raise BaseExceptionGroup(
+                        "report publication and rollback failed",
+                        [primary, *rollback_errors, recovery],
+                    )
+                raise
+
+            cleanup_errors: list[BaseException] = []
+            for backup in backups.values():
+                try:
+                    backup.unlink(missing_ok=True)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            try:
+                _fsync_directory(output_dir)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                preserve_backups = True
+                raise BaseExceptionGroup(
+                    "report published but backup cleanup failed",
+                    cleanup_errors,
+                )
+    finally:
+        cleanup_paths = list(staged.values())
+        if not preserve_backups:
+            cleanup_paths.extend(backups.values())
+        for temporary in cleanup_paths:
+            temporary.unlink(missing_ok=True)
     return markdown_path, json_path
 
 

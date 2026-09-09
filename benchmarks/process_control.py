@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
+import functools
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,8 +21,10 @@ from typing import Any
 
 RUNNER = Path(__file__).resolve().with_name("process_group_runner.py")
 DEFAULT_CLEANUP_GRACE_SECONDS = 1.0
+DEFAULT_IDENTITY_EXIT_TIMEOUT_SECONDS = 5.0
 POLL_SECONDS = 0.02
 TERMINATION_SIGNALS = frozenset((signal.SIGINT, signal.SIGTERM))
+PROC_PIDTBSDINFO = 3
 
 
 class ManagedCommandError(RuntimeError):
@@ -46,6 +52,132 @@ def blocked_termination_signals() -> Iterator[None]:
         yield
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+class _ProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("pbi_rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+@functools.lru_cache(maxsize=1)
+def _proc_pidinfo() -> Any:
+    if sys.platform != "darwin":
+        raise ManagedCommandError("process birth identity is available only on macOS")
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    function = library.proc_pidinfo
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    return function
+
+
+def process_birth_unix_ns(pid: int) -> int | None:
+    """Return a Darwin process birth token, or None when that PID is absent."""
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ManagedCommandError(f"invalid process PID for birth identity: {pid!r}")
+    info = _ProcBSDInfo()
+    ctypes.set_errno(0)
+    result = _proc_pidinfo()(
+        pid,
+        PROC_PIDTBSDINFO,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if result <= 0:
+        error_number = ctypes.get_errno()
+        if error_number in (0, errno.ESRCH):
+            return None
+        raise ManagedCommandError(
+            f"cannot read birth identity for process {pid}: "
+            f"{os.strerror(error_number)}"
+        )
+    if result != ctypes.sizeof(info) or info.pbi_pid != pid:
+        raise ManagedCommandError(
+            f"process {pid} returned an incomplete or mismatched birth identity"
+        )
+    birth_unix_ns = (
+        int(info.pbi_start_tvsec) * 1_000_000_000
+        + int(info.pbi_start_tvusec) * 1_000
+    )
+    if birth_unix_ns <= 0:
+        raise ManagedCommandError(f"process {pid} returned an invalid birth identity")
+    return birth_unix_ns
+
+
+def wait_for_process_identities_gone(
+    identities: list[tuple[int, int]],
+    *,
+    label: str,
+    timeout: float = DEFAULT_IDENTITY_EXIT_TIMEOUT_SECONDS,
+    identity_reader: Callable[[int], int | None] | None = None,
+) -> None:
+    """Wait until every original process identity exits, without signaling raw PIDs."""
+
+    if timeout < 0:
+        raise ValueError("process identity timeout must be non-negative")
+    expected: dict[int, int] = {}
+    for pid, birth_unix_ns in identities:
+        if (
+            isinstance(pid, bool)
+            or not isinstance(pid, int)
+            or pid <= 0
+            or isinstance(birth_unix_ns, bool)
+            or not isinstance(birth_unix_ns, int)
+            or birth_unix_ns <= 0
+        ):
+            raise ManagedCommandError(f"{label} contains an invalid process identity")
+        if pid in expected:
+            raise ManagedCommandError(f"{label} contains duplicate process PID {pid}")
+        expected[pid] = birth_unix_ns
+
+    reader = identity_reader or process_birth_unix_ns
+    deadline = time.monotonic() + timeout
+    pending = dict(expected)
+    while pending:
+        for pid, original_birth in list(pending.items()):
+            current_birth = reader(pid)
+            if current_birth is None or current_birth != original_birth:
+                del pending[pid]
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            details = ", ".join(
+                f"{pid}@{birth}" for pid, birth in sorted(pending.items())
+            )
+            raise ManagedCommandError(
+                f"{label} still has original process identities alive: {details}"
+            )
+        time.sleep(min(POLL_SECONDS, remaining))
 
 
 def spawn_supervisor(
@@ -285,8 +417,8 @@ class ManagedProcess:
         self.cwd = cwd
         self.label = label
         self.cleanup_grace_seconds = cleanup_grace_seconds
-        self._temporary = tempfile.TemporaryDirectory(prefix="srui-benchmark-process-")
-        directory = Path(self._temporary.name)
+        self._temporary = Path(tempfile.mkdtemp(prefix="srui-benchmark-process-"))
+        directory = self._temporary
         self.ready_path = directory / "ready.json"
         self.status_path = directory / "status.json"
         self.stdout_path = directory / "stdout"
@@ -338,7 +470,7 @@ class ManagedProcess:
 
     @property
     def closed(self) -> bool:
-        return self._reaped
+        return self._reaped and self._controls_cleaned
 
     @property
     def child_pid(self) -> int | None:
@@ -350,6 +482,21 @@ class ManagedProcess:
             return child_pid if isinstance(child_pid, int) else None
         except (OSError, json.JSONDecodeError):
             return None
+
+    def signal(self, signum: int) -> None:
+        """Signal the pinned supervised group; the sentinel ignores INT and TERM."""
+
+        if self._reaped or self.supervisor is None or self.supervisor.poll() is not None:
+            raise ManagedCommandError(f"{self.label} is not running")
+        try:
+            process_group = os.getpgid(self.supervisor.pid)
+        except ProcessLookupError as error:
+            raise ManagedCommandError(f"{self.label} process group disappeared") from error
+        if process_group != self.supervisor.pid:
+            raise ManagedCommandError(
+                f"{self.label} supervisor is not its process-group leader"
+            )
+        os.killpg(process_group, signum)
 
     def _status(self) -> dict[str, Any] | None:
         if self.status_path.exists():
@@ -385,7 +532,8 @@ class ManagedProcess:
     def _discard_controls(self) -> None:
         if self._controls_cleaned:
             return
-        self._temporary.cleanup()
+        if self._temporary.exists():
+            shutil.rmtree(self._temporary)
         self._controls_cleaned = True
 
     def terminate(self) -> None:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import signal
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -52,6 +54,35 @@ def artifact(digest: str = "a" * 64) -> dict[str, Any]:
 
 
 def valid_report() -> dict[str, Any]:
+    sections: dict[str, dict[str, Any]] = {}
+    artifacts: dict[str, dict[str, Any]] = {}
+    for driver in valid_manifest()["drivers"]:
+        payload = payload_for_driver(driver)
+        artifacts[driver["name"]] = payload["artifacts"]
+        for emitted in payload["sections"]:
+            section_id = emitted["id"]
+            if section_id in sections:
+                sections[section_id]["metrics"].extend(emitted["metrics"])
+                sections[section_id]["assertions"].extend(emitted["assertions"])
+            else:
+                sections[section_id] = emitted
+    benchmark_run.append_parity_assertion(sections, artifacts)
+    sections["31.5"]["metrics"].append(
+        {
+            "id": "production_reconnect_suite_ms",
+            "name": "production reconnect boundary suite",
+            "value": 1.0,
+            "unit": "ms",
+            "statistic": "wall",
+        }
+    )
+    sections["31.5"]["assertions"].append(
+        {
+            "id": "production_reconnect_suite",
+            "name": "production reconnect boundary suite",
+            "passed": True,
+        }
+    )
     return {
         "schema_version": 1,
         "generated_at": "2026-01-01T00:00:00Z",
@@ -62,8 +93,8 @@ def valid_report() -> dict[str, Any]:
             "machine": "test",
             "python": "3.14",
         },
-        "driver_artifacts": {"rust": artifact(), "macos": artifact()},
-        "sections": [section(section_id) for section_id in benchmark_run.EXPECTED_SECTIONS],
+        "driver_artifacts": artifacts,
+        "sections": list(sections.values()),
     }
 
 
@@ -154,6 +185,30 @@ def test_report_schema_requires_all_six_sections() -> None:
         benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
 
 
+def test_report_enforces_merged_inventory_and_canonical_parity() -> None:
+    report = valid_report()
+    benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
+
+    report["sections"][0]["metrics"].pop()
+    with pytest.raises(benchmark_run.BenchmarkError, match="metric inventory"):
+        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
+
+    report = valid_report()
+    report["driver_artifacts"]["macos"]["canonical_transaction_sha256"] = "b" * 64
+    with pytest.raises(benchmark_run.BenchmarkError, match="inconsistent"):
+        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
+
+    report = valid_report()
+    reconnect = next(item for item in report["sections"] if item["id"] == "31.5")
+    reconnect["metrics"] = [
+        item
+        for item in reconnect["metrics"]
+        if item["id"] != "production_reconnect_suite_ms"
+    ]
+    with pytest.raises(benchmark_run.BenchmarkError, match="metric inventory"):
+        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
+
+
 def test_manifest_enforces_driver_declarations() -> None:
     manifest = valid_manifest()
     benchmark_run.validate_manifest(manifest)
@@ -199,6 +254,7 @@ def test_zero_exit_without_conformance_contract_fails_verification(
 
 def payload_for_driver(driver: dict[str, Any]) -> dict[str, Any]:
     expected = benchmark_run.EXPECTED_DRIVER_INVENTORY[driver["name"]]
+    frame_budget = 1000.0 / 120.0
     sections = []
     for section_id in driver["sections"]:
         inventory = expected[section_id]
@@ -210,12 +266,22 @@ def payload_for_driver(driver: dict[str, Any]) -> dict[str, Any]:
                     {
                         "id": metric_id,
                         "name": metric_id,
-                        "value": 1.0,
+                        "value": (
+                            frame_budget
+                            if (metric_id, statistic)
+                            == (benchmark_run.LOCAL_FRAME_BUDGET_ID, "exact")
+                            else 1.0
+                        ),
                         "unit": metadata[0],
                         "statistic": statistic,
                         **(
                             {
-                                "target": metadata[1],
+                                "target": (
+                                    frame_budget
+                                    if metadata[1]
+                                    == benchmark_run.LOCAL_FRAME_BUDGET_ID
+                                    else metadata[1]
+                                ),
                                 "target_direction": metadata[2],
                             }
                             if metadata[1] is not None
@@ -248,6 +314,9 @@ def payload_for_driver(driver: dict[str, Any]) -> dict[str, Any]:
                 "started_unix_ns": 1,
                 "ended_unix_ns": 2,
                 "helper_pid_source": "no helper processes",
+                "process_identities": [
+                    {"pid": 43, "birth_unix_ns": 1_001},
+                ],
             },
             {
                 "candidate": "webkit",
@@ -257,6 +326,10 @@ def payload_for_driver(driver: dict[str, Any]) -> dict[str, Any]:
                 "started_unix_ns": 3,
                 "ended_unix_ns": 4,
                 "helper_pid_source": "WKWebView diagnostic process identifiers",
+                "process_identities": [
+                    {"pid": 44, "birth_unix_ns": 1_002},
+                    {"pid": 45, "birth_unix_ns": 1_003},
+                ],
             },
         ]
     return {"artifacts": artifacts, "sections": sections}
@@ -318,7 +391,7 @@ def test_driver_inventory_constrains_units_and_required_target_metadata() -> Non
         benchmark_run.validate_driver_output(payload, driver)
 
 
-def test_macos_attribution_is_bound_to_launched_driver_pid() -> None:
+def test_macos_attribution_is_bound_to_launched_driver_pid_and_birth_identity() -> None:
     driver = next(
         item for item in valid_manifest()["drivers"] if item["name"] == "macos"
     )
@@ -327,6 +400,75 @@ def test_macos_attribution_is_bound_to_launched_driver_pid() -> None:
 
     with pytest.raises(benchmark_run.BenchmarkError, match="does not match launched"):
         benchmark_run.validate_driver_output(payload, driver, launched_pid=99)
+
+    payload = payload_for_driver(driver)
+    payload["artifacts"]["renderer_process_attribution"][1][
+        "process_identities"
+    ].pop()
+    with pytest.raises(benchmark_run.BenchmarkError, match="exactly cover"):
+        benchmark_run.validate_driver_output(payload, driver, launched_pid=42)
+
+
+def test_dynamic_local_frame_budget_controls_every_local_p50_target() -> None:
+    driver = next(
+        item for item in valid_manifest()["drivers"] if item["name"] == "macos"
+    )
+    payload = payload_for_driver(driver)
+    network = next(item for item in payload["sections"] if item["id"] == "31.4")
+    budget = next(
+        item
+        for item in network["metrics"]
+        if item["id"] == benchmark_run.LOCAL_FRAME_BUDGET_ID
+    )
+    budget["value"] = 7.5
+    with pytest.raises(benchmark_run.BenchmarkError, match="metric metadata"):
+        benchmark_run.validate_driver_output(payload, driver)
+
+    for item in network["metrics"]:
+        if item.get("target_direction") == "max":
+            item["target"] = 7.5
+    benchmark_run.validate_driver_output(payload, driver)
+
+    budget["value"] = 0
+    for item in network["metrics"]:
+        if item.get("target_direction") == "max":
+            item["target"] = 0
+    with pytest.raises(benchmark_run.BenchmarkError, match="must be positive"):
+        benchmark_run.validate_driver_output(payload, driver)
+
+
+def test_run_driver_waits_for_exact_attributed_process_identities(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    driver = next(
+        item for item in valid_manifest()["drivers"] if item["name"] == "macos"
+    )
+    payload = payload_for_driver(driver)
+    observed: list[tuple[int, int]] = []
+
+    def fake_command(command: list[str], **_kwargs: Any) -> SimpleNamespace:
+        output_path = Path(command[command.index("--output") + 1])
+        output_path.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="", child_pid=42)
+
+    def observe(
+        identities: list[tuple[int, int]],
+        *,
+        label: str,
+    ) -> None:
+        assert label == "macos renderer candidates"
+        observed.extend(identities)
+
+    monkeypatch.setattr(benchmark_run, "run_managed_command", fake_command)
+    monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
+    monkeypatch.setattr(
+        benchmark_run,
+        "wait_for_process_identities_gone",
+        observe,
+    )
+    benchmark_run.run_driver(driver, tmp_path / "fixture.json", "smoke", 1)
+    assert sorted(observed) == [(43, 1_001), (44, 1_002), (45, 1_003)]
 
 
 def test_driver_schema_requires_stable_measurement_ids() -> None:
@@ -390,6 +532,13 @@ def test_failed_assertions_cannot_replace_baseline() -> None:
         benchmark_run.ensure_baseline_recordable(report)
 
 
+def test_ensure_baseline_recordable_rejects_smoke_directly() -> None:
+    report = valid_report()
+    report["profile"] = "smoke"
+    with pytest.raises(benchmark_run.BenchmarkError, match="non-full profile"):
+        benchmark_run.ensure_baseline_recordable(report)
+
+
 def test_full_failed_run_leaves_existing_baseline_untouched(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -413,18 +562,10 @@ def test_full_failed_run_leaves_existing_baseline_untouched(
         _profile: str,
         _timeout: int,
     ) -> dict[str, Any]:
-        emitted = []
-        for section_id in driver["sections"]:
-            item = section(section_id)
-            item["metrics"][0]["id"] = f"{driver['name']}_{section_id.replace('.', '_')}"
-            item["metrics"][0]["name"] = f"{driver['name']} measurement"
-            item["assertions"][0]["id"] = (
-                f"{driver['name']}_{section_id.replace('.', '_')}_correct"
-            )
-            if driver["name"] == "rust" and section_id == "31.2":
-                item["assertions"][0]["passed"] = False
-            emitted.append(item)
-        return {"artifacts": artifact(), "sections": emitted}
+        payload = payload_for_driver(driver)
+        if driver["name"] == "rust":
+            payload["sections"][0]["assertions"][0]["passed"] = False
+        return payload
 
     monkeypatch.setattr(benchmark_run, "ROOT", tmp_path)
     monkeypatch.setattr(benchmark_run, "MANIFEST", manifest_path)
@@ -439,6 +580,80 @@ def test_full_failed_run_leaves_existing_baseline_untouched(
         benchmark_run.main(["--profile", "full", "--record-baseline"])
     assert baseline_json.read_text() == "existing-json"
     assert baseline_markdown.read_text() == "existing-markdown"
+
+
+def test_report_pair_rolls_back_if_second_replacement_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    json_path = tmp_path / "latest.json"
+    markdown_path = tmp_path / "latest.md"
+    json_path.write_text("existing-json", encoding="utf-8")
+    markdown_path.write_text("existing-markdown", encoding="utf-8")
+    original_replace = benchmark_run.os.replace
+    failed = False
+
+    def fail_markdown_install(source: Any, destination: Any) -> None:
+        nonlocal failed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            not failed
+            and destination_path == markdown_path
+            and source_path.name.startswith(".latest.md.stage-")
+        ):
+            failed = True
+            raise OSError("synthetic markdown replacement failure")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(benchmark_run.os, "replace", fail_markdown_install)
+    with pytest.raises(OSError, match="synthetic markdown replacement failure"):
+        benchmark_run.write_report(valid_report(), tmp_path, "latest")
+
+    assert json_path.read_text(encoding="utf-8") == "existing-json"
+    assert markdown_path.read_text(encoding="utf-8") == "existing-markdown"
+    assert not list(tmp_path.glob(".*.stage-*"))
+    assert not list(tmp_path.glob(".*.backup-*"))
+
+
+def test_report_pair_remains_consistent_when_signal_arrives_during_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    report = valid_report()
+    json_path = tmp_path / "latest.json"
+    markdown_path = tmp_path / "latest.md"
+    original_replace = benchmark_run.os.replace
+    signaled = False
+
+    def signal_during_json_install(source: Any, destination: Any) -> None:
+        nonlocal signaled
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            not signaled
+            and destination_path == json_path
+            and source_path.name.startswith(".latest.json.stage-")
+        ):
+            signaled = True
+            signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(
+        benchmark_run.os,
+        "replace",
+        signal_during_json_install,
+    )
+    with pytest.raises(benchmark_run.TerminationRequested):
+        with benchmark_run.termination_handlers():
+            benchmark_run.write_report(report, tmp_path, "latest")
+
+    published = json.loads(json_path.read_text(encoding="utf-8"))
+    rendered = markdown_path.read_text(encoding="utf-8")
+    assert published["generated_at"] == report["generated_at"]
+    assert report["generated_at"] in rendered
+    assert not list(tmp_path.glob(".*.stage-*"))
+    assert not list(tmp_path.glob(".*.backup-*"))
 
 
 def test_signal_handler_raises_a_cleanup_safe_exception() -> None:
@@ -460,3 +675,5 @@ def test_committed_baseline_has_every_required_section() -> None:
     manifest = json.loads((root / "benchmarks/manifest.json").read_text())
     benchmark_run.validate_manifest(manifest)
     benchmark_run.validate_report(report, manifest["required_sections"])
+    assert report["profile"] == "full"
+    benchmark_run.ensure_baseline_recordable(report)

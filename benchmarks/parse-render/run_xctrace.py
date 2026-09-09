@@ -30,6 +30,7 @@ from process_control import (  # noqa: E402
     raise_termination_exceptions,
     run_managed_command,
     termination_exceptions,
+    wait_for_process_identities_gone,
 )
 
 DEFAULT_MAX_TRACE_BYTES = 2 * 1024 * 1024 * 1024
@@ -298,6 +299,8 @@ def driver_command(binary: Path, fixture: Path, result: Path) -> list[str]:
         str(fixture),
         "--profile",
         "full",
+        "--only-section",
+        "31.1",
         "--output",
         str(result),
     ]
@@ -521,6 +524,7 @@ ATTRIBUTION_KEYS = {
     "started_unix_ns",
     "ended_unix_ns",
     "helper_pid_source",
+    "process_identities",
 }
 
 
@@ -590,6 +594,27 @@ def load_renderer_process_attribution(
         if candidate == "srui" and helper_pids:
             raise CaptureError("srui attribution must not claim helper processes")
         item_pids = {item["host_pid"], *helper_pids}
+        identities = item["process_identities"]
+        if (
+            not isinstance(identities, list)
+            or any(
+                not isinstance(identity, dict)
+                or set(identity) != {"pid", "birth_unix_ns"}
+                or isinstance(identity["pid"], bool)
+                or not isinstance(identity["pid"], int)
+                or identity["pid"] <= 0
+                or isinstance(identity["birth_unix_ns"], bool)
+                or not isinstance(identity["birth_unix_ns"], int)
+                or identity["birth_unix_ns"] <= 0
+                for identity in identities
+            )
+        ):
+            raise CaptureError(f"{candidate} process identities are invalid")
+        identity_pids = [identity["pid"] for identity in identities]
+        if len(identity_pids) != len(set(identity_pids)) or set(identity_pids) != item_pids:
+            raise CaptureError(
+                f"{candidate} process identities must exactly cover host and helper PIDs"
+            )
         if item_pids & claimed_pids:
             raise CaptureError("renderer process attribution reuses a claimed PID")
         if (
@@ -853,11 +878,65 @@ def export_allocation_summary(
         temporary.unlink(missing_ok=True)
 
 
+def wait_for_attributed_processes_to_exit(
+    candidate_attribution: list[dict[str, Any]],
+) -> None:
+    identities = [
+        (identity["pid"], identity["birth_unix_ns"])
+        for item in candidate_attribution
+        for identity in item["process_identities"]
+    ]
+    try:
+        wait_for_process_identities_gone(
+            identities,
+            label="renderer allocation candidates",
+        )
+    except ManagedCommandError as error:
+        raise CaptureError(str(error)) from error
+
+
 def _cleanup_failure(label: str, error: BaseException) -> BaseException:
     if termination_exceptions(error):
         error.add_note(f"{label} was attempted before this termination propagated")
         return error
     return CaptureError(f"{label}: {type(error).__name__}: {error}")
+
+
+def _terminate_managed_with_retry(
+    process: ManagedProcess,
+    *,
+    label: str,
+) -> None:
+    errors: list[BaseException] = []
+    for _attempt in range(2):
+        if process.closed:
+            break
+        try:
+            process.terminate()
+        except BaseException as error:
+            errors.append(error)
+    if process.closed:
+        raise_termination_exceptions(
+            errors,
+            label=f"multiple termination requests while cleaning {label}",
+        )
+        return
+
+    supervisor_pid = (
+        process.supervisor.pid
+        if process.supervisor is not None
+        else "unregistered"
+    )
+    failure = CaptureError(
+        f"{label} remains pinned after two bounded cleanup attempts; "
+        f"supervisor PID {supervisor_pid}, controls {process.ready_path.parent}"
+    )
+    if errors:
+        raise BaseExceptionGroup(
+            f"{label} cleanup retry failed",
+            [*errors, failure],
+        )
+    raise failure
 
 
 def cleanup_capture(
@@ -872,9 +951,25 @@ def cleanup_capture(
     errors: list[BaseException] = []
     process_actions: list[tuple[str, Any]] = []
     if driver is not None and not driver.closed:
-        process_actions.append(("BenchmarkDriver cleanup", driver.terminate))
+        process_actions.append(
+            (
+                "BenchmarkDriver cleanup",
+                lambda: _terminate_managed_with_retry(
+                    driver,
+                    label="BenchmarkDriver",
+                ),
+            )
+        )
     if recorder is not None and not recorder.closed:
-        process_actions.append(("xctrace recorder cleanup", recorder.terminate))
+        process_actions.append(
+            (
+                "xctrace recorder cleanup",
+                lambda: _terminate_managed_with_retry(
+                    recorder,
+                    label="xctrace recorder",
+                ),
+            )
+        )
     if watcher is not None:
         process_actions.append(
             ("notification watcher cleanup", lambda: terminate_direct_process(watcher))
@@ -965,6 +1060,7 @@ def run(
             result,
             driver_pid=driver_result.child_pid,
         )
+        wait_for_attributed_processes_to_exit(candidate_attribution)
         recorder.signal(signal.SIGINT)
         recorder_result = recorder.wait(60, poll_hook=monitor)
         if recorder_result.returncode:

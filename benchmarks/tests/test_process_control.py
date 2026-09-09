@@ -76,6 +76,25 @@ def assert_process_gone(pid: int) -> None:
     pytest.fail(f"process {pid} survived supervised cleanup")
 
 
+def test_process_identity_wait_accepts_numeric_pid_reuse() -> None:
+    process_control.wait_for_process_identities_gone(
+        [(123, 456)],
+        label="reused candidate",
+        timeout=0,
+        identity_reader=lambda pid: 789 if pid == 123 else None,
+    )
+
+
+def test_process_identity_wait_rejects_same_identity_persistence() -> None:
+    with pytest.raises(ManagedCommandError, match="123@456"):
+        process_control.wait_for_process_identities_gone(
+            [(123, 456)],
+            label="persistent candidate",
+            timeout=0,
+            identity_reader=lambda pid: 456 if pid == 123 else None,
+        )
+
+
 def test_finished_supervisor_pid_is_never_treated_as_a_live_process_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -656,6 +656,60 @@ def test_report_pair_remains_consistent_when_signal_arrives_during_replacement(
     assert not list(tmp_path.glob(".*.backup-*"))
 
 
+def test_benchmark_cli_reports_companion_failure_with_signal_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recovery = benchmark_run.BenchmarkError(
+        "renderer identity persisted; retained supervisor/PGID 123; "
+        "control directory /tmp/recovery"
+    )
+
+    def fail(_argv: list[str] | None = None) -> int:
+        raise BaseExceptionGroup(
+            "termination plus recovery failure",
+            [
+                benchmark_run.TerminationRequested(signal.SIGTERM),
+                recovery,
+            ],
+        )
+
+    monkeypatch.setattr(benchmark_run, "main", fail)
+    assert benchmark_run.cli([]) == 128 + signal.SIGTERM
+    stderr = capsys.readouterr().err
+    assert "benchmark failures accompanying interruption" in stderr
+    assert "retained supervisor/PGID 123" in stderr
+    assert "control directory /tmp/recovery" in stderr
+    assert "benchmark interrupted by SIGTERM" in stderr
+
+
+def test_xctrace_cli_reports_companion_failure_with_signal_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    recovery = benchmark_xctrace.CaptureError(
+        "watcher cleanup failed; retained supervisor/PGID 456; "
+        "control directory /tmp/watcher"
+    )
+
+    def fail() -> int:
+        raise BaseExceptionGroup(
+            "termination plus watcher failure",
+            [
+                benchmark_xctrace.TerminationRequested(signal.SIGINT),
+                recovery,
+            ],
+        )
+
+    monkeypatch.setattr(benchmark_xctrace, "main", fail)
+    assert benchmark_xctrace.cli() == 130
+    stderr = capsys.readouterr().err
+    assert "allocation capture failures accompanying interruption" in stderr
+    assert "retained supervisor/PGID 456" in stderr
+    assert "control directory /tmp/watcher" in stderr
+    assert "allocation capture interrupted by SIGINT" in stderr
+
+
 def test_signal_handler_raises_a_cleanup_safe_exception() -> None:
     with pytest.raises(benchmark_run.TerminationRequested) as error:
         benchmark_run._raise_termination(signal.SIGTERM, None)

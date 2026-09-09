@@ -43,8 +43,11 @@ process with:
 
 The helper records the Allocations template with xctrace `--all-processes`, starts a full-profile
 driver scoped to §31.1 only after xctrace reports that recording began, and stops/finalizes the
-recorder as soon as the driver finishes. It cleans up the recorder, notification watcher, driver, and incomplete trace on every
-failure or interruption. The default live limits are a 2 GiB trace, a 256 MiB allocation export,
+recorder as soon as the driver finishes. The notification watcher is itself sentinel-supervised;
+the harness waits for its registered exec child before starting the recorder. It cleans up the
+recorder, notification watcher, driver, and incomplete trace on every failure or interruption.
+If interruption accompanies a postcondition or unrecoverable cleanup failure, the CLI prints that
+recovery context before returning the signal-derived exit status. The default live limits are a 2 GiB trace, a 256 MiB allocation export,
 and a 4 GiB free-space reserve; override them with `SRUI_XCTRACE_MAX_BYTES`,
 `SRUI_XCTRACE_MAX_EXPORT_BYTES`, and `SRUI_XCTRACE_MIN_FREE_BYTES`.
 

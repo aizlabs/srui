@@ -25,6 +25,7 @@ from process_control import (
     ManagedCommandError,
     ManagedCommandTimeout,
     blocked_termination_signals,
+    non_termination_exceptions,
     run_managed_command,
     termination_exceptions,
     wait_for_process_identities_gone,
@@ -1157,7 +1158,17 @@ def cli(argv: list[str] | None = None) -> int:
         return 2
     except BaseExceptionGroup as error:
         terminations = termination_exceptions(error)
+        companions = non_termination_exceptions(error)
         if terminations:
+            if companions:
+                print(
+                    "benchmark failures accompanying interruption: "
+                    + "; ".join(
+                        f"{type(companion).__name__}: {companion}"
+                        for companion in companions
+                    ),
+                    file=sys.stderr,
+                )
             first = terminations[0]
             if isinstance(first, TerminationRequested):
                 print(

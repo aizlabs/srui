@@ -217,7 +217,9 @@ def test_spawn_signal_window_registers_then_reaps_real_process_tree(
     supervisor_pids: list[int] = []
     child_pids: list[int] = []
     original_spawn = process_control.spawn_supervisor
+    original_killpg = process_control.os.killpg
     previous_handler = signal.getsignal(signal.SIGTERM)
+    kill_attempts = 0
 
     def raise_termination(_signum: int, _frame: object) -> None:
         raise RequestedTermination
@@ -232,8 +234,17 @@ def test_spawn_signal_window_registers_then_reaps_real_process_tree(
         signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
         return process
 
+    def fail_first_group_kill(process_group: int, signum: int) -> None:
+        nonlocal kill_attempts
+        if signum == signal.SIGKILL:
+            kill_attempts += 1
+            if kill_attempts == 1:
+                raise PermissionError("synthetic spawn cleanup group kill failure")
+        original_killpg(process_group, signum)
+
     signal.signal(signal.SIGTERM, raise_termination)
     monkeypatch.setattr(process_control, "spawn_supervisor", spawn_then_signal)
+    monkeypatch.setattr(process_control.os, "killpg", fail_first_group_kill)
     try:
         with pytest.raises(RequestedTermination):
             ManagedProcess.start(
@@ -247,6 +258,7 @@ def test_spawn_signal_window_registers_then_reaps_real_process_tree(
 
     assert len(supervisor_pids) == 1
     assert len(child_pids) == 1
+    assert kill_attempts == 2
     assert_process_gone(supervisor_pids[0])
     assert_process_gone(child_pids[0])
 
@@ -378,7 +390,7 @@ def test_run_managed_command_retries_transient_group_kill_failure(
         original_killpg(process_group, signum)
 
     monkeypatch.setattr(process_control.os, "killpg", fail_first_group_kill)
-    with pytest.raises(BaseExceptionGroup, match="cleanup"):
+    with pytest.raises(ManagedCommandTimeout, match="timed out"):
         run_managed_command(
             [sys.executable, "-c", SLEEPER, str(pid_file)],
             cwd=tmp_path,
@@ -389,6 +401,51 @@ def test_run_managed_command_retries_transient_group_kill_failure(
 
     assert kill_attempts == 2
     assert_process_gone(wait_for_pid(pid_file))
+
+
+def test_shared_cleanup_failure_retains_recovery_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "retained-cleanup-child.pid"
+    managed = ManagedProcess.start(
+        [sys.executable, "-c", SLEEPER, str(pid_file)],
+        cwd=tmp_path,
+        label="retained cleanup",
+        cleanup_grace_seconds=0.02,
+    )
+    child_pid = wait_for_pid(pid_file)
+    controls = managed.ready_path.parent
+    supervisor_pid = managed.supervisor.pid if managed.supervisor is not None else -1
+    original_killpg = process_control.os.killpg
+
+    def reject_group_kill(_process_group: int, signum: int) -> None:
+        if signum == signal.SIGKILL:
+            raise PermissionError("synthetic persistent group kill failure")
+        original_killpg(supervisor_pid, signum)
+
+    monkeypatch.setattr(process_control.os, "killpg", reject_group_kill)
+    try:
+        with pytest.raises(BaseExceptionGroup) as raised:
+            process_control.terminate_managed_process_with_retry(managed)
+        failures = [
+            nested
+            for nested in raised.value.exceptions
+            if isinstance(nested, ManagedCommandError)
+            and "retained supervisor/PGID" in str(nested)
+        ]
+        assert len(failures) == 1
+        recovery = failures[0]
+        assert str(supervisor_pid) in str(recovery)
+        assert str(controls) in str(recovery)
+        assert getattr(recovery, "process_handle") is managed
+        assert controls.exists()
+        assert not managed.closed
+    finally:
+        monkeypatch.setattr(process_control.os, "killpg", original_killpg)
+        process_control.terminate_managed_process_with_retry(managed)
+
+    assert_process_gone(child_pid)
 
 
 def test_termination_during_cleanup_is_reraised_after_real_group_reap(

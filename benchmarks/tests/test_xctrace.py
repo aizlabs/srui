@@ -306,43 +306,40 @@ def test_allocation_summary_fails_closed_on_unparseable_row_timestamp(
         )
 
 
-def test_second_spawn_failure_reaps_watcher_and_removes_partial_trace(
+def test_second_spawn_failure_reaps_managed_watcher_and_partial_trace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     trace = tmp_path / "capture.trace"
-    watcher_processes: list[subprocess.Popen[str]] = []
+    watchers: list[process_control.ManagedProcess] = []
+    watcher_pids: list[int] = []
+    original_start = benchmark_xctrace.ManagedProcess.start
+    starts = 0
 
-    def launch_watcher(_notification: str) -> subprocess.Popen[str]:
-        process = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(60)"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-            close_fds=True,
-        )
-        watcher_processes.append(process)
-        return process
-
-    def fail_recorder_start(
+    def start_then_fail(
         _cls: type[Any],
         _command: list[str],
-        **_kwargs: Any,
-    ) -> Any:
+        **kwargs: Any,
+    ) -> process_control.ManagedProcess:
+        nonlocal starts
+        starts += 1
+        if starts == 1:
+            kwargs["cleanup_grace_seconds"] = 0.05
+            watcher = original_start(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                **kwargs,
+            )
+            watchers.append(watcher)
+            watcher_pids.append(watcher.wait_until_started(2))
+            return watcher
         trace.mkdir()
         (trace / "incomplete").write_bytes(b"partial")
         raise OSError("second spawn failed")
 
     monkeypatch.setattr(
-        benchmark_xctrace,
-        "spawn_notification_watcher",
-        launch_watcher,
-    )
-    monkeypatch.setattr(
         benchmark_xctrace.ManagedProcess,
         "start",
-        classmethod(fail_recorder_start),
+        classmethod(start_then_fail),
     )
 
     with pytest.raises(OSError, match="second spawn failed"):
@@ -356,37 +353,42 @@ def test_second_spawn_failure_reaps_watcher_and_removes_partial_trace(
             min_remaining_bytes=1,
         )
 
-    assert len(watcher_processes) == 1
-    assert watcher_processes[0].poll() is not None
-    assert_process_gone(watcher_processes[0].pid)
+    assert starts == 2
+    assert len(watchers) == 1
+    assert watchers[0].closed
+    assert_process_gone(watcher_pids[0])
     assert not trace.exists()
     assert not (tmp_path / "capture.trace.summary.json").exists()
 
 
-def test_watcher_spawn_signal_window_registers_then_reaps_real_child(
+def test_managed_watcher_assignment_window_reaps_real_child_on_signal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     trace = tmp_path / "capture.trace"
-    watchers: list[subprocess.Popen[str]] = []
+    watchers: list[process_control.ManagedProcess] = []
+    child_pids: list[int] = []
+    original_start = benchmark_xctrace.ManagedProcess.start
 
-    def launch_then_signal(_notification: str) -> subprocess.Popen[str]:
-        watcher = subprocess.Popen(
+    def launch_then_signal(
+        _cls: type[Any],
+        _command: list[str],
+        **kwargs: Any,
+    ) -> process_control.ManagedProcess:
+        watcher = original_start(
             [sys.executable, "-c", "import time; time.sleep(60)"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-            close_fds=True,
+            **kwargs,
         )
+        child_pid = watcher.wait_until_started(2)
         watchers.append(watcher)
+        child_pids.append(child_pid)
         signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
         return watcher
 
     monkeypatch.setattr(
-        benchmark_xctrace,
-        "spawn_notification_watcher",
-        launch_then_signal,
+        benchmark_xctrace.ManagedProcess,
+        "start",
+        classmethod(launch_then_signal),
     )
 
     with pytest.raises(benchmark_xctrace.TerminationRequested):
@@ -402,29 +404,22 @@ def test_watcher_spawn_signal_window_registers_then_reaps_real_child(
             )
 
     assert len(watchers) == 1
-    assert watchers[0].poll() is not None
-    assert_process_gone(watchers[0].pid)
+    assert watchers[0].closed
+    assert_process_gone(child_pids[0])
     assert not trace.exists()
 
 
-def test_capture_cleanup_attempts_every_resource_and_removes_failed_capture(
-    monkeypatch: pytest.MonkeyPatch,
+def test_capture_cleanup_retries_every_managed_resource_and_retains_handles(
     tmp_path: Path,
 ) -> None:
     attempted: list[str] = []
-
-    class FailingWatcher:
-        pid = 999
-
-        @staticmethod
-        def poll() -> None:
-            return None
 
     class FailingManaged:
         closed = False
 
         def __init__(self, name: str) -> None:
             self.name = name
+            self.label = name
             self.supervisor = None
             self.ready_path = tmp_path / name / "ready.json"
 
@@ -437,16 +432,13 @@ def test_capture_cleanup_attempts_every_resource_and_removes_failed_capture(
     (trace / "partial").write_bytes(b"x")
     sidecar = tmp_path / "capture.trace.summary.json"
     sidecar.write_text("partial", encoding="utf-8")
+    driver = FailingManaged("driver")
+    recorder = FailingManaged("recorder")
+    watcher = FailingManaged("watcher")
 
-    def fail_watcher(_watcher: object) -> tuple[str, str]:
-        attempted.append("watcher")
-        raise RuntimeError("watcher failed")
-
-    monkeypatch.setattr(benchmark_xctrace, "terminate_direct_process", fail_watcher)
-    watcher = FailingWatcher()
     errors = benchmark_xctrace.cleanup_capture(
-        driver=FailingManaged("driver"),
-        recorder=FailingManaged("recorder"),
+        driver=driver,
+        recorder=recorder,
         watcher=watcher,
         trace=trace,
         sidecar=sidecar,
@@ -462,14 +454,19 @@ def test_capture_cleanup_attempts_every_resource_and_removes_failed_capture(
         "watcher",
     ]
     assert len(errors) == 3
-    watcher_group = errors[2].__cause__
-    assert isinstance(watcher_group, BaseExceptionGroup)
-    retained = [
-        error
-        for error in watcher_group.exceptions
-        if getattr(error, "process_handle", None) is watcher
-    ]
-    assert len(retained) == 1
+    for error, expected_handle in zip(
+        errors,
+        (driver, recorder, watcher),
+        strict=True,
+    ):
+        cleanup_group = error.__cause__
+        assert isinstance(cleanup_group, BaseExceptionGroup)
+        retained = [
+            nested
+            for nested in cleanup_group.exceptions
+            if getattr(nested, "process_handle", None) is expected_handle
+        ]
+        assert len(retained) == 1
     assert not trace.exists()
     assert not sidecar.exists()
 
@@ -533,43 +530,36 @@ time.sleep(60)
             managed.terminate()
 
 
-def test_capture_cleanup_retries_real_notification_watcher(
+def test_capture_cleanup_retries_real_managed_notification_watcher(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    ready_path = tmp_path / "notification-watcher.ready"
-    watcher = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import pathlib,signal,sys,time; "
-                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "pathlib.Path(sys.argv[1]).write_text('ready'); "
-                "time.sleep(60)"
-            ),
-            str(ready_path),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        close_fds=True,
+    pid_path = tmp_path / "managed-notification-watcher.pid"
+    sleeper = """
+import os
+import signal
+import sys
+import time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(str(os.getpid()))
+    output.flush()
+time.sleep(60)
+"""
+    watcher = process_control.ManagedProcess.start(
+        [sys.executable, "-c", sleeper, str(pid_path)],
+        cwd=tmp_path,
+        label="managed notification watcher",
+        cleanup_grace_seconds=0.05,
     )
-    deadline = time.monotonic() + 2
-    while not ready_path.exists():
+    deadline = time.monotonic() + 5
+    while not pid_path.exists():
         if time.monotonic() >= deadline:
-            watcher.kill()
-            watcher.wait(timeout=2)
-            pytest.fail("notification watcher did not install its signal handler")
+            pytest.fail("managed notification watcher did not start")
         time.sleep(0.01)
-
-    original_killpg = benchmark_xctrace.os.killpg
-    original_kill = watcher.kill
-    original_terminate = benchmark_xctrace.terminate_direct_process
+    child_pid = int(pid_path.read_text(encoding="utf-8"))
+    original_killpg = process_control.os.killpg
     group_kill_attempts = 0
-    direct_kill_attempts = 0
 
     def fail_first_group_kill(process_group: int, signum: int) -> None:
         nonlocal group_kill_attempts
@@ -579,23 +569,7 @@ def test_capture_cleanup_retries_real_notification_watcher(
                 raise PermissionError("synthetic watcher group kill failure")
         original_killpg(process_group, signum)
 
-    def fail_first_direct_kill() -> None:
-        nonlocal direct_kill_attempts
-        direct_kill_attempts += 1
-        if direct_kill_attempts == 1:
-            raise PermissionError("synthetic watcher direct kill failure")
-        original_kill()
-
-    def fast_terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
-        return original_terminate(process, grace_seconds=0.03)
-
-    monkeypatch.setattr(benchmark_xctrace.os, "killpg", fail_first_group_kill)
-    monkeypatch.setattr(watcher, "kill", fail_first_direct_kill)
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "terminate_direct_process",
-        fast_terminate,
-    )
+    monkeypatch.setattr(process_control.os, "killpg", fail_first_group_kill)
     try:
         errors = benchmark_xctrace.cleanup_capture(
             driver=None,
@@ -607,29 +581,28 @@ def test_capture_cleanup_retries_real_notification_watcher(
         )
         assert errors == []
         assert group_kill_attempts == 2
-        assert watcher.poll() is not None
-        assert_process_gone(watcher.pid)
+        assert watcher.closed
+        assert_process_gone(child_pid)
     finally:
-        monkeypatch.setattr(benchmark_xctrace.os, "killpg", original_killpg)
-        monkeypatch.setattr(watcher, "kill", original_kill)
-        if watcher.poll() is None:
-            watcher.kill()
-            watcher.communicate(timeout=2)
+        monkeypatch.setattr(process_control.os, "killpg", original_killpg)
+        if not watcher.closed:
+            process_control.terminate_managed_process_with_retry(watcher)
 
 
 def test_capture_cleanup_preserves_termination_class_after_all_attempts(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     class CleanupTermination(BaseException):
         pass
 
-    class FailingWatcher:
-        pid = 998
+    class InterruptingManaged:
+        closed = False
+        label = "notification watcher"
+        supervisor = None
+        ready_path = tmp_path / "watcher" / "ready.json"
 
-        @staticmethod
-        def poll() -> None:
-            return None
+        def terminate(self) -> None:
+            raise interruption
 
     interruption = CleanupTermination()
     trace = tmp_path / "capture.trace"
@@ -637,18 +610,10 @@ def test_capture_cleanup_preserves_termination_class_after_all_attempts(
     sidecar = tmp_path / "capture.trace.summary.json"
     sidecar.write_text("partial", encoding="utf-8")
 
-    def interrupt_after_attempt(_watcher: object) -> tuple[str, str]:
-        raise interruption
-
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "terminate_direct_process",
-        interrupt_after_attempt,
-    )
     errors = benchmark_xctrace.cleanup_capture(
         driver=None,
         recorder=None,
-        watcher=FailingWatcher(),
+        watcher=InterruptingManaged(),
         trace=trace,
         sidecar=sidecar,
         retain_outputs=False,

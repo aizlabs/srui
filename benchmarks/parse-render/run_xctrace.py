@@ -26,10 +26,10 @@ from process_control import (  # noqa: E402
     ManagedCommandError,
     ManagedCommandTimeout,
     ManagedProcess,
-    TERMINATION_SIGNALS,
     blocked_termination_signals,
-    raise_termination_exceptions,
+    non_termination_exceptions,
     run_managed_command,
+    terminate_managed_process_with_retry,
     termination_exceptions,
     wait_for_process_identities_gone,
 )
@@ -141,135 +141,45 @@ def remove_capture(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def spawn_notification_watcher(notification: str) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        ["notifyutil", "-1", notification],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        close_fds=True,
-    )
-
-
-def _signal_direct_group(process: subprocess.Popen[str], signum: int) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        process_group = os.getpgid(process.pid)
-    except ProcessLookupError:
-        return
-    if process_group != process.pid:
-        raise CaptureError(
-            f"process {process.pid} is not its process-group leader ({process_group})"
-        )
-    try:
-        os.killpg(process_group, signum)
-    except ProcessLookupError:
-        pass
-
-
-def terminate_direct_process(
-    process: subprocess.Popen[str],
-    grace_seconds: float = 2.0,
-) -> tuple[str, str]:
-    if process.poll() is not None:
-        return process.communicate(timeout=grace_seconds)
-
-    graceful_errors: list[BaseException] = []
-    output: tuple[str, str] | None = None
-    try:
-        _signal_direct_group(process, signal.SIGTERM)
-    except BaseException as error:
-        graceful_errors.append(error)
-    try:
-        output = process.communicate(timeout=grace_seconds)
-    except subprocess.TimeoutExpired:
-        pass
-    except BaseException as error:
-        graceful_errors.append(error)
-
-    if output is not None:
-        raise_termination_exceptions(
-            graceful_errors,
-            label=f"multiple termination requests while cleaning process {process.pid}",
-        )
-        return output
-
-    final_errors: list[BaseException] = []
-    group_killed = False
-    try:
-        _signal_direct_group(process, signal.SIGKILL)
-        group_killed = True
-    except BaseException as error:
-        final_errors.append(error)
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        except BaseException as direct_error:
-            final_errors.append(direct_error)
-    try:
-        output = process.communicate(timeout=grace_seconds)
-    except BaseException as error:
-        final_errors.append(error)
-        output = None
-
-    errors = [*graceful_errors, *final_errors]
-    if not group_killed or output is None or process.poll() is None:
-        failure = CaptureError(
-            f"could not confirm reap of direct process group {process.pid}: "
-            + "; ".join(f"{type(error).__name__}: {error}" for error in errors)
-        )
-        terminations = [
-            termination
-            for error in errors
-            for termination in termination_exceptions(error)
-        ]
-        if terminations:
-            raise BaseExceptionGroup(
-                f"termination requested and direct process group {process.pid} cleanup failed",
-                [*terminations, failure],
-            )
-        raise failure
-
-    raise_termination_exceptions(
-        errors,
-        label=f"multiple termination requests while cleaning process {process.pid}",
-    )
-    return output
+def notification_watcher_command(notification: str) -> list[str]:
+    return ["notifyutil", "-1", notification]
 
 
 def wait_for_recording_notification(
-    watcher: subprocess.Popen[str],
+    watcher: ManagedProcess,
     trace: Path,
     *,
     max_trace_bytes: int,
     min_remaining_bytes: int,
 ) -> None:
-    deadline = time.monotonic() + 15
-    while watcher.poll() is None:
-        ensure_capture_budget(
-            trace,
-            max_trace_bytes=max_trace_bytes,
-            min_remaining_bytes=min_remaining_bytes,
+    try:
+        result = watcher.wait(
+            15,
+            poll_hook=lambda _process: ensure_capture_budget(
+                trace,
+                max_trace_bytes=max_trace_bytes,
+                min_remaining_bytes=min_remaining_bytes,
+            ),
         )
-        if time.monotonic() >= deadline:
-            raise CaptureError(
-                "xctrace did not begin recording within 15s; grant Instruments "
-                "automation and Developer Tools privacy access"
-            )
-        time.sleep(POLL_SECONDS)
+    except ManagedCommandTimeout as error:
+        raise CaptureError(
+            "xctrace did not begin recording within 15s; grant Instruments "
+            "automation and Developer Tools privacy access"
+        ) from error
+    except ManagedCommandError as error:
+        raise CaptureError(
+            f"xctrace recording notification watcher failed: {error}"
+        ) from error
 
-    _watch_stdout, watch_stderr = watcher.communicate()
     ensure_capture_budget(
         trace,
         max_trace_bytes=max_trace_bytes,
         min_remaining_bytes=min_remaining_bytes,
     )
-    if watcher.returncode:
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
         raise CaptureError(
-            f"notifyutil failed ({watcher.returncode}): {watch_stderr[-1000:]}"
+            f"notifyutil failed ({result.returncode}): {detail[-1000:]}"
         )
 
 
@@ -905,127 +815,13 @@ def _cleanup_failure(label: str, error: BaseException) -> BaseException:
     return failure
 
 
-def _terminate_managed_with_retry(
-    process: ManagedProcess,
-    *,
-    label: str,
-) -> None:
-    errors: list[BaseException] = []
-    for _attempt in range(2):
-        if process.closed:
-            break
-        try:
-            process.terminate()
-        except BaseException as error:
-            errors.append(error)
-    if process.closed:
-        raise_termination_exceptions(
-            errors,
-            label=f"multiple termination requests while cleaning {label}",
-        )
-        return
-
-    supervisor_pid = (
-        process.supervisor.pid
-        if process.supervisor is not None
-        else "unregistered"
-    )
-    failure = CaptureError(
-        f"{label} remains pinned after two bounded cleanup attempts; "
-        f"supervisor PID {supervisor_pid}, controls {process.ready_path.parent}"
-    )
-    failure.process_handle = process  # type: ignore[attr-defined]
-    if errors:
-        raise BaseExceptionGroup(
-            f"{label} cleanup retry failed",
-            [*errors, failure],
-        )
-    raise failure
-
-
-def _drain_direct_process_with_retry(
-    process: subprocess.Popen[str],
-    *,
-    label: str,
-) -> None:
-    errors: list[BaseException] = []
-    for _attempt in range(2):
-        try:
-            terminate_direct_process(process)
-        except BaseException as error:
-            errors.append(error)
-        else:
-            raise_termination_exceptions(
-                errors,
-                label=f"multiple termination requests while cleaning {label}",
-            )
-            return
-
-        try:
-            reaped = process.poll() is not None
-        except BaseException as error:
-            errors.append(error)
-            continue
-        if reaped:
-            try:
-                process.communicate(timeout=2)
-            except BaseException as error:
-                errors.append(error)
-            else:
-                raise_termination_exceptions(
-                    errors,
-                    label=f"multiple termination requests while cleaning {label}",
-                )
-                return
-
-    failure = CaptureError(
-        f"{label} remains alive after two bounded cleanup attempts; "
-        f"process PID {process.pid} retained"
-    )
-    failure.process_handle = process  # type: ignore[attr-defined]
-    raise BaseExceptionGroup(
-        f"{label} cleanup retry failed",
-        [*errors, failure],
-    )
-
-
-def _terminate_direct_with_retry(
-    process: subprocess.Popen[str],
-    *,
-    label: str,
-) -> None:
-    previous_mask = signal.pthread_sigmask(
-        signal.SIG_BLOCK,
-        TERMINATION_SIGNALS,
-    )
-    cleanup_error: BaseException | None = None
-    try:
-        _drain_direct_process_with_retry(process, label=label)
-    except BaseException as error:
-        cleanup_error = error
-
-    deferred_termination: BaseException | None = None
-    try:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
-    except BaseException as error:
-        deferred_termination = error
-
-    if cleanup_error is not None and deferred_termination is not None:
-        raise BaseExceptionGroup(
-            f"{label} cleanup and deferred termination both failed",
-            [cleanup_error, deferred_termination],
-        )
-    if cleanup_error is not None:
-        raise cleanup_error
-    if deferred_termination is not None:
-        raise deferred_termination
 
 
 def cleanup_capture(
     *,
     driver: ManagedProcess | None,
     recorder: ManagedProcess | None,
-    watcher: subprocess.Popen[str] | None,
+    watcher: ManagedProcess | None,
     trace: Path,
     sidecar: Path,
     retain_outputs: bool,
@@ -1036,30 +832,21 @@ def cleanup_capture(
         process_actions.append(
             (
                 "BenchmarkDriver cleanup",
-                lambda: _terminate_managed_with_retry(
-                    driver,
-                    label="BenchmarkDriver",
-                ),
+                lambda: terminate_managed_process_with_retry(driver),
             )
         )
     if recorder is not None and not recorder.closed:
         process_actions.append(
             (
                 "xctrace recorder cleanup",
-                lambda: _terminate_managed_with_retry(
-                    recorder,
-                    label="xctrace recorder",
-                ),
+                lambda: terminate_managed_process_with_retry(recorder),
             )
         )
-    if watcher is not None:
+    if watcher is not None and not watcher.closed:
         process_actions.append(
             (
                 "notification watcher cleanup",
-                lambda: _terminate_direct_with_retry(
-                    watcher,
-                    label="notification watcher",
-                ),
+                lambda: terminate_managed_process_with_retry(watcher),
             )
         )
 
@@ -1099,7 +886,7 @@ def run(
         min_remaining_bytes=min_remaining_bytes,
     )
     notification = f"dev.srui.benchmark.xctrace.{os.getpid()}"
-    watcher: subprocess.Popen[str] | None = None
+    watcher: ManagedProcess | None = None
     recorder: ManagedProcess | None = None
     driver: ManagedProcess | None = None
     capture_complete = False
@@ -1113,11 +900,15 @@ def run(
         )
 
     try:
-        # The CLI installs handled signal exceptions. Defer them until the real
-        # watcher handle is assigned so every spawned process remains reachable.
+        # Outer blocking covers the return-to-assignment window in addition to
+        # ManagedProcess.start's internal spawn/registration critical section.
         with blocked_termination_signals():
-            spawned_watcher = spawn_notification_watcher(notification)
-            watcher = spawned_watcher
+            watcher = ManagedProcess.start(
+                notification_watcher_command(notification),
+                cwd=trace.parent,
+                label="xctrace notification watcher",
+            )
+        watcher.wait_until_started(5, poll_hook=monitor)
 
         recorder = ManagedProcess.start(
             trace_command(trace, notification),
@@ -1249,7 +1040,17 @@ def cli() -> int:
         return 2
     except BaseExceptionGroup as error:
         terminations = termination_exceptions(error)
+        companions = non_termination_exceptions(error)
         if terminations:
+            if companions:
+                print(
+                    "allocation capture failures accompanying interruption: "
+                    + "; ".join(
+                        f"{type(companion).__name__}: {companion}"
+                        for companion in companions
+                    ),
+                    file=sys.stderr,
+                )
             first = terminations[0]
             if isinstance(first, TerminationRequested):
                 print(

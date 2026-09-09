@@ -288,6 +288,18 @@ def termination_exceptions(error: BaseException) -> list[BaseException]:
     return [error] if not isinstance(error, Exception) else []
 
 
+def non_termination_exceptions(error: BaseException) -> list[Exception]:
+    """Flatten ordinary companion failures from a BaseException tree."""
+
+    if isinstance(error, BaseExceptionGroup):
+        return [
+            companion
+            for nested in error.exceptions
+            for companion in non_termination_exceptions(nested)
+        ]
+    return [error] if isinstance(error, Exception) else []
+
+
 def raise_termination_exceptions(
     errors: list[BaseException],
     *,
@@ -478,7 +490,7 @@ class ManagedProcess:
                 if managed.supervisor is None:
                     managed._discard_controls()
                 else:
-                    managed.terminate()
+                    terminate_managed_process_with_retry(managed)
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
             if cleanup_errors:
@@ -503,6 +515,41 @@ class ManagedProcess:
             return child_pid if isinstance(child_pid, int) else None
         except (OSError, json.JSONDecodeError):
             return None
+
+    def wait_until_started(
+        self,
+        timeout: float,
+        *,
+        poll_hook: Callable[[ManagedProcess], None] | None = None,
+    ) -> int:
+        """Wait for a live exec child to remain registered across one poll interval."""
+
+        if timeout <= 0:
+            raise ValueError("managed process start timeout must be positive")
+        deadline = time.monotonic() + timeout
+        observed_pid: int | None = None
+        observed_at = 0.0
+        while True:
+            status = self._status()
+            if status is not None:
+                raise ManagedCommandError(
+                    f"{self.label} exited before its child became ready"
+                )
+            child_pid = self.child_pid
+            now = time.monotonic()
+            if child_pid is not None:
+                if child_pid != observed_pid:
+                    observed_pid = child_pid
+                    observed_at = now
+                elif now - observed_at >= POLL_SECONDS:
+                    return child_pid
+            if poll_hook is not None:
+                poll_hook(self)
+            if now >= deadline:
+                raise ManagedCommandTimeout(
+                    f"{self.label} did not start within {timeout:g}s"
+                )
+            time.sleep(min(POLL_SECONDS, deadline - now))
 
     def signal(self, signum: int) -> None:
         """Signal the pinned supervised group; the sentinel ignores INT and TERM."""
@@ -594,7 +641,7 @@ class ManagedProcess:
                 time.sleep(POLL_SECONDS)
         except BaseException as primary:
             try:
-                self.terminate()
+                terminate_managed_process_with_retry(self)
             except BaseException as cleanup_error:
                 raise BaseExceptionGroup(
                     f"{self.label} failed and cleanup also failed",
@@ -640,6 +687,79 @@ class ManagedProcess:
         )
 
 
+def _drain_managed_process_with_retry(
+    process: ManagedProcess,
+    *,
+    attempts: int,
+) -> None:
+    if attempts <= 0:
+        raise ValueError("managed process cleanup attempts must be positive")
+    errors: list[BaseException] = []
+    for _attempt in range(attempts):
+        if process.closed:
+            break
+        try:
+            process.terminate()
+        except BaseException as error:
+            errors.append(error)
+    if process.closed:
+        raise_termination_exceptions(
+            errors,
+            label=f"multiple termination requests while cleaning {process.label}",
+        )
+        return
+
+    supervisor_identity = (
+        str(process.supervisor.pid)
+        if process.supervisor is not None
+        else "unregistered"
+    )
+    failure = ManagedCommandError(
+        f"{process.label} remains pinned after {attempts} bounded cleanup attempts; "
+        f"retained supervisor/PGID {supervisor_identity}; "
+        f"control directory {process.ready_path.parent}; "
+        "retry with the retained ManagedProcess handle"
+    )
+    failure.process_handle = process  # type: ignore[attr-defined]
+    if errors:
+        raise BaseExceptionGroup(
+            f"{process.label} cleanup retry failed",
+            [*errors, failure],
+        )
+    raise failure
+
+
+def terminate_managed_process_with_retry(
+    process: ManagedProcess,
+    *,
+    attempts: int = 2,
+) -> None:
+    """Run bounded cleanup before propagating any handled termination signal."""
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, TERMINATION_SIGNALS)
+    cleanup_error: BaseException | None = None
+    try:
+        _drain_managed_process_with_retry(process, attempts=attempts)
+    except BaseException as error:
+        cleanup_error = error
+
+    deferred_termination: BaseException | None = None
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException as error:
+        deferred_termination = error
+
+    if cleanup_error is not None and deferred_termination is not None:
+        raise BaseExceptionGroup(
+            f"{process.label} cleanup and deferred termination both failed",
+            [cleanup_error, deferred_termination],
+        )
+    if cleanup_error is not None:
+        raise cleanup_error
+    if deferred_termination is not None:
+        raise deferred_termination
+
+
 def run_managed_command(
     command: list[str],
     *,
@@ -661,9 +781,7 @@ def run_managed_command(
         cleanup_errors: list[BaseException] = []
         if not process.closed:
             try:
-                # wait() already tried once. Retry while the sentinel still pins
-                # the original group; terminate() remains bounded.
-                process.terminate()
+                terminate_managed_process_with_retry(process)
             except BaseException as cleanup_error:
                 cleanup_errors.append(cleanup_error)
 

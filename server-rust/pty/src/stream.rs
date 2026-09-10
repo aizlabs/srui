@@ -70,7 +70,8 @@ pub(crate) struct TerminalStream {
     command_tx: CommandSender,
     child: ChildSlot,
     child_pid: Arc<Mutex<Option<u32>>>,
-    exit_success: Arc<Mutex<Option<bool>>>,
+    #[cfg(any(test, feature = "benchmark-observability"))]
+    exit_status: watch::Sender<Option<bool>>,
     reader_thread: Mutex<Option<JoinHandle<()>>>,
     command_thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -137,7 +138,8 @@ impl TerminalStream {
             .or(child_pid);
 
         let child_pid = Arc::new(Mutex::new(child_pid));
-        let exit_success = Arc::new(Mutex::new(None));
+        #[cfg(any(test, feature = "benchmark-observability"))]
+        let (exit_status, _) = watch::channel(None);
         let ring = Arc::new(Mutex::new(OutputRing::new(spec.ring_capacity)));
         let (next_offset_watch, _) = watch::channel(0_u64);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
@@ -151,7 +153,8 @@ impl TerminalStream {
             command_tx: Arc::clone(&command_tx),
             child: Arc::clone(&child),
             child_pid: Arc::clone(&child_pid),
-            exit_success: Arc::clone(&exit_success),
+            #[cfg(any(test, feature = "benchmark-observability"))]
+            exit_status: exit_status.clone(),
             reader_thread: Mutex::new(None),
             command_thread: Mutex::new(None),
         });
@@ -160,7 +163,8 @@ impl TerminalStream {
         let reader_watch = next_offset_watch;
         let reader_child = Arc::clone(&child);
         let reader_child_pid = Arc::clone(&child_pid);
-        let reader_exit_success = Arc::clone(&exit_success);
+        #[cfg(any(test, feature = "benchmark-observability"))]
+        let reader_exit_status = exit_status;
         let reader = thread::Builder::new()
             .name(format!("srui-pty-read-{}", id.get()))
             .spawn(move || {
@@ -170,7 +174,8 @@ impl TerminalStream {
                     reader_watch,
                     reader_child,
                     reader_child_pid,
-                    reader_exit_success,
+                    #[cfg(any(test, feature = "benchmark-observability"))]
+                    reader_exit_status,
                     command_tx,
                 )
             })
@@ -226,11 +231,18 @@ impl TerminalStream {
         (ring.retained_start(), ring.next_offset())
     }
 
-    pub(crate) fn exit_success(&self) -> Option<bool> {
-        *self
-            .exit_success
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+    #[cfg(any(test, feature = "benchmark-observability"))]
+    pub(crate) async fn wait_for_exit(&self) -> bool {
+        let mut exit_status = self.exit_status.subscribe();
+        loop {
+            let current = *exit_status.borrow_and_update();
+            if let Some(success) = current {
+                return success;
+            }
+            exit_status.changed().await.expect(
+                "TerminalStream is held while waiting, so its exit-status sender cannot close",
+            );
+        }
     }
 
     pub(crate) fn subscribe(
@@ -302,12 +314,13 @@ impl TerminalStream {
             signal_child_tree(pid);
             if let Some(mut child) = self.child.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = child.kill();
-                if let Ok(status) = child.wait() {
-                    *self
-                        .exit_success
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = Some(status.success());
+                let status = child.wait();
+                #[cfg(any(test, feature = "benchmark-observability"))]
+                if let Ok(status) = status {
+                    self.exit_status.send_replace(Some(status.success()));
                 }
+                #[cfg(not(any(test, feature = "benchmark-observability")))]
+                drop(status);
             }
             // Command thread owns the master PTY. Join it first so dropping the master
             // forces EOF/EIO on the reader if any leftover slave holders remain.
@@ -358,7 +371,7 @@ fn read_loop(
     watch: watch::Sender<u64>,
     child: ChildSlot,
     child_pid: Arc<Mutex<Option<u32>>>,
-    exit_success: Arc<Mutex<Option<bool>>>,
+    #[cfg(any(test, feature = "benchmark-observability"))] exit_status: watch::Sender<Option<bool>>,
     command_tx: CommandSender,
 ) {
     let mut buf = vec![0_u8; PTY_READ_CHUNK];
@@ -379,11 +392,13 @@ fn read_loop(
         }
     }
     if let Some(mut child) = child.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        if let Ok(status) = child.wait() {
-            *exit_success
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(status.success());
+        let status = child.wait();
+        #[cfg(any(test, feature = "benchmark-observability"))]
+        if let Ok(status) = status {
+            exit_status.send_replace(Some(status.success()));
         }
+        #[cfg(not(any(test, feature = "benchmark-observability")))]
+        drop(status);
         *child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     // Natural exit: close the command worker so it does not sit on blocking_recv

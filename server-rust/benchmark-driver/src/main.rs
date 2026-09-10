@@ -48,7 +48,7 @@ async fn main() -> Result<(), String> {
         sections: vec![
             serialization(&fixture, iterations)?,
             reconnect(iterations).await?,
-            terminal(iterations)?,
+            terminal(iterations).await?,
         ],
     };
     let json = serde_json::to_vec_pretty(&output).map_err(|error| error.to_string())?;

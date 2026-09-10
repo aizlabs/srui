@@ -3,7 +3,9 @@
 Rust owners: `server-rust/benchmark-driver/src/terminal.rs::{pty_roundtrip,embedded_pty_roundtrip,terminal}`.
 The standalone and embedded cases each run a real PTY and capture the emitted byte stream. This is a
 server transport/process baseline: the embedded production `PTYManager` stream must finish at EOF
-with byte-for-byte equality to its expected payload and valid frame bounds. It is not presented as
+with byte-for-byte equality to its expected payload and valid frame bounds. The driver enables
+`srui-pty`'s opt-in `benchmark-observability` feature so it can await the reader/reaper completion
+signal without polling; default production builds expose no exit-status observer. It is not presented as
 a GUI terminal comparison. The production output ring is then exhausted and must report
 `TerminalResyncReason::RetentionLoss` for a reconnect offset older than its retained start.
 

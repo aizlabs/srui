@@ -7,7 +7,6 @@ use srui_pty::{
 use srui_semantic_tree::NodeId;
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::thread;
 use std::time::{Duration, Instant};
 
 const TERMINAL_LINE: &[u8] = b"\x1b[32mbenchmark output\x1b[0m\r\n";
@@ -60,43 +59,14 @@ fn terminal_spec(script: &str, ring_capacity: usize) -> TerminalSpec {
     }
 }
 
-fn wait_for_terminal_bytes(
-    manager: &PTYManager,
-    id: NodeId,
-    expected_next_offset: u64,
-) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if manager
-            .offsets(id)
-            .is_some_and(|(_, next)| next >= expected_next_offset)
-        {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    Err(format!(
-        "timed out waiting for terminal {id:?} to reach offset {expected_next_offset}"
-    ))
+async fn wait_for_terminal_exit(manager: &PTYManager, id: NodeId) -> Result<bool, String> {
+    tokio::time::timeout(Duration::from_secs(5), manager.benchmark_wait_for_exit(id))
+        .await
+        .map_err(|_| format!("timed out waiting for terminal {id:?} process exit"))?
+        .map_err(|error| error.to_string())
 }
 
-fn wait_for_terminal_exit(manager: &PTYManager, id: NodeId) -> Result<bool, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Some(success) = manager
-            .exit_success(id)
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(success);
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    Err(format!(
-        "timed out waiting for terminal {id:?} process exit"
-    ))
-}
-
-fn embedded_pty_roundtrip(
+async fn embedded_pty_roundtrip(
     payload: &[u8],
     script: &str,
 ) -> Result<(f64, Vec<u8>, usize, bool, bool), String> {
@@ -106,8 +76,7 @@ fn embedded_pty_roundtrip(
     manager
         .spawn(id, terminal_spec(script, payload.len() * 2))
         .map_err(|error| error.to_string())?;
-    wait_for_terminal_bytes(&manager, id, payload.len() as u64)?;
-    let exit_success = wait_for_terminal_exit(&manager, id)?;
+    let exit_success = wait_for_terminal_exit(&manager, id).await?;
     let final_offset = manager
         .offsets(id)
         .ok_or_else(|| "embedded PTY disappeared before final offset sampling".to_string())?
@@ -150,7 +119,7 @@ fn embedded_pty_roundtrip(
     ))
 }
 
-pub(crate) fn terminal(iterations: usize) -> Result<Section, String> {
+pub(crate) async fn terminal(iterations: usize) -> Result<Section, String> {
     let payload = TERMINAL_LINE.repeat(TERMINAL_LINES);
     let script = terminal_script(TERMINAL_LINES);
     let sample_count = iterations.min(20);
@@ -169,7 +138,7 @@ pub(crate) fn terminal(iterations: usize) -> Result<Section, String> {
         standalone_exit_success &= exited_successfully;
 
         let (elapsed, received, frame_count, sample_offsets_exact, sample_exit_success) =
-            embedded_pty_roundtrip(&payload, &script)?;
+            embedded_pty_roundtrip(&payload, &script).await?;
         embedded_ms.push(elapsed);
         exact_payloads &= received == payload;
         offsets_exact &= sample_offsets_exact;
@@ -184,8 +153,8 @@ pub(crate) fn terminal(iterations: usize) -> Result<Section, String> {
     exhaustion_manager
         .spawn(exhaustion_id, terminal_spec(&script, 1_024))
         .map_err(|error| error.to_string())?;
-    wait_for_terminal_bytes(&exhaustion_manager, exhaustion_id, payload.len() as u64)?;
-    let exhaustion_exit_success = wait_for_terminal_exit(&exhaustion_manager, exhaustion_id)?;
+    let exhaustion_exit_success =
+        wait_for_terminal_exit(&exhaustion_manager, exhaustion_id).await?;
     let start = Instant::now();
     let exhausted = exhaustion_manager
         .subscribe(exhaustion_id, 0)
@@ -300,7 +269,7 @@ pub(crate) fn terminal(iterations: usize) -> Result<Section, String> {
             },
         ],
         notes: vec![
-            "Standalone and embedded samples both include production PTY spawn, identical shell execution, EOF, and exact ANSI output; embedded additionally captures and frames the bytes."
+            "Standalone and embedded samples both include production PTY spawn, identical shell execution, EOF, and exact ANSI output; embedded additionally captures and frames the bytes. The embedded EOF boundary is event-driven and does not poll process state."
                 .into(),
         ],
     })

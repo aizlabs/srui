@@ -197,7 +197,7 @@ EXPECTED_DRIVER_INVENTORY = {
                 "srui.complete_paint": ("ms", DISTRIBUTION),
                 "srui.cpu": ("ms", ("p50", "p95")),
                 "srui.host_net_live_allocation_blocks": (
-                    "allocations",
+                    "blocks",
                     DISTRIBUTION,
                 ),
                 "srui.host_net_live_allocation_bytes": ("bytes", DISTRIBUTION),
@@ -207,7 +207,7 @@ EXPECTED_DRIVER_INVENTORY = {
                 "webkit.complete_paint": ("ms", ("p50", "p95")),
                 "webkit.cpu": ("ms", ("p50",)),
                 "webkit.host_net_live_allocation_blocks": (
-                    "allocations",
+                    "blocks",
                     DISTRIBUTION,
                 ),
                 "webkit.host_net_live_allocation_bytes": ("bytes", DISTRIBUTION),
@@ -331,14 +331,21 @@ EXPECTED_DRIVER_INVENTORY = {
             ),
             {
                 **{
-                    (f"interaction.{interaction}.rtt.{rtt}", "p50"): (
+                    (f"interaction.{interaction}.rtt.{rtt}", statistic): (
                         LOCAL_FRAME_BUDGET_ID,
                         "max",
                     )
                     for interaction in LOCAL_INTERACTIONS
                     for rtt in (0, 100, 300, 600)
+                    for statistic in DISTRIBUTION
                 },
-                ("local_rtt_delta", "p50"): (LOCAL_FRAME_BUDGET_ID, "max"),
+                **{
+                    ("local_rtt_delta", statistic): (
+                        LOCAL_FRAME_BUDGET_ID,
+                        "max",
+                    )
+                    for statistic in DISTRIBUTION
+                },
             },
         ),
         "31.5": _coverage(
@@ -1075,6 +1082,7 @@ def _validate_section_inventory(
             )
         if metric["unit"] in {
             "allocations",
+            "blocks",
             "boolean",
             "bytes",
             "frames",
@@ -1372,10 +1380,14 @@ def validate_driver_output(
         )
         local_delta = metrics[("local_rtt_delta", "p50")]["value"]
         frame_budget = metrics[(LOCAL_FRAME_BUDGET_ID, "exact")]["value"]
-        if local_latency["passed"] and local_delta > frame_budget:
+        if (
+            profile == "full"
+            and local_latency["passed"]
+            and local_delta > frame_budget
+        ):
             raise BenchmarkError(
                 "macos §31.4 local_latency_independent assertion contradicts "
-                "the dynamic display.frame_budget target"
+                "the full-compositor display.frame_budget target"
             )
     return payload
 
@@ -2019,8 +2031,9 @@ def markdown(report: dict[str, Any]) -> str:
             )
             if over_2x(metric):
                 followups.append(
-                    f"§{section['id']} {metric['name']}: {metric['value']:.4g} "
-                    f"{metric['unit']} vs target {metric['target']:g} {metric['unit']}"
+                    f"§{section['id']} {metric['name']} ({metric['statistic']}): "
+                    f"{metric['value']:.4g} {metric['unit']} vs target "
+                    f"{metric['target']:g} {metric['unit']}"
                 )
         lines += ["", "Assertions:", ""]
         for assertion in section["assertions"]:

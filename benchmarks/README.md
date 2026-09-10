@@ -112,7 +112,8 @@ The authoritative §31.1 allocation metrics are signed host/default-zone endpoin
 
 The report publishes p50/p95/p99
 `{srui,webkit}.host_net_live_allocation_{blocks,bytes}` values. They describe net live state,
-not cumulative allocation calls or traffic; negative values are valid and are never clamped.
+not cumulative allocation calls or traffic; negative values are valid and are never clamped. The
+count metric is reported in live `blocks`, never as a count of allocation calls.
 SRUI's value covers its renderer host. WKWebView is an explicitly host-only comparison control and
 excludes WebContent, Networking, GPU, and other helper allocations. The scope assertion and metric
 names make that limitation machine-readable.

@@ -328,6 +328,30 @@ def test_report_calls_out_performance_followup() -> None:
     assert "WARNING >2x" in rendered
 
 
+def test_report_flags_tail_local_latency_when_median_is_below_2x() -> None:
+    report = valid_report()
+    network = next(section for section in report["sections"] if section["id"] == "31.4")
+    budget = next(
+        metric["value"]
+        for metric in network["metrics"]
+        if metric["id"] == benchmark_run.LOCAL_FRAME_BUDGET_ID
+    )
+    interaction = {
+        metric["statistic"]: metric
+        for metric in network["metrics"]
+        if metric["id"] == "interaction.hover.rtt.0"
+    }
+    interaction["p50"]["value"] = budget * 1.5
+    interaction["p95"]["value"] = budget * 2.1
+    interaction["p99"]["value"] = budget * 2.2
+
+    benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
+    rendered = benchmark_run.markdown(report)
+    assert "§31.4 hover at 0ms RTT (p95):" in rendered
+    assert "§31.4 hover at 0ms RTT (p99):" in rendered
+    assert "§31.4 hover at 0ms RTT (p50):" not in rendered
+
+
 def test_report_schema_rejects_unknown_and_non_numeric_fields() -> None:
     report = valid_report()
     report["unexpected"] = True
@@ -478,6 +502,32 @@ def test_driver_rejects_passing_local_latency_assertion_above_frame_budget() -> 
         match="local_latency_independent assertion contradicts",
     ):
         benchmark_run.validate_driver_output(payload, driver)
+
+
+def test_smoke_driver_accepts_diagnostic_local_delta_above_frame_budget() -> None:
+    driver = next(
+        item for item in valid_manifest()["drivers"] if item["name"] == "macos"
+    )
+    payload = payload_for_driver(driver, profile="smoke")
+    network = next(
+        section for section in payload["sections"] if section["id"] == "31.4"
+    )
+    frame_budget = next(
+        metric["value"]
+        for metric in network["metrics"]
+        if (metric["id"], metric["statistic"])
+        == (benchmark_run.LOCAL_FRAME_BUDGET_ID, "exact")
+    )
+    for index, statistic in enumerate(benchmark_run.DISTRIBUTION, start=1):
+        metric = next(
+            metric
+            for metric in network["metrics"]
+            if (metric["id"], metric["statistic"])
+            == ("local_rtt_delta", statistic)
+        )
+        metric["value"] = frame_budget + index * 0.001
+
+    benchmark_run.validate_driver_output(payload, driver, profile="smoke")
 
 
 def test_manifest_enforces_driver_declarations() -> None:
@@ -781,7 +831,7 @@ def test_macos_allocation_inventory_uses_signed_host_endpoint_deltas() -> None:
             statistic,
         ): (unit, None, None)
         for candidate in ("srui", "webkit")
-        for suffix, unit in (("blocks", "allocations"), ("bytes", "bytes"))
+        for suffix, unit in (("blocks", "blocks"), ("bytes", "bytes"))
         for statistic in benchmark_run.DISTRIBUTION
     }
     assert {
@@ -1007,7 +1057,7 @@ def test_ordinary_macos_attribution_rejects_targeted_pid_requirements() -> None:
         benchmark_run.validate_driver_output(payload, driver, launched_pid=42)
 
 
-def test_dynamic_local_frame_budget_controls_every_local_p50_target() -> None:
+def test_dynamic_local_frame_budget_controls_every_local_percentile_target() -> None:
     driver = next(
         item for item in valid_manifest()["drivers"] if item["name"] == "macos"
     )

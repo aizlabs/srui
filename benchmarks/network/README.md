@@ -5,6 +5,14 @@ runs framed traffic through the production `SessionController` transport boundar
 0, 100, 300, and 600 ms RTT. The same production AppKit editor/renderer path performs text entry,
 caret movement, selection, marked-text IME composition, scrolling, hover, pressed feedback, and
 menu opening. Local control updates and server-dependent feedback are timed independently.
+
+Task 34 exposed a prerequisite renderer gap: stock `NSButton` did not provide a stable visible
+hover transition for the production Button path. `RendererAppKit.ControlFactory` now constructs
+its internal `HoverFeedbackButton`, and `ControlFactoryTests` proves enter changes its raster and
+exit restores it. This is an explicit production local-feedback correction under §22.5, not a
+benchmark-only control or forced invalidation in the timed observer; the measured subject includes
+that correction.
+
 In full mode, the harness resolves `CGWindowLevelForKey(.dockWindow)`,
 `CGWindowLevelForKey(.statusWindow)`, `CGWindowLevelForKey(.popUpMenuWindow)`, and
 `CGWindowLevelForKey(.screenSaverWindow)`, requires
@@ -55,8 +63,12 @@ It requires one new current-process window at the independently resolved pop-up 
 level is above the prepared status-level host, crops that window from the same delivered frame used
 for the timestamp, verifies nonblank/nonuniform pixels and exact identity/geometry/z-order, and
 only then cancels AppKit menu tracking.
-Smoke mode remains an explicitly named offscreen raster fallback with no compositor claim. The
-transport also applies a 1 MiB/s limit, deterministic frame loss/retry, and interruption.
+Smoke mode remains an explicitly named offscreen raster fallback with no compositor claim. Its
+whole-host raster can charge an unrelated released remote invalidation to a later local sample, so
+its cross-RTT latency delta is diagnostic rather than a correctness gate. Full mode enforces the
+p50 delta against the measured display-frame budget. Both profiles still require every exact
+held-response/delay-boundary/state proof. The transport also applies a 1 MiB/s limit,
+deterministic frame loss/retry, and interruption.
 
 Focused command:
 
@@ -64,11 +76,14 @@ Focused command:
 
 Metrics are `interaction.{kind}.rtt.{0,100,300,600}`, `server_feedback.rtt.*`,
 `local_rtt_delta`, `display.frame_budget`, `session_wire.{bytes,messages}`, and the
-`impairment.*` family. `local_latency_independent` and `no_sync_rtt` require local p50 work to
-stay within the measured display frame budget without tracking injected RTT. Each local trial
-starts one exact production response at the action boundary, proves the configured nonzero
-one-way delay is active at that boundary, holds delivery through the exact local visible
-completion, and releases the gate only afterwards. This demonstrates both genuine overlap with
-the injected transport impairment and non-dependence on its response.
+`impairment.*` family. In full mode, `local_latency_independent` requires the local p50 delta
+to stay within the measured display-frame budget; smoke publishes the same delta only as an
+offscreen-raster diagnostic. The p50, p95, and p99 metrics all carry the §23 next-frame target so
+tail misses appear in follow-up reporting, but the paired p95/p99 cross-RTT deltas are not
+assertion gates. In both profiles, `local_latency_independent` and `no_sync_rtt` require the exact
+causal proof: each local trial starts one production response at the action boundary, verifies
+the configured nonzero one-way delay is active at that boundary, holds delivery through exact
+local visible completion, and releases the gate only afterwards. This demonstrates both genuine
+overlap with the injected transport impairment and non-dependence on its response.
 `server_latency_tracks_rtt` and `impairments_use_session` separately validate the
 remote/control side.

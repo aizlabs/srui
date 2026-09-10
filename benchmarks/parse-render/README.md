@@ -63,10 +63,11 @@ Focused driver command:
     client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.1 --output /tmp/srui-31.1.json
 
 The renderer metric set includes `srui.first_paint`, `srui.complete_paint`, `srui.cpu`,
-`srui.host_retained_allocations`, `srui.process_footprint_peak`, and the corresponding
-`webkit.*` comparison-control metrics. Xctrace contributes separately measured
-interval-created-and-still-live allocation counts and bytes. Do not describe those xctrace values
-as cumulative allocations: allocations freed before trace finalization are absent.
+`srui.host_net_live_allocation_blocks`, `srui.host_net_live_allocation_bytes`,
+`srui.process_footprint_peak`, and the corresponding `webkit.*` comparison-control metrics.
+Allocation values are signed default-zone endpoint deltas, not cumulative allocation events; the
+count metric's unit is live `blocks`, not allocation calls. Xctrace is diagnostic-only and
+contributes no committed §31.1 metric or workload-interval total.
 
 ## Full-mode compositor isolation and evidence chain
 

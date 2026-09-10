@@ -2725,21 +2725,21 @@ func localRenderer(
             metric(
                 "SRUI host-process net live allocation block delta",
                 p50(srui.hostNetLiveAllocationBlockDelta),
-                "allocations",
+                "blocks",
                 "p50",
                 id: "srui.host_net_live_allocation_blocks"
             ),
             metric(
                 "SRUI host-process net live allocation block delta",
                 percentile(srui.hostNetLiveAllocationBlockDelta, 0.95),
-                "allocations",
+                "blocks",
                 "p95",
                 id: "srui.host_net_live_allocation_blocks"
             ),
             metric(
                 "SRUI host-process net live allocation block delta",
                 percentile(srui.hostNetLiveAllocationBlockDelta, 0.99),
-                "allocations",
+                "blocks",
                 "p99",
                 id: "srui.host_net_live_allocation_blocks"
             ),
@@ -2810,21 +2810,21 @@ func localRenderer(
             metric(
                 "WKWebView comparison host-process net live allocation block delta",
                 p50(web.hostNetLiveAllocationBlockDelta),
-                "allocations",
+                "blocks",
                 "p50",
                 id: "webkit.host_net_live_allocation_blocks"
             ),
             metric(
                 "WKWebView comparison host-process net live allocation block delta",
                 percentile(web.hostNetLiveAllocationBlockDelta, 0.95),
-                "allocations",
+                "blocks",
                 "p95",
                 id: "webkit.host_net_live_allocation_blocks"
             ),
             metric(
                 "WKWebView comparison host-process net live allocation block delta",
                 percentile(web.hostNetLiveAllocationBlockDelta, 0.99),
-                "allocations",
+                "blocks",
                 "p99",
                 id: "webkit.host_net_live_allocation_blocks"
             ),

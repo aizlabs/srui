@@ -120,6 +120,7 @@
             "bytes",
             "messages",
             "allocations",
+            "blocks",
             "MiB",
             "repaints",
             "boolean",

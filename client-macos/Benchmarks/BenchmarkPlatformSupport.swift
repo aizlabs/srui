@@ -634,6 +634,22 @@ enum BenchmarkPointerParkingSide {
     case right
 }
 
+private func benchmarkPostPointerMoved(at location: CGPoint) -> Bool {
+    guard let event = CGEvent(
+        mouseEventSource: nil,
+        mouseType: .mouseMoved,
+        mouseCursorPosition: location,
+        mouseButton: .left
+    ) else {
+        return false
+    }
+    // CGWarpMouseCursorPosition intentionally emits no mouse event. Notify the
+    // active session so the previously hovered application can retract stale
+    // tooltips before z-order evidence is captured.
+    event.post(tap: .cgSessionEventTap)
+    return true
+}
+
 @MainActor
 func benchmarkParkPointerOutsideMeasurementROI(
     on screen: NSScreen,
@@ -664,6 +680,12 @@ func benchmarkParkPointerOutsideMeasurementROI(
             "benchmark could not park the pointer outside the measurement ROI"
         )
     }
+    guard benchmarkPostPointerMoved(at: parkedLocation) else {
+        _ = CGWarpMouseCursorPosition(currentEvent.location)
+        throw BenchmarkFailure.message(
+            "benchmark could not notify the session of the parked pointer"
+        )
+    }
 
     let expectedAppKitX = switch side {
     case .left:
@@ -687,6 +709,7 @@ func benchmarkParkPointerOutsideMeasurementROI(
 
 func benchmarkRestorePointer(_ location: CGPoint) {
     _ = CGWarpMouseCursorPosition(location)
+    _ = benchmarkPostPointerMoved(at: location)
 }
 
 private func windowServerNonzeroAlphaIntersectionAbove(

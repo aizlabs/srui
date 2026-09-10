@@ -57,10 +57,13 @@ ordinary visual candidate, then restores the user's location after both candidat
 Each visual SRUI/WebKit subprocess independently saves its inherited pointer location, repeats
 the same left-interior park immediately before entering its candidate measurement function, and
 restores that child-local value on exit. Every full paint then refreshes that park after accepting
-the pre-action ScreenCaptureKit baseline and immediately before selecting the hidden window
-position; both operations complete before the action-start timestamp. This closes physical
-pointer movement during child warm-up or capture startup without moving the cursor inside a
-reported interval. Non-compositor smoke and optional diagnostic allocation passes use
+the pre-action ScreenCaptureKit baseline and immediately before the action-start timestamp.
+WebKit positions its already-created hidden window at that point; the native path creates and
+positions its hidden window during the timed production attach. This closes physical pointer
+movement during child warm-up or capture startup without moving the cursor inside a reported
+interval. Each park and restore also posts the matching public session-level `mouseMoved` event:
+Quartz warping alone emits no mouse event and can otherwise leave the previously hovered app\'s
+tooltip frozen ahead of the benchmark after that app deactivates. Non-compositor smoke and optional diagnostic allocation passes use
 deterministic hidden geometry without requiring or moving the pointer. The child-side guard is
 authoritative: it closes the parent-to-child build/spawn race and completes before any candidate
 measurement interval starts.

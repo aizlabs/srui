@@ -114,10 +114,12 @@ The full-profile sequence is:
 1. Resolve the target display and prepare the candidate while hidden.
 2. Start the ScreenCaptureKit display stream.
 3. Accept one complete pre-action baseline frame.
-4. Refresh the candidate-local cursor park and select the hidden window position. Both are
-   untimed; refreshing here closes physical pointer movement during warm-up or capture startup.
+4. Refresh the candidate-local cursor park. WebKit also selects its already-created hidden window
+   position here. These operations are untimed and close physical pointer movement during warm-up
+   or capture startup.
 5. Record the action-start Mach timestamp.
-6. Run the first-state or two-state production workload while the host remains hidden.
+6. Run the first-state or two-state production workload while the host remains hidden. The native
+   path creates and positions its window during this timed attach.
 7. Immediately before the sole order-front/display submission, arm a display-time cutoff.
 8. Ignore incomplete frames and every frame whose `displayTime` does not cross that cutoff.
 9. For each later candidate frame, resolve and validate the exact target/window geometry and
@@ -193,7 +195,18 @@ corner, hover state, or cursor overlay. Full parse/render mode uses two nested g
   immediately before entering its measurement function.
 
 The child-side guard closes the build/spawn interval during which the user or system can move the
-pointer. Both guards restore the exact saved location during normal return and failure unwinding.
+pointer. Every full paint refreshes the child park after accepting its pre-action display baseline
+and before recording the action-start timestamp. Both guards restore the exact saved location
+during normal return and failure unwinding.
+
+`CGWarpMouseCursorPosition` deliberately changes location without emitting a mouse event. That can
+leave the previously hovered application\'s tooltip alive after it deactivates. This occurred in a
+real full run as a 43×19-point ChatGPT message-time tooltip (`23:24`) at WindowServer layer 103;
+all 1,167 post-cutoff frames were correctly rejected because it overlapped the target. A controlled
+Swift/Quartz probe showed that a matching `.mouseMoved` event posted at `.cgSessionEventTap`
+dismissed the exact window. Park and restore therefore post that public session-level event after
+warping. The event occurs only during untimed preparation; it does not whitelist the tooltip, and
+an overlay that remains ahead still fails the existing z-order predicate.
 
 The 960×720 renderer ROI is placed in a visible-frame corner away from the parked pointer, with a
 64-point clearance requirement while hidden. Parking stays away from display edges to avoid Dock,

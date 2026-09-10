@@ -1987,11 +1987,20 @@ def markdown(report: dict[str, Any]) -> str:
     def one_line(value: Any) -> str:
         return str(value).replace("\n", " / ")
 
+    authoritative = report["profile"] == "full"
+    target_heading = "Target" if authoritative else "Diagnostic reference"
     lines = [
         "# SRUI benchmark report",
         "",
         f"- Generated: {report['generated_at']}",
         f"- Profile: {report['profile']}",
+        *(
+            []
+            if authoritative
+            else [
+                "- Evidence class: diagnostic only; smoke timing is not §23 evidence",
+            ]
+        ),
         f"- Host: {environment['platform']} / {environment['machine']}",
         f"- Chip: {environment['chip']}",
         f"- Physical RAM: {environment['physical_ram_bytes']} bytes",
@@ -2016,7 +2025,7 @@ def markdown(report: dict[str, Any]) -> str:
                 for group, count in sorted(section["sample_counts"].items())
             ],
             "",
-            "| Metric | Value | Statistic | Target |",
+            f"| Metric | Value | Statistic | {target_heading} |",
             "|---|---:|---|---:|",
         ]
         for metric in section["metrics"]:
@@ -2024,7 +2033,13 @@ def markdown(report: dict[str, Any]) -> str:
             if "target" in metric:
                 operator = "≤" if metric.get("target_direction", "max") == "max" else "≥"
                 target = f"{operator} {metric['target']:g} {metric['unit']}"
-            marker = " **WARNING >2x**" if over_2x(metric) else ""
+            marker = ""
+            if over_2x(metric):
+                marker = (
+                    " **WARNING >2x**"
+                    if authoritative
+                    else " **DIAGNOSTIC >2x**"
+                )
             lines.append(
                 f"| {metric['name']} | {metric['value']:.4g} {metric['unit']}{marker} | "
                 f"{metric['statistic']} | {target} |"
@@ -2047,10 +2062,23 @@ def markdown(report: dict[str, Any]) -> str:
             lines += [f"- {note}" for note in section["notes"]]
         lines.append("")
     lines += ["## Follow-up flags", ""]
-    if followups:
-        lines += [f"- **PERFORMANCE FOLLOW-UP (>2x):** {item}" for item in followups]
+    if authoritative:
+        if followups:
+            lines += [
+                f"- **PERFORMANCE FOLLOW-UP (>2x):** {item}"
+                for item in followups
+            ]
+        else:
+            lines.append("- No §23 target was missed by more than 2x.")
+    elif followups:
+        lines += [
+            f"- **SMOKE DIAGNOSTIC (>2x; not §23 evidence):** {item}"
+            for item in followups
+        ]
     else:
-        lines.append("- No §23 target was missed by more than 2x.")
+        lines.append(
+            "- Smoke profile is diagnostic only; run the full profile for §23 evidence."
+        )
     if correctness_failures:
         lines += ["", *[f"- **CORRECTNESS FAILURE:** {item}" for item in correctness_failures]]
     lines.append("")

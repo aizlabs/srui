@@ -317,15 +317,30 @@ def test_over_2x_honors_direction() -> None:
     )
 
 
-def test_report_calls_out_performance_followup() -> None:
+def test_full_report_calls_out_performance_followup() -> None:
     report = valid_report()
-    report["profile"] = "smoke"
     report["sections"][2]["metrics"][0].update(
         {"value": 2.1, "target": 1.0, "target_direction": "max"}
     )
     rendered = benchmark_run.markdown(report)
     assert "PERFORMANCE FOLLOW-UP (>2x)" in rendered
     assert "WARNING >2x" in rendered
+    assert "SMOKE DIAGNOSTIC" not in rendered
+
+
+def test_smoke_report_labels_target_comparisons_as_diagnostic() -> None:
+    report = valid_report()
+    report["profile"] = "smoke"
+    report["sections"][2]["metrics"][0].update(
+        {"value": 2.1, "target": 1.0, "target_direction": "max"}
+    )
+    rendered = benchmark_run.markdown(report)
+    assert "Evidence class: diagnostic only" in rendered
+    assert "Diagnostic reference" in rendered
+    assert "DIAGNOSTIC >2x" in rendered
+    assert "SMOKE DIAGNOSTIC (>2x; not §23 evidence)" in rendered
+    assert "PERFORMANCE FOLLOW-UP" not in rendered
+    assert "WARNING >2x" not in rendered
 
 
 def test_report_flags_tail_local_latency_when_median_is_below_2x() -> None:

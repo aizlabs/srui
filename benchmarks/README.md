@@ -56,10 +56,14 @@ location, parks at `display.minX + 160` and the vertical midpoint before spawnin
 ordinary visual candidate, then restores the user's location after both candidates or on failure.
 Each visual SRUI/WebKit subprocess independently saves its inherited pointer location, repeats
 the same left-interior park immediately before entering its candidate measurement function, and
-restores that child-local value on exit. Non-compositor smoke and optional diagnostic allocation
-passes use deterministic hidden geometry without requiring or moving the pointer. The child-side
-guard is authoritative: it closes the parent-to-child build/spawn race and completes before any
-candidate measurement interval starts.
+restores that child-local value on exit. Every full paint then refreshes that park after accepting
+the pre-action ScreenCaptureKit baseline and immediately before selecting the hidden window
+position; both operations complete before the action-start timestamp. This closes physical
+pointer movement during child warm-up or capture startup without moving the cursor inside a
+reported interval. Non-compositor smoke and optional diagnostic allocation passes use
+deterministic hidden geometry without requiring or moving the pointer. The child-side guard is
+authoritative: it closes the parent-to-child build/spawn race and completes before any candidate
+measurement interval starts.
 
 That interior position remains outside the right-corner 960-point renderer ROI. Each hidden native
 or WebKit window chooses the visible-frame corner farthest from the parked pointer with 64 points

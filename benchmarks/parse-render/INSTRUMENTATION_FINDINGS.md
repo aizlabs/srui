@@ -114,15 +114,17 @@ The full-profile sequence is:
 1. Resolve the target display and prepare the candidate while hidden.
 2. Start the ScreenCaptureKit display stream.
 3. Accept one complete pre-action baseline frame.
-4. Record the action-start Mach timestamp.
-5. Run the first-state or two-state production workload while the host remains hidden.
-6. Immediately before the sole order-front/display submission, arm a display-time cutoff.
-7. Ignore incomplete frames and every frame whose `displayTime` does not cross that cutoff.
-8. For each later candidate frame, resolve and validate the exact target/window geometry and
+4. Refresh the candidate-local cursor park and select the hidden window position. Both are
+   untimed; refreshing here closes physical pointer movement during warm-up or capture startup.
+5. Record the action-start Mach timestamp.
+6. Run the first-state or two-state production workload while the host remains hidden.
+7. Immediately before the sole order-front/display submission, arm a display-time cutoff.
+8. Ignore incomplete frames and every frame whose `displayTime` does not cross that cutoff.
+9. For each later candidate frame, resolve and validate the exact target/window geometry and
    z-order, crop the target content from that same frame, and apply the pixel predicates.
-9. Requery identity, geometry, and z-order after pixel comparison to close the verification race.
-10. Accept the frame only if all pre- and post-checks agree.
-11. Report action-start through the accepted frame's `displayTime`.
+10. Requery identity, geometry, and z-order after pixel comparison to close the verification race.
+11. Accept the frame only if all pre- and post-checks agree.
+12. Report action-start through the accepted frame's `displayTime`.
 
 A refresh that appears before WindowServer has published the exact host identity is rejected; the
 stream stays armed for a later eligible frame. A stale partially rendered WebKit state is likewise

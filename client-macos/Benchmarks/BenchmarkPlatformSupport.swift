@@ -2142,6 +2142,14 @@ func benchmarkMeasureExplicitCompositedPaint(
             from: captureSession.frames,
             operation: "explicit pre-action display baseline"
         )
+        // Refresh the candidate-local park after capture startup. Warm-up and
+        // baseline acquisition are intentionally untimed, so either interval
+        // can otherwise leave a physically moved pointer over every candidate
+        // renderer position before the action chooses its hidden window frame.
+        _ = try benchmarkParkPointerOutsideMeasurementROI(
+            on: screen,
+            side: .left
+        )
         try onActionStarting?()
         let actionStartedMachTicks = mach_absolute_time()
         let actionStartedAt = clock.now

@@ -1523,10 +1523,15 @@ private func loadAndObserveWebStates(
             )
         }
         let screen = try benchmarkMainScreen()
-        try positionRendererWindowAwayFromPointer(window, on: screen)
         let measurement =
             try await benchmarkMeasureExplicitCompositedPaint(
                 on: screen,
+                onActionStarting: {
+                    try positionRendererWindowAwayFromPointer(
+                        window,
+                        on: screen
+                    )
+                },
                 requiredContentChangeFromObservation:
                     requiredContentChangeFromObservation
             ) {

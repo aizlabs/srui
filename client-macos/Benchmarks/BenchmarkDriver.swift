@@ -204,6 +204,27 @@ struct BenchmarkDriver {
             } else {
                 allocationControl = nil
             }
+            let candidatePointerOriginalLocation: CGPoint?
+            if fullPaint {
+                guard let screen = NSScreen.main else {
+                    throw BenchmarkFailure.message(
+                        "full renderer candidate requires a main display"
+                    )
+                }
+                candidatePointerOriginalLocation =
+                    try benchmarkParkPointerOutsideMeasurementROI(
+                        on: screen,
+                        side: .left
+                    )
+            } else {
+                candidatePointerOriginalLocation = nil
+            }
+            defer {
+                if let candidatePointerOriginalLocation {
+                    benchmarkRestorePointer(candidatePointerOriginalLocation)
+                }
+            }
+
             let result: RendererCandidateResult
             switch candidate {
             case "srui":

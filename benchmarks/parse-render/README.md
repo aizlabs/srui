@@ -23,16 +23,21 @@ decode/load, apply, render, and display-submission work, but start no ScreenCapt
 periodic footprint sampler is never alive during the CPU/allocation pass.
 
 Smoke mode observes separate real offscreen AppKit bitmap rasters and WKSnapshot outputs for the
-first and complete states; it does not claim compositor-visible paint. Before full-mode candidate
-subprocesses start, the parent driver records the exact Quartz pointer location and parks it at
-`display.minX + 160` and the measured display's vertical midpoint. That interior location avoids
-the auto-hidden Dock, menu-bar, and hot-corner activation zones while remaining outside the
-right-corner 960-point renderer ROI. The driver restores the original Quartz location after both
-candidates, or during failure unwinding. This parent-side preparation is outside every timed child
-interval. While hidden, each native or WebKit candidate window then selects the visible-frame
-corner farthest from the parked pointer and requires 64 points of clearance. The pointer and WindowServer
-cursor surface are not whitelisted: no clear corner, or any reported intersecting nonzero-alpha surface
-ahead, fails closed.
+first and complete states; it does not claim compositor-visible paint. Full mode uses two nested
+pointer guards. Before spawning candidates, the parent records the user's exact Quartz location,
+parks at `display.minX + 160` and the measured display's vertical midpoint, and restores the user
+location after both candidates or during failure unwinding. Each full SRUI or WebKit subprocess
+then independently saves its inherited pointer location, repeats the same left-interior park
+immediately before entering its candidate measurement function, and restores that child-local
+location on exit. This child-side guard is authoritative: it closes a parent-to-child build/spawn
+race and completes before every candidate measurement interval.
+
+The interior location avoids auto-hidden Dock, menu-bar, and hot-corner activation zones while
+remaining outside the right-corner 960-point renderer ROI. While hidden, each candidate window
+selects the visible-frame corner farthest from the parked pointer and requires 64 points of
+clearance. If no position is cursor-free, the diagnostic includes the exact pointer location and
+all four candidate frames. The pointer and WindowServer cursor surface are not whitelisted; any
+reported intersecting nonzero-alpha surface ahead still fails closed.
 
 Full mode prepares its ScreenCaptureKit stream and baseline before starting the workload. The
 complete first-state or two-state production workload runs while the target window remains hidden;
@@ -77,12 +82,13 @@ display, client-content geometry, and target geometry remain required. The host 
 report the resolved status layer, and menu evidence must report the independently resolved pop-up
 layer above it.
 
-The parent-side interior pointer park avoids edge-triggered system windows and makes a cursor-free
-right corner available to the 960×720 renderer window; the exact prior Quartz location is restored
-after the candidate subprocesses. The hidden renderer-window placement avoids the parked cursor
-geometrically; it does not remove a cursor entry from the z-order inventory.
-Candidate-frame and post-comparison checks still reject any intersecting nonzero-alpha window
-ahead.
+The parent-side park protects candidate launch, while each candidate's authoritative local park
+protects the measurement loop from launch-time pointer movement. Both occur before measured work
+and restore their own saved Quartz location. The resulting interior point avoids edge-triggered
+system windows and makes a cursor-free right corner available to the 960×720 renderer window.
+Hidden-window placement avoids the parked cursor geometrically; it does not remove a cursor entry
+from the z-order inventory. Candidate-frame and post-comparison checks still reject any
+intersecting nonzero-alpha window ahead. No timing, visibility, or occlusion rule is relaxed.
 
 The ScreenCaptureKit paint-evidence path is:
 

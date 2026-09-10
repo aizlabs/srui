@@ -52,12 +52,18 @@ observations of that exact identity, window bounds, and client-content ROI space
 Preparation then allows up to 10 seconds for a genuinely clear z-order before capture. A geometry
 timeout reports the prepared AppKit frame and current WindowServer entry fields.
 
-Full §31.1 instead parks the saved pointer at `display.minX + 160` and the vertical midpoint
-before starting either candidate subprocess, then restores it after both candidates or on failure.
-That interior position remains outside the right-corner 960-point renderer ROI. This preparation
-happens outside the children's timed intervals. Each hidden native or WebKit window then chooses
-the visible-frame corner farthest from the parked pointer with 64 points of clearance before it is
-ordered.
+Full §31.1 instead has two nested guards. The top-level parent saves the user's exact Quartz
+location, parks at `display.minX + 160` and the vertical midpoint before spawning either
+candidate, then restores the user's location after both candidates or on failure. Each full SRUI
+or WebKit subprocess independently saves its inherited pointer location, repeats the same
+left-interior park immediately before entering its candidate measurement function, and restores
+that child-local value on exit. The child-side guard is authoritative: it closes the parent-to-child
+build/spawn race and completes before any candidate measurement interval starts.
+
+That interior position remains outside the right-corner 960-point renderer ROI. Each hidden native
+or WebKit window chooses the visible-frame corner farthest from the parked pointer with 64 points
+of clearance before it is ordered. If no position is cursor-free, the failure reports the exact
+pointer location and every candidate frame.
 
 These placements are not owner, Dock, pointer, or cursor whitelists. `kCGWindowAlpha` is
 whole-window metadata, not per-pixel opacity, and every intersecting nonzero-alpha surface
@@ -205,9 +211,12 @@ schema.
 ## Measurement policy
 
 - Smoke paint uses deterministic offscreen presentation and is safe for unattended runs.
-- Full first/complete paint parks and later restores the pointer in the parent process, starts
-  ScreenCaptureKit before the production child action, keeps the target hidden through decode/load,
-  apply, and geometry, then performs one animation-free order-front submission. A frame is eligible
+- Full first/complete paint uses both parent-side and authoritative candidate-local pointer
+  park/restore guards. The candidate-local guard runs after spawn and entirely before its
+  measurement function, closing the parent-to-child race without entering a timed interval. The
+  benchmark then starts ScreenCaptureKit before the production child action, keeps the target
+  hidden through decode/load, apply, and geometry, and performs one animation-free order-front
+  submission. A frame is eligible
   only after exact target identity, client/target geometry, unobscured z-order, nonblank/nonuniform
   pixels, and at least eight normalized ROI pixels with any RGBA channel delta greater than the
   explicit 2/255 tolerance versus the same-stream baseline are proven. The full result separately

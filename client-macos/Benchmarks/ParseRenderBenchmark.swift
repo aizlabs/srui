@@ -718,7 +718,8 @@ private func positionRendererWindowAwayFromPointer(
         chosenFrame.insetBy(dx: -cursorClearance, dy: -cursorClearance)
     guard protectedFrame.contains(pointer) == false else {
         throw BenchmarkFailure.message(
-            "pointer overlaps every candidate renderer position; move the pointer near a display edge and rerun"
+            "pointer overlaps every candidate renderer position after untimed "
+                + "parking: pointer=\(pointer), candidates=\(candidates)"
         )
     }
 

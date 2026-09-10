@@ -152,6 +152,14 @@ struct Arguments {
     let allocationTargetRole: String?
     let supervisedParent: Bool
 
+    var isAllocationCaptureCandidate: Bool {
+        allocationControlDirectory != nil
+    }
+
+    var requiresCompositedPresentation: Bool {
+        profile == "full" && !isAllocationCaptureCandidate
+    }
+
     init() throws {
         let values = CommandLine.arguments
         func value(after name: String) throws -> String {
@@ -354,6 +362,36 @@ struct AllocationCaptureControl {
         }
     }
 
+    private func waitForCaptureAcknowledgement(_ url: URL) throws {
+        let deadline = clock.now + .seconds(60)
+        try url.withUnsafeFileSystemRepresentation { path in
+            guard let path else {
+                throw BenchmarkFailure.message(
+                    "allocation capture acknowledgement path is unavailable"
+                )
+            }
+            while Darwin.access(path, F_OK) != 0 {
+                guard errno == ENOENT else {
+                    throw BenchmarkFailure.message(
+                        "allocation capture acknowledgement check failed for "
+                            + "\(url.lastPathComponent): errno \(errno)"
+                    )
+                }
+                guard clock.now < deadline else {
+                    throw BenchmarkFailure.message(
+                        "allocation control timed out waiting for "
+                            + url.lastPathComponent
+                    )
+                }
+                // This is deliberately synchronous and post-measurement. An
+                // async Task.sleep loop allocates while xctrace finalizes,
+                // making its Statistics and live-list views observe different
+                // heap tails.
+                Darwin.usleep(10_000)
+            }
+        }
+    }
+
     func begin(
         candidate: String,
         sampleIndex: Int,
@@ -454,7 +492,9 @@ struct AllocationCaptureControl {
             ),
             to: path("done", sampleIndex: token.sampleIndex).appendingPathExtension("json")
         )
-        try await waitForFile(path("captured", sampleIndex: token.sampleIndex))
+        try waitForCaptureAcknowledgement(
+            path("captured", sampleIndex: token.sampleIndex)
+        )
     }
 }
 
@@ -576,10 +616,13 @@ func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore 
     return store
 }
 
-func mallocSample() -> (blocks: Int, bytes: Int) {
+func mallocSample() -> (blocks: Int64, bytes: Int64) {
     var statistics = malloc_statistics_t()
     malloc_zone_statistics(malloc_default_zone(), &statistics)
-    return (Int(statistics.blocks_in_use), Int(statistics.size_in_use))
+    return (
+        Int64(statistics.blocks_in_use),
+        Int64(statistics.size_in_use)
+    )
 }
 
 func residentPeakMiB() -> Double {

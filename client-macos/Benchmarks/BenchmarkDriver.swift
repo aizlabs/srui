@@ -99,26 +99,45 @@ struct BenchmarkDriver {
             cleanupCandidateLifetime()
         }
         // Candidate process-group ownership and parent-birth supervision are established above,
-        // synchronously, before this first AppKit access. Full measurements must be eligible
-        // to become the active foreground application so AppKit and WindowServer can truthfully
-        // report visible, non-occluded presentation. Smoke keeps the unobtrusive accessory policy.
+        // synchronously, before this first AppKit access. Ordinary full renderer candidates
+        // must be eligible to become the foreground application because they provide the
+        // ScreenCaptureKit presentation evidence. Allocation candidates are separate,
+        // ad-hoc-signed xctrace hosts: they retain full-profile sample counts and production
+        // render submission, but provide no compositor evidence. They intentionally leave
+        // AppKit's process-selected policy untouched and never activate, so instrumentation
+        // does not depend on a successful activation-policy transition.
+        let requiresForegroundPresentation =
+            arguments.requiresCompositedPresentation
         let application = NSApplication.shared
         let applicationDelegate = BenchmarkApplicationDelegate()
         application.delegate = applicationDelegate
-        let activationPolicy: NSApplication.ActivationPolicy =
-            arguments.profile == "full" ? .regular : .accessory
-        _ = application.setActivationPolicy(activationPolicy)
-        guard application.activationPolicy() == activationPolicy else {
-            cleanupCandidateLifetime()
-            FileHandle.standardError.write(
-                Data(
-                    "BenchmarkDriver failed: could not establish \(activationPolicy) activation policy\n".utf8
+        let requestedActivationPolicy: NSApplication.ActivationPolicy?
+        if requiresForegroundPresentation {
+            requestedActivationPolicy = .regular
+        } else if arguments.isAllocationCaptureCandidate {
+            requestedActivationPolicy = nil
+        } else {
+            requestedActivationPolicy = .accessory
+        }
+        if let requestedActivationPolicy {
+            _ = application.setActivationPolicy(requestedActivationPolicy)
+            guard application.activationPolicy() == requestedActivationPolicy else {
+                cleanupCandidateLifetime()
+                FileHandle.standardError.write(
+                    Data(
+                        "BenchmarkDriver failed: could not establish \(requestedActivationPolicy) activation policy\n".utf8
+                    )
                 )
+                Darwin.exit(EXIT_FAILURE)
+            }
+        } else {
+            benchmarkPhase(
+                "allocation candidate leaves activation policy unchanged "
+                    + "rawValue=\(application.activationPolicy().rawValue)"
             )
-            Darwin.exit(EXIT_FAILURE)
         }
         application.finishLaunching()
-        if arguments.profile == "full" {
+        if requiresForegroundPresentation {
             application.activate()
         }
 
@@ -164,7 +183,7 @@ struct BenchmarkDriver {
         )
         let fixtureOperations = try operations(for: fixture)
         let iterations = arguments.profile == "full" ? 20 : 3
-        let fullPaint = arguments.profile == "full"
+        let fullPaint = arguments.requiresCompositedPresentation
 
         if ProcessInfo.processInfo.environment[
             "SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST"

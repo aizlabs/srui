@@ -44,8 +44,6 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install Python tooling
         run: uv sync --frozen --extra dev
-      - name: Enable exact-process Instruments attachment
-        run: sudo /usr/sbin/DevToolsSecurity -enable
       - name: Test benchmark harness
         run: uv run --frozen pytest benchmarks/tests
       - name: Run layered benchmark smoke suite

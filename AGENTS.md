@@ -3,6 +3,23 @@
 Notes for AI coding agents working in this repo. Build/test/architecture guidance lives in
 `CLAUDE.md`; this file records tooling hazards that have cost real debugging time.
 
+## Benchmark documentation map
+
+Before changing or interpreting the §31 benchmark suite, read the documents at the appropriate
+level:
+
+- `benchmarks/README.md` defines the suite-wide execution, validation, and reporting contract.
+- `benchmarks/parse-render/README.md` is the operational guide for the §31.1 macOS renderer
+  benchmark and its optional diagnostics.
+- `benchmarks/parse-render/INSTRUMENTATION_FINDINGS.md` records the detailed evidence, rejected
+  approaches, permission behavior, measurement semantics, reproduction commands, and
+  Linux/Windows portability notes. Read it before changing paint, allocation, footprint,
+  WindowServer, ScreenCaptureKit, or xctrace instrumentation.
+
+The findings document is explanatory, not authoritative: the design document remains the source
+of product requirements, while executable benchmark schemas and assertions define the checked
+measurement contract.
+
 ## Editing tools may preserve mtime — touch before trusting a red test
 
 **Symptom.** You edit a file, re-run the test, and the result is unchanged: a fix stays red, or a

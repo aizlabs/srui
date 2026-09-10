@@ -488,12 +488,24 @@ func inspectDOM(in webView: WKWebView) async throws -> DOMInspection {
     let value = try await javascriptString(source, in: webView)
     return try JSONDecoder().decode(DOMInspection.self, from: Data(value.utf8))
 }
+let sruiHostAllocationMeasurementScope =
+    "default malloc zone in the SRUI renderer host process only; "
+        + "signed after-minus-before net live state, not cumulative "
+        + "allocation events"
+let webKitHostAllocationMeasurementScope =
+    "default malloc zone in the WebKit comparison host process only; "
+        + "excludes WebContent, Network, and GPU helper processes; "
+        + "signed after-minus-before net live state, not cumulative "
+        + "allocation events"
+
 struct RendererCandidateResult: Codable {
     let candidate: String
     let firstPaint: [Double]
     let completePaint: [Double]
     let cpuTime: [Double]
-    let hostLiveAllocationDelta: [Double]
+    let hostNetLiveAllocationBlockDelta: [Double]
+    let hostNetLiveAllocationByteDelta: [Double]
+    let hostAllocationMeasurementScope: String
     let allocatedFootprintGrowthMiB: Double
     let processFootprintPeak: [Double]
     let renderedNodeCount: Int
@@ -615,7 +627,7 @@ func progressiveContentEvidenceCheck(
     guard fullPaint else {
         return ProgressiveContentEvidenceCheck(
             passed: first.crossedDisplayRefresh && complete.crossedDisplayRefresh,
-            detail: "smoke-only same-instance semantic/control validation plus separate offscreen raster or WKSnapshot completions; no WindowServer, compositor, visibility, or captured-content claim"
+            detail: "non-compositor same-instance semantic/control validation plus separate offscreen raster or WKSnapshot completions; no WindowServer, compositor, visibility, or captured-content claim"
         )
     }
     guard first.crossedDisplayRefresh,
@@ -732,7 +744,10 @@ private func positionRendererWindowAwayFromPointer(
 }
 
 @MainActor
-func configureNativeBenchmarkGeometry(_ renderer: AppKitRenderer) throws {
+func configureNativeBenchmarkGeometry(
+    _ renderer: AppKitRenderer,
+    requiresCursorClearPlacement: Bool
+) throws {
     let windows = renderer.registry.surfaceHandles.compactMap(\.window)
     guard windows.count == 1 else {
         throw BenchmarkFailure.message(
@@ -742,7 +757,20 @@ func configureNativeBenchmarkGeometry(_ renderer: AppKitRenderer) throws {
     let screen = try benchmarkMainScreen()
     for window in windows {
         window.setContentSize(NSSize(width: 960, height: 720))
-        try positionRendererWindowAwayFromPointer(window, on: screen)
+        if requiresCursorClearPlacement {
+            try positionRendererWindowAwayFromPointer(window, on: screen)
+        } else {
+            let origin = NSPoint(
+                x: screen.visibleFrame.minX + 16,
+                y: screen.visibleFrame.minY + 16
+            )
+            window.setFrameOrigin(origin)
+            guard screen.visibleFrame.contains(window.frame) else {
+                throw BenchmarkFailure.message(
+                    "offscreen renderer geometry does not fit the main display"
+                )
+            }
+        }
         window.contentView?.layoutSubtreeIfNeeded()
     }
 }
@@ -825,7 +853,8 @@ func observeNativePresentation(
 @MainActor
 private func applyNativeFirstState(
     plan: ProgressiveTransactionPlan,
-    renderer: AppKitRenderer
+    renderer: AppKitRenderer,
+    requiresCursorClearPlacement: Bool = false
 ) throws -> SemanticStore {
     let firstWire = try SRUITransaction(
         serializedBytes: plan.firstWireBytes
@@ -839,18 +868,23 @@ private func applyNativeFirstState(
         )
     }
     try renderer.attach(store: store)
-    try configureNativeBenchmarkGeometry(renderer)
+    try configureNativeBenchmarkGeometry(
+        renderer,
+        requiresCursorClearPlacement: requiresCursorClearPlacement
+    )
     return store
 }
 
 @MainActor
 private func applyNativeCompleteState(
     plan: ProgressiveTransactionPlan,
-    renderer: AppKitRenderer
+    renderer: AppKitRenderer,
+    requiresCursorClearPlacement: Bool = false
 ) throws -> SemanticStore {
     var store = try applyNativeFirstState(
         plan: plan,
-        renderer: renderer
+        renderer: renderer,
+        requiresCursorClearPlacement: requiresCursorClearPlacement
     )
     let completionWire = try SRUITransaction(
         serializedBytes: plan.completionWireBytes
@@ -868,13 +902,17 @@ private func applyNativeCompleteState(
         transaction: completionTransaction,
         newStore: store
     )
-    try configureNativeBenchmarkGeometry(renderer)
+    try configureNativeBenchmarkGeometry(
+        renderer,
+        requiresCursorClearPlacement: requiresCursorClearPlacement
+    )
     return store
 }
 
 @MainActor
 private func submitNativeRendererForDisplay(
-    _ renderer: AppKitRenderer
+    _ renderer: AppKitRenderer,
+    ordersWindow: Bool = true
 ) throws {
     let windows = renderer.registry.surfaceHandles.compactMap(\.window)
     guard windows.count == 1 else {
@@ -882,9 +920,13 @@ private func submitNativeRendererForDisplay(
             "native display-submission pass requires exactly one surface"
         )
     }
-    renderer.showWindows()
+    if ordersWindow {
+        renderer.showWindows()
+    }
     for window in windows {
-        window.orderFrontRegardless()
+        if ordersWindow {
+            window.orderFrontRegardless()
+        }
         window.contentView?.layoutSubtreeIfNeeded()
         window.contentView?.displayIfNeeded()
         window.displayIfNeeded()
@@ -922,7 +964,10 @@ func runSRUICandidate(
         let renderer = AppKitRenderer()
         do {
             try renderer.attach(store: warmStore)
-            try configureNativeBenchmarkGeometry(renderer)
+            try configureNativeBenchmarkGeometry(
+                renderer,
+                requiresCursorClearPlacement: false
+            )
             let warmObservation = try await observeNativePresentation(
                 renderer,
                 fullPaint: false
@@ -952,7 +997,8 @@ func runSRUICandidate(
     var first = [Double]()
     var complete = [Double]()
     var cpu = [Double]()
-    var allocations = [Double]()
+    var hostNetLiveAllocationBlockDeltas = [Double]()
+    var hostNetLiveAllocationByteDeltas = [Double]()
     var growth = [Double]()
     var peaks = [Double]()
     var measurementIntervals = [RendererMeasurementInterval]()
@@ -984,7 +1030,8 @@ func runSRUICandidate(
                     ) {
                         let candidateStore = try applyNativeFirstState(
                             plan: plan,
-                            renderer: renderer
+                            renderer: renderer,
+                            requiresCursorClearPlacement: true
                         )
                         measuredStore = candidateStore
                         return try explicitNativePaintTarget(renderer)
@@ -1056,7 +1103,8 @@ func runSRUICandidate(
                     ) {
                         let candidateStore = try applyNativeCompleteState(
                             plan: plan,
-                            renderer: renderer
+                            renderer: renderer,
+                            requiresCursorClearPlacement: true
                         )
                         measuredStore = candidateStore
                         return try explicitNativePaintTarget(renderer)
@@ -1150,7 +1198,10 @@ func runSRUICandidate(
                     plan: plan,
                     renderer: renderer
                 )
-                try submitNativeRendererForDisplay(renderer)
+                try submitNativeRendererForDisplay(
+                    renderer,
+                    ordersWindow: allocationControl == nil
+                )
                 let sampleEndedUnixNanoseconds =
                     benchmarkWallClockNanoseconds()
                 let afterAllocator = mallocSample()
@@ -1187,14 +1238,11 @@ func runSRUICandidate(
                             - beforeResources.cpuMilliseconds
                     )
                 )
-                allocations.append(
-                    Double(
-                        max(
-                            0,
-                            afterAllocator.blocks
-                                - beforeAllocator.blocks
-                        )
-                    )
+                hostNetLiveAllocationBlockDeltas.append(
+                    Double(afterAllocator.blocks - beforeAllocator.blocks)
+                )
+                hostNetLiveAllocationByteDeltas.append(
+                    Double(afterAllocator.bytes - beforeAllocator.bytes)
                 )
                 growth.append(
                     max(
@@ -1259,7 +1307,10 @@ func runSRUICandidate(
                 plan: plan,
                 renderer: renderer
             )
-            try submitNativeRendererForDisplay(renderer)
+            try submitNativeRendererForDisplay(
+                renderer,
+                ordersWindow: allocationControl == nil
+            )
             // Always include a synchronous post-workload exact-PID sample;
             // a sub-millisecond pass must not pass with baseline-only peak data.
             footprintSampler.sampleNow()
@@ -1326,7 +1377,12 @@ func runSRUICandidate(
         firstPaint: first,
         completePaint: complete,
         cpuTime: cpu,
-        hostLiveAllocationDelta: allocations,
+        hostNetLiveAllocationBlockDelta:
+            hostNetLiveAllocationBlockDeltas,
+        hostNetLiveAllocationByteDelta:
+            hostNetLiveAllocationByteDeltas,
+        hostAllocationMeasurementScope:
+            sruiHostAllocationMeasurementScope,
         allocatedFootprintGrowthMiB: p50(growth),
         processFootprintPeak: peaks,
         renderedNodeCount: renderedNodeCount,
@@ -1340,13 +1396,14 @@ func runSRUICandidate(
         contentPresentationPassed: contentPresentationPassed,
         contentPresentationDetail: contentPresentationDetail,
         paintCompletionMode: fullPaint
-            ? "four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before production protobuf decode/apply/render and ends at the accepted ScreenCaptureKit frame displayTime; CPU/live-allocation/footprint-growth use a separate production decode/apply/display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only production decode/apply/display-submission pass"
-            : "smoke-only first-state and complete-sequence timings end at separate offscreen AppKit raster completions; CPU/live-allocation/footprint-growth and peak use separate production decode/apply/display-submission passes, while no on-screen/compositor latency claim is made",
+            ? "four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before production protobuf decode/apply/render and ends at the accepted ScreenCaptureKit frame displayTime; CPU/host-net-live-allocation/footprint-growth use a separate production decode/apply/display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only production decode/apply/display-submission pass"
+            : "non-compositor first-state and complete-sequence timings end at separate offscreen AppKit raster completions; CPU/host-net-live-allocation/footprint-growth and peak use separate production decode/apply/display-submission passes, while no on-screen/compositor latency claim is made",
         attribution: attribution,
         succeeded: first.count == iterations
             && complete.count == iterations
             && cpu.count == iterations
-            && allocations.count == iterations
+            && hostNetLiveAllocationBlockDeltas.count == iterations
+            && hostNetLiveAllocationByteDeltas.count == iterations
             && peaks.count == iterations
             && renderedNodeCount == fixture.nodes.count
             && presentationCompletions == iterations * 2
@@ -1423,7 +1480,8 @@ private func hideBenchmarkWindow(_ window: NSWindow) throws {
 @MainActor
 private func submitWebViewForDisplay(
     _ webView: WKWebView,
-    window: NSWindow
+    window: NSWindow,
+    ordersWindow: Bool = true
 ) throws {
     guard window.isVisible == false,
           webView.window === window else {
@@ -1431,10 +1489,12 @@ private func submitWebViewForDisplay(
             "WebKit display-submission pass requires a hidden attached view"
         )
     }
-    NSApplication.shared.activate()
-    window.animationBehavior = .none
-    window.makeKeyAndOrderFront(nil)
-    window.orderFrontRegardless()
+    if ordersWindow {
+        NSApplication.shared.activate()
+        window.animationBehavior = .none
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
     webView.layoutSubtreeIfNeeded()
     webView.displayIfNeeded()
     window.displayIfNeeded()
@@ -1587,7 +1647,8 @@ func runWebCandidate(
     var first = [Double]()
     var complete = [Double]()
     var cpu = [Double]()
-    var allocations = [Double]()
+    var hostNetLiveAllocationBlockDeltas = [Double]()
+    var hostNetLiveAllocationByteDeltas = [Double]()
     var growth = [Double]()
     var peaks = [Double]()
     var measurementIntervals = [RendererMeasurementInterval]()
@@ -1857,7 +1918,11 @@ func runWebCandidate(
                     requireAnimationFrame: false
                 )
             }
-            try submitWebViewForDisplay(webView, window: window)
+            try submitWebViewForDisplay(
+                webView,
+                window: window,
+                ordersWindow: allocationControl == nil
+            )
             let ended = benchmarkWallClockNanoseconds()
             resourceEndedUnixNanoseconds = ended
             let afterAllocator = mallocSample()
@@ -1893,14 +1958,11 @@ func runWebCandidate(
                         - beforeResources.cpuMilliseconds
                 )
             )
-            allocations.append(
-                Double(
-                    max(
-                        0,
-                        afterAllocator.blocks
-                            - beforeAllocator.blocks
-                    )
-                )
+            hostNetLiveAllocationBlockDeltas.append(
+                Double(afterAllocator.blocks - beforeAllocator.blocks)
+            )
+            hostNetLiveAllocationByteDeltas.append(
+                Double(afterAllocator.bytes - beforeAllocator.bytes)
             )
             growth.append(
                 max(
@@ -1913,7 +1975,6 @@ func runWebCandidate(
                 sampleResourcesComplete
                     && afterResources.measuredPIDCount
                         == measurementPIDs.count
-
             let resourceInspection = try await inspectDOM(in: webView)
             semanticParityPassed = semanticParityPassed
                 && resourceInspection.nodes == completeParity
@@ -2022,7 +2083,11 @@ func runWebCandidate(
                 requireAnimationFrame: false
             )
         }
-        try submitWebViewForDisplay(webView, window: window)
+        try submitWebViewForDisplay(
+            webView,
+            window: window,
+            ordersWindow: allocationControl == nil
+        )
         // Pair the pre-workload baseline with an unconditional post-workload
         // exact-PID sample before the peak interval is closed.
         footprintSampler.sampleNow()
@@ -2129,7 +2194,12 @@ func runWebCandidate(
         firstPaint: first,
         completePaint: complete,
         cpuTime: cpu,
-        hostLiveAllocationDelta: allocations,
+        hostNetLiveAllocationBlockDelta:
+            hostNetLiveAllocationBlockDeltas,
+        hostNetLiveAllocationByteDelta:
+            hostNetLiveAllocationByteDeltas,
+        hostAllocationMeasurementScope:
+            webKitHostAllocationMeasurementScope,
         allocatedFootprintGrowthMiB: p50(growth),
         processFootprintPeak: peaks,
         renderedNodeCount: renderedNodeCount,
@@ -2144,13 +2214,14 @@ func runWebCandidate(
         contentPresentationPassed: contentPresentationPassed,
         contentPresentationDetail: contentPresentationDetail,
         paintCompletionMode: fullPaint
-            ? "four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before the corresponding hidden WebKit load sequence and ends at the accepted ScreenCaptureKit frame displayTime; CPU/live-allocation/footprint-growth use a separate hidden-load plus display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only hidden-load plus display-submission pass"
-            : "smoke-only first-state and complete-sequence timings end at separate offscreen WKSnapshot completions; CPU/live-allocation/footprint-growth and peak use separate hidden-load/display-submission passes, while no on-screen/compositor latency claim is made",
+            ? "four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before the corresponding hidden WebKit load sequence and ends at the accepted ScreenCaptureKit frame displayTime; CPU/host-net-live-allocation/footprint-growth use a separate hidden-load plus display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only hidden-load plus display-submission pass"
+            : "non-compositor first-state and complete-sequence timings end at separate offscreen WKSnapshot completions; CPU/host-net-live-allocation/footprint-growth and peak use separate hidden-load/display-submission passes, while no on-screen/compositor latency claim is made",
         attribution: attribution,
         succeeded: first.count == iterations
             && complete.count == iterations
             && cpu.count == iterations
-            && allocations.count == iterations
+            && hostNetLiveAllocationBlockDeltas.count == iterations
+            && hostNetLiveAllocationByteDeltas.count == iterations
             && peaks.count == iterations
             && renderedNodeCount == fixture.nodes.count
             && presentationCompletions == iterations * 2
@@ -2608,27 +2679,211 @@ func localRenderer(
             "macos.webkit.render": web.firstPaint.count,
         ],
         metrics: [
-            metric(nativeFirstName, p50(srui.firstPaint), id: "srui.first_paint"),
-            metric(nativeFirstName, percentile(srui.firstPaint, 0.95), "ms", "p95", id: "srui.first_paint"),
-            metric(nativeCompleteName, p50(srui.completePaint), id: "srui.complete_paint"),
-            metric(nativeCompleteName, percentile(srui.completePaint, 0.95), "ms", "p95", id: "srui.complete_paint"),
-            metric(nativeCompleteName, percentile(srui.completePaint, 0.99), "ms", "p99", id: "srui.complete_paint"),
-            metric("SRUI candidate process CPU time", p50(srui.cpuTime), id: "srui.cpu"),
-            metric("SRUI candidate process CPU time", percentile(srui.cpuTime, 0.95), "ms", "p95", id: "srui.cpu"),
-            metric("SRUI host retained allocation delta", p50(srui.hostLiveAllocationDelta), "allocations", id: "srui.host_retained_allocations"),
-            metric("SRUI host allocated footprint growth", srui.allocatedFootprintGrowthMiB, "MiB", "p50", id: "srui.process_footprint_growth"),
-            metric("SRUI maximum concurrently sampled process footprint", srui.processFootprintPeak.max() ?? -1, "MiB", "max", id: "srui.process_footprint_peak"),
-            metric(webFirstName, p50(web.firstPaint), id: "webkit.first_paint"),
-            metric(webFirstName, percentile(web.firstPaint, 0.95), "ms", "p95", id: "webkit.first_paint"),
-            metric(webCompleteName, p50(web.completePaint), id: "webkit.complete_paint"),
-            metric(webCompleteName, percentile(web.completePaint, 0.95), "ms", "p95", id: "webkit.complete_paint"),
-            metric("WKWebView host plus attributed helper CPU time", p50(web.cpuTime), id: "webkit.cpu"),
-            metric("WKWebView host retained allocation delta", p50(web.hostLiveAllocationDelta), "allocations", id: "webkit.host_retained_allocations"),
-            metric("WKWebView host plus helpers allocated footprint growth", web.allocatedFootprintGrowthMiB, "MiB", "p50", id: "webkit.process_footprint_growth"),
-            metric("WKWebView maximum concurrently sampled host-plus-helper footprint", web.processFootprintPeak.max() ?? -1, "MiB", "max", id: "webkit.process_footprint_peak"),
-            metric("SRUI representation", Double(srui.representationBytes), "bytes", "exact", id: "representation.srui_bytes"),
-            metric("HTML representation", Double(web.representationBytes), "bytes", "exact", id: "representation.html_bytes"),
-            metric("screen capture authorization", captureAuthorization ? 1 : 0, "boolean", "exact", id: "paint.capture_authorization"),
+            metric(
+                nativeFirstName,
+                p50(srui.firstPaint),
+                id: "srui.first_paint"
+            ),
+            metric(
+                nativeFirstName,
+                percentile(srui.firstPaint, 0.95),
+                "ms",
+                "p95",
+                id: "srui.first_paint"
+            ),
+            metric(
+                nativeCompleteName,
+                p50(srui.completePaint),
+                id: "srui.complete_paint"
+            ),
+            metric(
+                nativeCompleteName,
+                percentile(srui.completePaint, 0.95),
+                "ms",
+                "p95",
+                id: "srui.complete_paint"
+            ),
+            metric(
+                nativeCompleteName,
+                percentile(srui.completePaint, 0.99),
+                "ms",
+                "p99",
+                id: "srui.complete_paint"
+            ),
+            metric(
+                "SRUI candidate process CPU time",
+                p50(srui.cpuTime),
+                id: "srui.cpu"
+            ),
+            metric(
+                "SRUI candidate process CPU time",
+                percentile(srui.cpuTime, 0.95),
+                "ms",
+                "p95",
+                id: "srui.cpu"
+            ),
+            metric(
+                "SRUI host-process net live allocation block delta",
+                p50(srui.hostNetLiveAllocationBlockDelta),
+                "allocations",
+                "p50",
+                id: "srui.host_net_live_allocation_blocks"
+            ),
+            metric(
+                "SRUI host-process net live allocation block delta",
+                percentile(srui.hostNetLiveAllocationBlockDelta, 0.95),
+                "allocations",
+                "p95",
+                id: "srui.host_net_live_allocation_blocks"
+            ),
+            metric(
+                "SRUI host-process net live allocation block delta",
+                percentile(srui.hostNetLiveAllocationBlockDelta, 0.99),
+                "allocations",
+                "p99",
+                id: "srui.host_net_live_allocation_blocks"
+            ),
+            metric(
+                "SRUI host-process net live allocation byte delta",
+                p50(srui.hostNetLiveAllocationByteDelta),
+                "bytes",
+                "p50",
+                id: "srui.host_net_live_allocation_bytes"
+            ),
+            metric(
+                "SRUI host-process net live allocation byte delta",
+                percentile(srui.hostNetLiveAllocationByteDelta, 0.95),
+                "bytes",
+                "p95",
+                id: "srui.host_net_live_allocation_bytes"
+            ),
+            metric(
+                "SRUI host-process net live allocation byte delta",
+                percentile(srui.hostNetLiveAllocationByteDelta, 0.99),
+                "bytes",
+                "p99",
+                id: "srui.host_net_live_allocation_bytes"
+            ),
+            metric(
+                "SRUI host allocated footprint growth",
+                srui.allocatedFootprintGrowthMiB,
+                "MiB",
+                "p50",
+                id: "srui.process_footprint_growth"
+            ),
+            metric(
+                "SRUI maximum concurrently sampled process footprint",
+                srui.processFootprintPeak.max() ?? -1,
+                "MiB",
+                "max",
+                id: "srui.process_footprint_peak"
+            ),
+            metric(
+                webFirstName,
+                p50(web.firstPaint),
+                id: "webkit.first_paint"
+            ),
+            metric(
+                webFirstName,
+                percentile(web.firstPaint, 0.95),
+                "ms",
+                "p95",
+                id: "webkit.first_paint"
+            ),
+            metric(
+                webCompleteName,
+                p50(web.completePaint),
+                id: "webkit.complete_paint"
+            ),
+            metric(
+                webCompleteName,
+                percentile(web.completePaint, 0.95),
+                "ms",
+                "p95",
+                id: "webkit.complete_paint"
+            ),
+            metric(
+                "WKWebView host plus attributed helper CPU time",
+                p50(web.cpuTime),
+                id: "webkit.cpu"
+            ),
+            metric(
+                "WKWebView comparison host-process net live allocation block delta",
+                p50(web.hostNetLiveAllocationBlockDelta),
+                "allocations",
+                "p50",
+                id: "webkit.host_net_live_allocation_blocks"
+            ),
+            metric(
+                "WKWebView comparison host-process net live allocation block delta",
+                percentile(web.hostNetLiveAllocationBlockDelta, 0.95),
+                "allocations",
+                "p95",
+                id: "webkit.host_net_live_allocation_blocks"
+            ),
+            metric(
+                "WKWebView comparison host-process net live allocation block delta",
+                percentile(web.hostNetLiveAllocationBlockDelta, 0.99),
+                "allocations",
+                "p99",
+                id: "webkit.host_net_live_allocation_blocks"
+            ),
+            metric(
+                "WKWebView comparison host-process net live allocation byte delta",
+                p50(web.hostNetLiveAllocationByteDelta),
+                "bytes",
+                "p50",
+                id: "webkit.host_net_live_allocation_bytes"
+            ),
+            metric(
+                "WKWebView comparison host-process net live allocation byte delta",
+                percentile(web.hostNetLiveAllocationByteDelta, 0.95),
+                "bytes",
+                "p95",
+                id: "webkit.host_net_live_allocation_bytes"
+            ),
+            metric(
+                "WKWebView comparison host-process net live allocation byte delta",
+                percentile(web.hostNetLiveAllocationByteDelta, 0.99),
+                "bytes",
+                "p99",
+                id: "webkit.host_net_live_allocation_bytes"
+            ),
+            metric(
+                "WKWebView host plus helpers allocated footprint growth",
+                web.allocatedFootprintGrowthMiB,
+                "MiB",
+                "p50",
+                id: "webkit.process_footprint_growth"
+            ),
+            metric(
+                "WKWebView maximum concurrently sampled host-plus-helper footprint",
+                web.processFootprintPeak.max() ?? -1,
+                "MiB",
+                "max",
+                id: "webkit.process_footprint_peak"
+            ),
+            metric(
+                "SRUI representation",
+                Double(srui.representationBytes),
+                "bytes",
+                "exact",
+                id: "representation.srui_bytes"
+            ),
+            metric(
+                "HTML representation",
+                Double(web.representationBytes),
+                "bytes",
+                "exact",
+                id: "representation.html_bytes"
+            ),
+            metric(
+                "screen capture authorization",
+                captureAuthorization ? 1 : 0,
+                "boolean",
+                "exact",
+                id: "paint.capture_authorization"
+            ),
         ],
         assertions: [
             Assertion(
@@ -2655,15 +2910,34 @@ func localRenderer(
                     && web.resourceAttributionComplete,
                 detail: "host \(web.attribution.hostPID), helpers \(web.attribution.helperPIDs); no process-name matching"
             ),
+            Assertion(
+                id: "host_net_live_allocation_scope",
+                name: "signed net live allocation samples have exact host-process scope",
+                passed: srui.hostAllocationMeasurementScope
+                        == sruiHostAllocationMeasurementScope
+                    && web.hostAllocationMeasurementScope
+                        == webKitHostAllocationMeasurementScope
+                    && srui.hostNetLiveAllocationBlockDelta.count
+                        == srui.cpuTime.count
+                    && srui.hostNetLiveAllocationByteDelta.count
+                        == srui.cpuTime.count
+                    && web.hostNetLiveAllocationBlockDelta.count
+                        == web.cpuTime.count
+                    && web.hostNetLiveAllocationByteDelta.count
+                        == web.cpuTime.count
+                    && srui.cpuTime.isEmpty == false
+                    && web.cpuTime.isEmpty == false,
+                detail: "SRUI blocks=\(srui.hostNetLiveAllocationBlockDelta.count), bytes=\(srui.hostNetLiveAllocationByteDelta.count), scope=\(srui.hostAllocationMeasurementScope); WebKit control blocks=\(web.hostNetLiveAllocationBlockDelta.count), bytes=\(web.hostNetLiveAllocationByteDelta.count), scope=\(web.hostAllocationMeasurementScope)"
+            ),
         ],
         notes: [
             fullPaint
                 ? "Every accepted full-paint state requires an exact visible CGWindow, exact client/target geometry, unobscured z-order, and authorized nonblank/nonuniform ScreenCaptureKit pixels from one complete frame. Latency is action-start Mach time through that accepted frame's SCStream displayTime; callback receipt and pixel hashing are verifier metadata, not the presentation timestamp. The two reported timed states per logical sample produced native=\(srui.pixelCaptureCompletions) and WebKit=\(web.pixelCaptureCompletions) verified captures; capture_authorization=\(captureAuthorization). Warm/resource/peak passes are not counted in that metric. No permission request is issued."
                 : "Smoke deliberately uses named offscreen AppKit bitmap and WKSnapshot fallbacks; it validates state and raster completion but makes no WindowServer, visibility, or composited-pixel claim.",
-            "Each native logical sample uses four separately warmed/reset renderer instances: first-state visual latency, complete two-transaction visual latency, CPU/live-allocation/footprint-growth through production display submission, and sampler-only peak footprint. Each WebKit sample resets one warmed view between the same four disjoint workloads while preserving exact helper PID identities. Neither resource pass creates ScreenCaptureKit buffers, and the footprint sampler never runs in the CPU/allocation pass.",
+            "Each native logical sample uses four separately warmed/reset renderer instances: first-state visual latency, complete two-transaction visual latency, CPU/host-net-live-allocation/footprint-growth through production display submission, and sampler-only peak footprint. Each WebKit sample resets one warmed view between the same four disjoint workloads while preserving exact helper PID identities. Neither resource pass creates ScreenCaptureKit buffers, and the footprint sampler never runs in the CPU/allocation pass.",
             "Native first timing decodes and applies revision 0→1 through production initial attach. Native complete timing decodes/applies 0→1 and then applies 1→2 through production incremental apply. WebKit uses structurally equivalent first and complete DOM states. The measured instance is checked immediately after each accepted presentation for exact semantic/control or DOM state. Full mode additionally requires nonblank, nonuniform, equal-geometry client-content fingerprints that differ between first and complete states.",
-            "Each candidate process group is birth-identity verified. WebKit CPU, footprint growth, and peak footprint aggregate the host with exact benchmark-only WebContent/network/GPU diagnostic PIDs; retained malloc block counts are explicitly host-only. Peak footprint is the maximum simultaneous current-footprint sample at 1 ms cadence strictly inside its separate representative pass, not a sum of per-process lifetime maxima.",
-            "The warmed WKWebView candidate is a comparison control only; it is not the production SRUI renderer and its timing does not describe SRUI's native AppKit rendering path.",
+            "Each candidate process group is birth-identity verified. WebKit CPU, footprint growth, and peak footprint aggregate the host with exact benchmark-only WebContent/network/GPU diagnostic PIDs. Allocation samples are signed default-zone malloc_zone_statistics after-minus-before deltas: blocks_in_use and size_in_use describe net live state, not cumulative allocation traffic. Allocation scope: \(srui.hostAllocationMeasurementScope). Control scope: \(web.hostAllocationMeasurementScope). Peak footprint is the maximum simultaneous current-footprint sample at 1 ms cadence strictly inside its separate representative pass, not a sum of per-process lifetime maxima.",
+            "The warmed WKWebView candidate and its host-only allocator deltas are comparison controls only; they are not the production SRUI renderer, do not cover WebKit helper-process allocations, and do not describe SRUI's native AppKit rendering path.",
         ]
     )
     return LocalRendererResult(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import importlib.util
 import json
 import signal
@@ -68,475 +67,6 @@ def window_isolation_assertion() -> dict[str, Any]:
     }
 
 
-def valid_allocation_summary(sample_count: int = 1) -> dict[str, Any]:
-    readiness = "darwin_notification"
-    measurement_mode = "equivalent_exact_process_role_passes"
-    instrumentation = {
-        "strategy": "private_copy_ad_hoc_codesigned_for_instrumentation",
-        "source_binary_unchanged": True,
-        "signature_verified": True,
-        "entitlements": {"com.apple.security.get-task-allow": True},
-    }
-
-    def role_interval(
-        *,
-        role: str,
-        pid: int | None,
-        started: int,
-        ended: int,
-        birth: int = 900,
-        alive_through: int = 3_000,
-    ) -> dict[str, Any]:
-        interval: dict[str, Any] = {
-            "sample_index": 0,
-            "target_role": role,
-            "target_present": pid is not None,
-            "started_unix_ns": started,
-            "ended_unix_ns": ended,
-            "contribution_included": pid is not None,
-        }
-        if pid is not None:
-            interval.update(
-                {
-                    "target_pid": pid,
-                    "target_birth_unix_ns": birth,
-                    "observed_alive_through_unix_ns": alive_through,
-                    "required_allocation_pids": [pid],
-                    "trace_segment": f"{role}-{pid}.trace",
-                    "recording_readiness_basis": readiness,
-                    "timestamp_boundary_uncertainty_ns": 1_001_000,
-                }
-            )
-        return interval
-
-    def retained_fields(allocations: int, allocated_bytes: int) -> dict[str, int]:
-        return {
-            "retained_allocations": allocations,
-            "retained_bytes": allocated_bytes,
-            "retained_allocations_lower_bound": allocations,
-            "retained_allocations_upper_bound": allocations,
-            "retained_bytes_lower_bound": allocated_bytes,
-            "retained_bytes_upper_bound": allocated_bytes,
-            "boundary_ambiguous_allocations": 0,
-            "boundary_ambiguous_bytes": 0,
-        }
-
-    def process_total(
-        pid: int,
-        allocations: int,
-        allocated_bytes: int,
-    ) -> dict[str, Any]:
-        return {
-            "pid": pid,
-            "birth_unix_ns": 900,
-            "observed_alive_through_unix_ns": 3_000,
-            "names": [f"process-{pid}"],
-            **retained_fields(allocations, allocated_bytes),
-        }
-
-    def statistics(count: int, byte_count: int) -> dict[str, dict[str, int]]:
-        def row(
-            persistent_count: int,
-            persistent_bytes: int,
-            transient_count: int,
-            transient_bytes: int,
-            event_count: int,
-        ) -> dict[str, int]:
-            return {
-                "persistent_allocations": persistent_count,
-                "persistent_bytes": persistent_bytes,
-                "transient_allocations": transient_count,
-                "transient_bytes": transient_bytes,
-                "total_allocations": persistent_count + transient_count,
-                "total_bytes": persistent_bytes + transient_bytes,
-                "event_count": event_count,
-            }
-
-        anonymous_vm = row(1, 16, 0, 0, 1)
-        heap = row(count - 1, byte_count - 16, 2, 96, count + 3)
-        return {
-            "heap_and_anonymous_vm": {
-                field: heap[field] + anonymous_vm[field]
-                for field in benchmark_run.ALLOCATION_STATISTIC_FIELDS
-            },
-            "heap": heap,
-            "anonymous_vm": anonymous_vm,
-        }
-
-    srui_host = role_interval(role="host", pid=43, started=1_000, ended=1_100)
-    webkit_host = role_interval(role="host", pid=44, started=2_000, ended=2_050)
-    webcontent = role_interval(
-        role="webcontent", pid=45, started=2_100, ended=2_150
-    )
-    network = role_interval(role="network", pid=46, started=2_200, ended=2_250)
-    gpu_absent = role_interval(
-        role="gpu", pid=None, started=2_300, ended=2_350
-    )
-    srui_total = process_total(43, 10, 100)
-    webkit_totals = [
-        process_total(44, 5, 50),
-        process_total(45, 10, 100),
-        process_total(46, 5, 50),
-    ]
-
-    def target_pass(role: str) -> dict[str, Any]:
-        return {
-            "target_role": role,
-            "representation_bytes": 1_024,
-            "rendered_node_count": 32,
-            "semantic_parity_passed": True,
-            "element_kinds_passed": True,
-        }
-
-    candidate_processes = [
-        {
-            "candidate": "srui",
-            "host_pid": 43,
-            "helper_pids": [],
-            "helper_target_roles": [],
-            "helpers_without_retained_rows": [],
-            "measurement_mode": measurement_mode,
-            "recording_readiness_bases": [readiness],
-            "role_measurement_intervals": [srui_host],
-            "process_identities": [
-                {
-                    "pid": 43,
-                    "birth_unix_ns": 900,
-                    "observed_alive_through_unix_ns": 3_000,
-                }
-            ],
-            "equivalent_representation_bytes": 1_024,
-            "equivalent_rendered_node_count": 32,
-            "target_passes": [target_pass("host")],
-            "measurement_sample_count": 1,
-            "measurement_samples": [
-                {
-                    "sample_index": 0,
-                    "measurement_mode": measurement_mode,
-                    "role_intervals": [srui_host],
-                    "role_aliases": [],
-                    "absent_target_roles": [],
-                    **retained_fields(10, 100),
-                    "required_allocation_pids": [43],
-                    "process_totals": [srui_total],
-                }
-            ],
-            **retained_fields(10, 100),
-            "host_retained_allocations": 10,
-            "host_retained_bytes": 100,
-            "helper_retained_allocations": 0,
-            "helper_retained_bytes": 0,
-        },
-        {
-            "candidate": "webkit",
-            "host_pid": 44,
-            "helper_pids": [45, 46],
-            "helper_target_roles": [
-                {
-                    "target_role": "webcontent",
-                    "pids": [45],
-                    "present_sample_count": 1,
-                    "absent_sample_count": 0,
-                },
-                {
-                    "target_role": "network",
-                    "pids": [46],
-                    "present_sample_count": 1,
-                    "absent_sample_count": 0,
-                },
-                {
-                    "target_role": "gpu",
-                    "pids": [],
-                    "present_sample_count": 0,
-                    "absent_sample_count": 1,
-                },
-            ],
-            "helpers_without_retained_rows": [],
-            "measurement_mode": measurement_mode,
-            "recording_readiness_bases": [readiness],
-            "role_measurement_intervals": [
-                webkit_host,
-                webcontent,
-                network,
-                gpu_absent,
-            ],
-            "process_identities": [
-                {
-                    "pid": total["pid"],
-                    "birth_unix_ns": total["birth_unix_ns"],
-                    "observed_alive_through_unix_ns": total[
-                        "observed_alive_through_unix_ns"
-                    ],
-                }
-                for total in webkit_totals
-            ],
-            "equivalent_representation_bytes": 1_024,
-            "equivalent_rendered_node_count": 32,
-            "target_passes": [
-                target_pass(role)
-                for role in ("host", "webcontent", "network", "gpu")
-            ],
-            "measurement_sample_count": 1,
-            "measurement_samples": [
-                {
-                    "sample_index": 0,
-                    "measurement_mode": measurement_mode,
-                    "role_intervals": [
-                        webkit_host,
-                        webcontent,
-                        network,
-                        gpu_absent,
-                    ],
-                    "role_aliases": [],
-                    "absent_target_roles": ["gpu"],
-                    **retained_fields(20, 200),
-                    "required_allocation_pids": [44, 45, 46],
-                    "process_totals": webkit_totals,
-                }
-            ],
-            **retained_fields(20, 200),
-            "host_retained_allocations": 5,
-            "host_retained_bytes": 50,
-            "helper_retained_allocations": 15,
-            "helper_retained_bytes": 150,
-        },
-    ]
-
-    if sample_count < 1:
-        raise ValueError("allocation fixture sample_count must be positive")
-    for candidate in candidate_processes:
-        base_sample = candidate["measurement_samples"][0]
-        base_intervals = base_sample["role_intervals"]
-        samples = []
-        flattened_intervals = []
-        for sample_index in range(sample_count):
-            intervals = copy.deepcopy(base_intervals)
-            for interval in intervals:
-                interval["sample_index"] = sample_index
-            sample = copy.deepcopy(base_sample)
-            sample["sample_index"] = sample_index
-            sample["role_intervals"] = intervals
-            samples.append(sample)
-            flattened_intervals.extend(intervals)
-        candidate["measurement_sample_count"] = sample_count
-        candidate["measurement_samples"] = samples
-        candidate["role_measurement_intervals"] = sorted(
-            flattened_intervals,
-            key=lambda interval: interval["started_unix_ns"],
-        )
-        for field in benchmark_run.ALLOCATION_PROCESS_FIELDS:
-            candidate[field] *= sample_count
-        candidate["host_retained_allocations"] *= sample_count
-        candidate["host_retained_bytes"] *= sample_count
-        candidate["helper_retained_allocations"] *= sample_count
-        candidate["helper_retained_bytes"] *= sample_count
-        for role in candidate["helper_target_roles"]:
-            role["present_sample_count"] *= sample_count
-            role["absent_sample_count"] *= sample_count
-
-    capture_specs = [
-        ("srui", "host", srui_host, 20, 1_100),
-        ("webkit", "host", webkit_host, 15, 1_050),
-        ("webkit", "webcontent", webcontent, 20, 1_100),
-        ("webkit", "network", network, 15, 1_050),
-    ]
-    target_captures = []
-    for sample_index in range(sample_count):
-        for candidate, role, interval, count, byte_count in capture_specs:
-            target_captures.append(
-                {
-                    "candidate": candidate,
-                    "sample_index": sample_index,
-                    "target_role": role,
-                    "target_pid": interval["target_pid"],
-                    "target_birth_unix_ns": interval["target_birth_unix_ns"],
-                    "started_unix_ns": interval["started_unix_ns"],
-                    "ended_unix_ns": interval["ended_unix_ns"],
-                    "allocation_rows": count,
-                    "allocation_list_bytes": byte_count,
-                    "anonymous_vm_persistent_allocations": 1,
-                    "anonymous_vm_persistent_bytes": 16,
-                    "vm_category_rows": 1,
-                    "vm_category_bytes": 16,
-                    "whole_trace_statistics": statistics(count, byte_count),
-                }
-            )
-    aggregate_statistics = {
-        group: {
-            field: sum(
-                capture["whole_trace_statistics"][group][field]
-                for capture in target_captures
-            )
-            for field in benchmark_run.ALLOCATION_STATISTIC_FIELDS
-        }
-        for group in benchmark_run.ALLOCATION_STATISTIC_GROUPS
-    }
-    return {
-        "schema_version": 3,
-        "capture_scope": "exact_processes",
-        "capture_method": (
-            "xctrace Allocations --attach per exact target process, exported "
-            "through Statistics and Allocations List view details"
-        ),
-        "allocation_export_basis": (
-            "Xcode Allocations view details: complete live Allocations List "
-            "reconciled to All Heap & Anonymous VM Statistics"
-        ),
-        "allocation_timestamp_basis": (
-            "Allocations List elapsed timestamp plus TOC start-date"
-        ),
-        "metric_semantics": (
-            "heap and anonymous VM allocations created nominally inside the "
-            "measured interval that remain live at capture end"
-        ),
-        "whole_trace_statistics_semantics": (
-            "diagnostic whole-trace heap and anonymous VM aggregates including "
-            "the attach-time live baseline; never interpreted as interval "
-            "allocation traffic"
-        ),
-        "process_identity_basis": (
-            "each segment TOC names exactly one attached PID equal to the "
-            "requested PID; benchmark birth/liveness handshakes bound it"
-        ),
-        "recording_readiness_bases": [readiness],
-        "instrumentation": instrumentation,
-        "xctrace_environment": {
-            "instruments_versions": ["26.0 (17C52)"],
-            "platforms": ["macOS"],
-            "os_versions": ["26.4.1"],
-            "statistics_xpath": benchmark_xctrace.STATISTICS_XPATH,
-            "allocations_list_xpath": benchmark_xctrace.ALLOCATIONS_LIST_XPATH,
-        },
-        "trace_start_timestamp_resolution_ns": 1_000_000,
-        "allocation_list_timestamp_resolution_ns": 1_000,
-        "timestamp_boundary_uncertainty_ns": 1_001_000,
-        "allocation_rows": sum(capture["allocation_rows"] for capture in target_captures),
-        "allocation_list_bytes": sum(
-            capture["allocation_list_bytes"] for capture in target_captures
-        ),
-        "allocation_list_reconciled": True,
-        "anonymous_vm_persistent_allocations": sum(
-            capture["anonymous_vm_persistent_allocations"]
-            for capture in target_captures
-        ),
-        "anonymous_vm_persistent_bytes": sum(
-            capture["anonymous_vm_persistent_bytes"]
-            for capture in target_captures
-        ),
-        "vm_category_rows": sum(
-            capture["vm_category_rows"] for capture in target_captures
-        ),
-        "vm_category_bytes": sum(
-            capture["vm_category_bytes"] for capture in target_captures
-        ),
-        "target_capture_count": len(target_captures),
-        "target_captures": target_captures,
-        "whole_trace_statistics_aggregate": aggregate_statistics,
-        "candidate_processes": candidate_processes,
-    }
-
-
-def allocation_summary_with_cross_pass_alias(
-    *,
-    reuse_numeric_pid: bool = False,
-) -> dict[str, Any]:
-    summary = valid_allocation_summary()
-    webkit = summary["candidate_processes"][1]
-    sample = webkit["measurement_samples"][0]
-    network_pid = 45 if reuse_numeric_pid else 146
-
-    for interval in (
-        next(
-            item
-            for item in sample["role_intervals"]
-            if item["target_role"] == "network"
-        ),
-        next(
-            item
-            for item in webkit["role_measurement_intervals"]
-            if item["target_role"] == "network"
-        ),
-    ):
-        interval.update(
-            {
-                "target_pid": network_pid,
-                "target_birth_unix_ns": 1_900,
-                "observed_alive_through_unix_ns": 4_000,
-                "required_allocation_pids": [],
-                "trace_segment": f"network-{network_pid}.trace",
-                "contribution_included": False,
-                "alias_of_target_role": "webcontent",
-            }
-        )
-
-    sample["role_aliases"] = [
-        {
-            "canonical_target_role": "webcontent",
-            "aliased_target_roles": ["network"],
-            "pass_advertised_identities": [
-                {"target_role": "host", "pid": 145, "birth_unix_ns": 1_100},
-                {
-                    "target_role": "webcontent",
-                    "pid": 45,
-                    "birth_unix_ns": 900,
-                },
-                {
-                    "target_role": "network",
-                    "pid": network_pid,
-                    "birth_unix_ns": 1_900,
-                },
-                {"target_role": "gpu", "pid": 245, "birth_unix_ns": 2_100},
-            ],
-        }
-    ]
-    sample["required_allocation_pids"] = [44, 45]
-    sample["process_totals"] = sample["process_totals"][:2]
-    retained = {
-        "retained_allocations": 15,
-        "retained_bytes": 150,
-        "retained_allocations_lower_bound": 15,
-        "retained_allocations_upper_bound": 15,
-        "retained_bytes_lower_bound": 150,
-        "retained_bytes_upper_bound": 150,
-        "boundary_ambiguous_allocations": 0,
-        "boundary_ambiguous_bytes": 0,
-    }
-    sample.update(retained)
-    webkit.update(retained)
-    webkit["helper_pids"] = [45] if reuse_numeric_pid else [45, network_pid]
-    for helper_role in webkit["helper_target_roles"]:
-        if helper_role["target_role"] == "network":
-            helper_role["pids"] = [network_pid]
-    webkit["process_identities"] = [
-        {
-            "pid": 44,
-            "birth_unix_ns": 900,
-            "observed_alive_through_unix_ns": 3_000,
-        },
-        {
-            "pid": 45,
-            "birth_unix_ns": 900,
-            "observed_alive_through_unix_ns": 3_000,
-        },
-        {
-            "pid": network_pid,
-            "birth_unix_ns": 1_900,
-            "observed_alive_through_unix_ns": 4_000,
-        },
-    ]
-    webkit["host_retained_allocations"] = 5
-    webkit["host_retained_bytes"] = 50
-    webkit["helper_retained_allocations"] = 10
-    webkit["helper_retained_bytes"] = 100
-    network_capture = next(
-        capture
-        for capture in summary["target_captures"]
-        if capture["candidate"] == "webkit"
-        and capture["target_role"] == "network"
-    )
-    network_capture["target_pid"] = network_pid
-    network_capture["target_birth_unix_ns"] = 1_900
-    return summary
 
 
 def valid_report() -> dict[str, Any]:
@@ -548,14 +78,6 @@ def valid_report() -> dict[str, Any]:
         for emitted in payload["sections"]:
             benchmark_run._merge_driver_section(sections, emitted)
     benchmark_run.append_parity_assertion(sections, artifacts)
-    allocation_metrics, allocation_assertion, allocation_artifact = (
-        benchmark_run.fold_allocation_summary(
-            valid_allocation_summary(sample_count=20),
-            profile="full",
-        )
-    )
-    sections["31.1"]["metrics"].extend(allocation_metrics)
-    sections["31.1"]["assertions"].append(allocation_assertion)
     sections["31.1"]["assertions"].append(
         {
             "id": "candidate_failure_cleanup",
@@ -564,11 +86,6 @@ def valid_report() -> dict[str, Any]:
         }
     )
     sections["31.1"]["assertions"].append(window_isolation_assertion())
-    artifacts["macos"]["allocation_capture"] = allocation_artifact
-    for item in allocation_artifact["candidate_totals"]:
-        sections["31.1"]["sample_counts"][
-            f"runner.xctrace.{item['candidate']}"
-        ] = item["measurement_sample_count"]
     sections["31.5"]["metrics"].append(
         {
             "id": "production_reconnect_suite_ms",
@@ -784,7 +301,7 @@ def test_markdown_renders_environment_and_sample_counts() -> None:
     assert "- Chip: Apple M4 Max" in rendered
     assert "- Physical RAM: 137438953472 bytes" in rendered
     assert "- Git: " + "a" * 40 + " (clean)" in rendered
-    assert "runner.xctrace.srui" in rendered
+    assert "macos.srui.render" in rendered
     assert "runner.production_conformance" in rendered
 
 
@@ -936,362 +453,6 @@ def test_macos_terminal_inventory_covers_standalone_display_comparison() -> None
     }
 
 
-def test_report_requires_reconciled_allocation_evidence_without_trace_path() -> None:
-    report = valid_report()
-    del report["driver_artifacts"]["macos"]["allocation_capture"]
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="mandatory allocation_capture",
-    ):
-        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
-
-    report = valid_report()
-    report["driver_artifacts"]["macos"]["allocation_capture"]["trace"] = (
-        "/tmp/deleted.trace"
-    )
-    with pytest.raises(benchmark_run.BenchmarkError, match="schema violation"):
-        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
-
-    report = valid_report()
-    allocation_metric = next(
-        metric
-        for section in report["sections"]
-        if section["id"] == "31.1"
-        for metric in section["metrics"]
-        if metric["id"] == "srui.retained_allocations"
-    )
-    allocation_metric["value"] = -1
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="must be nonnegative",
-    ):
-        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
-
-
-def test_report_recomputes_allocation_distributions_from_sample_evidence() -> None:
-    report = valid_report()
-    allocation_metrics = [
-        metric
-        for section in report["sections"]
-        if section["id"] == "31.1"
-        for metric in section["metrics"]
-        if metric["id"] == "srui.boundary_ambiguous_bytes"
-    ]
-    assert len(allocation_metrics) == 3
-    for metric in allocation_metrics:
-        metric["value"] = 999_999
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="distribution contradicts sample evidence",
-    ):
-        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
-
-
-def test_allocation_fold_accepts_zero_interval_retained_measurement() -> None:
-    summary = valid_allocation_summary()
-    srui = summary["candidate_processes"][0]
-    sample = srui["measurement_samples"][0]
-    process_total = sample["process_totals"][0]
-    retained_fields = (
-        "retained_allocations",
-        "retained_bytes",
-        "retained_allocations_lower_bound",
-        "retained_allocations_upper_bound",
-        "retained_bytes_lower_bound",
-        "retained_bytes_upper_bound",
-        "boundary_ambiguous_allocations",
-        "boundary_ambiguous_bytes",
-    )
-    for field in retained_fields:
-        process_total[field] = 0
-        sample[field] = 0
-        srui[field] = 0
-    srui["host_retained_allocations"] = 0
-    srui["host_retained_bytes"] = 0
-
-    metrics, _assertion, artifact = benchmark_run.fold_allocation_summary(
-        summary, profile="full"
-    )
-
-    assert next(
-        metric["value"]
-        for metric in metrics
-        if metric["id"] == "srui.retained_allocations"
-        and metric["statistic"] == "p50"
-    ) == 0
-    assert artifact["candidate_totals"][0]["retained_allocations"] == 0
-
-
-def test_allocation_fold_preserves_compact_sample_role_process_evidence() -> None:
-    _metrics, _assertion, artifact = benchmark_run.fold_allocation_summary(
-        valid_allocation_summary(),
-        profile="full",
-    )
-
-    evidence = {
-        item["candidate"]: item["samples"]
-        for item in artifact["sample_evidence"]
-    }
-    assert set(evidence) == {"srui", "webkit"}
-    webkit_sample = evidence["webkit"][0]
-    assert webkit_sample["retained_allocations_lower_bound"] == 20
-    assert webkit_sample["retained_allocations_upper_bound"] == 20
-    roles = {role["target_role"]: role for role in webkit_sample["roles"]}
-    assert roles["webcontent"]["target_pid"] == 45
-    assert roles["webcontent"]["target_birth_unix_ns"] == 900
-    assert roles["gpu"] == {
-        "target_role": "gpu",
-        "target_present": False,
-        "started_unix_ns": 2_300,
-        "ended_unix_ns": 2_350,
-        "contribution_included": False,
-    }
-    webcontent = next(
-        total
-        for total in webkit_sample["process_totals"]
-        if total["pid"] == 45
-    )
-    assert webcontent["names"] == ["process-45"]
-    assert webcontent["retained_bytes_lower_bound"] == 100
-    assert webcontent["retained_bytes_upper_bound"] == 100
-    assert webkit_sample["role_aliases"] == []
-
-
-def test_allocation_fold_preserves_cross_pass_role_alias_evidence() -> None:
-    summary = allocation_summary_with_cross_pass_alias()
-    _metrics, _assertion, artifact = benchmark_run.fold_allocation_summary(
-        summary,
-        profile="full",
-    )
-
-    webkit = next(
-        item
-        for item in artifact["candidate_totals"]
-        if item["candidate"] == "webkit"
-    )
-    assert webkit["claimed_process_count"] == 3
-    assert webkit["processes_with_live_list_evidence"] == 2
-    assert webkit["helper_process_count"] == 2
-    assert webkit["aliased_role_measurement_count"] == 1
-    sample = next(
-        item["samples"][0]
-        for item in artifact["sample_evidence"]
-        if item["candidate"] == "webkit"
-    )
-    alias = sample["role_aliases"][0]
-    assert alias["canonical_target_role"] == "webcontent"
-    assert alias["aliased_target_roles"] == ["network"]
-    advertised = {
-        item["target_role"]: (item["pid"], item["birth_unix_ns"])
-        for item in alias["pass_advertised_identities"]
-    }
-    assert advertised["webcontent"] == (45, 900)
-    assert advertised["network"] == (146, 1_900)
-
-
-def test_allocation_fold_rejects_tampered_own_pass_alias_identity() -> None:
-    summary = allocation_summary_with_cross_pass_alias()
-    advertised = summary["candidate_processes"][1]["measurement_samples"][0][
-        "role_aliases"
-    ][0]["pass_advertised_identities"]
-    next(
-        item for item in advertised if item["target_role"] == "network"
-    )["birth_unix_ns"] += 1
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="role alias topology is invalid",
-    ):
-        benchmark_run.fold_allocation_summary(summary, profile="full")
-
-
-def test_report_accepts_numeric_pid_reuse_across_separate_role_passes() -> None:
-    _metrics, _assertion, artifact = benchmark_run.fold_allocation_summary(
-        allocation_summary_with_cross_pass_alias(reuse_numeric_pid=True),
-        profile="full",
-    )
-    report = valid_report()
-    report["driver_artifacts"]["macos"]["allocation_capture"] = artifact
-
-    benchmark_run.validate_document(report, "report", "benchmark report")
-
-    alias = next(
-        item["samples"][0]["role_aliases"][0]
-        for item in artifact["sample_evidence"]
-        if item["candidate"] == "webkit"
-    )
-    next(
-        item
-        for item in alias["pass_advertised_identities"]
-        if item["target_role"] == "network"
-    )["birth_unix_ns"] += 1
-    candidate_totals = {
-        item["candidate"]: item for item in artifact["candidate_totals"]
-    }
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="role alias topology is invalid",
-    ):
-        benchmark_run.validate_allocation_sample_evidence(
-            artifact,
-            candidate_totals,
-        )
-
-
-def test_report_schema_requires_role_alias_evidence_field() -> None:
-    report = valid_report()
-    sample = report["driver_artifacts"]["macos"]["allocation_capture"][
-        "sample_evidence"
-    ][0]["samples"][0]
-    del sample["role_aliases"]
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="schema violation",
-    ):
-        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
-
-
-def test_report_rejects_tampered_allocation_sample_bounds() -> None:
-    report = valid_report()
-    sample = report["driver_artifacts"]["macos"]["allocation_capture"][
-        "sample_evidence"
-    ][0]["samples"][0]
-    sample["retained_allocations_lower_bound"] += 1
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="sample evidence has invalid retained bounds",
-    ):
-        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
-
-
-def test_report_rejects_tampered_allocation_process_identity() -> None:
-    report = valid_report()
-    sample = report["driver_artifacts"]["macos"]["allocation_capture"][
-        "sample_evidence"
-    ][0]["samples"][0]
-    sample["process_totals"][0]["birth_unix_ns"] += 1
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="sample evidence has incomplete process totals",
-    ):
-        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
-
-
-def test_allocation_fold_rejects_cumulative_workload_semantics() -> None:
-    summary = valid_allocation_summary()
-    summary["metric_semantics"] = "all allocation events during the workload"
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="interval-retained measurement semantics",
-    ):
-        benchmark_run.fold_allocation_summary(summary, profile="full")
-
-
-def test_allocation_fold_rejects_webkit_host_only_samples() -> None:
-    summary = valid_allocation_summary()
-    webkit = summary["candidate_processes"][1]
-    sample = webkit["measurement_samples"][0]
-    sample["process_totals"] = [sample["process_totals"][0]]
-    sample["required_allocation_pids"] = [44]
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="process evidence is incomplete",
-    ):
-        benchmark_run.fold_allocation_summary(summary, profile="full")
-
-
-def test_allocation_fold_rejects_missing_webkit_host_rows() -> None:
-    summary = valid_allocation_summary()
-    webkit = summary["candidate_processes"][1]
-    sample = webkit["measurement_samples"][0]
-    sample["process_totals"] = sample["process_totals"][1:]
-    sample["required_allocation_pids"] = [45, 46]
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="process evidence is incomplete",
-    ):
-        benchmark_run.fold_allocation_summary(summary, profile="full")
-
-
-def test_allocation_fold_rejects_missing_mandatory_webcontent_role() -> None:
-    summary = valid_allocation_summary()
-    webkit = summary["candidate_processes"][1]
-    interval = webkit["measurement_samples"][0]["role_intervals"][1]
-    interval.clear()
-    interval.update(
-        {
-            "sample_index": 0,
-            "target_role": "webcontent",
-            "target_present": False,
-            "started_unix_ns": 2_100,
-            "ended_unix_ns": 2_150,
-            "contribution_included": False,
-        }
-    )
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="mandatory allocation target is absent",
-    ):
-        benchmark_run.fold_allocation_summary(summary, profile="full")
-
-
-def test_allocation_fold_rejects_unproven_recording_readiness() -> None:
-    summary = valid_allocation_summary()
-    interval = summary["candidate_processes"][0]["measurement_samples"][0][
-        "role_intervals"
-    ][0]
-    del interval["recording_readiness_basis"]
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="interval is invalid",
-    ):
-        benchmark_run.fold_allocation_summary(summary, profile="full")
-
-
-def test_allocation_fold_accepts_helper_without_interval_retained_rows() -> None:
-    summary = valid_allocation_summary()
-    webkit = summary["candidate_processes"][1]
-    sample = webkit["measurement_samples"][0]
-    webcontent = sample["process_totals"][1]
-    for field in (
-        "retained_allocations",
-        "retained_allocations_lower_bound",
-        "retained_allocations_upper_bound",
-    ):
-        webcontent[field] = 0
-        sample[field] = 10
-        webkit[field] = 10
-    for field in (
-        "retained_bytes",
-        "retained_bytes_lower_bound",
-        "retained_bytes_upper_bound",
-    ):
-        webcontent[field] = 0
-        sample[field] = 100
-        webkit[field] = 100
-    webkit["helper_retained_allocations"] = 5
-    webkit["helper_retained_bytes"] = 50
-    webkit["helpers_without_retained_rows"] = [45]
-
-    _metrics, _assertion, artifact = benchmark_run.fold_allocation_summary(
-        summary, profile="full"
-    )
-
-    webkit_artifact = next(
-        item
-        for item in artifact["candidate_totals"]
-        if item["candidate"] == "webkit"
-    )
-    assert webkit_artifact["helpers_without_retained_rows"] == 1
 
 
 def test_driver_rejects_passing_local_latency_assertion_above_frame_budget() -> None:
@@ -1360,41 +521,6 @@ def test_main_rejects_unsupported_platform_before_starting_drivers(
     assert started == []
 
 
-def test_allocation_host_preflight_accepts_enabled_developer_mode() -> None:
-    calls: list[tuple[list[str], dict[str, Any]]] = []
-
-    def status_runner(command: list[str], **kwargs: Any) -> SimpleNamespace:
-        calls.append((command, kwargs))
-        return SimpleNamespace(
-            returncode=0,
-            stdout="Developer mode is currently enabled.\n",
-            stderr="",
-        )
-
-    benchmark_run.validate_allocation_capture_host(
-        current_platform="darwin",
-        status_runner=status_runner,
-    )
-    assert calls[0][0] == ["/usr/sbin/DevToolsSecurity", "-status"]
-    assert calls[0][1]["timeout"] == 10
-
-
-def test_allocation_host_preflight_rejects_disabled_mode_before_drivers() -> None:
-    def status_runner(_command: list[str], **_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(
-            returncode=0,
-            stdout="Developer mode is currently disabled.\n",
-            stderr="",
-        )
-
-    with pytest.raises(
-        benchmark_run.BenchmarkError,
-        match="DevToolsSecurity -enable.*no drivers were started",
-    ):
-        benchmark_run.validate_allocation_capture_host(
-            current_platform="darwin",
-            status_runner=status_runner,
-        )
 
 
 def test_manifest_requires_canonical_fixture_and_locked_rust_build() -> None:
@@ -1457,6 +583,35 @@ def test_zero_exit_without_conformance_contract_fails_verification(
     assert passed is False
     assert sample_count is None
     assert "missing required output" in detail
+
+
+def test_reconnect_verification_parses_current_suite_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = (
+        "SRUI §32 conformance — both\n"
+        " 8  reconnect                PASS    9 runner(s)\n"
+        "1 passed, 0 failed, 0 documented gap(s), 0 not applicable\n"
+    )
+    monkeypatch.setattr(
+        benchmark_run,
+        "run_managed_command",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=output,
+            stderr="",
+            child_pid=123,
+        ),
+    )
+    monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
+
+    _elapsed, passed, _detail, sample_count = benchmark_run.run_verification(
+        valid_manifest()["verification_commands"][0],
+        default_timeout=1,
+    )
+
+    assert passed is True
+    assert sample_count == 9
 
 
 def valid_metric_value(
@@ -1616,6 +771,67 @@ def test_driver_inventory_accepts_only_complete_declared_measurements(
     payload["sections"][0]["metrics"].pop()
     with pytest.raises(benchmark_run.BenchmarkError, match="metric inventory"):
         benchmark_run.validate_driver_output(payload, driver, profile=profile)
+
+
+def test_macos_allocation_inventory_uses_signed_host_endpoint_deltas() -> None:
+    inventory = benchmark_run.EXPECTED_DRIVER_INVENTORY["macos"]["31.1"]
+    expected = {
+        (
+            f"{candidate}.host_net_live_allocation_{suffix}",
+            statistic,
+        ): (unit, None, None)
+        for candidate in ("srui", "webkit")
+        for suffix, unit in (("blocks", "allocations"), ("bytes", "bytes"))
+        for statistic in benchmark_run.DISTRIBUTION
+    }
+    assert {
+        identity: metadata
+        for identity, metadata in inventory["metrics"].items()
+        if identity[0] in benchmark_run.SIGNED_METRIC_IDS
+    } == expected
+    assert "host_net_live_allocation_scope" in inventory["assertions"]
+    assert not any(
+        "retained_allocations" in metric_id
+        for metric_id, _statistic in inventory["metrics"]
+    )
+
+
+@pytest.mark.parametrize(
+    "metric_id",
+    sorted(benchmark_run.SIGNED_METRIC_IDS),
+)
+def test_signed_net_live_allocation_deltas_allow_negative_integers(
+    metric_id: str,
+) -> None:
+    driver = next(
+        item for item in valid_manifest()["drivers"] if item["name"] == "macos"
+    )
+    payload = payload_for_driver(driver)
+    measured = next(
+        metric
+        for section in payload["sections"]
+        for metric in section["metrics"]
+        if metric["id"] == metric_id and metric["statistic"] == "p50"
+    )
+    measured["value"] = -1.0
+    benchmark_run.validate_driver_output(payload, driver)
+
+    measured["value"] = -1.5
+    with pytest.raises(
+        benchmark_run.BenchmarkError,
+        match="must be a whole count",
+    ):
+        benchmark_run.validate_driver_output(payload, driver)
+
+
+def test_report_rejects_obsolete_embedded_xctrace_evidence() -> None:
+    report = valid_report()
+    report["driver_artifacts"]["macos"]["allocation_capture"] = {}
+    with pytest.raises(
+        benchmark_run.BenchmarkError,
+        match="schema violation",
+    ):
+        benchmark_run.validate_report(report, list(benchmark_run.EXPECTED_SECTIONS))
 
 
 @pytest.mark.parametrize(
@@ -1976,7 +1192,6 @@ def test_main_runs_window_isolation_after_normal_macos_driver(
     monkeypatch.setattr(benchmark_run, "ROOT", tmp_path)
     monkeypatch.setattr(benchmark_run, "MANIFEST", manifest_path)
     monkeypatch.setattr(benchmark_run.sys, "platform", "darwin")
-    monkeypatch.setattr(benchmark_run, "validate_allocation_capture_host", lambda: None)
     monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
     monkeypatch.setattr(
         benchmark_run,
@@ -2147,45 +1362,6 @@ def test_candidate_cleanup_probe_waits_for_exact_identity_and_removes_tempdir(
     assert not capture_directory.exists()
 
 
-def test_allocation_capture_removes_raw_trace_and_does_not_publish_path(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    binary = tmp_path / "client-macos/.build/release/BenchmarkDriver"
-    binary.parent.mkdir(parents=True)
-    binary.write_bytes(b"binary")
-    script = tmp_path / "benchmarks/parse-render/run_xctrace.py"
-    script.parent.mkdir(parents=True)
-    script.write_text("# probe", encoding="utf-8")
-    fixture = tmp_path / "fixture.json"
-    fixture.write_text("{}", encoding="utf-8")
-    capture_directory: Path | None = None
-
-    def fake_command(command: list[str], **_kwargs: Any) -> SimpleNamespace:
-        nonlocal capture_directory
-        trace = Path(command[2])
-        capture_directory = trace.parent
-        trace.mkdir()
-        (trace / "raw").write_bytes(b"trace")
-        sidecar = trace.with_name(f"{trace.name}.summary.json")
-        sidecar.write_text(
-            json.dumps(valid_allocation_summary()),
-            encoding="utf-8",
-        )
-        return SimpleNamespace(returncode=0, stdout="", stderr="", child_pid=42)
-
-    monkeypatch.setattr(benchmark_run, "ROOT", tmp_path)
-    monkeypatch.setattr(benchmark_run, "run_managed_command", fake_command)
-    monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
-
-    summary = benchmark_run.run_allocation_capture(fixture, "smoke", 30)
-    _metrics, _assertion, artifact = benchmark_run.fold_allocation_summary(
-        summary,
-        profile="smoke",
-    )
-    assert "trace" not in artifact
-    assert capture_directory is not None
-    assert not capture_directory.exists()
 
 
 def test_driver_schema_requires_stable_measurement_ids() -> None:
@@ -2253,7 +1429,6 @@ def test_record_baseline_rejects_dirty_tree_before_starting_driver(
     environment["git_dirty"] = True
 
     monkeypatch.setattr(benchmark_run, "validate_runtime_platforms", lambda _manifest: None)
-    monkeypatch.setattr(benchmark_run, "validate_allocation_capture_host", lambda: None)
     monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
     monkeypatch.setattr(benchmark_run, "benchmark_environment", lambda: environment)
     monkeypatch.setattr(
@@ -2335,11 +1510,6 @@ def test_full_failed_run_leaves_existing_baseline_untouched(
 
     monkeypatch.setattr(benchmark_run, "ROOT", tmp_path)
     monkeypatch.setattr(benchmark_run, "MANIFEST", manifest_path)
-    monkeypatch.setattr(
-        benchmark_run,
-        "validate_allocation_capture_host",
-        lambda: None,
-    )
     monkeypatch.setattr(benchmark_run, "run_driver", fake_driver)
     monkeypatch.setattr(
         benchmark_run,
@@ -2355,13 +1525,6 @@ def test_full_failed_run_leaves_existing_baseline_untouched(
         benchmark_run,
         "run_candidate_cleanup_probe",
         lambda _fixture, _timeout: "reaped",
-    )
-    monkeypatch.setattr(
-        benchmark_run,
-        "run_allocation_capture",
-        lambda _fixture, _profile, _timeout: valid_allocation_summary(
-            sample_count=20
-        ),
     )
     monkeypatch.setattr(
         benchmark_run,

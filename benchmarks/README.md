@@ -8,13 +8,12 @@ Run a repeatable smoke measurement from the repository root:
     scripts/run-benchmarks --profile smoke
 
 Results go to .benchmark-results/latest.json and latest.md. The command runs native release
-drivers, captures mandatory §31.1 Allocations evidence with Instruments, writes intermediate
-results only to private temporary locations, validates the manifest, driver payloads, allocation
-summary, and merged report against benchmarks/schema.json, enforces every stable metric/assertion
-ID, unit, and §23 target contract, then times the production §32 reconnect suite. Renderer
-candidates and capture processes have bounded process-group cleanup plus exact process-birth exit
-postconditions. JSON and Markdown are staged, fsynced, and published as one rollback-protected
-pair. The harness requires 12 GiB of free space before and during a run by default; set
+drivers, validates the manifest, driver payloads, and merged report against
+benchmarks/schema.json, enforces every stable metric/assertion ID, unit, and §23 target contract,
+then times the production §32 reconnect suite. Renderer candidates have bounded process-group
+cleanup plus exact process-birth exit postconditions. JSON and Markdown are staged, fsynced, and
+published as one rollback-protected pair. The harness requires 12 GiB of free space before and
+during a run by default; set
 `SRUI_BENCHMARK_MIN_FREE_BYTES` to another positive byte count for a constrained benchmark host.
 Correctness failures make the command fail. Performance misses remain successful measurements and
 are called out as follow-up work when they exceed a §23 target by more than 2x. Reports also fail
@@ -27,8 +26,8 @@ ScreenCaptureKit client-content evidence. On macOS, `scripts/run-benchmarks` run
 a lifetime-bounded `caffeinate -d -i -u` assertion: it wakes an online display and prevents idle
 display/system sleep while the benchmark owns the process. It does not bypass a locked login
 session or Screen Recording authorization. The responsible Codex or terminal app must already have
-Screen Recording permission; the suite checks authorization and fails without prompting. This is
-separate from the Developer Tools permission used by xctrace below.
+Screen Recording permission; the suite checks authorization and fails without prompting.
+Developer Tools permission is needed only for the optional xctrace diagnostic described below.
 
 Every full-mode benchmark host resolves its WindowServer stratum at runtime with
 `CGWindowLevelForKey(.statusWindow)`. Before ordering the host, the driver resolves
@@ -54,11 +53,13 @@ timeout reports the prepared AppKit frame and current WindowServer entry fields.
 
 Full §31.1 instead has two nested guards. The top-level parent saves the user's exact Quartz
 location, parks at `display.minX + 160` and the vertical midpoint before spawning either
-candidate, then restores the user's location after both candidates or on failure. Each full SRUI
-or WebKit subprocess independently saves its inherited pointer location, repeats the same
-left-interior park immediately before entering its candidate measurement function, and restores
-that child-local value on exit. The child-side guard is authoritative: it closes the parent-to-child
-build/spawn race and completes before any candidate measurement interval starts.
+ordinary visual candidate, then restores the user's location after both candidates or on failure.
+Each visual SRUI/WebKit subprocess independently saves its inherited pointer location, repeats
+the same left-interior park immediately before entering its candidate measurement function, and
+restores that child-local value on exit. Non-compositor smoke and optional diagnostic allocation
+passes use deterministic hidden geometry without requiring or moving the pointer. The child-side
+guard is authoritative: it closes the parent-to-child build/spawn race and completes before any
+candidate measurement interval starts.
 
 That interior position remains outside the right-corner 960-point renderer ROI. Each hidden native
 or WebKit window chooses the visible-frame corner farthest from the parked pointer with 64 points
@@ -80,10 +81,10 @@ The diagnostic exits before running benchmark sections, so its temporary windows
 state cannot contaminate reported timing or pixels; the required output argument is intentionally
 unused.
 
-ScreenCaptureKit and xctrace are separate evidence paths. ScreenCaptureKit supplies the exact
-composited frame, WindowServer identity/geometry, target pixels, and display timestamp used for
-visible latency. Xctrace attaches to exact PID/process-birth identities and supplies the
-allocation rows reconciled below. Neither path is treated as proof for the other.
+ScreenCaptureKit supplies the exact composited frame, WindowServer identity/geometry, target
+pixels, and display timestamp used for visible latency. Signed in-process allocator endpoint
+samples supply the authoritative allocation metrics. Optional xctrace output is diagnostic only
+and is never treated as proof for either measurement.
 
 Record a reviewed, machine-specific baseline only with:
 
@@ -101,113 +102,38 @@ deliberately warmed and measured as a comparison control. It is not an SRUI prod
 and its paint or allocation results are not interchangeable with the native SRUI result. PTY
 process startup is excluded from serialization.
 
-## Allocation instrumentation
+## Allocation measurement
 
-Allocation attribution is mandatory in consolidated smoke and full runs. The pinned reference
-behavior is `xctrace version 26.0 (17C52)`. That version exposes Allocations through view-level
-details under the Allocations track. The supported exports used for validation are:
+The authoritative §31.1 allocation metrics are signed host/default-zone endpoint deltas from
+`malloc_zone_statistics` around the representative CPU/resource pass:
 
-    /trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]
-    /trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Allocations List"]
+    after.blocks_in_use - before.blocks_in_use
+    after.size_in_use   - before.size_in_use
 
-These are not the generic raw-data query
-`/trace-toc/run/data/table[@schema="allocations"]`. Always inspect a trace's own table of
-contents before assuming another Xcode build has the same views.
+The report publishes p50/p95/p99
+`{srui,webkit}.host_net_live_allocation_{blocks,bytes}` values. They describe net live state,
+not cumulative allocation calls or traffic; negative values are valid and are never clamped.
+SRUI's value covers its renderer host. WKWebView is an explicitly host-only comparison control and
+excludes WebContent, Networking, GPU, and other helper allocations. The scope assertion and metric
+names make that limitation machine-readable.
 
-The runner creates a token-owned temporary capture workspace and records equivalent exact-process
-passes for the SRUI host and the warmed WebKit control's host, WebContent process, and every
-available Network/GPU helper. Each target is identified by PID plus Darwin process birth time.
-Measurement cannot begin until xctrace emits the requested Darwin recording-start notification;
-progress text or a partially initialized trace bundle is not readiness evidence. An optional
-Network/GPU role may be absent, but absence must be published by the pre-measurement handshake. PID
-aliases across roles are reported and counted once. Rows from another process birth or unrelated
-same-named process are never attributed.
-
-The primary interval metric is the count and byte sum of all Allocations List rows whose allocation
-timestamp falls inside the candidate's measured interval and whose allocation is still live when
-the trace is finalized. It is therefore an **interval-created-and-still-live** heap-and-anonymous-
-VM measurement. It is not total allocation traffic, allocator call count, heap growth, or a count
-of allocations that were created and freed during the interval. The List is live-only in 17C52
-and must reconcile exactly with `All Heap & Anonymous VM` persistent totals. The parser also proves
-that this combined Statistics row equals `All Heap Allocations` plus `All Anonymous VM` for all
-seven exported fields. `VM:` List-category counts remain diagnostics only: retained probes proved
-that the prefix is not a valid partition of those two Statistics aggregates, so no row is silently
-excluded or reclassified by name.
-
-Statistics is retained as a whole-trace consistency check. Each of the three validated aggregate
-rows (`All Heap & Anonymous VM`, `All Heap Allocations`, and `All Anonymous VM`) obeys:
-
-    persistent-bytes + transient-bytes = total-bytes
-    count-persistent + count-transient = count-total
-
-`count-events` is an independent count of allocation and deallocation events, not an allocation
-count and not a value derivable from the other fields for an attached process. In particular, an
-object allocated before attachment can be deallocated during recording. Furthermore, `--attach`
-seeds Statistics with the live heap present at attachment. Because 17C52 provides no validated
-range-scoped Statistics export for the inner benchmark interval, its `total-*` and `count-total`
-values must not be reported as interval cumulative allocations.
-
-Candidate interval timestamps are Unix-epoch nanoseconds; List timestamps are trace-relative
-nanoseconds anchored to the TOC start date. The parser publishes
-`timestamp_boundary_uncertainty_ns` from the TOC start-date resolution plus the List's 1 µs display
-resolution. On the validated 17C52 traces this is a 1.001 ms boundary caveat. Each sample therefore
-carries nominal retained values, definite lower bounds, possible upper bounds, and the
-boundary-ambiguous difference; exact PID attribution does not make the independent clocks
-sub-millisecond-exact.
-
-Exact-process attachment has two independent authorization gates:
-
-- System developer mode must report enabled from
-  `/usr/sbin/DevToolsSecurity -status`; if necessary, an administrator can enable it with
-  `sudo /usr/sbin/DevToolsSecurity -enable`.
-- The responsible terminal or Codex host must be enabled in **System Settings → Privacy &
-  Security → Developer Tools**. Restart that app after changing the grant.
-
-Full Disk Access is not required and should not be granted as an attachment workaround. The target
-copy also needs the minimal `com.apple.security.get-task-allow=true` entitlement. The harness
-copies the release BenchmarkDriver into its private staging workspace and ad-hoc signs that copy;
-it must never re-sign or otherwise mutate `client-macos/.build/release/BenchmarkDriver`. This
-keeps SwiftPM's build artifact and concurrent builds untouched. The staged signature is benchmark
-instrumentation only and must not be distributed.
-
-The merged report contains p50/p95/p99 interval-created-and-still-live heap-and-anonymous-VM counts and bytes; the
-per-sample evidence retains `retained_allocations`, `retained_bytes`, their lower/upper bounds, and
-`boundary_ambiguous_*` values. It also carries exact-role coverage, List/Statistics reconciliation,
-readiness evidence, and the timestamp-boundary caveat. It contains no machine-local trace path.
-Normal runs remove raw traces and XML exports before publication.
-
-For retained diagnostic investigation, use a destination that does not already exist:
+Xctrace is not used by normal smoke/full runs and does not populate or gate the committed report.
+Real Xcode 26 captures disproved the required interval timestamp alignment and exact
+List/Statistics reconciliation, while attaching to warmed WebKit could stall inside JavaScriptCore
+allocator enumeration. A bounded SRUI-host-only diagnostic remains available:
 
     benchmarks/parse-render/profile-allocations.sh /tmp/srui-allocations.trace
 
-This uses the same bounded capture/parser path and publishes the trace,
-`/tmp/srui-allocations.trace.summary.json`, and the requested driver result. A `.trace` is a
-directory bundle: `stat -f %z /tmp/srui-allocations.trace` reports only the directory entry, not
-the capture size. The harness's `trace_bytes` recursively sums contained file sizes without
-following symlinks; `du -sk /tmp/srui-allocations.trace` is a useful on-disk diagnostic but is not
-the same quantity. Default limits are a 2 GiB recursive trace size, a 256 MiB export, and a 4 GiB
-free-space reserve; override them with `SRUI_XCTRACE_MAX_BYTES`,
-`SRUI_XCTRACE_MAX_EXPORT_BYTES`, and `SRUI_XCTRACE_MIN_FREE_BYTES`. The normal suite also
-requires 12 GiB free by default.
+It reports independent whole-trace Statistics, final live-list totals, and their signed
+discrepancy, with exact PID/birth identity and explicit non-authoritative semantics. Developer
+Tools permission and the staged `get-task-allow` entitlement are required only for that optional
+diagnostic. Full visual runs separately require Screen Recording for ScreenCaptureKit.
 
-See benchmarks/parse-render/README.md for the exact export, signing, reconciliation, and failure
-diagnostics and for the Apple/manpage references behind this contract.
-
-The consolidated suite is macOS-only because §31.1, §31.3, §31.4, and the client half of §31.5/6
-exercise AppKit, WebKit, WindowServer, and Instruments. Unsupported hosts fail during platform
-validation before any Rust or Swift benchmark driver starts.
-
-The methodology has a deliberate portability boundary. Protocol generation/serialization, exact
-wire counters, mutation ordering, reconnect boundaries, result-cache idempotency, PTY byte
-comparison, and ring-exhaustion scenarios can be reused on Linux and Windows. Renderer presentation,
-local input, process-allocation, and peak-memory evidence need native adapters: for example a
-GTK/Qt frame-clock plus compositor/PipeWire capture and `perf`/heaptrack-class instrumentation on
-Linux, or a WinUI/WPF target plus DWM/ETW presentation and Windows heap tooling. Those adapters must
-preserve this suite's same-frame target-pixel and exact-process-attribution contracts. §23's numeric
-targets are macOS renderer targets and must not silently become cross-platform acceptance thresholds;
-each future renderer needs separately justified platform targets while retaining the common report
-schema.
-
+For the complete evidence, failed approaches, exact observed values and stack locations,
+authorization/signing behavior, cleanup and disk safeguards, reproduction guidance, and
+Linux/Windows portability notes, see the
+[technical findings](parse-render/INSTRUMENTATION_FINDINGS.md). The
+[parse/render guide](parse-render/README.md) stays focused on operation.
 ## Measurement policy
 
 - Smoke paint uses deterministic offscreen presentation and is safe for unattended runs.

@@ -265,6 +265,11 @@ def targeted_pass(
             "renderedNodeCount": 50,
             "semanticParityPassed": True,
             "elementKindsPassed": True,
+            "captureAuthorization": False,
+            "pixelCaptureCompletions": 0,
+            "paintCompletionMode": (
+                "non-compositor synthetic allocation workload"
+            ),
             "succeeded": True,
             "attribution": {
                 "candidate": candidate,
@@ -296,6 +301,34 @@ def targeted_pass(
             },
         },
     }
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("captureAuthorization", True),
+        ("pixelCaptureCompletions", 1),
+        ("paintCompletionMode", "on-screen compositor claim"),
+    ],
+)
+def test_allocation_candidate_cannot_claim_compositor_evidence(
+    field: str,
+    value: object,
+) -> None:
+    role_pass = targeted_pass(
+        "srui",
+        "host",
+        host_pid=101,
+        target_pid=101,
+        target_birth_unix_ns=10,
+    )
+    role_pass["candidate_result"][field] = value
+
+    with pytest.raises(
+        benchmark_xctrace.CaptureError,
+        match="equivalent successful renderer workload",
+    ):
+        benchmark_xctrace._candidate_equivalence("srui", [role_pass])
+
+
 def test_trace_command_is_bounded_and_targets_exact_process() -> None:
     command = benchmark_xctrace.trace_command(
         Path("out.trace"),
@@ -890,694 +923,167 @@ def test_publication_rollback_preserves_raced_sidecar_replacement(
     benchmark_xctrace.remove_owned_capture(workspace)
 
 
-def test_exact_process_summary_pairs_webkit_host_and_webcontent(
-    tmp_path: Path,
-) -> None:
+def diagnostic_srui_pass(*, sample_count: int = 2) -> dict[str, Any]:
+    role_pass = targeted_pass(
+        "srui",
+        "host",
+        host_pid=101,
+        target_pid=101,
+        target_birth_unix_ns=10,
+        sample_count=sample_count,
+    )
+    samples = []
+    for sample_index, old_sample in enumerate(role_pass["samples"]):
+        started = old_sample["started_unix_ns"]
+        ended = old_sample["ended_unix_ns"]
+        observed = old_sample["observed_alive_through_unix_ns"]
+        live_allocations = 10 + sample_index
+        live_bytes = 4096 + sample_index * 16
+        statistics = whole_trace_statistics(
+            live_allocations + 3,
+            live_bytes + 32,
+            5,
+            2048,
+        )
+        samples.append(
+            {
+                "candidate": "srui",
+                "sample_index": sample_index,
+                "target_role": "host",
+                "target_present": True,
+                "host_pid": 101,
+                "available_targets": [
+                    {"role": "host", "pid": 101, "birth_unix_ns": 10}
+                ],
+                "target_pid": 101,
+                "target_birth_unix_ns": 10,
+                "started_unix_ns": started,
+                "ended_unix_ns": ended,
+                "observed_alive_through_unix_ns": observed,
+                "trace_segment": f"srui-host-{sample_index:03d}.trace",
+                "recording_readiness_basis": "darwin_notification",
+                "trace_bytes": 512,
+                "allocation_export_basis": "independently materialized views",
+                "metric_semantics": "whole-trace and final-live diagnostic",
+                "whole_trace_statistics_semantics": "whole-trace attach-inclusive",
+                "final_live_list_semantics": "final live rows",
+                "process_identity_basis": "exact targeted identity",
+                "whole_trace_statistics": statistics,
+                "final_live_list": {
+                    "allocations": live_allocations,
+                    "bytes": live_bytes,
+                    "vm_category_allocations": 0,
+                    "vm_category_bytes": 0,
+                    "vm_categories": {},
+                    "maximum_elapsed_timestamp_ns": 1_000_000,
+                },
+                "statistics_minus_final_live_list": {
+                    "persistent_allocations": 3,
+                    "persistent_bytes": 32,
+                },
+                "workload_window": {
+                    "started_unix_ns": started,
+                    "ended_unix_ns": ended,
+                    "used_for_allocation_attribution": False,
+                },
+                "xctrace": {
+                    "instruments_version": "26.0 (17C52)",
+                    "platform": "macOS",
+                    "os_version": "26.4.1",
+                    "attached_pid": 101,
+                    "attached_process_name": "BenchmarkDriver",
+                    "statistics_xpath": benchmark_xctrace.STATISTICS_XPATH,
+                    "allocations_list_xpath": benchmark_xctrace.ALLOCATIONS_LIST_XPATH,
+                },
+                "exact_process_identity": {
+                    "pid": 101,
+                    "birth_unix_ns": 10,
+                    "observed_alive_through_unix_ns": observed,
+                    "names": ["BenchmarkDriver"],
+                },
+            }
+        )
+    role_pass["samples"] = samples
+    return role_pass
+
+
+def test_exact_process_summary_is_srui_host_only_diagnostic(tmp_path: Path) -> None:
+    assert benchmark_xctrace.CAPTURE_PASSES == (("srui", "host"),)
     trace_directory = tmp_path / "capture.trace"
     trace_directory.mkdir()
     (trace_directory / "segment-data").write_bytes(b"trace")
-    pass_results = [
-        targeted_pass(
-            "srui",
-            "host",
-            host_pid=101,
-            target_pid=101,
-            target_birth_unix_ns=10,
-        ),
-        targeted_pass(
-            "webkit",
-            "host",
-            host_pid=201,
-            target_pid=201,
-            target_birth_unix_ns=20,
-        ),
-        targeted_pass(
-            "webkit",
-            "webcontent",
-            host_pid=301,
-            target_pid=401,
-            target_birth_unix_ns=30,
-        ),
-        targeted_pass(
-            "webkit",
-            "network",
-            host_pid=302,
-            target_pid=501,
-            target_birth_unix_ns=40,
-        ),
-        targeted_pass(
-            "webkit",
-            "gpu",
-            host_pid=303,
-            target_pid=601,
-            target_birth_unix_ns=50,
-        ),
-    ]
 
     summary = benchmark_xctrace.build_exact_process_summary(
-        pass_results,
+        [diagnostic_srui_pass()],
         trace_directory=trace_directory,
         reported_trace=tmp_path / "published.trace",
         instrumentation=TEST_INSTRUMENTATION,
     )
 
-    assert summary["capture_scope"] == "exact_processes"
-    assert summary["recording_readiness_bases"] == ["darwin_notification"]
-    assert summary["target_capture_count"] == 10
-    assert summary["trace"] == str(tmp_path / "published.trace")
-    candidates = {
-        item["candidate"]: item for item in summary["candidate_processes"]
-    }
-    assert candidates["srui"]["helper_pids"] == []
-    assert [
-        sample["required_allocation_pids"]
-        for sample in candidates["srui"]["measurement_samples"]
-    ] == [[101], [101]]
-    webkit = candidates["webkit"]
-    assert webkit["host_pid"] == 201
-    assert webkit["helper_pids"] == [401, 501, 601]
-    assert [
-        sample["required_allocation_pids"]
-        for sample in webkit["measurement_samples"]
-    ] == [[201, 401, 501, 601], [201, 401, 501, 601]]
-    assert all(
-        [total["pid"] for total in sample["process_totals"]]
-        == [201, 401, 501, 601]
-        for sample in webkit["measurement_samples"]
-    )
-    assert webkit["host_retained_allocations"] == 3
-    assert webkit["helper_retained_allocations"] == 9
-    assert webkit["retained_allocations"] == 12
-    assert summary["allocation_list_reconciled"] is True
-    assert summary["instrumentation"] == TEST_INSTRUMENTATION
+    assert summary["schema_version"] == 4
+    assert summary["diagnostic_only"] is True
+    assert summary["authoritative_benchmark_metric"] is False
+    assert summary["diagnostic_target"] == "srui_host"
+    assert summary["target_capture_count"] == 2
+    assert len(summary["candidate_processes"]) == 1
+    assert summary["candidate_processes"][0]["candidate"] == "srui"
+    assert summary["target_captures"][0][
+        "statistics_minus_final_live_list"
+    ] == {"persistent_allocations": 3, "persistent_bytes": 32}
+    assert summary["target_captures"][0]["workload_window"][
+        "used_for_allocation_attribution"
+    ] is False
 
 
-def test_exact_process_summary_accepts_zero_retained_webcontent_when_reconciled(
-    tmp_path: Path,
-) -> None:
-    trace_directory = tmp_path / "capture.trace"
-    trace_directory.mkdir()
-    pass_results = [
-        targeted_pass(
-            "srui", "host", host_pid=101, target_pid=101, target_birth_unix_ns=10
-        ),
-        targeted_pass(
-            "webkit", "host", host_pid=201, target_pid=201, target_birth_unix_ns=20
-        ),
-        targeted_pass(
-            "webkit",
-            "webcontent",
-            host_pid=301,
-            target_pid=401,
-            target_birth_unix_ns=30,
-        ),
-        targeted_pass(
-            "webkit",
-            "network",
-            host_pid=302,
-            target_pid=501,
-            target_birth_unix_ns=40,
-        ),
-        targeted_pass(
-            "webkit", "gpu", host_pid=303, target_pid=601, target_birth_unix_ns=50
-        ),
-    ]
-    for sample in pass_results[2]["samples"]:
-        for field in benchmark_xctrace.PROCESS_ALLOCATION_FIELDS:
-            sample[field] = 0
-            sample["process_total"][field] = 0
-        sample["excluded_outside_measurement_interval_rows"] = sample[
-            "allocation_rows"
-        ]
-
-    summary = benchmark_xctrace.build_exact_process_summary(
-        pass_results,
-        trace_directory=trace_directory,
-        reported_trace=tmp_path / "published.trace",
-        instrumentation=TEST_INSTRUMENTATION,
-    )
-    webkit = next(
-        item
-        for item in summary["candidate_processes"]
-        if item["candidate"] == "webkit"
-    )
-    assert webkit["helpers_without_retained_rows"] == [401]
-    assert webkit["measurement_samples"][0]["retained_allocations"] == 3
-
-
-def test_candidate_pass_waits_for_host_request_and_result_identities(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    pass_fixture = targeted_pass(
-        "webkit",
-        "network",
-        host_pid=301,
-        target_pid=501,
-        target_birth_unix_ns=40,
-        sample_count=3,
-    )
-    candidate_result = pass_fixture["candidate_result"]
-    observed_waits: list[tuple[list[tuple[int, int]], str]] = []
-
-    class FakeCandidate:
-        child_pid = 301
-        closed = False
-        label = "fake candidate"
-
-        def wait_until_started(self, _timeout: float, **_kwargs: Any) -> int:
-            return self.child_pid
-
-        def wait(self, _timeout: float, **_kwargs: Any) -> SimpleNamespace:
-            self.closed = True
-            return SimpleNamespace(returncode=0, stdout="", stderr="", child_pid=301)
-
-    def start_candidate(
-        _cls: type[Any],
-        command: list[str],
-        **kwargs: Any,
-    ) -> FakeCandidate:
-        assert kwargs["require_exact_owner_identity"] is True
-        output = Path(command[command.index("--output") + 1])
-        output.write_text(json.dumps(candidate_result), encoding="utf-8")
-        return FakeCandidate()
-    def capture_sample(**arguments: Any) -> dict[str, Any]:
-        sample = pass_fixture["samples"][arguments["sample_index"]]
-        benchmark_xctrace._remember_process_identity(
-            arguments["known_process_identities"],
-            pid=sample["target_pid"],
-            birth_unix_ns=sample["target_birth_unix_ns"],
-            label="fake request",
-        )
-        return sample
-
-    def observe_wait(
-        identities: list[tuple[int, int]],
-        *,
-        label: str,
-    ) -> None:
-        observed_waits.append((identities, label))
-
-    monkeypatch.setattr(
-        benchmark_xctrace.ManagedProcess,
-        "start",
-        classmethod(start_candidate),
-    )
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "capture_target_sample",
-        capture_sample,
-    )
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "process_birth_unix_ns",
-        lambda pid: 39 if pid == 301 else None,
-    )
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "wait_for_process_identities_gone",
-        observe_wait,
-    )
-    workspace = benchmark_xctrace.create_capture_workspace(tmp_path)
-    trace_directory = workspace.path / "capture.trace"
-    trace_directory.mkdir()
-    summary_directory = workspace.path / "summaries"
-    summary_directory.mkdir()
-
-    result = benchmark_xctrace.run_candidate_pass(
-        binary=tmp_path / "BenchmarkDriver",
-        fixture=tmp_path / "fixture.json",
-        profile="smoke",
-        candidate="webkit",
-        target_role="network",
-        workspace=workspace,
-        trace_directory=trace_directory,
-        summary_directory=summary_directory,
-        max_trace_bytes=1024 * 1024,
-        max_export_bytes=1024,
-        min_remaining_bytes=1,
-    )
-
-    assert result["target_role"] == "network"
-    assert observed_waits == [
-        (
-            [(301, 39), (501, 40), (3011, 40), (3013, 42)],
-            "webkit-network exact renderer processes",
-        )
-    ]
-    benchmark_xctrace.remove_owned_capture(workspace)
-
-
-def test_candidate_pass_failure_waits_for_known_request_identity(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    observed_waits: list[list[tuple[int, int]]] = []
-    terminated = False
-
-    class FakeCandidate:
-        child_pid = 301
-        closed = False
-        label = "fake candidate"
-
-        def wait_until_started(self, _timeout: float, **_kwargs: Any) -> int:
-            return self.child_pid
-
-    fake_candidate = FakeCandidate()
-
-    def start_candidate(
-        _cls: type[Any],
-        _command: list[str],
-        **_kwargs: Any,
-    ) -> FakeCandidate:
-        return fake_candidate
-
-    def fail_mid_sample(**arguments: Any) -> dict[str, Any]:
-        benchmark_xctrace._remember_process_identity(
-            arguments["known_process_identities"],
-            pid=501,
-            birth_unix_ns=40,
-            label="fake request",
-        )
-        raise benchmark_xctrace.CaptureError("synthetic mid-pass failure")
-
-    def terminate_candidate(process: FakeCandidate) -> None:
-        nonlocal terminated
-        terminated = True
-        process.closed = True
-
-    monkeypatch.setattr(
-        benchmark_xctrace.ManagedProcess,
-        "start",
-        classmethod(start_candidate),
-    )
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "capture_target_sample",
-        fail_mid_sample,
-    )
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "process_birth_unix_ns",
-        lambda pid: 39 if pid == 301 else None,
-    )
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "terminate_managed_process_with_retry",
-        terminate_candidate,
-    )
-    monkeypatch.setattr(
-        benchmark_xctrace,
-        "wait_for_process_identities_gone",
-        lambda identities, **_kwargs: observed_waits.append(identities),
-    )
-    workspace = benchmark_xctrace.create_capture_workspace(tmp_path)
-    trace_directory = workspace.path / "capture.trace"
-    trace_directory.mkdir()
-    summary_directory = workspace.path / "summaries"
-    summary_directory.mkdir()
-
+def test_exact_process_summary_rejects_webkit_capture(tmp_path: Path) -> None:
+    role_pass = diagnostic_srui_pass(sample_count=1)
+    role_pass["candidate"] = "webkit"
     with pytest.raises(
         benchmark_xctrace.CaptureError,
-        match="synthetic mid-pass failure",
+        match="only the SRUI host pass",
     ):
-        benchmark_xctrace.run_candidate_pass(
-            binary=tmp_path / "BenchmarkDriver",
-            fixture=tmp_path / "fixture.json",
-            profile="smoke",
-            candidate="webkit",
-            target_role="network",
-            workspace=workspace,
-            trace_directory=trace_directory,
-            summary_directory=summary_directory,
-            max_trace_bytes=1024 * 1024,
-            max_export_bytes=1024,
-            min_remaining_bytes=1,
-        )
-
-    assert terminated
-    assert observed_waits == [[(301, 39), (501, 40)]]
-    benchmark_xctrace.remove_owned_capture(workspace)
-
-
-def test_absent_optional_roles_are_measured_but_not_counted(
-    tmp_path: Path,
-) -> None:
-    trace_directory = tmp_path / "capture.trace"
-    trace_directory.mkdir()
-    available_roles = ("host", "webcontent")
-    pass_results = [
-        targeted_pass(
-            "srui",
-            "host",
-            host_pid=101,
-            target_pid=101,
-            target_birth_unix_ns=10,
-        ),
-        targeted_pass(
-            "webkit",
-            "host",
-            host_pid=201,
-            target_pid=201,
-            target_birth_unix_ns=20,
-            available_roles=available_roles,
-        ),
-        targeted_pass(
-            "webkit",
-            "webcontent",
-            host_pid=301,
-            target_pid=401,
-            target_birth_unix_ns=30,
-            available_roles=available_roles,
-        ),
-        targeted_pass(
-            "webkit",
-            "network",
-            host_pid=302,
-            target_pid=501,
-            target_birth_unix_ns=40,
-            available_roles=available_roles,
-        ),
-        targeted_pass(
-            "webkit",
-            "gpu",
-            host_pid=303,
-            target_pid=601,
-            target_birth_unix_ns=50,
-            available_roles=available_roles,
-        ),
-    ]
-
-    summary = benchmark_xctrace.build_exact_process_summary(
-        pass_results,
-        trace_directory=trace_directory,
-        reported_trace=tmp_path / "published.trace",
-        instrumentation=TEST_INSTRUMENTATION,
-    )
-
-    assert summary["role_measurement_count"] == 10
-    assert summary["target_capture_count"] == 6
-    assert len(summary["absent_role_measurements"]) == 4
-    webkit = next(
-        item
-        for item in summary["candidate_processes"]
-        if item["candidate"] == "webkit"
-    )
-    assert [
-        sample["required_allocation_pids"]
-        for sample in webkit["measurement_samples"]
-    ] == [[201, 401], [201, 401]]
-    role_counts = {
-        item["target_role"]: (
-            item["present_sample_count"],
-            item["absent_sample_count"],
-        )
-        for item in webkit["helper_target_roles"]
-    }
-    assert role_counts == {
-        "webcontent": (2, 0),
-        "network": (0, 2),
-        "gpu": (0, 2),
-    }
-
-
-def test_equivalent_role_set_disagreement_fails_closed(tmp_path: Path) -> None:
-    trace_directory = tmp_path / "capture.trace"
-    trace_directory.mkdir()
-    pass_results = [
-        targeted_pass(
-            "srui",
-            "host",
-            host_pid=101,
-            target_pid=101,
-            target_birth_unix_ns=10,
-        ),
-        targeted_pass(
-            "webkit",
-            "host",
-            host_pid=201,
-            target_pid=201,
-            target_birth_unix_ns=20,
-        ),
-        targeted_pass(
-            "webkit",
-            "webcontent",
-            host_pid=301,
-            target_pid=401,
-            target_birth_unix_ns=30,
-        ),
-        targeted_pass(
-            "webkit",
-            "network",
-            host_pid=302,
-            target_pid=501,
-            target_birth_unix_ns=40,
-            available_roles=("host", "webcontent"),
-        ),
-        targeted_pass(
-            "webkit",
-            "gpu",
-            host_pid=303,
-            target_pid=601,
-            target_birth_unix_ns=50,
-        ),
-    ]
-
-    with pytest.raises(benchmark_xctrace.CaptureError, match="role evidence disagrees"):
         benchmark_xctrace.build_exact_process_summary(
-            pass_results,
-            trace_directory=trace_directory,
+            [role_pass],
+            trace_directory=tmp_path,
             reported_trace=tmp_path / "published.trace",
             instrumentation=TEST_INSTRUMENTATION,
         )
 
 
-def test_per_pass_helper_alias_topology_is_deduplicated(
-    tmp_path: Path,
-) -> None:
-    trace_directory = tmp_path / "capture.trace"
-    trace_directory.mkdir()
-    helper_alias = (("webcontent", "network"),)
-    pass_results = [
-        targeted_pass(
-            "srui",
-            "host",
-            host_pid=101,
-            target_pid=101,
-            target_birth_unix_ns=10,
-        ),
-        targeted_pass(
-            "webkit",
-            "host",
-            host_pid=201,
-            target_pid=201,
-            target_birth_unix_ns=20,
-            alias_groups=helper_alias,
-        ),
-        targeted_pass(
-            "webkit",
-            "webcontent",
-            host_pid=301,
-            target_pid=401,
-            target_birth_unix_ns=30,
-            alias_groups=helper_alias,
-        ),
-        targeted_pass(
-            "webkit",
-            "network",
-            host_pid=302,
-            target_pid=501,
-            target_birth_unix_ns=40,
-            alias_groups=helper_alias,
-        ),
-        targeted_pass(
-            "webkit",
-            "gpu",
-            host_pid=303,
-            target_pid=601,
-            target_birth_unix_ns=50,
-            alias_groups=helper_alias,
-        ),
-    ]
-
-    summary = benchmark_xctrace.build_exact_process_summary(
-        pass_results,
-        trace_directory=trace_directory,
-        reported_trace=tmp_path / "published.trace",
-        instrumentation=TEST_INSTRUMENTATION,
-    )
-
-    assert summary["target_capture_count"] == 10
-    assert summary["deduplicated_alias_capture_count"] == 2
-    webkit = next(
-        item
-        for item in summary["candidate_processes"]
-        if item["candidate"] == "webkit"
-    )
-    assert webkit["helper_pids"] == [401, 501, 601]
-    assert webkit["helper_retained_allocations"] == 6
-    assert webkit["retained_allocations"] == 9
-    assert [
-        sample["required_allocation_pids"]
-        for sample in webkit["measurement_samples"]
-    ] == [[201, 401, 601], [201, 401, 601]]
-    expected_alias = {
-        "canonical_target_role": "webcontent",
-        "aliased_target_roles": ["network"],
-        "pass_advertised_identities": [
-            {"target_role": "host", "pid": 2011, "birth_unix_ns": 21},
-            {"target_role": "webcontent", "pid": 401, "birth_unix_ns": 30},
-            {"target_role": "network", "pid": 501, "birth_unix_ns": 40},
-            {"target_role": "gpu", "pid": 3031, "birth_unix_ns": 50},
-        ],
-    }
-    assert all(
-        sample["role_aliases"] == [expected_alias]
-        for sample in webkit["measurement_samples"]
-    )
-    network_captures = [
-        capture
-        for capture in summary["target_captures"]
-        if capture["target_role"] == "network"
-    ]
-    assert len(network_captures) == 2
-    assert all(
-        capture["included_in_candidate_total"] is False
-        for capture in network_captures
-    )
-
-
-def test_alias_topology_disagreement_across_equivalent_passes_fails_closed(
-    tmp_path: Path,
-) -> None:
-    trace_directory = tmp_path / "capture.trace"
-    trace_directory.mkdir()
-    helper_alias = (("webcontent", "network"),)
-    pass_results = [
-        targeted_pass(
-            "srui", "host", host_pid=101, target_pid=101, target_birth_unix_ns=10
-        ),
-        targeted_pass(
-            "webkit",
-            "host",
-            host_pid=201,
-            target_pid=201,
-            target_birth_unix_ns=20,
-            alias_groups=helper_alias,
-        ),
-        targeted_pass(
-            "webkit",
-            "webcontent",
-            host_pid=301,
-            target_pid=401,
-            target_birth_unix_ns=30,
-            alias_groups=helper_alias,
-        ),
-        targeted_pass(
-            "webkit",
-            "network",
-            host_pid=302,
-            target_pid=501,
-            target_birth_unix_ns=40,
-        ),
-        targeted_pass(
-            "webkit",
-            "gpu",
-            host_pid=303,
-            target_pid=601,
-            target_birth_unix_ns=50,
-            alias_groups=helper_alias,
-        ),
-    ]
-
-    with pytest.raises(benchmark_xctrace.CaptureError, match="alias topology disagrees"):
+def test_exact_process_summary_validates_signed_discrepancy(tmp_path: Path) -> None:
+    role_pass = diagnostic_srui_pass(sample_count=1)
+    role_pass["samples"][0]["statistics_minus_final_live_list"][
+        "persistent_bytes"
+    ] = 0
+    with pytest.raises(
+        benchmark_xctrace.CaptureError,
+        match="signed discrepancy",
+    ):
         benchmark_xctrace.build_exact_process_summary(
-            pass_results,
-            trace_directory=trace_directory,
+            [role_pass],
+            trace_directory=tmp_path,
             reported_trace=tmp_path / "published.trace",
             instrumentation=TEST_INSTRUMENTATION,
         )
 
 
-def test_targeted_identity_must_match_same_pass_advertisement() -> None:
-    role_pass = targeted_pass(
-        "webkit",
-        "network",
-        host_pid=302,
-        target_pid=501,
-        target_birth_unix_ns=40,
-    )
-    sample = role_pass["samples"][0]
-    sample["target_pid"] = 777
-    sample["xctrace"]["attached_pid"] = 777
-    sample["process_total"]["pid"] = 777
-
+def test_exact_process_summary_rejects_interval_attribution_claim(tmp_path: Path) -> None:
+    role_pass = diagnostic_srui_pass(sample_count=1)
+    role_pass["samples"][0]["workload_window"][
+        "used_for_allocation_attribution"
+    ] = True
     with pytest.raises(
         benchmark_xctrace.CaptureError,
-        match="identity does not match its advertised available target",
+        match="misstates allocation attribution",
     ):
-        benchmark_xctrace._validate_pass_result(
-            role_pass,
-            candidate="webkit",
-            target_role="network",
+        benchmark_xctrace.build_exact_process_summary(
+            [role_pass],
+            trace_directory=tmp_path,
+            reported_trace=tmp_path / "published.trace",
+            instrumentation=TEST_INSTRUMENTATION,
         )
 
 
-def test_numeric_pid_reuse_across_separate_role_passes_is_not_compared(
-    tmp_path: Path,
-) -> None:
-    trace_directory = tmp_path / "capture.trace"
-    trace_directory.mkdir()
-    pass_results = [
-        targeted_pass(
-            "srui", "host", host_pid=101, target_pid=101, target_birth_unix_ns=10
-        ),
-        targeted_pass(
-            "webkit",
-            "host",
-            host_pid=201,
-            target_pid=201,
-            target_birth_unix_ns=20,
-        ),
-        targeted_pass(
-            "webkit",
-            "webcontent",
-            host_pid=301,
-            target_pid=401,
-            target_birth_unix_ns=30,
-        ),
-        targeted_pass(
-            "webkit",
-            "network",
-            host_pid=302,
-            target_pid=401,
-            target_birth_unix_ns=40,
-        ),
-        targeted_pass(
-            "webkit",
-            "gpu",
-            host_pid=303,
-            target_pid=601,
-            target_birth_unix_ns=50,
-        ),
-    ]
-
-    summary = benchmark_xctrace.build_exact_process_summary(
-        pass_results,
-        trace_directory=trace_directory,
-        reported_trace=tmp_path / "published.trace",
-        instrumentation=TEST_INSTRUMENTATION,
-    )
-    webkit = next(
-        item
-        for item in summary["candidate_processes"]
-        if item["candidate"] == "webkit"
-    )
-    assert webkit["retained_allocations"] == 12
-    assert [
-        (total["pid"], total["birth_unix_ns"])
-        for total in webkit["helper_process_totals"]
-    ] == [(401, 30), (401, 40), (601, 50)]
 
 
 def test_control_handshake_accepts_helper_roles_aliased_to_one_exact_process(

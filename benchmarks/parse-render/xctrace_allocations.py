@@ -8,7 +8,6 @@ deliberately keeps those two meanings separate.
 
 from __future__ import annotations
 
-import datetime as dt
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -23,7 +22,6 @@ ALLOCATIONS_LIST_XPATH = (
     'details/detail[@name="Allocations List"]'
 )
 ALLOCATION_DETAIL_NAMES = ("Statistics", "Allocations List")
-ALLOCATION_LIST_TIMESTAMP_RESOLUTION_NS = 1_000
 
 
 class AllocationExportError(ValueError):
@@ -58,36 +56,6 @@ def _nonnegative_decimal(raw: str | None, label: str) -> int:
     if raw is None or re.fullmatch(r"[0-9]+", raw) is None:
         raise AllocationExportError(f"{label} must be a non-negative decimal integer")
     return int(raw)
-
-
-_XCTRACE_START_DATE = re.compile(
-    r"^(?P<clock>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"
-    r"(?:\.(?P<fraction>\d{1,9}))?"
-    r"(?P<zone>Z|[+-]\d{2}:?\d{2})$"
-)
-
-
-def _parse_start_date(raw: str) -> tuple[int, int]:
-    match = _XCTRACE_START_DATE.fullmatch(raw)
-    if match is None:
-        raise AllocationExportError(f"xctrace start-date is not ISO-8601: {raw!r}")
-    zone = match.group("zone")
-    if zone == "Z":
-        zone = "+00:00"
-    elif ":" not in zone:
-        zone = f"{zone[:3]}:{zone[3:]}"
-    try:
-        parsed = dt.datetime.fromisoformat(f"{match.group('clock')}{zone}")
-    except ValueError as error:
-        raise AllocationExportError(f"xctrace start-date is invalid: {raw!r}") from error
-    utc = parsed.astimezone(dt.timezone.utc)
-    delta = utc - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
-    whole_seconds = delta.days * 86_400 + delta.seconds
-    fraction_raw = match.group("fraction") or ""
-    fraction = fraction_raw.ljust(9, "0")
-    unix_ns = whole_seconds * 1_000_000_000 + (int(fraction) if fraction else 0)
-    resolution_ns = 10 ** (9 - len(fraction_raw)) if fraction_raw else 1_000_000_000
-    return unix_ns, resolution_ns
 
 
 def validate_allocation_toc(toc: str, *, requested_pid: int) -> dict[str, Any]:
@@ -133,17 +101,6 @@ def validate_allocation_toc(toc: str, *, requested_pid: int) -> dict[str, Any]:
                 f"Allocations/{detail_name} detail must be a table"
             )
 
-    start_dates = [
-        (element.text or "").strip()
-        for element in run.iter()
-        if _local_name(element) == "start-date" and (element.text or "").strip()
-    ]
-    start_date = _single(
-        [ET.Element("start-date", {"value": value}) for value in start_dates],
-        "xctrace run start-date",
-    ).attrib["value"]
-    trace_started_unix_ns, start_resolution_ns = _parse_start_date(start_date)
-
     template_names = [
         (element.text or "").strip()
         for element in run.iter()
@@ -164,15 +121,6 @@ def validate_allocation_toc(toc: str, *, requested_pid: int) -> dict[str, Any]:
     return {
         "attached_pid": attached_pid,
         "attached_process_name": process_name,
-        "trace_start_date": start_date,
-        "trace_started_unix_ns": trace_started_unix_ns,
-        "trace_start_timestamp_resolution_ns": start_resolution_ns,
-        "allocation_list_timestamp_resolution_ns": (
-            ALLOCATION_LIST_TIMESTAMP_RESOLUTION_NS
-        ),
-        "timestamp_boundary_uncertainty_ns": (
-            start_resolution_ns + ALLOCATION_LIST_TIMESTAMP_RESOLUTION_NS
-        ),
         "instruments_version": instrument_versions[0],
         "platform": device.attrib.get("platform", "unknown"),
         "os_version": device.attrib.get("os-version", "unknown"),
@@ -331,7 +279,13 @@ def summarize_allocation_exports(
     measurement_started_unix_ns: int,
     measurement_ended_unix_ns: int,
 ) -> dict[str, Any]:
-    """Return honest interval-retained evidence and whole-trace diagnostics."""
+    """Return independent whole-trace and final-live-list diagnostics.
+
+    Xcode materializes the Statistics and Allocations List views separately. Their
+    snapshots need not coincide, and the List's elapsed timestamps are not proven
+    to share the TOC start-date clock. The benchmark workload window therefore
+    establishes only exact-process liveness; it never selects allocation rows.
+    """
 
     if toc_metadata.get("attached_pid") != target_pid:
         raise AllocationExportError("TOC attachment does not match allocation target")
@@ -342,116 +296,62 @@ def summarize_allocation_exports(
         measurement_started_unix_ns,
         measurement_ended_unix_ns,
     )
-    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in integer_values):
-        raise AllocationExportError("allocation target identity or interval is invalid")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in integer_values
+    ):
+        raise AllocationExportError("allocation target identity or window is invalid")
     if not (
         target_birth_unix_ns
         <= measurement_started_unix_ns
         < measurement_ended_unix_ns
         <= observed_alive_through_unix_ns
     ):
-        raise AllocationExportError("allocation measurement exceeds exact-process lifetime")
+        raise AllocationExportError("allocation workload window exceeds exact-process lifetime")
+
     statistics = parse_allocation_statistics(statistics_path)
     rows = parse_allocation_list(allocations_list_path)
     combined = statistics["heap_and_anonymous_vm"]
     list_bytes = sum(row["size"] for row in rows)
-    vm_category_rows = [
-        row for row in rows if row["category"].startswith("VM:")
-    ]
-    vm_category_bytes = sum(row["size"] for row in vm_category_rows)
-    vm_categories: dict[str, tuple[int, int]] = {}
-    for row in vm_category_rows:
-        count, allocated_bytes = vm_categories.get(row["category"], (0, 0))
-        vm_categories[row["category"]] = (
-            count + 1,
-            allocated_bytes + row["size"],
-        )
-    if (
-        len(rows) != combined["persistent_allocations"]
-        or list_bytes != combined["persistent_bytes"]
-    ):
-        raise AllocationExportError(
-            "complete Allocations List does not reconcile with persistent All "
-            "Heap & Anonymous VM Statistics totals: "
-            f"list={len(rows)} allocations/{list_bytes} bytes, "
-            f"VM:-category-diagnostic={len(vm_category_rows)} allocations/"
-            f"{vm_category_bytes} bytes {vm_categories!r}, "
-            f"statistics={combined['persistent_allocations']} allocations/"
-            f"{combined['persistent_bytes']} bytes"
-        )
-
-    trace_started_unix_ns = toc_metadata.get("trace_started_unix_ns")
-    uncertainty_ns = toc_metadata.get("timestamp_boundary_uncertainty_ns")
-    if (
-        isinstance(trace_started_unix_ns, bool)
-        or not isinstance(trace_started_unix_ns, int)
-        or trace_started_unix_ns <= 0
-        or isinstance(uncertainty_ns, bool)
-        or not isinstance(uncertainty_ns, int)
-        or uncertainty_ns <= 0
-    ):
-        raise AllocationExportError("TOC timestamp metadata is invalid")
-
-    nominal: list[dict[str, Any]] = []
-    definite: list[dict[str, Any]] = []
-    possible: list[dict[str, Any]] = []
-    attach_baseline: list[dict[str, Any]] = []
+    vm_categories: dict[str, dict[str, int]] = {}
     for row in rows:
-        timestamp_unix_ns = trace_started_unix_ns + row["timestamp_relative_ns"]
-        if row["timestamp_relative_ns"] == 0:
-            attach_baseline.append(row)
-        if measurement_started_unix_ns <= timestamp_unix_ns <= measurement_ended_unix_ns:
-            nominal.append(row)
-        if (
-            measurement_started_unix_ns + uncertainty_ns
-            < timestamp_unix_ns
-            < measurement_ended_unix_ns - uncertainty_ns
-        ):
-            definite.append(row)
-        if (
-            measurement_started_unix_ns - uncertainty_ns
-            <= timestamp_unix_ns
-            <= measurement_ended_unix_ns + uncertainty_ns
-        ):
-            possible.append(row)
+        category = row["category"]
+        if not category.startswith("VM:"):
+            continue
+        total = vm_categories.setdefault(category, {"allocations": 0, "bytes": 0})
+        total["allocations"] += 1
+        total["bytes"] += row["size"]
+    vm_allocations = sum(total["allocations"] for total in vm_categories.values())
+    vm_bytes = sum(total["bytes"] for total in vm_categories.values())
 
-    def total_bytes(selected: list[dict[str, Any]]) -> int:
-        return sum(row["size"] for row in selected)
-
-    lower_count = len(definite)
-    upper_count = len(possible)
-    lower_bytes = total_bytes(definite)
-    upper_bytes = total_bytes(possible)
     return {
-        "allocation_rows": len(rows),
-        "allocation_list_bytes": list_bytes,
-        "allocation_list_reconciled": True,
-        "vm_category_rows": len(vm_category_rows),
-        "vm_category_bytes": vm_category_bytes,
         "whole_trace_statistics": statistics,
-        "attach_baseline_allocations": len(attach_baseline),
-        "attach_baseline_bytes": total_bytes(attach_baseline),
-        "retained_allocations": len(nominal),
-        "retained_bytes": total_bytes(nominal),
-        "retained_allocations_lower_bound": lower_count,
-        "retained_allocations_upper_bound": upper_count,
-        "retained_bytes_lower_bound": lower_bytes,
-        "retained_bytes_upper_bound": upper_bytes,
-        "boundary_ambiguous_allocations": upper_count - lower_count,
-        "boundary_ambiguous_bytes": upper_bytes - lower_bytes,
-        "excluded_outside_measurement_interval_rows": len(rows) - len(nominal),
-        "process_total": {
+        "final_live_list": {
+            "allocations": len(rows),
+            "bytes": list_bytes,
+            "vm_category_allocations": vm_allocations,
+            "vm_category_bytes": vm_bytes,
+            "vm_categories": vm_categories,
+            "maximum_elapsed_timestamp_ns": max(
+                (row["timestamp_relative_ns"] for row in rows),
+                default=0,
+            ),
+        },
+        "statistics_minus_final_live_list": {
+            "persistent_allocations": (
+                combined["persistent_allocations"] - len(rows)
+            ),
+            "persistent_bytes": combined["persistent_bytes"] - list_bytes,
+        },
+        "workload_window": {
+            "started_unix_ns": measurement_started_unix_ns,
+            "ended_unix_ns": measurement_ended_unix_ns,
+            "used_for_allocation_attribution": False,
+        },
+        "exact_process_identity": {
             "pid": target_pid,
             "birth_unix_ns": target_birth_unix_ns,
             "observed_alive_through_unix_ns": observed_alive_through_unix_ns,
             "names": [toc_metadata["attached_process_name"]],
-            "retained_allocations": len(nominal),
-            "retained_bytes": total_bytes(nominal),
-            "retained_allocations_lower_bound": lower_count,
-            "retained_allocations_upper_bound": upper_count,
-            "retained_bytes_lower_bound": lower_bytes,
-            "retained_bytes_upper_bound": upper_bytes,
-            "boundary_ambiguous_allocations": upper_count - lower_count,
-            "boundary_ambiguous_bytes": upper_bytes - lower_bytes,
         },
     }

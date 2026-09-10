@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Capture bounded cross-process allocation data and export exact per-process totals."""
+"""Capture a bounded, optional SRUI-host Allocations diagnostic."""
 
 from __future__ import annotations
 
@@ -50,10 +49,7 @@ CONTROL_FILE_TIMEOUT_SECONDS = 60
 CANDIDATE_EXIT_TIMEOUT_SECONDS = 30
 PROFILE_SAMPLE_COUNTS = {"smoke": 3, "full": 20}
 WEBKIT_TARGET_ROLES = ("host", "webcontent", "network", "gpu")
-CAPTURE_PASSES = (
-    ("srui", "host"),
-    *(("webkit", role) for role in WEBKIT_TARGET_ROLES),
-)
+CAPTURE_PASSES = (("srui", "host"),)
 OWNERSHIP_SENTINEL = ".srui-xctrace-owner"
 BENCHMARK_DRIVER_ENTITLEMENTS = PARSE_RENDER_DIR / "BenchmarkDriver.entitlements"
 
@@ -1225,41 +1221,32 @@ def export_allocation_summary(
             temporary_path.unlink(missing_ok=True)
 
     payload = {
-        "schema_version": 3,
-        "capture_scope": "exact_process",
-        "capture_method": "xctrace Allocations --attach to one validated exact PID",
+        "schema_version": 4,
+        "diagnostic_only": True,
+        "capture_scope": "exact_process_diagnostic",
+        "capture_method": "xctrace Allocations --attach to one validated SRUI host PID",
         "trace": str(reported_trace if reported_trace is not None else trace),
         "trace_bytes": trace_size_bytes(trace),
         "allocation_export_basis": (
-            "Xcode Allocations view details: complete live Allocations List "
-            "reconciled to All Heap & Anonymous VM Statistics"
-        ),
-        "allocation_timestamp_basis": (
-            "Allocations List elapsed timestamp plus TOC start-date"
+            "independently materialized Xcode Allocations Statistics and final "
+            "live Allocations List view details"
         ),
         "metric_semantics": (
-            "heap and anonymous VM allocations created nominally inside the "
-            "measured interval that remain live at capture end"
+            "whole-trace Statistics and a final live-list diagnostic; neither is "
+            "benchmark-interval allocation traffic"
         ),
         "whole_trace_statistics_semantics": (
-            "diagnostic whole-trace heap and anonymous VM aggregates including "
-            "the attach-time live baseline; never interpreted as interval "
-            "allocation traffic"
+            "whole-trace heap and anonymous VM aggregates, including the "
+            "attach-time live baseline"
+        ),
+        "final_live_list_semantics": (
+            "live rows returned by the Allocations List export when that view "
+            "was materialized; it is not required to equal Statistics"
         ),
         "process_identity_basis": (
             "TOC attached PID equals the requested PID and the benchmark "
             "handshake bounds the same PID by birth and observed liveness"
         ),
-        "trace_started_unix_ns": toc_metadata["trace_started_unix_ns"],
-        "trace_start_timestamp_resolution_ns": toc_metadata[
-            "trace_start_timestamp_resolution_ns"
-        ],
-        "allocation_list_timestamp_resolution_ns": toc_metadata[
-            "allocation_list_timestamp_resolution_ns"
-        ],
-        "timestamp_boundary_uncertainty_ns": toc_metadata[
-            "timestamp_boundary_uncertainty_ns"
-        ],
         "xctrace": {
             "instruments_version": toc_metadata["instruments_version"],
             "platform": toc_metadata["platform"],
@@ -1479,24 +1466,24 @@ def capture_target_sample(
             segment_summary = json.loads(
                 segment_sidecar.read_text(encoding="utf-8")
             )
-            process_total = segment_summary["process_total"]
+            exact_identity = segment_summary["exact_process_identity"]
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
             raise CaptureError(
                 f"targeted allocation summary is incomplete for "
                 f"{candidate}/{target_role} sample {sample_index}"
             ) from error
         if (
-            segment_summary.get("schema_version") != 3
-            or segment_summary.get("capture_scope") != "exact_process"
-            or process_total.get("pid") != request["target_pid"]
-            or process_total.get("birth_unix_ns")
+            segment_summary.get("schema_version") != 4
+            or segment_summary.get("diagnostic_only") is not True
+            or segment_summary.get("capture_scope") != "exact_process_diagnostic"
+            or exact_identity.get("pid") != request["target_pid"]
+            or exact_identity.get("birth_unix_ns")
             != request["target_birth_unix_ns"]
-            or segment_summary.get("allocation_list_reconciled") is not True
             or segment_summary.get("xctrace", {}).get("attached_pid")
             != request["target_pid"]
         ):
             raise CaptureError(
-                f"targeted allocation evidence does not exactly match "
+                f"targeted allocation diagnostic does not exactly match "
                 f"{candidate}/{target_role} sample {sample_index}"
             )
 
@@ -1521,67 +1508,27 @@ def capture_target_sample(
             "allocation_export_basis": segment_summary[
                 "allocation_export_basis"
             ],
-            "allocation_timestamp_basis": segment_summary[
-                "allocation_timestamp_basis"
-            ],
             "metric_semantics": segment_summary["metric_semantics"],
             "whole_trace_statistics_semantics": segment_summary[
                 "whole_trace_statistics_semantics"
             ],
-            "process_identity_basis": segment_summary["process_identity_basis"],
-            "allocation_rows": segment_summary["allocation_rows"],
-            "allocation_list_bytes": segment_summary["allocation_list_bytes"],
-            "excluded_vm_rows": segment_summary["excluded_vm_rows"],
-            "excluded_vm_bytes": segment_summary["excluded_vm_bytes"],
-            "allocation_list_reconciled": segment_summary[
-                "allocation_list_reconciled"
+            "final_live_list_semantics": segment_summary[
+                "final_live_list_semantics"
             ],
+            "process_identity_basis": segment_summary["process_identity_basis"],
             "whole_trace_statistics": segment_summary[
                 "whole_trace_statistics"
             ],
-            "attach_baseline_allocations": segment_summary[
-                "attach_baseline_allocations"
+            "final_live_list": segment_summary["final_live_list"],
+            "statistics_minus_final_live_list": segment_summary[
+                "statistics_minus_final_live_list"
             ],
-            "attach_baseline_bytes": segment_summary["attach_baseline_bytes"],
-            "retained_allocations": segment_summary["retained_allocations"],
-            "retained_bytes": segment_summary["retained_bytes"],
-            "retained_allocations_lower_bound": segment_summary[
-                "retained_allocations_lower_bound"
-            ],
-            "retained_allocations_upper_bound": segment_summary[
-                "retained_allocations_upper_bound"
-            ],
-            "retained_bytes_lower_bound": segment_summary[
-                "retained_bytes_lower_bound"
-            ],
-            "retained_bytes_upper_bound": segment_summary[
-                "retained_bytes_upper_bound"
-            ],
-            "boundary_ambiguous_allocations": segment_summary[
-                "boundary_ambiguous_allocations"
-            ],
-            "boundary_ambiguous_bytes": segment_summary[
-                "boundary_ambiguous_bytes"
-            ],
-            "excluded_outside_measurement_interval_rows": segment_summary[
-                "excluded_outside_measurement_interval_rows"
-            ],
-            "trace_started_unix_ns": segment_summary["trace_started_unix_ns"],
-            "trace_start_timestamp_resolution_ns": segment_summary[
-                "trace_start_timestamp_resolution_ns"
-            ],
-            "allocation_list_timestamp_resolution_ns": segment_summary[
-                "allocation_list_timestamp_resolution_ns"
-            ],
-            "timestamp_boundary_uncertainty_ns": segment_summary[
-                "timestamp_boundary_uncertainty_ns"
-            ],
+            "workload_window": segment_summary["workload_window"],
             "xctrace": segment_summary["xctrace"],
-            "process_total": process_total,
+            "exact_process_identity": exact_identity,
         }
     except BaseException as error:
         failure = error
-
     cleanup_errors = _cleanup_started_processes(
         [
             ("targeted allocation recorder cleanup", recorder),
@@ -1766,15 +1713,6 @@ def run_candidate_pass(
     return output
 
 
-SEGMENT_COUNTER_FIELDS = (
-    "attach_baseline_allocations",
-    "attach_baseline_bytes",
-    "boundary_ambiguous_allocations",
-    "boundary_ambiguous_bytes",
-    "excluded_outside_measurement_interval_rows",
-    "vm_category_rows",
-    "vm_category_bytes",
-)
 WHOLE_TRACE_STATISTIC_GROUPS = (
     "heap_and_anonymous_vm",
     "heap",
@@ -1789,20 +1727,14 @@ WHOLE_TRACE_STATISTIC_FIELDS = (
     "total_bytes",
     "event_count",
 )
-PROCESS_ALLOCATION_FIELDS = (
-    "retained_allocations",
-    "retained_bytes",
-    "retained_allocations_lower_bound",
-    "retained_allocations_upper_bound",
-    "retained_bytes_lower_bound",
-    "retained_bytes_upper_bound",
-    "boundary_ambiguous_allocations",
-    "boundary_ambiguous_bytes",
-)
 
 
 def _nonnegative_integer(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _signed_integer(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int)
 
 
 def _validate_statistics_row(value: Any, *, label: str) -> dict[str, int]:
@@ -1840,331 +1772,68 @@ def _validate_whole_trace_statistics(
             "combined whole-trace Statistics do not equal heap plus anonymous VM"
         )
     return validated
-def _validated_process_total(total: Any) -> dict[str, Any]:
-    if not isinstance(total, dict):
-        raise CaptureError("targeted process total has an invalid contract")
-    try:
-        pid = total["pid"]
-        birth_unix_ns = total["birth_unix_ns"]
-        observed_alive_through_unix_ns = total["observed_alive_through_unix_ns"]
-        names = total["names"]
-    except KeyError as error:
-        raise CaptureError("targeted process total has an invalid contract") from error
-    if (
-        not _positive_integer(pid)
-        or not _positive_integer(birth_unix_ns)
-        or not _positive_integer(observed_alive_through_unix_ns)
-        or observed_alive_through_unix_ns < birth_unix_ns
-        or not isinstance(names, list)
-        or not names
-        or any(not isinstance(name, str) or not name for name in names)
-        or any(
-            field not in total or not _nonnegative_integer(total[field])
-            for field in PROCESS_ALLOCATION_FIELDS
-        )
-        or total["retained_allocations_lower_bound"]
-        > total["retained_allocations"]
-        or total["retained_allocations"]
-        > total["retained_allocations_upper_bound"]
-        or total["retained_bytes_lower_bound"] > total["retained_bytes"]
-        or total["retained_bytes"] > total["retained_bytes_upper_bound"]
-        or total["boundary_ambiguous_allocations"]
-        != total["retained_allocations_upper_bound"]
-        - total["retained_allocations_lower_bound"]
-        or total["boundary_ambiguous_bytes"]
-        != total["retained_bytes_upper_bound"]
-        - total["retained_bytes_lower_bound"]
-    ):
-        raise CaptureError("targeted process total has invalid retained values")
-    return total
 
 
-def _merge_exact_process_totals(
-    totals: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    merged: dict[tuple[int, int], dict[str, Any]] = {}
-    numeric_pid_births: dict[int, int] = {}
-    for raw_total in totals:
-        total = _validated_process_total(raw_total)
-        pid = total["pid"]
-        birth_unix_ns = total["birth_unix_ns"]
-        previous_birth = numeric_pid_births.setdefault(pid, birth_unix_ns)
-        if previous_birth != birth_unix_ns:
-            raise CaptureError(
-                f"targeted passes reused numeric pid {pid} across exact identities"
-            )
-        identity = (pid, birth_unix_ns)
-        existing = merged.get(identity)
-        if existing is None:
-            merged[identity] = {
-                "pid": pid,
-                "birth_unix_ns": birth_unix_ns,
-                "observed_alive_through_unix_ns": total[
-                    "observed_alive_through_unix_ns"
-                ],
-                "names": sorted(set(total["names"])),
-                **{field: total[field] for field in PROCESS_ALLOCATION_FIELDS},
-            }
-            continue
-        existing["observed_alive_through_unix_ns"] = max(
-            existing["observed_alive_through_unix_ns"],
-            total["observed_alive_through_unix_ns"],
-        )
-        existing["names"] = sorted({*existing["names"], *total["names"]})
-        for field in PROCESS_ALLOCATION_FIELDS:
-            existing[field] += total[field]
-    return sorted(merged.values(), key=lambda item: (item["pid"], item["birth_unix_ns"]))
-
-
-def _validate_pass_result(
-    item: dict[str, Any],
-    *,
-    candidate: str,
-    target_role: str,
-) -> list[dict[str, Any]]:
-    if (
-        not isinstance(item, dict)
-        or item.get("candidate") != candidate
-        or item.get("target_role") != target_role
-        or not _positive_integer(item.get("host_pid"))
-        or not isinstance(item.get("samples"), list)
-        or not item["samples"]
-        or not isinstance(item.get("candidate_result"), dict)
-        or item["candidate_result"].get("candidate") != candidate
-        or item["candidate_result"].get("succeeded") is not True
-    ):
-        raise CaptureError(
-            f"{candidate}/{target_role} targeted pass has an invalid contract"
-        )
-    samples = item["samples"]
-    present_fields = {
-        "target_pid",
-        "target_birth_unix_ns",
+def _validate_exact_process_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "pid",
+        "birth_unix_ns",
         "observed_alive_through_unix_ns",
-        "trace_segment",
-        "recording_readiness_basis",
-        "trace_bytes",
-        "allocation_export_basis",
-        "allocation_rows",
-        "allocation_list_bytes",
-        "allocation_list_reconciled",
-        "allocation_timestamp_basis",
-        "metric_semantics",
-        "whole_trace_statistics_semantics",
-        "process_identity_basis",
-        "whole_trace_statistics",
-        "trace_started_unix_ns",
-        "trace_start_timestamp_resolution_ns",
-        "allocation_list_timestamp_resolution_ns",
-        "timestamp_boundary_uncertainty_ns",
-        "xctrace",
-        "process_total",
-        *PROCESS_ALLOCATION_FIELDS,
-        *SEGMENT_COUNTER_FIELDS,
-    }
-    for sample_index, sample in enumerate(samples):
-        if (
-            not isinstance(sample, dict)
-            or sample.get("candidate") != candidate
-            or sample.get("target_role") != target_role
-            or sample.get("sample_index") != sample_index
-            or sample.get("host_pid") != item["host_pid"]
-            or not isinstance(sample.get("target_present"), bool)
-            or not isinstance(sample.get("available_targets"), list)
-            or not _positive_integer(sample.get("started_unix_ns"))
-            or not _positive_integer(sample.get("ended_unix_ns"))
-            or sample["started_unix_ns"] >= sample["ended_unix_ns"]
-        ):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "has an invalid targeted-capture contract"
-            )
-        allowed_roles = (
-            {"host"} if candidate == "srui" else set(WEBKIT_TARGET_ROLES)
-        )
-        targets_by_role: dict[str, dict[str, Any]] = {}
-        target_births_by_pid: dict[int, int] = {}
-        for target in sample["available_targets"]:
-            if (
-                not isinstance(target, dict)
-                or set(target) != AVAILABLE_TARGET_KEYS
-                or target["role"] not in allowed_roles
-                or target["role"] in targets_by_role
-                or not _positive_integer(target["pid"])
-                or not _positive_integer(target["birth_unix_ns"])
-            ):
-                raise CaptureError(
-                    f"{candidate}/{target_role} sample {sample_index} "
-                    "has invalid available target evidence"
-                )
-            previous_birth = target_births_by_pid.setdefault(
-                target["pid"], target["birth_unix_ns"]
-            )
-            if previous_birth != target["birth_unix_ns"]:
-                raise CaptureError(
-                    f"{candidate}/{target_role} sample {sample_index} "
-                    "maps one available PID to multiple births"
-                )
-            targets_by_role[target["role"]] = target
+        "names",
+    }:
+        raise CaptureError("exact process identity has an invalid contract")
+    if (
+        not _positive_integer(value["pid"])
+        or not _positive_integer(value["birth_unix_ns"])
+        or not _positive_integer(value["observed_alive_through_unix_ns"])
+        or value["observed_alive_through_unix_ns"] < value["birth_unix_ns"]
+        or not isinstance(value["names"], list)
+        or not value["names"]
+        or any(not isinstance(name, str) or not name for name in value["names"])
+    ):
+        raise CaptureError("exact process identity contains invalid values")
+    return value
 
-        host_target = targets_by_role.get("host")
-        if (
-            host_target is None
-            or host_target["pid"] != sample["host_pid"]
-            or (candidate == "srui" and set(targets_by_role) != {"host"})
-            or (candidate == "webkit" and "webcontent" not in targets_by_role)
-            or any(
-                role != "host" and target["pid"] == sample["host_pid"]
-                for role, target in targets_by_role.items()
-            )
-        ):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "has invalid available target evidence"
-            )
-        selected_target = targets_by_role.get(target_role)
-        present = sample["target_present"]
-        if present != (selected_target is not None):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} target "
-                "presence disagrees with its advertised available target"
-            )
-        if present and any(field not in sample for field in present_fields):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "is missing exact allocation evidence"
-            )
-        if not present and any(field in sample for field in present_fields):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "claimed allocation evidence for an absent target"
-            )
-        if not present:
-            if target_role not in {"network", "gpu"}:
-                raise CaptureError(
-                    f"{candidate}/{target_role} sample {sample_index} "
-                    "claims a mandatory target is absent"
-                )
-            continue
 
-        if (
-            sample["target_pid"] != selected_target["pid"]
-            or sample["target_birth_unix_ns"]
-            != selected_target["birth_unix_ns"]
-        ):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} target "
-                "identity does not match its advertised available target"
-            )
-        if (
-            not _positive_integer(sample["target_pid"])
-            or not _positive_integer(sample["target_birth_unix_ns"])
-            or not _positive_integer(sample["observed_alive_through_unix_ns"])
-            or not (
-                sample["target_birth_unix_ns"]
-                <= sample["started_unix_ns"]
-                < sample["ended_unix_ns"]
-                <= sample["observed_alive_through_unix_ns"]
-            )
-            or not isinstance(sample["trace_segment"], str)
-            or not sample["trace_segment"]
-            or sample["recording_readiness_basis"] != "darwin_notification"
-            or not _positive_integer(sample["trace_bytes"])
-            or not _positive_integer(sample["allocation_rows"])
-            or not _nonnegative_integer(sample["allocation_list_bytes"])
-            or any(
-                not _nonnegative_integer(sample[field])
-                for field in SEGMENT_COUNTER_FIELDS
-            )
-            or sample["allocation_list_reconciled"] is not True
-            or not _positive_integer(sample["trace_started_unix_ns"])
-            or not _positive_integer(sample["trace_start_timestamp_resolution_ns"])
-            or not _positive_integer(sample["allocation_list_timestamp_resolution_ns"])
-            or sample["timestamp_boundary_uncertainty_ns"]
-            != sample["trace_start_timestamp_resolution_ns"]
-            + sample["allocation_list_timestamp_resolution_ns"]
-            or any(
-                not isinstance(sample[key], str) or not sample[key].strip()
-                for key in (
-                    "allocation_export_basis",
-                    "allocation_timestamp_basis",
-                    "metric_semantics",
-                    "whole_trace_statistics_semantics",
-                    "process_identity_basis",
-                )
-            )
-        ):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "has invalid exact allocation evidence"
-            )
-        statistics = _validate_whole_trace_statistics(
-            sample["whole_trace_statistics"]
+def _validate_final_live_list(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "allocations",
+        "bytes",
+        "vm_category_allocations",
+        "vm_category_bytes",
+        "vm_categories",
+        "maximum_elapsed_timestamp_ns",
+    }:
+        raise CaptureError("final live-list diagnostic has an invalid contract")
+    numeric_fields = (
+        "allocations",
+        "bytes",
+        "vm_category_allocations",
+        "vm_category_bytes",
+        "maximum_elapsed_timestamp_ns",
+    )
+    if any(not _nonnegative_integer(value[field]) for field in numeric_fields):
+        raise CaptureError("final live-list diagnostic contains invalid values")
+    categories = value["vm_categories"]
+    if (
+        not isinstance(categories, dict)
+        or any(not isinstance(name, str) or not name.startswith("VM:") for name in categories)
+        or any(
+            not isinstance(total, dict)
+            or set(total) != {"allocations", "bytes"}
+            or not _nonnegative_integer(total["allocations"])
+            or not _nonnegative_integer(total["bytes"])
+            for total in categories.values()
         )
-        combined_statistics = statistics["heap_and_anonymous_vm"]
-        if (
-            sample["allocation_rows"]
-            != combined_statistics["persistent_allocations"]
-            or sample["allocation_list_bytes"]
-            != combined_statistics["persistent_bytes"]
-            or sample["attach_baseline_allocations"] > sample["allocation_rows"]
-            or sample["attach_baseline_bytes"] > sample["allocation_list_bytes"]
-            or sample["excluded_outside_measurement_interval_rows"]
-            != sample["allocation_rows"] - sample["retained_allocations"]
-            or sample["retained_allocations_lower_bound"]
-            > sample["retained_allocations"]
-            or sample["retained_allocations"]
-            > sample["retained_allocations_upper_bound"]
-            or sample["retained_bytes_lower_bound"] > sample["retained_bytes"]
-            or sample["retained_bytes"] > sample["retained_bytes_upper_bound"]
-            or sample["boundary_ambiguous_allocations"]
-            != sample["retained_allocations_upper_bound"]
-            - sample["retained_allocations_lower_bound"]
-            or sample["boundary_ambiguous_bytes"]
-            != sample["retained_bytes_upper_bound"]
-            - sample["retained_bytes_lower_bound"]
-        ):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "has irreconcilable allocation totals"
-            )
-        xctrace = sample["xctrace"]
-        if (
-            not isinstance(xctrace, dict)
-            or xctrace.get("attached_pid") != sample["target_pid"]
-            or xctrace.get("statistics_xpath") != STATISTICS_XPATH
-            or xctrace.get("allocations_list_xpath") != ALLOCATIONS_LIST_XPATH
-            or any(
-                not isinstance(xctrace.get(key), str) or not xctrace[key]
-                for key in (
-                    "instruments_version",
-                    "platform",
-                    "os_version",
-                    "attached_process_name",
-                )
-            )
-        ):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "has invalid xctrace target evidence"
-            )
-        process_total = _validated_process_total(sample["process_total"])
-        if (
-            process_total["pid"] != sample["target_pid"]
-            or process_total["birth_unix_ns"]
-            != sample["target_birth_unix_ns"]
-            or process_total["observed_alive_through_unix_ns"]
-            != sample["observed_alive_through_unix_ns"]
-            or any(
-                process_total[field] != sample[field]
-                for field in PROCESS_ALLOCATION_FIELDS
-            )
-        ):
-            raise CaptureError(
-                f"{candidate}/{target_role} sample {sample_index} "
-                "process identity or retained totals do not match its handshake"
-            )
-    return samples
+        or value["vm_category_allocations"]
+        != sum(total["allocations"] for total in categories.values())
+        or value["vm_category_bytes"]
+        != sum(total["bytes"] for total in categories.values())
+        or value["vm_category_allocations"] > value["allocations"]
+        or value["vm_category_bytes"] > value["bytes"]
+    ):
+        raise CaptureError("final live-list VM diagnostics do not reconcile internally")
+    return value
 
 
 def _candidate_equivalence(
@@ -2181,6 +1850,10 @@ def _candidate_equivalence(
             or not _positive_integer(rendered_node_count)
             or result.get("semanticParityPassed") is not True
             or result.get("elementKindsPassed") is not True
+            or result.get("captureAuthorization") is not False
+            or result.get("pixelCaptureCompletions") != 0
+            or not isinstance(result.get("paintCompletionMode"), str)
+            or not result["paintCompletionMode"].startswith("non-compositor ")
             or result.get("succeeded") is not True
         ):
             raise CaptureError(
@@ -2196,7 +1869,9 @@ def _candidate_equivalence(
                 "element_kinds_passed": True,
             }
         )
-    if len({(item["representation_bytes"], item["rendered_node_count"]) for item in evidence}) != 1:
+    if not evidence or len(
+        {(item["representation_bytes"], item["rendered_node_count"]) for item in evidence}
+    ) != 1:
         raise CaptureError(
             f"{candidate} targeted passes did not render equivalent representations"
         )
@@ -2207,353 +1882,121 @@ def _candidate_equivalence(
     }
 
 
-def _role_partition_from_available_targets(
-    available_targets: list[dict[str, Any]],
-    *,
-    role_order: tuple[str, ...],
-) -> tuple[tuple[str, ...], ...]:
-    identity_by_role = {
-        target["role"]: (target["pid"], target["birth_unix_ns"])
-        for target in available_targets
-    }
-    roles_by_identity: dict[tuple[int, int], list[str]] = {}
-    for role in role_order:
-        identity = identity_by_role.get(role)
-        if identity is not None:
-            roles_by_identity.setdefault(identity, []).append(role)
-    return tuple(tuple(roles) for roles in roles_by_identity.values())
-
-
-def _combine_candidate_passes(
-    candidate: str,
-    *,
-    role_passes: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    expected_roles = ("host",) if candidate == "srui" else WEBKIT_TARGET_ROLES
-    if set(role_passes) != set(expected_roles):
-        raise CaptureError(
-            f"{candidate} targeted capture must contain exactly roles "
-            f"{list(expected_roles)}"
-        )
-    samples_by_role = {
-        role: _validate_pass_result(
-            role_passes[role], candidate=candidate, target_role=role
-        )
-        for role in expected_roles
-    }
-    sample_counts = {len(samples) for samples in samples_by_role.values()}
-    if len(sample_counts) != 1:
-        raise CaptureError(
-            f"{candidate} targeted passes have different logical sample counts"
-        )
-    sample_count = next(iter(sample_counts))
-    host_pid = role_passes["host"]["host_pid"]
-    if any(
-        not sample["target_present"] or sample["target_pid"] != host_pid
-        for sample in samples_by_role["host"]
+def _validate_pass_result(item: Any) -> list[dict[str, Any]]:
+    if (
+        not isinstance(item, dict)
+        or item.get("candidate") != "srui"
+        or item.get("target_role") != "host"
+        or not _positive_integer(item.get("host_pid"))
+        or not isinstance(item.get("samples"), list)
+        or not item["samples"]
+        or not isinstance(item.get("candidate_result"), dict)
     ):
-        raise CaptureError(
-            f"{candidate} host pass did not consistently target its candidate host"
-        )
-
-    measurement_samples: list[dict[str, Any]] = []
-    contribution_totals_by_role: dict[str, list[dict[str, Any]]] = {
-        role: [] for role in expected_roles
-    }
-    helper_pids: set[int] = set()
-    helper_pids_by_role: dict[str, set[int]] = {
-        role: set() for role in expected_roles if role != "host"
-    }
-    captured_process_identities: dict[tuple[int, int], int] = {}
-    role_intervals_all: list[dict[str, Any]] = []
-    mandatory_roles = {"host"} if candidate == "srui" else {"host", "webcontent"}
-    for sample_index in range(sample_count):
-        logical_samples_by_role = {
-            role: samples_by_role[role][sample_index] for role in expected_roles
-        }
-        available_by_pass = {
-            role: {
-                target["role"]: target
-                for target in logical_samples_by_role[role]["available_targets"]
-            }
-            for role in expected_roles
-        }
-        authoritative_roles = set(available_by_pass[expected_roles[0]])
-        if not mandatory_roles <= authoritative_roles:
-            raise CaptureError(
-                f"{candidate} logical sample {sample_index} lacks mandatory roles"
-            )
-        for role in expected_roles:
-            sample = logical_samples_by_role[role]
-            observed_roles = set(available_by_pass[role])
-            if (
-                observed_roles != authoritative_roles
-                or sample["target_present"] != (role in authoritative_roles)
-            ):
-                raise CaptureError(
-                    f"{candidate} logical sample {sample_index} role evidence "
-                    "disagrees across equivalent passes"
-                )
-
-        partitions_by_pass = {
-            role: _role_partition_from_available_targets(
-                logical_samples_by_role[role]["available_targets"],
-                role_order=expected_roles,
-            )
-            for role in expected_roles
-        }
-        authoritative_partition = partitions_by_pass[expected_roles[0]]
-        if any(
-            partition != authoritative_partition
-            for partition in partitions_by_pass.values()
-        ):
-            raise CaptureError(
-                f"{candidate} logical sample {sample_index} alias topology "
-                "disagrees across equivalent passes"
-            )
-
-        canonical_by_role = {
-            role: group[0]
-            for group in authoritative_partition
-            for role in group
-        }
-        present_samples = [
-            logical_samples_by_role[role]
-            for role in expected_roles
-            if logical_samples_by_role[role]["target_present"]
-        ]
-        contribution_samples = [
-            sample
-            for sample in present_samples
-            if canonical_by_role[sample["target_role"]] == sample["target_role"]
-        ]
-        for sample in present_samples:
-            identity = (sample["target_pid"], sample["target_birth_unix_ns"])
-            captured_process_identities[identity] = max(
-                captured_process_identities.get(identity, 0),
-                sample["observed_alive_through_unix_ns"],
-            )
-            if sample["target_role"] != "host":
-                helper_pids.add(sample["target_pid"])
-                helper_pids_by_role[sample["target_role"]].add(
-                    sample["target_pid"]
-                )
-        for sample in contribution_samples:
-            contribution_totals_by_role[sample["target_role"]].append(
-                sample["process_total"]
-            )
-
-        role_aliases = []
-        for group in authoritative_partition:
-            if len(group) == 1:
-                continue
-            pass_advertised_identities = []
-            for pass_role in expected_roles:
-                advertised_targets = available_by_pass[pass_role]
-                group_identities = {
-                    (
-                        advertised_targets[role]["pid"],
-                        advertised_targets[role]["birth_unix_ns"],
-                    )
-                    for role in group
-                }
-                if len(group_identities) != 1:
-                    raise CaptureError(
-                        f"{candidate} logical sample {sample_index} alias "
-                        f"evidence is inconsistent in the {pass_role} pass"
-                    )
-                pid, birth_unix_ns = next(iter(group_identities))
-                pass_advertised_identities.append(
-                    {
-                        "target_role": pass_role,
-                        "pid": pid,
-                        "birth_unix_ns": birth_unix_ns,
-                    }
-                )
-            role_aliases.append(
-                {
-                    "canonical_target_role": group[0],
-                    "aliased_target_roles": list(group[1:]),
-                    "pass_advertised_identities": pass_advertised_identities,
-                }
-            )
-
-        process_totals = [
-            _validated_process_total(sample["process_total"])
-            for sample in contribution_samples
-        ]
-        role_intervals: list[dict[str, Any]] = []
-        for role in expected_roles:
-            sample = logical_samples_by_role[role]
-            interval: dict[str, Any] = {
-                "sample_index": sample_index,
-                "target_role": sample["target_role"],
-                "target_present": sample["target_present"],
-                "started_unix_ns": sample["started_unix_ns"],
-                "ended_unix_ns": sample["ended_unix_ns"],
-                "contribution_included": False,
-            }
-            if sample["target_present"]:
-                canonical_role = canonical_by_role[sample["target_role"]]
-                included = sample["target_role"] == canonical_role
-                interval.update(
-                    {
-                        "target_pid": sample["target_pid"],
-                        "target_birth_unix_ns": sample["target_birth_unix_ns"],
-                        "observed_alive_through_unix_ns": sample[
-                            "observed_alive_through_unix_ns"
-                        ],
-                        "trace_segment": sample["trace_segment"],
-                        "recording_readiness_basis": sample[
-                            "recording_readiness_basis"
-                        ],
-                        "timestamp_boundary_uncertainty_ns": sample[
-                            "timestamp_boundary_uncertainty_ns"
-                        ],
-                        "required_allocation_pids": (
-                            [sample["target_pid"]] if included else []
-                        ),
-                        "contribution_included": included,
-                    }
-                )
-                if not included:
-                    interval["alias_of_target_role"] = canonical_role
-            role_intervals.append(interval)
-            role_intervals_all.append(interval)
-
-        sample_totals = {
-            field: sum(total[field] for total in process_totals)
-            for field in PROCESS_ALLOCATION_FIELDS
-        }
+        raise CaptureError("SRUI host diagnostic pass has an invalid contract")
+    samples = item["samples"]
+    for sample_index, sample in enumerate(samples):
         if (
-            sample_totals["retained_allocations_lower_bound"]
-            > sample_totals["retained_allocations"]
-            or sample_totals["retained_allocations"]
-            > sample_totals["retained_allocations_upper_bound"]
+            not isinstance(sample, dict)
+            or sample.get("candidate") != "srui"
+            or sample.get("target_role") != "host"
+            or sample.get("sample_index") != sample_index
+            or sample.get("host_pid") != item["host_pid"]
+            or sample.get("target_present") is not True
+            or sample.get("target_pid") != item["host_pid"]
+            or not isinstance(sample.get("available_targets"), list)
+            or len(sample["available_targets"]) != 1
+            or sample["available_targets"][0].get("role") != "host"
+            or sample["available_targets"][0].get("pid") != item["host_pid"]
+            or sample["available_targets"][0].get("birth_unix_ns")
+            != sample.get("target_birth_unix_ns")
+            or not _positive_integer(sample.get("target_birth_unix_ns"))
+            or not _positive_integer(sample.get("observed_alive_through_unix_ns"))
+            or not _positive_integer(sample.get("started_unix_ns"))
+            or not _positive_integer(sample.get("ended_unix_ns"))
+            or not (
+                sample["target_birth_unix_ns"]
+                <= sample["started_unix_ns"]
+                < sample["ended_unix_ns"]
+                <= sample["observed_alive_through_unix_ns"]
+            )
+            or not isinstance(sample.get("trace_segment"), str)
+            or not sample["trace_segment"]
+            or sample.get("recording_readiness_basis") != "darwin_notification"
+            or not _positive_integer(sample.get("trace_bytes"))
+            or any(
+                not isinstance(sample.get(field), str) or not sample[field].strip()
+                for field in (
+                    "allocation_export_basis",
+                    "metric_semantics",
+                    "whole_trace_statistics_semantics",
+                    "final_live_list_semantics",
+                    "process_identity_basis",
+                )
+            )
         ):
             raise CaptureError(
-                f"{candidate} sample {sample_index} retained bounds do not reconcile"
+                f"srui/host sample {sample_index} has an invalid diagnostic contract"
             )
-        measurement_samples.append(
-            {
-                "sample_index": sample_index,
-                "measurement_mode": "equivalent_exact_process_role_passes",
-                "role_intervals": role_intervals,
-                "role_aliases": role_aliases,
-                "absent_target_roles": [
-                    logical_samples_by_role[role]["target_role"]
-                    for role in expected_roles
-                    if not logical_samples_by_role[role]["target_present"]
-                ],
-                "required_allocation_pids": [
-                    sample["target_pid"] for sample in contribution_samples
-                ],
-                **sample_totals,
-                "process_totals": process_totals,
-            }
+        statistics = _validate_whole_trace_statistics(
+            sample.get("whole_trace_statistics")
         )
-
-    merged_totals_by_role = {
-        role: _merge_exact_process_totals(totals)
-        for role, totals in contribution_totals_by_role.items()
-        if totals
-    }
-    host_role_totals = merged_totals_by_role.get("host", [])
-    if len(host_role_totals) != 1:
-        raise CaptureError(f"{candidate} host has no single exact-process total")
-    host_process_totals = host_role_totals[0]
-    helper_process_totals = [
-        total
-        for role in expected_roles
-        if role != "host"
-        for total in merged_totals_by_role.get(role, [])
-    ]
-    all_process_totals = [host_process_totals, *helper_process_totals]
-    aggregate = {
-        field: sum(sample[field] for sample in measurement_samples)
-        for field in PROCESS_ALLOCATION_FIELDS
-    }
-    if any(
-        aggregate[field] != sum(total[field] for total in all_process_totals)
-        for field in PROCESS_ALLOCATION_FIELDS
-    ):
-        raise CaptureError(f"{candidate} retained process totals do not reconcile")
-
-    ordered_passes = [role_passes[role] for role in expected_roles]
-    return {
-        "candidate": candidate,
-        "driver_pid": os.getpid(),
-        "host_pid": host_pid,
-        "helper_pids": sorted(helper_pids),
-        "helper_target_roles": [
-            {
-                "target_role": role,
-                "pids": sorted(helper_pids_by_role[role]),
-                "present_sample_count": sum(
-                    sample["target_present"] for sample in samples_by_role[role]
-                ),
-                "absent_sample_count": sum(
-                    not sample["target_present"] for sample in samples_by_role[role]
-                ),
-            }
-            for role in expected_roles
-            if role != "host"
-        ],
-        "started_unix_ns": min(
-            interval["started_unix_ns"] for interval in role_intervals_all
-        ),
-        "ended_unix_ns": max(
-            interval["ended_unix_ns"] for interval in role_intervals_all
-        ),
-        "measurement_mode": "equivalent_exact_process_role_passes",
-        "recording_readiness_bases": sorted(
-            {
-                sample["recording_readiness_basis"]
-                for samples in samples_by_role.values()
-                for sample in samples
-                if sample["target_present"]
-            }
-        ),
-        "role_measurement_intervals": sorted(
-            role_intervals_all, key=lambda interval: interval["started_unix_ns"]
-        ),
-        "helper_pid_source": (
-            "none; exact SRUI host attachment"
-            if candidate == "srui"
-            else "exact WKWebView helper-role PID from pre-measurement handshake"
-        ),
-        "process_identities": [
-            {
-                "pid": pid,
-                "birth_unix_ns": birth_unix_ns,
-                "observed_alive_through_unix_ns": observed_alive_through_unix_ns,
-            }
-            for (pid, birth_unix_ns), observed_alive_through_unix_ns in sorted(
-                captured_process_identities.items()
+        live_list = _validate_final_live_list(sample.get("final_live_list"))
+        discrepancy = sample.get("statistics_minus_final_live_list")
+        combined = statistics["heap_and_anonymous_vm"]
+        if (
+            not isinstance(discrepancy, dict)
+            or set(discrepancy) != {"persistent_allocations", "persistent_bytes"}
+            or any(not _signed_integer(value) for value in discrepancy.values())
+            or discrepancy["persistent_allocations"]
+            != combined["persistent_allocations"] - live_list["allocations"]
+            or discrepancy["persistent_bytes"]
+            != combined["persistent_bytes"] - live_list["bytes"]
+        ):
+            raise CaptureError(
+                f"srui/host sample {sample_index} has invalid signed discrepancy diagnostics"
             )
-        ],
-        "measurement_sample_count": len(measurement_samples),
-        "measurement_samples": measurement_samples,
-        **aggregate,
-        "host_retained_allocations": host_process_totals["retained_allocations"],
-        "host_retained_bytes": host_process_totals["retained_bytes"],
-        "helper_retained_allocations": sum(
-            total["retained_allocations"] for total in helper_process_totals
-        ),
-        "helper_retained_bytes": sum(
-            total["retained_bytes"] for total in helper_process_totals
-        ),
-        "host_process_totals": host_process_totals,
-        "helper_process_totals": helper_process_totals,
-        "helpers_without_retained_rows": sorted(
-            {
-                total["pid"]
-                for total in helper_process_totals
-                if total["retained_allocations"] == 0
-            }
-        ),
-        **_candidate_equivalence(candidate, ordered_passes),
-    }
+        window = sample.get("workload_window")
+        if window != {
+            "started_unix_ns": sample["started_unix_ns"],
+            "ended_unix_ns": sample["ended_unix_ns"],
+            "used_for_allocation_attribution": False,
+        }:
+            raise CaptureError(
+                f"srui/host sample {sample_index} misstates allocation attribution"
+            )
+        xctrace = sample.get("xctrace")
+        if (
+            not isinstance(xctrace, dict)
+            or xctrace.get("attached_pid") != sample["target_pid"]
+            or xctrace.get("statistics_xpath") != STATISTICS_XPATH
+            or xctrace.get("allocations_list_xpath") != ALLOCATIONS_LIST_XPATH
+            or any(
+                not isinstance(xctrace.get(key), str) or not xctrace[key]
+                for key in (
+                    "instruments_version",
+                    "platform",
+                    "os_version",
+                    "attached_process_name",
+                )
+            )
+        ):
+            raise CaptureError(
+                f"srui/host sample {sample_index} has invalid xctrace target evidence"
+            )
+        identity = _validate_exact_process_identity(
+            sample.get("exact_process_identity")
+        )
+        if (
+            identity["pid"] != sample["target_pid"]
+            or identity["birth_unix_ns"] != sample["target_birth_unix_ns"]
+            or identity["observed_alive_through_unix_ns"]
+            != sample["observed_alive_through_unix_ns"]
+            or identity["names"] != [xctrace["attached_process_name"]]
+        ):
+            raise CaptureError(
+                f"srui/host sample {sample_index} process identity does not match"
+            )
+    return samples
 
 
 def build_exact_process_summary(
@@ -2563,91 +2006,82 @@ def build_exact_process_summary(
     reported_trace: Path,
     instrumentation: dict[str, Any],
 ) -> dict[str, Any]:
-    indexed: dict[tuple[str, str], dict[str, Any]] = {}
-    for item in pass_results:
-        if not isinstance(item, dict):
-            raise CaptureError("targeted allocation pass result is not an object")
-        key = (item.get("candidate"), item.get("target_role"))
-        if key in indexed:
-            raise CaptureError(f"duplicate targeted allocation pass: {key}")
-        indexed[key] = item
-    if set(indexed) != set(CAPTURE_PASSES):
-        raise CaptureError(
-            "targeted capture must contain SRUI host plus WebKit host, "
-            "WebContent, Network, and GPU role passes"
-        )
-    candidates = [
-        _combine_candidate_passes(
-            "srui", role_passes={"host": indexed[("srui", "host")]}
-        ),
-        _combine_candidate_passes(
-            "webkit",
-            role_passes={
-                role: indexed[("webkit", role)] for role in WEBKIT_TARGET_ROLES
-            },
-        ),
-    ]
-    role_samples = [
-        sample for pass_result in pass_results for sample in pass_result["samples"]
-    ]
-    target_samples = [sample for sample in role_samples if sample["target_present"]]
-    if not target_samples:
-        raise CaptureError("targeted xctrace capture contains no present targets")
-    common_string_fields = (
+    if len(pass_results) != 1 or (
+        pass_results[0].get("candidate"), pass_results[0].get("target_role")
+    ) != CAPTURE_PASSES[0]:
+        raise CaptureError("diagnostic capture must contain only the SRUI host pass")
+    role_pass = pass_results[0]
+    samples = _validate_pass_result(role_pass)
+    equivalence = _candidate_equivalence("srui", [role_pass])
+    common_fields = (
         "allocation_export_basis",
-        "allocation_timestamp_basis",
         "metric_semantics",
         "whole_trace_statistics_semantics",
+        "final_live_list_semantics",
+        "process_identity_basis",
     )
     common_values: dict[str, str] = {}
-    for field in common_string_fields:
-        values = {sample[field] for sample in target_samples}
+    for field in common_fields:
+        values = {sample[field] for sample in samples}
         if len(values) != 1:
-            raise CaptureError(f"targeted xctrace segments disagree on {field}")
+            raise CaptureError(f"SRUI host xctrace segments disagree on {field}")
         common_values[field] = next(iter(values))
-    readiness_bases = sorted(
-        {sample["recording_readiness_basis"] for sample in target_samples}
-    )
-    resolutions = {
-        sample["timestamp_boundary_uncertainty_ns"] for sample in target_samples
-    }
-    if len(resolutions) != 1:
-        raise CaptureError("targeted xctrace segments disagree on timestamp precision")
-    allocation_rows = sum(sample["allocation_rows"] for sample in target_samples)
-    if allocation_rows <= 0:
-        raise CaptureError("targeted xctrace capture contains no live allocation rows")
-    statistics_aggregate = {
-        group: {
-            field: sum(
-                sample["whole_trace_statistics"][group][field]
-                for sample in target_samples
-            )
-            for field in WHOLE_TRACE_STATISTIC_FIELDS
-        }
-        for group in WHOLE_TRACE_STATISTIC_GROUPS
-    }
-    _validate_whole_trace_statistics(statistics_aggregate)
-    included_trace_segments = {
-        interval["trace_segment"]
-        for candidate in candidates
-        for sample in candidate["measurement_samples"]
-        for interval in sample["role_intervals"]
-        if interval["target_present"] and interval["contribution_included"]
-    }
     xctrace_versions = sorted(
-        {sample["xctrace"]["instruments_version"] for sample in target_samples}
+        {sample["xctrace"]["instruments_version"] for sample in samples}
     )
-    platforms = sorted({sample["xctrace"]["platform"] for sample in target_samples})
-    os_versions = sorted({sample["xctrace"]["os_version"] for sample in target_samples})
+    platforms = sorted({sample["xctrace"]["platform"] for sample in samples})
+    os_versions = sorted({sample["xctrace"]["os_version"] for sample in samples})
+    target_captures = [
+        {
+            "candidate": "srui",
+            "sample_index": sample["sample_index"],
+            "target_role": "host",
+            "target_pid": sample["target_pid"],
+            "target_birth_unix_ns": sample["target_birth_unix_ns"],
+            "observed_alive_through_unix_ns": sample[
+                "observed_alive_through_unix_ns"
+            ],
+            "workload_window": sample["workload_window"],
+            "trace_segment": sample["trace_segment"],
+            "recording_readiness_basis": sample["recording_readiness_basis"],
+            "trace_bytes": sample["trace_bytes"],
+            "whole_trace_statistics": sample["whole_trace_statistics"],
+            "final_live_list": sample["final_live_list"],
+            "statistics_minus_final_live_list": sample[
+                "statistics_minus_final_live_list"
+            ],
+            "xctrace": sample["xctrace"],
+            "exact_process_identity": sample["exact_process_identity"],
+        }
+        for sample in samples
+    ]
+    identities: dict[tuple[int, int], int] = {}
+    for sample in samples:
+        identity = sample["exact_process_identity"]
+        key = (identity["pid"], identity["birth_unix_ns"])
+        identities[key] = max(
+            identities.get(key, 0),
+            identity["observed_alive_through_unix_ns"],
+        )
     return {
-        "schema_version": 3,
-        "capture_scope": "exact_processes",
+        "schema_version": 4,
+        "diagnostic_only": True,
+        "authoritative_benchmark_metric": False,
+        "capture_scope": "exact_process_diagnostic",
+        "diagnostic_target": "srui_host",
         "capture_method": (
-            "xctrace Allocations --attach per exact target process, exported "
-            "through Statistics and Allocations List view details"
+            "bounded xctrace Allocations --attach to one exact SRUI host PID "
+            "per sample"
         ),
         **common_values,
-        "recording_readiness_bases": readiness_bases,
+        "diagnostic_limitations": (
+            "Statistics and Allocations List are independently materialized "
+            "whole-trace/final-live views. Their signed discrepancy is reported; "
+            "neither view is attributed to the benchmark workload window."
+        ),
+        "recording_readiness_bases": sorted(
+            {sample["recording_readiness_basis"] for sample in samples}
+        ),
         "instrumentation": instrumentation,
         "xctrace_environment": {
             "instruments_versions": xctrace_versions,
@@ -2657,110 +2091,28 @@ def build_exact_process_summary(
             "allocations_list_xpath": ALLOCATIONS_LIST_XPATH,
         },
         "trace": str(reported_trace),
-        "trace_layout": "directory of per-target per-sample trace bundles",
+        "trace_layout": "directory of per-sample SRUI-host trace bundles",
         "trace_bytes": trace_size_bytes(trace_directory),
-        "role_measurement_count": len(role_samples),
-        "target_capture_count": len(target_samples),
-        "deduplicated_alias_capture_count": (
-            len(target_samples) - len(included_trace_segments)
-        ),
-        "trace_start_timestamp_resolution_ns": max(
-            sample["trace_start_timestamp_resolution_ns"]
-            for sample in target_samples
-        ),
-        "allocation_list_timestamp_resolution_ns": max(
-            sample["allocation_list_timestamp_resolution_ns"]
-            for sample in target_samples
-        ),
-        "timestamp_boundary_uncertainty_ns": next(iter(resolutions)),
-        "process_identity_basis": (
-            "each segment TOC names exactly one attached PID equal to the "
-            "requested PID; benchmark birth/liveness handshakes bound it"
-        ),
-        "trace_started_unix_ns": min(
-            sample["trace_started_unix_ns"] for sample in target_samples
-        ),
-        "allocation_rows": allocation_rows,
-        "allocation_list_bytes": sum(
-            sample["allocation_list_bytes"] for sample in target_samples
-        ),
-        "allocation_list_reconciled": all(
-            sample["allocation_list_reconciled"] for sample in target_samples
-        ),
-        "whole_trace_statistics_aggregate": statistics_aggregate,
-        **{
-            field: sum(sample[field] for sample in target_samples)
-            for field in SEGMENT_COUNTER_FIELDS
-        },
-        "exact_process_identity_count": sum(
-            len(candidate["process_identities"]) for candidate in candidates
-        ),
-        "absent_role_measurements": [
+        "target_capture_count": len(target_captures),
+        "exact_process_identity_count": len(identities),
+        "target_captures": target_captures,
+        "candidate_processes": [
             {
-                "candidate": sample["candidate"],
-                "sample_index": sample["sample_index"],
-                "target_role": sample["target_role"],
-                "started_unix_ns": sample["started_unix_ns"],
-                "ended_unix_ns": sample["ended_unix_ns"],
-                "available_target_roles": [
-                    target["role"] for target in sample["available_targets"]
+                "candidate": "srui",
+                "host_pid": role_pass["host_pid"],
+                "measurement_sample_count": len(samples),
+                "process_identities": [
+                    {
+                        "pid": pid,
+                        "birth_unix_ns": birth,
+                        "observed_alive_through_unix_ns": observed,
+                    }
+                    for (pid, birth), observed in sorted(identities.items())
                 ],
+                **equivalence,
             }
-            for sample in role_samples
-            if not sample["target_present"]
         ],
-        "target_captures": [
-            {
-                "candidate": sample["candidate"],
-                "sample_index": sample["sample_index"],
-                "target_role": sample["target_role"],
-                "target_pid": sample["target_pid"],
-                "target_birth_unix_ns": sample["target_birth_unix_ns"],
-                "started_unix_ns": sample["started_unix_ns"],
-                "ended_unix_ns": sample["ended_unix_ns"],
-                "observed_alive_through_unix_ns": sample[
-                    "observed_alive_through_unix_ns"
-                ],
-                "trace_segment": sample["trace_segment"],
-                "recording_readiness_basis": sample[
-                    "recording_readiness_basis"
-                ],
-                "included_in_candidate_total": (
-                    sample["trace_segment"] in included_trace_segments
-                ),
-                "trace_bytes": sample["trace_bytes"],
-                "allocation_rows": sample["allocation_rows"],
-                "allocation_list_bytes": sample["allocation_list_bytes"],
-                "vm_category_rows": sample["vm_category_rows"],
-                "vm_category_bytes": sample["vm_category_bytes"],
-                "retained_allocations": sample["retained_allocations"],
-                "retained_bytes": sample["retained_bytes"],
-                "retained_allocations_lower_bound": sample[
-                    "retained_allocations_lower_bound"
-                ],
-                "retained_allocations_upper_bound": sample[
-                    "retained_allocations_upper_bound"
-                ],
-                "retained_bytes_lower_bound": sample[
-                    "retained_bytes_lower_bound"
-                ],
-                "retained_bytes_upper_bound": sample[
-                    "retained_bytes_upper_bound"
-                ],
-                "boundary_ambiguous_allocations": sample[
-                    "boundary_ambiguous_allocations"
-                ],
-                "boundary_ambiguous_bytes": sample[
-                    "boundary_ambiguous_bytes"
-                ],
-                "whole_trace_statistics": sample["whole_trace_statistics"],
-                "xctrace": sample["xctrace"],
-            }
-            for sample in target_samples
-        ],
-        "candidate_processes": candidates,
     }
-
 
 def _write_json_atomic(path: Path, payload: Any) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -2907,8 +2259,9 @@ def run(
         _write_json_atomic(
             staged_result,
             {
-                "schema_version": 1,
-                "capture_scope": "exact_processes",
+                "schema_version": 2,
+                "diagnostic_only": True,
+                "capture_scope": "exact_process_diagnostic",
                 "profile": profile,
                 "instrumentation": instrumentation,
                 "candidate_passes": [

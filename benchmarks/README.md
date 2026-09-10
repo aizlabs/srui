@@ -104,7 +104,7 @@ process startup is excluded from serialization.
 
 ## Allocation measurement
 
-The authoritative §31.1 allocation metrics are signed host/default-zone endpoint deltas from
+The reported §31.1 allocation metrics are signed host/default-zone endpoint deltas from
 `malloc_zone_statistics` around the representative CPU/resource pass:
 
     after.blocks_in_use - before.blocks_in_use
@@ -117,6 +117,15 @@ count metric is reported in live `blocks`, never as a count of allocation calls.
 SRUI's value covers its renderer host. WKWebView is an explicitly host-only comparison control and
 excludes WebContent, Networking, GPU, and other helper allocations. The scope assertion and metric
 names make that limitation machine-readable.
+
+Task 34 deliberately does not claim a cumulative allocation-event count or total requested bytes.
+A real `MallocStackLoggingNoCompact=1` SRUI-host trial showed that the first pre-workload
+`malloc_history -allEvents` export alone expanded to 1,902,439,272 bytes. The supported CLI has no
+time-range or no-stack mode; producing six full histories for three interval samples would be an
+unsafe default and was rejected rather than silently weakened. The concrete follow-up is [issue #48](https://github.com/aizlabs/srui/issues/48): a
+benchmark-only Darwin allocator-interposition counter, following Apple SwiftNIO's established
+pattern, with atomic counters bracketing the separate resource pass. Until that exists, do not cite
+the endpoint deltas as allocation-call counts or as complete cumulative-allocation evidence.
 
 Xctrace is not used by normal smoke/full runs and does not populate or gate the committed report.
 Real Xcode 26 captures disproved the required interval timestamp alignment and exact
@@ -135,8 +144,6 @@ authorization/signing behavior, cleanup and disk safeguards, reproduction guidan
 Linux/Windows portability notes, see the
 [technical findings](parse-render/INSTRUMENTATION_FINDINGS.md). The
 [parse/render guide](parse-render/README.md) stays focused on operation.
-## Measurement policy
-
 - Smoke paint uses deterministic offscreen presentation and is safe for unattended runs.
 - Full first/complete paint uses both parent-side and authoritative candidate-local pointer
   park/restore guards. The candidate-local guard runs after spawn and entirely before its

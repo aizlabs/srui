@@ -116,7 +116,7 @@ nonzero-alpha entry still rejects the sample. This includes `loginwindow` or oth
 surfaces, so an inactive or locked session remains a hard failure.
 ## Allocation measurement
 
-The authoritative allocation metrics are signed default-zone endpoint deltas sampled immediately
+The reported allocation metrics are signed default-zone endpoint deltas sampled immediately
 before and after the separate representative CPU/resource pass:
 
     after.blocks_in_use - before.blocks_in_use
@@ -127,7 +127,15 @@ valid. SRUI's host contains the native renderer; WKWebView's allocation metrics 
 host-only comparison control and exclude WebContent, Networking, and GPU helper processes. The
 report publishes p50/p95/p99 block and byte deltas and checks the declared scope and sample counts.
 
-## Optional xctrace diagnostic
+Cumulative allocation-event count and requested bytes are deferred follow-up evidence. The
+supported `malloc_history -allEvents` CLI has no time-range or no-stack mode, and the first real
+SRUI pre-workload export expanded to 1,902,439,272 bytes. The suite therefore does not raise its
+disk cap, stream six multi-gigabyte histories, or relabel endpoint deltas. The planned replacement is tracked in
+[issue #48](https://github.com/aizlabs/srui/issues/48): a benchmark-only Darwin
+allocator-interposition counter modeled on Apple SwiftNIO, with atomic counters around the
+separate resource pass. See
+[the detailed findings](INSTRUMENTATION_FINDINGS.md#35-deferred-cumulative-allocation-event-count)
+for the rejected experiment, source links, and acceptance criteria.
 
 Xctrace is not part of the authoritative suite or committed baseline. Use it only to investigate
 the SRUI host:

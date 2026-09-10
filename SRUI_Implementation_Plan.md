@@ -1661,6 +1661,14 @@ Verification:
 - Commit the result (report + code, not just the numbers pasted somewhere transient).
 ```
 
+**Task 34 implementation note (2026-09-10).** The delivered §31.1 report uses explicitly named
+signed net-live default-zone endpoint deltas; it does not claim cumulative allocation-call or
+requested-byte counts. A real non-compacting `malloc_history -allEvents` pre-workload export
+expanded to 1,902,439,272 bytes and was rejected without producing a metric. The bounded
+benchmark-only Darwin interposition follow-up, detailed rationale, and acceptance criteria are
+tracked in [issue #48](https://github.com/aizlabs/srui/issues/48). This deferral does not weaken
+§31.1's allocation requirement.
+
 ### Task 35 — Local semantic inspection and automation API — Effort: Medium
 
 ```

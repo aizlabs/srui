@@ -238,7 +238,7 @@ It does not prove:
 - the same result would occur with a locked session or different display topology;
 - a smoke-profile offscreen result was visible.
 
-## 3. Authoritative allocation evidence
+## 3. Reported allocation evidence and deferred cumulative count
 
 ### 3.1 Endpoint counters
 
@@ -302,8 +302,7 @@ CPU, footprint growth, and peak footprint have a different scope: WebKit aggrega
 exact helper PIDs. The report's scope assertion and metric names must preserve this difference.
 Never combine the WebKit host malloc delta with host-plus-helper footprint and label the result as
 one uniform process scope.
-
-### 3.4 Why this source is authoritative
+### 3.4 Why the endpoint source is valid for its narrow metric
 
 The endpoint source is modest but defensible:
 
@@ -315,8 +314,77 @@ The endpoint source is modest but defensible:
 - the result has explicit signed, host-only, default-zone semantics.
 
 The source does not become more accurate by giving it a broader name. Its value comes from a
-narrow, repeatable, correctly described boundary.
+narrow, repeatable, correctly described boundary. In particular, it is not complete evidence for
+the separate cumulative allocation-event quantity requested by §31.1.
 
+### 3.5 Deferred cumulative allocation-event count
+
+Task 34 does not report cumulative allocation calls or total bytes requested from the allocator.
+That omission is explicit in the generated §31.1 notes, both operational READMEs, the metric IDs,
+and the units. The existing `blocks_in_use` delta must never be relabeled as “allocations.”
+
+#### Exact experiment and rejection
+
+A controlled C probe first established the semantics of Apple's history mechanism:
+
+1. launch with `MallocStackLoggingNoCompact=1` while explicitly unsetting
+   `MallocStackLogging`;
+2. stop the exact PID and capture `malloc_history PID -allEvents`;
+3. allocate 123, 456, and 623 bytes, free the 456-byte allocation, and stop again;
+4. capture a second history and require the first event sequence to be an exact prefix.
+
+The non-compacting history appended three `ALLOC` records and one `FREE` record, so an allocation
+freed inside the interval remained countable. The compact mode reordered/elided history and failed
+the prefix contract, as expected.
+
+The same method was then run against the real release SRUI `BenchmarkDriver`, using the existing
+supervised candidate handshake and exact PID/process-birth identity. It failed closed before
+producing a benchmark number: the first *pre-workload* `malloc_history -allEvents` text export was
+1,902,439,272 bytes. The implementation's safety cap was 536,870,912 bytes. No after snapshot was
+taken, the temporary output was cleaned, and no value from this attempt entered a report.
+
+This is intrinsic to the supported command surface, not a missing flag. Apple's
+[`malloc_history(1)` documentation](https://github.com/vitorgalvao/macos-man-pages/blob/83bb649c874e3f76a0023279be4c48656d16b18d/macOS/26/man1/malloc_history.1)
+states that `-allEvents` lists cumulative allocation/free events “up to the current time,” warns
+that the output can be voluminous, and exposes neither a time-range filter nor a no-stack output
+mode. `-q` only suppresses the process description header/footer. The undocumented
+`-machineReadableOutput` observed in Xcode 26.2 is not an acceptable committed dependency.
+Apple's
+[`malloc(3)` documentation](https://github.com/apple-oss-distributions/libmalloc/blob/c49dafa25f1efe8607701ae6014a663ad2ee437f/man/malloc.3)
+also confirms that `MallocStackLoggingNoCompact` retains adjacent allocation/free pairs and that
+plain `MallocStackLogging` takes precedence if both are set.
+
+Raising the cap would require at least six expanded histories for three before/after samples,
+several gigabytes of concurrent temporary storage, repeated symbolication of process startup, and
+substantial profiler perturbation. Streaming the same multi-gigabyte text would reduce temporary
+storage but not the cumulative export or symbolication work. Neither is a responsible default for
+a benchmark suite that previously exhausted local disk during redundant full builds.
+
+#### Concrete follow-up
+
+[Issue #48](https://github.com/aizlabs/srui/issues/48) tracks the replacement. The recommended
+implementation is the pattern used by Apple's SwiftNIO allocation benchmarks:
+
+- load a benchmark-only Darwin dynamic library through `DYLD_INSERT_LIBRARIES`;
+- interpose the relevant allocation entry points through dyld's
+  `__DATA,__interpose` mechanism;
+- maintain atomic allocation-call and requested-byte counters;
+- snapshot/reset those counters immediately around the separate production resource pass;
+- keep the instrumented pass disjoint from paint and CPU timing;
+- test allocate/free, calloc, realloc, alignment, failure, and multithreaded counter semantics;
+- enumerate and justify the hooked API surface so unobserved allocation paths fail review rather
+  than silently undercounting;
+- retain exact candidate PID/birth attribution and report the instrumentation scope;
+- treat WKWebView helpers as a separate multiprocess scope, never as part of the SRUI host count.
+
+References:
+
+- [SwiftNIO allocation-counter design](https://github.com/apple/swift-nio/blob/8c063f043d94c120d0f8d6303ef4fc7918e3561d/IntegrationTests/tests_04_performance/test_01_resources/README.md)
+- [SwiftNIO Darwin interposer](https://github.com/apple/swift-nio/blob/8c063f043d94c120d0f8d6303ef4fc7918e3561d/IntegrationTests/allocation-counter-tests-framework/template/HookedFunctionsDoHook/Sources/HookedFunctions/src/hooked-functions-darwin.c)
+
+Until that follow-up lands, the honest §31.1 allocation evidence is limited to signed net-live
+default-zone endpoint deltas, footprint growth, and peak footprint. It is not a cumulative event
+count.
 ## 4. Xcode 26 Allocations investigation
 
 ### 4.1 Why the investigation was performed

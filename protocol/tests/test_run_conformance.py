@@ -231,6 +231,7 @@ def test_manifest_must_declare_exactly_twelve_suites(manifest_backup, count: int
     result = run("--list")
     assert result.returncode == 1
     assert "exactly 12 suites" in (result.stdout + result.stderr)
+    assert "exactly 12 suites" in (result.stdout + result.stderr)
 
 
 def test_unknown_suite_selector_exits_nonzero() -> None:

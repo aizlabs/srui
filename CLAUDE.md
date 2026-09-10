@@ -21,7 +21,7 @@ cargo test -p srui-semantic-tree apply_transaction       # one test by name subs
 cargo fmt -p srui-sessiond                              # format only the crate you changed
 ```
 
-Never run `cargo fmt --all` (or bare `cargo fmt`) from `server-rust/`. That workspace has ten members; `--all` rewrites every crate and dirties files you did not touch. Format with `cargo fmt -p <crate>` (repeat `-p` for each crate you edited).
+Never run `cargo fmt --all` (or bare `cargo fmt`) from `server-rust/`. That workspace has eleven members; `--all` rewrites every crate and dirties files you did not touch. Format with `cargo fmt -p <crate>` (repeat `-p` for each crate you edited).
 
 # Swift client — from client-macos/
 swift build

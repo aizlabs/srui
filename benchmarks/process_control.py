@@ -209,11 +209,26 @@ def spawn_supervisor(
     status_path: Path,
     stdout_path: Path,
     stderr_path: Path,
+    require_exact_owner_identity: bool = False,
 ) -> subprocess.Popen[str]:
+    if not isinstance(require_exact_owner_identity, bool):
+        raise ManagedCommandError("exact-owner requirement must be boolean")
+    owner_pid = os.getpid()
+    owner_arguments = ["--owner-pid", str(owner_pid)]
+    if require_exact_owner_identity:
+        owner_birth_unix_ns = process_birth_unix_ns(owner_pid)
+        if owner_birth_unix_ns is None:
+            raise ManagedCommandError(
+                "cannot establish exact owner identity before supervisor spawn"
+            )
+        owner_arguments.extend(
+            ["--owner-birth-unix-ns", str(owner_birth_unix_ns)]
+        )
     return subprocess.Popen(
         [
             sys.executable,
             str(RUNNER),
+            *owner_arguments,
             "--ready",
             str(ready_path),
             "--status",
@@ -469,6 +484,7 @@ class ManagedProcess:
         cwd: Path,
         label: str,
         cleanup_grace_seconds: float = DEFAULT_CLEANUP_GRACE_SECONDS,
+        require_exact_owner_identity: bool = False,
     ) -> ManagedProcess:
         managed = cls(command, cwd, label, cleanup_grace_seconds)
         try:
@@ -482,6 +498,7 @@ class ManagedProcess:
                     status_path=managed.status_path,
                     stdout_path=managed.stdout_path,
                     stderr_path=managed.stderr_path,
+                    require_exact_owner_identity=require_exact_owner_identity,
                 )
                 managed.supervisor = supervisor
         except BaseException as primary:

@@ -7,10 +7,36 @@
     "process_identity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["pid", "birth_unix_ns"],
+      "required": [
+        "pid",
+        "birth_unix_ns",
+        "observed_alive_through_unix_ns"
+      ],
       "properties": {
         "pid": {"type": "integer", "minimum": 1},
-        "birth_unix_ns": {"type": "integer", "minimum": 1}
+        "birth_unix_ns": {"type": "integer", "minimum": 1},
+        "observed_alive_through_unix_ns": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "measurement_interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_unix_ns",
+        "ended_unix_ns",
+        "required_allocation_pids"
+      ],
+      "properties": {
+        "started_unix_ns": {"type": "integer", "minimum": 1},
+        "ended_unix_ns": {"type": "integer", "minimum": 1},
+        "required_allocation_pids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        }
       }
     },
     "renderer_process_attribution": {
@@ -23,6 +49,7 @@
         "helper_pids",
         "started_unix_ns",
         "ended_unix_ns",
+        "measurement_intervals",
         "helper_pid_source",
         "process_identities"
       ],
@@ -37,12 +64,530 @@
         },
         "started_unix_ns": {"type": "integer", "minimum": 1},
         "ended_unix_ns": {"type": "integer", "minimum": 1},
+        "measurement_intervals": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/measurement_interval"}
+        },
         "helper_pid_source": {"type": "string", "minLength": 1},
         "process_identities": {
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/process_identity"}
+        }
+      }
+    },
+    "allocation_statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "persistent_allocations",
+        "persistent_bytes",
+        "transient_allocations",
+        "transient_bytes",
+        "total_allocations",
+        "total_bytes",
+        "event_count"
+      ],
+      "properties": {
+        "persistent_allocations": {"type": "integer", "minimum": 0},
+        "persistent_bytes": {"type": "integer", "minimum": 0},
+        "transient_allocations": {"type": "integer", "minimum": 0},
+        "transient_bytes": {"type": "integer", "minimum": 0},
+        "total_allocations": {"type": "integer", "minimum": 0},
+        "total_bytes": {"type": "integer", "minimum": 0},
+        "event_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "allocation_statistics_group": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "heap_and_anonymous_vm",
+        "heap",
+        "anonymous_vm"
+      ],
+      "properties": {
+        "heap_and_anonymous_vm": {
+          "$ref": "#/$defs/allocation_statistics"
+        },
+        "heap": {"$ref": "#/$defs/allocation_statistics"},
+        "anonymous_vm": {"$ref": "#/$defs/allocation_statistics"}
+      }
+    },
+    "allocation_instrumentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy",
+        "source_binary_unchanged",
+        "signature_verified",
+        "entitlements"
+      ],
+      "properties": {
+        "strategy": {
+          "const": "private_copy_ad_hoc_codesigned_for_instrumentation"
+        },
+        "source_binary_unchanged": {"const": true},
+        "signature_verified": {"const": true},
+        "entitlements": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["com.apple.security.get-task-allow"],
+          "properties": {
+            "com.apple.security.get-task-allow": {"const": true}
+          }
+        }
+      }
+    },
+    "xctrace_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instruments_versions",
+        "platforms",
+        "os_versions",
+        "statistics_xpath",
+        "allocations_list_xpath"
+      ],
+      "properties": {
+        "instruments_versions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "platforms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "os_versions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "statistics_xpath": {
+          "const": "/trace-toc/run[@number=\"1\"]/tracks/track[@name=\"Allocations\"]/details/detail[@name=\"Statistics\"]"
+        },
+        "allocations_list_xpath": {
+          "const": "/trace-toc/run[@number=\"1\"]/tracks/track[@name=\"Allocations\"]/details/detail[@name=\"Allocations List\"]"
+        }
+      }
+    },
+    "allocation_process_total": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "birth_unix_ns",
+        "observed_alive_through_unix_ns",
+        "names",
+        "retained_allocations",
+        "retained_bytes",
+        "retained_allocations_lower_bound",
+        "retained_allocations_upper_bound",
+        "retained_bytes_lower_bound",
+        "retained_bytes_upper_bound",
+        "boundary_ambiguous_allocations",
+        "boundary_ambiguous_bytes"
+      ],
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1},
+        "birth_unix_ns": {"type": "integer", "minimum": 1},
+        "observed_alive_through_unix_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "names": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "retained_allocations": {"type": "integer", "minimum": 0},
+        "retained_bytes": {"type": "integer", "minimum": 0},
+        "retained_allocations_lower_bound": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retained_allocations_upper_bound": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retained_bytes_lower_bound": {"type": "integer", "minimum": 0},
+        "retained_bytes_upper_bound": {"type": "integer", "minimum": 0},
+        "boundary_ambiguous_allocations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "boundary_ambiguous_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "allocation_role_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_role",
+        "target_present",
+        "started_unix_ns",
+        "ended_unix_ns",
+        "contribution_included"
+      ],
+      "properties": {
+        "target_role": {
+          "enum": ["host", "webcontent", "network", "gpu"]
+        },
+        "target_present": {"type": "boolean"},
+        "started_unix_ns": {"type": "integer", "minimum": 1},
+        "ended_unix_ns": {"type": "integer", "minimum": 1},
+        "contribution_included": {"type": "boolean"},
+        "target_pid": {"type": "integer", "minimum": 1},
+        "target_birth_unix_ns": {"type": "integer", "minimum": 1},
+        "observed_alive_through_unix_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "recording_readiness_basis": {"const": "darwin_notification"},
+        "timestamp_boundary_uncertainty_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "alias_of_target_role": {
+          "enum": ["host", "webcontent", "network", "gpu"]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"target_present": {"const": true}},
+            "required": ["target_present"]
+          },
+          "then": {
+            "required": [
+              "target_pid",
+              "target_birth_unix_ns",
+              "observed_alive_through_unix_ns",
+              "recording_readiness_basis",
+              "timestamp_boundary_uncertainty_ns"
+            ]
+          },
+          "else": {
+            "properties": {"contribution_included": {"const": false}},
+            "not": {
+              "anyOf": [
+                {"required": ["target_pid"]},
+                {"required": ["target_birth_unix_ns"]},
+                {"required": ["observed_alive_through_unix_ns"]},
+                {"required": ["recording_readiness_basis"]},
+                {"required": ["timestamp_boundary_uncertainty_ns"]},
+                {"required": ["alias_of_target_role"]}
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"contribution_included": {"const": true}},
+            "required": ["contribution_included"]
+          },
+          "then": {
+            "properties": {"target_present": {"const": true}},
+            "not": {"required": ["alias_of_target_role"]}
+          }
+        },
+        {
+          "if": {"required": ["alias_of_target_role"]},
+          "then": {
+            "properties": {
+              "target_present": {"const": true},
+              "contribution_included": {"const": false}
+            }
+          }
+        }
+      ]
+    },
+    "allocation_pass_advertised_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_role", "pid", "birth_unix_ns"],
+      "properties": {
+        "target_role": {
+          "enum": ["host", "webcontent", "network", "gpu"]
+        },
+        "pid": {"type": "integer", "minimum": 1},
+        "birth_unix_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "allocation_role_alias_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "canonical_target_role",
+        "aliased_target_roles",
+        "pass_advertised_identities"
+      ],
+      "properties": {
+        "canonical_target_role": {
+          "enum": ["host", "webcontent", "network", "gpu"]
+        },
+        "aliased_target_roles": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["host", "webcontent", "network", "gpu"]
+          }
+        },
+        "pass_advertised_identities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/allocation_pass_advertised_identity"
+          }
+        }
+      }
+    },
+    "allocation_sample_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_index",
+        "retained_allocations",
+        "retained_bytes",
+        "retained_allocations_lower_bound",
+        "retained_allocations_upper_bound",
+        "retained_bytes_lower_bound",
+        "retained_bytes_upper_bound",
+        "boundary_ambiguous_allocations",
+        "boundary_ambiguous_bytes",
+        "roles",
+        "role_aliases",
+        "process_totals"
+      ],
+      "properties": {
+        "sample_index": {"type": "integer", "minimum": 0},
+        "retained_allocations": {"type": "integer", "minimum": 0},
+        "retained_bytes": {"type": "integer", "minimum": 0},
+        "retained_allocations_lower_bound": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retained_allocations_upper_bound": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retained_bytes_lower_bound": {"type": "integer", "minimum": 0},
+        "retained_bytes_upper_bound": {"type": "integer", "minimum": 0},
+        "boundary_ambiguous_allocations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "boundary_ambiguous_bytes": {"type": "integer", "minimum": 0},
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/allocation_role_evidence"}
+        },
+        "role_aliases": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/allocation_role_alias_evidence"}
+        },
+        "process_totals": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/allocation_process_total"}
+        }
+      }
+    },
+    "allocation_candidate_samples": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate", "samples"],
+      "properties": {
+        "candidate": {"enum": ["srui", "webkit"]},
+        "samples": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/allocation_sample_evidence"}
+        }
+      }
+    },
+    "allocation_candidate_total": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "measurement_mode",
+        "measurement_sample_count",
+        "measured_process_sample_count",
+        "claimed_process_count",
+        "processes_with_live_list_evidence",
+        "helper_process_count",
+        "helper_target_roles",
+        "present_role_measurement_count",
+        "absent_role_measurement_count",
+        "aliased_role_measurement_count",
+        "recording_readiness_bases",
+        "helpers_without_retained_rows",
+        "retained_allocations",
+        "retained_bytes",
+        "retained_allocations_lower_bound",
+        "retained_allocations_upper_bound",
+        "retained_bytes_lower_bound",
+        "retained_bytes_upper_bound",
+        "boundary_ambiguous_allocations",
+        "boundary_ambiguous_bytes",
+        "host_retained_allocations",
+        "host_retained_bytes",
+        "helper_retained_allocations",
+        "helper_retained_bytes"
+      ],
+      "properties": {
+        "candidate": {"enum": ["srui", "webkit"]},
+        "measurement_mode": {
+          "const": "equivalent_exact_process_role_passes"
+        },
+        "measurement_sample_count": {"type": "integer", "minimum": 1},
+        "measured_process_sample_count": {"type": "integer", "minimum": 1},
+        "claimed_process_count": {"type": "integer", "minimum": 1},
+        "processes_with_live_list_evidence": {"type": "integer", "minimum": 1},
+        "helper_process_count": {"type": "integer", "minimum": 0},
+        "helper_target_roles": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["webcontent", "network", "gpu"]}
+        },
+        "present_role_measurement_count": {"type": "integer", "minimum": 1},
+        "absent_role_measurement_count": {"type": "integer", "minimum": 0},
+        "aliased_role_measurement_count": {"type": "integer", "minimum": 0},
+        "recording_readiness_bases": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"const": "darwin_notification"}
+        },
+        "helpers_without_retained_rows": {"type": "integer", "minimum": 0},
+        "retained_allocations": {"type": "integer", "minimum": 0},
+        "retained_bytes": {"type": "integer", "minimum": 0},
+        "retained_allocations_lower_bound": {"type": "integer", "minimum": 0},
+        "retained_allocations_upper_bound": {"type": "integer", "minimum": 0},
+        "retained_bytes_lower_bound": {"type": "integer", "minimum": 0},
+        "retained_bytes_upper_bound": {"type": "integer", "minimum": 0},
+        "boundary_ambiguous_allocations": {"type": "integer", "minimum": 0},
+        "boundary_ambiguous_bytes": {"type": "integer", "minimum": 0},
+        "host_retained_allocations": {"type": "integer", "minimum": 0},
+        "host_retained_bytes": {"type": "integer", "minimum": 0},
+        "helper_retained_allocations": {"type": "integer", "minimum": 0},
+        "helper_retained_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "allocation_capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "profile",
+        "capture_scope",
+        "capture_method",
+        "allocation_export_basis",
+        "allocation_timestamp_basis",
+        "metric_semantics",
+        "whole_trace_statistics_semantics",
+        "process_identity_basis",
+        "recording_readiness_bases",
+        "instrumentation",
+        "xctrace_environment",
+        "trace_start_timestamp_resolution_ns",
+        "allocation_list_timestamp_resolution_ns",
+        "timestamp_boundary_uncertainty_ns",
+        "allocation_rows",
+        "allocation_list_bytes",
+        "anonymous_vm_persistent_allocations",
+        "anonymous_vm_persistent_bytes",
+        "vm_category_rows",
+        "vm_category_bytes",
+        "allocation_list_reconciled",
+        "whole_trace_statistics_aggregate",
+        "process_attribution_complete",
+        "candidate_totals",
+        "sample_evidence"
+      ],
+      "properties": {
+        "schema_version": {"const": 3},
+        "profile": {"enum": ["smoke", "full"]},
+        "capture_scope": {"const": "exact_processes"},
+        "capture_method": {
+          "const": "xctrace Allocations --attach per exact target process, exported through Statistics and Allocations List view details"
+        },
+        "allocation_export_basis": {
+          "const": "Xcode Allocations view details: complete live Allocations List reconciled to All Heap & Anonymous VM Statistics"
+        },
+        "allocation_timestamp_basis": {
+          "const": "Allocations List elapsed timestamp plus TOC start-date"
+        },
+        "metric_semantics": {
+          "const": "heap and anonymous VM allocations created nominally inside the measured interval that remain live at capture end"
+        },
+        "whole_trace_statistics_semantics": {
+          "const": "diagnostic whole-trace heap and anonymous VM aggregates including the attach-time live baseline; never interpreted as interval allocation traffic"
+        },
+        "process_identity_basis": {
+          "const": "each segment TOC names exactly one attached PID equal to the requested PID; benchmark birth/liveness handshakes bound it"
+        },
+        "recording_readiness_bases": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"const": "darwin_notification"}
+        },
+        "instrumentation": {"$ref": "#/$defs/allocation_instrumentation"},
+        "xctrace_environment": {"$ref": "#/$defs/xctrace_environment"},
+        "trace_start_timestamp_resolution_ns": {"type": "integer", "minimum": 1},
+        "allocation_list_timestamp_resolution_ns": {"type": "integer", "minimum": 1},
+        "timestamp_boundary_uncertainty_ns": {"type": "integer", "minimum": 1},
+        "allocation_rows": {"type": "integer", "minimum": 1},
+        "allocation_list_bytes": {"type": "integer", "minimum": 0},
+        "anonymous_vm_persistent_allocations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "anonymous_vm_persistent_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "vm_category_rows": {"type": "integer", "minimum": 0},
+        "vm_category_bytes": {"type": "integer", "minimum": 0},
+        "allocation_list_reconciled": {"const": true},
+        "whole_trace_statistics_aggregate": {
+          "$ref": "#/$defs/allocation_statistics_group"
+        },
+        "process_attribution_complete": {"const": true},
+        "candidate_totals": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/allocation_candidate_total"}
+        },
+        "sample_evidence": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/allocation_candidate_samples"}
         }
       }
     },
@@ -68,7 +613,8 @@
           "maxItems": 2,
           "uniqueItems": true,
           "items": {"$ref": "#/$defs/renderer_process_attribution"}
-        }
+        },
+        "allocation_capture": {"$ref": "#/$defs/allocation_capture"}
       }
     },
     "metric": {
@@ -91,7 +637,8 @@
             "MiB",
             "repaints",
             "boolean",
-            "frames"
+            "frames",
+            "ratio"
           ]
         },
         "statistic": {"type": "string", "minLength": 1},
@@ -117,15 +664,27 @@
         "detail": {"type": "string"}
       }
     },
+    "sample_counts": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z0-9]+(?:[._][a-z0-9]+)*$"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
     "section": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "name", "metrics", "assertions"],
+      "required": ["id", "name", "sample_counts", "metrics", "assertions"],
       "properties": {
         "id": {
           "enum": ["31.1", "31.2", "31.3", "31.4", "31.5", "31.6"]
         },
         "name": {"type": "string", "minLength": 1},
+        "sample_counts": {"$ref": "#/$defs/sample_counts"},
         "metrics": {
           "type": "array",
           "minItems": 1,
@@ -176,11 +735,32 @@
         "environment": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["platform", "machine", "python"],
+          "required": [
+            "platform",
+            "machine",
+            "python",
+            "chip",
+            "physical_ram_bytes",
+            "xcode",
+            "swift",
+            "rust",
+            "git_commit",
+            "git_dirty"
+          ],
           "properties": {
             "platform": {"type": "string", "minLength": 1},
             "machine": {"type": "string", "minLength": 1},
-            "python": {"type": "string", "minLength": 1}
+            "python": {"type": "string", "minLength": 1},
+            "chip": {"type": "string", "minLength": 1},
+            "physical_ram_bytes": {"type": "integer", "minimum": 1},
+            "xcode": {"type": "string", "minLength": 1},
+            "swift": {"type": "string", "minLength": 1},
+            "rust": {"type": "string", "minLength": 1},
+            "git_commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40,64}$"
+            },
+            "git_dirty": {"type": "boolean"}
           }
         },
         "driver_artifacts": {

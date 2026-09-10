@@ -4,6 +4,22 @@ import Testing
 @testable import RendererAppKit
 @testable import Collections
 
+@MainActor
+private func controlFactoryBitmapSignature(_ view: NSView) -> Data? {
+    view.layoutSubtreeIfNeeded()
+    let rect = view.bounds.integral
+    guard rect.width > 0, rect.height > 0,
+          let representation = view.bitmapImageRepForCachingDisplay(in: rect) else {
+        return nil
+    }
+    view.cacheDisplay(in: rect, to: representation)
+    guard let bytes = representation.bitmapData else { return nil }
+    return Data(
+        bytes: bytes,
+        count: representation.bytesPerRow * representation.pixelsHigh
+    )
+}
+
 private let controlFactoryRequiredTierTypes: [TypeRef] = [
     .surface, .row, .column, .grid, .spacer, .separator, .scroll,
     .text, .richText, .button, .toggle, .textInput, .textArea,
@@ -17,6 +33,62 @@ private let controlFactoryUnsupportedTypes: [TypeRef] = [
 
 @MainActor
 struct ControlFactoryTests {
+    @Test
+    func buttonHoverFeedbackChangesAndRestoresRaster() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+        let button = try #require(handle.view as? HoverFeedbackButton)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 180, height: 44),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = button
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        button.updateTrackingAreas()
+        #expect(button.trackingAreas.isEmpty == false)
+
+        let location = NSPoint(x: button.bounds.midX, y: button.bounds.midY)
+        let entered = try #require(NSEvent.enterExitEvent(
+            with: .mouseEntered,
+            location: location,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            trackingNumber: 1,
+            userData: nil
+        ))
+        let exited = try #require(NSEvent.enterExitEvent(
+            with: .mouseExited,
+            location: location,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            trackingNumber: 1,
+            userData: nil
+        ))
+        let initial = try #require(controlFactoryBitmapSignature(button))
+
+        button.mouseEntered(with: entered)
+        let hovered = try #require(controlFactoryBitmapSignature(button))
+        #expect(button.isPointerInside)
+        #expect(hovered != initial)
+
+        button.mouseExited(with: exited)
+        let restored = try #require(controlFactoryBitmapSignature(button))
+        #expect(button.isPointerInside == false)
+        #expect(restored == initial)
+    }
+
     @Test(arguments: controlFactoryRequiredTierTypes)
     func requiredTierCreatesExpectedViewAndDefaults(nodeType: TypeRef) throws {
         let factory = ControlFactory()
@@ -113,9 +185,10 @@ struct ControlFactoryTests {
             #expect(textView.textContainer?.widthTracksTextView == true)
 
         case .button:
-            let button = try #require(handle.view as? NSButton)
+            let button = try #require(handle.view as? HoverFeedbackButton)
             #expect(button.bezelStyle == .rounded)
             #expect(button.title == "Button")
+            #expect(button.isPointerInside == false)
             #expect(handle.actionTrampoline is ActionTrampoline)
 
         case .toggle:

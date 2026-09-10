@@ -1,263 +1,27 @@
+use crate::report::{push_timing_distributions, Assertion, Section};
 use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
-use sha2::{Digest, Sha256};
 use srui_protocol::{
     srui_message, ClientHello, ClientResume, EventAckStatus, SessionContinuity, SruiCodec,
-    SruiMessage, TerminalResyncReason,
-};
-use srui_pty::{
-    PTYManager, SubscribeSnapshot, TerminalEvent, TerminalSpec, MAX_TERMINAL_OUTPUT_FRAME_BYTES,
+    SruiMessage,
 };
 use srui_resources::CHUNK_PAYLOAD_SIZE;
 use srui_sdk::{Button, Surface, ACTIVATE, LABEL};
-use srui_semantic_tree::{
-    resolve_standard_node_type, resolve_standard_property, Event as DomainEvent, NodeId, Operation,
-    Revision, SemanticStore, Transaction, Value,
-};
+use srui_semantic_tree::{Event as DomainEvent, NodeId, Revision, SemanticStore};
 use srui_sessiond::{
     handle_connection, ConnectionError, EventOutcome, LogicalChannelClass, OutboundItem,
     OutboundReceiver, ResumeOutcome, Session, SessionConfig, CORE_VERSION,
 };
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::time::timeout;
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
-
-#[derive(Deserialize)]
-struct Fixture {
-    nodes: Vec<FixtureNode>,
-}
-#[derive(Deserialize)]
-struct FixtureNode {
-    id: u64,
-    #[serde(rename = "type")]
-    node_type: String,
-    parent: Option<u64>,
-    #[serde(default)]
-    properties: BTreeMap<String, JsonValue>,
-}
-
-#[derive(Serialize)]
-struct Output {
-    artifacts: Artifacts,
-    sections: Vec<Section>,
-}
-
-#[derive(Serialize)]
-struct Artifacts {
-    canonical_transaction_sha256: String,
-    canonical_transaction_bytes: usize,
-}
-
-#[derive(Serialize)]
-struct Section {
-    id: &'static str,
-    name: &'static str,
-    metrics: Vec<Metric>,
-    assertions: Vec<Assertion>,
-    notes: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct Metric {
-    id: &'static str,
-    name: String,
-    value: f64,
-    unit: &'static str,
-    statistic: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target_direction: Option<&'static str>,
-}
-
-#[derive(Serialize)]
-struct Assertion {
-    id: &'static str,
-    name: &'static str,
-    passed: bool,
-    detail: String,
-}
-
-fn metric(
-    name: impl Into<String>,
-    value: f64,
-    unit: &'static str,
-    statistic: &'static str,
-) -> Metric {
-    let name = name.into();
-    let id = match name.as_str() {
-        "abstract state generation" => "abstract_state_generation_ms",
-        "protobuf serialization" => "protobuf_serialization_ms",
-        "serialized transaction size" => "serialized_transaction_bytes",
-        "disconnect immediately before event receipt" => "disconnect_before_event_receipt_ms",
-        "event receipt through settled side effect" => "event_to_settled_side_effect_ms",
-        "in-process cached DUPLICATE response" => "cached_duplicate_response_ms",
-        "lost ACK wire reconnect through DUPLICATE acknowledgement" => "lost_ack_wire_duplicate_ms",
-        "mid-resource reconnect and exact replay" => "mid_resource_reconnect_ms",
-        "mid-transaction frame discard and atomic replay" => "mid_transaction_codec_replay_ms",
-        "mid-transaction wire disconnect and exact atomic replay" => {
-            "mid_transaction_wire_replay_ms"
-        }
-        "partial EVENT disconnect and one processed replay" => "partial_event_wire_replay_ms",
-        "resume beyond journal retention" => "resume_beyond_retention_ms",
-        "resume within journal retention" => "resume_within_retention_ms",
-        "embedded SRUI PTY exact ANSI capture and framing" => "embedded_pty_interaction_ms",
-        "standalone PTY exact ANSI interaction" => "standalone_pty_interaction_ms",
-        "terminal reconnect retention-loss decision" => "terminal_retention_loss_ms",
-        "terminal payload" => "terminal_payload_bytes",
-        "embedded terminal frame count" => "embedded_terminal_frame_count",
-        _ => panic!("metric `{name}` is missing a stable benchmark ID"),
-    };
-    Metric {
-        id,
-        name,
-        value,
-        unit,
-        statistic,
-        target: None,
-        target_direction: None,
-    }
-}
-
-fn percentile(mut values: Vec<f64>, fraction: f64) -> f64 {
-    values.sort_by(f64::total_cmp);
-    let index = ((values.len() - 1) as f64 * fraction).round() as usize;
-    values[index.min(values.len() - 1)]
-}
-
-fn p50(values: Vec<f64>) -> f64 {
-    percentile(values, 0.50)
-}
-
-fn json_to_value(value: &JsonValue) -> Result<Value, String> {
-    match value {
-        JsonValue::String(value) => Ok(Value::from(value.as_str())),
-        JsonValue::Bool(value) => Ok(Value::from(*value)),
-        JsonValue::Number(value) => value
-            .as_f64()
-            .map(Value::from)
-            .ok_or_else(|| "fixture number is not representable as f64".to_string()),
-        other => Err(format!("unsupported fixture value: {other}")),
-    }
-}
-
-fn build_transaction(fixture: &Fixture) -> Result<Transaction, String> {
-    let mut operations = Vec::with_capacity(fixture.nodes.len());
-    for node in &fixture.nodes {
-        let node_type =
-            resolve_standard_node_type(&node.node_type).map_err(|error| error.to_string())?;
-        let mut properties = Vec::with_capacity(node.properties.len());
-        for (name, value) in &node.properties {
-            properties.push((
-                resolve_standard_property(name).map_err(|error| error.to_string())?,
-                json_to_value(value)?,
-            ));
-        }
-        operations.push(Operation::create_node(
-            NodeId::new(node.id),
-            node_type,
-            node.parent.map(NodeId::new),
-            None,
-            properties,
-        ));
-    }
-    Ok(Transaction::new(Revision::INITIAL, operations))
-}
-
-fn serialization(fixture: &Fixture, iterations: usize) -> Result<Section, String> {
-    let mut generation_ms = Vec::with_capacity(iterations);
-    let mut serialization_ms = Vec::with_capacity(iterations);
-    let mut bytes = 0;
-    for _ in 0..iterations {
-        let start = Instant::now();
-        let transaction = build_transaction(fixture)?;
-        generation_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
-
-        let start = Instant::now();
-        let encoded = transaction.to_wire_bytes();
-        serialization_ms.push(start.elapsed().as_secs_f64() * 1_000.0);
-        bytes = encoded.len();
-        std::hint::black_box(encoded);
-    }
-    Ok(Section {
-        id: "31.2",
-        name: "Serialization",
-        metrics: vec![
-            metric(
-                "abstract state generation",
-                p50(generation_ms.clone()),
-                "ms",
-                "p50",
-            ),
-            metric(
-                "abstract state generation",
-                percentile(generation_ms.clone(), 0.95),
-                "ms",
-                "p95",
-            ),
-            metric(
-                "abstract state generation",
-                percentile(generation_ms, 0.99),
-                "ms",
-                "p99",
-            ),
-            metric(
-                "protobuf serialization",
-                p50(serialization_ms.clone()),
-                "ms",
-                "p50",
-            ),
-            metric(
-                "protobuf serialization",
-                percentile(serialization_ms.clone(), 0.95),
-                "ms",
-                "p95",
-            ),
-            metric(
-                "protobuf serialization",
-                percentile(serialization_ms, 0.99),
-                "ms",
-                "p99",
-            ),
-            metric(
-                "serialized transaction size",
-                bytes as f64,
-                "bytes",
-                "exact",
-            ),
-        ],
-        assertions: vec![Assertion {
-            id: "fixture_protobuf_valid",
-            name: "shared fixture produced SRUI protobuf",
-            passed: bytes > 0,
-            detail: format!("{} nodes encoded into {bytes} bytes", fixture.nodes.len()),
-        }],
-        notes: vec![
-            "PTY spawn and renderer work are excluded from server serialization timing.".into(),
-        ],
-    })
-}
-fn push_timing_distributions(metrics: &mut Vec<Metric>, timings: BTreeMap<&'static str, Vec<f64>>) {
-    for (name, values) in timings {
-        metrics.push(metric(name, p50(values.clone()), "ms", "p50"));
-        metrics.push(metric(name, percentile(values.clone(), 0.95), "ms", "p95"));
-        metrics.push(metric(name, percentile(values, 0.99), "ms", "p99"));
-    }
-}
 
 async fn next_resource(receiver: &mut OutboundReceiver) -> Result<OutboundItem, String> {
     timeout(
@@ -463,6 +227,7 @@ async fn wire_pre_receipt_disconnect(sample: usize) -> Result<(f64, bool), Strin
                 && ack.event_id == event_id.as_bytes()
                 && ack.revision_after_effect == 2
                 && ack.last_processed_event_seq == 1
+                && ack.settled_event_seq == 1
     ) && matches!(
         handler_transaction.msg,
         Some(srui_message::Msg::Transaction(transaction))
@@ -613,6 +378,7 @@ async fn wire_lost_ack_reconnect(sample: usize) -> Result<(f64, bool), String> {
                 && ack.event_id == event_id.as_bytes()
                 && ack.revision_after_effect == 2
                 && ack.last_processed_event_seq == 1
+                && ack.settled_event_seq == 1
     );
     let no_duplicate_transaction = timeout(Duration::from_millis(5), resumed_read.next())
         .await
@@ -884,6 +650,7 @@ async fn wire_partial_event_reconnect(sample: usize) -> Result<(f64, bool), Stri
                 && ack.event_id == event_id.as_bytes()
                 && ack.revision_after_effect == 2
                 && ack.last_processed_event_seq == 1
+                && ack.settled_event_seq == 1
     ) && matches!(
         handler_transaction.msg,
         Some(srui_message::Msg::Transaction(transaction))
@@ -917,7 +684,7 @@ async fn wire_partial_event_reconnect(sample: usize) -> Result<(f64, bool), Stri
     ))
 }
 
-async fn reconnect(iterations: usize) -> Result<Section, String> {
+pub(crate) async fn reconnect(iterations: usize) -> Result<Section, String> {
     let mut timings: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
     let mut resource_replay_correct = true;
     let mut transaction_replay_correct = true;
@@ -1177,11 +944,40 @@ async fn reconnect(iterations: usize) -> Result<Section, String> {
         wire_partial_event_correct &= correct;
     }
 
+    let mut sample_counts = BTreeMap::new();
+    for (name, values) in &timings {
+        let group = match *name {
+            "mid-resource reconnect and exact replay" => "rust.mid_resource",
+            "mid-transaction frame discard and atomic replay" => "rust.mid_transaction_codec",
+            "event receipt through settled side effect" => "rust.event_side_effect",
+            "in-process cached DUPLICATE response" => "rust.cached_duplicate",
+            "resume within journal retention" => "rust.resume_within_retention",
+            "resume beyond journal retention" => "rust.resume_beyond_retention",
+            "disconnect immediately before event receipt" => "rust.pre_receipt_wire",
+            "lost ACK wire reconnect through DUPLICATE acknowledgement" => "rust.lost_ack_wire",
+            "mid-transaction wire disconnect and exact atomic replay" => {
+                "rust.mid_transaction_wire"
+            }
+            "partial EVENT disconnect and one processed replay" => "rust.partial_event_wire",
+            unexpected => {
+                return Err(format!(
+                    "reconnect timing group has no sample-count identity: {unexpected}"
+                ));
+            }
+        };
+        if sample_counts.insert(group, values.len()).is_some() {
+            return Err(format!(
+                "duplicate reconnect sample-count identity: {group}"
+            ));
+        }
+    }
+
     let mut metrics = Vec::new();
     push_timing_distributions(&mut metrics, timings);
     Ok(Section {
         id: "31.5",
         name: "Reconnect",
+        sample_counts,
         metrics,
         assertions: vec![
             Assertion {
@@ -1233,337 +1029,6 @@ async fn reconnect(iterations: usize) -> Result<Section, String> {
         ],
     })
 }
-const TERMINAL_LINE: &[u8] = b"\x1b[32mbenchmark output\x1b[0m\r\n";
-const TERMINAL_LINES: usize = 256;
-
-fn terminal_script(lines: usize) -> String {
-    format!(
-        "stty raw -echo; i=0; while [ \"$i\" -lt {lines} ]; do \
-         printf '\\033[32mbenchmark output\\033[0m\\r\\n'; i=$((i + 1)); done"
-    )
-}
-
-fn pty_roundtrip(payload: &[u8], script: &str) -> Result<(f64, Vec<u8>, bool), String> {
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|error| error.to_string())?;
-    let mut command = CommandBuilder::new("/bin/sh");
-    command.arg("-c");
-    command.arg(script);
-    let start = Instant::now();
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| error.to_string())?;
-    drop(pair.slave);
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|error| error.to_string())?;
-    let mut received = Vec::with_capacity(payload.len());
-    reader
-        .read_to_end(&mut received)
-        .map_err(|error| error.to_string())?;
-    let status = child.wait().map_err(|error| error.to_string())?;
-    let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
-    Ok((elapsed, received, status.success()))
-}
-
-fn terminal_spec(script: &str, ring_capacity: usize) -> TerminalSpec {
-    TerminalSpec {
-        executable: "/bin/sh".into(),
-        args: vec!["-c".into(), script.into()],
-        ring_capacity,
-        ..TerminalSpec::default()
-    }
-}
-
-fn wait_for_terminal_bytes(
-    manager: &PTYManager,
-    id: NodeId,
-    expected_next_offset: u64,
-) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if manager
-            .offsets(id)
-            .is_some_and(|(_, next)| next >= expected_next_offset)
-        {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    Err(format!(
-        "timed out waiting for terminal {id:?} to reach offset {expected_next_offset}"
-    ))
-}
-
-fn wait_for_terminal_exit(manager: &PTYManager, id: NodeId) -> Result<bool, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Some(success) = manager
-            .exit_success(id)
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(success);
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    Err(format!(
-        "timed out waiting for terminal {id:?} process exit"
-    ))
-}
-
-fn embedded_pty_roundtrip(
-    payload: &[u8],
-    script: &str,
-) -> Result<(f64, Vec<u8>, usize, bool, bool), String> {
-    let manager = PTYManager::default();
-    let id = NodeId::new(1);
-    let start = Instant::now();
-    manager
-        .spawn(id, terminal_spec(script, payload.len() * 2))
-        .map_err(|error| error.to_string())?;
-    wait_for_terminal_bytes(&manager, id, payload.len() as u64)?;
-    let exit_success = wait_for_terminal_exit(&manager, id)?;
-    let final_offset = manager
-        .offsets(id)
-        .ok_or_else(|| "embedded PTY disappeared before final offset sampling".to_string())?
-        .1;
-    let outcome = manager
-        .subscribe(id, 0)
-        .map_err(|error| error.to_string())?;
-    let mut received = Vec::with_capacity(payload.len());
-    let mut expected_offset = 0_u64;
-    let mut offsets_exact = true;
-    let frames = match outcome.snapshot {
-        SubscribeSnapshot::Replay { frames } => frames,
-        SubscribeSnapshot::Resync { .. } => {
-            manager.shutdown();
-            return Ok((
-                start.elapsed().as_secs_f64() * 1_000.0,
-                received,
-                0,
-                false,
-                exit_success,
-            ));
-        }
-    };
-    for frame in &frames {
-        offsets_exact &= frame.stream_id == id.get()
-            && frame.byte_offset == expected_offset
-            && !frame.data.is_empty()
-            && frame.data.len() <= MAX_TERMINAL_OUTPUT_FRAME_BYTES;
-        expected_offset = expected_offset.saturating_add(frame.data.len() as u64);
-        received.extend_from_slice(&frame.data);
-    }
-    let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
-    manager.shutdown();
-    Ok((
-        elapsed,
-        received,
-        frames.len(),
-        offsets_exact && final_offset == payload.len() as u64,
-        exit_success,
-    ))
-}
-
-fn terminal(iterations: usize) -> Result<Section, String> {
-    let payload = TERMINAL_LINE.repeat(TERMINAL_LINES);
-    let script = terminal_script(TERMINAL_LINES);
-    let sample_count = iterations.min(20);
-    let mut standalone_ms = Vec::with_capacity(sample_count);
-    let mut embedded_ms = Vec::with_capacity(sample_count);
-    let mut exact_payloads = true;
-    let mut standalone_exit_success = true;
-    let mut embedded_exit_success = true;
-    let mut offsets_exact = true;
-    let mut embedded_frame_counts = Vec::with_capacity(sample_count);
-
-    for _ in 0..sample_count {
-        let (elapsed, received, exited_successfully) = pty_roundtrip(&payload, &script)?;
-        standalone_ms.push(elapsed);
-        exact_payloads &= received == payload;
-        standalone_exit_success &= exited_successfully;
-
-        let (elapsed, received, frame_count, sample_offsets_exact, sample_exit_success) =
-            embedded_pty_roundtrip(&payload, &script)?;
-        embedded_ms.push(elapsed);
-        exact_payloads &= received == payload;
-        offsets_exact &= sample_offsets_exact;
-        embedded_exit_success &= sample_exit_success;
-        embedded_frame_counts.push(frame_count as f64);
-    }
-
-    // Exhaust the ring through a real PTY stream, then reconnect through PTYManager::subscribe.
-    // The public subscription maps the retention gap to one explicit RETENTION_LOSS event.
-    let exhaustion_manager = PTYManager::default();
-    let exhaustion_id = NodeId::new(2);
-    exhaustion_manager
-        .spawn(exhaustion_id, terminal_spec(&script, 1_024))
-        .map_err(|error| error.to_string())?;
-    wait_for_terminal_bytes(&exhaustion_manager, exhaustion_id, payload.len() as u64)?;
-    let exhaustion_exit_success = wait_for_terminal_exit(&exhaustion_manager, exhaustion_id)?;
-    let start = Instant::now();
-    let exhausted = exhaustion_manager
-        .subscribe(exhaustion_id, 0)
-        .map_err(|error| error.to_string())?;
-    let exhaustion_ms = start.elapsed().as_secs_f64() * 1_000.0;
-    let exhaustion_detected = matches!(
-        &exhausted.snapshot,
-        SubscribeSnapshot::Resync {
-            requested_offset: 0,
-            retained_from_offset,
-            resume_at_offset,
-            reason: TerminalResyncReason::RetentionLoss,
-        } if *retained_from_offset > 0 && *resume_at_offset == payload.len() as u64
-    ) && exhaustion_exit_success
-        && matches!(
-            exhausted.catch_up_events().as_slice(),
-            [TerminalEvent::Resync(resync)]
-                if resync.reason == TerminalResyncReason::RetentionLoss as i32
-                    && resync.requested_offset == 0
-                    && resync.retained_from_offset > 0
-                    && resync.resume_at_offset == payload.len() as u64
-        );
-    exhaustion_manager.shutdown();
-
-    let mut metrics = Vec::new();
-    let mut timings = BTreeMap::new();
-    timings.insert("standalone PTY exact ANSI interaction", standalone_ms);
-    timings.insert(
-        "embedded SRUI PTY exact ANSI capture and framing",
-        embedded_ms,
-    );
-    push_timing_distributions(&mut metrics, timings);
-    metrics.push(metric(
-        "terminal reconnect retention-loss decision",
-        exhaustion_ms,
-        "ms",
-        "sample",
-    ));
-    metrics.push(metric(
-        "terminal payload",
-        payload.len() as f64,
-        "bytes",
-        "exact",
-    ));
-    metrics.push(metric(
-        "embedded terminal frame count",
-        p50(embedded_frame_counts.clone()),
-        "messages",
-        "p50",
-    ));
-    metrics.push(metric(
-        "embedded terminal frame count",
-        percentile(embedded_frame_counts.clone(), 0.95),
-        "messages",
-        "p95",
-    ));
-    metrics.push(metric(
-        "embedded terminal frame count",
-        percentile(embedded_frame_counts.clone(), 0.99),
-        "messages",
-        "p99",
-    ));
-
-    Ok(Section {
-        id: "31.6",
-        name: "Terminal",
-        metrics,
-        assertions: vec![
-            Assertion {
-                id: "pty_payload_identical",
-                name: "standalone and embedded PTYs emit the identical ANSI byte stream",
-                passed: exact_payloads,
-                detail: format!("both paths compared all {} payload bytes", payload.len()),
-            },
-            Assertion {
-                id: "standalone_pty_exit_success",
-                name: "standalone terminal command exits successfully",
-                passed: standalone_exit_success,
-                detail: format!("{sample_count} child exit statuses checked"),
-            },
-            Assertion {
-                id: "embedded_pty_eof_exact",
-                name: "embedded terminal reaches natural successful EOF with no trailing bytes",
-                passed: embedded_exit_success && offsets_exact,
-                detail: format!(
-                    "{sample_count} production PTY exit statuses checked after the final exact offset"
-                ),
-            },
-            Assertion {
-                id: "embedded_terminal_frame_bounds",
-                name: "embedded terminal frames preserve exact offsets and bounds",
-                passed: offsets_exact,
-                detail: format!(
-                    "{} samples aggregated; p50 {:.0} frames, each at most {MAX_TERMINAL_OUTPUT_FRAME_BYTES} bytes",
-                    embedded_frame_counts.len(),
-                    p50(embedded_frame_counts)
-                ),
-            },
-            Assertion {
-                id: "terminal_ring_retention_loss",
-                name: "reconnect ring-buffer exhaustion maps to RETENTION_LOSS",
-                passed: exhaustion_detected,
-                detail:
-                    "PTYManager::subscribe returned Resync and catch_up emitted TerminalResyncRequired"
-                        .into(),
-            },
-        ],
-        notes: vec![
-            "Standalone and embedded samples both include production PTY spawn, identical shell execution, EOF, and exact ANSI output; embedded additionally captures and frames the bytes."
-                .into(),
-        ],
-    })
-}
-
-fn argument(name: &str) -> Result<String, String> {
-    let mut args = std::env::args();
-    while let Some(arg) = args.next() {
-        if arg == name {
-            return args
-                .next()
-                .ok_or_else(|| format!("{name} requires a value"));
-        }
-    }
-    Err(format!("missing {name}"))
-}
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<(), String> {
-    let fixture_path = PathBuf::from(argument("--fixture")?);
-    let output_path = PathBuf::from(argument("--output")?);
-    let profile = argument("--profile")?;
-    let iterations = if profile == "full" { 500 } else { 25 };
-    let fixture: Fixture = serde_json::from_slice(
-        &fs::read(&fixture_path).map_err(|error| format!("{}: {error}", fixture_path.display()))?,
-    )
-    .map_err(|error| error.to_string())?;
-
-    let canonical_transaction = build_transaction(&fixture)?;
-    let canonical_bytes = canonical_transaction.to_wire_bytes();
-    let canonical_digest = Sha256::digest(&canonical_bytes);
-    let output = Output {
-        artifacts: Artifacts {
-            canonical_transaction_sha256: format!("{canonical_digest:x}"),
-            canonical_transaction_bytes: canonical_bytes.len(),
-        },
-        sections: vec![
-            serialization(&fixture, iterations)?,
-            reconnect(iterations).await?,
-            terminal(iterations)?,
-        ],
-    };
-    let json = serde_json::to_vec_pretty(&output).map_err(|error| error.to_string())?;
-    fs::write(Path::new(&output_path), json).map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,15 +1061,5 @@ mod tests {
     async fn lost_ack_wire_reconnect_returns_duplicate_without_second_effect() {
         let (_, correct) = wire_lost_ack_reconnect(0).await.unwrap();
         assert!(correct);
-    }
-
-    #[test]
-    fn terminal_fixture_matches_cross_language_contract() {
-        let payload = TERMINAL_LINE.repeat(TERMINAL_LINES);
-        assert_eq!(payload.len(), 6_912);
-        assert_eq!(
-            &payload[..TERMINAL_LINE.len()],
-            b"\x1b[32mbenchmark output\x1b[0m\r\n"
-        );
     }
 }

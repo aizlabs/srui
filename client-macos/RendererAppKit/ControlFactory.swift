@@ -8,6 +8,53 @@ public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
 }
 
+/// Native button whose pointer feedback is owned entirely by the local renderer (§22.5).
+@MainActor
+final class HoverFeedbackButton: NSButton {
+    private var feedbackTrackingArea: NSTrackingArea?
+    private(set) var isPointerInside = false
+
+    override func updateTrackingAreas() {
+        if let feedbackTrackingArea {
+            removeTrackingArea(feedbackTrackingArea)
+        }
+        super.updateTrackingAreas()
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        feedbackTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        isPointerInside = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        isPointerInside = false
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard isPointerInside, isEnabled else { return }
+        let overlayRect = bounds.insetBy(dx: 1, dy: 1)
+        guard overlayRect.isEmpty == false else { return }
+        NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
+        NSBezierPath(
+            roundedRect: overlayRect,
+            xRadius: 6,
+            yRadius: 6
+        ).fill()
+    }
+}
+
 /// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
 @MainActor
 public final class ActionTrampoline: NSObject {
@@ -217,7 +264,7 @@ public final class ControlFactory {
             result = (scrollView, nil, nil, nil)
 
         case .button:
-            let button = NSButton(title: "Button", target: nil, action: nil)
+            let button = HoverFeedbackButton(title: "Button", target: nil, action: nil)
             button.bezelStyle = .rounded
             let trampoline = ActionTrampoline(nodeID: node.id) { [weak self] interaction in
                 self?.onInteraction?(interaction)

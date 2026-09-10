@@ -48,6 +48,94 @@ struct AppKitRendererTests {
     }
 
     @Test
+    func nativeValueChangeGatesCadenceRasterAndIdleDoesNotRaster() throws {
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 5,
+                nodeType: .progress,
+                parentID: 1,
+                properties: [(.value, .float64(0))]
+            ),
+        ]
+        let renderer = AppKitRenderer()
+        let store = try makeStore(base)
+        try renderer.attach(store: store)
+
+        let root = try #require(
+            renderer.registry.handle(for: 1)?.window?.contentView
+        )
+        let progress = try #require(
+            renderer.registry.view(for: 5) as? NSProgressIndicator
+        )
+        var lastPaintedValue = progress.doubleValue
+
+        func cadenceTick() throws -> Bool {
+            guard progress.doubleValue != lastPaintedValue else {
+                return false
+            }
+            root.layoutSubtreeIfNeeded()
+            let rect = root.bounds.integral
+            let representation = try #require(
+                root.bitmapImageRepForCachingDisplay(in: rect)
+            )
+            root.cacheDisplay(in: rect, to: representation)
+            guard representation.bitmapData != nil else {
+                return false
+            }
+            lastPaintedValue = progress.doubleValue
+            return true
+        }
+
+        #expect(progress.doubleValue == 0)
+        #expect(root.bounds.width > 0)
+        #expect(root.bounds.height > 0)
+
+        let first = SemanticModel.Operation.setProperty(
+            id: 5,
+            property: .value,
+            value: .float64(0.5)
+        )
+        let firstStore = try makeStore(base + [first])
+        try renderer.apply(
+            transaction: Transaction(
+                baseRevision: store.revision,
+                operations: [first]
+            ),
+            newStore: firstStore
+        )
+        #expect(progress.doubleValue == 0.5)
+        #expect(try cadenceTick())
+        #expect(lastPaintedValue == 0.5)
+
+        var repaintCount = 1
+        #expect(try cadenceTick() == false)
+        if try cadenceTick() {
+            repaintCount += 1
+        }
+        #expect(repaintCount == 1, "An idle cadence tick must not rasterize.")
+
+        let second = SemanticModel.Operation.setProperty(
+            id: 5,
+            property: .value,
+            value: .float64(0.75)
+        )
+        let secondStore = try makeStore(base + [first, second])
+        try renderer.apply(
+            transaction: Transaction(
+                baseRevision: firstStore.revision,
+                operations: [second]
+            ),
+            newStore: secondStore
+        )
+        #expect(progress.doubleValue == 0.75)
+        #expect(try cadenceTick())
+        #expect(lastPaintedValue == 0.75)
+        repaintCount += 1
+        #expect(repaintCount == 2)
+        #expect(try cadenceTick() == false)
+    }
+    @Test
     func attachIsIdempotentForTheSameCommittedStore() throws {
         let store = try makeStore([
             .createNode(id: 1, nodeType: .surface),

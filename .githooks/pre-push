@@ -32,7 +32,7 @@ run() {
 
 # --- Registry Validation (CI: job `registry`) --------------------------------
 run "registry: validate_registry.py" uv run python protocol/validate_registry.py
-run "registry: pytest" uv run pytest protocol/tests -q
+run "python: pytest" uv run pytest -q
 
 # --- Rust Build (CI: job `rust`) ---------------------------------------------
 # `--all-targets` compiles tests, benches and examples, so CI's separate `cargo check` adds

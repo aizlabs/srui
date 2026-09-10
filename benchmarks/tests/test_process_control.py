@@ -55,6 +55,39 @@ while not pid_file.exists():
     time.sleep(0.01)
 """
 
+OWNER_CONTROLLER = """
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import process_control
+
+root = Path(sys.argv[4])
+descendant_path = Path(sys.argv[5])
+state_path = Path(sys.argv[6])
+exact_owner = sys.argv[7] == "exact"
+supervisor = process_control.spawn_supervisor(
+    [sys.executable, "-c", sys.argv[2], sys.argv[3], str(descendant_path)],
+    cwd=root,
+    ready_path=root / "owner-ready.json",
+    status_path=root / "owner-status.json",
+    stdout_path=root / "owner-command.stdout",
+    stderr_path=root / "owner-command.stderr",
+    require_exact_owner_identity=exact_owner,
+)
+deadline = time.monotonic() + 5
+while not descendant_path.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit("owner controller descendant did not start")
+    time.sleep(0.01)
+state_path.write_text(
+    f"{supervisor.pid},{descendant_path.read_text(encoding='utf-8')}",
+    encoding="utf-8",
+)
+time.sleep(60)
+"""
+
 
 def wait_for_pid(path: Path) -> int:
     deadline = time.monotonic() + 5
@@ -74,6 +107,17 @@ def assert_process_gone(pid: int) -> None:
             return
         time.sleep(0.02)
     pytest.fail(f"process {pid} survived supervised cleanup")
+
+
+def wait_for_two_pids(path: Path) -> tuple[int, int]:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if path.exists():
+            parts = path.read_text(encoding="utf-8").split(",")
+            if len(parts) == 2:
+                return int(parts[0]), int(parts[1])
+        time.sleep(0.01)
+    raise AssertionError(f"two-PID state file was not written: {path}")
 
 
 def test_process_identity_wait_accepts_numeric_pid_reuse() -> None:
@@ -497,6 +541,181 @@ def test_timeout_reaps_signal_ignoring_process_tree(tmp_path: Path) -> None:
             cleanup_grace_seconds=0.05,
         )
     assert_process_gone(wait_for_pid(pid_file))
+
+def test_runner_refuses_stale_explicit_owner_before_spawning_child(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "startup-race-child.pid"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(process_control.RUNNER),
+            "--owner-pid",
+            str(os.getpid() + 1_000_000),
+            "--ready",
+            str(tmp_path / "startup-ready.json"),
+            "--status",
+            str(tmp_path / "startup-status.json"),
+            "--stdout",
+            str(tmp_path / "startup.stdout"),
+            "--stderr",
+            str(tmp_path / "startup.stderr"),
+            "--",
+            sys.executable,
+            "-c",
+            SLEEPER,
+            str(child_pid_path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        close_fds=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 125
+    assert "owner disappeared or changed identity" in result.stderr
+    assert not child_pid_path.exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin birth identity")
+def test_runner_refuses_live_owner_with_wrong_birth_before_spawning_child(
+    tmp_path: Path,
+) -> None:
+    child_pid_path = tmp_path / "wrong-birth-child.pid"
+    owner_birth = process_control.process_birth_unix_ns(os.getpid())
+    assert owner_birth is not None
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(process_control.RUNNER),
+            "--owner-pid",
+            str(os.getpid()),
+            "--owner-birth-unix-ns",
+            str(owner_birth + 1),
+            "--ready",
+            str(tmp_path / "wrong-birth-ready.json"),
+            "--status",
+            str(tmp_path / "wrong-birth-status.json"),
+            "--stdout",
+            str(tmp_path / "wrong-birth.stdout"),
+            "--stderr",
+            str(tmp_path / "wrong-birth.stderr"),
+            "--",
+            sys.executable,
+            "-c",
+            SLEEPER,
+            str(child_pid_path),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+        close_fds=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 125
+    assert "owner disappeared or changed identity" in result.stderr
+    assert not child_pid_path.exists()
+
+
+@pytest.mark.parametrize(
+    "exact_owner",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin",
+                reason="Darwin birth identity",
+            ),
+        ),
+    ],
+)
+def test_hard_owner_death_reaps_established_sentinel_and_descendant(
+    exact_owner: bool,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "owner-state.txt"
+    descendant_path = tmp_path / "owner-descendant.pid"
+    controller = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            OWNER_CONTROLLER,
+            str(BENCHMARKS),
+            SPAWNER,
+            SLEEPER,
+            str(tmp_path),
+            str(descendant_path),
+            str(state_path),
+            "exact" if exact_owner else "pid-only",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    sentinel_pid: int | None = None
+    descendant_pid: int | None = None
+    try:
+        sentinel_pid, descendant_pid = wait_for_two_pids(state_path)
+        os.kill(controller.pid, signal.SIGKILL)
+        controller.wait(timeout=5)
+        assert_process_gone(sentinel_pid)
+        assert_process_gone(descendant_pid)
+    finally:
+        if controller.poll() is None:
+            controller.kill()
+            controller.wait(timeout=5)
+        for pid in (sentinel_pid, descendant_pid):
+            if pid is not None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+@pytest.mark.parametrize("failed_publication", ["ready", "status"])
+def test_control_publication_failure_keeps_group_pinned_until_tree_is_gone(
+    failed_publication: str,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / f"{failed_publication}-publication-child.pid"
+    ready_path = tmp_path / "ready.json"
+    status_path = tmp_path / "status.json"
+    failed_path = ready_path if failed_publication == "ready" else status_path
+    failed_path.mkdir()
+    command = (
+        [sys.executable, "-c", SLEEPER, str(pid_file)]
+        if failed_publication == "ready"
+        else [sys.executable, "-c", SPAWNER, SLEEPER, str(pid_file)]
+    )
+    supervisor = process_control.spawn_supervisor(
+        command,
+        cwd=tmp_path,
+        ready_path=ready_path,
+        status_path=status_path,
+        stdout_path=tmp_path / "command.stdout",
+        stderr_path=tmp_path / "command.stderr",
+    )
+    child_pid = wait_for_pid(pid_file)
+    time.sleep(0.1)
+    assert supervisor.poll() is None
+
+    _stdout, supervisor_stderr = process_control.terminate_supervised_process(
+        supervisor,
+        grace_seconds=0.05,
+    )
+
+    assert_process_gone(child_pid)
+    assert_process_gone(supervisor.pid)
+    if failed_publication == "status":
+        assert "retaining group pin" in supervisor_stderr
 
 
 class RequestedTermination(BaseException):

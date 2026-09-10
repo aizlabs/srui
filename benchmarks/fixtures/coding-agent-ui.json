@@ -2,6 +2,7 @@
   "name": "coding-agent",
   "description": "Representative §30 coding-agent UI shared by server serialization and macOS rendering benchmarks; extension islands use their standard-profile fallbacks here and are measured directly in §31.6.",
   "extension_islands": ["org.srui.terminal/1", "org.example.diff/1"],
+  "first_paint_node_count": 5,
   "nodes": [
     {"id": 1, "type": "Surface", "properties": {"label": "Remote coding session"}},
     {"id": 2, "type": "Column", "parent": 1},

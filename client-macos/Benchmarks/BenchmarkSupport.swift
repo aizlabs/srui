@@ -83,6 +83,12 @@ enum FixtureValue: Codable, Equatable {
         if case .number(let value) = self { return value }
         return nil
     }
+
+    var stringListValue: [String]? {
+        guard case .list(let values) = self else { return nil }
+        let strings = values.compactMap(\.stringValue)
+        return strings.count == values.count ? strings : nil
+    }
 }
 
 struct Output: Encodable {

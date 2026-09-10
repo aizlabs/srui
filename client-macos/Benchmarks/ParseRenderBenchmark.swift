@@ -133,6 +133,11 @@ func html(for nodes: [FixtureNode]) throws -> String {
         case "Button":
             let disabled = properties["enabled"]?.boolValue == false ? " disabled" : ""
             return "<button\(metadata)\(disabled)>\(escapedHTML(label ?? "Button"))</button>\(descendants)"
+        case "Menu":
+            let options = (properties["items"]?.stringListValue ?? []).map {
+                "<option>\(escapedHTML($0))</option>"
+            }.joined()
+            return "<select\(metadata)\(attribute("aria-label", label))>\(options)</select>\(descendants)"
         case "Separator":
             return "<hr\(metadata)>\(descendants)"
         default:
@@ -247,6 +252,11 @@ func nativeRenderedPropertiesMatch(
             guard let button = handle.view as? NSButton,
                   button.title == (properties["label"]?.stringValue ?? "Button"),
                   button.isEnabled == (properties["enabled"]?.boolValue ?? true) else {
+                return false
+            }
+        case "Menu":
+            guard let menu = handle.view as? NSPopUpButton,
+                  menu.itemTitles == (properties["items"]?.stringListValue ?? []) else {
                 return false
             }
         default:
@@ -433,7 +443,7 @@ func inspectDOM(in webView: WKWebView) async throws -> DOMInspection {
       const expectedTags = {
         Surface: "MAIN", Column: "SECTION", Row: "DIV", Text: "P",
         RichText: "PRE", Progress: "PROGRESS", Tree: "NAV",
-        TextArea: "TEXTAREA", Button: "BUTTON", Separator: "HR"
+        TextArea: "TEXTAREA", Button: "BUTTON", Menu: "SELECT", Separator: "HR"
       };
       const elements = Array.from(document.querySelectorAll("[data-srui-id]"));
       const propertiesFor = (element) => {
@@ -472,6 +482,11 @@ func inspectDOM(in webView: WKWebView) async throws -> DOMInspection {
           case "Button":
             return element.textContent === (properties.label ?? "Button")
               && element.disabled === (properties.enabled === false);
+          case "Menu":
+            return JSON.stringify(Array.from(element.options, (option) => option.text))
+                === JSON.stringify(properties.items ?? [])
+              && (properties.label === undefined
+                || element.getAttribute("aria-label") === properties.label);
           case "Surface":
           case "Column":
           case "Row":
@@ -500,6 +515,7 @@ let webKitHostAllocationMeasurementScope =
 
 struct RendererCandidateResult: Codable {
     let candidate: String
+    let expectedSampleCount: Int
     let firstPaint: [Double]
     let completePaint: [Double]
     let cpuTime: [Double]
@@ -1374,6 +1390,7 @@ func runSRUICandidate(
     let requiredPixelCaptures = fullPaint ? iterations * 2 : 0
     return RendererCandidateResult(
         candidate: "srui",
+        expectedSampleCount: iterations,
         firstPaint: first,
         completePaint: complete,
         cpuTime: cpu,
@@ -2196,6 +2213,7 @@ func runWebCandidate(
     let requiredPixelCaptures = fullPaint ? iterations * 2 : 0
     return RendererCandidateResult(
         candidate: "webkit",
+        expectedSampleCount: iterations,
         firstPaint: first,
         completePaint: complete,
         cpuTime: cpu,
@@ -2676,6 +2694,19 @@ func localRenderer(
         : "WKWebView complete offscreen snapshot fallback"
     let captureAuthorization = srui.captureAuthorization && web.captureAuthorization
 
+    func paintEvidencePassed(_ result: RendererCandidateResult) -> Bool {
+        let expectedPaintCompletions = result.expectedSampleCount * 2
+        return result.expectedSampleCount > 0
+            && result.firstPaint.count == result.expectedSampleCount
+            && result.completePaint.count == result.expectedSampleCount
+            && result.presentationCompletions == expectedPaintCompletions
+            && result.contentPresentationPassed
+            && (!fullPaint || (
+                result.captureAuthorization
+                    && result.pixelCaptureCompletions == expectedPaintCompletions
+            ))
+    }
+
     let section = Section(
         id: "31.1",
         name: "Local renderer",
@@ -2894,19 +2925,21 @@ func localRenderer(
             Assertion(
                 id: "semantic_representation_parity",
                 name: "representative fixture preserves exact parent, type, and property semantics",
-                passed: srui.semanticParityPassed
+                passed: srui.renderedNodeCount == fixture.nodes.count
+                    && web.renderedNodeCount == fixture.nodes.count
+                    && srui.semanticParityPassed
                     && srui.elementKindsPassed
                     && web.semanticParityPassed
                     && web.elementKindsPassed,
-                detail: "\(srui.renderedNodeCount) native store nodes and rendered control values plus \(web.renderedNodeCount) DOM nodes/elements/rendered properties matched exact fixture records"
+                detail: "expected=\(fixture.nodes.count), native=\(srui.renderedNodeCount) semantic=\(srui.semanticParityPassed) controls=\(srui.elementKindsPassed), WebKit=\(web.renderedNodeCount) semantic=\(web.semanticParityPassed) elements-and-properties=\(web.elementKindsPassed)"
             ),
             Assertion(
                 id: "paint_completion_observed",
                 name: fullPaint
                     ? "candidate production state reaches a verified composited target-pixel frame"
                     : "candidate content draw completes in the offscreen raster fallback",
-                passed: srui.succeeded && web.succeeded,
-                detail: "\(srui.presentationCompletions) native and \(web.presentationCompletions) WebKit completions; native content: \(srui.contentPresentationDetail); WebKit content: \(web.contentPresentationDetail); \(srui.paintCompletionMode); \(web.paintCompletionMode)"
+                passed: paintEvidencePassed(srui) && paintEvidencePassed(web),
+                detail: "native presentations=\(srui.presentationCompletions)/\(srui.expectedSampleCount * 2), pixels=\(srui.pixelCaptureCompletions), authorized=\(srui.captureAuthorization), content=\(srui.contentPresentationDetail); WebKit presentations=\(web.presentationCompletions)/\(web.expectedSampleCount * 2), pixels=\(web.pixelCaptureCompletions), authorized=\(web.captureAuthorization), content=\(web.contentPresentationDetail); \(srui.paintCompletionMode); \(web.paintCompletionMode)"
             ),
             Assertion(
                 id: "webkit_helpers_attributed",

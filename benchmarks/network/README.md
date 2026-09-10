@@ -18,10 +18,20 @@ remain mandatory. This is not a Dock, owner, pointer, or cursor whitelist:
 nonzero-alpha surface ahead—including a WindowServer cursor or `loginwindow`—still rejects the
 sample.
 
-Untimed preparation puts the passive host at a deterministic left-side position, requires
-identical exact WindowServer identity and geometry across 300 ms, and waits up to 10 seconds for a
-genuinely clear z-order instead of accepting or whitelisting a transient surface. It then starts
-ScreenCaptureKit and obtains a complete-frame baseline for the exact visible target-control ROI.
+Before untimed preparation, the full section saves the exact Quartz pointer location and parks it
+at `display.maxX - 160` and the display's vertical midpoint; it restores the original location
+on exit, including failure. The deterministic host is left-side, so the interior right-side park
+stays outside the measured target without entering Dock, menu-bar, or hot-corner edge activation
+zones. Because pointer relocation can nevertheless start the retraction of a previously activated
+Dock or menu surface, exact `.optionOnScreenOnly` WindowServer identity acquisition has a
+bounded 10-second untimed settling window. A separate 10-second geometry deadline must contain
+identical exact WindowServer identity, window bounds, and client-content ROI observations spaced
+300 ms apart. Preparation independently waits up to 10 seconds for a genuinely clear z-order
+instead of accepting or whitelisting a transient surface. The extended geometry deadline
+accommodates slow AppKit/WindowServer settling observed while cycling the 600 ms RTT case; it does
+not move the later action-start or display-latency boundaries. A timeout reports the prepared
+AppKit frame and current WindowServer entry fields. Only after these checks does the harness start
+ScreenCaptureKit and obtain a complete-frame baseline for the exact visible target-control ROI.
 Only after that baseline and its pre-action recheck succeed does the harness start the real
 `BenchmarkTransport` injected response, verify that every nonzero RTT has an active delayed
 operation, and begin the timed local action. Frames delivered while that action is still running

@@ -664,48 +664,6 @@ func progressiveContentEvidenceCheck(
         detail: "full composited client-content proof: first=\(String(firstEvidence.normalizedFingerprintSHA256.prefix(16))) complete=\(String(completeEvidence.normalizedFingerprintSHA256.prefix(16))) dimensions=\(firstEvidence.pixelWidth)x\(firstEvidence.pixelHeight)/\(completeEvidence.pixelWidth)x\(completeEvidence.pixelHeight) unmasked=\(firstEvidence.unmaskedPixelCount)/\(completeEvidence.unmaskedPixelCount) quantized-colors=\(firstEvidence.distinctQuantizedColorCount)/\(completeEvidence.distinctQuantizedColorCount) non-dominant=\(firstEvidence.nonDominantPixelCount)/\(completeEvidence.nonDominantPixelCount) nonblank-and-nonuniform=\(usefulContent) material-pixels=\(contentDelta?.materiallyDifferentPixelCount ?? -1)/\(contentDelta?.requiredMaterialPixelCount ?? 8) max-channel-delta=\(contentDelta?.maximumChannelDelta ?? -1)/255 tolerance=\(benchmarkStreamCaptureChannelTolerance)/255 materially-distinct=\(distinctContent) same-geometry-and-normalization=\(sameGeometry) provenance=\(first.visibilityProvenance)/\(complete.visibilityProvenance)"
     )
 }
-@MainActor
-private func parkBenchmarkPointerAtDisplayEdge(
-    on screen: NSScreen
-) throws -> CGPoint {
-    guard let screenNumber = screen.deviceDescription[
-        NSDeviceDescriptionKey("NSScreenNumber")
-    ] as? NSNumber,
-          let currentEvent = CGEvent(source: nil) else {
-        throw BenchmarkFailure.message(
-            "renderer benchmark could not resolve the pointer or display identity"
-        )
-    }
-    let displayID = CGDirectDisplayID(screenNumber.uint32Value)
-    let displayBounds = CGDisplayBounds(displayID)
-    let parkedLocation = CGPoint(
-        x: displayBounds.minX + 2,
-        y: displayBounds.midY
-    )
-    guard CGWarpMouseCursorPosition(parkedLocation) == .success else {
-        throw BenchmarkFailure.message(
-            "renderer benchmark could not park the pointer outside the paint ROI"
-        )
-    }
-
-    let deadline = Date().addingTimeInterval(1)
-    let expectedAppKitX = screen.frame.minX + 2
-    while abs(NSEvent.mouseLocation.x - expectedAppKitX) > 8,
-          Date() < deadline {
-        pumpRunLoop(for: 0.01)
-    }
-    guard abs(NSEvent.mouseLocation.x - expectedAppKitX) <= 8 else {
-        _ = CGWarpMouseCursorPosition(currentEvent.location)
-        throw BenchmarkFailure.message(
-            "WindowServer did not move the pointer to the prepared display edge"
-        )
-    }
-    return currentEvent.location
-}
-
-private func restoreBenchmarkPointer(_ location: CGPoint) {
-    _ = CGWarpMouseCursorPosition(location)
-}
 
 @MainActor
 private func positionRendererWindowAwayFromPointer(
@@ -2607,12 +2565,13 @@ func localRenderer(
 ) throws -> LocalRendererResult {
     let fullPaint = profile == "full"
     let originalPointerLocation = fullPaint
-        ? try parkBenchmarkPointerAtDisplayEdge(
-            on: try benchmarkMainScreen()
+        ? try benchmarkParkPointerOutsideMeasurementROI(
+            on: try benchmarkMainScreen(),
+            side: .left
         ) : nil
     defer {
         if let originalPointerLocation {
-            restoreBenchmarkPointer(originalPointerLocation)
+            benchmarkRestorePointer(originalPointerLocation)
         }
     }
 

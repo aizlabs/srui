@@ -629,6 +629,65 @@ private func benchmarkIsolatedHostWindowLevel() throws -> NSWindow.Level {
     }
     return NSWindow.Level(rawValue: statusLevel)
 }
+enum BenchmarkPointerParkingSide {
+    case left
+    case right
+}
+
+@MainActor
+func benchmarkParkPointerOutsideMeasurementROI(
+    on screen: NSScreen,
+    side: BenchmarkPointerParkingSide
+) throws -> CGPoint {
+    guard let screenNumber = screen.deviceDescription[
+        NSDeviceDescriptionKey("NSScreenNumber")
+    ] as? NSNumber,
+          let currentEvent = CGEvent(source: nil) else {
+        throw BenchmarkFailure.message(
+            "benchmark could not resolve the pointer or display identity"
+        )
+    }
+    let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+    let displayBounds = CGDisplayBounds(displayID)
+    // Stay clear of the measurement ROI without touching macOS activation
+    // edges used by the auto-hidden Dock, menu bar, and hot corners.
+    let horizontalInset: CGFloat = 160
+    let parkedX = switch side {
+    case .left:
+        displayBounds.minX + horizontalInset
+    case .right:
+        displayBounds.maxX - horizontalInset
+    }
+    let parkedLocation = CGPoint(x: parkedX, y: displayBounds.midY)
+    guard CGWarpMouseCursorPosition(parkedLocation) == .success else {
+        throw BenchmarkFailure.message(
+            "benchmark could not park the pointer outside the measurement ROI"
+        )
+    }
+
+    let expectedAppKitX = switch side {
+    case .left:
+        screen.frame.minX + horizontalInset
+    case .right:
+        screen.frame.maxX - horizontalInset
+    }
+    let deadline = Date().addingTimeInterval(1)
+    while abs(NSEvent.mouseLocation.x - expectedAppKitX) > 8,
+          Date() < deadline {
+        pumpRunLoop(for: 0.01)
+    }
+    guard abs(NSEvent.mouseLocation.x - expectedAppKitX) <= 8 else {
+        _ = CGWarpMouseCursorPosition(currentEvent.location)
+        throw BenchmarkFailure.message(
+            "WindowServer did not move the pointer to the prepared interior position"
+        )
+    }
+    return currentEvent.location
+}
+
+func benchmarkRestorePointer(_ location: CGPoint) {
+    _ = CGWarpMouseCursorPosition(location)
+}
 
 private func windowServerNonzeroAlphaIntersectionAbove(
     _ evidence: BenchmarkWindowServerEvidence
@@ -2544,7 +2603,10 @@ private func benchmarkPrepareExactVisibleWindow(
     }
 
     func awaitExactEvidence() async throws -> BenchmarkWindowServerEvidence {
-        let deadline = Date().addingTimeInterval(2)
+        // Pointer relocation can start an untimed Dock/menu-bar retraction.
+        // Give WindowServer the same bounded settling window used by the
+        // subsequent clear-z-order proof; the timed action has not begun.
+        let deadline = Date().addingTimeInterval(10)
         var evidence = exactWindowServerEvidence(for: window, on: screen)
         while (window.isVisible == false || evidence == nil), Date() < deadline {
             submitUntimedWindow()
@@ -2587,7 +2649,7 @@ private func benchmarkPrepareExactVisibleWindow(
     // final client rectangle. Require the same exact identity and geometry
     // across 300 ms—longer than an ordinary AppKit opening transition—before
     // starting the baseline stream. The timed action begins only afterwards.
-    let stableGeometryDeadline = Date().addingTimeInterval(2)
+    let stableGeometryDeadline = Date().addingTimeInterval(10)
     var clientContentBounds: CGRect?
     while clientContentBounds == nil, Date() < stableGeometryDeadline {
         guard let candidateEvidence = exactWindowServerEvidence(
@@ -2622,7 +2684,10 @@ private func benchmarkPrepareExactVisibleWindow(
     }
     guard let clientContentBounds else {
         throw BenchmarkFailure.message(
-            "prepared window never reached exact final client geometry"
+            "prepared window never reached exact final client geometry within "
+                + "the untimed 10-second settling deadline: "
+                + "window_frame=\(window.frame) "
+                + benchmarkWindowServerEntryDiagnostic(for: window)
         )
     }
     // Transient system progress or shielding surfaces can legitimately

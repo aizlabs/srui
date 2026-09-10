@@ -41,13 +41,23 @@ on-screen proof. WindowServer may omit the redundant optional `kCGWindowIsOnscre
 field, so its absence is not treated as missing evidence. Exact window ID, owner PID, resolved
 layer, alpha, bounds, display, client-content geometry, and target geometry remain mandatory.
 
-Passive hosts use a deterministic untimed left-side placement, require stable exact geometry across
-300 ms, and wait up to 10 seconds for a genuinely clear z-order before capture. For full §31.1,
-the parent driver saves the pointer location, parks it two pixels inside the measured display edge
-before starting either candidate subprocess, and restores the saved location after both candidates
-or on failure. This happens outside the children's timed intervals. Each hidden native or WebKit
-window then chooses the visible-frame corner farthest from the parked pointer with 64 points of
-clearance before it is ordered.
+Full passive §31.3, §31.4, and §31.6 runs save the exact Quartz pointer location, park it at
+`display.maxX - 160` and the display's vertical midpoint, and restore it on section exit,
+including failure. Their deterministic host is left-side, so this interior right-side point stays
+outside the target while avoiding Dock, menu-bar, and hot-corner edge activation zones. Pointer
+relocation can still start the retraction of an already activated Dock or menu surface. Untimed
+preparation therefore allows up to 10 seconds to acquire the exact `.optionOnScreenOnly`
+WindowServer identity. A separate 10-second geometry-settling deadline must contain two identical
+observations of that exact identity, window bounds, and client-content ROI spaced 300 ms apart.
+Preparation then allows up to 10 seconds for a genuinely clear z-order before capture. A geometry
+timeout reports the prepared AppKit frame and current WindowServer entry fields.
+
+Full §31.1 instead parks the saved pointer at `display.minX + 160` and the vertical midpoint
+before starting either candidate subprocess, then restores it after both candidates or on failure.
+That interior position remains outside the right-corner 960-point renderer ROI. This preparation
+happens outside the children's timed intervals. Each hidden native or WebKit window then chooses
+the visible-frame corner farthest from the parked pointer with 64 points of clearance before it is
+ordered.
 
 These placements are not owner, Dock, pointer, or cursor whitelists. `kCGWindowAlpha` is
 whole-window metadata, not per-pixel opacity, and every intersecting nonzero-alpha surface
@@ -205,10 +215,16 @@ schema.
   threshold. WebKit enforces that prior-state comparison while selecting its complete frame, so a
   stale partially populated surface remains ineligible. SHA-256 fingerprints are diagnostics, not
   the distinctness predicate.
-- Full passive mutation/local-interaction preparation uses deterministic placement, stable exact
-  geometry, and an untimed clear-z-order wait before starting ScreenCaptureKit. It then obtains a
-  complete-frame baseline for the exact visible target-control ROI and ignores frames through
-  action completion. A later frame is eligible only when geometry is identical, content remains
+- Full passive mutation/local-interaction/terminal preparation saves and parks the pointer at
+  `display.maxX - 160`, uses deterministic left-side placement, permits bounded untimed
+  WindowServer settling, requires stable exact geometry, and waits for a clear z-order before
+  starting ScreenCaptureKit. Exact `.optionOnScreenOnly` identity acquisition, the geometry
+  interval, and clear-z-order acquisition each have a 10-second bound because pointer relocation
+  can initiate Dock/menu retraction. Geometry still requires identical exact identity, bounds, and
+  client-content ROI across 300 ms. The original pointer location is restored on exit. It then
+  obtains a complete-frame baseline for the exact visible target-control ROI and ignores frames
+  through action completion. These untimed bounds do not change the action or latency boundary. A
+  later frame is eligible only when geometry is identical, content remains
   nonblank/nonuniform, and at least eight unmasked ROI pixels have any RGBA channel change greater
   than the explicit 2/255 SCStream tolerance. Latency uses action-start Mach ticks through that
   frame's `SCStreamFrameInfo.displayTime`; callback receipt is verifier metadata. Exact window,

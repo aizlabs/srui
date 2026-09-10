@@ -251,6 +251,29 @@ struct BenchmarkDriver {
             operations: fixtureOperations
         ).canonicalBytes
 
+        var passivePointerOriginalLocation: CGPoint?
+        func preparePointerForPassiveMeasurement() throws {
+            guard fullPaint,
+                  passivePointerOriginalLocation == nil else {
+                return
+            }
+            guard let screen = NSScreen.main else {
+                throw BenchmarkFailure.message(
+                    "full passive benchmark requires a main display"
+                )
+            }
+            passivePointerOriginalLocation =
+                try benchmarkParkPointerOutsideMeasurementROI(
+                    on: screen,
+                    side: .right
+                )
+        }
+        defer {
+            if let passivePointerOriginalLocation {
+                benchmarkRestorePointer(passivePointerOriginalLocation)
+            }
+        }
+
         var sections = [Section]()
         var rendererProcessAttribution = [RendererProcessAttribution]()
         if arguments.onlySection == nil || arguments.onlySection == "31.1" {
@@ -263,6 +286,7 @@ struct BenchmarkDriver {
             rendererProcessAttribution = result.attributions
         }
         if arguments.onlySection == nil || arguments.onlySection == "31.3" {
+            try preparePointerForPassiveMeasurement()
             sections.append(
                 try await mutationAndCadence(
                     fixtureOperations: fixtureOperations,
@@ -272,6 +296,7 @@ struct BenchmarkDriver {
             )
         }
         if arguments.onlySection == nil || arguments.onlySection == "31.4" {
+            try preparePointerForPassiveMeasurement()
             sections.append(
                 try await networkAndLocalInteraction(
                     fixtureOperations: fixtureOperations,
@@ -289,6 +314,7 @@ struct BenchmarkDriver {
             )
         }
         if arguments.onlySection == nil || arguments.onlySection == "31.6" {
+            try preparePointerForPassiveMeasurement()
             sections.append(
                 try await terminal(
                     iterations: max(10, iterations),

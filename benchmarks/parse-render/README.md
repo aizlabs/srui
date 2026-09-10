@@ -24,12 +24,14 @@ periodic footprint sampler is never alive during the CPU/allocation pass.
 
 Smoke mode observes separate real offscreen AppKit bitmap rasters and WKSnapshot outputs for the
 first and complete states; it does not claim compositor-visible paint. Before full-mode candidate
-subprocesses start, the parent driver records the pointer location and parks it two pixels inside
-the measured display's left edge. It restores the original location after both candidates, or
-during failure unwinding. This parent-side preparation is outside every timed child interval.
-While hidden, each native or WebKit candidate window then selects the visible-frame corner farthest
-from the parked pointer and requires 64 points of clearance. The pointer and WindowServer cursor
-surface are not whitelisted: no clear corner, or any reported intersecting nonzero-alpha surface
+subprocesses start, the parent driver records the exact Quartz pointer location and parks it at
+`display.minX + 160` and the measured display's vertical midpoint. That interior location avoids
+the auto-hidden Dock, menu-bar, and hot-corner activation zones while remaining outside the
+right-corner 960-point renderer ROI. The driver restores the original Quartz location after both
+candidates, or during failure unwinding. This parent-side preparation is outside every timed child
+interval. While hidden, each native or WebKit candidate window then selects the visible-frame
+corner farthest from the parked pointer and requires 64 points of clearance. The pointer and WindowServer
+cursor surface are not whitelisted: no clear corner, or any reported intersecting nonzero-alpha surface
 ahead, fails closed.
 
 Full mode prepares its ScreenCaptureKit stream and baseline before starting the workload. The
@@ -75,9 +77,10 @@ display, client-content geometry, and target geometry remain required. The host 
 report the resolved status layer, and menu evidence must report the independently resolved pop-up
 layer above it.
 
-The parent-side pointer park makes a cursor-free corner available to the 960×720 renderer window
-and is restored after the candidate subprocesses. The hidden renderer-window placement avoids the
-parked cursor geometrically; it does not remove a cursor entry from the z-order inventory.
+The parent-side interior pointer park avoids edge-triggered system windows and makes a cursor-free
+right corner available to the 960×720 renderer window; the exact prior Quartz location is restored
+after the candidate subprocesses. The hidden renderer-window placement avoids the parked cursor
+geometrically; it does not remove a cursor entry from the z-order inventory.
 Candidate-frame and post-comparison checks still reject any intersecting nonzero-alpha window
 ahead.
 

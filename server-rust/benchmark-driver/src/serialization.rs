@@ -32,6 +32,11 @@ fn json_to_value(value: &JsonValue) -> Result<Value, String> {
             .as_f64()
             .map(Value::from)
             .ok_or_else(|| "fixture number is not representable as f64".to_string()),
+        JsonValue::Array(values) => values
+            .iter()
+            .map(json_to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
         other => Err(format!("unsupported fixture value: {other}")),
     }
 }

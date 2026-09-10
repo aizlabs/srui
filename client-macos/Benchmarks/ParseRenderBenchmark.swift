@@ -61,7 +61,7 @@ struct ParityNode: Codable, Equatable {
     let id: UInt64
     let type: String
     let parent: UInt64?
-    let properties: [String: JSONScalar]
+    let properties: [String: FixtureValue]
 }
 
 struct DOMInspection: Decodable {
@@ -85,7 +85,7 @@ func fixtureParityNodes(_ nodes: [FixtureNode]) -> [ParityNode] {
     }.sorted { $0.id < $1.id }
 }
 
-func encodedProperties(_ properties: [String: JSONScalar]) throws -> String {
+func encodedProperties(_ properties: [String: FixtureValue]) throws -> String {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     return try encoder.encode(properties).base64EncodedString()

@@ -28,13 +28,14 @@ struct FixtureNode: Decodable {
     let id: UInt64
     let type: String
     let parent: UInt64?
-    let properties: [String: JSONScalar]?
+    let properties: [String: FixtureValue]?
 }
 
-enum JSONScalar: Codable, Equatable {
+enum FixtureValue: Codable, Equatable {
     case string(String)
     case bool(Bool)
     case number(Double)
+    case list([FixtureValue])
 
     init(from decoder: any Swift.Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -42,6 +43,8 @@ enum JSONScalar: Codable, Equatable {
             self = .bool(value)
         } else if let value = try? container.decode(Double.self) {
             self = .number(value)
+        } else if let value = try? container.decode([FixtureValue].self) {
+            self = .list(value)
         } else {
             self = .string(try container.decode(String.self))
         }
@@ -53,6 +56,7 @@ enum JSONScalar: Codable, Equatable {
         case .string(let value): try container.encode(value)
         case .bool(let value): try container.encode(value)
         case .number(let value): try container.encode(value)
+        case .list(let value): try container.encode(value)
         }
     }
 
@@ -61,6 +65,7 @@ enum JSONScalar: Codable, Equatable {
         case .string(let value): .string(value)
         case .bool(let value): .bool(value)
         case .number(let value): .float64(value)
+        case .list(let value): .list(value.map(\.semanticValue))
         }
     }
 

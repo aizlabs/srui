@@ -6,12 +6,15 @@ runs framed traffic through the production `SessionController` transport boundar
 caret movement, selection, marked-text IME composition, scrolling, hover, pressed feedback, and
 menu opening. Local control updates and server-dependent feedback are timed independently.
 
-Task 34 exposed a prerequisite renderer gap: stock `NSButton` did not provide a stable visible
-hover transition for the production Button path. `RendererAppKit.ControlFactory` now constructs
-its internal `HoverFeedbackButton`, and `ControlFactoryTests` proves enter changes its raster and
-exit restores it. This is an explicit production local-feedback correction under §22.5, not a
-benchmark-only control or forced invalidation in the timed observer; the measured subject includes
-that correction.
+Task 34 exposed two prerequisite renderer gaps. Stock `NSButton` did not provide a stable visible
+hover transition for the production Button path, so `RendererAppKit.ControlFactory` now constructs
+its internal `HoverFeedbackButton`; `ControlFactoryTests` proves enter changes its raster and exit
+restores it. The canonical semantic fixture now also contains a `Menu` node with inline `.items`,
+which `ControlFactory` mounts as an `NSPopUpButton`; the menu-opening trial presents that exact
+renderer-owned `NSMenu` instead of constructing benchmark-only menu state. Its production test
+proves initial item materialization, incremental replacement, and clearing. These are explicit
+production local-feedback prerequisites under §22.5, not forced invalidations in the timed
+observer; the measured subject includes both corrections.
 
 In full mode, the harness resolves `CGWindowLevelForKey(.dockWindow)`,
 `CGWindowLevelForKey(.statusWindow)`, `CGWindowLevelForKey(.popUpMenuWindow)`, and

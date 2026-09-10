@@ -21,7 +21,8 @@
     {"id": 15, "type": "Row", "parent": 8},
     {"id": 16, "type": "Button", "parent": 15, "properties": {"label": "Approve", "enabled": true}},
     {"id": 17, "type": "Button", "parent": 15, "properties": {"label": "Reject", "enabled": true}},
-    {"id": 18, "type": "Separator", "parent": 2},
+    {"id": 21, "type": "Menu", "parent": 15, "properties": {"label": "Actions", "items": ["One", "Two", "Three"]}},
+    {"id": 18, "type": "Separator", "parent": 2, "properties": {}},
     {"id": 19, "type": "Text", "parent": 2, "properties": {"text": "Activity"}},
     {"id": 20, "type": "Text", "parent": 2, "properties": {"text": "27 tests passed"}}
   ]

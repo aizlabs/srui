@@ -263,6 +263,8 @@ func localInteractionSamples(
     let textView = rendererTextView(renderer)
     let textScroll = (textHandle?.view as? NSScrollView) ?? textView?.enclosingScrollView
     let button = renderer.registry.view(for: NodeId(16)) as? NSButton
+    let menuControl = renderer.registry.view(for: NodeId(21)) as? NSPopUpButton
+    let semanticMenu = menuControl?.menu
     let surface = renderer.registry.handle(for: NodeId(1))
     let window = surface?.window
     let host = window?.contentView
@@ -270,6 +272,9 @@ func localInteractionSamples(
     guard let textView,
           let textScroll,
           let button,
+          let menuControl,
+          let semanticMenu,
+          semanticMenu.items.isEmpty == false,
           let window,
           let host,
           let productionHandler else {
@@ -277,6 +282,7 @@ func localInteractionSamples(
             "representative native interaction controls did not mount: "
                 + "text_handle=\(textHandle != nil), text_view=\(textView != nil), "
                 + "text_scroll=\(textScroll != nil), button=\(button != nil), "
+                + "semantic_menu=\(semanticMenu?.items.isEmpty == false), "
                 + "surface=\(surface != nil), window=\(window != nil), "
                 + "host=\(host != nil), production_handler=\(productionHandler != nil)"
         )
@@ -294,7 +300,6 @@ func localInteractionSamples(
     }
     host.layoutSubtreeIfNeeded()
     textView.frame.size.height = max(textView.frame.height, 5_000)
-    let previousMenu = button.menu
 
     var callbackCount = 0
     var textEditCallbacks = [LocalTextEditCallback]()
@@ -314,7 +319,7 @@ func localInteractionSamples(
     }
     defer {
         renderer.onInteraction = productionHandler
-        button.menu = previousMenu
+        semanticMenu.delegate = nil
     }
 
     var samples = [String: [Double]]()
@@ -614,16 +619,8 @@ func localInteractionSamples(
         )
     }
     for index in 0..<iterations {
-        let menu = NSMenu(title: "Benchmark local menu")
-        for title in ["One", "Two", "Three"] {
-            menu.addItem(
-                withTitle: title,
-                action: nil,
-                keyEquivalent: ""
-            )
-        }
+        let menu = semanticMenu
         let menuProbe = SmokeMenuTrackingProbe()
-        button.menu = menu
 
         benchmarkTrace(
             "31.4 rtt=\(rttMilliseconds) menu_opening start"
@@ -642,10 +639,10 @@ func localInteractionSamples(
                             menu,
                             positioningItem: menu.items.first,
                             at: NSPoint(
-                                x: button.bounds.minX,
-                                y: button.bounds.maxY
+                                x: menuControl.bounds.minX,
+                                y: menuControl.bounds.maxY
                             ),
-                            in: button,
+                            in: menuControl,
                             onActionStarting: startInjection
                         )
                     menuOpened += 1
@@ -676,10 +673,10 @@ func localInteractionSamples(
                     _ = menu.popUp(
                         positioning: menu.items.first,
                         at: NSPoint(
-                            x: button.bounds.minX,
-                            y: button.bounds.maxY
+                            x: menuControl.bounds.minX,
+                            y: menuControl.bounds.maxY
                         ),
-                        in: button
+                        in: menuControl
                     )
                     menuOpened += 1
                     if let observedAt = menuProbe.observedAt {
@@ -709,7 +706,6 @@ func localInteractionSamples(
             nonzeroDelayActiveAtActionStartProbeCount += 1
         }
         heldResponseProbeCount += 1
-        button.menu = previousMenu
         menu.delegate = nil
         benchmarkTrace(
             "31.4 rtt=\(rttMilliseconds) menu_opening end"

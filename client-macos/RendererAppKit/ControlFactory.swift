@@ -360,6 +360,11 @@ public final class ControlFactory {
             let outline = makeOutline(for: node, store: store)
             result = (outline.0, outline.1, outline.2, nil)
 
+        case .menu:
+            let popUp = NSPopUpButton(frame: .zero, pullsDown: false)
+            popUp.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
+            result = (popUp, nil, nil, nil)
+
         default:
             throw ControlFactoryError.unsupportedNodeType(node.nodeType)
         }
@@ -539,7 +544,14 @@ public final class ControlFactory {
             applyResourceProperty(value?.asResourceHash, to: handle)
 
         case .items, .modelRef, .columns, .selectionMode:
-            if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+            if property == .items,
+               handle.nodeType == .menu,
+               let popUp = handle.view as? NSPopUpButton {
+                popUp.removeAllItems()
+                popUp.addItems(
+                    withTitles: value?.asList?.compactMap { $0.asString } ?? []
+                )
+            } else if let adapter = handle.modelAdapter as? TableCollectionAdapter,
                let tableView = tableView(in: handle) {
                 if property == .columns {
                     let colStrings = value?.asList?.compactMap { $0.asString }

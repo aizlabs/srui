@@ -28,7 +28,7 @@ private let controlFactoryRequiredTierTypes: [TypeRef] = [
 
 private let controlFactoryUnsupportedTypes: [TypeRef] = [
     .dialog, .select, .choiceGroup, .slider, .numberInput,
-    .tabs, .split, .menu, .toolbar,
+    .tabs, .split, .toolbar,
 ]
 
 @MainActor
@@ -310,6 +310,41 @@ struct ControlFactoryTests {
         if let adapter = handle.modelAdapter as? TableCollectionAdapter {
             #expect(adapter.rows.isEmpty)
         }
+    }
+
+    @Test
+    func semanticMenuCreatesAndUpdatesRendererOwnedPopup() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(
+            for: Node(
+                id: 21,
+                nodeType: .menu,
+                properties: [
+                    .label: .string("Actions"),
+                    .items: .list([
+                        .string("One"),
+                        .string("Two"),
+                        .string("Three"),
+                    ]),
+                ]
+            )
+        )
+        let popUp = try #require(handle.view as? NSPopUpButton)
+
+        #expect(handle.nodeType == .menu)
+        #expect(handle.accessibilityMetadata.label == "Actions")
+        #expect(popUp.itemTitles == ["One", "Two", "Three"])
+        #expect(popUp.menu?.items.map(\.title) == ["One", "Two", "Three"])
+
+        factory.apply(
+            property: .items,
+            value: .list([.string("Updated")]),
+            to: handle
+        )
+        #expect(popUp.itemTitles == ["Updated"])
+
+        factory.apply(property: .items, value: nil, to: handle)
+        #expect(popUp.numberOfItems == 0)
     }
 
     @Test

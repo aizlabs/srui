@@ -56,6 +56,18 @@ def artifact(digest: str = "a" * 64) -> dict[str, Any]:
     }
 
 
+def window_isolation_assertion() -> dict[str, Any]:
+    return {
+        "id": "window_isolation_fail_closed",
+        "name": "WindowServer isolation rejects an exact synthetic occluder",
+        "passed": True,
+        "detail": (
+            "window isolation self-test passed: dock=20 status=25 ahead=26 "
+            "popup=101 target=123 occluder=124"
+        ),
+    }
+
+
 def valid_allocation_summary(sample_count: int = 1) -> dict[str, Any]:
     readiness = "darwin_notification"
     measurement_mode = "equivalent_exact_process_role_passes"
@@ -551,6 +563,7 @@ def valid_report() -> dict[str, Any]:
             "passed": True,
         }
     )
+    sections["31.1"]["assertions"].append(window_isolation_assertion())
     artifacts["macos"]["allocation_capture"] = allocation_artifact
     for item in allocation_artifact["candidate_totals"]:
         sections["31.1"]["sample_counts"][
@@ -1806,6 +1819,182 @@ def test_dynamic_local_frame_budget_controls_every_local_p50_target() -> None:
         benchmark_run.validate_driver_output(payload, driver)
 
 
+def test_window_isolation_report_assertion_is_full_profile_only() -> None:
+    assertion_id = benchmark_run.WINDOW_ISOLATION_ASSERTION_ID
+    assert assertion_id in benchmark_run.EXPECTED_REPORT_INVENTORY["31.1"][
+        "assertions"
+    ]
+    assert assertion_id in benchmark_run.expected_report_inventory_for_profile(
+        "31.1", "full"
+    )["assertions"]
+    assert assertion_id not in benchmark_run.expected_report_inventory_for_profile(
+        "31.1", "smoke"
+    )["assertions"]
+
+
+def test_window_isolation_self_test_parses_exact_evidence() -> None:
+    line = (
+        "window isolation self-test passed: dock=20 status=25 ahead=26 "
+        "popup=101 target=123 occluder=124"
+    )
+    assert benchmark_run.parse_window_isolation_self_test_output(
+        "unrelated stdout\n",
+        f"unrelated stderr\n{line}\n",
+    ) == {
+        "dock": 20,
+        "status": 25,
+        "ahead": 26,
+        "popup": 101,
+        "target": 123,
+        "occluder": 124,
+    }
+
+
+def test_window_isolation_self_test_rejects_malformed_or_duplicate_lines() -> None:
+    malformed = (
+        "window isolation self-test passed: dock=20 status=25 ahead=26 "
+        "popup=101 target=abc occluder=124"
+    )
+    with pytest.raises(benchmark_run.BenchmarkError, match="malformed result line"):
+        benchmark_run.parse_window_isolation_self_test_output("", malformed)
+
+    valid = (
+        "window isolation self-test passed: dock=20 status=25 ahead=26 "
+        "popup=101 target=123 occluder=124"
+    )
+    with pytest.raises(benchmark_run.BenchmarkError, match="exactly one result line"):
+        benchmark_run.parse_window_isolation_self_test_output(valid, valid)
+
+
+def test_window_isolation_self_test_rejects_invalid_level_order() -> None:
+    line = (
+        "window isolation self-test passed: dock=20 status=25 ahead=101 "
+        "popup=101 target=123 occluder=124"
+    )
+    with pytest.raises(benchmark_run.BenchmarkError, match="invalid level ordering"):
+        benchmark_run.parse_window_isolation_self_test_output("", line)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ("target=0 occluder=124", "target=123 occluder=123"),
+)
+def test_window_isolation_self_test_rejects_invalid_window_identity(
+    identity: str,
+) -> None:
+    line = (
+        "window isolation self-test passed: dock=20 status=25 ahead=26 "
+        f"popup=101 {identity}"
+    )
+    with pytest.raises(
+        benchmark_run.BenchmarkError,
+        match="distinct positive window IDs",
+    ):
+        benchmark_run.parse_window_isolation_self_test_output("", line)
+
+
+def test_window_isolation_self_test_invokes_built_release_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "client-macos/.build/release/BenchmarkDriver"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"binary")
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text("{}", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    output_path: Path | None = None
+
+    def fake_command(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        nonlocal output_path
+        calls.append((command, kwargs))
+        output_path = Path(command[command.index("--output") + 1])
+        assert output_path.is_file()
+        return SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr=(
+                "window isolation self-test passed: dock=20 status=25 ahead=26 "
+                "popup=101 target=123 occluder=124\n"
+            ),
+            child_pid=42,
+        )
+
+    monkeypatch.setattr(benchmark_run, "ROOT", tmp_path)
+    monkeypatch.setattr(benchmark_run, "run_managed_command", fake_command)
+    monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
+
+    assertion = benchmark_run.run_window_isolation_self_test(fixture, 17)
+    assert assertion == window_isolation_assertion()
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[:4] == [
+        "/usr/bin/env",
+        "SRUI_BENCHMARK_PHASES=1",
+        "SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST=1",
+        str(binary),
+    ]
+    assert command[4:8] == [
+        "--fixture",
+        str(fixture),
+        "--profile",
+        "full",
+    ]
+    assert command[8] == "--output"
+    assert kwargs["cwd"] == tmp_path
+    assert kwargs["timeout"] == 17
+    assert kwargs["label"] == "window isolation self-test"
+    assert output_path is not None
+    assert not output_path.exists()
+
+
+def test_main_runs_window_isolation_after_normal_macos_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    manifest = valid_manifest()
+    fixture = tmp_path / manifest["fixture"]
+    fixture.parent.mkdir(parents=True)
+    fixture.write_text("{}", encoding="utf-8")
+    manifest_path = tmp_path / "benchmarks/manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    events: list[str] = []
+
+    def fake_driver(
+        driver: dict[str, Any],
+        _fixture: Path,
+        profile: str,
+        _timeout: int,
+    ) -> dict[str, Any]:
+        events.append(f"driver:{driver['name']}")
+        return payload_for_driver(driver, profile=profile)
+
+    def stop_after_self_test(_fixture: Path, timeout: int) -> dict[str, Any]:
+        events.append(f"self-test:{timeout}")
+        raise benchmark_run.BenchmarkError("self-test sentinel")
+
+    monkeypatch.setattr(benchmark_run, "ROOT", tmp_path)
+    monkeypatch.setattr(benchmark_run, "MANIFEST", manifest_path)
+    monkeypatch.setattr(benchmark_run.sys, "platform", "darwin")
+    monkeypatch.setattr(benchmark_run, "validate_allocation_capture_host", lambda: None)
+    monkeypatch.setattr(benchmark_run, "ensure_free_space", lambda _path: None)
+    monkeypatch.setattr(
+        benchmark_run,
+        "benchmark_environment",
+        lambda: valid_report()["environment"],
+    )
+    monkeypatch.setattr(benchmark_run, "run_driver", fake_driver)
+    monkeypatch.setattr(
+        benchmark_run,
+        "run_window_isolation_self_test",
+        stop_after_self_test,
+    )
+
+    with pytest.raises(benchmark_run.BenchmarkError, match="self-test sentinel"):
+        benchmark_run.main(["--profile", "full", "--timeout", "120"])
+    assert events == ["driver:rust", "driver:macos", "self-test:30"]
+
+
 def test_run_driver_waits_for_exact_attributed_process_identities(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2152,6 +2341,11 @@ def test_full_failed_run_leaves_existing_baseline_untouched(
         lambda: None,
     )
     monkeypatch.setattr(benchmark_run, "run_driver", fake_driver)
+    monkeypatch.setattr(
+        benchmark_run,
+        "run_window_isolation_self_test",
+        lambda _fixture, _timeout: window_isolation_assertion(),
+    )
     monkeypatch.setattr(
         benchmark_run,
         "benchmark_environment",

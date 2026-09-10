@@ -625,29 +625,151 @@ func progressiveContentEvidenceCheck(
           first.pixelCaptureVerified,
           complete.pixelCaptureVerified,
           let firstEvidence = first.compositedContentEvidence,
-          let completeEvidence = complete.compositedContentEvidence else {
+          let completeEvidence = complete.compositedContentEvidence,
+          let firstNormalization =
+              first.compositedContentNormalization,
+          let completeNormalization =
+              complete.compositedContentNormalization else {
         return ProgressiveContentEvidenceCheck(
             passed: false,
-            detail: "full-paint observation lacked authorized composited client-content evidence; first provenance=\(first.visibilityProvenance), complete provenance=\(complete.visibilityProvenance)"
+            detail: "full-paint observation lacked authorized normalized composited client-content evidence; first provenance=\(first.visibilityProvenance), complete provenance=\(complete.visibilityProvenance)"
         )
     }
     let sameGeometry =
         firstEvidence.pixelWidth == completeEvidence.pixelWidth
             && firstEvidence.pixelHeight == completeEvidence.pixelHeight
-            && firstEvidence.unmaskedPixelCount == completeEvidence.unmaskedPixelCount
+            && firstEvidence.unmaskedPixelCount
+                == completeEvidence.unmaskedPixelCount
+            && firstNormalization == completeNormalization
     let usefulContent =
         firstEvidence.hasNonblankContent
             && firstEvidence.hasNonuniformContent
             && completeEvidence.hasNonblankContent
             && completeEvidence.hasNonuniformContent
+    let contentDelta = sameGeometry
+        ? benchmarkCompositedDeltaEvidence(
+            completeEvidence,
+            firstEvidence,
+            normalization: completeNormalization,
+            channelTolerance: benchmarkStreamCaptureChannelTolerance
+        ) : nil
     let distinctContent =
-        firstEvidence.normalizedFingerprintSHA256
-            != completeEvidence.normalizedFingerprintSHA256
+        contentDelta.map {
+            $0.materiallyDifferentPixelCount
+                >= $0.requiredMaterialPixelCount
+        } ?? false
     let passed = sameGeometry && usefulContent && distinctContent
     return ProgressiveContentEvidenceCheck(
         passed: passed,
-        detail: "full composited client-content proof: first=\(String(firstEvidence.normalizedFingerprintSHA256.prefix(16))) complete=\(String(completeEvidence.normalizedFingerprintSHA256.prefix(16))) dimensions=\(firstEvidence.pixelWidth)x\(firstEvidence.pixelHeight)/\(completeEvidence.pixelWidth)x\(completeEvidence.pixelHeight) unmasked=\(firstEvidence.unmaskedPixelCount)/\(completeEvidence.unmaskedPixelCount) quantized-colors=\(firstEvidence.distinctQuantizedColorCount)/\(completeEvidence.distinctQuantizedColorCount) non-dominant=\(firstEvidence.nonDominantPixelCount)/\(completeEvidence.nonDominantPixelCount) nonblank-and-nonuniform=\(usefulContent) distinct=\(distinctContent) same-geometry=\(sameGeometry) provenance=\(first.visibilityProvenance)/\(complete.visibilityProvenance)"
+        detail: "full composited client-content proof: first=\(String(firstEvidence.normalizedFingerprintSHA256.prefix(16))) complete=\(String(completeEvidence.normalizedFingerprintSHA256.prefix(16))) dimensions=\(firstEvidence.pixelWidth)x\(firstEvidence.pixelHeight)/\(completeEvidence.pixelWidth)x\(completeEvidence.pixelHeight) unmasked=\(firstEvidence.unmaskedPixelCount)/\(completeEvidence.unmaskedPixelCount) quantized-colors=\(firstEvidence.distinctQuantizedColorCount)/\(completeEvidence.distinctQuantizedColorCount) non-dominant=\(firstEvidence.nonDominantPixelCount)/\(completeEvidence.nonDominantPixelCount) nonblank-and-nonuniform=\(usefulContent) material-pixels=\(contentDelta?.materiallyDifferentPixelCount ?? -1)/\(contentDelta?.requiredMaterialPixelCount ?? 8) max-channel-delta=\(contentDelta?.maximumChannelDelta ?? -1)/255 tolerance=\(benchmarkStreamCaptureChannelTolerance)/255 materially-distinct=\(distinctContent) same-geometry-and-normalization=\(sameGeometry) provenance=\(first.visibilityProvenance)/\(complete.visibilityProvenance)"
     )
+}
+@MainActor
+private func parkBenchmarkPointerAtDisplayEdge(
+    on screen: NSScreen
+) throws -> CGPoint {
+    guard let screenNumber = screen.deviceDescription[
+        NSDeviceDescriptionKey("NSScreenNumber")
+    ] as? NSNumber,
+          let currentEvent = CGEvent(source: nil) else {
+        throw BenchmarkFailure.message(
+            "renderer benchmark could not resolve the pointer or display identity"
+        )
+    }
+    let displayID = CGDirectDisplayID(screenNumber.uint32Value)
+    let displayBounds = CGDisplayBounds(displayID)
+    let parkedLocation = CGPoint(
+        x: displayBounds.minX + 2,
+        y: displayBounds.midY
+    )
+    guard CGWarpMouseCursorPosition(parkedLocation) == .success else {
+        throw BenchmarkFailure.message(
+            "renderer benchmark could not park the pointer outside the paint ROI"
+        )
+    }
+
+    let deadline = Date().addingTimeInterval(1)
+    let expectedAppKitX = screen.frame.minX + 2
+    while abs(NSEvent.mouseLocation.x - expectedAppKitX) > 8,
+          Date() < deadline {
+        pumpRunLoop(for: 0.01)
+    }
+    guard abs(NSEvent.mouseLocation.x - expectedAppKitX) <= 8 else {
+        _ = CGWarpMouseCursorPosition(currentEvent.location)
+        throw BenchmarkFailure.message(
+            "WindowServer did not move the pointer to the prepared display edge"
+        )
+    }
+    return currentEvent.location
+}
+
+private func restoreBenchmarkPointer(_ location: CGPoint) {
+    _ = CGWarpMouseCursorPosition(location)
+}
+
+@MainActor
+private func positionRendererWindowAwayFromPointer(
+    _ window: NSWindow,
+    on screen: NSScreen
+) throws {
+    let visibleFrame = screen.visibleFrame
+    let windowSize = window.frame.size
+    let edgeInset: CGFloat = 16
+    let cursorClearance: CGFloat = 64
+
+    guard windowSize.width + (edgeInset * 2) <= visibleFrame.width,
+          windowSize.height + (edgeInset * 2) <= visibleFrame.height else {
+        throw BenchmarkFailure.message(
+            "renderer benchmark window does not fit inside the main display's visible frame"
+        )
+    }
+
+    let minX = visibleFrame.minX + edgeInset
+    let maxX = visibleFrame.maxX - edgeInset - windowSize.width
+    let minY = visibleFrame.minY + edgeInset
+    let maxY = visibleFrame.maxY - edgeInset - windowSize.height
+    let candidates = [
+        NSRect(origin: NSPoint(x: minX, y: minY), size: windowSize),
+        NSRect(origin: NSPoint(x: minX, y: maxY), size: windowSize),
+        NSRect(origin: NSPoint(x: maxX, y: minY), size: windowSize),
+        NSRect(origin: NSPoint(x: maxX, y: maxY), size: windowSize),
+    ]
+    let pointer = NSEvent.mouseLocation
+
+    func squaredDistance(from point: NSPoint, to rect: NSRect) -> CGFloat {
+        let dx = max(max(rect.minX - point.x, 0), point.x - rect.maxX)
+        let dy = max(max(rect.minY - point.y, 0), point.y - rect.maxY)
+        return (dx * dx) + (dy * dy)
+    }
+
+    guard let chosenFrame = candidates.max(by: {
+        squaredDistance(
+            from: pointer,
+            to: $0.insetBy(dx: -cursorClearance, dy: -cursorClearance)
+        ) < squaredDistance(
+            from: pointer,
+            to: $1.insetBy(dx: -cursorClearance, dy: -cursorClearance)
+        )
+    }) else {
+        throw BenchmarkFailure.message(
+            "renderer benchmark could not select a cursor-free window position"
+        )
+    }
+
+    let protectedFrame =
+        chosenFrame.insetBy(dx: -cursorClearance, dy: -cursorClearance)
+    guard protectedFrame.contains(pointer) == false else {
+        throw BenchmarkFailure.message(
+            "pointer overlaps every candidate renderer position; move the pointer near a display edge and rerun"
+        )
+    }
+
+    window.setFrameOrigin(chosenFrame.origin)
+    guard visibleFrame.contains(window.frame) else {
+        throw BenchmarkFailure.message(
+            "AppKit moved the renderer benchmark window outside the main display's visible frame"
+        )
+    }
 }
 
 @MainActor
@@ -658,8 +780,10 @@ func configureNativeBenchmarkGeometry(_ renderer: AppKitRenderer) throws {
             "representative native fixture must mount exactly one surface window"
         )
     }
+    let screen = try benchmarkMainScreen()
     for window in windows {
         window.setContentSize(NSSize(width: 960, height: 720))
+        try positionRendererWindowAwayFromPointer(window, on: screen)
         window.contentView?.layoutSubtreeIfNeeded()
     }
 }
@@ -967,7 +1091,9 @@ func runSRUICandidate(
                 var measuredStore: SemanticStore?
                 let measurement =
                     try await benchmarkMeasureExplicitCompositedPaint(
-                        on: try benchmarkMainScreen()
+                        on: try benchmarkMainScreen(),
+                        requiredContentChangeFromObservation:
+                            firstObservation
                     ) {
                         let candidateStore = try applyNativeCompleteState(
                             plan: plan,
@@ -1362,7 +1488,9 @@ private func loadAndObserveWebStates(
     window: NSWindow,
     probe: NavigationProbe,
     states: [WebDOMLoadRequest],
-    fullPaint: Bool
+    fullPaint: Bool,
+    requiredContentChangeFromObservation:
+        OnScreenPaintObservation? = nil
 ) async throws -> WebPaintMeasurement {
     guard states.isEmpty == false else {
         throw BenchmarkFailure.message(
@@ -1375,9 +1503,13 @@ private func loadAndObserveWebStates(
                 "WebKit explicit paint must begin with a hidden window"
             )
         }
+        let screen = try benchmarkMainScreen()
+        try positionRendererWindowAwayFromPointer(window, on: screen)
         let measurement =
             try await benchmarkMeasureExplicitCompositedPaint(
-                on: try benchmarkMainScreen()
+                on: screen,
+                requiredContentChangeFromObservation:
+                    requiredContentChangeFromObservation
             ) {
                 for state in states {
                     try await loadWebDOMState(
@@ -1631,7 +1763,9 @@ func runWebCandidate(
                 window: window,
                 probe: probe,
                 states: completeVisualStates,
-                fullPaint: fullPaint
+                fullPaint: fullPaint,
+                requiredContentChangeFromObservation:
+                    firstObservation
             )
         let completeObservation = completeMeasurement.observation
         complete.append(
@@ -2471,9 +2605,27 @@ func localRenderer(
     fixtureURL: URL,
     profile: String
 ) throws -> LocalRendererResult {
-    let srui = try runCandidateSubprocess(name: "srui", fixture: fixtureURL, profile: profile)
-    let web = try runCandidateSubprocess(name: "webkit", fixture: fixtureURL, profile: profile)
     let fullPaint = profile == "full"
+    let originalPointerLocation = fullPaint
+        ? try parkBenchmarkPointerAtDisplayEdge(
+            on: try benchmarkMainScreen()
+        ) : nil
+    defer {
+        if let originalPointerLocation {
+            restoreBenchmarkPointer(originalPointerLocation)
+        }
+    }
+
+    let srui = try runCandidateSubprocess(
+        name: "srui",
+        fixture: fixtureURL,
+        profile: profile
+    )
+    let web = try runCandidateSubprocess(
+        name: "webkit",
+        fixture: fixtureURL,
+        profile: profile
+    )
     let nativeFirstName = fullPaint
         ? "SRUI first on-screen paint crossing display refresh"
         : "SRUI first offscreen raster fallback"

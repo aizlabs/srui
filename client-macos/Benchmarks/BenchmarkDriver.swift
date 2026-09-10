@@ -166,6 +166,21 @@ struct BenchmarkDriver {
         let iterations = arguments.profile == "full" ? 20 : 3
         let fullPaint = arguments.profile == "full"
 
+        if ProcessInfo.processInfo.environment[
+            "SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST"
+        ] == "1" {
+            guard fullPaint else {
+                throw BenchmarkFailure.message(
+                    "window-isolation self-test requires --profile full"
+                )
+            }
+            try await benchmarkVerifyWindowServerIsolation()
+            // This diagnostic intentionally exits before any benchmark
+            // measurement so its temporary windows and activation state cannot
+            // contaminate renderer timing or pixels.
+            return
+        }
+
         if let candidate = arguments.candidate {
             if ProcessInfo.processInfo.environment[
                 "SRUI_BENCHMARK_FORCE_CANDIDATE_INTERNAL_FAILURE"

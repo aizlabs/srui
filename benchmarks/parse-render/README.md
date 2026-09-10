@@ -23,19 +23,34 @@ decode/load, apply, render, and display-submission work, but start no ScreenCapt
 periodic footprint sampler is never alive during the CPU/allocation pass.
 
 Smoke mode observes separate real offscreen AppKit bitmap rasters and WKSnapshot outputs for the
-first and complete states; it does not claim compositor-visible paint. Full mode prepares its
-ScreenCaptureKit stream and baseline before starting the workload. The complete first-state or
-two-state production workload runs while the target window remains hidden; the capture helper then
-performs the sole window ordering and accepts the first later complete display frame that proves
-the exact target. A refresh that races ahead of WindowServer publication is rejected and does not
-become a false failure or timestamp. The reported visual latency is calculated from the Mach
-action-start timestamp to the accepted frame's ScreenCaptureKit display timestamp, not callback
-receipt or later image verification. The exact target-view crop must be visible, unobscured,
-changed from its same-stream baseline, nonblank, and nonuniform. First and complete captures must
-have equal normalized geometry and unmasked pixel count but different normalized fingerprints.
-Exact semantic/control/DOM state is then checked on that same measured renderer or WebView
-instance. Full mode fails closed if capture authorization or any evidence is unavailable; the suite
-never opens a permission prompt.
+first and complete states; it does not claim compositor-visible paint. Before full-mode candidate
+subprocesses start, the parent driver records the pointer location and parks it two pixels inside
+the measured display's left edge. It restores the original location after both candidates, or
+during failure unwinding. This parent-side preparation is outside every timed child interval.
+While hidden, each native or WebKit candidate window then selects the visible-frame corner farthest
+from the parked pointer and requires 64 points of clearance. The pointer and WindowServer cursor
+surface are not whitelisted: no clear corner, or any reported intersecting nonzero-alpha surface
+ahead, fails closed.
+
+Full mode prepares its ScreenCaptureKit stream and baseline before starting the workload. The
+complete first-state or two-state production workload runs while the target window remains hidden;
+the capture helper performs the sole window ordering and accepts a later complete display frame
+only after proving the exact target. A refresh that races ahead of WindowServer publication is
+rejected and does not become a false failure or timestamp. The reported visual latency is
+calculated from the Mach action-start timestamp to the accepted frame's ScreenCaptureKit display
+timestamp, not callback receipt or later image verification.
+
+The exact target-view crop must be visible, unobscured, nonblank, nonuniform, and materially
+different from its same-stream baseline: at least eight normalized pixels must have any RGBA
+channel delta greater than the explicit 2/255 tolerance. The accepted first and complete captures
+must have equal normalization and geometry, and at least eight normalized pixels must also exceed
+that threshold between those two states. WebKit applies this first-state comparison while selecting
+the complete frame, leaving the stream armed when a stale partial surface is observed. SHA-256
+fingerprints remain in evidence details for diagnosis only; raw hash inequality is not the
+distinctness criterion. Exact semantic/control/DOM state is then checked on that same measured
+renderer or WebView instance. Full mode fails closed if capture authorization or any evidence is
+unavailable; the suite never opens a permission prompt.
+
 Focused driver command:
 
     client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.1 --output /tmp/srui-31.1.json
@@ -45,6 +60,60 @@ The renderer metric set includes `srui.first_paint`, `srui.complete_paint`, `sru
 `webkit.*` comparison-control metrics. Xctrace contributes separately measured
 interval-created-and-still-live allocation counts and bytes. Do not describe those xctrace values
 as cumulative allocations: allocations freed before trace finalization are absent.
+
+## Full-mode compositor isolation and evidence chain
+
+Full-mode host windows use the level returned at runtime by
+`CGWindowLevelForKey(.statusWindow)`; the benchmark does not depend on numeric level constants.
+It also resolves `.dockWindow`, `.popUpMenuWindow`, and `.screenSaverWindow` and
+refuses to measure unless `dock < status < popup < screen-saver`. The status stratum isolates
+the host from the Dock-owned desktop surface while keeping it below the production `NSMenu`
+surface. Exact WindowServer inventories use `.optionOnScreenOnly`; membership in that filtered
+result is the on-screen proof even when WindowServer omits the redundant optional
+`kCGWindowIsOnscreen` dictionary field. Exact identity, owner, resolved layer, alpha, bounds,
+display, client-content geometry, and target geometry remain required. The host evidence must
+report the resolved status layer, and menu evidence must report the independently resolved pop-up
+layer above it.
+
+The parent-side pointer park makes a cursor-free corner available to the 960×720 renderer window
+and is restored after the candidate subprocesses. The hidden renderer-window placement avoids the
+parked cursor geometrically; it does not remove a cursor entry from the z-order inventory.
+Candidate-frame and post-comparison checks still reject any intersecting nonzero-alpha window
+ahead.
+
+The ScreenCaptureKit paint-evidence path is:
+
+1. Start a display stream and accept a complete pre-action baseline.
+2. Run the production decode/apply/render workload while the target host is hidden.
+3. Arm a Mach display-time cutoff immediately before the sole order-front submission.
+4. For each later complete frame, derive the exact target window identity, resolved status layer,
+   display, bounds, client-content rectangle, and target-view crop from AppKit and WindowServer.
+5. Reject the frame if any on-screen, nonzero-alpha window ahead intersects the target; then require
+   nonblank/nonuniform content and at least eight normalized pixels with any RGBA channel delta
+   greater than 2/255 versus the same-frame baseline crop.
+6. Requery identity, geometry, crop, and z-order after the pixel comparison and accept only if they
+   remain unchanged. Visible latency ends at that frame's ScreenCaptureKit
+   `SCStreamFrameInfo.displayTime`, not callback receipt.
+
+`kCGWindowAlpha` is the compositor's whole-window alpha metadata, not a per-pixel opacity map. In
+particular, a full-display Dock-owned surface can report alpha 1 while its target-area pixels are
+transparent. Treating owner `Dock` or alpha 1 as pixel coverage would be false evidence, so the
+suite has no Dock, owner-name, or window-number exception. Raising the host only to the dynamically
+resolved status stratum removes that surface from the ahead set; every remaining intersecting
+nonzero-alpha entry still rejects the sample. This includes `loginwindow` or other shielding
+surfaces, so an inactive or locked session remains a hard failure.
+
+Xctrace is an independent allocation-evidence path, not the source of the paint timestamp. The
+harness copies the release driver into a token-owned private workspace, ad-hoc signs only that copy
+with `com.apple.security.get-task-allow=true`, launches the candidate, and identifies every
+measured host/helper by PID plus Darwin process birth time. It attaches the Allocations template,
+waits for xctrace's requested Darwin recording-start notification before releasing the candidate,
+records the candidate's published wall-clock interval, stops and finalizes the trace, exports the
+TOC-advertised `Statistics` and `Allocations List` details, reconciles them exactly, and then
+selects live List rows whose allocation timestamps fall within the measured interval, including
+the documented clock-boundary bounds. The report merges these allocation results with the native
+driver's ScreenCaptureKit results only after both evidence paths validate; it never infers one from
+the other.
 
 ## Reference tool and export contract
 
@@ -232,9 +301,11 @@ Use this order; each check answers a different question:
 3. Keep the logged-in desktop unlocked and visible. `scripts/run-benchmarks` wraps the macOS run in
    `caffeinate -d -i -u`, which wakes an online display and prevents idle sleep only for the
    runner's lifetime. It cannot unlock the session. If `CGDisplayIsActive` is false,
-   ScreenCaptureKit can legitimately publish zero displays; if opaque `loginwindow` surfaces
-   cover the display, the exact z-order proof must fail rather than claiming content hidden behind
-   the lock screen.
+   ScreenCaptureKit can legitimately publish zero displays. Full-mode hosts use the dynamically
+   resolved status level only after proving `dock < status < popup`; this is compositor isolation,
+   not permission to cover secure UI. Any intersecting, nonzero-alpha `loginwindow` or other
+   ahead surface still makes the exact z-order proof fail rather than claiming content hidden
+   behind the lock screen.
 4. Inspect the staged target with
    `codesign -d --entitlements :- STAGED_BENCHMARK_DRIVER`. “Target is not debuggable,” inability
    to acquire the task port, or exit before the recording-start notification points to signing or

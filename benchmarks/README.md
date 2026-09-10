@@ -20,27 +20,61 @@ Correctness failures make the command fail. Performance misses remain successful
 are called out as follow-up work when they exceed a §23 target by more than 2x. Reports also fail
 closed unless they record the exact chip, physical RAM, Xcode, Swift, Rust, Git commit, and Git
 dirty state. Every driver publishes named sample-count groups, including one-shot boundary probes;
-the runner requires each count to equal the selected smoke/full profile before merging or recording
+the runner requires each count to equal the selected smoke/full profile before merging or recording.
+
 Full mode increases repetitions and requires native/WebKit presentation completion plus exact
 ScreenCaptureKit client-content evidence. On macOS, `scripts/run-benchmarks` runs the suite under
 a lifetime-bounded `caffeinate -d -i -u` assertion: it wakes an online display and prevents idle
 display/system sleep while the benchmark owns the process. It does not bypass a locked login
 session or Screen Recording authorization. The responsible Codex or terminal app must already have
 Screen Recording permission; the suite checks authorization and fails without prompting. This is
-separate from the Developer Tools permission used by xctrace below. Record a reviewed,
-machine-specific baseline only with:
-    scripts/run-benchmarks --profile full
+separate from the Developer Tools permission used by xctrace below.
 
-Full mode increases repetitions and requires native/WebKit presentation completion plus exact
-ScreenCaptureKit client-content evidence. The responsible Codex or terminal app must already have
-Screen Recording permission; the suite checks authorization and fails without prompting. This is
-separate from the Developer Tools permission used by xctrace below. Record a reviewed,
-machine-specific baseline only with:
+Every full-mode benchmark host resolves its WindowServer stratum at runtime with
+`CGWindowLevelForKey(.statusWindow)`. Before ordering the host, the driver resolves
+`.dockWindow`, `.statusWindow`, `.popUpMenuWindow`, and
+`.screenSaverWindow` and requires `dock < status < popup < screen-saver`. This puts the
+evidence window above the Dock-owned desktop surface that can otherwise precede it in the window
+list while keeping it below real AppKit pop-up menus. Exact target and z-order inventories use
+`CGWindowListCopyWindowInfo(.optionOnScreenOnly, ...)`; membership in that filtered result is the
+on-screen proof. WindowServer may omit the redundant optional `kCGWindowIsOnscreen` dictionary
+field, so its absence is not treated as missing evidence. Exact window ID, owner PID, resolved
+layer, alpha, bounds, display, client-content geometry, and target geometry remain mandatory.
+
+Passive hosts use a deterministic untimed left-side placement, require stable exact geometry across
+300 ms, and wait up to 10 seconds for a genuinely clear z-order before capture. For full §31.1,
+the parent driver saves the pointer location, parks it two pixels inside the measured display edge
+before starting either candidate subprocess, and restores the saved location after both candidates
+or on failure. This happens outside the children's timed intervals. Each hidden native or WebKit
+window then chooses the visible-frame corner farthest from the parked pointer with 64 points of
+clearance before it is ordered.
+
+These placements are not owner, Dock, pointer, or cursor whitelists. `kCGWindowAlpha` is
+whole-window metadata, not per-pixel opacity, and every intersecting nonzero-alpha surface
+ahead—including a WindowServer cursor or `loginwindow` shield—still makes timed, pre-action,
+accepted-frame, post-action, and restoration checks fail closed.
+
+A standalone diagnostic proves both sides with real overlapping opaque windows: a Dock-level
+window must remain below the status host, while the same exact window at `status + 1` must be
+rejected by WindowServer ID and layer:
+
+    env SRUI_BENCHMARK_PHASES=1 SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST=1 client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --output /tmp/srui-window-isolation-unused.json --profile full
+
+The diagnostic exits before running benchmark sections, so its temporary windows and activation
+state cannot contaminate reported timing or pixels; the required output argument is intentionally
+unused.
+
+ScreenCaptureKit and xctrace are separate evidence paths. ScreenCaptureKit supplies the exact
+composited frame, WindowServer identity/geometry, target pixels, and display timestamp used for
+visible latency. Xctrace attaches to exact PID/process-birth identities and supplies the
+allocation rows reconciled below. Neither path is treated as proof for the other.
+
+Record a reviewed, machine-specific baseline only with:
 
     scripts/run-benchmarks --profile full --record-baseline
 
-The runner rejects baseline recording from smoke mode and refuses to overwrite the committed
-baseline until every correctness assertion passes. The committed-baseline check applies the same
+Do not replace the committed baseline until every correctness assertion passes. The
+committed-baseline check applies the same
 full-profile and recordability gate.
 
 The representative coding-agent state is benchmarks/fixtures/coding-agent-ui.json. Its declared
@@ -161,18 +195,30 @@ schema.
 ## Measurement policy
 
 - Smoke paint uses deterministic offscreen presentation and is safe for unattended runs.
-- Full first/complete paint starts ScreenCaptureKit before the production action, keeps the target
-  hidden through decode/load, apply, and geometry, then performs one animation-free order-front
-  submission. It accepts the first later complete frame that proves exact target identity,
-  client/target geometry, unobscured z-order, and changed nonblank/nonuniform target pixels.
-- Full passive mutation/local-interaction timing starts ScreenCaptureKit before the action, obtains
-  a complete-frame baseline for the exact visible target-control ROI, ignores frames through action
-  completion, and accepts only a later complete frame with identical pixel geometry and a changed
-  nonblank/nonuniform ROI. Latency uses action-start Mach ticks through that frame's
-  `SCStreamFrameInfo.displayTime`; callback receipt is retained only as verifier metadata. Exact
-  window, client-content, target geometry, display, ownership, and z-order are rechecked.
-- Full menu timing detects a new current-process popup-level WindowServer surface, verifies its exact
-  crop in the same frame, and likewise uses its display timestamp before cancelling menu tracking.
+- Full first/complete paint parks and later restores the pointer in the parent process, starts
+  ScreenCaptureKit before the production child action, keeps the target hidden through decode/load,
+  apply, and geometry, then performs one animation-free order-front submission. A frame is eligible
+  only after exact target identity, client/target geometry, unobscured z-order, nonblank/nonuniform
+  pixels, and at least eight normalized ROI pixels with any RGBA channel delta greater than the
+  explicit 2/255 tolerance versus the same-stream baseline are proven. The full result separately
+  requires the accepted complete state to differ from the accepted first state by the same material
+  threshold. WebKit enforces that prior-state comparison while selecting its complete frame, so a
+  stale partially populated surface remains ineligible. SHA-256 fingerprints are diagnostics, not
+  the distinctness predicate.
+- Full passive mutation/local-interaction preparation uses deterministic placement, stable exact
+  geometry, and an untimed clear-z-order wait before starting ScreenCaptureKit. It then obtains a
+  complete-frame baseline for the exact visible target-control ROI and ignores frames through
+  action completion. A later frame is eligible only when geometry is identical, content remains
+  nonblank/nonuniform, and at least eight unmasked ROI pixels have any RGBA channel change greater
+  than the explicit 2/255 SCStream tolerance. Latency uses action-start Mach ticks through that
+  frame's `SCStreamFrameInfo.displayTime`; callback receipt is verifier metadata. Exact window,
+  client-content, target geometry, display, ownership, and z-order are checked before and after.
+  Hover additionally compares same-API ScreenCaptureKit screenshots taken before the action and
+  after `mouseExited`; restoration requires zero unmasked pixels with any channel delta greater
+  than 5/255, and the report publishes the maximum observed restoration channel delta.
+- Full menu timing detects a new current-process popup-level WindowServer surface, verifies its
+  exact crop in the same frame, and likewise uses its display timestamp before cancelling menu
+  tracking.
 - p50/p95/p99 values use deterministic nearest-index selection over native-driver samples.
 - Wire byte and message counts come from the protocol transport tap, not estimates.
 - For each 1/100/1,000-update case, the same pre-encoded one-operation transaction sequence is

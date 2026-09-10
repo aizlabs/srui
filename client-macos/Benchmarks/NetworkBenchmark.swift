@@ -21,7 +21,10 @@ struct LocalTextEditCallback {
 struct LocalInteractionResult {
     let samples: [String: [Double]]
     let stateChecksPassed: Bool
+    let stateCheckFailures: [String]
     let everyInjectedResponseUnfinishedThroughVisibleCompletion: Bool
+    let everyConfiguredDelayStateVerifiedAtActionStart: Bool
+    let nonzeroDelayActiveAtActionStartProbeCount: Int
     let heldResponseProbeCount: Int
     let productionCallbacks: Int
     let textEditCallbacks: [LocalTextEditCallback]
@@ -79,13 +82,22 @@ func rendererTextView(_ renderer: AppKitRenderer) -> NSTextView? {
     return (handle.view as? NSScrollView)?.documentView as? NSTextView
 }
 
+struct HeldInjectedResponseProof {
+    let responseUnfinishedThroughVisibleCompletion: Bool
+    let configuredDelayStateVerifiedAtActionStart: Bool
+    let nonzeroDelayActiveAtActionStart: Bool
+}
+
 @MainActor
 func withHeldInjectedResponse(
     rttMilliseconds: Int,
     controller: SessionController,
     transport: BenchmarkTransport,
-    body: @MainActor () async throws -> Void
-) async throws -> Bool {
+    body: @MainActor (
+        _ startInjection:
+            @escaping @MainActor () async throws -> Void
+    ) async throws -> Void
+) async throws -> HeldInjectedResponseProof {
     let baseRevision = controller.applier.lastAppliedRevision
     let nextRevision = Revision(baseRevision.value + 1)
     let progress = Double(nextRevision.value % 100) / 100.0
@@ -101,29 +113,69 @@ func withHeldInjectedResponse(
     )
     let responseFrame = try framed(transactionMessage(response))
     let deliveryGate = BenchmarkDeliveryGate()
-    benchmarkTrace("31.4 rtt=\(rttMilliseconds) held receive start")
-    let receiveTask = Task {
-        try await transport.injectFromServer(
-            responseFrame,
-            deliveryGate: deliveryGate
+    var receiveTask: Task<Void, Error>?
+    var configuredDelayStateVerifiedAtActionStart = false
+    var nonzeroDelayActiveAtActionStart = false
+
+    let startInjection: @MainActor () async throws -> Void = {
+        guard receiveTask == nil else {
+            throw BenchmarkFailure.message(
+                "held response injection started more than once"
+            )
+        }
+        benchmarkTrace(
+            "31.4 rtt=\(rttMilliseconds) held receive start at action boundary"
         )
-    }
-    do {
+        let task = Task {
+            try await transport.injectFromServer(
+                responseFrame,
+                deliveryGate: deliveryGate
+            )
+        }
+        receiveTask = task
         try await waitUntil {
             await deliveryGate.snapshot().started
         }
-        try await body()
+        let delaySnapshot = await transport.snapshot()
+        if rttMilliseconds == 0 {
+            configuredDelayStateVerifiedAtActionStart =
+                delaySnapshot.activeDelayedOperations == 0
+        } else {
+            nonzeroDelayActiveAtActionStart =
+                delaySnapshot.activeDelayedOperations > 0
+            configuredDelayStateVerifiedAtActionStart =
+                nonzeroDelayActiveAtActionStart
+        }
+    }
+
+    do {
+        try await body(startInjection)
+        guard let receiveTask else {
+            throw BenchmarkFailure.message(
+                "held response injection never reached the action boundary"
+            )
+        }
         benchmarkTrace("31.4 rtt=\(rttMilliseconds) held body end")
         let visibleSnapshot = await deliveryGate.snapshot()
         await deliveryGate.release()
         try await receiveTask.value
         try await waitForRevision(nextRevision, controller: controller)
         benchmarkTrace("31.4 rtt=\(rttMilliseconds) held receive end")
-        return visibleSnapshot.started && visibleSnapshot.finished == false
+        return HeldInjectedResponseProof(
+            responseUnfinishedThroughVisibleCompletion:
+                visibleSnapshot.started
+                    && visibleSnapshot.finished == false,
+            configuredDelayStateVerifiedAtActionStart:
+                configuredDelayStateVerifiedAtActionStart,
+            nonzeroDelayActiveAtActionStart:
+                nonzeroDelayActiveAtActionStart
+        )
     } catch {
-        receiveTask.cancel()
+        receiveTask?.cancel()
         await deliveryGate.release()
-        _ = try? await receiveTask.value
+        if let receiveTask {
+            _ = try? await receiveTask.value
+        }
         throw error
     }
 }
@@ -267,36 +319,57 @@ func localInteractionSamples(
 
     var samples = [String: [Double]]()
     var checks = true
+    var stateCheckFailures = [String]()
     var everyInjectedResponseUnfinishedThroughVisibleCompletion = true
+    var everyConfiguredDelayStateVerifiedAtActionStart = true
+    var nonzeroDelayActiveAtActionStartProbeCount = 0
     var heldResponseProbeCount = 0
     var menuOpened = 0
-    var hoverVisualChanges = 0
+    var hoverCompletedCompositedCycles = 0
+    var hoverActionMaterialPixelCounts = [Int]()
+    var hoverRestorationMaximumChannelDeltas = [Int]()
 
     func record(
         _ id: String,
         targetView: NSView,
+        requiresExactCompositedRestoration: Bool = false,
         action: @escaping () throws -> Bool,
-        cleanup: () -> Bool = { true }
+        cleanup: @escaping () -> Bool = { true }
     ) async throws {
         benchmarkTrace("31.4 rtt=\(rttMilliseconds) \(id) start")
         var sample = 0.0
         var samplePassed = false
-        let responseUnfinishedThroughVisibleCompletion =
+        var sampleCheckDetail = "action=false pixels=false cleanup=false"
+        var cleanupResult: Bool?
+        let responseProof =
             try await withHeldInjectedResponse(
                 rttMilliseconds: rttMilliseconds,
                 controller: controller,
                 transport: transport
-            ) {
+            ) { startInjection in
                 do {
                     let stateCorrect: Bool
                     let pixels: Bool
                     let latencyMilliseconds: Double
                     if fullPaint {
                         var actionStateCorrect = false
+                        let exactRestorationAction:
+                            (@MainActor () throws -> Bool)?
+                        if requiresExactCompositedRestoration {
+                            exactRestorationAction = {
+                                let result = cleanup()
+                                cleanupResult = result
+                                return result
+                            }
+                        } else {
+                            exactRestorationAction = nil
+                        }
                         let measured =
                             try await benchmarkMeasurePassiveCompositedChange(
                                 window,
-                                targetView: targetView
+                                targetView: targetView,
+                                onActionStarting: startInjection,
+                                restorationAction: exactRestorationAction
                             ) {
                                 benchmarkTrace(
                                     "31.4 rtt=\(rttMilliseconds) \(id) "
@@ -314,7 +387,25 @@ func localInteractionSamples(
                             && measured.observation.pixelCaptureVerified
                         latencyMilliseconds =
                             measured.presentationLatencyMilliseconds
+                        if requiresExactCompositedRestoration {
+                            guard let actionDelta =
+                                    measured.contentDeltaEvidence,
+                                  let restorationDelta =
+                                    measured.restorationDeltaEvidence else {
+                                throw BenchmarkFailure.message(
+                                    "composited restoration measurement omitted "
+                                        + "its action or restoration delta evidence"
+                                )
+                            }
+                            hoverActionMaterialPixelCounts.append(
+                                actionDelta.materiallyDifferentPixelCount
+                            )
+                            hoverRestorationMaximumChannelDeltas.append(
+                                restorationDelta.maximumChannelDelta
+                            )
+                        }
                     } else {
+                        try await startInjection()
                         let start = clock.now
                         benchmarkTrace(
                             "31.4 rtt=\(rttMilliseconds) \(id) action start"
@@ -331,20 +422,41 @@ func localInteractionSamples(
                     benchmarkTrace(
                         "31.4 rtt=\(rttMilliseconds) \(id) paint end"
                     )
-                    let cleanupCorrect = cleanup()
+                    let cleanupCorrect: Bool
+                    if let cleanupResult {
+                        cleanupCorrect = cleanupResult
+                    } else {
+                        let result = cleanup()
+                        cleanupResult = result
+                        cleanupCorrect = result
+                    }
                     sample = latencyMilliseconds
                     samplePassed =
                         stateCorrect && pixels && cleanupCorrect
+                    sampleCheckDetail =
+                        "action=\(stateCorrect) pixels=\(pixels) "
+                            + "cleanup=\(cleanupCorrect)"
                 } catch {
-                    _ = cleanup()
+                    if cleanupResult == nil {
+                        _ = cleanup()
+                    }
                     throw error
                 }
             }
         samples[id, default: []].append(sample)
+        if samplePassed == false {
+            stateCheckFailures.append("\(id): \(sampleCheckDetail)")
+        }
         checks = checks && samplePassed
         everyInjectedResponseUnfinishedThroughVisibleCompletion =
             everyInjectedResponseUnfinishedThroughVisibleCompletion
-                && responseUnfinishedThroughVisibleCompletion
+                && responseProof.responseUnfinishedThroughVisibleCompletion
+        everyConfiguredDelayStateVerifiedAtActionStart =
+            everyConfiguredDelayStateVerifiedAtActionStart
+                && responseProof.configuredDelayStateVerifiedAtActionStart
+        if responseProof.nonzeroDelayActiveAtActionStart {
+            nonzeroDelayActiveAtActionStartProbeCount += 1
+        }
         heldResponseProbeCount += 1
         benchmarkTrace("31.4 rtt=\(rttMilliseconds) \(id) end")
     }
@@ -426,9 +538,13 @@ func localInteractionSamples(
             "scrolling",
             targetView: textScroll.contentView
         ) {
+            // Alternate between two offsets that both retain rendered
+            // editor content. Marching monotonically into the deliberately
+            // enlarged blank tail can change scroll state without changing
+            // any captured pixels, which is not decode-to-visible evidence.
             let target = NSPoint(
                 x: 0,
-                y: min(4_000, Double((index + 1) * 23))
+                y: index.isMultiple(of: 2) ? 23 : 0
             )
             textScroll.contentView.scroll(to: target)
             textScroll.reflectScrolledClipView(textScroll.contentView)
@@ -467,21 +583,20 @@ func localInteractionSamples(
         try await record(
             "hover",
             targetView: button,
+            requiresExactCompositedRestoration: true,
             action: {
                 button.mouseEntered(with: hover)
-                guard button.needsDisplay else {
-                    return false
-                }
-                hoverVisualChanges += 1
+                // The full path proves the renderer-produced button changed
+                // in the exact composited ROI. NSView.needsDisplay is not a
+                // reliable post-dispatch state signal for layer-backed views.
                 return true
             },
             cleanup: {
                 button.mouseExited(with: exit)
-                let exitInvalidated = button.needsDisplay
-                _ = rasterize(button)
-                return exitInvalidated
+                return true
             }
         )
+        hoverCompletedCompositedCycles += 1
 
         let callbacksBefore = callbackCount
         try await record(
@@ -515,12 +630,12 @@ func localInteractionSamples(
         )
         var sample = 0.0
         var samplePassed = false
-        let responseUnfinishedThroughVisibleCompletion =
+        let responseProof =
             try await withHeldInjectedResponse(
                 rttMilliseconds: rttMilliseconds,
                 controller: controller,
                 transport: transport
-            ) {
+            ) { startInjection in
                 if fullPaint {
                     let measured =
                         try await benchmarkMeasureOwnedMenuPresentation(
@@ -530,7 +645,8 @@ func localInteractionSamples(
                                 x: button.bounds.minX,
                                 y: button.bounds.maxY
                             ),
-                            in: button
+                            in: button,
+                            onActionStarting: startInjection
                         )
                     menuOpened += 1
                     sample = measured.presentationLatencyMilliseconds
@@ -541,6 +657,7 @@ func localInteractionSamples(
                         && measured.observation.pixelCaptureVerified
                 } else {
                     menu.delegate = menuProbe
+                    try await startInjection()
                     let start = clock.now
                     let opensBefore = menuProbe.openCount
                     let presentationsBefore = menuProbe.presentationCount
@@ -578,10 +695,19 @@ func localInteractionSamples(
                 }
             }
         samples["menu_opening", default: []].append(sample)
+        if samplePassed == false {
+            stateCheckFailures.append("menu_opening: presentation=false")
+        }
         checks = checks && samplePassed
         everyInjectedResponseUnfinishedThroughVisibleCompletion =
             everyInjectedResponseUnfinishedThroughVisibleCompletion
-                && responseUnfinishedThroughVisibleCompletion
+                && responseProof.responseUnfinishedThroughVisibleCompletion
+        everyConfiguredDelayStateVerifiedAtActionStart =
+            everyConfiguredDelayStateVerifiedAtActionStart
+                && responseProof.configuredDelayStateVerifiedAtActionStart
+        if responseProof.nonzeroDelayActiveAtActionStart {
+            nonzeroDelayActiveAtActionStartProbeCount += 1
+        }
         heldResponseProbeCount += 1
         button.menu = previousMenu
         menu.delegate = nil
@@ -596,21 +722,36 @@ func localInteractionSamples(
     try await waitUntil(timeout: .seconds(10)) {
         await transport.snapshot().activeDelayedOperations == 0
     }
+    let hoverMinimumMaterialPixelCount =
+        hoverActionMaterialPixelCounts.min() ?? 0
+    let hoverMaximumRestorationChannelDelta =
+        hoverRestorationMaximumChannelDeltas.max() ?? 0
     return LocalInteractionResult(
         samples: samples,
         stateChecksPassed: checks,
+        stateCheckFailures: stateCheckFailures,
         everyInjectedResponseUnfinishedThroughVisibleCompletion:
             everyInjectedResponseUnfinishedThroughVisibleCompletion,
+        everyConfiguredDelayStateVerifiedAtActionStart:
+            everyConfiguredDelayStateVerifiedAtActionStart,
+        nonzeroDelayActiveAtActionStartProbeCount:
+            nonzeroDelayActiveAtActionStartProbeCount,
         heldResponseProbeCount: heldResponseProbeCount,
         productionCallbacks: callbackCount,
         textEditCallbacks: textEditCallbacks,
         finalText: textView.string,
         hoverMode: fullPaint
-            ? "renderer-produced NSButton changed its exact composited target "
-                + "ROI on the local AppKit hover path and restored on exit in "
-                + "\(hoverVisualChanges)/\(iterations) samples"
+            ? "renderer-produced NSButton changed at least "
+                + "\(hoverMinimumMaterialPixelCount) target-ROI pixels above "
+                + "the explicit 2/255 per-channel SCStream tolerance on the "
+                + "local AppKit hover path in "
+                + "\(hoverCompletedCompositedCycles)/\(iterations) samples; "
+                + "mouseExited then restored every unmasked screenshot pixel "
+                + "within the explicit 5/255 same-API tolerance, with maximum "
+                + "observed channel delta "
+                + "\(hoverMaximumRestorationChannelDelta)/255"
             : "renderer-produced NSButton completed the smoke offscreen hover "
-                + "path in \(hoverVisualChanges)/\(iterations) samples",
+                + "path in \(hoverCompletedCompositedCycles)/\(iterations) samples",
         menuMode: fullPaint
             ? "renderer-produced NSButton context menu was proven as a new "
                 + "exact owned menu-level WindowServer surface in the same "
@@ -658,7 +799,10 @@ func networkAndLocalInteraction(
     var localByRTT = [Int: [String: [Double]]]()
     var dependentByRTT = [Int: [Double]]()
     var allLocalStateChecks = true
+    var localStateCheckFailures = [String]()
     var allInjectedResponsesUnfinishedThroughVisibleCompletion = true
+    var allConfiguredDelayStatesVerifiedAtActionStart = true
+    var totalNonzeroDelayActiveAtActionStartProbeCount = 0
     var allProductionTextEditsExact = true
     var productionCallbackCount = 0
     var productionTextEditCallbackCount = 0
@@ -692,10 +836,18 @@ func networkAndLocalInteraction(
         benchmarkPhase("31.4 rtt=\(rtt) local interactions finished")
         localByRTT[rtt] = local.samples
         allLocalStateChecks = allLocalStateChecks && local.stateChecksPassed
+        localStateCheckFailures.append(
+            contentsOf: local.stateCheckFailures.map { "RTT \(rtt)ms \($0)" }
+        )
         allInjectedResponsesUnfinishedThroughVisibleCompletion =
             allInjectedResponsesUnfinishedThroughVisibleCompletion
                 && local
                     .everyInjectedResponseUnfinishedThroughVisibleCompletion
+        allConfiguredDelayStatesVerifiedAtActionStart =
+            allConfiguredDelayStatesVerifiedAtActionStart
+                && local.everyConfiguredDelayStateVerifiedAtActionStart
+        totalNonzeroDelayActiveAtActionStartProbeCount +=
+            local.nonzeroDelayActiveAtActionStartProbeCount
         totalHeldResponseProbeCount += local.heldResponseProbeCount
         productionCallbackCount += local.productionCallbacks
         productionTextEditCallbackCount += local.textEditCallbacks.count
@@ -722,7 +874,10 @@ func networkAndLocalInteraction(
         var acknowledgedSequences = Set<UInt64>()
         var exactTextSlotAcknowledged = false
         var stableEmptyPasses = 0
-        let drainDeadline = clock.now + .seconds(20)
+        // Each editor sequence slot is deliberately serialized until its
+        // acknowledgement completes. Forty callbacks at 600 ms RTT can
+        // legitimately need more than 20 seconds; this drain is untimed.
+        let drainDeadline = clock.now + .seconds(60)
         while clock.now < drainDeadline {
             let interactionEvents = try await capturedEvents(in: transport)
             let unacknowledged = interactionEvents
@@ -1281,6 +1436,67 @@ func networkAndLocalInteraction(
     sampleCounts["macos.bandwidth"] = bandwidthSamples.count
     sampleCounts["macos.loss"] = completedLossTrials
     sampleCounts["macos.interruption"] = completedInterruptionTrials
+
+    let expectedHeldResponseProbeCount = iterations * 8 * 4
+    let expectedNonzeroDelayProbeCount = iterations * 8 * 3
+    let delayBoundaryProofPassed =
+        allConfiguredDelayStatesVerifiedAtActionStart
+            && totalNonzeroDelayActiveAtActionStartProbeCount
+                == expectedNonzeroDelayProbeCount
+            && totalHeldResponseProbeCount == expectedHeldResponseProbeCount
+    let localLatencyIndependentPassed =
+        worstP50Added <= frameBudget.milliseconds
+            && allLocalStateChecks
+            && allInjectedResponsesUnfinishedThroughVisibleCompletion
+            && delayBoundaryProofPassed
+            && productionCallbackCount >= iterations * 4
+    let localStateFailureDetail = localStateCheckFailures.isEmpty
+        ? ""
+        : " failures=["
+            + localStateCheckFailures.joined(separator: "; ")
+            + "]"
+    var localLatencyDetail =
+        "largest p50 increase "
+            + "\(String(format: "%.4f", worstP50Added)) ms versus "
+            + "the measured local frame budget of "
+            + "\(String(format: "%.4f", frameBudget.milliseconds)) ms; "
+    localLatencyDetail +=
+        "paired injected transaction remained blocked through local visible "
+            + "completion in \(totalHeldResponseProbeCount)/"
+            + "\(expectedHeldResponseProbeCount) probes="
+            + "\(allInjectedResponsesUnfinishedThroughVisibleCompletion); "
+    localLatencyDetail +=
+        "configured delay state was verified at the exact action boundary in "
+            + "\(totalHeldResponseProbeCount)/"
+            + "\(expectedHeldResponseProbeCount) probes="
+            + "\(allConfiguredDelayStatesVerifiedAtActionStart), with a "
+            + "nonzero transport delay still active in "
+            + "\(totalNonzeroDelayActiveAtActionStartProbeCount)/"
+            + "\(expectedNonzeroDelayProbeCount) nonzero-RTT probes; "
+    localLatencyDetail +=
+        "local_state_checks=\(allLocalStateChecks)"
+            + localStateFailureDetail
+            + "; descriptive p95/p99 deltas were "
+            + "\(String(format: "%.4f", worstP95Added))/"
+            + "\(String(format: "%.4f", worstP99Added)) ms; "
+            + "production renderer callbacks=\(productionCallbackCount)"
+
+    let noSynchronousRTTDependencyPassed =
+        allInjectedResponsesUnfinishedThroughVisibleCompletion
+            && delayBoundaryProofPassed
+            && serverTracksRTT
+    var noSynchronousRTTDependencyDetail =
+        "Each local action began only after its exact compositor baseline was "
+            + "ready and while its configured BenchmarkTransport delay state "
+            + "was verified; "
+    noSynchronousRTTDependencyDetail +=
+        "\(totalNonzeroDelayActiveAtActionStartProbeCount)/"
+            + "\(expectedNonzeroDelayProbeCount) nonzero-RTT actions began "
+            + "during an active delay. Every paired production transaction "
+            + "remained blocked through visible completion; the gate was "
+            + "released only afterward. Separately, production server-dependent "
+            + "feedback tracked 100/300/600ms RTT."
+
     return Section(
         id: "31.4",
         name: "Network and local interaction",
@@ -1290,25 +1506,8 @@ func networkAndLocalInteraction(
             Assertion(
                 id: "local_latency_independent",
                 name: "mounted local interactions do not acquire one RTT",
-                passed: worstP50Added <= frameBudget.milliseconds
-                    && allLocalStateChecks
-                    && allInjectedResponsesUnfinishedThroughVisibleCompletion
-                    && totalHeldResponseProbeCount == iterations * 8 * 4
-                    && productionCallbackCount >= iterations * 4,
-                detail: "largest p50 increase "
-                    + "\(String(format: "%.4f", worstP50Added)) ms versus "
-                    + "the measured local frame budget of "
-                    + "\(String(format: "%.4f", frameBudget.milliseconds)) "
-                    + "ms; paired injected transaction remained blocked "
-                    + "through local visible completion in "
-                    + "\(totalHeldResponseProbeCount)/\(iterations * 8 * 4) "
-                    + "probes="
-                    + "\(allInjectedResponsesUnfinishedThroughVisibleCompletion); "
-                    + "descriptive p95/p99 deltas were "
-                    + "\(String(format: "%.4f", worstP95Added))/"
-                    + "\(String(format: "%.4f", worstP99Added)) ms; "
-                    + "production renderer callbacks="
-                    + "\(productionCallbackCount)"
+                passed: localLatencyIndependentPassed,
+                detail: localLatencyDetail
             ),
             Assertion(
                 id: "production_text_edit_framed",
@@ -1326,15 +1525,8 @@ func networkAndLocalInteraction(
             Assertion(
                 id: "no_sync_rtt",
                 name: "local visible completion does not await an injected transport response",
-                passed:
-                    allInjectedResponsesUnfinishedThroughVisibleCompletion
-                    && totalHeldResponseProbeCount == iterations * 8 * 4
-                    && serverTracksRTT,
-                detail: "Each local action reached its visible boundary while "
-                    + "its paired injected production transaction remained "
-                    + "blocked before delivery; the gate was released only "
-                    + "afterward. Separately, production server-dependent "
-                    + "feedback tracked 100/300/600ms RTT."
+                passed: noSynchronousRTTDependencyPassed,
+                detail: noSynchronousRTTDependencyDetail
             ),
             Assertion(
                 id: "impairments_use_session",

@@ -178,6 +178,15 @@ PROFILE_DRIVER_ITERATIONS = {
 }
 PRODUCTION_CONFORMANCE_SAMPLE_COUNT = 9
 METADATA_COMMAND_TIMEOUT_SECONDS = 10
+WINDOW_ISOLATION_SELF_TEST_TIMEOUT_SECONDS = 30
+WINDOW_ISOLATION_ASSERTION_ID = "window_isolation_fail_closed"
+WINDOW_ISOLATION_SELF_TEST_PREFIX = "window isolation self-test passed:"
+WINDOW_ISOLATION_SELF_TEST_PATTERN = re.compile(
+    r"^window isolation self-test passed: "
+    r"dock=(?P<dock>[0-9]+) status=(?P<status>[0-9]+) "
+    r"ahead=(?P<ahead>[0-9]+) popup=(?P<popup>[0-9]+) "
+    r"target=(?P<target>[0-9]+) occluder=(?P<occluder>[0-9]+)$"
+)
 LOCAL_INTERACTIONS = (
     "text_entry",
     "caret_movement",
@@ -491,7 +500,11 @@ def _merged_report_inventory() -> dict[str, dict[str, Any]]:
                     (f"{candidate}.{metric_kind}", statistic)
                 ] = (unit, None, None)
     merged["31.1"]["assertions"].update(
-        {"allocation_trace_attributed", "candidate_failure_cleanup"}
+        {
+            "allocation_trace_attributed",
+            "candidate_failure_cleanup",
+            WINDOW_ISOLATION_ASSERTION_ID,
+        }
     )
     merged["31.2"]["assertions"].add("canonical_transaction_parity")
     merged["31.5"]["metrics"][("production_reconnect_suite_ms", "wall")] = (
@@ -510,6 +523,17 @@ def _merged_report_inventory() -> dict[str, dict[str, Any]]:
 
 
 EXPECTED_REPORT_INVENTORY = _merged_report_inventory()
+
+
+def expected_report_inventory_for_profile(
+    section_id: str,
+    profile: str,
+) -> dict[str, Any]:
+    inventory = EXPECTED_REPORT_INVENTORY[section_id]
+    assertions = inventory["assertions"]
+    if profile == "smoke" and section_id == "31.1":
+        assertions = assertions - {WINDOW_ISOLATION_ASSERTION_ID}
+    return {"metrics": inventory["metrics"], "assertions": assertions}
 
 
 def _build_metric_display_names() -> dict[str, str]:
@@ -2476,6 +2500,116 @@ def run_driver(
         output_path.unlink(missing_ok=True)
 
 
+def parse_window_isolation_self_test_output(
+    stdout: str,
+    stderr: str,
+) -> dict[str, int]:
+    candidate_lines = [
+        line
+        for stream in (stdout, stderr)
+        for line in stream.splitlines()
+        if WINDOW_ISOLATION_SELF_TEST_PREFIX in line
+    ]
+    if len(candidate_lines) != 1:
+        raise BenchmarkError(
+            "window isolation self-test must emit exactly one result line; "
+            f"observed {len(candidate_lines)}"
+        )
+    line = candidate_lines[0]
+    match = WINDOW_ISOLATION_SELF_TEST_PATTERN.fullmatch(line)
+    if match is None:
+        raise BenchmarkError(
+            f"window isolation self-test emitted malformed result line: {line!r}"
+        )
+    evidence = {key: int(value) for key, value in match.groupdict().items()}
+    if not (
+        evidence["dock"]
+        < evidence["status"]
+        < evidence["ahead"]
+        < evidence["popup"]
+    ):
+        raise BenchmarkError(
+            "window isolation self-test reported invalid level ordering: "
+            f"dock={evidence['dock']} status={evidence['status']} "
+            f"ahead={evidence['ahead']} popup={evidence['popup']}"
+        )
+    target = evidence["target"]
+    occluder = evidence["occluder"]
+    if target <= 0 or occluder <= 0 or target == occluder:
+        raise BenchmarkError(
+            "window isolation self-test requires distinct positive window IDs: "
+            f"target={target} occluder={occluder}"
+        )
+    return evidence
+
+
+def run_window_isolation_self_test(
+    fixture: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    binary = ROOT / "client-macos/.build/release/BenchmarkDriver"
+    if not binary.is_file():
+        raise BenchmarkError(
+            "window isolation self-test requires the built release BenchmarkDriver"
+        )
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as output:
+        output_path = Path(output.name)
+    command = [
+        "/usr/bin/env",
+        "SRUI_BENCHMARK_PHASES=1",
+        "SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST=1",
+        str(binary),
+        "--fixture",
+        str(fixture),
+        "--profile",
+        "full",
+        "--output",
+        str(output_path),
+    ]
+    ensure_free_space(ROOT)
+    try:
+        try:
+            result = run_managed_command(
+                command,
+                cwd=ROOT,
+                timeout=timeout,
+                label="window isolation self-test",
+                poll_hook=lambda _process: ensure_free_space(ROOT),
+            )
+        except ManagedCommandTimeout as error:
+            raise BenchmarkError(
+                f"window isolation self-test timed out after {timeout}s"
+            ) from error
+        except ManagedCommandError as error:
+            raise BenchmarkError(
+                f"window isolation self-test process supervision failed: {error}"
+            ) from error
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise BenchmarkError(
+                "window isolation self-test failed "
+                f"({result.returncode}): {detail[-4000:]}"
+            )
+        evidence = parse_window_isolation_self_test_output(
+            result.stdout,
+            result.stderr,
+        )
+        detail = (
+            f"window isolation self-test passed: dock={evidence['dock']} "
+            f"status={evidence['status']} ahead={evidence['ahead']} "
+            f"popup={evidence['popup']} target={evidence['target']} "
+            f"occluder={evidence['occluder']}"
+        )
+        return {
+            "id": WINDOW_ISOLATION_ASSERTION_ID,
+            "name": "WindowServer isolation rejects an exact synthetic occluder",
+            "passed": True,
+            "detail": detail,
+        }
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
 def run_candidate_cleanup_probe(
     fixture: Path,
     timeout: int,
@@ -3081,11 +3215,26 @@ def validate_report(report: dict[str, Any], required: list[str]) -> None:
     for section_id, section in sections_by_id.items():
         _validate_section_inventory(
             section,
-            EXPECTED_REPORT_INVENTORY[section_id],
+            expected_report_inventory_for_profile(section_id, report["profile"]),
             expected_sample_counts=expected_counts[section_id],
             label=f"report §{section_id}",
             profile=report["profile"],
         )
+
+    if report["profile"] == "full":
+        window_isolation = next(
+            assertion
+            for assertion in sections_by_id["31.1"]["assertions"]
+            if assertion["id"] == WINDOW_ISOLATION_ASSERTION_ID
+        )
+        if window_isolation["passed"] is not True:
+            raise BenchmarkError("window isolation self-test assertion must pass")
+        isolation_detail = window_isolation.get("detail")
+        if not isinstance(isolation_detail, str):
+            raise BenchmarkError(
+                "window isolation self-test assertion must retain exact numeric detail"
+            )
+        parse_window_isolation_self_test_output("", isolation_detail)
 
     artifacts = report["driver_artifacts"]
     if "renderer_process_attribution" in artifacts["rust"]:
@@ -3603,6 +3752,16 @@ def main(argv: list[str] | None = None) -> int:
                 f"{driver['name']} requires {driver['platform']}; current platform is {sys.platform}"
             )
         payload = run_driver(driver, fixture, args.profile, args.timeout)
+        if driver["name"] == "macos" and args.profile == "full":
+            parse_render = next(
+                section for section in payload["sections"] if section["id"] == "31.1"
+            )
+            parse_render["assertions"].append(
+                run_window_isolation_self_test(
+                    fixture,
+                    min(args.timeout, WINDOW_ISOLATION_SELF_TEST_TIMEOUT_SECONDS),
+                )
+            )
         driver_artifacts[driver["name"]] = payload["artifacts"]
         for section in payload["sections"]:
             _merge_driver_section(sections, section)

@@ -227,6 +227,7 @@ final class BenchmarkDrawCompletionProbe: NSView {
 
 struct BenchmarkCompositedContentEvidence: Sendable, Equatable {
     let normalizedFingerprintSHA256: String
+    let normalizedRGBA8Pixels: [UInt8]
     let pixelWidth: Int
     let pixelHeight: Int
     let unmaskedPixelCount: Int
@@ -523,6 +524,40 @@ private struct BenchmarkWindowServerEvidence: Equatable, Sendable {
 }
 
 @MainActor
+private func benchmarkWindowServerEntryDiagnostic(
+    for window: NSWindow
+) -> String {
+    let windowID = CGWindowID(window.windowNumber)
+    guard windowID != 0,
+          let entries = CGWindowListCopyWindowInfo(
+              [.optionIncludingWindow],
+              windowID
+          ) as? [[String: Any]],
+          entries.isEmpty == false else {
+        return "matching_entry=absent"
+    }
+    return entries.map { entry in
+        let number = (entry[kCGWindowNumber as String] as? NSNumber)?
+            .uint32Value
+        let ownerPID = (entry[kCGWindowOwnerPID as String] as? NSNumber)?
+            .int32Value
+        let onScreen = (entry[kCGWindowIsOnscreen as String] as? NSNumber)?
+            .boolValue
+        let layer = (entry[kCGWindowLayer as String] as? NSNumber)?
+            .intValue
+        let alpha = (entry[kCGWindowAlpha as String] as? NSNumber)?
+            .doubleValue
+        let bounds = entry[kCGWindowBounds as String] as? NSDictionary
+        return "entry(number=\(String(describing: number)), "
+            + "owner_pid=\(String(describing: ownerPID)), "
+            + "on_screen=\(String(describing: onScreen)), "
+            + "layer=\(String(describing: layer)), "
+            + "alpha=\(String(describing: alpha)), "
+            + "bounds=\(String(describing: bounds)))"
+    }.joined(separator: ", ")
+}
+
+@MainActor
 private func exactWindowServerEvidence(
     for window: NSWindow,
     on screen: NSScreen
@@ -545,7 +580,9 @@ private func exactWindowServerEvidence(
           let entry = matchingEntries.first,
           let ownerPID = (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
           ownerPID == getpid(),
-          (entry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue == true,
+          // Membership in this .optionOnScreenOnly result is the on-screen
+          // proof. WindowServer may omit the redundant kCGWindowIsOnscreen
+          // dictionary key even for entries returned by that filtered query.
           let layer = (entry[kCGWindowLayer as String] as? NSNumber)?.intValue,
           layer == window.level.rawValue,
           let alpha = (entry[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
@@ -575,34 +612,54 @@ private func exactWindowServerEvidence(
     )
 }
 
-private func windowServerReportsNoOpaqueIntersectionAbove(
+private func benchmarkIsolatedHostWindowLevel() throws -> NSWindow.Level {
+    let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+    let statusLevel = Int(CGWindowLevelForKey(.statusWindow))
+    let popUpMenuLevel = Int(CGWindowLevelForKey(.popUpMenuWindow))
+    let screenSaverLevel = Int(CGWindowLevelForKey(.screenSaverWindow))
+    guard dockLevel < statusLevel,
+          statusLevel < popUpMenuLevel,
+          popUpMenuLevel < screenSaverLevel else {
+        throw BenchmarkFailure.message(
+            "WindowServer levels cannot isolate benchmark hosts between Dock "
+                + "and pop-up menus: dock=\(dockLevel), "
+                + "status=\(statusLevel), popup=\(popUpMenuLevel), "
+                + "screen-saver=\(screenSaverLevel)"
+        )
+    }
+    return NSWindow.Level(rawValue: statusLevel)
+}
+
+private func windowServerNonzeroAlphaIntersectionAbove(
     _ evidence: BenchmarkWindowServerEvidence
-) -> Bool {
+) -> String? {
     guard let entries = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements],
         kCGNullWindowID
     ) as? [[String: Any]] else {
-        return false
+        return "WindowServer window list was unavailable"
     }
     let targetIndices = entries.indices.filter { index in
         (entries[index][kCGWindowNumber as String] as? NSNumber)?.uint32Value
             == evidence.windowID
     }
     guard targetIndices.count == 1, let targetIndex = targetIndices.first else {
-        return false
+        return "target window did not have exactly one z-order entry"
     }
 
     for index in entries.indices where index < targetIndex {
         let entry = entries[index]
-        guard (entry[kCGWindowIsOnscreen as String] as? NSNumber)?
-                .boolValue == true,
-              let windowNumber = (
+        let ownerName =
+            entry[kCGWindowOwnerName as String] as? String ?? "<unknown>"
+        // The source list was requested with .optionOnScreenOnly;
+        // do not require its optional redundant metadata key.
+        guard let windowNumber = (
                   entry[kCGWindowNumber as String] as? NSNumber
               )?.uint32Value,
-              let _ = (
+              let ownerPID = (
                   entry[kCGWindowOwnerPID as String] as? NSNumber
               )?.int32Value,
-              let _ = (
+              let layer = (
                   entry[kCGWindowLayer as String] as? NSNumber
               )?.intValue,
               let alpha = (
@@ -624,29 +681,161 @@ private func windowServerReportsNoOpaqueIntersectionAbove(
               bounds.height >= 0 else {
             // The z-order proof is fail-closed: an ahead window whose required
             // identity/visibility/geometry fields are absent is not ignorable.
-            return false
+            return "ahead z-order entry \(index) owned by \(ownerName) "
+                + "omitted required identity or geometry"
         }
-        guard windowNumber != evidence.windowID else { return false }
+        guard windowNumber != evidence.windowID else {
+            return "target window appeared twice in z-order"
+        }
         let intersection = bounds.intersection(evidence.bounds)
         if alpha > 0,
            intersection.isNull == false,
            intersection.width > 0,
            intersection.height > 0 {
-            return false
+            return "owner=\(ownerName) pid=\(ownerPID) "
+                + "window=\(windowNumber) layer=\(layer) alpha=\(alpha) "
+                + "bounds=\(bounds) intersection=\(intersection)"
         }
     }
-    return true
+    return nil
 }
+
+private func windowServerReportsNoNonzeroAlphaIntersectionAbove(
+    _ evidence: BenchmarkWindowServerEvidence
+) -> Bool {
+    windowServerNonzeroAlphaIntersectionAbove(evidence) == nil
+}
+
+@MainActor
+func benchmarkVerifyWindowServerIsolation() async throws {
+    guard let screen = NSScreen.main else {
+        throw BenchmarkFailure.message(
+            "window-isolation self-test requires a main display"
+        )
+    }
+    let statusLevel = try benchmarkIsolatedHostWindowLevel()
+    let dockLevel = NSWindow.Level(
+        rawValue: Int(CGWindowLevelForKey(.dockWindow))
+    )
+    let popUpMenuLevel = Int(CGWindowLevelForKey(.popUpMenuWindow))
+    let syntheticAheadLevel = statusLevel.rawValue + 1
+    guard syntheticAheadLevel < popUpMenuLevel else {
+        throw BenchmarkFailure.message(
+            "window-isolation self-test has no level between status and popup"
+        )
+    }
+
+    let frame = CGRect(
+        x: screen.visibleFrame.midX - 80,
+        y: screen.visibleFrame.midY - 60,
+        width: 160,
+        height: 120
+    )
+    func makeOpaqueWindow(color: NSColor) -> NSWindow {
+        let window = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false,
+            screen: screen
+        )
+        window.animationBehavior = .none
+        window.backgroundColor = color
+        window.isOpaque = true
+        window.alphaValue = 1
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        return window
+    }
+    let target = makeOpaqueWindow(color: .systemBlue)
+    let syntheticOccluder = makeOpaqueWindow(color: .systemRed)
+    defer {
+        syntheticOccluder.orderOut(nil)
+        target.orderOut(nil)
+    }
+
+    func awaitEvidence(
+        for window: NSWindow,
+        expectedLevel: NSWindow.Level
+    ) async throws -> BenchmarkWindowServerEvidence {
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if let evidence = exactWindowServerEvidence(
+                for: window,
+                on: screen
+            ), evidence.layer == expectedLevel.rawValue {
+                return evidence
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        throw BenchmarkFailure.message(
+            "window-isolation self-test did not observe window "
+                + "\(window.windowNumber) at layer \(expectedLevel.rawValue)"
+        )
+    }
+
+    target.level = statusLevel
+    target.orderFrontRegardless()
+    syntheticOccluder.level = dockLevel
+    syntheticOccluder.orderFrontRegardless()
+    CATransaction.flush()
+    var targetEvidence = try await awaitEvidence(
+        for: target,
+        expectedLevel: statusLevel
+    )
+    _ = try await awaitEvidence(
+        for: syntheticOccluder,
+        expectedLevel: dockLevel
+    )
+    if let unexpected =
+        windowServerNonzeroAlphaIntersectionAbove(targetEvidence)
+    {
+        throw BenchmarkFailure.message(
+            "below-status synthetic window was incorrectly reported ahead: "
+                + unexpected
+        )
+    }
+
+    let aheadLevel = NSWindow.Level(rawValue: syntheticAheadLevel)
+    syntheticOccluder.level = aheadLevel
+    syntheticOccluder.orderFrontRegardless()
+    CATransaction.flush()
+    let aheadEvidence = try await awaitEvidence(
+        for: syntheticOccluder,
+        expectedLevel: aheadLevel
+    )
+    targetEvidence = try await awaitEvidence(
+        for: target,
+        expectedLevel: statusLevel
+    )
+    guard let diagnostic =
+        windowServerNonzeroAlphaIntersectionAbove(targetEvidence),
+          diagnostic.contains("window=\(aheadEvidence.windowID) "),
+          diagnostic.contains("layer=\(aheadEvidence.layer) ") else {
+        throw BenchmarkFailure.message(
+            "above-status synthetic window was not rejected with its exact "
+                + "WindowServer identity"
+        )
+    }
+    benchmarkPhase(
+        "window isolation self-test passed: dock=\(dockLevel.rawValue) "
+            + "status=\(statusLevel.rawValue) ahead=\(aheadEvidence.layer) "
+            + "popup=\(popUpMenuLevel) target=\(targetEvidence.windowID) "
+            + "occluder=\(aheadEvidence.windowID)"
+    )
+}
+
 private struct BenchmarkVisibilityMarkerMatch: Sendable {
     let x: Int
     let y: Int
     let step: Int
 }
 
-private struct BenchmarkCompositedCaptureEvidence: Sendable {
+private struct BenchmarkCompositedCaptureEvidence: @unchecked Sendable {
     let markerVisible: Bool
     let content: BenchmarkCompositedContentEvidence
     let normalization: BenchmarkCompositedContentNormalization
+    let image: CGImage
 }
 
 private func normalizedCompositedContentEvidence(
@@ -817,6 +1006,8 @@ private func normalizedCompositedContentEvidence(
     let minimumContentPixels = max(32, unmaskedPixelCount / 2_000)
     let contentEvidence = BenchmarkCompositedContentEvidence(
         normalizedFingerprintSHA256: digestHex(Data(normalizedBytes)),
+        normalizedRGBA8Pixels:
+            Array(normalizedBytes.dropFirst(header.count)),
         pixelWidth: image.width,
         pixelHeight: image.height,
         unmaskedPixelCount: unmaskedPixelCount,
@@ -828,7 +1019,8 @@ private func normalizedCompositedContentEvidence(
     return BenchmarkCompositedCaptureEvidence(
         markerVisible: markerVisible,
         content: contentEvidence,
-        normalization: resolvedNormalization
+        normalization: resolvedNormalization,
+        image: image
     )
 }
 @MainActor
@@ -1051,6 +1243,28 @@ struct BenchmarkPassivePresentationMeasurement: Sendable {
     let acceptedDisplayMachTicks: UInt64
     let presentationLatencyMilliseconds: Double
     let observation: OnScreenPaintObservation
+    let contentDeltaEvidence: BenchmarkCompositedDeltaEvidence?
+    let restorationDeltaEvidence: BenchmarkCompositedDeltaEvidence?
+
+    init(
+        actionStartedAt: ContinuousClock.Instant,
+        actionCompletedAt: ContinuousClock.Instant,
+        actionStartedMachTicks: UInt64,
+        acceptedDisplayMachTicks: UInt64,
+        presentationLatencyMilliseconds: Double,
+        observation: OnScreenPaintObservation,
+        contentDeltaEvidence: BenchmarkCompositedDeltaEvidence? = nil,
+        restorationDeltaEvidence: BenchmarkCompositedDeltaEvidence? = nil
+    ) {
+        self.actionStartedAt = actionStartedAt
+        self.actionCompletedAt = actionCompletedAt
+        self.actionStartedMachTicks = actionStartedMachTicks
+        self.acceptedDisplayMachTicks = acceptedDisplayMachTicks
+        self.presentationLatencyMilliseconds = presentationLatencyMilliseconds
+        self.observation = observation
+        self.contentDeltaEvidence = contentDeltaEvidence
+        self.restorationDeltaEvidence = restorationDeltaEvidence
+    }
 }
 
 struct BenchmarkMenuPresentationMeasurement: Sendable {
@@ -1547,16 +1761,172 @@ private func benchmarkAwaitFirstCompleteFrame(
         )
     }
 }
+let benchmarkStreamCaptureChannelTolerance = 2
+private let benchmarkScreenshotCaptureChannelTolerance = 5
+
+struct BenchmarkCompositedDeltaEvidence: Sendable {
+    let comparedPixelCount: Int
+    let materiallyDifferentPixelCount: Int
+    let maximumChannelDelta: Int
+    let channelTolerance: Int
+
+    var requiredMaterialPixelCount: Int {
+        8
+    }
+}
+
+private func benchmarkRGBA8Bytes(_ image: CGImage) -> [UInt8]? {
+    guard image.width > 0, image.height > 0 else { return nil }
+    let bytesPerRow = image.width * 4
+    let (byteCount, overflow) = bytesPerRow.multipliedReportingOverflow(
+        by: image.height
+    )
+    guard overflow == false, byteCount > 0 else { return nil }
+
+    var bytes = [UInt8](repeating: 0, count: byteCount)
+    let drewImage = bytes.withUnsafeMutableBytes { storage -> Bool in
+        guard let baseAddress = storage.baseAddress,
+              let context = CGContext(
+                  data: baseAddress,
+                  width: image.width,
+                  height: image.height,
+                  bitsPerComponent: 8,
+                  bytesPerRow: bytesPerRow,
+                  space: CGColorSpace(name: CGColorSpace.sRGB)
+                      ?? CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                      | CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return false
+        }
+        context.interpolationQuality = .none
+        context.draw(
+            image,
+            in: CGRect(
+                x: 0,
+                y: 0,
+                width: image.width,
+                height: image.height
+            )
+        )
+        return true
+    }
+    return drewImage ? bytes : nil
+}
+
+private func benchmarkCompositedDeltaEvidence(
+    _ lhsBytes: [UInt8],
+    _ rhsBytes: [UInt8],
+    normalization: BenchmarkCompositedContentNormalization,
+    channelTolerance: Int
+) -> BenchmarkCompositedDeltaEvidence? {
+    let (bytesPerRow, rowOverflow) =
+        normalization.pixelWidth.multipliedReportingOverflow(by: 4)
+    let (byteCount, sizeOverflow) =
+        bytesPerRow.multipliedReportingOverflow(
+            by: normalization.pixelHeight
+        )
+    guard channelTolerance >= 0,
+          rowOverflow == false,
+          sizeOverflow == false,
+          byteCount > 0,
+          lhsBytes.count == byteCount,
+          rhsBytes.count == byteCount else {
+        return nil
+    }
+
+    var comparedPixelCount = 0
+    var materiallyDifferentPixelCount = 0
+    var maximumChannelDelta = 0
+    for y in 0..<normalization.pixelHeight {
+        for x in 0..<normalization.pixelWidth {
+            let isMasked =
+                x >= normalization.markerMaskMinX
+                && x < normalization.markerMaskMaxX
+                && y >= normalization.markerMaskMinY
+                && y < normalization.markerMaskMaxY
+            if isMasked {
+                continue
+            }
+            comparedPixelCount += 1
+            let offset = y * bytesPerRow + x * 4
+            var pixelIsMateriallyDifferent = false
+            for channel in 0..<4 {
+                let delta = abs(
+                    Int(lhsBytes[offset + channel])
+                        - Int(rhsBytes[offset + channel])
+                )
+                maximumChannelDelta = max(maximumChannelDelta, delta)
+                if delta > channelTolerance {
+                    pixelIsMateriallyDifferent = true
+                }
+            }
+            if pixelIsMateriallyDifferent {
+                materiallyDifferentPixelCount += 1
+            }
+        }
+    }
+    guard comparedPixelCount > 0 else { return nil }
+    return BenchmarkCompositedDeltaEvidence(
+        comparedPixelCount: comparedPixelCount,
+        materiallyDifferentPixelCount: materiallyDifferentPixelCount,
+        maximumChannelDelta: maximumChannelDelta,
+        channelTolerance: channelTolerance
+    )
+}
+
+func benchmarkCompositedDeltaEvidence(
+    _ lhs: BenchmarkCompositedContentEvidence,
+    _ rhs: BenchmarkCompositedContentEvidence,
+    normalization: BenchmarkCompositedContentNormalization,
+    channelTolerance: Int
+) -> BenchmarkCompositedDeltaEvidence? {
+    guard lhs.pixelWidth == normalization.pixelWidth,
+          lhs.pixelHeight == normalization.pixelHeight,
+          rhs.pixelWidth == normalization.pixelWidth,
+          rhs.pixelHeight == normalization.pixelHeight else {
+        return nil
+    }
+    return benchmarkCompositedDeltaEvidence(
+        lhs.normalizedRGBA8Pixels,
+        rhs.normalizedRGBA8Pixels,
+        normalization: normalization,
+        channelTolerance: channelTolerance
+    )
+}
+
+private func benchmarkCompositedDeltaEvidence(
+    _ lhs: CGImage,
+    _ rhs: CGImage,
+    normalization: BenchmarkCompositedContentNormalization,
+    channelTolerance: Int
+) -> BenchmarkCompositedDeltaEvidence? {
+    guard lhs.width == rhs.width,
+          lhs.height == rhs.height,
+          lhs.width == normalization.pixelWidth,
+          lhs.height == normalization.pixelHeight,
+          let lhsBytes = benchmarkRGBA8Bytes(lhs),
+          let rhsBytes = benchmarkRGBA8Bytes(rhs) else {
+        return nil
+    }
+    return benchmarkCompositedDeltaEvidence(
+        lhsBytes,
+        rhsBytes,
+        normalization: normalization,
+        channelTolerance: channelTolerance
+    )
+}
 
 private func benchmarkAwaitChangedTargetFrame(
     from frames: AsyncStream<BenchmarkScreenCaptureFrame>,
     afterDisplayTime: UInt64,
     afterReceivedAt: ContinuousClock.Instant,
-    baselineFingerprint: String,
+    baselineFrame: BenchmarkScreenCaptureFrame,
     baselineNormalization: BenchmarkCompositedContentNormalization
 ) async throws -> (
     frame: BenchmarkScreenCaptureFrame,
-    capture: BenchmarkCompositedCaptureEvidence
+    capture: BenchmarkCompositedCaptureEvidence,
+    delta: BenchmarkCompositedDeltaEvidence
 ) {
     try await withBenchmarkDeadline(
         "post-action target-ROI composited change"
@@ -1568,18 +1938,89 @@ private func benchmarkAwaitChangedTargetFrame(
                   capture.normalization == baselineNormalization,
                   capture.content.hasNonblankContent,
                   capture.content.hasNonuniformContent,
-                  capture.content.normalizedFingerprintSHA256
-                      != baselineFingerprint else {
+                  let delta = benchmarkCompositedDeltaEvidence(
+                      frame.image,
+                      baselineFrame.image,
+                      normalization: baselineNormalization,
+                      channelTolerance:
+                          benchmarkStreamCaptureChannelTolerance
+                  ),
+                  delta.materiallyDifferentPixelCount
+                      >= delta.requiredMaterialPixelCount else {
                 continue
             }
-            return (frame, capture)
+            return (frame, capture, delta)
         }
         throw BenchmarkFailure.message(
-            "ScreenCaptureKit stream ended before the target ROI changed"
+            "ScreenCaptureKit stream ended before the target ROI had the "
+                + "required material pixel change above the explicit "
+                + "\(benchmarkStreamCaptureChannelTolerance)/255 "
+                + "SCStream channel tolerance"
         )
     }
 }
 
+@MainActor
+private func benchmarkCaptureRestoredTarget(
+    window: NSWindow,
+    screen: NSScreen,
+    expectedWindowEvidence: BenchmarkWindowServerEvidence,
+    targetBounds: CGRect,
+    baselineImage: CGImage,
+    normalization: BenchmarkCompositedContentNormalization
+) async throws -> (
+    capture: BenchmarkCompositedCaptureEvidence,
+    delta: BenchmarkCompositedDeltaEvidence
+) {
+    let deadline = clock.now + .seconds(10)
+    var lastDelta: BenchmarkCompositedDeltaEvidence?
+    while clock.now < deadline {
+        guard let evidence = exactWindowServerEvidence(
+            for: window,
+            on: screen
+        ),
+              evidence == expectedWindowEvidence,
+              windowServerReportsNoNonzeroAlphaIntersectionAbove(evidence) else {
+            throw BenchmarkFailure.message(
+                "target lost exact identity, geometry, display, or unobscured "
+                    + "z-order during restoration capture"
+            )
+        }
+        let capture = try await captureCompositedClientContent(
+            evidence: evidence,
+            clientContentBounds: targetBounds,
+            normalization: normalization
+        )
+        guard capture.content.hasNonblankContent,
+              capture.content.hasNonuniformContent,
+              let delta = benchmarkCompositedDeltaEvidence(
+                  capture.image,
+                  baselineImage,
+                  normalization: normalization,
+                  channelTolerance:
+                      benchmarkScreenshotCaptureChannelTolerance
+              ) else {
+            throw BenchmarkFailure.message(
+                "post-cleanup target screenshot was blank, uniform, or could "
+                    + "not be normalized against its baseline"
+            )
+        }
+        lastDelta = delta
+        if delta.materiallyDifferentPixelCount == 0 {
+            return (capture, delta)
+        }
+        await Task.yield()
+    }
+    throw BenchmarkFailure.message(
+        "post-cleanup ScreenCaptureKit screenshots did not restore within the "
+            + "explicit \(benchmarkScreenshotCaptureChannelTolerance)/255 "
+            + "per-channel screenshot "
+            + "tolerance; last_material_pixels="
+            + "\(lastDelta?.materiallyDifferentPixelCount ?? -1) "
+            + "last_max_channel_delta="
+            + "\(lastDelta?.maximumChannelDelta ?? -1)/255"
+    )
+}
 struct BenchmarkExplicitPaintTarget {
     let window: NSWindow
     let targetView: NSView
@@ -1589,11 +2030,35 @@ struct BenchmarkExplicitPaintTarget {
 func benchmarkMeasureExplicitCompositedPaint(
     on screen: NSScreen,
     onActionStarting: (@MainActor () throws -> Void)? = nil,
+    requiredContentChangeFromObservation:
+        OnScreenPaintObservation? = nil,
     action:
         @escaping @MainActor () async throws -> BenchmarkExplicitPaintTarget,
     onPresented:
         (@MainActor (ContinuousClock.Instant, UInt64) -> Void)? = nil
 ) async throws -> BenchmarkPassivePresentationMeasurement {
+    let requiredContentChange: (
+        content: BenchmarkCompositedContentEvidence,
+        normalization: BenchmarkCompositedContentNormalization
+    )?
+    if let requiredContentChangeFromObservation {
+        guard requiredContentChangeFromObservation.captureAuthorization,
+              requiredContentChangeFromObservation.pixelCaptureVerified,
+              let content =
+                requiredContentChangeFromObservation
+                    .compositedContentEvidence,
+              let normalization =
+                requiredContentChangeFromObservation
+                    .compositedContentNormalization else {
+            throw BenchmarkFailure.message(
+                "required prior paint state lacked authorized normalized "
+                    + "composited pixel evidence"
+            )
+        }
+        requiredContentChange = (content, normalization)
+    } else {
+        requiredContentChange = nil
+    }
     guard let screenNumber = screen.deviceDescription[
         NSDeviceDescriptionKey("NSScreenNumber")
     ] as? NSNumber else {
@@ -1640,10 +2105,12 @@ func benchmarkMeasureExplicitCompositedPaint(
         let application = NSApplication.shared
         application.activate()
         let usesAppKitVisiblePath = application.isActive
+        let isolatedHostLevel = try benchmarkIsolatedHostWindowLevel()
         target.window.animationBehavior = .none
-        if usesAppKitVisiblePath == false {
-            target.window.level = .screenSaver
-        }
+        // Use a public WindowServer stratum above the Dock but below AppKit's
+        // real pop-up menus. This isolates the benchmark from the Dock-owned
+        // transparent desktop surface without ignoring any ahead window.
+        target.window.level = isolatedHostLevel
         target.window.contentView?.layoutSubtreeIfNeeded()
 
         // The target is hidden until this one submission. Arm immediately
@@ -1721,10 +2188,10 @@ func benchmarkMeasureExplicitCompositedPaint(
             guard let evidence = exactWindowServerEvidence(
                 for: target.window,
                 on: screen
-            ) else {
+            ), evidence.layer == isolatedHostLevel.rawValue else {
                 lastRejectedCondition =
-                    "condition 5/24: exact WindowServer target identity was absent"
-                    + diagnosticSuffix
+                    "condition 5/24: exact WindowServer target identity or "
+                    + "isolated layer was absent" + diagnosticSuffix
                 continue candidateLoop
             }
             guard evidence.displayID == displayID else {
@@ -1755,10 +2222,13 @@ func benchmarkMeasureExplicitCompositedPaint(
                     + diagnosticSuffix
                 continue candidateLoop
             }
-            guard windowServerReportsNoOpaqueIntersectionAbove(evidence) else {
+            if let intersection =
+                windowServerNonzeroAlphaIntersectionAbove(evidence)
+            {
                 lastRejectedCondition =
-                    "condition 9/24: another nontransparent window intersected "
-                    + "the target in front" + diagnosticSuffix
+                    "condition 9/24: another nonzero-alpha window intersected "
+                    + "the target in front: \(intersection)"
+                    + diagnosticSuffix
                 continue candidateLoop
             }
             if usesAppKitVisiblePath {
@@ -1839,12 +2309,58 @@ func benchmarkMeasureExplicitCompositedPaint(
                     + diagnosticSuffix
                 continue candidateLoop
             }
-            guard targetCapture.content.normalizedFingerprintSHA256
-                    != baselineCapture.content.normalizedFingerprintSHA256 else {
+            guard let baselineDelta = benchmarkCompositedDeltaEvidence(
+                targetCapture.content,
+                baselineCapture.content,
+                normalization: targetCapture.normalization,
+                channelTolerance: benchmarkStreamCaptureChannelTolerance
+            ) else {
                 lastRejectedCondition =
-                    "condition 18/24: candidate target ROI equaled baseline"
+                    "condition 18/24: candidate-to-baseline material pixel "
+                    + "comparison failed" + diagnosticSuffix
+                continue candidateLoop
+            }
+            guard baselineDelta.materiallyDifferentPixelCount
+                    >= baselineDelta.requiredMaterialPixelCount else {
+                lastRejectedCondition =
+                    "condition 18/24: candidate target ROI had only "
+                    + "\(baselineDelta.materiallyDifferentPixelCount) material "
+                    + "pixel(s) versus baseline; required "
+                    + "\(baselineDelta.requiredMaterialPixelCount), max channel "
+                    + "delta \(baselineDelta.maximumChannelDelta)/255 at "
+                    + "\(baselineDelta.channelTolerance)/255 tolerance"
                     + diagnosticSuffix
                 continue candidateLoop
+            }
+            if let requiredContentChange {
+                guard requiredContentChange.normalization
+                        == targetCapture.normalization,
+                      let priorDelta = benchmarkCompositedDeltaEvidence(
+                          targetCapture.content,
+                          requiredContentChange.content,
+                          normalization: targetCapture.normalization,
+                          channelTolerance:
+                              benchmarkStreamCaptureChannelTolerance
+                      ) else {
+                    lastRejectedCondition =
+                        "condition 18b/24: required prior visible content "
+                        + "could not be compared on identical geometry"
+                        + diagnosticSuffix
+                    continue candidateLoop
+                }
+                guard priorDelta.materiallyDifferentPixelCount
+                        >= priorDelta.requiredMaterialPixelCount else {
+                    lastRejectedCondition =
+                        "condition 18b/24: candidate target ROI had only "
+                        + "\(priorDelta.materiallyDifferentPixelCount) material "
+                        + "pixel(s) versus the required prior visible state; "
+                        + "required \(priorDelta.requiredMaterialPixelCount), "
+                        + "max channel delta "
+                        + "\(priorDelta.maximumChannelDelta)/255 at "
+                        + "\(priorDelta.channelTolerance)/255 tolerance"
+                        + diagnosticSuffix
+                    continue candidateLoop
+                }
             }
 
             // Recheck after hashing this same candidate frame. Any missing
@@ -1890,12 +2406,12 @@ func benchmarkMeasureExplicitCompositedPaint(
                     + diagnosticSuffix
                 continue candidateLoop
             }
-            guard windowServerReportsNoOpaqueIntersectionAbove(
-                recheckedEvidence
-            ) else {
+            if let intersection =
+                windowServerNonzeroAlphaIntersectionAbove(recheckedEvidence)
+            {
                 lastRejectedCondition =
                     "condition 23/24: target became intersected during "
-                    + "verification" + diagnosticSuffix
+                    + "verification: \(intersection)" + diagnosticSuffix
                 continue candidateLoop
             }
             guard presentationBoundary.accept(
@@ -1932,8 +2448,10 @@ func benchmarkMeasureExplicitCompositedPaint(
         let targetCapture = acceptedCandidate.targetCapture
 
         let visibilityProvenance = usesAppKitVisiblePath
-            ? "screencapturekit_first_complete_target_frame_appkit_visible"
-            : "screencapturekit_first_complete_target_frame_screen_saver_level"
+            ? "screencapturekit_first_complete_target_frame_status_level_"
+                + "\(isolatedHostLevel.rawValue)_appkit_active"
+            : "screencapturekit_first_complete_target_frame_status_level_"
+                + "\(isolatedHostLevel.rawValue)_appkit_inactive"
         let observation = OnScreenPaintObservation(
             crossedDisplayRefresh: true,
             captureAuthorization: true,
@@ -1989,6 +2507,32 @@ private func benchmarkPrepareExactVisibleWindow(
         )
     }
 
+    let availableFrame = screen.visibleFrame
+    let windowFrame = window.frame
+    guard windowFrame.width <= availableFrame.width,
+          windowFrame.height <= availableFrame.height else {
+        throw BenchmarkFailure.message(
+            "benchmark host window does not fit on the selected display: "
+                + "window=\(windowFrame), available=\(availableFrame)"
+        )
+    }
+    // AppKit cascades newly created windows across launches. Repeated focused
+    // runs can otherwise leave a later process partially offscreen. Use a
+    // deterministic untimed left-side position instead of screen center, where
+    // macOS commonly presents transient system progress surfaces. This changes
+    // no z-order rule: any surface that intersects the target still fails closed.
+    let horizontalInset = min(16, max(0, availableFrame.width - windowFrame.width))
+    window.setFrameOrigin(
+        NSPoint(
+            x: floor(availableFrame.minX + horizontalInset),
+            y: floor(availableFrame.midY - windowFrame.height / 2)
+        )
+    )
+
+    let isolatedHostLevel = try benchmarkIsolatedHostWindowLevel()
+    window.animationBehavior = .none
+    window.level = isolatedHostLevel
+
     func submitUntimedWindow() {
         NSApplication.shared.activate()
         window.makeKeyAndOrderFront(nil)
@@ -2010,7 +2554,12 @@ private func benchmarkPrepareExactVisibleWindow(
         guard window.isVisible, let evidence else {
             throw BenchmarkFailure.message(
                 "untimed preparation did not acquire exact WindowServer "
-                    + "identity, on-screen state, layer, bounds, and display"
+                    + "identity, on-screen state, layer, bounds, and display: "
+                    + "window_number=\(window.windowNumber) "
+                    + "window_frame=\(window.frame) screen_frame=\(screen.frame) "
+                    + "visible_frame=\(screen.visibleFrame) "
+                    + "level=\(window.level.rawValue) is_visible=\(window.isVisible) "
+                    + benchmarkWindowServerEntryDiagnostic(for: window)
             )
         }
         return evidence
@@ -2018,61 +2567,101 @@ private func benchmarkPrepareExactVisibleWindow(
 
     submitUntimedWindow()
     var evidence = try await awaitExactEvidence()
-    let visibilityProvenance: String
-    if window.occlusionState.contains(.visible) {
-        visibilityProvenance = "appkit_occlusion_visible"
-    } else {
-        guard window.occlusionState.rawValue != 0 else {
-            throw BenchmarkFailure.message(
-                "AppKit reported the benchmark window fully occluded"
-            )
-        }
-        // The command-line full benchmark cannot always become foreground on
-        // modern macOS. Elevate only the fail-closed composited-evidence path;
-        // the target ROI is still captured and every intersecting visible
-        // nonzero-alpha window ahead is rejected below.
-        window.level = .screenSaver
-        submitUntimedWindow()
-        evidence = try await awaitExactEvidence()
-        visibilityProvenance =
-            "screencapturekit_composited_baseline_screen_saver_level"
+    guard evidence.layer == isolatedHostLevel.rawValue else {
+        throw BenchmarkFailure.message(
+            "benchmark host did not reach isolated WindowServer level "
+                + "\(isolatedHostLevel.rawValue)"
+        )
     }
+    // NSWindow.occlusionState is advisory and can remain empty for a
+    // command-line AppKit process even when WindowServer reports the exact
+    // on-screen window. Record it, but prove visibility below with exact
+    // z-order plus ScreenCaptureKit pixels from the target ROI.
+    let appKitOcclusionRawValue = window.occlusionState.rawValue
+    let visibilityProvenance =
+        "screencapturekit_composited_baseline_status_level_"
+            + "\(isolatedHostLevel.rawValue)_appkit_occlusion_"
+            + "\(appKitOcclusionRawValue)"
 
     // WindowServer can publish opening-animation geometry before the exact
-    // final client rectangle. Poll its own identity/geometry without forcing
-    // any further draw; the first SCStream frame acquired by the caller is the
-    // actual composited baseline.
+    // final client rectangle. Require the same exact identity and geometry
+    // across 300 ms—longer than an ordinary AppKit opening transition—before
+    // starting the baseline stream. The timed action begins only afterwards.
     let stableGeometryDeadline = Date().addingTimeInterval(2)
     var clientContentBounds: CGRect?
     while clientContentBounds == nil, Date() < stableGeometryDeadline {
-        guard let currentEvidence = exactWindowServerEvidence(
+        guard let candidateEvidence = exactWindowServerEvidence(
             for: window,
             on: screen
-        ) else {
-            throw BenchmarkFailure.message(
-                "prepared window lost exact WindowServer evidence"
-            )
-        }
-        evidence = currentEvidence
-        clientContentBounds = exactClientContentBounds(
-            for: window,
-            on: screen,
-            evidence: currentEvidence
-        )
-        if clientContentBounds == nil {
+        ),
+              let candidateClientContentBounds = exactClientContentBounds(
+                  for: window,
+                  on: screen,
+                  evidence: candidateEvidence
+              ) else {
             try await Task.sleep(for: .milliseconds(1))
+            continue
         }
+        try await Task.sleep(for: .milliseconds(300))
+        guard let recheckedEvidence = exactWindowServerEvidence(
+            for: window,
+            on: screen
+        ),
+              let recheckedClientContentBounds = exactClientContentBounds(
+                  for: window,
+                  on: screen,
+                  evidence: recheckedEvidence
+              ),
+              recheckedEvidence == candidateEvidence,
+              recheckedClientContentBounds
+                  == candidateClientContentBounds else {
+            continue
+        }
+        evidence = recheckedEvidence
+        clientContentBounds = recheckedClientContentBounds
     }
-    guard let clientContentBounds,
-          windowServerReportsNoOpaqueIntersectionAbove(evidence) else {
+    guard let clientContentBounds else {
         throw BenchmarkFailure.message(
-            "prepared window never reached exact final unobscured client geometry"
+            "prepared window never reached exact final client geometry"
+        )
+    }
+    // Transient system progress or shielding surfaces can legitimately
+    // appear while preparation is still untimed. Wait for a genuinely clear
+    // z-order instead of whitelisting an owner or accepting contaminated
+    // pixels. Once timing starts, every equivalent intersection still fails.
+    let unobscuredDeadline = Date().addingTimeInterval(10)
+    var lastIntersection: String?
+    var unobscuredEvidence: BenchmarkWindowServerEvidence?
+    while Date() < unobscuredDeadline {
+        guard let candidateEvidence = exactWindowServerEvidence(
+            for: window,
+            on: screen
+        ),
+              candidateEvidence == evidence else {
+            try await Task.sleep(for: .milliseconds(10))
+            continue
+        }
+        if let intersection =
+            windowServerNonzeroAlphaIntersectionAbove(candidateEvidence)
+        {
+            lastIntersection = intersection
+            try await Task.sleep(for: .milliseconds(10))
+            continue
+        }
+        unobscuredEvidence = candidateEvidence
+        break
+    }
+    guard let unobscuredEvidence else {
+        throw BenchmarkFailure.message(
+            "prepared window did not obtain an unobscured z-order before the "
+                + "untimed deadline; last intersection: "
+                + (lastIntersection ?? "WindowServer evidence unavailable")
         )
     }
     return (
         screen,
         visibilityProvenance,
-        evidence,
+        unobscuredEvidence,
         clientContentBounds
     )
 }
@@ -2081,6 +2670,10 @@ private func benchmarkPrepareExactVisibleWindow(
 func benchmarkMeasurePassiveCompositedChange(
     _ window: NSWindow,
     targetView: NSView,
+    onActionStarting:
+        (@MainActor () async throws -> Void)? = nil,
+    restorationAction:
+        (@MainActor () throws -> Bool)? = nil,
     action: @escaping @MainActor () async throws -> Void
 ) async throws -> BenchmarkPassivePresentationMeasurement {
     let prepared = try await benchmarkPrepareExactVisibleWindow(window)
@@ -2114,35 +2707,94 @@ func benchmarkMeasurePassiveCompositedChange(
                 "passive target-ROI baseline was blank or uniform"
             )
         }
-
         guard let preActionEvidence = exactWindowServerEvidence(
             for: window,
             on: prepared.screen
-        ),
-              preActionEvidence == prepared.evidence,
-              let preActionClientContentBounds = exactClientContentBounds(
-                  for: window,
-                  on: prepared.screen,
-                  evidence: preActionEvidence
-              ),
-              preActionClientContentBounds == prepared.clientContentBounds,
-              let preActionTargetBounds = exactTargetViewBounds(
-                  targetView,
-                  in: window,
-                  on: prepared.screen,
-                  windowEvidence: preActionEvidence,
-                  clientContentBounds: preActionClientContentBounds
-              ),
-              preActionTargetBounds == targetBounds,
-              windowServerReportsNoOpaqueIntersectionAbove(
-                  preActionEvidence
-              ) else {
+        ) else {
             throw BenchmarkFailure.message(
-                "target window identity, geometry, ROI, or unobscured state "
-                    + "changed while acquiring its baseline"
+                "target lost exact WindowServer evidence while acquiring "
+                    + "its baseline"
+            )
+        }
+        guard preActionEvidence == prepared.evidence else {
+            throw BenchmarkFailure.message(
+                "target WindowServer evidence changed while acquiring its "
+                    + "baseline: prepared window=\(prepared.evidence.windowID) "
+                    + "layer=\(prepared.evidence.layer) "
+                    + "bounds=\(prepared.evidence.bounds), current window="
+                    + "\(preActionEvidence.windowID) "
+                    + "layer=\(preActionEvidence.layer) "
+                    + "bounds=\(preActionEvidence.bounds)"
+            )
+        }
+        guard let preActionClientContentBounds = exactClientContentBounds(
+            for: window,
+            on: prepared.screen,
+            evidence: preActionEvidence
+        ),
+              preActionClientContentBounds
+                  == prepared.clientContentBounds else {
+            throw BenchmarkFailure.message(
+                "target client-content geometry changed while acquiring its "
+                    + "baseline"
+            )
+        }
+        guard let preActionTargetBounds = exactTargetViewBounds(
+            targetView,
+            in: window,
+            on: prepared.screen,
+            windowEvidence: preActionEvidence,
+            clientContentBounds: preActionClientContentBounds
+        ),
+              preActionTargetBounds == targetBounds else {
+            throw BenchmarkFailure.message(
+                "target ROI changed while acquiring its baseline"
+            )
+        }
+        if let intersection =
+            windowServerNonzeroAlphaIntersectionAbove(preActionEvidence)
+        {
+            throw BenchmarkFailure.message(
+                "target acquired an intersecting nonzero-alpha window ahead "
+                    + "while acquiring its baseline: \(intersection)"
             )
         }
 
+        let restorationReferenceCapture:
+            BenchmarkCompositedCaptureEvidence?
+        if restorationAction != nil {
+            let reference = try await captureCompositedClientContent(
+                evidence: preActionEvidence,
+                clientContentBounds: targetBounds,
+                normalization: baselineCapture.normalization
+            )
+            guard reference.content.hasNonblankContent,
+                  reference.content.hasNonuniformContent,
+                  reference.normalization == baselineCapture.normalization else {
+                throw BenchmarkFailure.message(
+                    "pre-action restoration reference screenshot was blank, "
+                        + "uniform, or used different normalization"
+                )
+            }
+            restorationReferenceCapture = reference
+        } else {
+            restorationReferenceCapture = nil
+        }
+
+        benchmarkTrace(
+            "passive baseline window=\(prepared.evidence.windowID) "
+                + "target=\(targetBounds) mouse=\(NSEvent.mouseLocation) "
+                + "fingerprint="
+                + String(
+                    baselineCapture.content.normalizedFingerprintSHA256
+                        .prefix(16)
+                )
+        )
+
+        // Any injected transport impairment begins only after untimed
+        // window preparation, stream startup, baseline capture, and exact
+        // pre-action validation. Its setup cannot consume the configured RTT.
+        try await onActionStarting?()
         let actionStartedMachTicks = mach_absolute_time()
         let actionStartedAt = clock.now
         try await action()
@@ -2157,11 +2809,9 @@ func benchmarkMeasurePassiveCompositedChange(
             from: captureSession.frames,
             afterDisplayTime: postActionDisplayTime,
             afterReceivedAt: actionCompletedAt,
-            baselineFingerprint:
-                baselineCapture.content.normalizedFingerprintSHA256,
+            baselineFrame: baselineFrame,
             baselineNormalization: baselineCapture.normalization
         )
-
         guard let postActionEvidence = exactWindowServerEvidence(
             for: window,
             on: prepared.screen
@@ -2181,7 +2831,7 @@ func benchmarkMeasurePassiveCompositedChange(
                   clientContentBounds: postActionClientContentBounds
               ),
               postActionTargetBounds == targetBounds,
-              windowServerReportsNoOpaqueIntersectionAbove(
+              windowServerReportsNoNonzeroAlphaIntersectionAbove(
                   postActionEvidence
               ) else {
             throw BenchmarkFailure.message(
@@ -2190,8 +2840,72 @@ func benchmarkMeasurePassiveCompositedChange(
             )
         }
 
+        var captureEquivalentBaselineRestorationVerified = false
+        var restorationDeltaEvidence: BenchmarkCompositedDeltaEvidence?
+        if let restorationAction {
+            guard let restorationReferenceCapture else {
+                throw BenchmarkFailure.message(
+                    "composited restoration omitted its same-API reference capture"
+                )
+            }
+            // The timed hover frame is already accepted. Stop its continuous
+            // stream, invoke cleanup, flush AppKit/Core Animation, and use an
+            // explicit ScreenCaptureKit screenshot for current compositor
+            // state. An identical re-submission need not produce another
+            // SCStream frame, so stream notification is not restoration proof.
+            await captureSession.stop()
+            let restorationStateCorrect = try restorationAction()
+            targetView.displayIfNeeded()
+            window.displayIfNeeded()
+            CATransaction.flush()
+            guard restorationStateCorrect else {
+                throw BenchmarkFailure.message(
+                    "target restoration action reported an invalid local state"
+                )
+            }
+            let restored = try await benchmarkCaptureRestoredTarget(
+                window: window,
+                screen: prepared.screen,
+                expectedWindowEvidence: prepared.evidence,
+                targetBounds: targetBounds,
+                baselineImage: restorationReferenceCapture.image,
+                normalization: restorationReferenceCapture.normalization
+            )
+            guard let restoredEvidence = exactWindowServerEvidence(
+                for: window,
+                on: prepared.screen
+            ),
+                  restoredEvidence == prepared.evidence,
+                  let restoredClientContentBounds = exactClientContentBounds(
+                      for: window,
+                      on: prepared.screen,
+                      evidence: restoredEvidence
+                  ),
+                  restoredClientContentBounds == prepared.clientContentBounds,
+                  let restoredTargetBounds = exactTargetViewBounds(
+                      targetView,
+                      in: window,
+                      on: prepared.screen,
+                      windowEvidence: restoredEvidence,
+                      clientContentBounds: restoredClientContentBounds
+                  ),
+                  restoredTargetBounds == targetBounds,
+                  windowServerReportsNoNonzeroAlphaIntersectionAbove(
+                      restoredEvidence
+                  ) else {
+                throw BenchmarkFailure.message(
+                    "restored target frame changed exact window identity, geometry, "
+                        + "ROI, display, or unobscured visibility"
+                )
+            }
+            captureEquivalentBaselineRestorationVerified = true
+            restorationDeltaEvidence = restored.delta
+        }
+
         let provenance =
             "screencapturekit_same_complete_frame_target_roi_after_action_"
+                + (captureEquivalentBaselineRestorationVerified
+                    ? "capture_equivalent_baseline_restored_" : "")
                 + prepared.visibilityProvenance
         let observation = OnScreenPaintObservation(
             crossedDisplayRefresh: true,
@@ -2211,6 +2925,8 @@ func benchmarkMeasurePassiveCompositedChange(
                     changed.capture.content.normalizedFingerprintSHA256
                         .prefix(16)
                 )
+                + " restoration="
+                + "\(captureEquivalentBaselineRestorationVerified)"
         )
         return BenchmarkPassivePresentationMeasurement(
             actionStartedAt: actionStartedAt,
@@ -2222,7 +2938,9 @@ func benchmarkMeasurePassiveCompositedChange(
                     from: actionStartedMachTicks,
                     to: changed.frame.displayTime
                 ),
-            observation: observation
+            observation: observation,
+            contentDeltaEvidence: changed.delta,
+            restorationDeltaEvidence: restorationDeltaEvidence
         )
     } catch {
         await captureSession.stop()
@@ -2250,14 +2968,14 @@ private func benchmarkOnScreenOwnedWindowIDs() throws -> Set<CGWindowID> {
             )
         }
         guard ownerPID == getpid() else { continue }
-        guard (entry[kCGWindowIsOnscreen as String] as? NSNumber)?
-                .boolValue == true,
-              let identifier = (
-                  entry[kCGWindowNumber as String] as? NSNumber
-              )?.uint32Value,
+        // .optionOnScreenOnly membership is authoritative; the
+        // kCGWindowIsOnscreen value itself is not guaranteed to be present.
+        guard let identifier = (
+            entry[kCGWindowNumber as String] as? NSNumber
+        )?.uint32Value,
               identifier != 0 else {
             throw BenchmarkFailure.message(
-                "pre-menu owned window omitted exact on-screen identity"
+                "pre-menu on-screen owned window omitted exact identity"
             )
         }
         identifiers.insert(identifier)
@@ -2469,7 +3187,7 @@ private func benchmarkAwaitOwnedMenuFrame(
                       displayID: displayID,
                       menuLayer: menuLayer
                   ),
-                  windowServerReportsNoOpaqueIntersectionAbove(candidate),
+                  windowServerReportsNoNonzeroAlphaIntersectionAbove(candidate),
                   let baselineCrop = benchmarkCropDisplayFrame(
                       baselineFrame.image,
                       to: candidate.bounds,
@@ -2510,7 +3228,7 @@ private func benchmarkAwaitOwnedMenuFrame(
             guard let rechecked =
                 try benchmarkRecheckOwnedMenuWindowEvidence(candidate),
                   rechecked == candidate,
-                  windowServerReportsNoOpaqueIntersectionAbove(rechecked)
+                  windowServerReportsNoNonzeroAlphaIntersectionAbove(rechecked)
             else {
                 throw BenchmarkFailure.message(
                     "owned menu identity, geometry, z-order, or visibility "
@@ -2536,7 +3254,9 @@ func benchmarkMeasureOwnedMenuPresentation(
     _ menu: NSMenu,
     positioningItem: NSMenuItem?,
     at location: NSPoint,
-    in view: NSView
+    in view: NSView,
+    onActionStarting:
+        (@MainActor () async throws -> Void)? = nil
 ) async throws -> BenchmarkMenuPresentationMeasurement {
     guard let window = view.window else {
         throw BenchmarkFailure.message(
@@ -2544,35 +3264,14 @@ func benchmarkMeasureOwnedMenuPresentation(
         )
     }
     let prepared = try await benchmarkPrepareExactVisibleWindow(window)
-    if window.level == .screenSaver {
-        // The fallback host must remain above ordinary app windows but below
-        // AppKit's separate pop-up-menu window. Otherwise a layer-101 menu is
-        // truthfully reported as covered by its own layer-1000 host.
-        window.level = .statusBar
-        window.orderFrontRegardless()
-        CATransaction.flush()
-        let hostLevelDeadline = Date().addingTimeInterval(2)
-        var loweredHostEvidence = exactWindowServerEvidence(
-            for: window,
-            on: prepared.screen
+    let isolatedHostLevel = try benchmarkIsolatedHostWindowLevel()
+    let menuLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
+    guard window.level == isolatedHostLevel,
+          prepared.evidence.layer == isolatedHostLevel.rawValue,
+          prepared.evidence.layer < menuLayer else {
+        throw BenchmarkFailure.message(
+            "menu host was not isolated below its production pop-up level"
         )
-        while loweredHostEvidence == nil, Date() < hostLevelDeadline {
-            try await Task.sleep(for: .milliseconds(1))
-            loweredHostEvidence = exactWindowServerEvidence(
-                for: window,
-                on: prepared.screen
-            )
-        }
-        guard let loweredHostEvidence,
-              loweredHostEvidence.layer == NSWindow.Level.statusBar.rawValue,
-              windowServerReportsNoOpaqueIntersectionAbove(
-                  loweredHostEvidence
-              ) else {
-            throw BenchmarkFailure.message(
-                "menu host could not establish an unobscured level below its "
-                    + "owned pop-up window"
-            )
-        }
     }
     let baselineWindowIDs = try benchmarkOnScreenOwnedWindowIDs()
     let displayID = prepared.evidence.displayID
@@ -2591,10 +3290,12 @@ func benchmarkMeasureOwnedMenuPresentation(
             from: captureSession.frames,
             operation: "owned menu pre-action display baseline"
         )
+        // Align the real transport impairment with the menu action only after
+        // the full-display baseline and exact host evidence are ready.
+        try await onActionStarting?()
         let actionStartedMachTicks = mach_absolute_time()
         let actionStartedAt = clock.now
         let postActionDisplayTime = actionStartedMachTicks
-        let menuLayer = NSWindow.Level.popUpMenu.rawValue
         let cancellationTarget = BenchmarkMenuCancellationTarget(menu: menu)
         let evidenceTask = Task.detached {
             do {

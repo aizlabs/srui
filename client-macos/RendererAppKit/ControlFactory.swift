@@ -83,13 +83,19 @@ public final class ActionTrampoline: NSObject {
     }
 }
 
-/// Creates native controls for the required §7.3 tier and applies scalar properties in place.
+/// Creates native controls for the required §7.3 tier and any explicitly implemented optional tiers.
 @MainActor
 public final class ControlFactory {
+    /// Standard types this renderer implements. Optional/deferred additions stay explicit so
+    /// conformance can distinguish supported semantics from an accidental fallback.
+    static let implementedStandardNodeTypes: Set<TypeRef> = [
+        .surface, .row, .column, .grid, .spacer, .separator, .scroll,
+        .text, .richText, .button, .toggle, .textInput, .textArea,
+        .progress, .image, .list, .table, .tree, .menu,
+    ]
+
     /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
-
-    /// Primitive cache-miss callback. Session encodes this as `ClientModelRangeRequest` (§8, §22.7).
     public var onCollectionRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
 
     /// Synchronous main-actor resolver from content hash to a retained `NSImage` (§14).

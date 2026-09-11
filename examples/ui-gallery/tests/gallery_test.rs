@@ -287,8 +287,8 @@ fn initial_graph_contains_every_supported_node_type() {
         "the gallery must instantiate exactly the node types implemented by the renderer"
     );
     // Surface, Scroll, Column, Row, Grid, Spacer, Separator, Text, RichText, Image, Button,
-    // Toggle, TextInput, TextArea, Progress, List, Table, Tree, and deferred-tier Menu.
-    assert_eq!(expected.len(), 19);
+    // Toggle, TextInput, TextArea, Progress, List, Table, and Tree.
+    assert_eq!(expected.len(), 18);
 }
 
 #[test]
@@ -322,7 +322,6 @@ fn every_section_and_collection_is_present() {
         ids::LAYOUT_COLUMN,
         ids::COLL_COLUMN,
         ids::INSPECT_COLUMN,
-        ids::CONN_COLUMN,
     ] {
         assert!(
             app.session().contains_node(node),
@@ -330,19 +329,6 @@ fn every_section_and_collection_is_present() {
             node.get()
         );
     }
-
-    let menu = app.session().get_node(ids::MENU).expect("menu node");
-    assert_eq!(menu.node_type, TypeRef::MENU);
-    assert_eq!(
-        menu.get_property(ITEMS),
-        Some(&Value::List(
-            ui::BASELINE_MENU_ITEMS
-                .iter()
-                .map(|item| Value::String((*item).to_string()))
-                .collect()
-        )),
-        "the deferred-tier Menu must publish the choices rendered by NSPopUpButton"
-    );
 
     app.session().with_store(|store| {
         assert_eq!(
@@ -540,10 +526,17 @@ fn autoplay_toggle_drives_server_state() {
 }
 
 #[test]
-fn text_edit_commits_the_authoritative_editor_value() {
+fn text_edit_commit_is_instrumented_without_faking_or_double_counting_transactions() {
     let app = app();
     let mut client = Client::new();
     let before = app.session().current_revision();
+    let metrics_before = app.with_state(|state| {
+        (
+            state.metrics.transactions(),
+            state.metrics.operations(),
+            state.metrics.events(),
+        )
+    });
     let event = client.text_edit(app.session(), ids::INPUT_PLAIN, "edited by client", 1);
 
     assert!(
@@ -553,7 +546,11 @@ fn text_edit_commits_the_authoritative_editor_value() {
         ),
         "a valid text edit must be accepted by the default Session policy"
     );
-    assert_eq!(app.session().current_revision(), before.saturating_add(1));
+    assert_eq!(
+        app.session().current_revision(),
+        before.saturating_add(2),
+        "the built-in edit is followed by exactly one instrumentation commit"
+    );
     let input = app
         .session()
         .get_node(ids::INPUT_PLAIN)
@@ -562,6 +559,49 @@ fn text_edit_commits_the_authoritative_editor_value() {
         input.get_property(VALUE).and_then(Value::as_string),
         Some("edited by client"),
         "accepted TEXT_EDIT must update authoritative node state"
+    );
+
+    let metrics_after = app.with_state(|state| {
+        (
+            state.metrics.transactions(),
+            state.metrics.operations(),
+            state.metrics.events(),
+        )
+    });
+    assert_eq!(metrics_after.0, metrics_before.0.saturating_add(2));
+    assert!(
+        metrics_after.1 >= metrics_before.1.saturating_add(2),
+        "the real value and validation operations must be metered"
+    );
+    assert_eq!(metrics_after.2, metrics_before.2.saturating_add(1));
+
+    let rows = trace_rows(app.session());
+    assert!(
+        rows.iter()
+            .any(|row| row[1] == "C→S" && row[2] == "TEXT_EDIT"),
+        "the inbound edit must appear in the inspector"
+    );
+    assert!(
+        rows.iter().any(|row| {
+            row[1] == "S→C"
+                && row[2] == "SET_PROPERTY"
+                && row[3].contains(&format!("node {}", ids::INPUT_PLAIN.get()))
+        }),
+        "the authoritative edit operations must appear in the inspector"
+    );
+    assert!(text_of(app.session(), ids::INSPECT_LAST_EVENT).contains("TEXT_EDIT"));
+    let revision = app.session().current_revision();
+    assert_eq!(
+        text_of(app.session(), ids::INSPECT_REVISION),
+        format!("Revision: {revision}")
+    );
+    assert_eq!(
+        text_of(app.session(), ids::CONN_REVISION),
+        format!("Revision: {revision} (journal head {revision})")
+    );
+    assert!(
+        text_of(app.session(), ids::CONN_LAG).contains("min 0"),
+        "a fresh edit must be measured against its authoritative commit base"
     );
 }
 
@@ -805,6 +845,17 @@ fn a_full_scene_cycle_and_reset_restore_the_baseline() {
         let event = client.value_changed(app.session(), node, value);
         dispatch(app.session(), &event);
     }
+    for (node, value) in [
+        (ids::INPUT_PLAIN, "changed plain"),
+        (ids::INPUT_SEARCH, "changed search"),
+        (ids::INPUT_SECURE, "changed secret"),
+        (ids::INPUT_COMMAND, "changed command"),
+        (ids::INPUT_INVALID, "changed validated"),
+        (ids::TEXT_AREA, "changed\nnotes"),
+    ] {
+        let edit = client.text_edit(app.session(), node, value, 1);
+        dispatch(app.session(), &edit);
+    }
     let button = client.activate(app.session(), ids::BTN_DESTRUCTIVE);
     dispatch(app.session(), &button);
     let selection = client.selection(app.session(), ids::LIST, ids::LIST_ITEMS[1]);
@@ -822,6 +873,26 @@ fn a_full_scene_cycle_and_reset_restore_the_baseline() {
         "reset after control events and a scene must restore the baseline graph",
     );
     assert!(!app.autoplay(), "reset must stop autoplay");
+    for (node, value) in [
+        (ids::INPUT_PLAIN, ui::BASELINE_INPUT_PLAIN),
+        (ids::INPUT_SEARCH, ui::BASELINE_INPUT_SEARCH),
+        (ids::INPUT_SECURE, ui::BASELINE_INPUT_SECURE),
+        (ids::INPUT_COMMAND, ui::BASELINE_INPUT_COMMAND),
+        (ids::INPUT_INVALID, ui::BASELINE_INPUT_INVALID),
+        (ids::TEXT_AREA, ui::BASELINE_TEXT_AREA),
+    ] {
+        let actual = app.session().get_node(node).and_then(|node| {
+            node.get_property(VALUE)
+                .and_then(Value::as_string)
+                .map(str::to_string)
+        });
+        assert_eq!(
+            actual.as_deref(),
+            Some(value),
+            "reset must restore authoritative editor value for node {}",
+            node.get()
+        );
+    }
     assert_eq!(
         app.with_state(|state| (state.list_selection, state.table_selection)),
         (None, None),

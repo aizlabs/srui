@@ -11,22 +11,22 @@
 //!
 //! - **§5.2 Semantic state, not display remoting**: nothing here paints, encodes a frame, or
 //!   measures a pixel. Every visible change is a property, model, or structural operation.
-//! - **§12.1 Atomic transactions**: each scene change and each accepted event produces exactly one
-//!   all-or-nothing transaction. The inspector row describing a change is committed inside the
-//!   same transaction as the change, so the two can never be observed apart.
+//! - **§12.1 Atomic transactions**: each scene change commits all-or-nothing. Built-in text edits
+//!   commit authoritatively inside Session, then one instrumentation transaction reports that exact
+//!   commit; ordinary gallery events remain self-describing in their mutation transaction.
 //! - **§23 Incremental rendering**: scenes mutate existing nodes. `CREATE_NODE` after startup only
 //!   ever appears in the structure scene, which creates one node and deletes it again.
 //! - **§4 inv. 13 No silent degradation**: the gallery instantiates only node types the renderer
-//!   implements, and labels the two interaction paths that are not wired yet (text editing, tree
-//!   expansion) in the UI rather than pretending they work.
+//!   implements, and labels the remaining interaction path that is not wired yet (tree expansion)
+//!   in the UI rather than pretending it works.
 //! - **§7.7 `action_key` is data**: keys are published for the client and for logs. Dispatch is by
 //!   `(NodeId, TypeRef)` handler registration only; no key is ever parsed or executed.
 //!
 //! # Locking
 //!
 //! One mutex guards application state. The lock order is **state → session**, never the reverse.
-//! Session counters are read after taking the state lock but before a transaction opens, because
-//! `Session::transaction` holds the same inner mutex those accessors need.
+//! Non-revision Session counters are read after taking the state lock and before a transaction
+//! opens. The transaction's revisions are supplied from the actual Session commit critical section.
 
 pub mod ids;
 pub mod scenes;
@@ -37,9 +37,9 @@ pub mod ui;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Instant;
 
-use srui_protocol::Event as WireEvent;
+use srui_protocol::{Event as WireEvent, Transaction as WireTransaction};
 use srui_sdk::*;
-use srui_semantic_tree::Event as SemanticEvent;
+use srui_semantic_tree::{Event as SemanticEvent, Transaction as SemanticTransaction};
 use srui_sessiond::{Session, SessionError};
 
 pub use scenes::{Scene, SceneContext, SCENES};
@@ -54,7 +54,7 @@ pub use trace::{Trigger, MAX_TRACE_ROWS};
 pub const GALLERY_IMAGE: &[u8] = include_bytes!("../assets/gallery.png");
 
 /// Application state owned by the gallery server.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct GalleryState {
     /// Scene currently applied to the graph.
     pub scene: Scene,
@@ -72,11 +72,68 @@ pub struct GalleryState {
     pub metrics: Metrics,
 }
 
-/// The gallery application: a [`Session`], deterministic state, and the handlers wired to it.
+impl Clone for GalleryState {
+    fn clone(&self) -> Self {
+        Self {
+            scene: self.scene,
+            autoplay: self.autoplay,
+            list_selection: self.list_selection,
+            table_selection: self.table_selection,
+            scenes: self.scenes.clone(),
+            trace: self.trace.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.scene = source.scene;
+        self.autoplay = source.autoplay;
+        self.list_selection = source.list_selection;
+        self.table_selection = source.table_selection;
+        self.scenes.clone_from(&source.scenes);
+        self.trace.clone_from(&source.trace);
+        self.metrics.clone_from(&source.metrics);
+    }
+}
+
+/// Reusable published and staging buffers for gallery-owned state.
+#[derive(Debug)]
+struct GalleryStates {
+    published: GalleryState,
+    staging: GalleryState,
+}
+
+/// Operations from a transaction committed before the gallery instrumentation transaction.
+#[derive(Debug, Default)]
+struct PriorTransaction {
+    base_revision: Option<u64>,
+    operations: Vec<Operation>,
+}
+
+impl PriorTransaction {
+    fn observed(transaction: SemanticTransaction) -> Self {
+        Self {
+            base_revision: Some(transaction.base_revision.get()),
+            operations: transaction.operations,
+        }
+    }
+}
+
+impl From<Vec<Operation>> for PriorTransaction {
+    fn from(operations: Vec<Operation>) -> Self {
+        Self {
+            base_revision: None,
+            operations,
+        }
+    }
+}
+
+/// The gallery application: a Session, deterministic state, and the handlers wired to it.
 #[derive(Debug)]
 pub struct GalleryApp {
     session: Arc<Session>,
-    state: Mutex<GalleryState>,
+    state: Mutex<GalleryStates>,
+    autoplay_updates: tokio::sync::watch::Sender<bool>,
     image: Option<ResourceHash>,
 }
 
@@ -96,17 +153,21 @@ impl GalleryApp {
         state.metrics.observe_resource(GALLERY_IMAGE.len() as u64);
         state.metrics.observe_transaction(base_revision, &initial);
 
+        let (autoplay_updates, _) = tokio::sync::watch::channel(state.autoplay);
+        let staging = state.clone();
         let app = Arc::new(Self {
             session,
-            state: Mutex::new(state),
+            state: Mutex::new(GalleryStates {
+                published: state,
+                staging,
+            }),
+            autoplay_updates,
             image: Some(image),
         });
 
-        // The initial graph is already committed, so its operations are described from the next
-        // transaction rather than from inside itself. Every later transaction is self-describing.
         app.commit(
             Trigger::server(format!(
-                "initial gallery graph \u{b7} {} operations",
+                "initial gallery graph · {} operations",
                 initial.len()
             )),
             initial,
@@ -130,65 +191,72 @@ impl GalleryApp {
 
     /// Runs `f` against authoritative application state.
     pub fn with_state<T>(&self, f: impl FnOnce(&GalleryState) -> T) -> T {
-        f(&lock_or_recover(&self.state))
+        let states = lock_or_recover(&self.state);
+        f(&states.published)
     }
 
     /// Scene currently applied to the graph.
     pub fn scene(&self) -> Scene {
-        lock_or_recover(&self.state).scene
+        lock_or_recover(&self.state).published.scene
     }
 
     /// Whether autoplay is advancing scenes.
     pub fn autoplay(&self) -> bool {
-        lock_or_recover(&self.state).autoplay
+        lock_or_recover(&self.state).published.autoplay
     }
 
+    /// Subscribes to autoplay changes; enabling always starts a fresh dwell interval.
+    pub fn autoplay_updates(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.autoplay_updates.subscribe()
+    }
     // =========================================================================
     // Transactions
     // =========================================================================
 
     /// Commits one transaction, appending the inspector rows and telemetry it implies.
     ///
-    /// `prior` describes operations committed by an earlier transaction (used once, for the
-    /// bootstrap graph); everything else described comes from the operations `f` stages here.
+    /// Prior operations may come from the bootstrap graph (trace-only) or an authoritative
+    /// TEXT_EDIT carrying its exact base revision (trace and metrics).
     fn commit<F>(
         &self,
         trigger: Trigger,
-        prior: Vec<Operation>,
+        prior: impl Into<PriorTransaction>,
         started: Option<Instant>,
         f: F,
     ) -> Result<Vec<Operation>, SessionError>
     where
         F: FnOnce(&mut UiTransaction, &mut GalleryState) -> Result<(), StoreError>,
     {
-        // Serialize gallery commits first, then capture session facts immediately before opening
-        // the transaction. This preserves the state → session lock order while ensuring concurrent
-        // callers cannot render or frame a superseded revision.
-        let mut state = lock_or_recover(&self.state);
+        let mut states = lock_or_recover(&self.state);
         let facts = SessionFacts::capture(&self.session);
+        let prior = prior.into();
+        let GalleryStates { published, staging } = &mut *states;
 
-        // Session::transaction already stages the semantic store. Clone the gallery-owned state as
-        // well so StoreError and caught-panic rollback cover scene allocators, trace ids, metrics,
-        // rendered-value caches, and every other application field.
-        let mut staged = state.clone();
-        let committed = self.session.transaction(|ui| {
-            f(ui, &mut staged)?;
+        // Reuse staging allocations across commits. A StoreError or caught panic never swaps this
+        // buffer into published, so gallery-owned state rolls back with the semantic graph.
+        staging.clone_from(published);
+        let result = self.session.transaction_with_result(|ui, revisions| {
+            let facts = facts.with_transaction(revisions);
+            f(ui, staging)?;
 
-            // Snapshot before the inspector writes, so the inspector never describes itself.
-            let mut described = prior;
+            if let Some(base_revision) = prior.base_revision {
+                staging
+                    .metrics
+                    .observe_transaction(base_revision, &prior.operations);
+            }
+
+            // Snapshot before inspector writes so the inspector never describes itself.
+            let mut described = prior.operations;
             described.extend_from_slice(ui.operations());
-            staged.trace.record(ui, &trigger, &described)?;
+            staging.trace.record(ui, &trigger, &described)?;
 
             Text::set_text_for(ui, ids::INSPECT_LAST_EVENT, trigger.inspector_text())?;
             Text::set_text_for(
                 ui,
                 ids::INSPECT_REVISION,
-                format!("Revision: {}", facts.committed_revision()),
+                format!("Revision: {}", revisions.committed_revision),
             )?;
 
-            // Observed before rendering so the panel reflects the event that caused this
-            // transaction rather than lagging one behind it. The sample covers decode,
-            // validation, and staging — every server-side step except the commit itself.
             if let (
                 Some(started),
                 Trigger::Event {
@@ -196,27 +264,33 @@ impl GalleryApp {
                 },
             ) = (started, &trigger)
             {
-                let lag = facts.revision.saturating_sub(*observed_revision);
-                staged.metrics.observe_event(started.elapsed(), lag);
+                let event_base_revision = prior.base_revision.unwrap_or(revisions.base_revision);
+                let lag = event_base_revision.saturating_sub(*observed_revision);
+                staging.metrics.observe_event(started.elapsed(), lag);
             }
 
-            staged.metrics.render(ui, &facts)?;
+            staging.metrics.render(ui, &facts)?;
             Ok(ui.operations().to_vec())
         })?;
 
-        // Framed size is only knowable once the operation list is final, so the throughput panel
-        // reports every transaction committed strictly before the one being rendered. This method
-        // is deliberately infallible: the semantic commit has succeeded, so publishing the staged
-        // application state must not introduce a second failure boundary.
-        staged
+        // Framed size is known only once the operation list is final. The panel therefore renders
+        // prior commits, then this exact transaction is included in the next render.
+        staging
             .metrics
-            .observe_transaction(facts.revision, &committed);
-        *state = staged;
+            .observe_transaction(result.transaction.base_revision, &result.value);
+        let autoplay_changed = published.autoplay != staging.autoplay;
+        std::mem::swap(published, staging);
+        let autoplay = published.autoplay;
+        drop(states);
 
-        Ok(committed)
+        if autoplay_changed {
+            self.autoplay_updates.send_replace(autoplay);
+        }
+
+        Ok(result.value)
     }
 
-    /// Commits a server-initiated transaction described by `label`.
+    /// Commits a server-initiated transaction described by label.
     pub fn mutate<F>(&self, label: impl Into<String>, f: F) -> Result<Vec<Operation>, SessionError>
     where
         F: FnOnce(&mut UiTransaction, &mut GalleryState) -> Result<(), StoreError>,
@@ -331,6 +405,18 @@ impl GalleryApp {
         ] {
             Toggle::set_value_for(ui, node, value)?;
         }
+        for (node, value) in [
+            (ids::INPUT_PLAIN, ui::BASELINE_INPUT_PLAIN),
+            (ids::INPUT_SEARCH, ui::BASELINE_INPUT_SEARCH),
+            (ids::INPUT_SECURE, ui::BASELINE_INPUT_SECURE),
+            (ids::INPUT_COMMAND, ui::BASELINE_INPUT_COMMAND),
+            (ids::INPUT_INVALID, ui::BASELINE_INPUT_INVALID),
+        ] {
+            TextInput::set_value_for(ui, node, value)?;
+            TextInput::set_validation_state_for(ui, node, ValidationState::Valid)?;
+        }
+        TextArea::set_value_for(ui, ids::TEXT_AREA, ui::BASELINE_TEXT_AREA)?;
+        TextArea::set_validation_state_for(ui, ids::TEXT_AREA, ValidationState::Valid)?;
         Ok(())
     }
 
@@ -393,6 +479,27 @@ impl GalleryApp {
                 });
         }
 
+        for node in [
+            ids::INPUT_PLAIN,
+            ids::INPUT_SEARCH,
+            ids::INPUT_SECURE,
+            ids::INPUT_COMMAND,
+            ids::INPUT_INVALID,
+            ids::TEXT_AREA,
+        ] {
+            let target: Weak<Self> = Arc::downgrade(self);
+            self.session
+                .on_result_with_transaction(node, TEXT_EDIT, move |_, event, committed| {
+                    let app = target.upgrade().ok_or_else(handler_target_unavailable)?;
+                    let committed = committed.ok_or_else(|| {
+                        SessionError::InvalidConfiguration(
+                            "accepted gallery TEXT_EDIT did not carry its transaction".to_string(),
+                        )
+                    })?;
+                    app.on_text_edit(event, committed)
+                });
+        }
+
         for (node, collection) in [
             (ids::LIST, Collection::List),
             (ids::TABLE, Collection::Table),
@@ -404,6 +511,29 @@ impl GalleryApp {
                     app.on_selection_changed(collection, event)
                 });
         }
+    }
+
+    fn on_text_edit(
+        &self,
+        event: &WireEvent,
+        committed: &WireTransaction,
+    ) -> Result<(), SessionError> {
+        let started = Instant::now();
+        let transaction = SemanticTransaction::try_from(committed.clone())?;
+        let edited_bytes = decode_semantic_event(event)
+            .and_then(|event| event.text_arg().map(str::len))
+            .unwrap_or(0);
+        let trigger = event_trigger(
+            event,
+            format!("authoritative text edit · {edited_bytes} UTF-8 bytes"),
+        );
+        self.commit(
+            trigger,
+            PriorTransaction::observed(transaction),
+            Some(started),
+            |_, _| Ok(()),
+        )
+        .map(|_| ())
     }
 
     fn on_scene_action(&self, action: SceneAction, event: &WireEvent) -> Result<(), SessionError> {

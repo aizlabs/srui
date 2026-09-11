@@ -18,14 +18,14 @@ Two terminals.
 
 ```bash
 cargo run --manifest-path examples/ui-gallery/Cargo.toml -- \
-  --socket /tmp/srui-ui-gallery.sock
+  --socket /tmp/srui-$(id -u)/ui-gallery.sock
 ```
 
 **Client** — from the repository root:
 
 ```bash
 swift run --package-path client-macos RendererDemoApp \
-  --socket /tmp/srui-ui-gallery.sock
+  --socket /tmp/srui-$(id -u)/ui-gallery.sock
 ```
 
 Server flags:
@@ -33,12 +33,14 @@ Server flags:
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--socket PATH` | `$XDG_RUNTIME_DIR/srui-ui-gallery.sock`, else `$TMPDIR/…` | Unix socket to bind |
-| `--autoplay` | off | Start the scene tour immediately |
+| `--autoplay` | off | Start the scene tour after one full cadence interval |
 | `--autoplay-interval SECONDS` | `4` | Autoplay cadence |
 
 All diagnostics go to stderr, so the binary is safe to bridge over an SSH subsystem where stdout
-is the protocol stream (§19.1, §20.1). Only one server may own a socket path at a time; ownership
-is enforced with `flock(2)`, not a connect probe.
+is the protocol stream (§19.1, §20.1). The shared `srui-unix-security` boundary creates a private
+0700 parent, binds the socket at 0600, validates each peer's effective UID, and retains an advisory
+lock across stale-socket cleanup and binding. Orderly shutdown removes only the socket and lock
+inodes this process owns.
 
 ### What you should see
 
@@ -53,7 +55,7 @@ is enforced with `flock(2)`, not a connect probe.
 
 ## Support matrix
 
-### Rendered by the gallery (19 node types)
+### Rendered by the gallery (18 node types)
 
 | Category | Node types | Where |
 | --- | --- | --- |
@@ -61,18 +63,16 @@ is enforced with `flock(2)`, not a connect probe.
 | Content | `Text`, `RichText`, `Image` | hero + typography sections |
 | Controls | `Button`, `Toggle`, `TextInput`, `TextArea`, `Progress` | controls section |
 | Collections | `List`, `Table`, `Tree` | collections + inspector sections |
-| Shell | `Menu` (explicitly implemented deferred tier) | controls section |
 
 `tests/gallery_test.rs::initial_graph_contains_every_supported_node_type` asserts this list is
 exactly what the initial graph instantiates — no more, no less.
 
 ### Deliberately absent
 
-`Dialog`, `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`, `Split`, `Toolbar`.
+`Dialog`, `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`, `Split`, `Toolbar`, `Menu`.
 
 These exist in `protocol/registry.yaml` but `ControlFactory` throws `unsupportedNodeType` for
-them. `Menu` is intentionally not in this list: the renderer explicitly supports that deferred-tier
-type. Creating any listed type would put a node in the authoritative tree that no client can render — exactly
+them. Creating any listed type would put a node in the authoritative tree that no client can render — exactly
 the silent degradation §4 inv. 13 forbids. `unsupported_node_types_are_not_advertised` fails the
 build if one ever appears.
 
@@ -82,7 +82,6 @@ build if one ever appears.
 | --- | --- | --- |
 | Text editing (`TextInput`, `TextArea`) | **authoritative** | Native editor commits emit `TEXT_EDIT`; `Session` validates and deduplicates the edit, then commits the accepted string to the node's `value`. |
 | Tree interaction | **presentation-only** | The outline is built from a flat inline `items` list. There is no hierarchical model type and no `EXPANSION_CHANGED` event, so expanding a row changes nothing on the server. |
-| Menu interaction | **presentation-only** | `Menu` is an explicitly rendered deferred-tier node, but the standard registry declares no events for it. |
 | Round-trip latency | **not measured** | The server never sees the client's clock, and `EVENT_ACK` is emitted below the `Session` API. The connection panel reports server-side handling time only. |
 
 ---
@@ -123,17 +122,17 @@ reference, not a re-send (§14, §19.2).
 
 A `Table` over a bounded model showing the semantic traffic in both directions:
 
-- **S→C** — every `Operation` this server commits.
+- **S→C** — every gallery operation plus the exact authoritative value/validation operations from
+  Session's built-in `TEXT_EDIT` transaction.
 - **C→S** — every `Event` that reached a handler, with its `event_seq` and `observed_revision`.
 
 ### Why it does not loop
 
-Appending a log row is itself a mutation, so "log every transaction" would log its own log
-forever. The inspector is instead **self-describing inside a single transaction**: it runs after
-the caller has staged its operations but before the commit, reads `UiTransaction::operations()`,
-and appends the rows describing them to the same transaction. The row and the change it describes
-reach the client atomically at one revision (§12.1), and no second transaction exists to recurse
-on.
+Appending a log row is itself a mutation, so an unrestricted transaction observer would log its
+own log forever. Ordinary gallery mutations are self-describing inside their transaction. A
+built-in `TEXT_EDIT` must commit inside Session first; its opt-in handler receives that exact wire
+transaction and one follow-up transaction records its operations, event, metrics, and committed
+revision. Instrumentation transactions are never observed recursively.
 
 The inspector's own `MODEL_INSERT`/`MODEL_DELETE` and the telemetry `SET_PROPERTY` operations are
 deliberately not traced — they are bookkeeping about the traffic, not the traffic itself
@@ -156,17 +155,18 @@ Everything measured above the `Session` API, which is the highest layer an appli
 | Throughput | each committed operation list is re-encoded into the same `SruiMessage{Transaction}` envelope and varint length-delimited frame `handle_connection` writes | yes, before SSH encryption (§26) |
 | Size histogram | five buckets over that framed size, drawn as `Progress` bars | yes |
 | Server-side latency | handler entry → operations staged; min / p50 / p95 / max over a bounded window | yes, server work only |
-| Client revision lag | `current_revision - event.observed_revision` | yes |
-| Session facts | `attached_count`, `current_revision`, `journal_latest_revision`, `outbound_queue_capacity`, `retained_client_state_bytes` | yes |
+| Client revision lag | actual event transaction base revision minus `event.observed_revision` | yes |
+| Session facts | non-revision counters captured before commit; base/committed revisions supplied atomically by Session | yes |
 | Resource transfer | published bytes and `ceil(bytes / 16 KiB)` chunks | yes |
 
 Throughput reports transactions committed strictly **before** the one being rendered: a
 transaction's framed size is only knowable once its operation list is final, which is after the
 panel has been written. Latency does include the event that caused the current transaction.
 
-All session accessors are read after the gallery state lock is acquired and *before* the
-transaction opens. `Session::transaction` holds the same inner mutex those accessors need, so this
-state → facts → transaction order prevents both deadlock and concurrent stale-fact snapshots.
+Non-revision Session accessors are read after the gallery state lock is acquired and before the
+transaction opens. Base and committed revisions come from the exact Session commit critical
+section, so concurrent built-in commits cannot make the inspector or connection panel report a
+guessed or stale revision.
 
 ---
 
@@ -214,7 +214,7 @@ cargo test --manifest-path examples/ui-gallery/Cargo.toml
 
 | Test | Claim |
 | --- | --- |
-| `initial_graph_contains_every_supported_node_type` | all 19 renderer-supported node types appear, and only those |
+| `initial_graph_contains_every_supported_node_type` | all 18 renderer-supported node types appear, and only those |
 | `unsupported_node_types_are_not_advertised` | no unrenderable registry type is ever created |
 | `every_section_and_collection_is_present` | all seven sections, both models, all eight text roles |
 | `gallery_image_is_published_and_referenced_by_the_image_node` | the asset bytes are published and the node holds the resulting `ResourceHash` |
@@ -226,8 +226,9 @@ cargo test --manifest-path examples/ui-gallery/Cargo.toml
 | `model_scene_mutates_and_restores_both_collections` | exact item-id order after insert/update/delete and after revert |
 | `structure_scene_creates_moves_and_deletes_one_transient_node` | create → move → reorder → delete |
 | `transient_node_ids_are_never_reused` | `DELETE_NODE` retires an id permanently |
-| `a_full_scene_cycle_and_reset_restore_the_baseline` | a full cycle and an explicit reset restore the baseline graph and node identity |
+| `a_full_scene_cycle_and_reset_restore_the_baseline` | reset restores node identity, toggles, autoplay, selections, and every writable editor value |
 | `reaching_a_scene_by_any_route_produces_the_same_graph` | revert-then-apply makes the tour path-independent |
 | `inspector_records_both_directions_and_stays_bounded` | C→S and S→C rows, committed with the change, bounded at 40 rows |
 | `inspector_does_not_describe_its_own_bookkeeping` | no self-referential logging |
-| `connection_statistics_are_published_as_semantic_state` | real framed byte counts, exact chunk count, latency percentiles |
+| `connection_statistics_are_published_as_semantic_state` | real framed bytes, exact chunk count, and cached latency percentiles |
+| `text_edit_commit_is_instrumented_without_faking_or_double_counting_transactions` | built-in edit operations, trace, metrics, lag, and revisions remain aligned |

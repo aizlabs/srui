@@ -1,11 +1,10 @@
 //! Runnable SRUI UI gallery server (§19.1, §20.1, §20.2).
 //!
-//! Hosts the gallery on a Unix domain socket, which `srui-ssh-bridge` forwards to over an SSH
-//! subsystem. All diagnostics go to stderr so a bridged stdout stays a pure binary protocol
-//! stream (§19.1).
+//! Hosts the gallery on a private Unix domain socket. All diagnostics go to stderr so a bridged
+//! stdout stays a pure binary protocol stream (§19.1).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
@@ -15,10 +14,13 @@ use tracing::{error, info, warn};
 
 use srui_example_ui_gallery::GalleryApp;
 use srui_sessiond::{handle_connection, Session};
+use srui_unix_security::{
+    default_named_socket_path, effective_uid, prepare_private_socket_parent, validate_peer,
+    PrivateSocketParent, SocketIdentity,
+};
 
-/// Autoplay cadence. A commit is a state-consistency boundary, not a frame: the renderer paces
-/// drawing independently of this interval (§12.2).
 const DEFAULT_AUTOPLAY_INTERVAL: Duration = Duration::from_secs(4);
+const USAGE: &str = "usage: ui-gallery [--socket PATH] [--autoplay] [--autoplay-interval SECONDS]";
 
 struct Options {
     socket_path: PathBuf,
@@ -26,21 +28,20 @@ struct Options {
     autoplay_on_start: bool,
 }
 
-fn default_socket_path() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("srui-ui-gallery.sock")
+enum ParseOutcome {
+    Run(Options),
+    Help,
 }
 
-fn parse_options(args: &[String]) -> Result<Options, String> {
+fn parse_options(args: &[String]) -> Result<ParseOutcome, String> {
     let mut socket_path = None;
     let mut autoplay_interval = DEFAULT_AUTOPLAY_INTERVAL;
     let mut autoplay_on_start = false;
-
     let mut index = 0;
+
     while index < args.len() {
         match args[index].as_str() {
+            "-h" | "--help" => return Ok(ParseOutcome::Help),
             "--socket" => {
                 let value = args
                     .get(index + 1)
@@ -70,28 +71,57 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         }
     }
 
-    Ok(Options {
-        socket_path: socket_path.unwrap_or_else(default_socket_path),
+    Ok(ParseOutcome::Run(Options {
+        socket_path: socket_path
+            .unwrap_or_else(|| default_named_socket_path(effective_uid(), "srui-ui-gallery.sock")),
         autoplay_interval,
         autoplay_on_start,
-    })
+    }))
 }
 
-/// A socket path this process created and is therefore allowed to unlink.
+type FileIdentity = (u64, u64);
+
+fn metadata_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+struct OwnedLock {
+    path: PathBuf,
+    identity: FileIdentity,
+    _file: std::fs::File,
+}
+
+impl Drop for OwnedLock {
+    fn drop(&mut self) {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata_identity(&metadata) == self.identity => {
+                if let Err(error) = std::fs::remove_file(&self.path) {
+                    warn!("failed to remove {}: {error}", self.path.display());
+                }
+            }
+            Ok(_) => warn!(
+                "leaving {} in place: the lock path now belongs to another process",
+                self.path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warn!("failed to inspect {}: {error}", self.path.display()),
+        }
+    }
+}
+
 struct OwnedSocket {
     path: PathBuf,
-    /// `(device, inode)` of the endpoint created by this process.
-    identity: (u64, u64),
-    /// Exclusive advisory lock on the socket path, released when this value is dropped.
-    _lock: std::fs::File,
+    identity: SocketIdentity,
+    parent: PrivateSocketParent,
+    _lock: OwnedLock,
 }
 
-impl OwnedSocket {
-    /// Removes the socket, but only while the path still resolves to the endpoint we bound.
-    fn remove(&self) {
-        match socket_identity(&self.path) {
+impl Drop for OwnedSocket {
+    fn drop(&mut self) {
+        match self.parent.socket_identity() {
             Ok(Some(identity)) if identity == self.identity => {
-                if let Err(error) = std::fs::remove_file(&self.path) {
+                if let Err(error) = self.parent.remove_socket() {
                     warn!("failed to remove {}: {error}", self.path.display());
                 }
             }
@@ -99,28 +129,9 @@ impl OwnedSocket {
                 "leaving {} in place: it now belongs to another server",
                 self.path.display()
             ),
-            Ok(None) | Err(_) => {}
+            Ok(None) => {}
+            Err(error) => warn!("failed to inspect {}: {error}", self.path.display()),
         }
-    }
-}
-
-/// Returns the `(device, inode)` identity of `path` when it is a Unix socket.
-///
-/// `Ok(None)` means the path does not exist; a path that exists but is not a socket is an error,
-/// so an unrelated file is never a removal candidate.
-fn socket_identity(path: &Path) -> std::io::Result<Option<(u64, u64)>> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            Ok(Some((metadata.dev(), metadata.ino())))
-        }
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} exists and is not a Unix socket", path.display()),
-        )),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
     }
 }
 
@@ -130,29 +141,20 @@ fn socket_lock_path(socket_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Takes the exclusive advisory lock marking this process as owner of the socket path.
-///
-/// `flock(2)` is the authority on ownership, not a connect probe: the kernel releases it when the
-/// descriptor closes, including on `SIGKILL`, so a crashed server never leaves the endpoint
-/// permanently claimed, and holding it across unlink-then-bind closes the window in which two
-/// instances could both conclude the existing socket was stale.
-fn acquire_socket_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
+fn acquire_socket_lock(socket_path: &Path) -> std::io::Result<OwnedLock> {
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
 
-    let lock_path = socket_lock_path(socket_path);
+    let path = socket_lock_path(socket_path);
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(&lock_path)?;
+        .open(&path)?;
 
-    // SAFETY: `file` owns a valid open descriptor for the duration of the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
+        return if error.kind() == std::io::ErrorKind::WouldBlock {
             Err(std::io::Error::new(
                 std::io::ErrorKind::AddrInUse,
                 format!(
@@ -164,39 +166,39 @@ fn acquire_socket_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
             Err(error)
         };
     }
-    Ok(file)
+
+    let identity = metadata_identity(&file.metadata()?);
+    Ok(OwnedLock {
+        path,
+        identity,
+        _file: file,
+    })
 }
 
-static UMASK_LOCK: Mutex<()> = Mutex::new(());
-
-/// Restores the process umask even when binding returns early or unwinds.
-struct UmaskGuard {
-    previous: libc::mode_t,
-    _lock: MutexGuard<'static, ()>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketLiveness {
+    Live,
+    Absent,
+    Ambiguous,
 }
 
-impl UmaskGuard {
-    fn private_socket() -> Self {
-        let lock = UMASK_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // SAFETY: `umask` accepts every mode value, has no pointer arguments, and the previous
-        // process mask is retained by this guard until it is restored in Drop.
-        let previous = unsafe { libc::umask(0o177) };
-        Self {
-            previous,
-            _lock: lock,
-        }
+async fn probe_socket_liveness(
+    path: &Path,
+    parent: &PrivateSocketParent,
+) -> std::io::Result<SocketLiveness> {
+    if parent.socket_identity()?.is_none() {
+        return Ok(SocketLiveness::Absent);
     }
-}
 
-impl Drop for UmaskGuard {
-    fn drop(&mut self) {
-        // SAFETY: restoring the mode returned by `umask` is always valid. The guard's mutex
-        // serializes every bind performed through this module until restoration is complete.
-        unsafe {
-            libc::umask(self.previous);
+    match UnixStream::connect(path).await {
+        Ok(_) => Ok(SocketLiveness::Live),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.kind() == std::io::ErrorKind::ConnectionRefused =>
+        {
+            Ok(SocketLiveness::Absent)
         }
+        Err(_) => Ok(SocketLiveness::Ambiguous),
     }
 }
 
@@ -208,8 +210,6 @@ async fn serve_gallery_connection(
 ) {
     let mut connection = Box::pin(handle_connection(stream, session, shutdown));
 
-    // handle_connection attaches synchronously on its first poll and then waits for the handshake.
-    // Poll it before the yield branch so the telemetry commit observes this exact attachment.
     let result = tokio::select! {
         biased;
         result = &mut connection => result,
@@ -221,7 +221,6 @@ async fn serve_gallery_connection(
         }
     };
 
-    // The connection future has completed and its AttachmentGuard has detached on every exit path.
     if let Err(error) = app.refresh_connection_telemetry() {
         warn!("failed to refresh telemetry after client detach: {error}");
     }
@@ -230,22 +229,39 @@ async fn serve_gallery_connection(
     }
 }
 
-async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
+async fn bind_owned_socket(path: &Path, uid: u32) -> std::io::Result<(UnixListener, OwnedSocket)> {
+    let parent = prepare_private_socket_parent(path, uid)?;
     let lock = acquire_socket_lock(path)?;
 
-    // The lock is held, so any socket still at this path belongs to a process that is gone.
-    if socket_identity(path)?.is_some() {
-        info!("removing stale socket at {}", path.display());
-        std::fs::remove_file(path)?;
+    match probe_socket_liveness(path, &parent).await? {
+        SocketLiveness::Live => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} is already served by a running process; pass a different --socket",
+                    path.display()
+                ),
+            ));
+        }
+        SocketLiveness::Ambiguous => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!(
+                    "{} could not be proven unused; refusing to unlink it",
+                    path.display()
+                ),
+            ));
+        }
+        SocketLiveness::Absent => {}
     }
 
-    // A Unix socket honors the process umask at creation. Keep the endpoint owner-only so
-    // another local account cannot inspect the tree or inject authoritative UI events.
-    let listener = {
-        let _umask = UmaskGuard::private_socket();
-        UnixListener::bind(path)?
-    };
-    let identity = socket_identity(path)?.ok_or_else(|| {
+    if parent.socket_identity()?.is_some() {
+        info!("removing stale socket at {}", path.display());
+        parent.remove_socket()?;
+    }
+
+    let listener = UnixListener::from_std(parent.bind()?)?;
+    let identity = parent.socket_identity()?.ok_or_else(|| {
         std::io::Error::other(format!(
             "{} vanished immediately after bind",
             path.display()
@@ -257,14 +273,53 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
         OwnedSocket {
             path: path.to_path_buf(),
             identity,
+            parent,
             _lock: lock,
         },
     ))
 }
 
+async fn run_autoplay(
+    app: Arc<GalleryApp>,
+    interval_duration: Duration,
+    shutdown: CancellationToken,
+) {
+    let mut autoplay = app.autoplay_updates();
+
+    loop {
+        while !*autoplay.borrow_and_update() {
+            tokio::select! {
+                changed = autoplay.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = shutdown.cancelled() => return,
+            }
+        }
+
+        let dwell = tokio::time::sleep(interval_duration);
+        tokio::pin!(dwell);
+        tokio::select! {
+            _ = &mut dwell => {
+                if *autoplay.borrow() {
+                    if let Err(error) = app.next_scene() {
+                        warn!("autoplay transaction failed: {error}");
+                    }
+                }
+            }
+            changed = autoplay.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = shutdown.cancelled() => return,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // stderr only: a bridged stdout is the binary protocol stream (§19.1, §20.1).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -275,17 +330,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match parse_options(&args) {
-        Ok(options) => options,
+        Ok(ParseOutcome::Run(options)) => options,
+        Ok(ParseOutcome::Help) => {
+            println!("{USAGE}");
+            return Ok(());
+        }
         Err(message) => {
             eprintln!("{message}");
-            eprintln!(
-                "usage: ui-gallery [--socket PATH] [--autoplay] [--autoplay-interval SECONDS]"
-            );
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };
 
-    let (listener, owned_socket) = bind_owned_socket(&options.socket_path).await?;
+    let uid = effective_uid();
+    let (listener, owned_socket) = bind_owned_socket(&options.socket_path, uid).await?;
     info!("ui gallery listening on {}", options.socket_path.display());
 
     let session = Arc::new(Session::mint());
@@ -304,36 +362,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown = CancellationToken::new();
     let mut tasks = JoinSet::new();
-
-    let autoplay_app = app.clone();
-    let autoplay_shutdown = shutdown.clone();
-    let interval_duration = options.autoplay_interval;
-    tasks.spawn(async move {
-        let mut interval = tokio::time::interval(interval_duration);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    if autoplay_app.autoplay() {
-                        if let Err(error) = autoplay_app.next_scene() {
-                            warn!("autoplay transaction failed: {error}");
-                        }
-                    }
-                }
-                _ = autoplay_shutdown.cancelled() => break,
-            }
-        }
-    });
+    tasks.spawn(run_autoplay(
+        app.clone(),
+        options.autoplay_interval,
+        shutdown.clone(),
+    ));
 
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _peer)) => {
-                        let session = session.clone();
-                        let app = app.clone();
+                        if let Err(error) = validate_peer(&stream, uid) {
+                            warn!(
+                                error = %error,
+                                "rejecting Unix socket peer outside the authenticated user boundary"
+                            );
+                            continue;
+                        }
                         let child = shutdown.child_token();
-                        tasks.spawn(serve_gallery_connection(stream, session, app, child));
+                        tasks.spawn(serve_gallery_connection(
+                            stream,
+                            session.clone(),
+                            app.clone(),
+                            child,
+                        ));
                     }
                     Err(error) => error!("accept failed: {error}"),
                 }
@@ -352,7 +405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!("task ended abnormally: {error}");
         }
     }
-    owned_socket.remove();
+    drop(owned_socket);
     info!("ui gallery shutdown complete");
     Ok(())
 }
@@ -363,56 +416,116 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct RestoreUmask(libc::mode_t);
-
-    impl Drop for RestoreUmask {
-        fn drop(&mut self) {
-            // SAFETY: this is the mode returned by the successful `umask` call below.
-            unsafe {
-                libc::umask(self.0);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn bound_socket_is_owner_only_and_original_umask_is_restored() {
-        // Arrange a permissive conventional mask so this test would observe 0755 without the
-        // restrictive bind guard. Restore the process-wide setting even if an assertion unwinds.
-        // SAFETY: `umask` accepts every mode value and returns the previous process mask.
-        let previous = unsafe { libc::umask(0o022) };
-        let _restore = RestoreUmask(previous);
-
+    fn temporary_socket_path(label: &str) -> (PathBuf, PathBuf) {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        // Unix socket paths are short (104 bytes on macOS); /tmp keeps the regression portable
-        // even when the test runner's TMPDIR is a deeply nested sandbox path.
-        let directory =
-            PathBuf::from("/tmp").join(format!("srui-gallery-{}-{unique}", std::process::id()));
+        let directory = PathBuf::from("/tmp").join(format!(
+            "srui-gallery-{}-{label}-{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir(&directory).expect("temporary socket directory is created");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("temporary directory becomes private");
         let path = directory.join("gallery.sock");
+        (directory, path)
+    }
 
-        let (listener, owned) = bind_owned_socket(&path).await.expect("socket binds");
+    #[test]
+    fn short_and_long_help_flags_request_successful_help() {
+        for flag in ["-h", "--help"] {
+            let parsed = parse_options(&[flag.to_string()]).expect("help parses");
+            assert!(matches!(parsed, ParseOutcome::Help));
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_socket_is_private_validates_peers_and_cleans_owned_paths() {
+        let (directory, path) = temporary_socket_path("security");
+        let lock_path = socket_lock_path(&path);
+        let uid = effective_uid();
+
+        let (listener, owned) = bind_owned_socket(&path, uid).await.expect("socket binds");
         let mode = std::fs::symlink_metadata(&path)
             .expect("bound socket has metadata")
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "the socket must be accessible only by its owner"
-        );
+        assert_eq!(mode, srui_unix_security::PRIVATE_SOCKET_MODE);
 
-        // Observe the current mask while leaving the test's sentinel mask in place.
-        // SAFETY: the sentinel is a valid mode and RestoreUmask retains the original mode.
-        let observed = unsafe { libc::umask(0o022) };
-        assert_eq!(observed, 0o022, "binding must restore the caller's umask");
+        let client = UnixStream::connect(&path)
+            .await
+            .expect("same-user client connects");
+        let (server, _) = listener.accept().await.expect("server accepts peer");
+        validate_peer(&server, uid).expect("same-user peer is authenticated");
+        drop(client);
+        drop(server);
+        drop(listener);
+        drop(owned);
+
+        assert!(!path.exists(), "owned socket is removed on orderly drop");
+        assert!(!lock_path.exists(), "owned lock is removed on orderly drop");
+        std::fs::remove_dir(directory).expect("temporary socket directory is removed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_remove_a_replacement_lock_file() {
+        let (directory, path) = temporary_socket_path("replacement-lock");
+        let lock_path = socket_lock_path(&path);
+        let (listener, owned) = bind_owned_socket(&path, effective_uid())
+            .await
+            .expect("socket binds");
+
+        std::fs::remove_file(&lock_path).expect("test unlinks the owned lock name");
+        std::fs::write(&lock_path, b"replacement").expect("replacement lock is created");
 
         drop(listener);
-        owned.remove();
-        std::fs::remove_file(socket_lock_path(&path)).expect("lock file is removed");
+        drop(owned);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("replacement lock survives"),
+            b"replacement"
+        );
+
+        std::fs::remove_file(lock_path).expect("replacement lock is removed");
         std::fs::remove_dir(directory).expect("temporary socket directory is removed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn autoplay_waits_a_full_dwell_after_enable_and_reenable() {
+        let app = GalleryApp::start(Arc::new(Session::mint())).expect("gallery starts");
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_autoplay(
+            app.clone(),
+            Duration::from_secs(4),
+            shutdown.clone(),
+        ));
+
+        app.set_autoplay(true).expect("autoplay enables");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(3_999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(app.scene(), srui_example_ui_gallery::Scene::Baseline);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(app.scene(), srui_example_ui_gallery::Scene::Content);
+
+        app.set_autoplay(false).expect("autoplay disables");
+        tokio::time::advance(Duration::from_secs(8)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(app.scene(), srui_example_ui_gallery::Scene::Content);
+
+        app.set_autoplay(true).expect("autoplay re-enables");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(3_999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(app.scene(), srui_example_ui_gallery::Scene::Content);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(app.scene(), srui_example_ui_gallery::Scene::State);
+
+        shutdown.cancel();
+        task.await.expect("autoplay task exits cleanly");
     }
 
     fn attached_clients_text(session: &Session) -> String {

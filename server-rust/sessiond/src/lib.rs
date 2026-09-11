@@ -17,8 +17,8 @@ pub use session::{
     ModelRangeError, ModelRangeFulfillment, ModelRangeProvider, ModelRangeQuery,
     ModelRangeRequestInbox, ResumeClientBootstrap, ResumeOutcome, Session, SessionConfig,
     SessionError, SessionState, TerminalAttach, TextEditDecision, TextEditRequest, TextEditTracker,
-    CORE_VERSION, MAX_CLIENT_INSTANCE_ID_BYTES, MAX_RETAINED_CLIENT_STATE_BYTES,
-    MAX_TEXT_EDIT_STREAMS,
+    TransactionResult, TransactionRevisions, CORE_VERSION, MAX_CLIENT_INSTANCE_ID_BYTES,
+    MAX_RETAINED_CLIENT_STATE_BYTES, MAX_TEXT_EDIT_STREAMS,
 };
 
 pub use srui_pty::{PTYManager, PTYManagerConfig, TerminalSpec};

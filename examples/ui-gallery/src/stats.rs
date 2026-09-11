@@ -10,9 +10,9 @@
 //!   would write, so `framed_bytes` is the real SRUI frame size before SSH encryption (§26).
 //! - **Server handling latency** — wall time from entering an event handler to the commit that
 //!   settles it. This is server-side work only.
-//! - **Revision lag** — `current_revision - event.observed_revision`: how stale the client's view
-//!   was at the moment it acted (§7.7).
-//! - **Session facts** — attached connections, current and journalled revision, outbound queue
+//! - **Revision lag** — actual event-transaction base minus `event.observed_revision`: how stale
+//!   the client's view was at the moment it acted (§7.7).
+//! - **Session facts** — attached connections, exact transaction revisions, outbound queue
 //!   capacity, retained per-client state (§18.1, §20.2).
 //! - **Resource transfer** — published byte count and the exact chunk count it decomposes into
 //!   (§14, §19.2).
@@ -23,11 +23,12 @@
 //! "server-side" for exactly that reason.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use srui_sdk::{NodeId, Operation, Progress, StoreError, UiTransaction, Value};
 use srui_semantic_tree::{Revision, Transaction};
-use srui_sessiond::Session;
+use srui_sessiond::{Session, TransactionRevisions};
 
 use crate::ids;
 
@@ -50,43 +51,39 @@ const SAMPLE_WINDOW: usize = 256;
 /// Facts read from the session after the gallery state lock is acquired and before a transaction
 /// opens.
 ///
-/// Every accessor here takes the session's inner mutex, which `Session::transaction` also holds for
-/// the duration of the closure. Capturing before opening that transaction is therefore not an
-/// optimisation but a deadlock-avoidance requirement.
+/// These non-revision accessors cannot be called from inside Session::transaction. The base and
+/// committed revisions are filled from TransactionRevisions inside the actual commit critical
+/// section, so concurrent built-in commits cannot make the rendered revision stale.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionFacts {
     pub attached: usize,
-    pub revision: u64,
-    pub journal_revision: u64,
+    pub base_revision: u64,
+    pub committed_revision: u64,
     pub queue_capacity: usize,
     pub retained_bytes: Option<usize>,
 }
 
 impl SessionFacts {
-    /// Reads every session-level counter the statistics panel reports.
+    /// Reads non-revision session counters before the transaction opens.
     pub fn capture(session: &Session) -> Self {
         Self {
             attached: session.attached_count(),
-            revision: session.current_revision(),
-            journal_revision: session.journal_latest_revision(),
             queue_capacity: session.outbound_queue_capacity(),
             retained_bytes: session.retained_client_state_bytes().ok(),
+            ..Self::default()
         }
     }
 
-    /// Revision carried by a transaction opened immediately after these facts were captured.
-    pub fn committed_revision(self) -> u64 {
-        self.revision.saturating_add(1)
-    }
-
-    /// Journal head after that transaction commits.
-    pub fn committed_journal_revision(self) -> u64 {
-        self.journal_revision.saturating_add(1)
+    /// Associates the counters with revisions chosen atomically for the committing transaction.
+    pub fn with_transaction(mut self, revisions: TransactionRevisions) -> Self {
+        self.base_revision = revisions.base_revision;
+        self.committed_revision = revisions.committed_revision;
+        self
     }
 }
 
 /// Bounded traffic and latency accumulator.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Metrics {
     transactions: u64,
     operations: u64,
@@ -96,6 +93,9 @@ pub struct Metrics {
     events: u64,
     handling_micros: VecDeque<u64>,
     revision_lag: VecDeque<u64>,
+    handling_summary: String,
+    revision_lag_summary: String,
+    summary_scratch: Vec<u64>,
     resource_bytes: u64,
     started: Instant,
     /// Last string written to each `(node, property)` pair, so a repeated render emits no
@@ -103,6 +103,47 @@ pub struct Metrics {
     rendered_text: HashMap<(NodeId, u32), String>,
     /// Last progress value written to each histogram bar, compared bitwise.
     rendered_value: HashMap<NodeId, u64>,
+}
+
+impl Clone for Metrics {
+    fn clone(&self) -> Self {
+        Self {
+            transactions: self.transactions,
+            operations: self.operations,
+            bytes: self.bytes,
+            buckets: self.buckets,
+            unframable: self.unframable,
+            events: self.events,
+            handling_micros: self.handling_micros.clone(),
+            revision_lag: self.revision_lag.clone(),
+            handling_summary: self.handling_summary.clone(),
+            revision_lag_summary: self.revision_lag_summary.clone(),
+            summary_scratch: self.summary_scratch.clone(),
+            resource_bytes: self.resource_bytes,
+            started: self.started,
+            rendered_text: self.rendered_text.clone(),
+            rendered_value: self.rendered_value.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.transactions = source.transactions;
+        self.operations = source.operations;
+        self.bytes = source.bytes;
+        self.buckets = source.buckets;
+        self.unframable = source.unframable;
+        self.events = source.events;
+        self.handling_micros.clone_from(&source.handling_micros);
+        self.revision_lag.clone_from(&source.revision_lag);
+        self.handling_summary.clone_from(&source.handling_summary);
+        self.revision_lag_summary
+            .clone_from(&source.revision_lag_summary);
+        self.summary_scratch.clone_from(&source.summary_scratch);
+        self.resource_bytes = source.resource_bytes;
+        self.started = source.started;
+        self.rendered_text.clone_from(&source.rendered_text);
+        self.rendered_value.clone_from(&source.rendered_value);
+    }
 }
 
 impl Default for Metrics {
@@ -116,6 +157,9 @@ impl Default for Metrics {
             events: 0,
             handling_micros: VecDeque::new(),
             revision_lag: VecDeque::new(),
+            handling_summary: "no samples yet (µs)".to_string(),
+            revision_lag_summary: "no samples yet (rev)".to_string(),
+            summary_scratch: Vec::with_capacity(SAMPLE_WINDOW),
             resource_bytes: 0,
             started: Instant::now(),
             rendered_text: HashMap::new(),
@@ -199,6 +243,18 @@ impl Metrics {
         let handling_micros = u64::try_from(handling.as_micros()).unwrap_or(u64::MAX);
         push_bounded(&mut self.handling_micros, handling_micros);
         push_bounded(&mut self.revision_lag, revision_lag);
+        summarize_into(
+            &self.handling_micros,
+            "µs",
+            &mut self.summary_scratch,
+            &mut self.handling_summary,
+        );
+        summarize_into(
+            &self.revision_lag,
+            "rev",
+            &mut self.summary_scratch,
+            &mut self.revision_lag_summary,
+        );
     }
 
     /// Writes the current statistics into the telemetry nodes, emitting operations only for the
@@ -223,8 +279,7 @@ impl Metrics {
             ids::CONN_REVISION,
             format!(
                 "Revision: {} (journal head {})",
-                facts.committed_revision(),
-                facts.committed_journal_revision()
+                facts.committed_revision, facts.committed_revision
             ),
         )?;
         self.set_text(
@@ -275,17 +330,13 @@ impl Metrics {
             ids::CONN_LATENCY,
             format!(
                 "Server-side handling ({} events): {}",
-                self.events,
-                summarize(&self.handling_micros, "\u{b5}s")
+                self.events, self.handling_summary
             ),
         )?;
         self.set_text(
             ui,
             ids::CONN_LAG,
-            format!(
-                "Client revision lag: {}",
-                summarize(&self.revision_lag, "rev")
-            ),
+            format!("Client revision lag: {}", self.revision_lag_summary),
         )?;
 
         let total = self
@@ -363,22 +414,68 @@ fn push_bounded(samples: &mut VecDeque<u64>, sample: u64) {
     samples.push_back(sample);
 }
 
-/// Renders `min / p50 / p95 / max` over a bounded sample window.
-fn summarize(samples: &VecDeque<u64>, unit: &str) -> String {
-    if samples.is_empty() {
-        return format!("no samples yet ({unit})");
+/// Updates a cached min / p50 / p95 / max summary after a new sample arrives.
+fn summarize_into(
+    samples: &VecDeque<u64>,
+    unit: &str,
+    scratch: &mut Vec<u64>,
+    output: &mut String,
+) {
+    scratch.clear();
+    scratch.extend(samples.iter().copied());
+    scratch.sort_unstable();
+    output.clear();
+
+    if scratch.is_empty() {
+        write!(output, "no samples yet ({unit})").expect("writing to String cannot fail");
+        return;
     }
-    let mut sorted: Vec<u64> = samples.iter().copied().collect();
-    sorted.sort_unstable();
+
     let pick = |q: f64| -> u64 {
-        let index = ((sorted.len() - 1) as f64 * q).round() as usize;
-        sorted[index]
+        let index = ((scratch.len() - 1) as f64 * q).round() as usize;
+        scratch[index]
     };
-    format!(
-        "min {} \u{b7} p50 {} \u{b7} p95 {} \u{b7} max {} {unit}",
-        sorted[0],
+    write!(
+        output,
+        "min {} · p50 {} · p95 {} · max {} {unit}",
+        scratch[0],
         pick(0.50),
         pick(0.95),
-        sorted[sorted.len() - 1]
+        scratch[scratch.len() - 1]
     )
+    .expect("writing to String cannot fail");
+    scratch.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_summary_caches_change_only_when_samples_change() {
+        let mut metrics = Metrics::default();
+        assert_eq!(metrics.handling_summary, "no samples yet (µs)");
+        assert_eq!(metrics.revision_lag_summary, "no samples yet (rev)");
+
+        metrics.observe_event(Duration::from_micros(10), 3);
+        let first_handling = metrics.handling_summary.clone();
+        let first_lag = metrics.revision_lag_summary.clone();
+        assert_eq!(first_handling, "min 10 · p50 10 · p95 10 · max 10 µs");
+        assert_eq!(first_lag, "min 3 · p50 3 · p95 3 · max 3 rev");
+
+        metrics.observe_transaction(0, &[]);
+        assert_eq!(metrics.handling_summary, first_handling);
+        assert_eq!(metrics.revision_lag_summary, first_lag);
+
+        metrics.observe_event(Duration::from_micros(30), 7);
+        assert_eq!(
+            metrics.handling_summary,
+            "min 10 · p50 30 · p95 30 · max 30 µs"
+        );
+        assert_eq!(
+            metrics.revision_lag_summary,
+            "min 3 · p50 7 · p95 7 · max 7 rev"
+        );
+        assert!(metrics.summary_scratch.is_empty());
+    }
 }

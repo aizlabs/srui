@@ -2,14 +2,13 @@
 //!
 //! # Architecture & Design Invariants
 //!
-//! - **One transaction**: the entire gallery — models, items, and every node — is created by a
-//!   single all-or-nothing transaction, so a client either sees the whole gallery or none of it
-//!   (§12.1).
-//! - **Renderer support set**: every node type built here is one the AppKit `ControlFactory`
-//!   actually renders: all required-tier types plus the explicitly implemented deferred `Menu`.
-//!   Other optional/deferred registry types remain absent because advertising an unrenderable node
-//!   would be exactly the silent degradation §4 inv. 13 forbids.
-//! - **Section builders**: each `build_*` function owns one 100-wide id block from [`crate::ids`]
+//! - **Renderer support set**: every node type built here is one the AppKit ControlFactory
+//!   actually renders: the required-tier node types. Optional and deferred registry types,
+//!   including Menu, remain absent because advertising an unrenderable node would be exactly
+//!   the silent degradation §4 inv. 13 forbids.
+//! - **Section builders**: each build function owns one 100-wide id block from crate::ids
+//!   and appends one column to the gallery. Adding a widget means extending one builder, adding
+//!   one scene entry in crate::scenes, and one test.
 //!   and appends one column to the gallery. Adding a widget means extending one builder, adding
 //!   one scene entry in [`crate::scenes`], and one test.
 //! - **Baseline constants**: every string, role, and value a scene later mutates is declared here
@@ -40,7 +39,6 @@ pub const BASELINE_HERO_STATUS: &str =
     "Session live \u{b7} resource published \u{b7} awaiting interaction";
 pub const BASELINE_IMAGE_PLACEHOLDER: &str =
     "Image resource cleared \u{2014} the client falls back to its placeholder";
-
 pub const BASELINE_TYPO_BODY: &str =
     "Body \u{b7} the default reading role for paragraphs of prose.";
 pub const BASELINE_PROGRESS_VALUE: f64 = 0.35;
@@ -50,7 +48,15 @@ pub const BASELINE_AUTOPLAY: bool = false;
 pub const BASELINE_TOGGLE_CHECKBOX: bool = true;
 pub const BASELINE_TOGGLE_SWITCH: bool = false;
 pub const BASELINE_TOGGLE_AUTOMATIC: bool = false;
-pub const BASELINE_MENU_ITEMS: [&str; 3] = ["Inspect", "Reconnect", "Close"];
+pub const BASELINE_INPUT_PLAIN: &str = "plain text";
+pub const BASELINE_INPUT_SEARCH: &str = "";
+pub const BASELINE_INPUT_SECURE: &str = "";
+pub const BASELINE_INPUT_COMMAND: &str = "cargo clippy --all-targets";
+pub const BASELINE_INPUT_INVALID: &str = "looks fine";
+pub const BASELINE_TEXT_AREA: &str = concat!(
+    "TextArea content is authoritative server state.\n",
+    "Typing here emits validated TEXT_EDIT commits."
+);
 pub const BASELINE_CTRL_STATUS: &str = "No control has been activated yet";
 pub const BASELINE_COLL_SELECTION: &str = "Nothing selected";
 
@@ -89,7 +95,7 @@ pub const BASELINE_TREE_ITEMS: [&str; 6] = [
 ];
 
 /// Every node type this gallery instantiates, matching the AppKit `ControlFactory` support set:
-/// all §7.3 required-tier types plus explicitly implemented deferred-tier `Menu`.
+/// Every node type this gallery instantiates, matching the AppKit ControlFactory support set.
 pub fn supported_node_types() -> Vec<TypeRef> {
     vec![
         Surface::NODE_TYPE,
@@ -110,7 +116,6 @@ pub fn supported_node_types() -> Vec<TypeRef> {
         List::NODE_TYPE,
         Table::NODE_TYPE,
         Tree::NODE_TYPE,
-        TypeRef::MENU,
     ]
 }
 
@@ -125,11 +130,9 @@ pub fn unsupported_node_type_names() -> Vec<&'static str> {
         "Tabs",
         "Split",
         "Toolbar",
+        "Menu",
     ]
 }
-
-// =============================================================================
-// Entry point
 // =============================================================================
 
 /// Creates every model, seeds its items, and builds the whole node tree in one transaction (§12.1).
@@ -478,7 +481,7 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         ids::CTRL_COLUMN,
         ids::CTRL_HEADING,
         ids::CTRL_SEPARATOR,
-        "Controls · Buttons, toggles, inputs, progress, menu",
+        "Controls · Buttons, toggles, inputs, progress",
     )?;
 
     Row::builder(ids::CTRL_BUTTON_ROW)
@@ -557,13 +560,28 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         .create(ui)?;
 
     let inputs: [(NodeId, InputRole, &str, &str); 4] = [
-        (ids::INPUT_PLAIN, InputRole::Plain, "plain text", "Plain"),
-        (ids::INPUT_SEARCH, InputRole::Search, "", "Search"),
-        (ids::INPUT_SECURE, InputRole::Secure, "", "Secure"),
+        (
+            ids::INPUT_PLAIN,
+            InputRole::Plain,
+            BASELINE_INPUT_PLAIN,
+            "Plain",
+        ),
+        (
+            ids::INPUT_SEARCH,
+            InputRole::Search,
+            BASELINE_INPUT_SEARCH,
+            "Search",
+        ),
+        (
+            ids::INPUT_SECURE,
+            InputRole::Secure,
+            BASELINE_INPUT_SECURE,
+            "Secure",
+        ),
         (
             ids::INPUT_COMMAND,
             InputRole::Command,
-            "cargo clippy --all-targets",
+            BASELINE_INPUT_COMMAND,
             "Command",
         ),
     ];
@@ -591,7 +609,7 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         .parent(ids::CTRL_INPUT_GRID)
         .label("Validated")
         .role(InputRole::Plain)
-        .value("looks fine")
+        .value(BASELINE_INPUT_INVALID)
         .read_only(false)
         .validation_state(ValidationState::Valid)
         .value_description("Validation state is server-authoritative")
@@ -600,12 +618,10 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
     TextArea::builder(ids::TEXT_AREA)
         .parent(ids::CTRL_COLUMN)
         .label("Notes")
-        .value(concat!(
-            "TextArea content is authoritative server state.\n",
-            "Typing here emits validated TEXT_EDIT commits."
-        ))
+        .value(BASELINE_TEXT_AREA)
         .placeholder("Multi-line notes")
         .read_only(false)
+        .validation_state(ValidationState::Valid)
         .create(ui)?;
 
     Text::builder(ids::TEXT_AREA_NOTE)
@@ -616,6 +632,7 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         ))
         .role(TextRole::Caption)
         .create(ui)?;
+
     Row::builder(ids::CTRL_PROGRESS_ROW)
         .parent(ids::CTRL_COLUMN)
         .spacing_role(SpacingRole::Normal)
@@ -636,39 +653,6 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         .value_description("idle")
         .busy(false)
         .grow(1.0)
-        .create(ui)?;
-
-    ui.create_node(
-        ids::MENU,
-        TypeRef::MENU,
-        Some(ids::CTRL_COLUMN),
-        None,
-        [
-            (LABEL, Value::String("Command menu".to_string())),
-            (
-                ITEMS,
-                Value::List(
-                    BASELINE_MENU_ITEMS
-                        .iter()
-                        .map(|item| Value::String((*item).to_string()))
-                        .collect(),
-                ),
-            ),
-            (
-                ACCESSIBLE_DESCRIPTION,
-                Value::String(
-                    "Renderer-owned deferred-tier Menu; the standard registry declares no events"
-                        .to_string(),
-                ),
-            ),
-            (ENABLED, Value::Bool(true)),
-        ],
-    )?;
-
-    Text::builder(ids::MENU_NOTE)
-        .parent(ids::CTRL_COLUMN)
-        .text("Menu is deferred-tier presentation only; the standard registry declares no events.")
-        .role(TextRole::Caption)
         .create(ui)?;
 
     Text::builder(ids::CTRL_STATUS)

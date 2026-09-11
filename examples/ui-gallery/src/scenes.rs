@@ -24,7 +24,7 @@ use crate::ui;
 ///
 /// Held by [`crate::GalleryState`] and threaded through every `apply`/`revert` so scenes stay
 /// free functions over an open transaction rather than reaching back into the application.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct SceneContext {
     /// Hash of the published gallery image, restored by the image scene's revert (§14).
     image: Option<ResourceHash>,
@@ -32,6 +32,22 @@ pub struct SceneContext {
     next_transient: u64,
     /// Nodes the applied scene created, deleted again on revert.
     transient: Vec<NodeId>,
+}
+
+impl Clone for SceneContext {
+    fn clone(&self) -> Self {
+        Self {
+            image: self.image,
+            next_transient: self.next_transient,
+            transient: self.transient.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.image = source.image;
+        self.next_transient = source.next_transient;
+        self.transient.clone_from(&source.transient);
+    }
 }
 
 impl SceneContext {

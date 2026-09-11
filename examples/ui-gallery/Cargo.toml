@@ -4,18 +4,17 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Extensible SRUI showcase covering every node type the AppKit renderer supports"
-
 [dependencies]
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.43", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libc = "0.2"
+fs2 = "0.4"
 srui-sdk = { path = "../../server-rust/sdk" }
 srui-sessiond = { path = "../../server-rust/sessiond" }
 srui-protocol = { path = "../../server-rust/protocol" }
 srui-semantic-tree = { path = "../../server-rust/semantic-tree" }
-
+srui-unix-security = { path = "../../server-rust/unix-security" }
 [lib]
 name = "srui_example_ui_gallery"
 path = "src/lib.rs"

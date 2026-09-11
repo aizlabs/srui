@@ -228,6 +228,23 @@ final class ConnectionSessionContext {
     let continuityContext = SessionContinuityContext()
     let renderer = AppKitRenderer()
     var hasStartedAttempt = false
+
+    private var revisionReadySessionID: String?
+
+    func invalidatePersistableRevision() {
+        revisionReadySessionID = nil
+    }
+
+    func markPersistableRevisionReady(for sessionID: String) {
+        revisionReadySessionID = sessionID
+    }
+
+    func persistableRevision(for sessionID: String?) -> UInt64? {
+        guard let sessionID, revisionReadySessionID == sessionID else {
+            return nil
+        }
+        return applier.lastAppliedRevision.value
+    }
 }
 
 @MainActor
@@ -472,8 +489,12 @@ public final class ConnectionManager {
         }
 
         for index in entries.indices {
-            guard let context = contexts[entries[index].id] else { continue }
-            entries[index].lastKnownRevision = context.applier.lastAppliedRevision.value
+            if let context = contexts[entries[index].id],
+               let revision = context.persistableRevision(
+                   for: entries[index].sessionID
+               ) {
+                entries[index].lastKnownRevision = revision
+            }
             statuses[entries[index].id] = .disconnected(
                 resumeAvailable: entries[index].sessionID != nil
             )
@@ -639,10 +660,12 @@ public final class ConnectionManager {
             return false
 
         case .resynchronizing:
+            contexts[connectionID]?.invalidatePersistableRevision()
             statuses[connectionID] = .resynchronizing
             return false
 
         case .replaced(let previousSessionID, let newSessionID):
+            contexts[connectionID]?.invalidatePersistableRevision()
             entries[index].sessionID = newSessionID
             entries[index].lastKnownRevision = 0
             statuses[connectionID] = .resynchronizing
@@ -670,6 +693,7 @@ public final class ConnectionManager {
         case .ready(let sessionID, let revision):
             entries[index].sessionID = sessionID
             entries[index].lastKnownRevision = revision
+            contexts[connectionID]?.markPersistableRevisionReady(for: sessionID)
             pendingFirstSuccess.remove(connectionID)
             statuses[connectionID] = .connected
             let persistenceError = await save(entries)
@@ -757,8 +781,11 @@ public final class ConnectionManager {
             statuses.removeValue(forKey: connectionID)
             contexts.removeValue(forKey: connectionID)
         } else {
-            if let context = contexts[connectionID] {
-                entries[index].lastKnownRevision = context.applier.lastAppliedRevision.value
+            if let context = contexts[connectionID],
+               let revision = context.persistableRevision(
+                   for: entries[index].sessionID
+               ) {
+                entries[index].lastKnownRevision = revision
             }
             statuses[connectionID] = .disconnected(
                 resumeAvailable: entries[index].sessionID != nil

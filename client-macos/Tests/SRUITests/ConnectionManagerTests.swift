@@ -157,6 +157,44 @@ private struct TemporaryConnectionStore {
 @MainActor
 @Suite("Connection Manager Tests (§6.3, §17, §18, §19.1)")
 struct ConnectionManagerTests {
+    private func enterReplacementCatchUp(
+        manager: ConnectionManager,
+        harness: ConnectionAttemptHarness,
+        saved: SavedConnection,
+        replacementSessionID: String
+    ) async throws -> TestConnectionAttempt {
+        let originalSessionID = try #require(saved.sessionID)
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.first)
+        let request = try #require(harness.requests.first)
+        let appliedRevision = try request.context.applier.apply(
+            baseRevision: .initial,
+            operations: []
+        ).get()
+        #expect(appliedRevision == Revision(1))
+
+        await attempt.emit(.ready(
+            sessionID: originalSessionID,
+            revision: appliedRevision.value
+        ))
+        try await AsyncTestSupport.eventually(description: "original session ready") {
+            manager.status(for: saved.id) == .connected
+                && manager.entries.first?.lastKnownRevision == appliedRevision.value
+        }
+
+        await attempt.emit(.replaced(
+            previousSessionID: originalSessionID,
+            newSessionID: replacementSessionID
+        ))
+        try await AsyncTestSupport.eventually(description: "replacement catch-up") {
+            manager.status(for: saved.id) == .resynchronizing
+                && manager.entries.first?.sessionID == replacementSessionID
+                && manager.entries.first?.lastKnownRevision == 0
+                && manager.alert?.kind == .sessionReplaced
+        }
+        return attempt
+    }
+
     @Test("saved connections replace the JSON file atomically")
     func savedConnectionsRoundTripAtomically() async throws {
         let temporary = TemporaryConnectionStore()
@@ -240,6 +278,40 @@ struct ConnectionManagerTests {
         await attempt.stop()
     }
 
+    @Test("cold failure preserves last-known revision metadata until ready")
+    func coldFailurePreservesSavedRevision() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Cold Failure",
+            host: "cold-failure.example",
+            user: "alice",
+            sessionID: "saved-session",
+            lastKnownRevision: 900
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.first)
+
+        await attempt.emit(.failed("cold resume failed"))
+        try await AsyncTestSupport.eventually(description: "cold failure recorded") {
+            manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
+                && manager.entries.first?.lastKnownRevision == 900
+                && manager.alert?.kind == .connectionFailed
+        }
+        #expect(try await temporary.store.load().first?.lastKnownRevision == 900)
+
+        await manager.shutdown()
+        #expect(try await temporary.store.load().first?.lastKnownRevision == 900)
+    }
+
     @Test("first ready event saves the entry and authoritative revision")
     func successfulConnectionIsSaved() async throws {
         let temporary = TemporaryConnectionStore()
@@ -318,6 +390,83 @@ struct ConnectionManagerTests {
         }
         #expect(manager.entries.first?.lastKnownRevision == 5)
         await manager.shutdown()
+    }
+
+    @Test("disconnect during replacement catch-up keeps revision zero")
+    func replacementDisconnectKeepsRevisionZero() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Replacement Disconnect",
+            host: "replacement-disconnect.example",
+            user: "alice",
+            sessionID: "old-session",
+            lastKnownRevision: 40
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        let attempt = try await enterReplacementCatchUp(
+            manager: manager,
+            harness: harness,
+            saved: saved,
+            replacementSessionID: "new-session"
+        )
+
+        await attempt.emit(.stopped)
+        try await AsyncTestSupport.eventuallyAsync(
+            description: "replacement attempt stopped"
+        ) {
+            await attempt.stopCount() > 0
+        }
+
+        #expect(manager.status(for: saved.id) == .disconnected(resumeAvailable: true))
+        #expect(manager.entries.first?.sessionID == "new-session")
+        #expect(manager.entries.first?.lastKnownRevision == 0)
+        let stored = try #require(try await temporary.store.load().first)
+        #expect(stored.sessionID == "new-session")
+        #expect(stored.lastKnownRevision == 0)
+        await manager.shutdown()
+    }
+
+    @Test("shutdown during replacement catch-up keeps revision zero")
+    func replacementShutdownKeepsRevisionZero() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Replacement Shutdown",
+            host: "replacement-shutdown.example",
+            user: "alice",
+            sessionID: "old-session",
+            lastKnownRevision: 40
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        _ = try await enterReplacementCatchUp(
+            manager: manager,
+            harness: harness,
+            saved: saved,
+            replacementSessionID: "new-session"
+        )
+
+        await manager.shutdown()
+
+        #expect(manager.entries.first?.sessionID == "new-session")
+        #expect(manager.entries.first?.lastKnownRevision == 0)
+        let stored = try #require(try await temporary.store.load().first)
+        #expect(stored.sessionID == "new-session")
+        #expect(stored.lastKnownRevision == 0)
     }
 
     @Test("back-to-back connects never start the superseded attempt")

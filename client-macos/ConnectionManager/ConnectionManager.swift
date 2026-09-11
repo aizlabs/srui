@@ -120,6 +120,15 @@ public enum ConnectionStatus: Equatable, Sendable {
     case connected
     case disconnected(resumeAvailable: Bool)
 
+    var acceptsConnectRequest: Bool {
+        switch self {
+        case .connecting, .resynchronizing, .connected:
+            return false
+        case .unknown, .disconnected:
+            return true
+        }
+    }
+
     public var displayText: String {
         switch self {
         case .unknown:

@@ -215,6 +215,16 @@ struct ConnectionManagerTests {
         return attempt
     }
 
+    @Test("connect control is disabled while an attempt is in flight")
+    func connectControlAvailabilityTracksAttemptState() {
+        #expect(ConnectionStatus.unknown.acceptsConnectRequest)
+        #expect(!ConnectionStatus.connecting.acceptsConnectRequest)
+        #expect(!ConnectionStatus.resynchronizing.acceptsConnectRequest)
+        #expect(!ConnectionStatus.connected.acceptsConnectRequest)
+        #expect(ConnectionStatus.disconnected(resumeAvailable: true).acceptsConnectRequest)
+        #expect(ConnectionStatus.disconnected(resumeAvailable: false).acceptsConnectRequest)
+    }
+
     @Test("saved connections replace the JSON file atomically")
     func savedConnectionsRoundTripAtomically() async throws {
         let temporary = TemporaryConnectionStore()

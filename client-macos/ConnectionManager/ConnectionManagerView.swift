@@ -108,6 +108,7 @@ private struct SavedConnectionRow: View {
                 .accessibilityLabel("\(entry.label) status: \(status.displayText)")
 
             Button("Connect", action: onConnect)
+                .disabled(!status.acceptsConnectRequest)
                 .accessibilityLabel("Connect \(entry.label)")
             Button("Remove", role: .destructive, action: onRemove)
                 .accessibilityLabel("Remove \(entry.label)")

@@ -155,6 +155,45 @@ Membership in the `.optionOnScreenOnly` result is the on-screen proof.
 `kCGWindowIsOnscreen` is redundant metadata and can be absent even for entries returned by that
 filtered query. Its absence is not converted into a false negative or an invented value.
 
+#### CLI activation and active-Space association
+
+A full run on the tested macOS/Xcode 26 host exposed a separate failure mode: ScreenCaptureKit kept
+supplying complete display frames, `NSWindow.isVisible` was true, and
+`CGWindowListCopyWindowInfo(.optionAll, ...)` contained the exact candidate window at layer 25,
+alpha 1, and the expected 960×752 frame. The same window was absent from the
+`.optionOnScreenOnly` inventory, so every one of 144–587 post-cutoff frames was correctly rejected
+as `exact WindowServer target identity was unavailable`. A standalone AppKit control window at the
+same level and geometry appeared in both inventories. This distinguishes Space association from
+Screen Recording authorization, missing frames, geometry, or level selection.
+
+The reason cannot be repaired by treating `NSApplication.activate()` as a synchronous proof.
+Apple documents that the method only requests activation and does not guarantee it. The former
+`activateIgnoringOtherApps` option is deprecated on macOS 14 and later and the tested SDK states
+that it has no effect. Waiting for `NSApplication.isActive` therefore converted the symptom into a
+clear failure but could not make the command-line process foreground; that experiment was removed.
+`moveToActiveSpace` was likewise ineffective when activation was not granted.
+
+The retained solution is narrower: immediately before ordering, the short-lived benchmark host
+window inserts `.canJoinAllSpaces`. The same setting is applied during untimed preparation of
+§31.4's benchmark-only host. It is not a production renderer default and is not evidence by itself.
+The window must still appear in `.optionOnScreenOnly`, match exact PID/window/layer/display/geometry,
+have clear z-order, and produce accepted ScreenCaptureKit pixels before a sample exists. With this setting present, two consecutive full-profile §31.1 focused runs completed after the
+failure was reproduced; the second reused the already-built executable. The consolidated full run remains the authoritative confirmation.
+
+Operationally, if `.optionAll` contains the exact expected window but `.optionOnScreenOnly` does
+not, inspect active-Space association before changing capture permissions or weakening identity
+checks. If neither inventory contains the window, investigate ordering/lifetime instead. If the
+on-screen inventory contains it with different fields, preserve the exact mismatch as the failure.
+
+Apple references:
+
+- [`NSApplication.activate()`](https://developer.apple.com/documentation/appkit/nsapplication/activate())
+  — an activation request, not a guarantee;
+- [`NSRunningApplication.activate(options:)`](https://developer.apple.com/documentation/appkit/nsrunningapplication/activate(options:))
+  — returns whether activation succeeded;
+- [`activateIgnoringOtherApps`](https://developer.apple.com/documentation/appkit/nsapplication/activationoptions/activateignoringotherapps)
+  — deprecated as ineffective on macOS 14 and later.
+
 ### 2.4 Window levels and z-order
 
 Numeric level constants are not assumed. Each run resolves:

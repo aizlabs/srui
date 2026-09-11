@@ -95,6 +95,10 @@ func benchmarkMeasureExplicitCompositedPaint(
         }
 
         let application = NSApplication.shared
+        // Repeated CLI candidates can inherit an inactive Space association. This dedicated
+        // short-lived benchmark host joins every Space before ordering; exact WindowServer
+        // visibility, z-order, and captured pixels remain fail-closed below.
+        target.window.collectionBehavior.insert(.canJoinAllSpaces)
         application.activate()
         let usesAppKitVisiblePath = application.isActive
         let isolatedHostLevel = try benchmarkIsolatedHostWindowLevel()
@@ -223,6 +227,12 @@ func benchmarkMeasureExplicitCompositedPaint(
                     + "\(rejectedCandidateCount) post-cutoff candidate(s); "
                     + "last rejection: "
                     + (lastRejection?.description ?? "no frame received")
+                    + "; final target state: window_number="
+                    + "\(target.window.windowNumber) visible=\(target.window.isVisible) "
+                    + "miniaturized=\(target.window.isMiniaturized) "
+                    + "app_active=\(application.isActive) "
+                    + "app_hidden=\(application.isHidden) "
+                    + benchmarkWindowServerEntryDiagnostic(for: target.window)
             )
         }
 
@@ -311,6 +321,10 @@ func benchmarkPrepareExactVisibleWindow(
         )
     )
 
+    // The long-lived CLI driver can retain an inactive Space association just like a candidate
+    // subprocess. This window is benchmark-only; joining Spaces does not relax any visibility,
+    // z-order, geometry, or pixel acceptance rule below.
+    window.collectionBehavior.insert(.canJoinAllSpaces)
     let isolatedHostLevel = try benchmarkIsolatedHostWindowLevel()
     window.animationBehavior = .none
     window.level = isolatedHostLevel

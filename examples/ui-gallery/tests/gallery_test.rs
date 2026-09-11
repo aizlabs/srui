@@ -1,7 +1,8 @@
 //! Gallery graph, resource, event, mutation, and reset tests (§7.2, §7.3, §7.6, §8, §12.1, §14).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 use srui_example_ui_gallery::{ids, scenes::Scene, stats::SIZE_BUCKETS, ui, GalleryApp, SCENES};
 use srui_protocol::Event as WireEvent;
@@ -663,14 +664,39 @@ fn a_full_scene_cycle_and_reset_restore_the_baseline() {
         "cycling through every scene must restore the baseline graph",
     );
 
-    // And an explicit reset from an arbitrary mid-tour scene does the same.
+    // Exercise every control value and gallery-owned selection before resetting from an
+    // arbitrary mid-tour scene. Reset must restore state changed by events as well as scenes.
+    let mut client = Client::new();
+    for (node, value) in [
+        (ids::TOGGLE_CHECKBOX, false),
+        (ids::TOGGLE_SWITCH, true),
+        (ids::TOGGLE_AUTOMATIC, true),
+        (ids::TOGGLE_AUTOPLAY, true),
+    ] {
+        let event = client.value_changed(app.session(), node, value);
+        dispatch(app.session(), &event);
+    }
+    let button = client.activate(app.session(), ids::BTN_DESTRUCTIVE);
+    dispatch(app.session(), &button);
+    let selection = client.selection(app.session(), ids::LIST, ids::LIST_ITEMS[1]);
+    dispatch(app.session(), &selection);
+    assert!(
+        app.autoplay(),
+        "the precondition must leave autoplay enabled"
+    );
+
     app.goto_scene(Scene::Structure).expect("scene applies");
-    app.goto_scene(Scene::State).expect("scene applies");
     app.reset().expect("reset applies");
     assert_same_graph(
         &fingerprint(app.session()),
         &baseline,
-        "reset from mid-tour must restore the baseline graph",
+        "reset after control events and a scene must restore the baseline graph",
+    );
+    assert!(!app.autoplay(), "reset must stop autoplay");
+    assert_eq!(
+        app.with_state(|state| (state.list_selection, state.table_selection)),
+        (None, None),
+        "reset must clear gallery-owned selection state"
     );
 
     let after: BTreeSet<u64> = all_nodes(app.session())
@@ -681,6 +707,99 @@ fn a_full_scene_cycle_and_reset_restore_the_baseline() {
         after, baseline_nodes,
         "reset is a revert, not a rebuild: node identity survives"
     );
+}
+
+#[test]
+fn failed_structure_commit_rolls_back_graph_and_all_gallery_state() {
+    let app = app();
+    let baseline = fingerprint(app.session());
+    let revision_before = app.session().current_revision();
+    let state_before = app.with_state(|state| {
+        (
+            state.scene,
+            state.autoplay,
+            state.scenes.transient().to_vec(),
+            state.trace.len(),
+            state.trace.next_seq(),
+            state.metrics.transactions(),
+            state.metrics.events(),
+            state.metrics.bytes(),
+        )
+    });
+
+    let failed = app.mutate("failing structure probe", |ui, state| {
+        Scene::Structure.apply(ui, &mut state.scenes)?;
+        state.scene = Scene::Structure;
+        state.metrics.observe_event(Duration::from_micros(123), 7);
+        ui.delete(ids::CONN_LAG)?;
+        Ok(())
+    });
+
+    assert!(
+        failed.is_err(),
+        "the deleted telemetry node must reject render"
+    );
+    assert_eq!(
+        app.session().current_revision(),
+        revision_before,
+        "a rejected transaction must not advance semantic state"
+    );
+    assert_same_graph(
+        &fingerprint(app.session()),
+        &baseline,
+        "a rejected structure scene must leave the semantic graph unchanged",
+    );
+    assert_eq!(
+        app.with_state(|state| {
+            (
+                state.scene,
+                state.autoplay,
+                state.scenes.transient().to_vec(),
+                state.trace.len(),
+                state.trace.next_seq(),
+                state.metrics.transactions(),
+                state.metrics.events(),
+                state.metrics.bytes(),
+            )
+        }),
+        state_before,
+        "scene bookkeeping, trace allocators, metrics, and caches publish atomically"
+    );
+
+    app.goto_scene(Scene::Structure)
+        .expect("a valid structure transition still succeeds after rollback");
+    let created = app.with_state(|state| state.scenes.transient().to_vec());
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        created[0].get(),
+        ids::TRANSIENT_ID_BASE,
+        "the failed allocation must not consume a transient id"
+    );
+    app.reset().expect("the successful structure scene reverts");
+    assert_same_graph(
+        &fingerprint(app.session()),
+        &baseline,
+        "a failed structure attempt must not wedge later transitions",
+    );
+}
+
+#[test]
+fn panicking_transaction_does_not_publish_gallery_state() {
+    let app = app();
+    let revision_before = app.session().current_revision();
+    let failed = app.mutate("panic rollback probe", |_, state| {
+        state.scene = Scene::Structure;
+        state.autoplay = true;
+        panic!("intentional gallery rollback probe");
+    });
+
+    assert!(
+        failed.is_err(),
+        "Session must convert the panic into an error"
+    );
+    assert_eq!(app.session().current_revision(), revision_before);
+    assert_eq!(app.scene(), Scene::Baseline);
+    assert!(!app.autoplay());
 }
 
 #[test]
@@ -710,6 +829,55 @@ fn reaching_a_scene_by_any_route_produces_the_same_graph() {
 // =============================================================================
 // Protocol inspector
 // =============================================================================
+
+#[test]
+fn inspector_status_tracks_each_trigger_and_its_committing_revision() {
+    let app = app();
+    assert!(
+        text_of(app.session(), ids::INSPECT_LAST_EVENT)
+            .contains("TRANSACTION · initial gallery graph"),
+        "startup must replace the inspector placeholder with its actual trigger"
+    );
+    assert_eq!(
+        text_of(app.session(), ids::INSPECT_REVISION),
+        format!("Revision: {}", app.session().current_revision())
+    );
+
+    let mut client = Client::new();
+    let event = client.value_changed(app.session(), ids::TOGGLE_SWITCH, true);
+    dispatch(app.session(), &event);
+    let last_event = text_of(app.session(), ids::INSPECT_LAST_EVENT);
+    assert!(
+        last_event.contains("VALUE_CHANGED")
+            && last_event.contains(&format!("node {}", ids::TOGGLE_SWITCH.get()))
+            && last_event.contains("seq 1"),
+        "the inspector must identify the current client event, got {last_event:?}"
+    );
+    assert_eq!(
+        text_of(app.session(), ids::INSPECT_REVISION),
+        format!("Revision: {}", app.session().current_revision())
+    );
+
+    app.goto_scene(Scene::Content).expect("scene applies");
+    assert!(
+        text_of(app.session(), ids::INSPECT_LAST_EVENT).contains("TRANSACTION · scene"),
+        "a programmatic scene change must replace the current trigger"
+    );
+    assert_eq!(
+        text_of(app.session(), ids::INSPECT_REVISION),
+        format!("Revision: {}", app.session().current_revision())
+    );
+
+    app.reset().expect("reset applies");
+    assert!(
+        text_of(app.session(), ids::INSPECT_LAST_EVENT).contains("TRANSACTION · reset to baseline"),
+        "reset must publish its own trigger"
+    );
+    assert_eq!(
+        text_of(app.session(), ids::INSPECT_REVISION),
+        format!("Revision: {}", app.session().current_revision())
+    );
+}
 
 #[test]
 fn inspector_records_both_directions_and_stays_bounded() {
@@ -805,8 +973,15 @@ fn connection_statistics_are_published_as_semantic_state() {
 
     let latency = text_of(app.session(), ids::CONN_LATENCY);
     assert!(
-        latency.contains("p50") && latency.contains("\u{b5}s"),
+        latency.contains("p50") && latency.contains("µs"),
         "server-side latency percentiles must be published, got {latency:?}"
+    );
+
+    let revision = app.session().current_revision();
+    assert_eq!(
+        text_of(app.session(), ids::CONN_REVISION),
+        format!("Revision: {revision} (journal head {revision})"),
+        "the statistics carried by a transaction must name its committed revision"
     );
 
     let observed = app.with_state(|state| {
@@ -824,6 +999,48 @@ fn connection_statistics_are_published_as_semantic_state() {
         "every measured transaction lands in exactly one size bucket"
     );
     assert_eq!(observed.2.len(), SIZE_BUCKETS.len());
+}
+
+#[test]
+fn concurrent_commits_capture_facts_after_gallery_state_serialization() {
+    let app = app();
+    let barrier = Arc::new(Barrier::new(3));
+
+    let handles = app.with_state(|_| {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let app = app.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                app.mutate("concurrent facts probe", |_, _| Ok(()))
+            }));
+        }
+
+        barrier.wait();
+        // Both workers have entered commit while this thread owns the state lock. With the old
+        // facts-before-state ordering, both captured the same stale revision before blocking.
+        std::thread::sleep(Duration::from_millis(100));
+        handles
+    });
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("concurrent commit thread does not panic")
+            .expect("concurrent commit succeeds");
+    }
+
+    let revision = app.session().current_revision();
+    assert_eq!(
+        text_of(app.session(), ids::CONN_REVISION),
+        format!("Revision: {revision} (journal head {revision})"),
+        "the last serialized commit must render facts for its own revision"
+    );
+    assert_eq!(
+        text_of(app.session(), ids::INSPECT_REVISION),
+        format!("Revision: {revision}")
+    );
 }
 
 #[test]

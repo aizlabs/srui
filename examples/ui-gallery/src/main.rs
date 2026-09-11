@@ -5,7 +5,7 @@
 //! stream (§19.1).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::net::UnixListener;
@@ -167,6 +167,39 @@ fn acquire_socket_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Restores the process umask even when binding returns early or unwinds.
+struct UmaskGuard {
+    previous: libc::mode_t,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl UmaskGuard {
+    fn private_socket() -> Self {
+        let lock = UMASK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: `umask` accepts every mode value, has no pointer arguments, and the previous
+        // process mask is retained by this guard until it is restored in Drop.
+        let previous = unsafe { libc::umask(0o177) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring the mode returned by `umask` is always valid. The guard's mutex
+        // serializes every bind performed through this module until restoration is complete.
+        unsafe {
+            libc::umask(self.previous);
+        }
+    }
+}
+
 async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
     let lock = acquire_socket_lock(path)?;
 
@@ -176,7 +209,12 @@ async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedS
         std::fs::remove_file(path)?;
     }
 
-    let listener = UnixListener::bind(path)?;
+    // A Unix socket honors the process umask at creation. Keep the endpoint owner-only so
+    // another local account cannot inspect the tree or inject authoritative UI events.
+    let listener = {
+        let _umask = UmaskGuard::private_socket();
+        UnixListener::bind(path)?
+    };
     let identity = socket_identity(path)?.ok_or_else(|| {
         std::io::Error::other(format!(
             "{} vanished immediately after bind",
@@ -290,4 +328,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     owned_socket.remove();
     info!("ui gallery shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct RestoreUmask(libc::mode_t);
+
+    impl Drop for RestoreUmask {
+        fn drop(&mut self) {
+            // SAFETY: this is the mode returned by the successful `umask` call below.
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_socket_is_owner_only_and_original_umask_is_restored() {
+        // Arrange a permissive conventional mask so this test would observe 0755 without the
+        // restrictive bind guard. Restore the process-wide setting even if an assertion unwinds.
+        // SAFETY: `umask` accepts every mode value and returns the previous process mask.
+        let previous = unsafe { libc::umask(0o022) };
+        let _restore = RestoreUmask(previous);
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        // Unix socket paths are short (104 bytes on macOS); /tmp keeps the regression portable
+        // even when the test runner's TMPDIR is a deeply nested sandbox path.
+        let directory =
+            PathBuf::from("/tmp").join(format!("srui-gallery-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).expect("temporary socket directory is created");
+        let path = directory.join("gallery.sock");
+
+        let (listener, owned) = bind_owned_socket(&path).await.expect("socket binds");
+        let mode = std::fs::symlink_metadata(&path)
+            .expect("bound socket has metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the socket must be accessible only by its owner"
+        );
+
+        // Observe the current mask while leaving the test's sentinel mask in place.
+        // SAFETY: the sentinel is a valid mode and RestoreUmask retains the original mode.
+        let observed = unsafe { libc::umask(0o022) };
+        assert_eq!(observed, 0o022, "binding must restore the caller's umask");
+
+        drop(listener);
+        owned.remove();
+        std::fs::remove_file(socket_lock_path(&path)).expect("lock file is removed");
+        std::fs::remove_dir(directory).expect("temporary socket directory is removed");
+    }
 }

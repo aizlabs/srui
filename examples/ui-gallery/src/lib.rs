@@ -25,8 +25,8 @@
 //! # Locking
 //!
 //! One mutex guards application state. The lock order is **state → session**, never the reverse.
-//! Session counters are read *before* the state lock is taken and before a transaction opens,
-//! because `Session::transaction` holds the same inner mutex those accessors need.
+//! Session counters are read after taking the state lock but before a transaction opens, because
+//! `Session::transaction` holds the same inner mutex those accessors need.
 
 pub mod ids;
 pub mod scenes;
@@ -54,7 +54,7 @@ pub use trace::{Trigger, MAX_TRACE_ROWS};
 pub const GALLERY_IMAGE: &[u8] = include_bytes!("../assets/gallery.png");
 
 /// Application state owned by the gallery server.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct GalleryState {
     /// Scene currently applied to the graph.
     pub scene: Scene,
@@ -161,18 +161,30 @@ impl GalleryApp {
     where
         F: FnOnce(&mut UiTransaction, &mut GalleryState) -> Result<(), StoreError>,
     {
-        // Read before locking state and before the transaction opens: these accessors take the
-        // session's inner mutex, which `Session::transaction` holds for the whole closure.
-        let facts = SessionFacts::capture(&self.session);
+        // Serialize gallery commits first, then capture session facts immediately before opening
+        // the transaction. This preserves the state → session lock order while ensuring concurrent
+        // callers cannot render or frame a superseded revision.
         let mut state = lock_or_recover(&self.state);
+        let facts = SessionFacts::capture(&self.session);
 
+        // Session::transaction already stages the semantic store. Clone the gallery-owned state as
+        // well so StoreError and caught-panic rollback cover scene allocators, trace ids, metrics,
+        // rendered-value caches, and every other application field.
+        let mut staged = state.clone();
         let committed = self.session.transaction(|ui| {
-            f(ui, &mut state)?;
+            f(ui, &mut staged)?;
 
             // Snapshot before the inspector writes, so the inspector never describes itself.
             let mut described = prior;
             described.extend_from_slice(ui.operations());
-            state.trace.record(ui, &trigger, &described)?;
+            staged.trace.record(ui, &trigger, &described)?;
+
+            Text::set_text_for(ui, ids::INSPECT_LAST_EVENT, trigger.inspector_text())?;
+            Text::set_text_for(
+                ui,
+                ids::INSPECT_REVISION,
+                format!("Revision: {}", facts.committed_revision()),
+            )?;
 
             // Observed before rendering so the panel reflects the event that caused this
             // transaction rather than lagging one behind it. The sample covers decode,
@@ -185,18 +197,21 @@ impl GalleryApp {
             ) = (started, &trigger)
             {
                 let lag = facts.revision.saturating_sub(*observed_revision);
-                state.metrics.observe_event(started.elapsed(), lag);
+                staged.metrics.observe_event(started.elapsed(), lag);
             }
 
-            state.metrics.render(ui, &facts)?;
+            staged.metrics.render(ui, &facts)?;
             Ok(ui.operations().to_vec())
         })?;
 
         // Framed size is only knowable once the operation list is final, so the throughput panel
-        // reports every transaction committed strictly before the one being rendered.
-        state
+        // reports every transaction committed strictly before the one being rendered. This method
+        // is deliberately infallible: the semantic commit has succeeded, so publishing the staged
+        // application state must not introduce a second failure boundary.
+        staged
             .metrics
             .observe_transaction(facts.revision, &committed);
+        *state = staged;
 
         Ok(committed)
     }
@@ -262,19 +277,34 @@ impl GalleryApp {
             Trigger::server("reset to baseline"),
             Vec::new(),
             None,
-            move |ui, state| {
-                state.scene.revert(ui, &mut state.scenes)?;
-                state.scene = Scene::Baseline;
-                state.list_selection = None;
-                state.table_selection = None;
-                Text::set_text_for(ui, ids::SCENE_LABEL, Scene::Baseline.label())?;
-                Text::set_text_for(ui, ids::INSPECT_SCENE, Scene::Baseline.label())?;
-                Text::set_text_for(ui, ids::CTRL_STATUS, ui::BASELINE_CTRL_STATUS)?;
-                Text::set_text_for(ui, ids::COLL_SELECTION, ui::BASELINE_COLL_SELECTION)?;
-                Text::set_text_for(ui, ids::HERO_STATUS, ui::BASELINE_HERO_STATUS)?;
-                Ok(())
-            },
+            Self::restore_baseline,
         )
+    }
+
+    fn restore_baseline(
+        ui: &mut UiTransaction,
+        state: &mut GalleryState,
+    ) -> Result<(), StoreError> {
+        state.scene.revert(ui, &mut state.scenes)?;
+        state.scene = Scene::Baseline;
+        state.autoplay = ui::BASELINE_AUTOPLAY;
+        state.list_selection = None;
+        state.table_selection = None;
+
+        Text::set_text_for(ui, ids::SCENE_LABEL, Scene::Baseline.label())?;
+        Text::set_text_for(ui, ids::INSPECT_SCENE, Scene::Baseline.label())?;
+        Text::set_text_for(ui, ids::CTRL_STATUS, ui::BASELINE_CTRL_STATUS)?;
+        Text::set_text_for(ui, ids::COLL_SELECTION, ui::BASELINE_COLL_SELECTION)?;
+        Text::set_text_for(ui, ids::HERO_STATUS, ui::BASELINE_HERO_STATUS)?;
+        for (node, value) in [
+            (ids::TOGGLE_AUTOPLAY, ui::BASELINE_AUTOPLAY),
+            (ids::TOGGLE_CHECKBOX, ui::BASELINE_TOGGLE_CHECKBOX),
+            (ids::TOGGLE_SWITCH, ui::BASELINE_TOGGLE_SWITCH),
+            (ids::TOGGLE_AUTOMATIC, ui::BASELINE_TOGGLE_AUTOMATIC),
+        ] {
+            Toggle::set_value_for(ui, node, value)?;
+        }
+        Ok(())
     }
 
     /// Turns the autoplay timer on or off and echoes the authoritative value back to the client.
@@ -363,18 +393,7 @@ impl GalleryApp {
                 self.goto_scene_traced(self.scene().previous(), trigger, Some(started))
             }
             SceneAction::Reset => {
-                self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
-                    state.scene.revert(ui, &mut state.scenes)?;
-                    state.scene = Scene::Baseline;
-                    state.list_selection = None;
-                    state.table_selection = None;
-                    Text::set_text_for(ui, ids::SCENE_LABEL, Scene::Baseline.label())?;
-                    Text::set_text_for(ui, ids::INSPECT_SCENE, Scene::Baseline.label())?;
-                    Text::set_text_for(ui, ids::CTRL_STATUS, ui::BASELINE_CTRL_STATUS)?;
-                    Text::set_text_for(ui, ids::COLL_SELECTION, ui::BASELINE_COLL_SELECTION)?;
-                    Text::set_text_for(ui, ids::HERO_STATUS, ui::BASELINE_HERO_STATUS)?;
-                    Ok(())
-                })
+                self.commit(trigger, Vec::new(), Some(started), Self::restore_baseline)
             }
         };
         report("scene action", result);

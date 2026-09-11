@@ -24,7 +24,7 @@ use crate::ui;
 ///
 /// Held by [`crate::GalleryState`] and threaded through every `apply`/`revert` so scenes stay
 /// free functions over an open transaction rather than reaching back into the application.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SceneContext {
     /// Hash of the published gallery image, restored by the image scene's revert (§14).
     image: Option<ResourceHash>,
@@ -55,15 +55,17 @@ impl SceneContext {
     }
 
     /// Reserves a never-before-used node id for a scene-created node (§6.2).
-    fn allocate(&mut self) -> NodeId {
+    fn allocate(&mut self) -> Result<NodeId, StoreError> {
         // `next_transient` is zero on a defaulted context; start the block where it belongs.
         if self.next_transient < ids::TRANSIENT_ID_BASE {
             self.next_transient = ids::TRANSIENT_ID_BASE;
         }
         let id = NodeId::new(self.next_transient);
-        self.next_transient += 1;
+        self.next_transient = self.next_transient.checked_add(1).ok_or_else(|| {
+            StoreError::OperationError("transient node id space is exhausted".to_string())
+        })?;
         self.transient.push(id);
-        id
+        Ok(id)
     }
 
     /// Hands back every id the applied scene created and clears the list.
@@ -404,7 +406,7 @@ fn revert_models(ui: &mut UiTransaction) -> Result<(), StoreError> {
 fn apply_structure(ui: &mut UiTransaction, ctx: &mut SceneContext) -> Result<(), StoreError> {
     // A fresh id each time: the previous badge was deleted, and the store refuses to resurrect a
     // retired node id (§6.2).
-    let badge = ctx.allocate();
+    let badge = ctx.allocate()?;
     Text::builder(badge)
         .parent(ids::LAYOUT_COLUMN)
         .text(SCENE_BADGE_TEXT)

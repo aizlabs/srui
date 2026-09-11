@@ -46,6 +46,10 @@ pub const BASELINE_TYPO_BODY: &str =
 pub const BASELINE_PROGRESS_VALUE: f64 = 0.35;
 pub const BASELINE_PROGRESS_DESCRIPTION: &str = "35% \u{b7} determinate";
 pub const BASELINE_PRIMARY_LABEL: &str = "Primary";
+pub const BASELINE_AUTOPLAY: bool = false;
+pub const BASELINE_TOGGLE_CHECKBOX: bool = true;
+pub const BASELINE_TOGGLE_SWITCH: bool = false;
+pub const BASELINE_TOGGLE_AUTOMATIC: bool = false;
 pub const BASELINE_CTRL_STATUS: &str = "No control has been activated yet";
 pub const BASELINE_COLL_SELECTION: &str = "Nothing selected";
 
@@ -250,7 +254,7 @@ fn build_frame(ui: &mut UiTransaction, scene_label: &str) -> Result<(), StoreErr
     Toggle::switch(ids::TOGGLE_AUTOPLAY)
         .parent(ids::TOOLBAR)
         .label("Auto Play")
-        .value(false)
+        .value(BASELINE_AUTOPLAY)
         .action_key(ids::ACTION_AUTOPLAY)
         .accessible_description("Advance to the next scene every few seconds")
         .create(ui)?;
@@ -527,20 +531,20 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
     Toggle::checkbox(ids::TOGGLE_CHECKBOX)
         .parent(ids::CTRL_TOGGLE_ROW)
         .label("Checkbox hint")
-        .value(true)
+        .value(BASELINE_TOGGLE_CHECKBOX)
         .action_key(ids::ACTION_TOGGLE_CHECKBOX)
         .create(ui)?;
     Toggle::switch(ids::TOGGLE_SWITCH)
         .parent(ids::CTRL_TOGGLE_ROW)
         .label("Switch hint")
-        .value(false)
+        .value(BASELINE_TOGGLE_SWITCH)
         .action_key(ids::ACTION_TOGGLE_SWITCH)
         .visibility(Visibility::Visible)
         .create(ui)?;
     Toggle::automatic(ids::TOGGLE_AUTOMATIC)
         .parent(ids::CTRL_TOGGLE_ROW)
         .label("Automatic hint")
-        .value(false)
+        .value(BASELINE_TOGGLE_AUTOMATIC)
         .action_key(ids::ACTION_TOGGLE_AUTOMATIC)
         .create(ui)?;
 

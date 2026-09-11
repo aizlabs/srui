@@ -60,6 +60,16 @@ impl Trigger {
         }
     }
 
+    /// Text shown above the trace table for the transaction currently being committed.
+    pub fn inspector_text(&self) -> String {
+        let (_, kind, detail) = self.row();
+        if detail.is_empty() {
+            format!("Last event: {kind}")
+        } else {
+            format!("Last event: {kind} · {detail}")
+        }
+    }
+
     fn row(&self) -> (&'static str, String, String) {
         match self {
             Self::Server { label } => (SERVER_TO_CLIENT, "TRANSACTION".to_string(), label.clone()),
@@ -90,7 +100,7 @@ impl Trigger {
 }
 
 /// Bounded, newest-first log of semantic traffic backed by [`ids::TRACE_MODEL`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TraceLog {
     next_seq: u64,
     next_item: u64,
@@ -155,30 +165,34 @@ impl TraceLog {
         }
 
         // Newest row sits at index 0, so the batch is inserted in reverse chronological order.
-        let items: Vec<ModelItem> = chronological
-            .into_iter()
-            .map(|(direction, kind, detail)| {
-                let seq = self.next_seq;
-                self.next_seq += 1;
-                let item_id = ItemId::new(self.next_item);
-                self.next_item += 1;
-                ModelItem::new(
-                    item_id,
-                    Value::List(vec![
-                        Value::String(seq.to_string()),
-                        Value::String(direction.to_string()),
-                        Value::String(kind),
-                        Value::String(detail),
-                    ]),
-                    [],
-                )
-            })
-            .rev()
-            .collect();
+        let mut items = Vec::with_capacity(chronological.len());
+        for (direction, kind, detail) in chronological {
+            let seq = self.next_seq;
+            self.next_seq = self.next_seq.checked_add(1).ok_or_else(|| {
+                StoreError::OperationError("trace sequence space is exhausted".to_string())
+            })?;
+            let item_id = ItemId::new(self.next_item);
+            self.next_item = self.next_item.checked_add(1).ok_or_else(|| {
+                StoreError::OperationError("trace item id space is exhausted".to_string())
+            })?;
+            items.push(ModelItem::new(
+                item_id,
+                Value::List(vec![
+                    Value::String(seq.to_string()),
+                    Value::String(direction.to_string()),
+                    Value::String(kind),
+                    Value::String(detail),
+                ]),
+                [],
+            ));
+        }
+        items.reverse();
 
         let inserted = items.len();
         ui.apply_op(&Operation::model_insert(ids::TRACE_MODEL, 0, items))?;
-        self.len += inserted;
+        self.len = self.len.checked_add(inserted).ok_or_else(|| {
+            StoreError::OperationError("trace row count overflowed usize".to_string())
+        })?;
 
         if self.len > MAX_TRACE_ROWS {
             let excess = self.len - MAX_TRACE_ROWS;

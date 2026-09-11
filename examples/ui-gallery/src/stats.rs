@@ -47,11 +47,12 @@ pub const CHUNK_PAYLOAD_SIZE: usize = srui_sdk::CHUNK_PAYLOAD_SIZE;
 /// without limit (§26 is about wire limits, but the same discipline applies to server memory).
 const SAMPLE_WINDOW: usize = 256;
 
-/// Facts read from the session *before* a transaction opens.
+/// Facts read from the session after the gallery state lock is acquired and before a transaction
+/// opens.
 ///
 /// Every accessor here takes the session's inner mutex, which `Session::transaction` also holds for
-/// the duration of the closure. Capturing first is therefore not an optimisation but a deadlock
-/// avoidance requirement.
+/// the duration of the closure. Capturing before opening that transaction is therefore not an
+/// optimisation but a deadlock-avoidance requirement.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionFacts {
     pub attached: usize,
@@ -72,10 +73,20 @@ impl SessionFacts {
             retained_bytes: session.retained_client_state_bytes().ok(),
         }
     }
+
+    /// Revision carried by a transaction opened immediately after these facts were captured.
+    pub fn committed_revision(self) -> u64 {
+        self.revision.saturating_add(1)
+    }
+
+    /// Journal head after that transaction commits.
+    pub fn committed_journal_revision(self) -> u64 {
+        self.journal_revision.saturating_add(1)
+    }
 }
 
 /// Bounded traffic and latency accumulator.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Metrics {
     transactions: u64,
     operations: u64,
@@ -155,8 +166,9 @@ impl Metrics {
     /// A transaction that cannot be framed is counted separately rather than recorded as zero
     /// bytes: an oversize frame is precisely the condition these statistics exist to surface.
     pub fn observe_transaction(&mut self, base_revision: u64, operations: &[Operation]) {
-        self.transactions += 1;
-        self.operations += operations.len() as u64;
+        self.transactions = self.transactions.saturating_add(1);
+        let operation_count = u64::try_from(operations.len()).unwrap_or(u64::MAX);
+        self.operations = self.operations.saturating_add(operation_count);
 
         let transaction = Transaction::new(Revision::new(base_revision), operations.to_vec());
         let wire: srui_protocol::Transaction = (&transaction).into();
@@ -166,15 +178,16 @@ impl Metrics {
         match srui_protocol::encode_framed(&envelope) {
             Ok(framed) => {
                 let len = framed.len();
-                self.bytes += len as u64;
+                let framed_bytes = u64::try_from(len).unwrap_or(u64::MAX);
+                self.bytes = self.bytes.saturating_add(framed_bytes);
                 let index = SIZE_BUCKETS
                     .iter()
                     .position(|(_, limit)| len <= *limit)
                     .unwrap_or(SIZE_BUCKETS.len() - 1);
-                self.buckets[index] += 1;
+                self.buckets[index] = self.buckets[index].saturating_add(1);
             }
             Err(error) => {
-                self.unframable += 1;
+                self.unframable = self.unframable.saturating_add(1);
                 tracing::warn!("revision {base_revision} could not be framed: {error}");
             }
         }
@@ -182,8 +195,9 @@ impl Metrics {
 
     /// Records one client event: server handling time and how stale the client's view was.
     pub fn observe_event(&mut self, handling: Duration, revision_lag: u64) {
-        self.events += 1;
-        push_bounded(&mut self.handling_micros, handling.as_micros() as u64);
+        self.events = self.events.saturating_add(1);
+        let handling_micros = u64::try_from(handling.as_micros()).unwrap_or(u64::MAX);
+        push_bounded(&mut self.handling_micros, handling_micros);
         push_bounded(&mut self.revision_lag, revision_lag);
     }
 
@@ -209,7 +223,8 @@ impl Metrics {
             ids::CONN_REVISION,
             format!(
                 "Revision: {} (journal head {})",
-                facts.revision, facts.journal_revision
+                facts.committed_revision(),
+                facts.committed_journal_revision()
             ),
         )?;
         self.set_text(
@@ -273,7 +288,10 @@ impl Metrics {
             ),
         )?;
 
-        let total: u64 = self.buckets.iter().sum();
+        let total = self
+            .buckets
+            .iter()
+            .fold(0_u64, |sum, count| sum.saturating_add(*count));
         for (index, node) in ids::CONN_HIST_BARS.iter().enumerate() {
             let count = self.buckets[index];
             let fraction = if total == 0 {

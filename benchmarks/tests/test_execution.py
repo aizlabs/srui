@@ -15,6 +15,24 @@ from benchmarks.tests.support import (
     valid_report,
     window_isolation_assertion,
 )
+
+
+@pytest.mark.parametrize(
+    ("profile", "requested", "expected"),
+    (
+        ("smoke", None, 600),
+        ("full", None, 1_800),
+        ("full", 77, 77),
+    ),
+)
+def test_driver_timeout_is_profile_bounded_and_overrideable(
+    profile: str,
+    requested: int | None,
+    expected: int,
+) -> None:
+    assert benchmark_run.effective_driver_timeout(profile, requested) == expected
+
+
 def test_window_isolation_report_assertion_is_full_profile_only() -> None:
     assertion_id = benchmark_run.WINDOW_ISOLATION_ASSERTION_ID
     assert assertion_id in benchmark_run.EXPECTED_REPORT_INVENTORY["31.1"][
@@ -142,11 +160,15 @@ def test_window_isolation_self_test_invokes_built_release_driver(
     assert kwargs["label"] == "window isolation self-test"
     assert output_path is not None
     assert not output_path.exists()
-
-
+@pytest.mark.parametrize(
+    ("timeout_args", "expected_timeout"),
+    (([], 1_800), (["--timeout", "120"], 120)),
+)
 def test_main_runs_window_isolation_after_normal_macos_driver(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    timeout_args: list[str],
+    expected_timeout: int,
 ) -> None:
     manifest = valid_manifest()
     fixture = tmp_path / manifest["fixture"]
@@ -160,11 +182,10 @@ def test_main_runs_window_isolation_after_normal_macos_driver(
         driver: dict[str, Any],
         _fixture: Path,
         profile: str,
-        _timeout: int,
+        timeout: int,
     ) -> dict[str, Any]:
-        events.append(f"driver:{driver['name']}")
+        events.append(f"driver:{driver['name']}:{timeout}")
         return payload_for_driver(driver, profile=profile)
-
     def stop_after_self_test(_fixture: Path, timeout: int) -> dict[str, Any]:
         events.append(f"self-test:{timeout}")
         raise benchmark_run.BenchmarkError("self-test sentinel")
@@ -186,9 +207,12 @@ def test_main_runs_window_isolation_after_normal_macos_driver(
     )
 
     with pytest.raises(benchmark_run.BenchmarkError, match="self-test sentinel"):
-        benchmark_run.main(["--profile", "full", "--timeout", "120"])
-    assert events == ["driver:rust", "driver:macos", "self-test:30"]
-
+        benchmark_run.main(["--profile", "full", *timeout_args])
+    assert events == [
+        f"driver:rust:{expected_timeout}",
+        f"driver:macos:{expected_timeout}",
+        "self-test:30",
+    ]
 
 def test_run_driver_waits_for_exact_attributed_process_identities(
     monkeypatch: pytest.MonkeyPatch,

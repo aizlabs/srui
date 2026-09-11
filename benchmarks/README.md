@@ -42,6 +42,11 @@ Codex or terminal app must already have Screen Recording permission; the suite c
 and fails without prompting. Developer Tools permission is not required; the rejected xctrace
 prototype is not runnable.
 
+The runner keeps every child bounded. Its default per-driver timeout is 600 seconds for smoke and
+1,800 seconds for full. The full bound accounts for 640 §31.4 local-interaction probes—including
+responses deliberately held at 100/300/600 ms—plus the other five sections; the former 600-second
+full bound could terminate a healthy run. `--timeout SECONDS` remains an explicit override.
+
 Every full-mode benchmark host resolves its WindowServer stratum at runtime with
 `CGWindowLevelForKey(.statusWindow)`. Before ordering the host, the driver resolves
 `.dockWindow`, `.statusWindow`, `.popUpMenuWindow`, and

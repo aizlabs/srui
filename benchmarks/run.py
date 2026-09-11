@@ -93,6 +93,17 @@ WINDOW_ISOLATION_SELF_TEST_PATTERN = re.compile(
     r"target=(?P<target>[0-9]+) occluder=(?P<occluder>[0-9]+)$"
 )
 DEFAULT_MIN_FREE_BYTES = 12 * 1024 * 1024 * 1024
+DEFAULT_DRIVER_TIMEOUT_SECONDS = {
+    "smoke": 600,
+    # Full §31.4 executes 640 local-interaction probes, including deliberately
+    # held 100/300/600 ms responses, in addition to the other five sections.
+    # Keep the complete run bounded without treating its valid workload as a hang.
+    "full": 1_800,
+}
+
+
+def effective_driver_timeout(profile: str, requested: int | None) -> int:
+    return requested if requested is not None else DEFAULT_DRIVER_TIMEOUT_SECONDS[profile]
 
 
 def _macos_release_driver_path() -> Path:
@@ -659,12 +670,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--record-baseline", action="store_true")
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        help="per-driver timeout in seconds (default: smoke 600, full 1800)",
+    )
     args = parser.parse_args(argv)
     if args.record_baseline and args.profile != "full":
         parser.error("--record-baseline requires --profile full")
-    if args.timeout <= 0:
+    if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout must be positive")
+    driver_timeout = effective_driver_timeout(args.profile, args.timeout)
 
     try:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
@@ -688,7 +704,7 @@ def main(argv: list[str] | None = None) -> int:
             raise BenchmarkError(
                 f"{driver['name']} requires {driver['platform']}; current platform is {sys.platform}"
             )
-        payload = run_driver(driver, fixture, args.profile, args.timeout)
+        payload = run_driver(driver, fixture, args.profile, driver_timeout)
         if driver["name"] == "macos" and args.profile == "full":
             parse_render = next(
                 section for section in payload["sections"] if section["id"] == "31.1"
@@ -696,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
             parse_render["assertions"].append(
                 run_window_isolation_self_test(
                     fixture,
-                    min(args.timeout, WINDOW_ISOLATION_SELF_TEST_TIMEOUT_SECONDS),
+                    min(driver_timeout, WINDOW_ISOLATION_SELF_TEST_TIMEOUT_SECONDS),
                 )
             )
         driver_artifacts[driver["name"]] = payload["artifacts"]
@@ -707,7 +723,7 @@ def main(argv: list[str] | None = None) -> int:
 
     candidate_cleanup_detail = run_candidate_cleanup_probe(
         fixture,
-        args.timeout,
+        driver_timeout,
     )
     sections["31.1"]["assertions"].append(
         {
@@ -720,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for verification in manifest["verification_commands"]:
         elapsed, passed, detail, conformance_count = run_verification(
-            verification, args.timeout
+            verification, driver_timeout
         )
         if conformance_count is None:
             raise BenchmarkError(

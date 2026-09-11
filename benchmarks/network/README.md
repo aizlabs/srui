@@ -1,92 +1,91 @@
 # §31.4 network and local-interaction benchmark
 
-Owner: `client-macos/Benchmarks/NetworkBenchmark.swift::networkAndLocalInteraction`. The benchmark
-runs framed traffic through the production `SessionController` transport boundary while injecting
-0, 100, 300, and 600 ms RTT. The same production AppKit editor/renderer path performs text entry,
-caret movement, selection, marked-text IME composition, scrolling, hover, pressed feedback, and
-menu opening. Local control updates and server-dependent feedback are timed independently.
+Owners: `client-macos/Benchmarks/NetworkBenchmark.swift::networkAndLocalInteraction`,
+`LocalInteractionBenchmark.swift::localInteractionSamples`, and
+`NetworkInteractionSupport.swift::LocalInteractionRecorder`.
 
-Task 34 exposed two prerequisite renderer gaps. Stock `NSButton` did not provide a stable visible
-hover transition for the production Button path, so `RendererAppKit.ControlFactory` now constructs
-its internal `HoverFeedbackButton`; `ControlFactoryTests` proves enter changes its raster and exit
-restores it. The canonical semantic fixture now also contains a `Menu` node with inline `.items`,
-which `ControlFactory` mounts as an `NSPopUpButton`; the menu-opening trial presents that exact
-renderer-owned `NSMenu` instead of constructing benchmark-only menu state. Its production test
-proves initial item materialization, incremental replacement, and clearing. These are explicit
-production local-feedback prerequisites under §22.5, not forced invalidations in the timed
-observer; the measured subject includes both corrections.
+The section mounts the representative state through the production `AppKitRenderer`, then runs
+framed traffic through `SessionController`, `EventOutbox`, `SRUIFraming`, and
+`BenchmarkTransport` at 0, 100, 300, and 600 ms configured RTT. Each local trial starts one exact
+paired production transaction at its action boundary, proves the configured nonzero delay is
+active, holds that response through local visible completion, and releases it only afterward.
+Server-dependent feedback is timed separately and must track the injected RTT.
 
-In full mode, the harness resolves `CGWindowLevelForKey(.dockWindow)`,
-`CGWindowLevelForKey(.statusWindow)`, `CGWindowLevelForKey(.popUpMenuWindow)`, and
-`CGWindowLevelForKey(.screenSaverWindow)`, requires
-`dock < status < popup < screen-saver`, and places the benchmark host at the resolved status
-level. This avoids the Dock-owned desktop surface without placing the host above the production
-menu being measured. Exact inventories use `.optionOnScreenOnly`; membership is the on-screen
-proof because WindowServer may omit the redundant optional `kCGWindowIsOnscreen` field. Window
-ID, owner PID, resolved layer, alpha, bounds, display, client-content geometry, and target geometry
-remain mandatory. This is not a Dock, owner, pointer, or cursor whitelist:
-`kCGWindowAlpha` is whole-window metadata rather than pixel opacity, and every intersecting
-nonzero-alpha surface ahead—including a WindowServer cursor or `loginwindow`—still rejects the
-sample.
+## Measured controls and interaction boundary
 
-Before untimed preparation, the full section saves the exact Quartz pointer location and parks it
-at `display.maxX - 160` and the display's vertical midpoint; it restores the original location
-on exit, including failure. The deterministic host is left-side, so the interior right-side park
-stays outside the measured target without entering Dock, menu-bar, or hot-corner edge activation
-zones. Because pointer relocation can nevertheless start the retraction of a previously activated
-Dock or menu surface, exact `.optionOnScreenOnly` WindowServer identity acquisition has a
-bounded 10-second untimed settling window. A separate 10-second geometry deadline must contain
-identical exact WindowServer identity, window bounds, and client-content ROI observations spaced
-300 ms apart. Preparation independently waits up to 10 seconds for a genuinely clear z-order
-instead of accepting or whitelisting a transient surface. The extended geometry deadline
-accommodates slow AppKit/WindowServer settling observed while cycling the 600 ms RTT case; it does
-not move the later action-start or display-latency boundaries. A timeout reports the prepared
-AppKit frame and current WindowServer entry fields. Only after these checks does the harness start
-ScreenCaptureKit and obtain a complete-frame baseline for the exact visible target-control ROI.
-Only after that baseline and its pre-action recheck succeed does the harness start the real
-`BenchmarkTransport` injected response, verify that every nonzero RTT has an active delayed
-operation, and begin the timed local action. Frames delivered while that action is still running
-are ineligible. Once the action returns, the observer arms a fresh host-time cutoff and accepts
-only a later complete frame with identical target geometry, nonblank/nonuniform content, and at
-least eight unmasked ROI pixels whose RGBA value differs from the baseline by more than the
-explicit 2/255 per-channel SCStream tolerance. The output callback records the visible timestamp
-before locking or comparing pixels. Exact window identity, owner, resolved status layer, alpha,
-bounds, display, client-content bounds, target ROI, and absence of any intersecting window above
-are all re-derived after the accepted sample. The observer performs no invalidation, layout,
-activation, ordering, display, or transaction flush after timing starts; a missing production
-repaint therefore fails.
+The measured controls are the renderer-mounted production `NSTextView`, its `NSScrollView`, and
+the renderer-mounted `HoverFeedbackButton`. No semantic `Menu` node or `NSPopUpButton` is added for
+the benchmark. Menu opening asks the mounted `NSTextView` for its native context menu and presents
+that exact menu.
 
-Hover adds a cleanup proof after its timed frame is accepted: the continuous stream is stopped,
-`mouseExited` restores local state, and an explicit ScreenCaptureKit screenshot is compared with
-a pre-action screenshot from the same API and normalization. Restoration requires zero unmasked
-pixels with any channel delta greater than 5/255. The report publishes both the minimum material
-hover-change pixel count and the maximum observed restoration channel delta; it does not present
-an exact-image fingerprint match as the hover/restoration criterion.
-It requires one new current-process window at the independently resolved pop-up level, proves that
-level is above the prepared status-level host, crops that window from the same delivered frame used
-for the timestamp, verifies nonblank/nonuniform pixels and exact identity/geometry/z-order, and
-only then cancels AppKit menu tracking.
-Smoke mode remains an explicitly named offscreen raster fallback with no compositor claim. Its
-whole-host raster can charge an unrelated released remote invalidation to a later local sample, so
-its cross-RTT latency delta is diagnostic rather than a correctness gate. Full mode enforces the
-p50 delta against the measured display-frame budget. Both profiles still require every exact
-held-response/delay-boundary/state proof. The transport also applies a 1 MiB/s limit,
-deterministic frame loss/retry, and interruption.
+Text entry, caret movement, selection, marked-text IME composition, and scrolling invoke the
+corresponding native control APIs on those mounted controls. Text entry must also produce and settle
+one exact framed production `TEXT_EDIT`, including node ID, edit sequence, observed revision, ACK,
+and an empty stable outbox tail.
+
+Hover injects an inside/outside pointer location, application-active state, and window-visible state
+through benchmark SPI into the production `HoverFeedbackButton.reconcilePointerState()` method.
+The timed path is the real renderer-owned state change, invalidation, draw, and—in full mode—the
+composited target pixels. Cleanup drives the same production reconciliation with an outside
+location. The production button also reconciles on AppKit enter/exit, application activation,
+window move/resize/minimize/occlusion notifications, and before drawing; production tests cover a
+missed exit plus inactive, invisible, and detached contexts.
+
+Pressed feedback calls `performClick(nil)` on that mounted button. This uses AppKit's native
+programmatic click behavior and must invoke the production `ActionTrampoline` exactly once. Because
+the highlighted state is transient while `performClick` is running, full mode allows a frame after
+the action-start cutoff but before the call returns.
+
+These hover and pressed trials deliberately exclude hardware-event and WindowServer input-routing
+latency. Attempts to drive real session-level mouse events from the unbundled SwiftPM executable
+were rejected: supported macOS versions did not reliably grant that executable foreground/key
+activation even with event-posting access, so such a path could not produce repeatable evidence.
+The suite measures the SRUI contribution from local native state to visible output; it does not
+claim to benchmark the OS's common input-dispatch cost. This scope boundary is explicit in every
+fresh report rather than being disguised as a real mouse event.
+
+## Full compositor evidence
+
+Full mode resolves the Dock, status, pop-up-menu, and screen-saver levels at runtime and requires
+`dock < status < popup < screen-saver`. The host uses the resolved status level, below the native
+menu surface. Window inventories use `.optionOnScreenOnly`; membership is the on-screen proof
+because `kCGWindowIsOnscreen` is optional. Exact window ID, owner PID, layer, alpha, bounds,
+display, client-content geometry, target geometry, and unobscured z-order remain mandatory.
+
+Before each timed action, ScreenCaptureKit supplies a complete baseline for the exact target-control
+ROI. Ordinary persistent interactions accept only a complete frame after action completion. Hover
+and pressed may accept a complete frame after action start because their interesting state can be
+transient during the action. In both cases the accepted frame must keep identical target geometry,
+contain nonblank/nonuniform content, and differ by at least eight unmasked pixels above the explicit
+2/255 per-channel tolerance. Its `SCStreamFrameInfo.displayTime`, not callback receipt, ends the
+visible-latency interval. Exact identity, geometry, crop, and z-order are re-derived after pixel
+verification. The observer performs no forced invalidation after timing starts.
+
+Hover additionally restores the outside state and compares same-API ScreenCaptureKit screenshots.
+Restoration permits no unmasked pixel with a channel delta above 5/255 and publishes both the
+minimum material action delta and maximum restoration delta.
+
+Menu timing requires one new current-process window at the independently resolved pop-up level,
+crops that surface from the same frame used for its timestamp, verifies its pixels and exact
+identity/geometry/z-order, then cancels menu tracking. The optional `kCGWindowIsOnscreen` dictionary
+field is never required or used.
+
+Smoke mode is an explicitly named offscreen raster fallback and makes no compositor claim. Its
+cross-RTT latency delta is diagnostic because a whole-host raster can charge a previously released
+invalidation to a later action. Full mode gates the worst local p50 increase against the measured
+display-frame budget. Both profiles require every local state, held-response, delay-boundary,
+framed-text-edit, and impairment proof.
+
+The impairment cases also exercise a 1 MiB/s transport limit, deterministic loss/retry, and
+interruption/resume. All impairment traffic remains above the transport interface; the benchmark
+does not call `Transport.send` directly.
 
 Focused command:
 
-    client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.4 --output /tmp/srui-31.4.json
+    client-macos/Benchmarks/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.4 --output /tmp/srui-31.4.json
 
 Metrics are `interaction.{kind}.rtt.{0,100,300,600}`, `server_feedback.rtt.*`,
 `local_rtt_delta`, `display.frame_budget`, `session_wire.{bytes,messages}`, and the
-`impairment.*` family. In full mode, `local_latency_independent` requires the local p50 delta
-to stay within the measured display-frame budget; smoke publishes the same delta only as an
-offscreen-raster diagnostic. The p50, p95, and p99 metrics all carry the §23 next-frame target so
-tail misses appear in follow-up reporting, but the paired p95/p99 cross-RTT deltas are not
-assertion gates. In both profiles, `local_latency_independent` and `no_sync_rtt` require the exact
-causal proof: each local trial starts one production response at the action boundary, verifies
-the configured nonzero one-way delay is active at that boundary, holds delivery through exact
-local visible completion, and releases the gate only afterwards. This demonstrates both genuine
-overlap with the injected transport impairment and non-dependence on its response.
-`server_latency_tracks_rtt` and `impairments_use_session` separately validate the
-remote/control side.
+`impairment.*` family. Interaction p50/p95/p99 values carry the §23 next-frame target so material
+absolute misses are reported. Paired p95/p99 cross-RTT deltas remain diagnostic; the correctness
+gate uses the paired p50 delta and the exact causal held-response proof.

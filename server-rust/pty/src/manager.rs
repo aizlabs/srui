@@ -208,17 +208,6 @@ impl PTYManager {
             .map(|stream| stream.snapshot_offsets())
     }
 
-    /// Waits until the terminal reader reaches EOF and the child has been reaped.
-    ///
-    /// Compiled only for the opt-in benchmark observer or this crate's tests. Default production
-    /// builds expose no process-exit observer. A concurrent [`Self::close`] or [`Self::shutdown`]
-    /// reports the child status after teardown completes.
-    #[cfg(any(test, feature = "benchmark-observability"))]
-    #[doc(hidden)]
-    pub async fn benchmark_wait_for_exit(&self, id: NodeId) -> Result<bool, PTYManagerError> {
-        Ok(self.stream(id)?.wait_for_exit().await)
-    }
-
     #[cfg(test)]
     pub(crate) fn process_id(&self, id: NodeId) -> Option<u32> {
         self.lock()
@@ -313,6 +302,14 @@ impl TerminalSubscription {
     }
 
     /// Waits until the ring advances past `cursor`, then drains.
+    ///
+    /// An **empty vector means the subscription producer has stopped and all retained bytes have
+    /// been drained**, not a spurious wake. The reader thread owns the only sender, so channel
+    /// closure is sticky after that thread exits -- whether because the PTY returned EOF, a
+    /// terminal read failed, or output could not be appended to the ring. `recv` does not
+    /// distinguish those causes. Callers must treat an empty result as terminal and stop polling:
+    /// every later call also returns empty immediately. A non-empty result always carries at
+    /// least one event.
     pub async fn recv(&mut self) -> Vec<TerminalEvent> {
         loop {
             let drained = self.try_drain();
@@ -615,7 +612,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn natural_exit_reaps_the_child() {
+    async fn recv_drains_then_reports_end_of_stream_after_natural_eof() {
+        let manager = PTYManager::default();
+        let id = NodeId::new(24);
+        manager
+            .spawn(id, echo_spec("printf 'SRUI_EOF_OK'; exit 0", 4_096))
+            .unwrap();
+        let SubscribeOutcome {
+            mut subscription, ..
+        } = manager.subscribe(id, 0).unwrap();
+
+        let mut received = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = subscription.recv().await;
+                if events.is_empty() {
+                    // Channel closure, not a spurious wake: the reader has exited.
+                    return true;
+                }
+                for event in events {
+                    if let TerminalEvent::Data(data) = event {
+                        received.extend_from_slice(&data.data);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("recv must report end of stream after natural EOF");
+
+        assert!(ended);
+        assert!(
+            received
+                .windows(b"SRUI_EOF_OK".len())
+                .any(|window| window == b"SRUI_EOF_OK"),
+            "end of stream arrived before the retained bytes: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        // Terminal, and stays terminal: a caller that ignored the empty result would spin here.
+        assert!(subscription.recv().await.is_empty());
+        manager.shutdown();
+    }
+
+    #[test]
+    fn natural_exit_reaps_the_child() {
         let manager = PTYManager::default();
         let id = NodeId::new(22);
         manager
@@ -624,30 +663,19 @@ mod tests {
         let pid = manager
             .process_id(id)
             .expect("spawned child must expose a pid");
-        let exit_success =
-            tokio::time::timeout(Duration::from_secs(2), manager.benchmark_wait_for_exit(id))
-                .await
-                .expect("natural child exit timed out")
-                .unwrap();
-        let bytes = retained_bytes(&manager, id);
-        assert!(
-            bytes
-                .windows(b"SRUI_EXIT_OK".len())
-                .any(|window| window == b"SRUI_EXIT_OK"),
-            "sentinel missing after natural EOF from {:?}",
-            String::from_utf8_lossy(&bytes)
-        );
-        assert!(
-            is_child_reaped(pid),
-            "child {pid} was not reaped by natural exit"
-        );
-        assert!(
-            exit_success,
-            "natural zero exit must remain observable after reap"
-        );
+        wait_for_output(&manager, id, b"SRUI_EXIT_OK");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut reaped = false;
+        while std::time::Instant::now() < deadline {
+            if is_child_reaped(pid) {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         manager.close(id).unwrap();
+        assert!(reaped, "child {pid} was not reaped by natural exit");
     }
-
     fn is_child_reaped(pid: u32) -> bool {
         #[cfg(unix)]
         {

@@ -12,773 +12,10 @@ import Terminal
 import TransportSSH
 import WebKit
 
-struct LocalTextEditCallback {
-    let nodeID: NodeId
-    let text: String
-    let editSeq: EditSeq
-    let observedRevision: UInt64
-}
-struct LocalInteractionResult {
-    let samples: [String: [Double]]
-    let stateChecksPassed: Bool
-    let stateCheckFailures: [String]
-    let everyInjectedResponseUnfinishedThroughVisibleCompletion: Bool
-    let everyConfiguredDelayStateVerifiedAtActionStart: Bool
-    let nonzeroDelayActiveAtActionStartProbeCount: Int
-    let heldResponseProbeCount: Int
-    let productionCallbacks: Int
-    let textEditCallbacks: [LocalTextEditCallback]
-    let finalText: String
-    let hoverMode: String
-    let menuMode: String
-}
-
-struct BandwidthLimiterProofSample {
-    let framedBytes: Int
-    let outboundMessages: Int
-    let measuredMilliseconds: Double
-    let theoreticalMinimumMilliseconds: Double
-    let exactEventMatched: Bool
-
-    var passed: Bool {
-        framedBytes > 0
-            && outboundMessages == 1
-            && measuredMilliseconds.isFinite
-            && theoreticalMinimumMilliseconds.isFinite
-            && theoreticalMinimumMilliseconds > 0
-            && measuredMilliseconds >= theoreticalMinimumMilliseconds
-            && exactEventMatched
-    }
-
-    var detail: String {
-        "\(framedBytes) framed bytes / \(outboundMessages) message: "
-            + "measured \(String(format: "%.4f", measuredMilliseconds)) ms >= "
-            + "theoretical \(String(format: "%.4f", theoreticalMinimumMilliseconds)) ms; "
-            + "exact_event=\(exactEventMatched)"
-    }
-}
-actor TransportFailureObservation {
-    private var failures = [SessionFailure]()
-
-    func record(_ failure: SessionFailure) {
-        failures.append(failure)
-    }
-
-    func snapshot() -> (count: Int, transportEnded: Bool) {
-        (
-            failures.count,
-            failures.contains {
-                if case .transportEnded = $0 { return true }
-                return false
-            }
-        )
-    }
-}
-
-@MainActor
-func rendererTextView(_ renderer: AppKitRenderer) -> NSTextView? {
-    guard let handle = renderer.registry.handle(for: NodeId(14)) else { return nil }
-    if let view = handle.view as? NSTextView { return view }
-    return (handle.view as? NSScrollView)?.documentView as? NSTextView
-}
-
-struct HeldInjectedResponseProof {
-    let responseUnfinishedThroughVisibleCompletion: Bool
-    let configuredDelayStateVerifiedAtActionStart: Bool
-    let nonzeroDelayActiveAtActionStart: Bool
-}
-
-@MainActor
-func withHeldInjectedResponse(
-    rttMilliseconds: Int,
-    controller: SessionController,
-    transport: BenchmarkTransport,
-    body: @MainActor (
-        _ startInjection:
-            @escaping @MainActor () async throws -> Void
-    ) async throws -> Void
-) async throws -> HeldInjectedResponseProof {
-    let baseRevision = controller.applier.lastAppliedRevision
-    let nextRevision = Revision(baseRevision.value + 1)
-    let progress = Double(nextRevision.value % 100) / 100.0
-    let response = Transaction(
-        baseRevision: baseRevision,
-        operations: [
-            .setProperty(
-                id: NodeId(5),
-                property: .value,
-                value: .float64(progress)
-            )
-        ]
-    )
-    let responseFrame = try framed(transactionMessage(response))
-    let deliveryGate = BenchmarkDeliveryGate()
-    var receiveTask: Task<Void, Error>?
-    var configuredDelayStateVerifiedAtActionStart = false
-    var nonzeroDelayActiveAtActionStart = false
-
-    let startInjection: @MainActor () async throws -> Void = {
-        guard receiveTask == nil else {
-            throw BenchmarkFailure.message(
-                "held response injection started more than once"
-            )
-        }
-        benchmarkTrace(
-            "31.4 rtt=\(rttMilliseconds) held receive start at action boundary"
-        )
-        let task = Task {
-            try await transport.injectFromServer(
-                responseFrame,
-                deliveryGate: deliveryGate
-            )
-        }
-        receiveTask = task
-        try await waitUntil {
-            await deliveryGate.snapshot().started
-        }
-        let delaySnapshot = await transport.snapshot()
-        if rttMilliseconds == 0 {
-            configuredDelayStateVerifiedAtActionStart =
-                delaySnapshot.activeDelayedOperations == 0
-        } else {
-            nonzeroDelayActiveAtActionStart =
-                delaySnapshot.activeDelayedOperations > 0
-            configuredDelayStateVerifiedAtActionStart =
-                nonzeroDelayActiveAtActionStart
-        }
-    }
-
-    do {
-        try await body(startInjection)
-        guard let receiveTask else {
-            throw BenchmarkFailure.message(
-                "held response injection never reached the action boundary"
-            )
-        }
-        benchmarkTrace("31.4 rtt=\(rttMilliseconds) held body end")
-        let visibleSnapshot = await deliveryGate.snapshot()
-        await deliveryGate.release()
-        try await receiveTask.value
-        try await waitForRevision(nextRevision, controller: controller)
-        benchmarkTrace("31.4 rtt=\(rttMilliseconds) held receive end")
-        return HeldInjectedResponseProof(
-            responseUnfinishedThroughVisibleCompletion:
-                visibleSnapshot.started
-                    && visibleSnapshot.finished == false,
-            configuredDelayStateVerifiedAtActionStart:
-                configuredDelayStateVerifiedAtActionStart,
-            nonzeroDelayActiveAtActionStart:
-                nonzeroDelayActiveAtActionStart
-        )
-    } catch {
-        receiveTask?.cancel()
-        await deliveryGate.release()
-        if let receiveTask {
-            _ = try? await receiveTask.value
-        }
-        throw error
-    }
-}
-
-@MainActor
-func benchmarkMouseEvent(
-    _ type: NSEvent.EventType,
-    window: NSWindow,
-    location: NSPoint,
-    eventNumber: Int
-) throws -> NSEvent {
-    guard let event = NSEvent.mouseEvent(
-        with: type,
-        location: location,
-        modifierFlags: [],
-        timestamp: ProcessInfo.processInfo.systemUptime,
-        windowNumber: window.windowNumber,
-        context: nil,
-        eventNumber: eventNumber,
-        clickCount: 1,
-        pressure: type == .leftMouseDown ? 1 : 0
-    ) else {
-        throw BenchmarkFailure.message("could not construct AppKit mouse event")
-    }
-    return event
-}
-
-@MainActor
-func benchmarkTrackingEvent(
-    _ type: NSEvent.EventType,
-    window: NSWindow,
-    location: NSPoint,
-    eventNumber: Int
-) throws -> NSEvent {
-    guard let event = NSEvent.enterExitEvent(
-        with: type,
-        location: location,
-        modifierFlags: [],
-        timestamp: ProcessInfo.processInfo.systemUptime,
-        windowNumber: window.windowNumber,
-        context: nil,
-        eventNumber: eventNumber,
-        trackingNumber: 1,
-        userData: nil
-    ) else {
-        throw BenchmarkFailure.message("could not construct AppKit tracking event")
-    }
-    return event
-}
-@MainActor
-final class SmokeMenuTrackingProbe: NSObject, NSMenuDelegate {
-    private(set) var openCount = 0
-    private(set) var presentationCount = 0
-    private(set) var observedAt: ContinuousClock.Instant?
-    private weak var host: NSView?
-
-    func prepare(host: NSView) {
-        self.host = host
-        observedAt = nil
-    }
-
-    func menuWillOpen(_ menu: NSMenu) {
-        openCount += 1
-    }
-
-    @objc func observePresentationAndCancel(_ menu: NSMenu) {
-        if let host, rasterize(host) {
-            presentationCount += 1
-            observedAt = clock.now
-        }
-        menu.cancelTrackingWithoutAnimation()
-    }
-}
-@MainActor
-func localInteractionSamples(
-    renderer: AppKitRenderer,
-    controller: SessionController,
-    transport: BenchmarkTransport,
-    sessionID: String,
-    rttMilliseconds: Int,
-    iterations: Int,
-    fullPaint: Bool
-) async throws -> LocalInteractionResult {
-    let textHandle = renderer.registry.handle(for: NodeId(14))
-    let textView = rendererTextView(renderer)
-    let textScroll = (textHandle?.view as? NSScrollView) ?? textView?.enclosingScrollView
-    let button = renderer.registry.view(for: NodeId(16)) as? NSButton
-    let menuControl = renderer.registry.view(for: NodeId(21)) as? NSPopUpButton
-    let semanticMenu = menuControl?.menu
-    let surface = renderer.registry.handle(for: NodeId(1))
-    let window = surface?.window
-    let host = window?.contentView
-    let productionHandler = renderer.onInteraction
-    guard let textView,
-          let textScroll,
-          let button,
-          let menuControl,
-          let semanticMenu,
-          semanticMenu.items.isEmpty == false,
-          let window,
-          let host,
-          let productionHandler else {
-        throw BenchmarkFailure.message(
-            "representative native interaction controls did not mount: "
-                + "text_handle=\(textHandle != nil), text_view=\(textView != nil), "
-                + "text_scroll=\(textScroll != nil), button=\(button != nil), "
-                + "semantic_menu=\(semanticMenu?.items.isEmpty == false), "
-                + "surface=\(surface != nil), window=\(window != nil), "
-                + "host=\(host != nil), production_handler=\(productionHandler != nil)"
-        )
-    }
-    if fullPaint {
-        window.makeKeyAndOrderFront(nil)
-        guard window.makeFirstResponder(textView),
-              window.firstResponder === textView,
-              textView.inputContext != nil else {
-            throw BenchmarkFailure.message(
-                "full local text interaction benchmark requires the production "
-                    + "NSTextView as first responder with an input context"
-            )
-        }
-    }
-    host.layoutSubtreeIfNeeded()
-    textView.frame.size.height = max(textView.frame.height, 5_000)
-
-    var callbackCount = 0
-    var textEditCallbacks = [LocalTextEditCallback]()
-    renderer.onInteraction = { interaction in
-        callbackCount += 1
-        if case .textEdit(let nodeID, let text, let editSeq, _) = interaction {
-            textEditCallbacks.append(
-                LocalTextEditCallback(
-                    nodeID: nodeID,
-                    text: text,
-                    editSeq: editSeq,
-                    observedRevision: controller.applier.lastAppliedRevision.value
-                )
-            )
-        }
-        productionHandler(interaction)
-    }
-    defer {
-        renderer.onInteraction = productionHandler
-        semanticMenu.delegate = nil
-    }
-
-    var samples = [String: [Double]]()
-    var checks = true
-    var stateCheckFailures = [String]()
-    var everyInjectedResponseUnfinishedThroughVisibleCompletion = true
-    var everyConfiguredDelayStateVerifiedAtActionStart = true
-    var nonzeroDelayActiveAtActionStartProbeCount = 0
-    var heldResponseProbeCount = 0
-    var menuOpened = 0
-    var hoverCompletedCompositedCycles = 0
-    var hoverActionMaterialPixelCounts = [Int]()
-    var hoverRestorationMaximumChannelDeltas = [Int]()
-
-    func record(
-        _ id: String,
-        targetView: NSView,
-        requiresExactCompositedRestoration: Bool = false,
-        action: @escaping () throws -> Bool,
-        cleanup: @escaping () -> Bool = { true }
-    ) async throws {
-        benchmarkTrace("31.4 rtt=\(rttMilliseconds) \(id) start")
-        var sample = 0.0
-        var samplePassed = false
-        var sampleCheckDetail = "action=false pixels=false cleanup=false"
-        var cleanupResult: Bool?
-        let responseProof =
-            try await withHeldInjectedResponse(
-                rttMilliseconds: rttMilliseconds,
-                controller: controller,
-                transport: transport
-            ) { startInjection in
-                do {
-                    let stateCorrect: Bool
-                    let pixels: Bool
-                    let latencyMilliseconds: Double
-                    if fullPaint {
-                        var actionStateCorrect = false
-                        let exactRestorationAction:
-                            (@MainActor () throws -> Bool)?
-                        if requiresExactCompositedRestoration {
-                            exactRestorationAction = {
-                                let result = cleanup()
-                                cleanupResult = result
-                                return result
-                            }
-                        } else {
-                            exactRestorationAction = nil
-                        }
-                        let measured =
-                            try await benchmarkMeasurePassiveCompositedChange(
-                                window,
-                                targetView: targetView,
-                                onActionStarting: startInjection,
-                                restorationAction: exactRestorationAction
-                            ) {
-                                benchmarkTrace(
-                                    "31.4 rtt=\(rttMilliseconds) \(id) "
-                                        + "action start"
-                                )
-                                actionStateCorrect = try action()
-                                benchmarkTrace(
-                                    "31.4 rtt=\(rttMilliseconds) \(id) "
-                                        + "action end"
-                                )
-                            }
-                        stateCorrect = actionStateCorrect
-                        pixels = measured.observation.crossedDisplayRefresh
-                            && measured.observation.captureAuthorization
-                            && measured.observation.pixelCaptureVerified
-                        latencyMilliseconds =
-                            measured.presentationLatencyMilliseconds
-                        if requiresExactCompositedRestoration {
-                            guard let actionDelta =
-                                    measured.contentDeltaEvidence,
-                                  let restorationDelta =
-                                    measured.restorationDeltaEvidence else {
-                                throw BenchmarkFailure.message(
-                                    "composited restoration measurement omitted "
-                                        + "its action or restoration delta evidence"
-                                )
-                            }
-                            hoverActionMaterialPixelCounts.append(
-                                actionDelta.materiallyDifferentPixelCount
-                            )
-                            hoverRestorationMaximumChannelDeltas.append(
-                                restorationDelta.maximumChannelDelta
-                            )
-                        }
-                    } else {
-                        try await startInjection()
-                        let start = clock.now
-                        benchmarkTrace(
-                            "31.4 rtt=\(rttMilliseconds) \(id) action start"
-                        )
-                        stateCorrect = try action()
-                        benchmarkTrace(
-                            "31.4 rtt=\(rttMilliseconds) \(id) action end"
-                        )
-                        pixels = rasterize(host)
-                        latencyMilliseconds = milliseconds(
-                            start.duration(to: clock.now)
-                        )
-                    }
-                    benchmarkTrace(
-                        "31.4 rtt=\(rttMilliseconds) \(id) paint end"
-                    )
-                    let cleanupCorrect: Bool
-                    if let cleanupResult {
-                        cleanupCorrect = cleanupResult
-                    } else {
-                        let result = cleanup()
-                        cleanupResult = result
-                        cleanupCorrect = result
-                    }
-                    sample = latencyMilliseconds
-                    samplePassed =
-                        stateCorrect && pixels && cleanupCorrect
-                    sampleCheckDetail =
-                        "action=\(stateCorrect) pixels=\(pixels) "
-                            + "cleanup=\(cleanupCorrect)"
-                } catch {
-                    if cleanupResult == nil {
-                        _ = cleanup()
-                    }
-                    throw error
-                }
-            }
-        samples[id, default: []].append(sample)
-        if samplePassed == false {
-            stateCheckFailures.append("\(id): \(sampleCheckDetail)")
-        }
-        checks = checks && samplePassed
-        everyInjectedResponseUnfinishedThroughVisibleCompletion =
-            everyInjectedResponseUnfinishedThroughVisibleCompletion
-                && responseProof.responseUnfinishedThroughVisibleCompletion
-        everyConfiguredDelayStateVerifiedAtActionStart =
-            everyConfiguredDelayStateVerifiedAtActionStart
-                && responseProof.configuredDelayStateVerifiedAtActionStart
-        if responseProof.nonzeroDelayActiveAtActionStart {
-            nonzeroDelayActiveAtActionStartProbeCount += 1
-        }
-        heldResponseProbeCount += 1
-        benchmarkTrace("31.4 rtt=\(rttMilliseconds) \(id) end")
-    }
-
-    for _ in 0..<iterations {
-        try await record(
-            "text_entry",
-            targetView: textScroll.contentView
-        ) {
-            let before = (textView.string as NSString).length
-            textView.insertText(
-                "x",
-                replacementRange: NSRange(location: before, length: 0)
-            )
-            return (textView.string as NSString).length == before + 1
-        }
-    }
-    for index in 0..<iterations {
-        let textLength = (textView.string as NSString).length
-        guard textLength > 0 else {
-            throw BenchmarkFailure.message(
-                "caret benchmark requires nonempty production editor text"
-            )
-        }
-        let baselineLocation = index % textLength
-        let location = (baselineLocation + 1) % (textLength + 1)
-        textView.setSelectedRange(
-            NSRange(location: baselineLocation, length: 1)
-        )
-        try await record(
-            "caret_movement",
-            targetView: textScroll.contentView
-        ) {
-            textView.setSelectedRange(
-                NSRange(location: location, length: 0)
-            )
-            return textView.selectedRange().location == location
-                && textView.selectedRange().length == 0
-        }
-    }
-    for index in 0..<iterations {
-        try await record(
-            "text_selection",
-            targetView: textScroll.contentView
-        ) {
-            let length = min(2, (textView.string as NSString).length)
-            let availableStarts = max(
-                1,
-                min(4, (textView.string as NSString).length - length + 1)
-            )
-            let location = (index + 1) % availableStarts
-            textView.setSelectedRange(
-                NSRange(location: location, length: length)
-            )
-            return textView.selectedRange()
-                == NSRange(location: location, length: length)
-        }
-    }
-    for _ in 0..<iterations {
-        try await record(
-            "ime_composition",
-            targetView: textScroll.contentView,
-            action: {
-                textView.setMarkedText(
-                    "é",
-                    selectedRange: NSRange(location: 1, length: 0),
-                    replacementRange: NSRange(location: NSNotFound, length: 0)
-                )
-                return textView.hasMarkedText()
-            },
-            cleanup: {
-                textView.unmarkText()
-                return textView.hasMarkedText() == false
-            }
-        )
-    }
-    for index in 0..<iterations {
-        try await record(
-            "scrolling",
-            targetView: textScroll.contentView
-        ) {
-            // Alternate between two offsets that both retain rendered
-            // editor content. Marching monotonically into the deliberately
-            // enlarged blank tail can change scroll state without changing
-            // any captured pixels, which is not decode-to-visible evidence.
-            let target = NSPoint(
-                x: 0,
-                y: index.isMultiple(of: 2) ? 23 : 0
-            )
-            textScroll.contentView.scroll(to: target)
-            textScroll.reflectScrolledClipView(textScroll.contentView)
-            return abs(textScroll.contentView.bounds.origin.y - target.y) < 1
-        }
-    }
-    for index in 0..<iterations {
-        let center = button.convert(
-            NSPoint(x: button.bounds.midX, y: button.bounds.midY),
-            to: nil
-        )
-        let hover = try benchmarkTrackingEvent(
-            .mouseEntered,
-            window: window,
-            location: center,
-            eventNumber: index * 4
-        )
-        let exit = try benchmarkTrackingEvent(
-            .mouseExited,
-            window: window,
-            location: center,
-            eventNumber: index * 4 + 1
-        )
-        let down = try benchmarkMouseEvent(
-            .leftMouseDown,
-            window: window,
-            location: center,
-            eventNumber: index * 4 + 2
-        )
-        let up = try benchmarkMouseEvent(
-            .leftMouseUp,
-            window: window,
-            location: center,
-            eventNumber: index * 4 + 3
-        )
-        try await record(
-            "hover",
-            targetView: button,
-            requiresExactCompositedRestoration: true,
-            action: {
-                button.mouseEntered(with: hover)
-                // The full path proves the renderer-produced button changed
-                // in the exact composited ROI. NSView.needsDisplay is not a
-                // reliable post-dispatch state signal for layer-backed views.
-                return true
-            },
-            cleanup: {
-                button.mouseExited(with: exit)
-                return true
-            }
-        )
-        hoverCompletedCompositedCycles += 1
-
-        let callbacksBefore = callbackCount
-        try await record(
-            "pressed",
-            targetView: button,
-            action: {
-                window.sendEvent(down)
-                return button.isHighlighted
-            },
-            cleanup: {
-                window.sendEvent(up)
-                return button.isHighlighted == false
-                    && callbackCount == callbacksBefore + 1
-            }
-        )
-    }
-    for index in 0..<iterations {
-        let menu = semanticMenu
-        let menuProbe = SmokeMenuTrackingProbe()
-
-        benchmarkTrace(
-            "31.4 rtt=\(rttMilliseconds) menu_opening start"
-        )
-        var sample = 0.0
-        var samplePassed = false
-        let responseProof =
-            try await withHeldInjectedResponse(
-                rttMilliseconds: rttMilliseconds,
-                controller: controller,
-                transport: transport
-            ) { startInjection in
-                if fullPaint {
-                    let measured =
-                        try await benchmarkMeasureOwnedMenuPresentation(
-                            menu,
-                            positioningItem: menu.items.first,
-                            at: NSPoint(
-                                x: menuControl.bounds.minX,
-                                y: menuControl.bounds.maxY
-                            ),
-                            in: menuControl,
-                            onActionStarting: startInjection
-                        )
-                    menuOpened += 1
-                    sample = measured.presentationLatencyMilliseconds
-                    samplePassed = menuOpened == index + 1
-                        && measured.menuWindowID != 0
-                        && measured.observation.crossedDisplayRefresh
-                        && measured.observation.captureAuthorization
-                        && measured.observation.pixelCaptureVerified
-                } else {
-                    menu.delegate = menuProbe
-                    try await startInjection()
-                    let start = clock.now
-                    let opensBefore = menuProbe.openCount
-                    let presentationsBefore = menuProbe.presentationCount
-                    menuProbe.prepare(host: host)
-                    let observeSelector = #selector(
-                        SmokeMenuTrackingProbe
-                            .observePresentationAndCancel(_:)
-                    )
-                    RunLoop.main.perform(
-                        observeSelector,
-                        target: menuProbe,
-                        argument: menu,
-                        order: 0,
-                        modes: [.eventTracking]
-                    )
-                    _ = menu.popUp(
-                        positioning: menu.items.first,
-                        at: NSPoint(
-                            x: menuControl.bounds.minX,
-                            y: menuControl.bounds.maxY
-                        ),
-                        in: menuControl
-                    )
-                    menuOpened += 1
-                    if let observedAt = menuProbe.observedAt {
-                        sample = milliseconds(
-                            start.duration(to: observedAt)
-                        )
-                    }
-                    samplePassed = menuOpened == index + 1
-                        && menuProbe.openCount == opensBefore + 1
-                        && menuProbe.presentationCount
-                            == presentationsBefore + 1
-                        && menuProbe.observedAt != nil
-                }
-            }
-        samples["menu_opening", default: []].append(sample)
-        if samplePassed == false {
-            stateCheckFailures.append("menu_opening: presentation=false")
-        }
-        checks = checks && samplePassed
-        everyInjectedResponseUnfinishedThroughVisibleCompletion =
-            everyInjectedResponseUnfinishedThroughVisibleCompletion
-                && responseProof.responseUnfinishedThroughVisibleCompletion
-        everyConfiguredDelayStateVerifiedAtActionStart =
-            everyConfiguredDelayStateVerifiedAtActionStart
-                && responseProof.configuredDelayStateVerifiedAtActionStart
-        if responseProof.nonzeroDelayActiveAtActionStart {
-            nonzeroDelayActiveAtActionStartProbeCount += 1
-        }
-        heldResponseProbeCount += 1
-        menu.delegate = nil
-        benchmarkTrace(
-            "31.4 rtt=\(rttMilliseconds) menu_opening end"
-        )
-    }
-
-    // Flush outside every timed local-paint interval so the benchmark can separately prove that
-    // native editor state crossed the production semantic-event and framed-transport boundary.
-    renderer.textEditingSession.flushAllPending()
-    try await waitUntil(timeout: .seconds(10)) {
-        await transport.snapshot().activeDelayedOperations == 0
-    }
-    let hoverMinimumMaterialPixelCount =
-        hoverActionMaterialPixelCounts.min() ?? 0
-    let hoverMaximumRestorationChannelDelta =
-        hoverRestorationMaximumChannelDeltas.max() ?? 0
-    return LocalInteractionResult(
-        samples: samples,
-        stateChecksPassed: checks,
-        stateCheckFailures: stateCheckFailures,
-        everyInjectedResponseUnfinishedThroughVisibleCompletion:
-            everyInjectedResponseUnfinishedThroughVisibleCompletion,
-        everyConfiguredDelayStateVerifiedAtActionStart:
-            everyConfiguredDelayStateVerifiedAtActionStart,
-        nonzeroDelayActiveAtActionStartProbeCount:
-            nonzeroDelayActiveAtActionStartProbeCount,
-        heldResponseProbeCount: heldResponseProbeCount,
-        productionCallbacks: callbackCount,
-        textEditCallbacks: textEditCallbacks,
-        finalText: textView.string,
-        hoverMode: fullPaint
-            ? "renderer-produced NSButton changed at least "
-                + "\(hoverMinimumMaterialPixelCount) target-ROI pixels above "
-                + "the explicit 2/255 per-channel SCStream tolerance on the "
-                + "local AppKit hover path in "
-                + "\(hoverCompletedCompositedCycles)/\(iterations) samples; "
-                + "mouseExited then restored every unmasked screenshot pixel "
-                + "within the explicit 5/255 same-API tolerance, with maximum "
-                + "observed channel delta "
-                + "\(hoverMaximumRestorationChannelDelta)/255"
-            : "renderer-produced NSButton completed the smoke offscreen hover "
-                + "path in \(hoverCompletedCompositedCycles)/\(iterations) samples",
-        menuMode: fullPaint
-            ? "renderer-produced NSButton context menu was proven as a new "
-                + "exact owned menu-level WindowServer surface in the same "
-                + "ScreenCaptureKit frame used for its presentation timestamp"
-            : "renderer-produced NSButton context NSMenu opened and was "
-                + "deterministically cancelled through AppKit event tracking "
-                + "in smoke mode"
-    )
-}
-func acknowledgementForCapturedEvent(
-    _ event: CapturedEvent,
-    outbox: EventOutbox,
-    sessionID: String,
-    revision: Revision
-) -> SRUIMessage {
-    var acknowledgement = SRUIServerEventAck()
-    acknowledgement.sessionID = sessionID
-    acknowledgement.clientInstanceID = outbox.clientInstanceId.bytes
-    acknowledgement.eventID = event.id
-    acknowledgement.lastProcessedEventSeq = event.sequence
-    acknowledgement.settledEventSeq = event.sequence
-    acknowledgement.status = .processed
-    acknowledgement.revisionAfterEffect = revision.value
-    var message = SRUIMessage()
-    message.serverEventAck = acknowledgement
-    return message
-}
-
 @MainActor
 func networkAndLocalInteraction(
     fixtureOperations: [SemanticModel.Operation],
+    fixtureIndex: BenchmarkFixtureIndex,
     iterations: Int,
     fullPaint: Bool
 ) async throws -> Section {
@@ -808,7 +45,7 @@ func networkAndLocalInteraction(
     var menuModes = Set<String>()
     var measuredWireBytes = 0
     var measuredWireMessages = 0
-    for rtt in [0, 100, 300, 600] {
+    for rtt in NetworkBenchmarkConfiguration.roundTripTimesMilliseconds {
         benchmarkTrace("31.4 rtt=\(rtt) begin")
         let transport = BenchmarkTransport(rttMilliseconds: rtt)
         let renderer = AppKitRenderer()
@@ -817,11 +54,13 @@ func networkAndLocalInteraction(
             transport: transport,
             renderer: renderer,
             fixtureOperations: fixtureOperations,
+            fixtureIndex: fixtureIndex,
             sessionID: sessionID
         )
 
         let local = try await localInteractionSamples(
             renderer: renderer,
+            fixtureIndex: fixtureIndex,
             controller: controller,
             transport: transport,
             sessionID: sessionID,
@@ -852,12 +91,15 @@ func networkAndLocalInteraction(
 
         renderer.textEditingSession.flushAllPending()
         let expectedTextCallback = local.textEditCallbacks
-            .filter { $0.nodeID == NodeId(14) && $0.text == local.finalText }
+            .filter {
+                $0.nodeID == fixtureIndex.textEditor
+                    && $0.text == local.finalText
+            }
             .max { $0.editSeq < $1.editSeq }
         func isExactFinalTextEvent(_ captured: CapturedEvent) -> Bool {
             guard let expectedTextCallback else { return false }
             return captured.eventType == .EVENT_TEXT_EDIT
-                && captured.nodeID == NodeId(14)
+                && captured.nodeID == fixtureIndex.textEditor
                 && captured.arguments[.TEXT] == .string(local.finalText)
                 && captured.editSeq == expectedTextCallback.editSeq
                 && (captured.editSeq?.rawValue ?? 0) > 0
@@ -918,7 +160,8 @@ func networkAndLocalInteraction(
             && stableEmptyPasses >= 5
         allProductionTextEditsExact = allProductionTextEditsExact && textEditExact
         textEditProofDetails.append(
-            "RTT \(rtt)ms: node=14 final_text=\(String(reflecting: local.finalText)) "
+            "RTT \(rtt)ms: node=\(fixtureIndex.textEditor.value) "
+                + "final_text=\(String(reflecting: local.finalText)) "
                 + "edit_seq=\(expectedTextCallback?.editSeq.rawValue ?? 0) "
                 + "observed_revision=\(expectedTextCallback?.observedRevision ?? 0) "
                 + "matching_framed_events=\(exactTextEvents.count) "
@@ -975,6 +218,7 @@ func networkAndLocalInteraction(
             transport: feedbackTransport,
             renderer: feedbackRenderer,
             fixtureOperations: fixtureOperations,
+            fixtureIndex: fixtureIndex,
             sessionID: feedbackSessionID
         )
         let feedbackWarmVisible: Bool
@@ -1007,7 +251,7 @@ func networkAndLocalInteraction(
                 @MainActor () async throws -> SemanticModel.Event = {
                     let event =
                         try await feedbackController.sendValueChanged(
-                            nodeId: NodeId(5),
+                            nodeId: fixtureIndex.progress,
                             value: .float64(expectedValue)
                         )
                     let eventsAfter =
@@ -1027,7 +271,7 @@ func networkAndLocalInteraction(
                         baseRevision: baseRevision,
                         operations: [
                             .setProperty(
-                                id: NodeId(5),
+                                id: fixtureIndex.progress,
                                 property: .value,
                                 value: .float64(expectedValue)
                             )
@@ -1042,7 +286,7 @@ func networkAndLocalInteraction(
                     )
                     try await waitUntil {
                         guard let progress =
-                            feedbackRenderer.registry.view(for: NodeId(5))
+                            feedbackRenderer.registry.view(for: fixtureIndex.progress)
                                 as? NSProgressIndicator else {
                             return false
                         }
@@ -1065,7 +309,7 @@ func networkAndLocalInteraction(
                 guard windows.count == 1,
                       let window = windows.first,
                       let progress =
-                        feedbackRenderer.registry.view(for: NodeId(5))
+                        feedbackRenderer.registry.view(for: fixtureIndex.progress)
                             as? NSProgressIndicator,
                       progress.window === window else {
                     throw BenchmarkFailure.message(
@@ -1161,6 +405,7 @@ func networkAndLocalInteraction(
         transport: bandwidthTransport,
         renderer: bandwidthRenderer,
         fixtureOperations: fixtureOperations,
+        fixtureIndex: fixtureIndex,
         sessionID: "bandwidth"
     )
     let bandwidthBefore = await bandwidthTransport.snapshot()
@@ -1172,7 +417,7 @@ func networkAndLocalInteraction(
         let eventsBefore = try await capturedEvents(in: bandwidthTransport)
         let start = clock.now
         let event = try await bandwidthController.sendValueChanged(
-            nodeId: NodeId(16),
+            nodeId: fixtureIndex.primaryAction,
             value: largeValue
         )
         let measuredMilliseconds = milliseconds(start.duration(to: clock.now))
@@ -1234,11 +479,14 @@ func networkAndLocalInteraction(
         transport: lossTransport,
         renderer: lossRenderer,
         fixtureOperations: fixtureOperations,
+        fixtureIndex: fixtureIndex,
         sessionID: "loss",
         outbox: lossOutbox
     )
     let lossBefore = await lossTransport.snapshot()
-    let lostEvent = try await lossController.sendActivate(nodeId: NodeId(16))
+    let lostEvent = try await lossController.sendActivate(
+        nodeId: fixtureIndex.primaryAction
+    )
     let lossAfter = await lossTransport.snapshot()
     let retainedAfterLoss = await lossOutbox.pendingCount == 1
     await lossController.stop()
@@ -1291,6 +539,7 @@ func networkAndLocalInteraction(
         transport: interruptionTransport,
         renderer: interruptionRenderer,
         fixtureOperations: fixtureOperations,
+        fixtureIndex: fixtureIndex,
         sessionID: "interruption",
         outbox: interruptionOutbox
     )
@@ -1303,7 +552,9 @@ func networkAndLocalInteraction(
     let interruptionStart = clock.now
     var interruptionFailed = false
     do {
-        _ = try await interruptionController.sendActivate(nodeId: NodeId(16))
+        _ = try await interruptionController.sendActivate(
+            nodeId: fixtureIndex.primaryAction
+        )
     } catch TransportError.closed {
         interruptionFailed = true
     }
@@ -1410,10 +661,12 @@ func networkAndLocalInteraction(
     metrics.append(metric("maximum RTT-induced local latency delta", worstP95Added, "ms", "p95", target: frameBudget.milliseconds, id: "local_rtt_delta"))
     metrics.append(metric("maximum RTT-induced local latency delta", worstP99Added, "ms", "p99", target: frameBudget.milliseconds, id: "local_rtt_delta"))
 
-    let serverTracksRTT = [100, 300, 600].allSatisfy {
-        guard let samples = dependentByRTT[$0] else { return false }
-        return p50(samples) >= Double($0) * 0.80
-    }
+    let serverTracksRTT =
+        NetworkBenchmarkConfiguration.nonzeroRoundTripTimesMilliseconds
+            .allSatisfy {
+                guard let samples = dependentByRTT[$0] else { return false }
+                return p50(samples) >= Double($0) * 0.80
+            }
     let lossPendingCleared = await lossOutbox.pendingCount == 0
     let interruptionPendingCleared = await interruptionOutbox.pendingCount == 0
     let impairmentsApplied = bandwidthLimiterDelayProven
@@ -1448,8 +701,16 @@ func networkAndLocalInteraction(
     sampleCounts["macos.loss"] = completedLossTrials
     sampleCounts["macos.interruption"] = completedInterruptionTrials
 
-    let expectedHeldResponseProbeCount = iterations * 8 * 4
-    let expectedNonzeroDelayProbeCount = iterations * 8 * 3
+    let interactionKindCount = LocalInteractionKind.allCases.count
+    let expectedHeldResponseProbeCount =
+        iterations
+            * interactionKindCount
+            * NetworkBenchmarkConfiguration.roundTripTimesMilliseconds.count
+    let expectedNonzeroDelayProbeCount =
+        iterations
+            * interactionKindCount
+            * NetworkBenchmarkConfiguration
+                .nonzeroRoundTripTimesMilliseconds.count
     let delayBoundaryProofPassed =
         allConfiguredDelayStatesVerifiedAtActionStart
             && totalNonzeroDelayActiveAtActionStartProbeCount
@@ -1490,7 +751,7 @@ func networkAndLocalInteraction(
     localLatencyDetail +=
         "local_state_checks=\(allLocalStateChecks)"
             + localStateFailureDetail
-                        + "paired p95/p99 deltas were "
+            + "; paired p95/p99 deltas were "
             + "\(String(format: "%.4f", worstP95Added))/"
             + "\(String(format: "%.4f", worstP99Added)) ms; "
             + "production renderer callbacks=\(productionCallbackCount)"
@@ -1554,7 +815,8 @@ func networkAndLocalInteraction(
         ],
         notes: [
             "Controls are mounted renderer TextArea, ScrollView, and Button. \(menuModes.sorted().joined(separator: "; ")).",
-            "Pressed state is observed between real NSWindow-dispatched mouseDown/mouseUp events and triggers the production ActionTrampoline. \(hoverModes.sorted().joined(separator: "; ")). Permission-free hover invokes the renderer-produced NSButton's own AppKit entry/exit path and does not claim WindowServer pointer latency.",
+            "The unbundled full benchmark runs with AppKit accessory activation policy so benchmark-only hosts can join the active Space/application set without pretending that foreground activation succeeded. The mounted NSTextView must still become the window first responder with a live input context, and every timed visual transition still requires exact WindowServer and ScreenCaptureKit evidence.",
+            "Pressed feedback uses performClick on the mounted renderer button, accepts its transient action-time composited frame, and triggers the production ActionTrampoline. \(hoverModes.sorted().joined(separator: "; ")). Hover injects a deterministic pointer context through benchmark SPI into the production HoverFeedbackButton reconciliation path. These two trials measure SRUI local state-to-visible latency and explicitly exclude OS hardware-event routing latency.",
             "Local frame budget \(String(format: "%.6f", frameBudget.milliseconds)) ms came from \(frameBudget.source).",
             "All impairment traffic traverses SessionController, EventOutbox, SRUIFraming, and replacement-session resume/replay; no benchmark calls Transport.send directly.",
             "For each 1 MiB/s sample, the proof takes the exact outbound framed-byte delta around one awaited SessionController.sendValueChanged call, requires exactly one matching event frame, and requires elapsed wall time >= framed bytes / 1,048,576 bytes/s. Encoding and outbox overhead are inside the measured interval and can only increase that elapsed time.",

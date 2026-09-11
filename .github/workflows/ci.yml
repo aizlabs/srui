@@ -161,8 +161,8 @@ jobs:
         run: uv sync --extra dev
       - name: Validate protocol/registry.yaml
         run: uv run python protocol/validate_registry.py
-      - name: Run Python unit tests
-        run: uv run --frozen pytest
+      - name: Run protocol Python unit tests
+        run: uv run --frozen pytest protocol/tests
 
   # The server workspace is built and tested on Linux only. It was previously also built on
   # macOS, but that job ran an identical command set at ~10x the per-minute price, and the one
@@ -177,10 +177,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Build and test server-rust workspace
+      - name: Build and test production server-rust default members
         run: |
-          cargo test --workspace --all-targets
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --all-targets
+          cargo clippy --all-targets -- -D warnings
         working-directory: server-rust
       - name: Build and test examples
         run: |

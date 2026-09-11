@@ -2132,14 +2132,6 @@ peak memory
 
 This answers renderer/representation cost only.
 
-> **Implementation status (non-normative, 2026-09-10):** Task 34 reports signed
-> `malloc_zone_statistics` net-live block/byte endpoint deltas, footprint growth, and peak
-> footprint. Those endpoint deltas do not count allocations created and freed wholly inside the
-> interval and therefore do not complete the cumulative allocation-event evidence intended by
-> “allocations” above. The bounded Darwin allocation-counter follow-up is
-> [issue #48](https://github.com/aizlabs/srui/issues/48); until it lands, reports must preserve the
-> narrower metric names and state this limitation explicitly.
-
 ### 31.2 Serialization benchmark
 
 Start from the same abstract application UI state and separately measure server-side generation/serialization.

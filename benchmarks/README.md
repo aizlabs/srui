@@ -3,6 +3,14 @@
 This suite implements the layer-separated methodology in design §31 and compares the macOS
 renderer measurements with the numeric targets in §23.
 
+`benchmarks/metric-contract.json` is the authoritative metric contract. It owns driver commands,
+metric and assertion IDs, display names, units, statistics, targets and directions, profile
+iterations, sample-count formulas, and percentile semantics. `benchmarks/schema.json` separately
+owns the JSON report shape. Every driver and merged report declares `contract_schema_version` and
+the canonical compact/sorted UTF-8 `contract_sha256`; mixed or stale producers fail validation.
+Run `python3 benchmarks/generate_metric_contract.py --check` to verify the checked-in Swift and
+Rust contract descriptors.
+
 Run a repeatable smoke measurement from the repository root:
 
     scripts/run-benchmarks --profile smoke
@@ -16,7 +24,9 @@ published as one rollback-protected pair. The harness requires 12 GiB of free sp
 during a run by default; set
 `SRUI_BENCHMARK_MIN_FREE_BYTES` to another positive byte count for a constrained benchmark host.
 Correctness failures make the command fail. Performance misses remain successful measurements and
-are called out as follow-up work when they exceed a §23 target by more than 2x. Reports also fail
+are called out as follow-up work when they exceed a §23 target by more than 2x. The complete
+six-section report is macOS-only while §31.1/31.3/31.4 require AppKit. On Linux, the runner rejects
+the platform before starting Rust and writes no misleading partial report. Reports also fail
 closed unless they record the exact chip, physical RAM, Xcode, Swift, Rust, Git commit, and Git
 dirty state. Every driver publishes named sample-count groups, including one-shot boundary probes;
 the runner requires each count to equal the selected smoke/full profile before merging or recording.
@@ -25,9 +35,17 @@ Full mode increases repetitions and requires native/WebKit presentation completi
 ScreenCaptureKit client-content evidence. On macOS, `scripts/run-benchmarks` runs the suite under
 a lifetime-bounded `caffeinate -d -i -u` assertion: it wakes an online display and prevents idle
 display/system sleep while the benchmark owns the process. It does not bypass a locked login
-session or Screen Recording authorization. The responsible Codex or terminal app must already have
-Screen Recording permission; the suite checks authorization and fails without prompting.
-Developer Tools permission is needed only for the optional xctrace diagnostic described below.
+session or Screen Recording authorization. When the public session dictionary reports
+`CGSSessionScreenIsLocked`, the driver fails before opening a measurement window; if that
+diagnostic key is absent, the exact WindowServer/pixel checks still fail closed. The responsible
+Codex or terminal app must already have Screen Recording permission; the suite checks authorization
+and fails without prompting. Developer Tools permission is not required; the rejected xctrace
+prototype is not runnable.
+
+The runner keeps every child bounded. Its default per-driver timeout is 600 seconds for smoke and
+1,800 seconds for full. The full bound accounts for 640 §31.4 local-interaction probes—including
+responses deliberately held at 100/300/600 ms—plus the other five sections; the former 600-second
+full bound could terminate a healthy run. `--timeout SECONDS` remains an explicit override.
 
 Every full-mode benchmark host resolves its WindowServer stratum at runtime with
 `CGWindowLevelForKey(.statusWindow)`. Before ordering the host, the driver resolves
@@ -48,8 +66,18 @@ relocation can still start the retraction of an already activated Dock or menu s
 preparation therefore allows up to 10 seconds to acquire the exact `.optionOnScreenOnly`
 WindowServer identity. A separate 10-second geometry-settling deadline must contain two identical
 observations of that exact identity, window bounds, and client-content ROI spaced 300 ms apart.
-Preparation then allows up to 10 seconds for a genuinely clear z-order before capture. A geometry
-timeout reports the prepared AppKit frame and current WindowServer entry fields.
+Preparation then allows up to 10 seconds for a genuinely clear z-order before capture. Passive
+measurement also brackets its baseline: the exact target must be unobscured immediately before a
+new ScreenCaptureKit stream starts, the accepted complete frame must have a display timestamp after
+that start boundary, and the exact target must still be unobscured immediately afterward. A
+contaminated stream and its frame are discarded together. The remaining portion of one untimed
+10-second stability budget is passed to post-cutoff frame acquisition, and a stream whose startup
+returns after that budget is stopped. ScreenCaptureKit's framework startup call exposes no separate
+safe timeout; a startup that never returns remains covered by the runner's hard per-driver timeout.
+No owner or window level is whitelisted. These WindowServer observations bracket the captured frame;
+they are not described as an atomic z-order snapshot at the frame timestamp. Exact captured pixels
+and the later material-delta gates remain separate evidence. A geometry or baseline timeout reports
+the last exact rejection.
 
 Full §31.1 instead has two nested guards. The top-level parent saves the user's exact Quartz
 location, parks at `display.minX + 160` and the vertical midpoint before spawning either
@@ -62,11 +90,13 @@ WebKit positions its already-created hidden window at that point; the native pat
 positions its hidden window during the timed production attach. This closes physical pointer
 movement during child warm-up or capture startup without moving the cursor inside a reported
 interval. Each park and restore also posts the matching public session-level `mouseMoved` event:
-Quartz warping alone emits no mouse event and can otherwise leave the previously hovered app\'s
-tooltip frozen ahead of the benchmark after that app deactivates. Non-compositor smoke and optional diagnostic allocation passes use
-deterministic hidden geometry without requiring or moving the pointer. The child-side guard is
-authoritative: it closes the parent-to-child build/spawn race and completes before any candidate
-measurement interval starts.
+Quartz warping alone emits no mouse event and can otherwise leave the previously hovered app's
+tooltip frozen ahead of the benchmark after that app deactivates. The explicit-paint helper saves
+its pre-refresh location and restores it only after the accepted frame (or on failure). This matters
+when §31.3 uses that helper for an initial mount: the nested left-side renderer park cannot overwrite
+the passive section's outer right-side park. Non-compositor smoke passes use deterministic hidden
+geometry without requiring or moving the pointer. The child-side guard is authoritative: it closes
+the parent-to-child build/spawn race and completes before any candidate measurement interval starts.
 
 That interior position remains outside the right-corner 960-point renderer ROI. Each hidden native
 or WebKit window chooses the visible-frame corner farthest from the parked pointer with 64 points
@@ -82,7 +112,7 @@ A standalone diagnostic proves both sides with real overlapping opaque windows: 
 window must remain below the status host, while the same exact window at `status + 1` must be
 rejected by WindowServer ID and layer:
 
-    env SRUI_BENCHMARK_PHASES=1 SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST=1 client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --output /tmp/srui-window-isolation-unused.json --profile full
+    env SRUI_BENCHMARK_PHASES=1 SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST=1 client-macos/Benchmarks/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --output /tmp/srui-window-isolation-unused.json --profile full
 
 The diagnostic exits before running benchmark sections, so its temporary windows and activation
 state cannot contaminate reported timing or pixels; the required output argument is intentionally
@@ -90,8 +120,7 @@ unused.
 
 ScreenCaptureKit supplies the exact composited frame, WindowServer identity/geometry, target
 pixels, and display timestamp used for visible latency. Signed in-process allocator endpoint
-samples supply the authoritative allocation metrics. Optional xctrace output is diagnostic only
-and is never treated as proof for either measurement.
+samples supply the authoritative allocation metrics. Xctrace data is excluded from the report and is never treated as proof for either measurement.
 
 Record a reviewed, machine-specific baseline only with:
 
@@ -134,17 +163,12 @@ benchmark-only Darwin allocator-interposition counter, following Apple SwiftNIO'
 pattern, with atomic counters bracketing the separate resource pass. Until that exists, do not cite
 the endpoint deltas as allocation-call counts or as complete cumulative-allocation evidence.
 
-Xctrace is not used by normal smoke/full runs and does not populate or gate the committed report.
-Real Xcode 26 captures disproved the required interval timestamp alignment and exact
-List/Statistics reconciliation, while attaching to warmed WebKit could stall inside JavaScriptCore
-allocator enumeration. A bounded SRUI-host-only diagnostic remains available:
-
-    benchmarks/parse-render/profile-allocations.sh /tmp/srui-allocations.trace
-
-It reports independent whole-trace Statistics, final live-list totals, and their signed
-discrepancy, with exact PID/birth identity and explicit non-authoritative semantics. Developer
-Tools permission and the staged `get-task-allow` entitlement are required only for that optional
-diagnostic. Full visual runs separately require Screen Recording for ScreenCaptureKit.
+Xctrace is not used by smoke/full runs and does not populate or gate the committed report. Real
+Xcode 26 captures disproved the required interval timestamp alignment and exact List/Statistics
+reconciliation, while attaching to warmed WebKit could stall inside JavaScriptCore allocator
+enumeration. The experimental runner, entitlement, exporter, and tests were removed so a future
+agent cannot accidentally cite that diagnostic as §31.1 evidence. Full visual runs require Screen
+Recording for ScreenCaptureKit; no benchmark mode requires Developer Tools permission.
 
 For the complete evidence, failed approaches, exact observed values and stack locations,
 authorization/signing behavior, cleanup and disk safeguards, reproduction guidance, and
@@ -165,23 +189,24 @@ Linux/Windows portability notes, see the
   threshold. WebKit enforces that prior-state comparison while selecting its complete frame, so a
   stale partially populated surface remains ineligible. SHA-256 fingerprints are diagnostics, not
   the distinctness predicate.
-- Full passive mutation/local-interaction/terminal preparation saves and parks the pointer at
+- Full passive mutation/local-interaction/terminal preparation saves and parks the real pointer at
   `display.maxX - 160`, uses deterministic left-side placement, permits bounded untimed
   WindowServer settling, requires stable exact geometry, and waits for a clear z-order before
-  starting ScreenCaptureKit. Exact `.optionOnScreenOnly` identity acquisition, the geometry
-  interval, and clear-z-order acquisition each have a 10-second bound because pointer relocation
-  can initiate Dock/menu retraction. Geometry still requires identical exact identity, bounds, and
-  client-content ROI across 300 ms. The original pointer location is restored on exit. It then
-  obtains a complete-frame baseline for the exact visible target-control ROI and ignores frames
-  through action completion. These untimed bounds do not change the action or latency boundary. A
-  later frame is eligible only when geometry is identical, content remains
-  nonblank/nonuniform, and at least eight unmasked ROI pixels have any RGBA channel change greater
-  than the explicit 2/255 SCStream tolerance. Latency uses action-start Mach ticks through that
-  frame's `SCStreamFrameInfo.displayTime`; callback receipt is verifier metadata. Exact window,
-  client-content, target geometry, display, ownership, and z-order are checked before and after.
-  Hover additionally compares same-API ScreenCaptureKit screenshots taken before the action and
-  after `mouseExited`; restoration requires zero unmasked pixels with any channel delta greater
-  than 5/255, and the report publishes the maximum observed restoration channel delta.
+  starting ScreenCaptureKit. This parking keeps cursor/system UI outside the ROI; §31.4 hover state
+  itself is driven separately through a deterministic benchmark SPI pointer context into the
+  production `HoverFeedbackButton` reconciliation path. Exact `.optionOnScreenOnly` identity
+  acquisition, the geometry interval, and clear-z-order acquisition each have a 10-second bound.
+  Geometry requires identical exact identity, bounds, and client-content ROI across 300 ms. The
+  original real pointer location is restored on exit. A complete-frame baseline is acquired before
+  the action. Persistent interactions accept only frames after action completion; transient hover
+  and pressed feedback may accept frames after action start. In either case, a frame is eligible
+  only when geometry is identical, content remains nonblank/nonuniform, and at least eight unmasked
+  ROI pixels have any RGBA channel change greater than the explicit 2/255 SCStream tolerance.
+  Latency uses action-start Mach ticks through that frame's `SCStreamFrameInfo.displayTime`;
+  callback receipt is verifier metadata. Exact window, client-content, target geometry, display,
+  ownership, and z-order are checked before and after. Hover then drives the production reconciler
+  to an outside context and compares same-API ScreenCaptureKit screenshots; restoration requires
+  zero unmasked pixels with any channel delta greater than 5/255.
 - Full menu timing detects a new current-process popup-level WindowServer surface, verifies its
   exact crop in the same frame, and likewise uses its display timestamp before cancelling menu
   tracking.

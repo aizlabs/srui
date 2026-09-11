@@ -15,12 +15,67 @@ import WebKit
 struct Fixture: Decodable {
     let name: String
     let firstPaintNodeCount: Int
+    let roles: FixtureRoles
     let nodes: [FixtureNode]
 
     enum CodingKeys: String, CodingKey {
-        case name
+        case name, roles, nodes
         case firstPaintNodeCount = "first_paint_node_count"
-        case nodes
+    }
+}
+
+struct FixtureRoles: Decodable {
+    let surface: UInt64
+    let progress: UInt64
+    let fileTree: UInt64
+    let textEditor: UInt64
+    let primaryAction: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case surface, progress
+        case fileTree = "file_tree"
+        case textEditor = "text_editor"
+        case primaryAction = "primary_action"
+    }
+}
+
+struct BenchmarkFixtureIndex: Sendable {
+    let surface: NodeId
+    let progress: NodeId
+    let fileTree: NodeId
+    let textEditor: NodeId
+    let primaryAction: NodeId
+
+    init(fixture: Fixture) throws {
+        let nodesByID = Dictionary(grouping: fixture.nodes, by: \.id)
+        guard nodesByID.values.allSatisfy({ $0.count == 1 }) else {
+            throw BenchmarkFailure.message("benchmark fixture contains duplicate node IDs")
+        }
+        let roleDefinitions: [(String, UInt64, String)] = [
+            ("surface", fixture.roles.surface, "Surface"),
+            ("progress", fixture.roles.progress, "Progress"),
+            ("file_tree", fixture.roles.fileTree, "Tree"),
+            ("text_editor", fixture.roles.textEditor, "TextArea"),
+            ("primary_action", fixture.roles.primaryAction, "Button"),
+        ]
+        for (role, id, expectedType) in roleDefinitions {
+            guard let matches = nodesByID[id],
+                  matches.count == 1,
+                  matches[0].type == expectedType else {
+                throw BenchmarkFailure.message(
+                    "benchmark fixture role \(role) must identify exactly one \(expectedType) node"
+                )
+            }
+        }
+        let roleIDs = roleDefinitions.map(\.1)
+        guard Set(roleIDs).count == roleIDs.count else {
+            throw BenchmarkFailure.message("benchmark fixture roles must identify distinct nodes")
+        }
+        surface = NodeId(fixture.roles.surface)
+        progress = NodeId(fixture.roles.progress)
+        fileTree = NodeId(fixture.roles.fileTree)
+        textEditor = NodeId(fixture.roles.textEditor)
+        primaryAction = NodeId(fixture.roles.primaryAction)
     }
 }
 
@@ -31,6 +86,8 @@ struct FixtureNode: Decodable {
     let properties: [String: FixtureValue]?
 }
 
+/// Cross-language fixture subset. Untagged JSON numbers normalize to binary64; signed and
+/// unsigned semantic integers require a future explicit tagged representation.
 enum FixtureValue: Codable, Equatable {
     case string(String)
     case bool(Bool)
@@ -92,8 +149,23 @@ enum FixtureValue: Codable, Equatable {
 }
 
 struct Output: Encodable {
+    let contractSchemaVersion: Int
+    let contractSHA256: String
     let artifacts: Artifacts
     let sections: [Section]
+
+    init(artifacts: Artifacts, sections: [Section]) {
+        contractSchemaVersion = BenchmarkMetricContract.schemaVersion
+        contractSHA256 = BenchmarkMetricContract.sha256
+        self.artifacts = artifacts
+        self.sections = sections
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case contractSchemaVersion = "contract_schema_version"
+        case contractSHA256 = "contract_sha256"
+        case artifacts, sections
+    }
 }
 
 struct Artifacts: Encodable {
@@ -150,7 +222,6 @@ struct Assertion: Encodable {
         self.detail = detail
     }
 }
-
 struct Arguments {
     let fixture: URL
     let output: URL
@@ -159,16 +230,10 @@ struct Arguments {
     let onlySection: String?
     let driverPID: Int32
     let driverBirthUnixNanoseconds: UInt64?
-    let allocationControlDirectory: URL?
-    let allocationTargetRole: String?
     let supervisedParent: Bool
 
-    var isAllocationCaptureCandidate: Bool {
-        allocationControlDirectory != nil
-    }
-
     var requiresCompositedPresentation: Bool {
-        profile == "full" && !isAllocationCaptureCandidate
+        profile == "full"
     }
 
     init() throws {
@@ -214,9 +279,7 @@ struct Arguments {
                   values.indices.contains(pidIndex + 1),
                   let parsedPID = Int32(values[pidIndex + 1]),
                   parsedPID > 0,
-                  let birthIndex = values.firstIndex(
-                      of: "--driver-birth-unix-ns"
-                  ),
+                  let birthIndex = values.firstIndex(of: "--driver-birth-unix-ns"),
                   values.indices.contains(birthIndex + 1),
                   let parsedBirth = UInt64(values[birthIndex + 1]),
                   parsedBirth > 0 else {
@@ -226,317 +289,12 @@ struct Arguments {
             driverBirthUnixNanoseconds = parsedBirth
         } else {
             guard supervisedParent == false else {
-                throw BenchmarkFailure.message(
-                    "--supervised-parent requires --candidate"
-                )
+                throw BenchmarkFailure.message("--supervised-parent requires --candidate")
             }
             driverPID = getpid()
             driverBirthUnixNanoseconds = nil
         }
-        let controlIndex = values.firstIndex(of: "--allocation-control-dir")
-        let roleIndex = values.firstIndex(of: "--allocation-target-role")
-        guard (controlIndex == nil) == (roleIndex == nil) else {
-            throw BenchmarkFailure.message(
-                "--allocation-control-dir and --allocation-target-role must be used together"
-            )
-        }
-        if let controlIndex, let roleIndex {
-            guard candidate != nil,
-                  values.indices.contains(controlIndex + 1),
-                  values.indices.contains(roleIndex + 1),
-                  ["host", "webcontent", "network", "gpu"]
-                    .contains(values[roleIndex + 1]) else {
-                throw BenchmarkFailure.message("invalid allocation capture control arguments")
-            }
-            allocationControlDirectory = URL(
-                fileURLWithPath: values[controlIndex + 1],
-                isDirectory: true
-            )
-            allocationTargetRole = values[roleIndex + 1]
-        } else {
-            allocationControlDirectory = nil
-            allocationTargetRole = nil
-        }
     }
-}
-
-struct AllocationCaptureTarget: Encodable {
-    let role: String
-    let pid: Int32
-    let birthUnixNanoseconds: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case role, pid
-        case birthUnixNanoseconds = "birth_unix_ns"
-    }
-}
-
-struct AllocationCaptureRequest: Encodable {
-    let schemaVersion = 2
-    let candidate: String
-    let sampleIndex: Int
-    let hostPID: Int32
-    let targetRole: String
-    let targetPresent: Bool
-    let targetPID: Int32?
-    let targetBirthUnixNanoseconds: UInt64?
-    let availableTargets: [AllocationCaptureTarget]
-
-    enum CodingKeys: String, CodingKey {
-        case schemaVersion = "schema_version"
-        case candidate
-        case sampleIndex = "sample_index"
-        case hostPID = "host_pid"
-        case targetRole = "target_role"
-        case targetPresent = "target_present"
-        case targetPID = "target_pid"
-        case targetBirthUnixNanoseconds = "target_birth_unix_ns"
-        case availableTargets = "available_targets"
-    }
-}
-
-struct AllocationCaptureDone: Encodable {
-    let schemaVersion = 2
-    let targetPresent: Bool
-    let startedUnixNanoseconds: UInt64
-    let endedUnixNanoseconds: UInt64
-    let observedAliveThroughUnixNanoseconds: UInt64?
-
-    enum CodingKeys: String, CodingKey {
-        case schemaVersion = "schema_version"
-        case targetPresent = "target_present"
-        case startedUnixNanoseconds = "started_unix_ns"
-        case endedUnixNanoseconds = "ended_unix_ns"
-        case observedAliveThroughUnixNanoseconds = "observed_alive_through_unix_ns"
-    }
-}
-
-struct AllocationCaptureToken {
-    let sampleIndex: Int
-    let targetRole: String
-    let target: AllocationCaptureTarget?
-}
-
-@MainActor
-struct AllocationCaptureControl {
-    let directory: URL
-    let targetRole: String
-
-    init(directory: URL, targetRole: String) throws {
-        let values = try directory.resourceValues(
-            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
-        )
-        guard values.isDirectory == true, values.isSymbolicLink != true else {
-            throw BenchmarkFailure.message(
-                "allocation control directory must be an existing real directory"
-            )
-        }
-        self.directory = directory.standardizedFileURL
-        self.targetRole = targetRole
-    }
-
-    private func path(_ prefix: String, sampleIndex: Int) -> URL {
-        directory.appendingPathComponent(
-            "\(prefix)-\(sampleIndex)-\(targetRole)",
-            isDirectory: false
-        )
-    }
-
-    private func publish<T: Encodable>(
-        _ value: T,
-        to destination: URL
-    ) throws {
-        let temporary = directory.appendingPathComponent(
-            ".\(destination.lastPathComponent).\(UUID().uuidString).tmp",
-            isDirectory: false
-        )
-        let data = try JSONEncoder().encode(value)
-        try data.write(to: temporary, options: .withoutOverwriting)
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        guard Darwin.link(temporary.path, destination.path) == 0 else {
-            throw BenchmarkFailure.message(
-                "allocation control publication failed for "
-                    + "\(destination.lastPathComponent): errno \(errno)"
-            )
-        }
-    }
-
-    private func waitForFile(_ url: URL) async throws {
-        let deadline = clock.now + .seconds(60)
-        while FileManager.default.fileExists(atPath: url.path) == false {
-            guard clock.now < deadline else {
-                throw BenchmarkFailure.message(
-                    "allocation control timed out waiting for \(url.lastPathComponent)"
-                )
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-    }
-
-    private func waitForCaptureAcknowledgement(_ url: URL) throws {
-        let deadline = clock.now + .seconds(60)
-        try url.withUnsafeFileSystemRepresentation { path in
-            guard let path else {
-                throw BenchmarkFailure.message(
-                    "allocation capture acknowledgement path is unavailable"
-                )
-            }
-            while Darwin.access(path, F_OK) != 0 {
-                guard errno == ENOENT else {
-                    throw BenchmarkFailure.message(
-                        "allocation capture acknowledgement check failed for "
-                            + "\(url.lastPathComponent): errno \(errno)"
-                    )
-                }
-                guard clock.now < deadline else {
-                    throw BenchmarkFailure.message(
-                        "allocation control timed out waiting for "
-                            + url.lastPathComponent
-                    )
-                }
-                // This is deliberately synchronous and post-measurement. An
-                // async Task.sleep loop allocates while xctrace finalizes,
-                // making its Statistics and live-list views observe different
-                // heap tails.
-                Darwin.usleep(10_000)
-            }
-        }
-    }
-
-    func begin(
-        candidate: String,
-        sampleIndex: Int,
-        targetPIDsByRole: [String: Int32]
-    ) async throws -> AllocationCaptureToken {
-        let allowedRoles = Set(["host", "webcontent", "network", "gpu"])
-        guard allowedRoles.contains(targetRole),
-              Set(targetPIDsByRole.keys).isSubset(of: allowedRoles),
-              targetPIDsByRole["host"] == getpid(),
-              candidate == "webkit" || (
-                targetRole == "host" && Set(targetPIDsByRole.keys) == ["host"]
-              ) else {
-            throw BenchmarkFailure.message(
-                "allocation target role or available-target map is invalid"
-            )
-        }
-
-        var availableTargets = [AllocationCaptureTarget]()
-        for (role, pid) in targetPIDsByRole.sorted(by: { $0.key < $1.key }) {
-            guard let identity = benchmarkProcessIdentity(pid: pid) else {
-                throw BenchmarkFailure.message(
-                    "allocation target identity is unavailable for role \(role)"
-                )
-            }
-            availableTargets.append(
-                AllocationCaptureTarget(
-                    role: role,
-                    pid: pid,
-                    birthUnixNanoseconds: identity.birthUnixNanoseconds
-                )
-            )
-        }
-        let target = availableTargets.first { $0.role == targetRole }
-        let request = AllocationCaptureRequest(
-            candidate: candidate,
-            sampleIndex: sampleIndex,
-            hostPID: getpid(),
-            targetRole: targetRole,
-            targetPresent: target != nil,
-            targetPID: target?.pid,
-            targetBirthUnixNanoseconds: target?.birthUnixNanoseconds,
-            availableTargets: availableTargets
-        )
-        try publish(
-            request,
-            to: path("request", sampleIndex: sampleIndex).appendingPathExtension("json")
-        )
-        try await waitForFile(path("go", sampleIndex: sampleIndex))
-        guard availableTargets.allSatisfy({
-            benchmarkProcessMatchesIdentity(
-                pid: $0.pid,
-                birthUnixNanoseconds: $0.birthUnixNanoseconds
-            )
-        }) else {
-            throw BenchmarkFailure.message(
-                "an allocation target identity changed before measurement"
-            )
-        }
-        return AllocationCaptureToken(
-            sampleIndex: sampleIndex,
-            targetRole: targetRole,
-            target: target
-        )
-    }
-
-    func finish(
-        _ token: AllocationCaptureToken,
-        startedUnixNanoseconds: UInt64,
-        endedUnixNanoseconds: UInt64
-    ) async throws {
-        guard startedUnixNanoseconds < endedUnixNanoseconds else {
-            throw BenchmarkFailure.message(
-                "allocation capture measured interval is empty"
-            )
-        }
-        let observedAliveThroughUnixNanoseconds: UInt64?
-        if let target = token.target {
-            guard let identity = benchmarkProcessIdentity(pid: target.pid),
-                  identity.birthUnixNanoseconds == target.birthUnixNanoseconds,
-                  identity.observedAliveThroughUnixNanoseconds
-                    >= endedUnixNanoseconds else {
-                throw BenchmarkFailure.message(
-                    "allocation target identity did not span the measured interval"
-                )
-            }
-            observedAliveThroughUnixNanoseconds =
-                identity.observedAliveThroughUnixNanoseconds
-        } else {
-            observedAliveThroughUnixNanoseconds = nil
-        }
-        try publish(
-            AllocationCaptureDone(
-                targetPresent: token.target != nil,
-                startedUnixNanoseconds: startedUnixNanoseconds,
-                endedUnixNanoseconds: endedUnixNanoseconds,
-                observedAliveThroughUnixNanoseconds:
-                    observedAliveThroughUnixNanoseconds
-            ),
-            to: path("done", sampleIndex: token.sampleIndex).appendingPathExtension("json")
-        )
-        try waitForCaptureAcknowledgement(
-            path("captured", sampleIndex: token.sampleIndex)
-        )
-    }
-}
-
-func requiredAllocationPIDs(
-    control: AllocationCaptureControl?,
-    token: AllocationCaptureToken?
-) throws -> [Int32] {
-    guard let control else {
-        guard token == nil else {
-            throw BenchmarkFailure.message(
-                "ordinary renderer measurement unexpectedly created an allocation capture token"
-            )
-        }
-        return []
-    }
-    guard let token, token.targetRole == control.targetRole else {
-        throw BenchmarkFailure.message(
-            "targeted allocation measurement has no matching capture token"
-        )
-    }
-    if let target = token.target {
-        return [target.pid]
-    }
-    guard control.targetRole == "network" || control.targetRole == "gpu" else {
-        throw BenchmarkFailure.message(
-            "required allocation target role \(control.targetRole) was absent"
-        )
-    }
-    // The version-2 request/done handshake records target_present=false for
-    // optional WebKit roles. An empty requirement is valid only on that path.
-    return []
 }
 
 enum BenchmarkFailure: Error, CustomStringConvertible {
@@ -557,11 +315,54 @@ func milliseconds(_ duration: Duration) -> Double {
         + Double(components.attoseconds) / 1_000_000_000_000_000.0
 }
 
-func percentile(_ values: [Double], _ fraction: Double) -> Double {
-    guard !values.isEmpty else { return .nan }
+enum BenchmarkStatisticsError: Error, Equatable, CustomStringConvertible {
+    case noSamples
+    case invalidFraction
+    case nonfiniteSamples
+
+    var description: String {
+        switch self {
+        case .noSamples:
+            "benchmark percentile contract requires at least one sample"
+        case .invalidFraction:
+            "benchmark percentile fraction must be finite and between zero and one"
+        case .nonfiniteSamples:
+            "benchmark percentile samples must all be finite"
+        }
+    }
+}
+
+func checkedPercentile(
+    _ values: [Double],
+    _ fraction: Double
+) -> Result<Double, BenchmarkStatisticsError> {
+    guard values.isEmpty == false else {
+        return .failure(.noSamples)
+    }
+    guard fraction.isFinite && (0.0...1.0).contains(fraction) else {
+        return .failure(.invalidFraction)
+    }
+    guard values.allSatisfy(\.isFinite) else {
+        return .failure(.nonfiniteSamples)
+    }
     let ordered = values.sorted()
-    let index = min(ordered.count - 1, max(0, Int((Double(ordered.count - 1) * fraction).rounded())))
-    return ordered[index]
+    let rank = Double(ordered.count - 1) * fraction
+    // Nearest-rank-index with an explicit half-up tie rule. Do not use the
+    // language-default rounding mode: cross-driver reports must agree.
+    let index = min(
+        ordered.count - 1,
+        max(0, Int(floor(rank + 0.5)))
+    )
+    return .success(ordered[index])
+}
+
+func percentile(_ values: [Double], _ fraction: Double) -> Double {
+    switch checkedPercentile(values, fraction) {
+    case .success(let value):
+        value
+    case .failure(let error):
+        preconditionFailure(error.description)
+    }
 }
 
 func p50(_ values: [Double]) -> Double {

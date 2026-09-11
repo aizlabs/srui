@@ -1,4 +1,7 @@
+#[path = "metric_contract.generated.rs"]
+mod metric_contract;
 mod reconnect;
+mod reconnect_wire;
 mod report;
 mod serialization;
 mod terminal;
@@ -41,6 +44,8 @@ async fn main() -> Result<(), String> {
     let canonical_bytes = frame_encoded_transactions(&canonical_encoded)?;
     let canonical_digest = Sha256::digest(&canonical_bytes);
     let output = Output {
+        contract_schema_version: metric_contract::SCHEMA_VERSION,
+        contract_sha256: metric_contract::CONTRACT_SHA256,
         artifacts: Artifacts {
             canonical_transaction_sha256: format!("{canonical_digest:x}"),
             canonical_transaction_bytes: canonical_bytes.len(),

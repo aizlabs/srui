@@ -3,6 +3,13 @@
   "description": "Representative §30 coding-agent UI shared by server serialization and macOS rendering benchmarks; extension islands use their standard-profile fallbacks here and are measured directly in §31.6.",
   "extension_islands": ["org.srui.terminal/1", "org.example.diff/1"],
   "first_paint_node_count": 5,
+  "roles": {
+    "surface": 1,
+    "progress": 5,
+    "file_tree": 7,
+    "text_editor": 14,
+    "primary_action": 16
+  },
   "nodes": [
     {"id": 1, "type": "Surface", "properties": {"label": "Remote coding session"}},
     {"id": 2, "type": "Column", "parent": 1},
@@ -21,7 +28,6 @@
     {"id": 15, "type": "Row", "parent": 8},
     {"id": 16, "type": "Button", "parent": 15, "properties": {"label": "Approve", "enabled": true}},
     {"id": 17, "type": "Button", "parent": 15, "properties": {"label": "Reject", "enabled": true}},
-    {"id": 21, "type": "Menu", "parent": 15, "properties": {"label": "Actions", "items": ["One", "Two", "Three"]}},
     {"id": 18, "type": "Separator", "parent": 2, "properties": {}},
     {"id": 19, "type": "Text", "parent": 2, "properties": {"text": "Activity"}},
     {"id": 20, "type": "Text", "parent": 2, "properties": {"text": "27 tests passed"}}

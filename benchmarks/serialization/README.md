@@ -10,7 +10,7 @@ are timed separately; PTY spawn, transport, client decode, and rendering are exc
 
 Combined Rust-driver command (the single invocation emits §31.2, §31.5, and §31.6):
 
-    cargo run --quiet --release --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver -- --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --output /tmp/srui-rust.json
+    cargo run --quiet --release --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver -- --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --output /tmp/srui-rust.json
 
 Metrics are `abstract_state_generation_ms`, `protobuf_serialization_ms`, and exact
 `serialized_transaction_bytes`; `fixture_protobuf_valid` verifies that the shared fixture produced

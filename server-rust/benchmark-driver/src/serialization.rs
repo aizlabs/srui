@@ -24,6 +24,9 @@ struct FixtureNode {
     properties: BTreeMap<String, JsonValue>,
 }
 
+// The shared untagged JSON fixture deliberately normalizes every number to binary64,
+// matching Swift FixtureValue.number(Double). JSON itself cannot preserve signed versus
+// unsigned intent, so those variants require a future tagged cross-language fixture syntax.
 fn json_to_value(value: &JsonValue) -> Result<Value, String> {
     match value {
         JsonValue::String(value) => Ok(Value::from(value.as_str())),
@@ -40,7 +43,6 @@ fn json_to_value(value: &JsonValue) -> Result<Value, String> {
         other => Err(format!("unsupported fixture value: {other}")),
     }
 }
-
 fn build_operation(node: &FixtureNode) -> Result<Operation, String> {
     let node_type =
         resolve_standard_node_type(&node.node_type).map_err(|error| error.to_string())?;
@@ -151,37 +153,37 @@ pub(crate) fn serialization(fixture: &Fixture, iterations: usize) -> Result<Sect
         metrics: vec![
             metric(
                 "abstract state generation",
-                p50(generation_ms.clone()),
+                p50(generation_ms.clone())?,
                 "ms",
                 "p50",
             ),
             metric(
                 "abstract state generation",
-                percentile(generation_ms.clone(), 0.95),
+                percentile(generation_ms.clone(), 0.95)?,
                 "ms",
                 "p95",
             ),
             metric(
                 "abstract state generation",
-                percentile(generation_ms, 0.99),
+                percentile(generation_ms, 0.99)?,
                 "ms",
                 "p99",
             ),
             metric(
                 "protobuf serialization",
-                p50(serialization_ms.clone()),
+                p50(serialization_ms.clone())?,
                 "ms",
                 "p50",
             ),
             metric(
                 "protobuf serialization",
-                percentile(serialization_ms.clone(), 0.95),
+                percentile(serialization_ms.clone(), 0.95)?,
                 "ms",
                 "p95",
             ),
             metric(
                 "protobuf serialization",
-                percentile(serialization_ms, 0.99),
+                percentile(serialization_ms, 0.99)?,
                 "ms",
                 "p99",
             ),
@@ -236,6 +238,21 @@ mod tests {
                 node(3, Some(2), "Text"),
             ],
         }
+    }
+
+    #[test]
+    fn fixture_values_follow_the_shared_binary64_subset() {
+        assert_eq!(
+            json_to_value(&serde_json::json!(42)).unwrap(),
+            Value::Float64(42.0)
+        );
+        assert_eq!(
+            json_to_value(&serde_json::json!(-7)).unwrap(),
+            Value::Float64(-7.0)
+        );
+        assert!(json_to_value(&JsonValue::Null)
+            .unwrap_err()
+            .contains("unsupported fixture value"));
     }
 
     #[test]

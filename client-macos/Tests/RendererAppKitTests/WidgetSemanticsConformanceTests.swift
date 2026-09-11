@@ -9,9 +9,8 @@
 // §4 inv. 13 (unknown required semantics fail explicitly), §32.2, §32.5.
 // This asserts what widgets *do*: which interaction each control originates, that a disabled
 // control originates nothing, that the renderer has no way to emit a coordinate stream at all,
-// and that every required node type constructs. Standard node types outside the renderer's
-// explicit support set are refused rather than approximated; an optional/deferred type may be
-// implemented without changing its registry tier.
+// and that exactly the required node types construct. Standard node types outside the required
+// tier are refused rather than approximated.
 //
 // `ControlFactoryTests` remains the detailed per-widget construction and property coverage; the
 // manifest lists both files under suites 2 and 10. Nothing here re-derives the registry: tier
@@ -30,34 +29,30 @@ import Testing
 @MainActor
 struct WidgetSemanticsConformanceTests {
 
-    /// §7.3: all 18 required-tier node types construct. Menu is the one explicitly implemented
-    /// deferred-tier type; every remaining unsupported standard type is refused outright rather
-    /// than silently substituted (§4 inv. 13).
+    /// §7.3: exactly the 18 required-tier node types construct; everything else is refused
+    /// outright rather than silently substituted (§4 inv. 13).
     @Test
-    func rendererImplementsRequiredAndExplicitOptionalTypes() throws {
-        // Required-tier membership comes from the generated registry. ControlFactory owns the
-        // explicit implementation set so supporting another optional type cannot silently invert
-        // this conformance check.
+    func rendererImplementsExactlyTheRequiredTier() throws {
+        // Tier comes from `standardNodeTypesTable`, which generate_swift_registry.py emits from
+        // registry.yaml. Listing the required types by hand here would invert silently on a tier
+        // change: a node promoted to `required` but not yet implemented would land in the "must be
+        // refused" branch below and the suite would pass for exactly the wrong reason.
         let requiredTier = Set(
             standardNodeTypesTable
                 .filter { $0.tier == "required" }
                 .map { TypeRef.standard($0.id) })
-        let implementedBeyondRequired =
-            ControlFactory.implementedStandardNodeTypes.subtracting(requiredTier)
         #expect(requiredTier.count == 18, "§7.3 defines 18 required-tier node types")
-        #expect(requiredTier.isSubset(of: ControlFactory.implementedStandardNodeTypes))
-        #expect(implementedBeyondRequired == [.menu])
 
         let factory = ControlFactory()
         for entry in standardNodeTypesTable {
             let nodeType = TypeRef.standard(entry.id)
             let node = Node(id: 1, nodeType: nodeType)
 
-            if ControlFactory.implementedStandardNodeTypes.contains(nodeType) {
+            if requiredTier.contains(nodeType) {
                 let handle = try factory.makeHandle(for: node)
                 #expect(
                     handle.nodeType == nodeType,
-                    "implemented standard type '\(entry.name)' produced the wrong handle type")
+                    "required-tier '\(entry.name)' produced a handle for the wrong node type")
             } else {
                 #expect(throws: ControlFactoryError.unsupportedNodeType(nodeType)) {
                     _ = try factory.makeHandle(for: node)

@@ -64,7 +64,8 @@ actor ResumeFailureObservation {
 
 @MainActor
 func preReceiptEventReplaySample(
-    fixtureOperations: [SemanticModel.Operation]
+    fixtureOperations: [SemanticModel.Operation],
+    fixtureIndex: BenchmarkFixtureIndex
 ) async throws -> (latency: Double, passed: Bool, detail: String) {
     let outbox = EventOutbox()
     let sessionID = "pre-receipt-session"
@@ -74,11 +75,14 @@ func preReceiptEventReplaySample(
         transport: firstTransport,
         renderer: firstRenderer,
         fixtureOperations: fixtureOperations,
+        fixtureIndex: fixtureIndex,
         sessionID: sessionID,
         outbox: outbox
     )
 
-    let event = try await first.sendActivate(nodeId: NodeId(16))
+    let event = try await first.sendActivate(
+        nodeId: fixtureIndex.primaryAction
+    )
     let firstEvents = try await capturedEvents(in: firstTransport)
     let firstSnapshot = await firstTransport.snapshot()
     let retainedBeforeDisconnect = await outbox.pendingCount == 1
@@ -231,7 +235,9 @@ func midResourceReconnectSample() async throws -> (latency: Double, passed: Bool
 }
 
 @MainActor
-func supersededResumeSample() async throws -> (
+func supersededResumeSample(
+    fixtureIndex: BenchmarkFixtureIndex
+) async throws -> (
     oldResponseLatency: Double,
     newResponseLatency: Double,
     passed: Bool,
@@ -245,7 +251,9 @@ func supersededResumeSample() async throws -> (
         try framed(welcomeMessage(sessionID: "superseded-session"))
     )
     try await waitUntil { seed.isEventDispatchEnabled }
-    let pending = try await seed.sendActivate(nodeId: NodeId(16))
+    let pending = try await seed.sendActivate(
+        nodeId: fixtureIndex.primaryAction
+    )
     await seed.stop()
 
     let oldFailures = ResumeFailureObservation()
@@ -326,7 +334,9 @@ func supersededResumeSample() async throws -> (
     )
     try await waitUntil { await outbox.pendingCount == 0 }
 
-    let fresh = try await newController.sendActivate(nodeId: NodeId(16))
+    let fresh = try await newController.sendActivate(
+        nodeId: fixtureIndex.primaryAction
+    )
     try await waitUntil {
         (try? await capturedEvents(in: newTransport).count) == 2
     }
@@ -403,7 +413,8 @@ func supersededResumeSample() async throws -> (
 @MainActor
 func reconnect(
     iterations: Int,
-    fixtureOperations: [SemanticModel.Operation]
+    fixtureOperations: [SemanticModel.Operation],
+    fixtureIndex: BenchmarkFixtureIndex
 ) async throws -> Section {
     var preReceiptLatencies = [Double]()
     var resourceLatencies = [Double]()
@@ -416,7 +427,8 @@ func reconnect(
     var supersededDetails = Set<String>()
     for _ in 0..<max(2, min(5, iterations)) {
         let preReceipt = try await preReceiptEventReplaySample(
-            fixtureOperations: fixtureOperations
+            fixtureOperations: fixtureOperations,
+            fixtureIndex: fixtureIndex
         )
         preReceiptLatencies.append(preReceipt.latency)
         preReceiptPassed = preReceiptPassed && preReceipt.passed
@@ -426,7 +438,9 @@ func reconnect(
         resourceLatencies.append(resource.latency)
         resourcePassed = resourcePassed && resource.passed
 
-        let superseded = try await supersededResumeSample()
+        let superseded = try await supersededResumeSample(
+            fixtureIndex: fixtureIndex
+        )
         supersededLatencies.append(superseded.oldResponseLatency)
         activeLatencies.append(superseded.newResponseLatency)
         supersededPassed = supersededPassed && superseded.passed

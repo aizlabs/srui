@@ -1,502 +1,464 @@
 {
+  "contract_schema_version": 1,
+  "contract_sha256": "98c8f350c9fd4afbf5ad13f2d7d5917b77e1d66db52b917cc8180e84f52ccbac",
   "driver_artifacts": {
     "macos": {
-      "canonical_transaction_bytes": 981,
-      "canonical_transaction_sha256": "3c0273c2eeb792e0cc99a9159c1a1b1fb7fc6cf9f947ec5ad5f33396fc9d8f50",
+      "canonical_transaction_bytes": 910,
+      "canonical_transaction_sha256": "8c7ebc3774fafdaa731d47e9dcb4611078a9efa1da649907db3c45cff03c40c6",
       "renderer_process_attribution": [
         {
           "candidate": "srui",
-          "driver_pid": 23204,
-          "ended_unix_ns": 1789089956199379000,
+          "driver_pid": 46422,
+          "ended_unix_ns": 1789146276399093000,
           "helper_pid_source": "native candidate has no renderer helper processes",
           "helper_pids": [],
-          "host_pid": 24192,
+          "host_pid": 47866,
           "measurement_intervals": [
             {
-              "ended_unix_ns": 1789089944460194000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089944411401000
+              "ended_unix_ns": 1789146262412957000,
+              "started_unix_ns": 1789146262374602000
             },
             {
-              "ended_unix_ns": 1789089945207760000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089945162462000
+              "ended_unix_ns": 1789146263134548000,
+              "started_unix_ns": 1789146263098585000
             },
             {
-              "ended_unix_ns": 1789089945792739000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089945747845000
+              "ended_unix_ns": 1789146263928948000,
+              "started_unix_ns": 1789146263897551000
             },
             {
-              "ended_unix_ns": 1789089946415621000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089946372711000
+              "ended_unix_ns": 1789146264692490000,
+              "started_unix_ns": 1789146264655510000
             },
             {
-              "ended_unix_ns": 1789089947047040000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089947004354000
+              "ended_unix_ns": 1789146265408277000,
+              "started_unix_ns": 1789146265371916000
             },
             {
-              "ended_unix_ns": 1789089947637068000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089947596759000
+              "ended_unix_ns": 1789146266137117000,
+              "started_unix_ns": 1789146266105234000
             },
             {
-              "ended_unix_ns": 1789089948231459000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089948186602000
+              "ended_unix_ns": 1789146266860202000,
+              "started_unix_ns": 1789146266829879000
             },
             {
-              "ended_unix_ns": 1789089948807399000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089948765067000
+              "ended_unix_ns": 1789146267595882000,
+              "started_unix_ns": 1789146267564349000
             },
             {
-              "ended_unix_ns": 1789089949430869000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089949386821000
+              "ended_unix_ns": 1789146268310976000,
+              "started_unix_ns": 1789146268272984000
             },
             {
-              "ended_unix_ns": 1789089950072873000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089950029316000
+              "ended_unix_ns": 1789146269236970000,
+              "started_unix_ns": 1789146269199841000
             },
             {
-              "ended_unix_ns": 1789089950664858000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089950621314000
+              "ended_unix_ns": 1789146269979373000,
+              "started_unix_ns": 1789146269946481000
             },
             {
-              "ended_unix_ns": 1789089951246223000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089951203266000
+              "ended_unix_ns": 1789146270676483000,
+              "started_unix_ns": 1789146270646367000
             },
             {
-              "ended_unix_ns": 1789089951841393000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089951798895000
+              "ended_unix_ns": 1789146271369687000,
+              "started_unix_ns": 1789146271331782000
             },
             {
-              "ended_unix_ns": 1789089952455794000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089952414625000
+              "ended_unix_ns": 1789146272076691000,
+              "started_unix_ns": 1789146272041786000
             },
             {
-              "ended_unix_ns": 1789089953073018000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089953028712000
+              "ended_unix_ns": 1789146272761922000,
+              "started_unix_ns": 1789146272730161000
             },
             {
-              "ended_unix_ns": 1789089953657267000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089953613098000
+              "ended_unix_ns": 1789146273451615000,
+              "started_unix_ns": 1789146273414406000
             },
             {
-              "ended_unix_ns": 1789089954281122000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089954237752000
+              "ended_unix_ns": 1789146274179859000,
+              "started_unix_ns": 1789146274147048000
             },
             {
-              "ended_unix_ns": 1789089954898252000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089954853027000
+              "ended_unix_ns": 1789146274900597000,
+              "started_unix_ns": 1789146274863727000
             },
             {
-              "ended_unix_ns": 1789089955488805000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089955443702000
+              "ended_unix_ns": 1789146275629671000,
+              "started_unix_ns": 1789146275598122000
             },
             {
-              "ended_unix_ns": 1789089956106033000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089956063670000
+              "ended_unix_ns": 1789146276300274000,
+              "started_unix_ns": 1789146276262931000
             }
           ],
           "process_identities": [
             {
-              "birth_unix_ns": 1789089943016090000,
-              "observed_alive_through_unix_ns": 1789089956199379000,
-              "pid": 24192
+              "birth_unix_ns": 1789146261319281000,
+              "observed_alive_through_unix_ns": 1789146276399093000,
+              "pid": 47866
             }
           ],
-          "started_unix_ns": 1789089943120905000
+          "started_unix_ns": 1789146261420856000
         },
         {
           "candidate": "webkit",
-          "driver_pid": 23204,
-          "ended_unix_ns": 1789089972966788000,
+          "driver_pid": 46422,
+          "ended_unix_ns": 1789146298900880000,
           "helper_pid_source": "required WebContent PID from benchmark-only _webProcessIdentifier; optional _networkProcessIdentifier/_gpuProcessIdentifier values included when available; every exact PID-role mapping must remain unchanged through the separate resource and peak-footprint passes",
           "helper_pids": [
-            24656,
-            24657,
-            24658,
-            24715,
-            24716,
-            24774,
-            24775,
-            24820,
-            24821,
-            24849,
-            24850,
-            24877,
-            24878,
-            24904,
-            24905,
-            24932,
-            24933,
-            24959,
-            24960,
-            24987,
-            24988,
-            25016,
-            25017,
-            25048,
-            25049,
-            25066,
-            25076,
-            25078,
-            25079,
-            25105,
-            25106,
-            25133,
-            25134,
-            25160,
-            25161,
-            25187,
-            25188,
-            25214,
-            25215,
-            25242,
-            25243
+            48502,
+            48503,
+            48504,
+            48559,
+            48560,
+            48613,
+            48614,
+            48643,
+            48647,
+            48676,
+            48677,
+            48728,
+            48729,
+            48758,
+            48759,
+            48785,
+            48786,
+            48814,
+            48815,
+            48880,
+            48881,
+            48888,
+            48889,
+            48918,
+            48919,
+            48973,
+            48974,
+            49002,
+            49004,
+            49032,
+            49033,
+            49072,
+            49098,
+            49124,
+            49125,
+            49157,
+            49158,
+            49185,
+            49186,
+            49237,
+            49238
           ],
-          "host_pid": 24615,
+          "host_pid": 48500,
           "measurement_intervals": [
             {
-              "ended_unix_ns": 1789089958017383000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089958008981000
+              "ended_unix_ns": 1789146278152636000,
+              "started_unix_ns": 1789146278132792000
             },
             {
-              "ended_unix_ns": 1789089958625793000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089958615811000
+              "ended_unix_ns": 1789146279294552000,
+              "started_unix_ns": 1789146279271861000
             },
             {
-              "ended_unix_ns": 1789089959410638000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089959401468000
+              "ended_unix_ns": 1789146280376981000,
+              "started_unix_ns": 1789146280344315000
             },
             {
-              "ended_unix_ns": 1789089960183799000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089960174359000
+              "ended_unix_ns": 1789146281477432000,
+              "started_unix_ns": 1789146281442761000
             },
             {
-              "ended_unix_ns": 1789089961001142000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089960990883000
+              "ended_unix_ns": 1789146282577187000,
+              "started_unix_ns": 1789146282543998000
             },
             {
-              "ended_unix_ns": 1789089961809489000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089961802677000
+              "ended_unix_ns": 1789146283579011000,
+              "started_unix_ns": 1789146283509530000
             },
             {
-              "ended_unix_ns": 1789089962625933000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089962615866000
+              "ended_unix_ns": 1789146285002858000,
+              "started_unix_ns": 1789146284980171000
             },
             {
-              "ended_unix_ns": 1789089963451072000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089963441156000
+              "ended_unix_ns": 1789146286152290000,
+              "started_unix_ns": 1789146286129529000
             },
             {
-              "ended_unix_ns": 1789089964209447000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089964199687000
+              "ended_unix_ns": 1789146287194991000,
+              "started_unix_ns": 1789146287170943000
             },
             {
-              "ended_unix_ns": 1789089965109785000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089965103099000
+              "ended_unix_ns": 1789146287918881000,
+              "started_unix_ns": 1789146287895242000
             },
             {
-              "ended_unix_ns": 1789089965708524000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089965698916000
+              "ended_unix_ns": 1789146288660033000,
+              "started_unix_ns": 1789146288636140000
             },
             {
-              "ended_unix_ns": 1789089966492823000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089966483436000
+              "ended_unix_ns": 1789146289802922000,
+              "started_unix_ns": 1789146289780027000
             },
             {
-              "ended_unix_ns": 1789089967300992000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089967294390000
+              "ended_unix_ns": 1789146290869660000,
+              "started_unix_ns": 1789146290846691000
             },
             {
-              "ended_unix_ns": 1789089968092159000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089968083552000
+              "ended_unix_ns": 1789146292077159000,
+              "started_unix_ns": 1789146292043480000
             },
             {
-              "ended_unix_ns": 1789089968863138000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089968856635000
+              "ended_unix_ns": 1789146293152679000,
+              "started_unix_ns": 1789146293129800000
             },
             {
-              "ended_unix_ns": 1789089969567424000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089969557123000
+              "ended_unix_ns": 1789146294235304000,
+              "started_unix_ns": 1789146294210278000
             },
             {
-              "ended_unix_ns": 1789089970358531000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089970348667000
+              "ended_unix_ns": 1789146295352598000,
+              "started_unix_ns": 1789146295319829000
             },
             {
-              "ended_unix_ns": 1789089971176063000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089971168961000
+              "ended_unix_ns": 1789146296536482000,
+              "started_unix_ns": 1789146296505937000
             },
             {
-              "ended_unix_ns": 1789089972084372000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089972076901000
+              "ended_unix_ns": 1789146297659705000,
+              "started_unix_ns": 1789146297634386000
             },
             {
-              "ended_unix_ns": 1789089972883210000,
-              "required_allocation_pids": [],
-              "started_unix_ns": 1789089972873567000
+              "ended_unix_ns": 1789146298761159000,
+              "started_unix_ns": 1789146298737750000
             }
           ],
           "process_identities": [
             {
-              "birth_unix_ns": 1789089956226100000,
-              "observed_alive_through_unix_ns": 1789089972908694000,
-              "pid": 24615
+              "birth_unix_ns": 1789146276424191000,
+              "observed_alive_through_unix_ns": 1789146298839071000,
+              "pid": 48500
             },
             {
-              "birth_unix_ns": 1789089956598565000,
-              "observed_alive_through_unix_ns": 1789089972908692000,
-              "pid": 24656
+              "birth_unix_ns": 1789146276604471000,
+              "observed_alive_through_unix_ns": 1789146298839064000,
+              "pid": 48502
             },
             {
-              "birth_unix_ns": 1789089956688936000,
-              "observed_alive_through_unix_ns": 1789089958042071000,
-              "pid": 24657
+              "birth_unix_ns": 1789146276642749000,
+              "observed_alive_through_unix_ns": 1789146278232806000,
+              "pid": 48503
             },
             {
-              "birth_unix_ns": 1789089956756899000,
-              "observed_alive_through_unix_ns": 1789089958042074000,
-              "pid": 24658
+              "birth_unix_ns": 1789146276699758000,
+              "observed_alive_through_unix_ns": 1789146278232808000,
+              "pid": 48504
             },
             {
-              "birth_unix_ns": 1789089958110930000,
-              "observed_alive_through_unix_ns": 1789089958650981000,
-              "pid": 24715
+              "birth_unix_ns": 1789146278301587000,
+              "observed_alive_through_unix_ns": 1789146279372303000,
+              "pid": 48559
             },
             {
-              "birth_unix_ns": 1789089958141171000,
-              "observed_alive_through_unix_ns": 1789089958650980000,
-              "pid": 24716
+              "birth_unix_ns": 1789146278340807000,
+              "observed_alive_through_unix_ns": 1789146279372304000,
+              "pid": 48560
             },
             {
-              "birth_unix_ns": 1789089958717799000,
-              "observed_alive_through_unix_ns": 1789089959443783000,
-              "pid": 24774
+              "birth_unix_ns": 1789146279443657000,
+              "observed_alive_through_unix_ns": 1789146280455952000,
+              "pid": 48613
             },
             {
-              "birth_unix_ns": 1789089958745495000,
-              "observed_alive_through_unix_ns": 1789089959443780000,
-              "pid": 24775
+              "birth_unix_ns": 1789146279470412000,
+              "observed_alive_through_unix_ns": 1789146280455953000,
+              "pid": 48614
             },
             {
-              "birth_unix_ns": 1789089959513083000,
-              "observed_alive_through_unix_ns": 1789089960208953000,
-              "pid": 24820
+              "birth_unix_ns": 1789146280526362000,
+              "observed_alive_through_unix_ns": 1789146281555735000,
+              "pid": 48643
             },
             {
-              "birth_unix_ns": 1789089959545510000,
-              "observed_alive_through_unix_ns": 1789089960208957000,
-              "pid": 24821
+              "birth_unix_ns": 1789146280553245000,
+              "observed_alive_through_unix_ns": 1789146281555731000,
+              "pid": 48647
             },
             {
-              "birth_unix_ns": 1789089960275344000,
-              "observed_alive_through_unix_ns": 1789089961029645000,
-              "pid": 24849
+              "birth_unix_ns": 1789146281626199000,
+              "observed_alive_through_unix_ns": 1789146282655596000,
+              "pid": 48676
             },
             {
-              "birth_unix_ns": 1789089960302975000,
-              "observed_alive_through_unix_ns": 1789089961029638000,
-              "pid": 24850
+              "birth_unix_ns": 1789146281652725000,
+              "observed_alive_through_unix_ns": 1789146282655595000,
+              "pid": 48677
             },
             {
-              "birth_unix_ns": 1789089961096568000,
-              "observed_alive_through_unix_ns": 1789089961834739000,
-              "pid": 24877
+              "birth_unix_ns": 1789146282726561000,
+              "observed_alive_through_unix_ns": 1789146283742055000,
+              "pid": 48728
             },
             {
-              "birth_unix_ns": 1789089961127326000,
-              "observed_alive_through_unix_ns": 1789089961834741000,
-              "pid": 24878
+              "birth_unix_ns": 1789146282770733000,
+              "observed_alive_through_unix_ns": 1789146283742056000,
+              "pid": 48729
             },
             {
-              "birth_unix_ns": 1789089961904444000,
-              "observed_alive_through_unix_ns": 1789089962651672000,
-              "pid": 24904
+              "birth_unix_ns": 1789146283819765000,
+              "observed_alive_through_unix_ns": 1789146285081251000,
+              "pid": 48758
             },
             {
-              "birth_unix_ns": 1789089961936366000,
-              "observed_alive_through_unix_ns": 1789089962651670000,
-              "pid": 24905
+              "birth_unix_ns": 1789146283934345000,
+              "observed_alive_through_unix_ns": 1789146285081245000,
+              "pid": 48759
             },
             {
-              "birth_unix_ns": 1789089962726426000,
-              "observed_alive_through_unix_ns": 1789089963476189000,
-              "pid": 24932
+              "birth_unix_ns": 1789146285152029000,
+              "observed_alive_through_unix_ns": 1789146286231243000,
+              "pid": 48785
             },
             {
-              "birth_unix_ns": 1789089962771614000,
-              "observed_alive_through_unix_ns": 1789089963476194000,
-              "pid": 24933
+              "birth_unix_ns": 1789146285187292000,
+              "observed_alive_through_unix_ns": 1789146286231244000,
+              "pid": 48786
             },
             {
-              "birth_unix_ns": 1789089963545921000,
-              "observed_alive_through_unix_ns": 1789089964242961000,
-              "pid": 24959
+              "birth_unix_ns": 1789146286301957000,
+              "observed_alive_through_unix_ns": 1789146287272689000,
+              "pid": 48814
             },
             {
-              "birth_unix_ns": 1789089963574846000,
-              "observed_alive_through_unix_ns": 1789089964242966000,
-              "pid": 24960
+              "birth_unix_ns": 1789146286328900000,
+              "observed_alive_through_unix_ns": 1789146287272693000,
+              "pid": 48815
             },
             {
-              "birth_unix_ns": 1789089964317623000,
-              "observed_alive_through_unix_ns": 1789089965134119000,
-              "pid": 24987
+              "birth_unix_ns": 1789146287352974000,
+              "observed_alive_through_unix_ns": 1789146287998001000,
+              "pid": 48880
             },
             {
-              "birth_unix_ns": 1789089964345143000,
-              "observed_alive_through_unix_ns": 1789089965134121000,
-              "pid": 24988
+              "birth_unix_ns": 1789146287386123000,
+              "observed_alive_through_unix_ns": 1789146287998005000,
+              "pid": 48881
             },
             {
-              "birth_unix_ns": 1789089965200315000,
-              "observed_alive_through_unix_ns": 1789089965733707000,
-              "pid": 25016
+              "birth_unix_ns": 1789146288068484000,
+              "observed_alive_through_unix_ns": 1789146288739453000,
+              "pid": 48888
             },
             {
-              "birth_unix_ns": 1789089965228805000,
-              "observed_alive_through_unix_ns": 1789089965733709000,
-              "pid": 25017
+              "birth_unix_ns": 1789146288110195000,
+              "observed_alive_through_unix_ns": 1789146288739456000,
+              "pid": 48889
             },
             {
-              "birth_unix_ns": 1789089965800420000,
-              "observed_alive_through_unix_ns": 1789089966526074000,
-              "pid": 25048
+              "birth_unix_ns": 1789146288810172000,
+              "observed_alive_through_unix_ns": 1789146289880807000,
+              "pid": 48918
             },
             {
-              "birth_unix_ns": 1789089965828405000,
-              "observed_alive_through_unix_ns": 1789089966526079000,
-              "pid": 25049
+              "birth_unix_ns": 1789146288837439000,
+              "observed_alive_through_unix_ns": 1789146289880808000,
+              "pid": 48919
             },
             {
-              "birth_unix_ns": 1789089966600845000,
-              "observed_alive_through_unix_ns": 1789089967325300000,
-              "pid": 25066
+              "birth_unix_ns": 1789146289951380000,
+              "observed_alive_through_unix_ns": 1789146290947675000,
+              "pid": 48973
             },
             {
-              "birth_unix_ns": 1789089966631211000,
-              "observed_alive_through_unix_ns": 1789089967325296000,
-              "pid": 25076
+              "birth_unix_ns": 1789146289992020000,
+              "observed_alive_through_unix_ns": 1789146290947670000,
+              "pid": 48974
             },
             {
-              "birth_unix_ns": 1789089967392522000,
-              "observed_alive_through_unix_ns": 1789089968121401000,
-              "pid": 25078
+              "birth_unix_ns": 1789146291018023000,
+              "observed_alive_through_unix_ns": 1789146292155781000,
+              "pid": 49002
             },
             {
-              "birth_unix_ns": 1789089967419979000,
-              "observed_alive_through_unix_ns": 1789089968121403000,
-              "pid": 25079
+              "birth_unix_ns": 1789146291045641000,
+              "observed_alive_through_unix_ns": 1789146292155776000,
+              "pid": 49004
             },
             {
-              "birth_unix_ns": 1789089968188011000,
-              "observed_alive_through_unix_ns": 1789089968888069000,
-              "pid": 25105
+              "birth_unix_ns": 1789146292226862000,
+              "observed_alive_through_unix_ns": 1789146293231179000,
+              "pid": 49032
             },
             {
-              "birth_unix_ns": 1789089968237378000,
-              "observed_alive_through_unix_ns": 1789089968888064000,
-              "pid": 25106
+              "birth_unix_ns": 1789146292263427000,
+              "observed_alive_through_unix_ns": 1789146293231175000,
+              "pid": 49033
             },
             {
-              "birth_unix_ns": 1789089968954249000,
-              "observed_alive_through_unix_ns": 1789089969591870000,
-              "pid": 25133
+              "birth_unix_ns": 1789146293301794000,
+              "observed_alive_through_unix_ns": 1789146294314953000,
+              "pid": 49072
             },
             {
-              "birth_unix_ns": 1789089968983904000,
-              "observed_alive_through_unix_ns": 1789089969591872000,
-              "pid": 25134
+              "birth_unix_ns": 1789146293336920000,
+              "observed_alive_through_unix_ns": 1789146294314957000,
+              "pid": 49098
             },
             {
-              "birth_unix_ns": 1789089969658243000,
-              "observed_alive_through_unix_ns": 1789089970383572000,
-              "pid": 25160
+              "birth_unix_ns": 1789146294388981000,
+              "observed_alive_through_unix_ns": 1789146295430747000,
+              "pid": 49124
             },
             {
-              "birth_unix_ns": 1789089969687132000,
-              "observed_alive_through_unix_ns": 1789089970383576000,
-              "pid": 25161
+              "birth_unix_ns": 1789146294419893000,
+              "observed_alive_through_unix_ns": 1789146295430746000,
+              "pid": 49125
             },
             {
-              "birth_unix_ns": 1789089970450219000,
-              "observed_alive_through_unix_ns": 1789089971204823000,
-              "pid": 25187
+              "birth_unix_ns": 1789146295501859000,
+              "observed_alive_through_unix_ns": 1789146296624523000,
+              "pid": 49157
             },
             {
-              "birth_unix_ns": 1789089970478179000,
-              "observed_alive_through_unix_ns": 1789089971204819000,
-              "pid": 25188
+              "birth_unix_ns": 1789146295537122000,
+              "observed_alive_through_unix_ns": 1789146296624538000,
+              "pid": 49158
             },
             {
-              "birth_unix_ns": 1789089971271875000,
-              "observed_alive_through_unix_ns": 1789089972108614000,
-              "pid": 25214
+              "birth_unix_ns": 1789146296703544000,
+              "observed_alive_through_unix_ns": 1789146297739797000,
+              "pid": 49185
             },
             {
-              "birth_unix_ns": 1789089971303372000,
-              "observed_alive_through_unix_ns": 1789089972108618000,
-              "pid": 25215
+              "birth_unix_ns": 1789146296762362000,
+              "observed_alive_through_unix_ns": 1789146297739801000,
+              "pid": 49186
             },
             {
-              "birth_unix_ns": 1789089972175417000,
-              "observed_alive_through_unix_ns": 1789089972908688000,
-              "pid": 25242
+              "birth_unix_ns": 1789146297809755000,
+              "observed_alive_through_unix_ns": 1789146298839068000,
+              "pid": 49237
             },
             {
-              "birth_unix_ns": 1789089972205258000,
-              "observed_alive_through_unix_ns": 1789089972908691000,
-              "pid": 25243
+              "birth_unix_ns": 1789146297837210000,
+              "observed_alive_through_unix_ns": 1789146298839069000,
+              "pid": 49238
             }
           ],
-          "started_unix_ns": 1789089956509701000
+          "started_unix_ns": 1789146276532213000
         }
       ]
     },
     "rust": {
-      "canonical_transaction_bytes": 981,
-      "canonical_transaction_sha256": "3c0273c2eeb792e0cc99a9159c1a1b1fb7fc6cf9f947ec5ad5f33396fc9d8f50"
+      "canonical_transaction_bytes": 910,
+      "canonical_transaction_sha256": "8c7ebc3774fafdaa731d47e9dcb4611078a9efa1da649907db3c45cff03c40c6"
     }
   },
   "environment": {
     "chip": "Apple M2 Max",
-    "git_commit": "c21925e6a59512c9d0ff390f764d3375e90d3269",
+    "git_commit": "1dea52080593cc1ed58d3cbdd404efc0976c5e6d",
     "git_dirty": false,
     "machine": "arm64",
     "physical_ram_bytes": 34359738368,
@@ -507,20 +469,20 @@
     "xcode": "Xcode 26.2\nBuild version 17C52"
   },
   "fixture": "benchmarks/fixtures/coding-agent-ui.json",
-  "generated_at": "2026-09-11T01:36:28.092414+00:00",
+  "generated_at": "2026-09-11T17:16:29.285131+00:00",
   "profile": "full",
   "schema_version": 1,
   "sections": [
     {
       "assertions": [
         {
-          "detail": "21 nodes split 5 + 16 across revisions 0\u21921\u21922 and encoded into 981 framed bytes",
+          "detail": "20 nodes split 5 + 15 across revisions 0\u21921\u21922 and encoded into 910 framed bytes",
           "id": "fixture_protobuf_valid",
           "name": "shared fixture produced SRUI protobuf",
           "passed": true
         },
         {
-          "detail": "3c0273c2eeb792e0cc99a9159c1a1b1fb7fc6cf9f947ec5ad5f33396fc9d8f50 / 981 exact canonical progressive sequence bytes",
+          "detail": "8c7ebc3774fafdaa731d47e9dcb4611078a9efa1da649907db3c45cff03c40c6 / 910 exact canonical progressive sequence bytes",
           "id": "canonical_transaction_parity",
           "name": "canonical progressive transaction sequence bytes match",
           "passed": true
@@ -533,49 +495,49 @@
           "name": "abstract state generation",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.003625
+          "value": 0.00125
         },
         {
           "id": "abstract_state_generation_ms",
           "name": "abstract state generation",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.006084
+          "value": 0.001625
         },
         {
           "id": "abstract_state_generation_ms",
           "name": "abstract state generation",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.013333
+          "value": 0.003583
         },
         {
           "id": "protobuf_serialization_ms",
           "name": "protobuf serialization",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.008833
+          "value": 0.00275
         },
         {
           "id": "protobuf_serialization_ms",
           "name": "protobuf serialization",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.013583
+          "value": 0.003458
         },
         {
           "id": "protobuf_serialization_ms",
           "name": "protobuf serialization",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.039708
+          "value": 0.004583
         },
         {
           "id": "serialized_transaction_bytes",
           "name": "serialized transaction size",
           "statistic": "exact",
           "unit": "bytes",
-          "value": 981.0
+          "value": 910.0
         }
       ],
       "name": "Serialization",
@@ -609,7 +571,7 @@
           "passed": true
         },
         {
-          "detail": "50 duplex reconnects decoded ServerEventAck::Duplicate with cached revision 2; handler count and state stayed at one effect",
+          "detail": "50 duplex reconnects decoded ServerEventAck::Duplicate with cached revision 2; after connection shutdown the handler count, revision, and store remained at one effect",
           "id": "lost_ack_wire_duplicate_once",
           "name": "lost ACK wire replay is DUPLICATE without a second side effect",
           "passed": true
@@ -652,21 +614,21 @@
           "name": "disconnect immediately before event receipt",
           "statistic": "p50",
           "unit": "ms",
-          "value": 6.883165999999999
+          "value": 0.056666999999999995
         },
         {
           "id": "disconnect_before_event_receipt_ms",
           "name": "disconnect immediately before event receipt",
           "statistic": "p95",
           "unit": "ms",
-          "value": 7.078167
+          "value": 0.11574999999999999
         },
         {
           "id": "disconnect_before_event_receipt_ms",
           "name": "disconnect immediately before event receipt",
           "statistic": "p99",
           "unit": "ms",
-          "value": 19.396084000000002
+          "value": 0.241333
         },
         {
           "id": "event_to_settled_side_effect_ms",
@@ -680,14 +642,14 @@
           "name": "event receipt through settled side effect",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.002
+          "value": 0.001
         },
         {
           "id": "event_to_settled_side_effect_ms",
           "name": "event receipt through settled side effect",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.0043749999999999995
+          "value": 0.004458
         },
         {
           "id": "cached_duplicate_response_ms",
@@ -701,35 +663,35 @@
           "name": "in-process cached DUPLICATE response",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.0005
+          "value": 0.000292
         },
         {
           "id": "cached_duplicate_response_ms",
           "name": "in-process cached DUPLICATE response",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.0006659999999999999
+          "value": 0.000541
         },
         {
           "id": "lost_ack_wire_duplicate_ms",
           "name": "lost ACK wire reconnect through DUPLICATE acknowledgement",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.109125
+          "value": 0.053375000000000006
         },
         {
           "id": "lost_ack_wire_duplicate_ms",
           "name": "lost ACK wire reconnect through DUPLICATE acknowledgement",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.257291
+          "value": 0.092
         },
         {
           "id": "lost_ack_wire_duplicate_ms",
           "name": "lost ACK wire reconnect through DUPLICATE acknowledgement",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.427542
+          "value": 0.0925
         },
         {
           "id": "mid_resource_reconnect_ms",
@@ -743,14 +705,14 @@
           "name": "mid-resource reconnect and exact replay",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.021333
+          "value": 0.008208
         },
         {
           "id": "mid_resource_reconnect_ms",
           "name": "mid-resource reconnect and exact replay",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.026208000000000002
+          "value": 0.024375
         },
         {
           "id": "mid_transaction_codec_replay_ms",
@@ -764,56 +726,56 @@
           "name": "mid-transaction frame discard and atomic replay",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.003125
+          "value": 0.001583
         },
         {
           "id": "mid_transaction_codec_replay_ms",
           "name": "mid-transaction frame discard and atomic replay",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.008875000000000001
+          "value": 0.0048330000000000005
         },
         {
           "id": "mid_transaction_wire_replay_ms",
           "name": "mid-transaction wire disconnect and exact atomic replay",
           "statistic": "p50",
           "unit": "ms",
-          "value": 6.893541000000001
+          "value": 0.059459
         },
         {
           "id": "mid_transaction_wire_replay_ms",
           "name": "mid-transaction wire disconnect and exact atomic replay",
           "statistic": "p95",
           "unit": "ms",
-          "value": 7.129875
+          "value": 0.09658299999999999
         },
         {
           "id": "mid_transaction_wire_replay_ms",
           "name": "mid-transaction wire disconnect and exact atomic replay",
           "statistic": "p99",
           "unit": "ms",
-          "value": 7.370917
+          "value": 0.13566699999999998
         },
         {
           "id": "partial_event_wire_replay_ms",
           "name": "partial EVENT disconnect and one processed replay",
           "statistic": "p50",
           "unit": "ms",
-          "value": 7.449208
+          "value": 0.412292
         },
         {
           "id": "partial_event_wire_replay_ms",
           "name": "partial EVENT disconnect and one processed replay",
           "statistic": "p95",
           "unit": "ms",
-          "value": 8.687167
+          "value": 0.667625
         },
         {
           "id": "partial_event_wire_replay_ms",
           "name": "partial EVENT disconnect and one processed replay",
           "statistic": "p99",
           "unit": "ms",
-          "value": 10.600874999999998
+          "value": 0.891541
         },
         {
           "id": "resume_beyond_retention_ms",
@@ -827,14 +789,14 @@
           "name": "resume beyond journal retention",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.001958
+          "value": 0.000958
         },
         {
           "id": "resume_beyond_retention_ms",
           "name": "resume beyond journal retention",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.0029170000000000003
+          "value": 0.002166
         },
         {
           "id": "resume_within_retention_ms",
@@ -848,81 +810,82 @@
           "name": "resume within journal retention",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.001709
+          "value": 0.000875
         },
         {
           "id": "resume_within_retention_ms",
           "name": "resume within journal retention",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.0028339999999999997
+          "value": 0.0015
         },
         {
           "id": "pre_receipt_event_replay",
           "name": "pre-receipt retained-event replay",
           "statistic": "p50",
           "unit": "ms",
-          "value": 23.897
+          "value": 20.555333
         },
         {
           "id": "pre_receipt_event_replay",
           "name": "pre-receipt retained-event replay",
           "statistic": "p95",
           "unit": "ms",
-          "value": 37.196542
+          "value": 20.751125
         },
         {
           "id": "mid_resource_recovery",
           "name": "mid-resource reconnect recovery",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.817042
+          "value": 0.869583
         },
         {
           "id": "mid_resource_recovery",
           "name": "mid-resource reconnect recovery",
           "statistic": "p95",
           "unit": "ms",
-          "value": 1.743042
+          "value": 1.384709
         },
         {
           "id": "superseded_response",
           "name": "superseded resume response handling",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.111875
+          "value": 0.128875
         },
         {
           "id": "superseded_response",
           "name": "superseded resume response handling",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.129166
+          "value": 0.306542
         },
         {
           "id": "active_response",
           "name": "active resume response handling",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.21725
+          "value": 0.252709
         },
         {
           "id": "active_response",
           "name": "active resume response handling",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.333125
+          "value": 0.308833
         },
         {
           "id": "production_reconnect_suite_ms",
           "name": "production reconnect boundary suite",
           "statistic": "wall",
           "unit": "ms",
-          "value": 29437.497249804437
+          "value": 36019.15775006637
         }
       ],
       "name": "Reconnect",
       "notes": [
+        "Wire negative proofs use decoded acknowledgements plus exact handler counters, revisions, and store state after bounded connection shutdown; they do not infer absence from short timeouts.",
         "Superseded resume-attempt inertness is measured against the Task 23 client generation guard in the macOS driver.",
         "The pre-receipt sample allocates the production EventOutbox identity before a deterministic transport loss delivers zero EVENT frames; a replacement SessionController then replays the exact retained id/sequence/revision and drains it only after an exact-slot acknowledgement.",
         "The old resume response is inert with respect to active/new wire, event/action identity, semantic state, and lifecycle. Task 23 intentionally reports .superseded, marks the old controller diverged, and closes only its transport; those expected old-lifecycle effects are measured explicitly."
@@ -954,19 +917,19 @@
           "passed": true
         },
         {
-          "detail": "20 child exit statuses checked",
+          "detail": "20 bounded child exit statuses checked",
           "id": "standalone_pty_exit_success",
           "name": "standalone terminal command exits successfully",
           "passed": true
         },
         {
-          "detail": "20 production PTY exit statuses checked after the final exact offset",
+          "detail": "20 production OutputRing captures reached exact byte offset 6912 and then natural EOF before explicit shutdown",
           "id": "embedded_pty_eof_exact",
-          "name": "embedded terminal reaches natural successful EOF with no trailing bytes",
+          "name": "embedded terminal reaches exact output and bounded natural EOF",
           "passed": true
         },
         {
-          "detail": "20 samples aggregated; p50 1 frames, each at most 16384 bytes",
+          "detail": "20 samples aggregated; p50 154 frames, each at most 16384 bytes",
           "id": "embedded_terminal_frame_bounds",
           "name": "embedded terminal frames preserve exact offsets and bounds",
           "passed": true
@@ -978,7 +941,7 @@
           "passed": true
         },
         {
-          "detail": "every active SessionController delivery decoded one framed SRUITerminalData carrying exactly 6912 payload bytes at offset zero; the renderer-owned TerminalSession ended at 6912; framed envelope byte counts: [6922]",
+          "detail": "every active SessionController delivery decoded one framed SRUITerminalData carrying exactly 6912 payload bytes at offset zero; the renderer-owned TerminalSession ended at 6912; framed envelope byte counts: [6923]",
           "id": "terminal_offsets_exact",
           "name": "framed embedded terminal payload and offsets remain exact",
           "passed": true
@@ -990,7 +953,7 @@
           "passed": true
         },
         {
-          "detail": "20/20 embedded and 20/20 standalone TerminalView completions crossed the configured draw-visible boundary and produced content-distinct bitmaps; full mode additionally required nonblank, nonuniform client-only composited captures; embedded visibility provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; standalone visibility provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; embedded composited fingerprints: [\"4fa708a5da1d635c15ad19010349023e3064a3d9407b73b317beb149e64cd8c1\"]; standalone composited fingerprints: [\"12b12e48b07e6c24a820f342eb502fd874855c3e8d4609cdc06292cd54c9e016\", \"28f12e79bc64c59b5fb18c3121f4c8bc4e40e3245cb7c0d1968ad2fd75e93dbe\", \"2fe3ae5122549135ac918ebb23c6f878322cde23454549ceba76c3547f058b2e\", \"5141d4a957f992073bb98c0cc49ef15c7d5c68e87c1e4f84d21623ce3996ad2a\", \"664f8ce4b2b7e7de2f5167fb2b8fd7bd7792b812ad2153bc49e39a6784cff805\", \"77bc8876723fdc2239e955971e6dcfc923aa9ae3d5ab4deb5091532c0f6dd82f\", \"862a83f16208e85a3439664d96ca2c1336b9657b805bd2b3f0f175fe807445a2\", \"96165413fe372f11d697dbd5d4cc67c0b983fb74dd9da2387207efbbd4830a39\", \"978ae248382719a20268bcb32a52506fa06acd3be9551f07129068b54208adc5\", \"99dd133b137136c03c3b7123f1cc2869f4a21225c43b095c8a11d077ed0f322f\", \"a21edb6dbe47256facd053d7912001e13b6c60a9ccce9306e43dc39eb0b6fce5\", \"a9a615464ccc0daf27ffcc147929d06abf0828cd8e4ee1334742d24eb6bacbc9\", \"ac7948e1eaddad5b6dd776c8742f7f5acf502ba3ae07b9feface42f46e67868d\", \"ad48ebcae6fec79569e8e90a3949f8fe552f6f39953ec172e7f9a65ce5d48baf\", \"b50a0710a9e8fb8b0500240f36122f4b2de2ee1a688c52751f6fd0b00406ffbb\", \"cacaa40ed3dc94d6b65a9dab9296bfe9f59e1a182df7eb4c9b3634ba81481869\", \"d0cda6b6c3bd620eb225faecbdbdc7d8998728d86eb9461b38c29aafb82cf28c\", \"e3efd89a87a17515df86bb03df0ba7d0d5f6c273790f0ee941b4e1b73be7069f\"]",
+          "detail": "20/20 embedded and 20/20 standalone TerminalView completions crossed the configured draw-visible boundary and produced content-distinct bitmaps; full mode additionally required nonblank, nonuniform client-only composited captures; embedded visibility provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; standalone visibility provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; embedded composited fingerprints: [\"0dc05dba9000af4570e1bf6a19a6f883d70c1ff158f4b7637614f131d0aaa393\", \"a1c897d8b65ac0fade800b013c3e6f94d3913c7a45282bdf807c4d29e69f83c7\", \"ba2dc6e19f34c045808a1a4f9742bf90fdb0ab08725b7eab7e64612a056ed05f\"]; standalone composited fingerprints: [\"1cf5986ec7901722e7350b92d3b0231ccad75e35867ed23c607fef3564d77e5f\", \"2922132788342273a5c1a6dde7d9458960872b81a3c9231479c72c7f4ccf0106\", \"2ff432b9624c460e213353e4f994c52764de2b61feb9c1b28b10060a1c92a3c3\", \"3eb8e3f082a77045767507bea3679befbf416247a44d6457275f26090a30cd94\", \"4292db3018525e0f615dd44798cb4a5c6d2f1e21451aebd934d877f0cb1ab4be\", \"4338970efc306dcee249f23fa7bc0f8cffba8739449bbd7c71a56ba0e5448b2f\", \"45cbef6594a6f29ca3838cf8c267b8d75a666b6ecc30ebf41cf5b5109931257c\", \"62d49ae7267521c6f53565eb0a3d1a9b3bd144f886f0e09ee9f5747800d87405\", \"653420d6cba8d2ab3a5fcce7cfb93b7834aab5c0e4a38177b196642c395f2b07\", \"6875924888d49829137c6a415eb19453e82edd23791bd0a4ccc38e426b2d0368\", \"6e11d0b34fe9c4da36bee5f7a276469dc392af1cf41df38cedf1618417e8e064\", \"75aeeee86a3534d4ac9ad99277a740db1cf0f53ea70d8be7af3312f6f40fe1f8\", \"913a4da64d7da5bf47a3bc41324c76653ba1e7b5032e62e2b1cf6c77d07241eb\", \"b98a9705fbb75dc9c477f21e3bcc5a53d628e5caa3a610fb2bade35fbb97f3d7\", \"c7b386c69d56dc40b26fcc454328c2714aa4cd0b3f8bdf0e8d6e76589598f74f\", \"c8757bdc623f7cadc6397ed2c37c2c4fecba370fa1716be5843c10758a2b4d86\", \"e527da809b8e333b4b6cede2fa3801819b44f9983f36588a02ad25939d49fd29\"]",
           "id": "terminal_display_draw_completion",
           "name": "standalone and embedded terminal visible completions are actual draws",
           "passed": true
@@ -1015,49 +978,49 @@
           "name": "embedded SRUI PTY exact ANSI capture and framing",
           "statistic": "p50",
           "unit": "ms",
-          "value": 11.146916999999998
+          "value": 9.441875000000001
         },
         {
           "id": "embedded_pty_interaction_ms",
           "name": "embedded SRUI PTY exact ANSI capture and framing",
           "statistic": "p95",
           "unit": "ms",
-          "value": 12.440334
+          "value": 12.319791
         },
         {
           "id": "embedded_pty_interaction_ms",
           "name": "embedded SRUI PTY exact ANSI capture and framing",
           "statistic": "p99",
           "unit": "ms",
-          "value": 13.708083
+          "value": 14.19925
         },
         {
           "id": "standalone_pty_interaction_ms",
           "name": "standalone PTY exact ANSI interaction",
           "statistic": "p50",
           "unit": "ms",
-          "value": 9.58675
+          "value": 9.154542
         },
         {
           "id": "standalone_pty_interaction_ms",
           "name": "standalone PTY exact ANSI interaction",
           "statistic": "p95",
           "unit": "ms",
-          "value": 15.313291999999999
+          "value": 10.499457999999999
         },
         {
           "id": "standalone_pty_interaction_ms",
           "name": "standalone PTY exact ANSI interaction",
           "statistic": "p99",
           "unit": "ms",
-          "value": 25.872709
+          "value": 13.457959
         },
         {
           "id": "terminal_retention_loss_ms",
           "name": "terminal reconnect retention-loss decision",
           "statistic": "sample",
           "unit": "ms",
-          "value": 0.001
+          "value": 0.000417
         },
         {
           "id": "terminal_payload_bytes",
@@ -1071,126 +1034,126 @@
           "name": "embedded terminal frame count",
           "statistic": "p50",
           "unit": "messages",
-          "value": 1.0
+          "value": 154.0
         },
         {
           "id": "embedded_terminal_frame_count",
           "name": "embedded terminal frame count",
           "statistic": "p95",
           "unit": "messages",
-          "value": 1.0
+          "value": 246.0
         },
         {
           "id": "embedded_terminal_frame_count",
           "name": "embedded terminal frame count",
           "statistic": "p99",
           "unit": "messages",
-          "value": 1.0
+          "value": 252.0
         },
         {
           "id": "client_terminal.decode_visible",
           "name": "embedded SRUI Terminal decode-to-visible",
           "statistic": "p50",
           "unit": "ms",
-          "value": 19.918166666666668
+          "value": 19.003708333333332
         },
         {
           "id": "client_terminal.decode_visible",
           "name": "embedded SRUI Terminal decode-to-visible",
           "statistic": "p95",
           "unit": "ms",
-          "value": 22.00525
+          "value": 19.852833333333333
         },
         {
           "id": "client_terminal.decode_visible",
           "name": "embedded SRUI Terminal decode-to-visible",
           "statistic": "p99",
           "unit": "ms",
-          "value": 24.429
+          "value": 26.64091666666667
         },
         {
           "id": "client_terminal.draw_only",
           "name": "embedded SRUI Terminal draw-only",
           "statistic": "p50",
           "unit": "ms",
-          "value": 14.96025
+          "value": 12.008375
         },
         {
           "id": "client_terminal.draw_only",
           "name": "embedded SRUI Terminal draw-only",
           "statistic": "p95",
           "unit": "ms",
-          "value": 20.351791666666667
+          "value": 18.184
         },
         {
           "id": "client_terminal.draw_only",
           "name": "embedded SRUI Terminal draw-only",
           "statistic": "p99",
           "unit": "ms",
-          "value": 23.237166666666667
+          "value": 18.240791666666667
         },
         {
           "id": "standalone_terminal.decode_visible",
           "name": "standalone TerminalSession and TerminalView decode-to-visible",
           "statistic": "p50",
           "unit": "ms",
-          "value": 20.496875
+          "value": 18.946291666666667
         },
         {
           "id": "standalone_terminal.decode_visible",
           "name": "standalone TerminalSession and TerminalView decode-to-visible",
           "statistic": "p95",
           "unit": "ms",
-          "value": 25.26654166666667
+          "value": 19.628
         },
         {
           "id": "standalone_terminal.decode_visible",
           "name": "standalone TerminalSession and TerminalView decode-to-visible",
           "statistic": "p99",
           "unit": "ms",
-          "value": 25.4255
+          "value": 19.644125
         },
         {
           "id": "standalone_terminal.draw_only",
           "name": "standalone TerminalView draw-only",
           "statistic": "p50",
           "unit": "ms",
-          "value": 17.512708333333332
+          "value": 11.818541666666667
         },
         {
           "id": "standalone_terminal.draw_only",
           "name": "standalone TerminalView draw-only",
           "statistic": "p95",
           "unit": "ms",
-          "value": 24.374791666666667
+          "value": 12.710833333333333
         },
         {
           "id": "standalone_terminal.draw_only",
           "name": "standalone TerminalView draw-only",
           "statistic": "p99",
           "unit": "ms",
-          "value": 24.52925
+          "value": 12.745458333333334
         },
         {
           "id": "terminal_display.embedded_to_standalone_decode_ratio",
           "name": "embedded-to-standalone terminal decode-to-visible",
           "statistic": "p50",
           "unit": "ratio",
-          "value": 0.9717660212430758
+          "value": 1.00303049629325
         },
         {
           "id": "terminal_display.embedded_to_standalone_draw_ratio",
           "name": "embedded-to-standalone terminal draw-only",
           "statistic": "p50",
           "unit": "ratio",
-          "value": 0.8542510795731671
+          "value": 1.016062331435421
         },
         {
           "id": "client_terminal.frame_bytes",
           "name": "client terminal framed envelope",
           "statistic": "exact",
           "unit": "bytes",
-          "value": 6922
+          "value": 6923
         },
         {
           "id": "client_terminal.raster_completions",
@@ -1209,7 +1172,7 @@
       ],
       "name": "Terminal",
       "notes": [
-        "Standalone and embedded samples both include production PTY spawn, identical shell execution, EOF, and exact ANSI output; embedded additionally captures and frames the bytes. The embedded EOF boundary is event-driven and does not poll process state.",
+        "Both clocks start immediately before PTY allocation and stop when the identical exact ANSI byte count is first observed. Each path then drains to bounded natural EOF and rejects trailing bytes before reporting success. Standalone blocking I/O runs in spawn_blocking behind a five-second watchdog and one nonblocking-reader cleanup path; embedded observes production OutputRing frames and offsets through PTYManager subscriptions. Process teardown occurs after the timed boundary and EOF proof.",
         "Embedded decode-to-visible starts before a framed 6,912-byte SRUITerminalData enters BenchmarkTransport, then crosses SessionController, the renderer-owned TerminalSession, the renderer-created TerminalView snapshot subscription, and the configured presentation boundary.",
         "The standalone display baseline feeds the identical Data value at offset zero through fresh production TerminalSession and TerminalView instances, using the embedded view's exact grid and bounds. The reported ratios compare p50 display completion on like-for-like content and geometry.",
         "Full mode starts an exact TerminalView-ROI ScreenCaptureKit stream and verifies a nonblank, nonuniform baseline before timing. After the production payload action completes, it accepts only a later complete compositor sample whose same-frame ROI fingerprint changed; the reported latency is action-start mach time to that sample's ScreenCaptureKit display time. Exact WindowServer identity, display, client/ROI geometry, and absence of every intersecting visible nonzero-alpha window are checked before and after acceptance. Callback receipt remains metadata rather than the latency clock. Observed embedded provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; standalone provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]. Smoke uses an explicitly named offscreen bitmap draw and is not presentation evidence.",
@@ -1226,19 +1189,19 @@
     {
       "assertions": [
         {
-          "detail": "expected=21, native=21 semantic=true controls=true, WebKit=21 semantic=true elements-and-properties=true",
+          "detail": "expected=20, native=20 semantic=true controls=true, WebKit=20 semantic=true elements-and-properties=true",
           "id": "semantic_representation_parity",
           "name": "representative fixture preserves exact parent, type, and property semantics",
           "passed": true
         },
         {
-          "detail": "native presentations=40/40, pixels=40, authorized=true, content=20/20 samples passed; sample 19: full composited client-content proof: first=b5035007cea49854 complete=5322788e1ad2b066 dimensions=958x718/958x718 unmasked=687844/687844 quantized-colors=100/113 non-dominant=12845/63782 nonblank-and-nonuniform=true material-pixels=68991/8 max-channel-delta=219/255 tolerance=2/255 materially-distinct=true same-geometry-and-normalization=true provenance=screencapturekit_first_complete_target_frame_status_level_25_appkit_active/screencapturekit_first_complete_target_frame_status_level_25_appkit_active; WebKit presentations=40/40, pixels=40, authorized=true, content=20/20 samples passed; sample 19: full composited client-content proof: first=b52ca9ee70e20959 complete=e91a297af7e9d8b1 dimensions=958x718/958x718 unmasked=687844/687844 quantized-colors=33/33 non-dominant=2661/19242 nonblank-and-nonuniform=true material-pixels=17400/8 max-channel-delta=255/255 tolerance=2/255 materially-distinct=true same-geometry-and-normalization=true provenance=screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive/screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive; four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before production protobuf decode/apply/render and ends at the accepted ScreenCaptureKit frame displayTime; CPU/host-net-live-allocation/footprint-growth use a separate production decode/apply/display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only production decode/apply/display-submission pass; four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before the corresponding hidden WebKit load sequence and ends at the accepted ScreenCaptureKit frame displayTime; CPU/host-net-live-allocation/footprint-growth use a separate hidden-load plus display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only hidden-load plus display-submission pass",
+          "detail": "native presentations=40/40, pixels=40, authorized=true, content=20/20 samples passed; sample 19: full composited client-content proof: first=d8727085c87f795c complete=5b1884aeb62feef4 dimensions=958x718/958x718 unmasked=687844/687844 quantized-colors=308/88 non-dominant=158730/60918 nonblank-and-nonuniform=true material-pixels=687327/8 max-channel-delta=243/255 tolerance=2/255 materially-distinct=true same-geometry-and-normalization=true provenance=screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive/screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive; shared candidate lifecycle: srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | srui/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted; WebKit presentations=40/40, pixels=40, authorized=true, content=20/20 samples passed; sample 19: full composited client-content proof: first=83230ab95746e2bb complete=3c8f9b5fa15e08c8 dimensions=958x718/958x718 unmasked=687844/687844 quantized-colors=32/32 non-dominant=2659/17688 nonblank-and-nonuniform=true material-pixels=15847/8 max-channel-delta=255/255 tolerance=2/255 materially-distinct=true same-geometry-and-normalization=true provenance=screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive/screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive; shared candidate lifecycle: webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/first_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted | webkit/complete_paint:warm_completed->reset_completed->timing_started->host_attached->representation_ingested->display_submitted; four disjoint passes per sample: the shared candidate lifecycle warms and resets before timing; host attachment, prebuilt protobuf ingestion, and display submission occur after the common timestamp; the accepted ScreenCaptureKit frame displayTime ends each visual interval; CPU/host-net-live-allocation/footprint-growth and peak use separate passes; four disjoint passes per sample: the shared candidate lifecycle warms and resets before timing; measured NSWindow creation and attachment, prebuilt HTML-byte ingestion, and display submission occur after the common timestamp; the accepted ScreenCaptureKit frame displayTime ends each visual interval; CPU/host-net-live-allocation/footprint-growth and peak use separate measured-host passes",
           "id": "paint_completion_observed",
           "name": "candidate production state reaches a verified composited target-pixel frame",
           "passed": true
         },
         {
-          "detail": "host 24615, helpers [24656, 24657, 24658, 24715, 24716, 24774, 24775, 24820, 24821, 24849, 24850, 24877, 24878, 24904, 24905, 24932, 24933, 24959, 24960, 24987, 24988, 25016, 25017, 25048, 25049, 25066, 25076, 25078, 25079, 25105, 25106, 25133, 25134, 25160, 25161, 25187, 25188, 25214, 25215, 25242, 25243]; no process-name matching",
+          "detail": "host 48500, helpers [48502, 48503, 48504, 48559, 48560, 48613, 48614, 48643, 48647, 48676, 48677, 48728, 48729, 48758, 48759, 48785, 48786, 48814, 48815, 48880, 48881, 48888, 48889, 48918, 48919, 48973, 48974, 49002, 49004, 49032, 49033, 49072, 49098, 49124, 49125, 49157, 49158, 49185, 49186, 49237, 49238]; no process-name matching",
           "id": "webkit_helpers_attributed",
           "name": "WebKit helper resources use exact measured process attribution",
           "passed": true
@@ -1250,7 +1213,7 @@
           "passed": true
         },
         {
-          "detail": "window isolation self-test passed: dock=20 status=25 ahead=26 popup=101 target=449985 occluder=449986",
+          "detail": "window isolation self-test passed: dock=20 status=25 ahead=26 popup=101 target=466015 occluder=466016",
           "id": "window_isolation_fail_closed",
           "name": "WindowServer isolation rejects an exact synthetic occluder",
           "passed": true
@@ -1269,168 +1232,168 @@
           "name": "SRUI first on-screen paint crossing display refresh",
           "statistic": "p50",
           "unit": "ms",
-          "value": 50.31104166666666
+          "value": 27.52425
         },
         {
           "id": "srui.first_paint",
           "name": "SRUI first on-screen paint crossing display refresh",
           "statistic": "p95",
           "unit": "ms",
-          "value": 53.47083333333334
+          "value": 27.80270833333333
         },
         {
           "id": "srui.complete_paint",
           "name": "SRUI complete on-screen paint crossing display refresh",
           "statistic": "p50",
           "unit": "ms",
-          "value": 62.855958333333334
+          "value": 78.4465
         },
         {
           "id": "srui.complete_paint",
           "name": "SRUI complete on-screen paint crossing display refresh",
           "statistic": "p95",
           "unit": "ms",
-          "value": 68.96808333333333
+          "value": 120.16945833333332
         },
         {
           "id": "srui.complete_paint",
           "name": "SRUI complete on-screen paint crossing display refresh",
           "statistic": "p99",
           "unit": "ms",
-          "value": 183.83133333333333
+          "value": 161.03966666666665
         },
         {
           "id": "srui.cpu",
           "name": "SRUI candidate process CPU time",
           "statistic": "p50",
           "unit": "ms",
-          "value": 1.0212700000000012
+          "value": 0.7338120000000004
         },
         {
           "id": "srui.cpu",
           "name": "SRUI candidate process CPU time",
           "statistic": "p95",
           "unit": "ms",
-          "value": 1.0466710000000035
+          "value": 0.8286779999999965
         },
         {
           "id": "srui.host_net_live_allocation_blocks",
           "name": "SRUI host-process net live allocation block delta",
           "statistic": "p50",
           "unit": "blocks",
-          "value": 22022
+          "value": 19435
         },
         {
           "id": "srui.host_net_live_allocation_blocks",
           "name": "SRUI host-process net live allocation block delta",
           "statistic": "p95",
           "unit": "blocks",
-          "value": 22334
+          "value": 19738
         },
         {
           "id": "srui.host_net_live_allocation_blocks",
           "name": "SRUI host-process net live allocation block delta",
           "statistic": "p99",
           "unit": "blocks",
-          "value": 22428
+          "value": 19798
         },
         {
           "id": "srui.host_net_live_allocation_bytes",
           "name": "SRUI host-process net live allocation byte delta",
           "statistic": "p50",
           "unit": "bytes",
-          "value": 2173072
+          "value": 1860128
         },
         {
           "id": "srui.host_net_live_allocation_bytes",
           "name": "SRUI host-process net live allocation byte delta",
           "statistic": "p95",
           "unit": "bytes",
-          "value": 2189808
+          "value": 1875664
         },
         {
           "id": "srui.host_net_live_allocation_bytes",
           "name": "SRUI host-process net live allocation byte delta",
           "statistic": "p99",
           "unit": "bytes",
-          "value": 2247408
+          "value": 1996576
         },
         {
           "id": "srui.process_footprint_growth",
           "name": "SRUI host allocated footprint growth",
           "statistic": "p50",
           "unit": "MiB",
-          "value": 0.984375
+          "value": 0.75
         },
         {
           "id": "srui.process_footprint_peak",
           "name": "SRUI maximum concurrently sampled process footprint",
           "statistic": "max",
           "unit": "MiB",
-          "value": 50.235267639160156
+          "value": 44.032073974609375
         },
         {
           "id": "webkit.first_paint",
           "name": "WKWebView first on-screen paint crossing display refresh",
           "statistic": "p50",
           "unit": "ms",
-          "value": 34.50595833333334
+          "value": 145.12395833333335
         },
         {
           "id": "webkit.first_paint",
           "name": "WKWebView first on-screen paint crossing display refresh",
           "statistic": "p95",
           "unit": "ms",
-          "value": 99.88525
+          "value": 187.26995833333334
         },
         {
           "id": "webkit.complete_paint",
           "name": "WKWebView complete on-screen paint crossing display refresh",
           "statistic": "p50",
           "unit": "ms",
-          "value": 125.862375
+          "value": 145.024125
         },
         {
           "id": "webkit.complete_paint",
           "name": "WKWebView complete on-screen paint crossing display refresh",
           "statistic": "p95",
           "unit": "ms",
-          "value": 137.29141666666666
+          "value": 203.18029166666665
         },
         {
           "id": "webkit.cpu",
           "name": "WKWebView host plus attributed helper CPU time",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.27313499999999635
+          "value": 0.5528750000000002
         },
         {
           "id": "webkit.host_net_live_allocation_blocks",
           "name": "WKWebView comparison host-process net live allocation block delta",
           "statistic": "p50",
           "unit": "blocks",
-          "value": 302
+          "value": 60
         },
         {
           "id": "webkit.host_net_live_allocation_blocks",
           "name": "WKWebView comparison host-process net live allocation block delta",
           "statistic": "p95",
           "unit": "blocks",
-          "value": 381
+          "value": 343
         },
         {
           "id": "webkit.host_net_live_allocation_blocks",
           "name": "WKWebView comparison host-process net live allocation block delta",
           "statistic": "p99",
           "unit": "blocks",
-          "value": 399
+          "value": 4067
         },
         {
           "id": "webkit.host_net_live_allocation_bytes",
           "name": "WKWebView comparison host-process net live allocation byte delta",
           "statistic": "p50",
           "unit": "bytes",
-          "value": 44864
+          "value": 24080
         },
         {
           "id": "webkit.host_net_live_allocation_bytes",
@@ -1444,35 +1407,35 @@
           "name": "WKWebView comparison host-process net live allocation byte delta",
           "statistic": "p99",
           "unit": "bytes",
-          "value": 50992
+          "value": 322896
         },
         {
           "id": "webkit.process_footprint_growth",
           "name": "WKWebView host plus helpers allocated footprint growth",
           "statistic": "p50",
           "unit": "MiB",
-          "value": 0.640625
+          "value": 0.125
         },
         {
           "id": "webkit.process_footprint_peak",
           "name": "WKWebView maximum concurrently sampled host-plus-helper footprint",
           "statistic": "max",
           "unit": "MiB",
-          "value": 163.09674835205078
+          "value": 172.23746490478516
         },
         {
           "id": "representation.srui_bytes",
           "name": "SRUI representation",
           "statistic": "exact",
           "unit": "bytes",
-          "value": 981
+          "value": 910
         },
         {
           "id": "representation.html_bytes",
           "name": "HTML representation",
           "statistic": "exact",
           "unit": "bytes",
-          "value": 4652
+          "value": 4420
         },
         {
           "id": "paint.capture_authorization",
@@ -1484,9 +1447,10 @@
       ],
       "name": "Local renderer",
       "notes": [
-        "Every accepted full-paint state requires an exact visible CGWindow, exact client/target geometry, unobscured z-order, and authorized nonblank/nonuniform ScreenCaptureKit pixels from one complete frame. Latency is action-start Mach time through that accepted frame's SCStream displayTime; callback receipt and pixel hashing are verifier metadata, not the presentation timestamp. The two reported timed states per logical sample produced native=40 and WebKit=40 verified captures; capture_authorization=true. Warm/resource/peak passes are not counted in that metric. No permission request is issued.",
+        "Every accepted full-paint state requires an exact visible CGWindow, exact client/target geometry, unobscured z-order, and authorized nonblank/nonuniform ScreenCaptureKit pixels from one complete frame. Latency is action-start Mach time through that accepted frame's SCStream displayTime; callback receipt and pixel hashing are verifier metadata, not the presentation timestamp. The two reported timed states per logical sample produced native=40 and WebKit=40 verified captures; capture_authorization=true. Warm/resource/peak passes are not counted in that metric. No permission request is issued. Full renderer candidates use the benchmark-only accessory activation policy plus canJoinAllSpaces/canJoinAllApplications; those settings are not evidence\u2014the exact on-screen WindowServer entry and accepted composited pixels are.",
         "Each native logical sample uses four separately warmed/reset renderer instances: first-state visual latency, complete two-transaction visual latency, CPU/host-net-live-allocation/footprint-growth through production display submission, and sampler-only peak footprint. Each WebKit sample resets one warmed view between the same four disjoint workloads while preserving exact helper PID identities. Neither resource pass creates ScreenCaptureKit buffers, and the footprint sampler never runs in the CPU/allocation pass.",
         "Native first timing decodes and applies revision 0\u21921 through production initial attach. Native complete timing decodes/applies 0\u21921 and then applies 1\u21922 through production incremental apply. WebKit uses structurally equivalent first and complete DOM states. The measured instance is checked immediately after each accepted presentation for exact semantic/control or DOM state. Full mode additionally requires nonblank, nonuniform, equal-geometry client-content fingerprints that differ between first and complete states.",
+        "The shared candidate lifecycle requires host attach and representation ingest to fall inside the timed window for both candidates, so neither can hoist window construction out of its own measurement. The two readiness proofs are not equally cheap, and that asymmetry is inside the numbers: the native path applies its transaction and inspects state in process, while the WebKit path proves its DOM is ingested with evaluateJavaScript round trips to the WebContent process. After each failed readiness probe it yields and waits 2 ms before trying again, so the true probe interval also includes the cross-process round trip. That harness cost has no native counterpart, so the reported WebKit latency is an upper bound on WebKit's disadvantage rather than a measurement of WebKit rendering alone.",
         "Each candidate process group is birth-identity verified. WebKit CPU, footprint growth, and peak footprint aggregate the host with exact benchmark-only WebContent/network/GPU diagnostic PIDs. Allocation samples are signed default-zone malloc_zone_statistics after-minus-before deltas: blocks_in_use and size_in_use describe net live state, not cumulative allocation traffic. Allocation scope: default malloc zone in the SRUI renderer host process only; signed after-minus-before net live state, not cumulative allocation events. Control scope: default malloc zone in the WebKit comparison host process only; excludes WebContent, Network, and GPU helper processes; signed after-minus-before net live state, not cumulative allocation events. Peak footprint is the maximum simultaneous current-footprint sample at 1 ms cadence strictly inside its separate representative pass, not a sum of per-process lifetime maxima.",
         "Task 34 deliberately defers cumulative allocation-call and requested-byte counts. The supported malloc_history all-events export was rejected after the first real pre-workload SRUI snapshot expanded to 1,902,439,272 bytes; no value from that attempt entered this report. GitHub issue aizlabs/srui#48 tracks a benchmark-only Darwin allocator-interposition counter.",
         "The warmed WKWebView candidate and its host-only allocator deltas are comparison controls only; they are not the production SRUI renderer, do not cover WebKit helper-process allocations, and do not describe SRUI's native AppKit rendering path."
@@ -1517,7 +1481,7 @@
           "passed": true
         },
         {
-          "detail": "1@60Hz=1, 1@120Hz=1, 1@144Hz=1, 1@240Hz=1, 100@60Hz=13, 100@120Hz=24, 100@144Hz=27, 100@240Hz=48, 1000@60Hz=243, 1000@120Hz=367, 1000@144Hz=386, 1000@240Hz=495. This diagnostic measures configured coalescing opportunities; it is not evidence of AppKit's natural invalidation count.",
+          "detail": "1@60Hz=1, 1@120Hz=1, 1@144Hz=1, 1@240Hz=1, 100@60Hz=14, 100@120Hz=25, 100@144Hz=30, 100@240Hz=49, 1000@60Hz=188, 1000@120Hz=294, 1000@144Hz=416, 1000@240Hz=528. This diagnostic measures configured coalescing opportunities; it is not evidence of AppKit's natural invalidation count.",
           "id": "cadence_repaint_independent",
           "name": "synthetic native-change-gated repaint count varies independently",
           "passed": true
@@ -1536,42 +1500,42 @@
           "name": "1 updates semantic decode/apply",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.016
+          "value": 0.015167
         },
         {
           "id": "updates.1.semantic",
           "name": "1 updates semantic decode/apply",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.018458
+          "value": 0.018792
         },
         {
           "id": "updates.1.semantic",
           "name": "1 updates semantic decode/apply",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.145667
+          "value": 0.090584
         },
         {
           "id": "updates.1.visible",
           "name": "1 updates decode-to-visible",
           "statistic": "p50",
           "unit": "ms",
-          "value": 13.133791666666665
+          "value": 19.319333333333333
         },
         {
           "id": "updates.1.visible",
           "name": "1 updates decode-to-visible",
           "statistic": "p95",
           "unit": "ms",
-          "value": 17.873708333333333
+          "value": 19.844416666666667
         },
         {
           "id": "updates.1.visible",
           "name": "1 updates decode-to-visible",
           "statistic": "p99",
           "unit": "ms",
-          "value": 17.974083333333333
+          "value": 19.8995
         },
         {
           "id": "updates.1.bytes",
@@ -1594,42 +1558,42 @@
           "target": 1,
           "target_direction": "max",
           "unit": "ms",
-          "value": 0.103792
+          "value": 0.104583
         },
         {
           "id": "updates.100.semantic",
           "name": "100 updates semantic decode/apply",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.11
+          "value": 0.1145
         },
         {
           "id": "updates.100.semantic",
           "name": "100 updates semantic decode/apply",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.190167
+          "value": 0.116583
         },
         {
           "id": "updates.100.visible",
           "name": "100 updates decode-to-visible",
           "statistic": "p50",
           "unit": "ms",
-          "value": 12.12925
+          "value": 19.088541666666668
         },
         {
           "id": "updates.100.visible",
           "name": "100 updates decode-to-visible",
           "statistic": "p95",
           "unit": "ms",
-          "value": 17.830625
+          "value": 19.84645833333333
         },
         {
           "id": "updates.100.visible",
           "name": "100 updates decode-to-visible",
           "statistic": "p99",
           "unit": "ms",
-          "value": 18.268583333333332
+          "value": 19.878875
         },
         {
           "id": "updates.100.bytes",
@@ -1652,42 +1616,42 @@
           "target": 5,
           "target_direction": "max",
           "unit": "ms",
-          "value": 0.849458
+          "value": 0.891875
         },
         {
           "id": "updates.1000.semantic",
           "name": "1000 updates semantic decode/apply",
           "statistic": "p95",
           "unit": "ms",
-          "value": 0.882791
+          "value": 1.649042
         },
         {
           "id": "updates.1000.semantic",
           "name": "1000 updates semantic decode/apply",
           "statistic": "p99",
           "unit": "ms",
-          "value": 0.968708
+          "value": 1.654666
         },
         {
           "id": "updates.1000.visible",
           "name": "1000 updates decode-to-visible",
           "statistic": "p50",
           "unit": "ms",
-          "value": 19.35354166666667
+          "value": 18.720916666666668
         },
         {
           "id": "updates.1000.visible",
           "name": "1000 updates decode-to-visible",
           "statistic": "p95",
           "unit": "ms",
-          "value": 20.415791666666667
+          "value": 27.192083333333333
         },
         {
           "id": "updates.1000.visible",
           "name": "1000 updates decode-to-visible",
           "statistic": "p99",
           "unit": "ms",
-          "value": 20.639958333333333
+          "value": 34.662791666666664
         },
         {
           "id": "updates.1000.bytes",
@@ -1708,7 +1672,7 @@
           "name": "1 updates at 60Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 37.262375
+          "value": 44.52645833333334
         },
         {
           "id": "cadence.1.60.bytes",
@@ -1764,7 +1728,7 @@
           "name": "1 updates at 120Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 29.25691666666667
+          "value": 33.92875
         },
         {
           "id": "cadence.1.120.bytes",
@@ -1820,7 +1784,7 @@
           "name": "1 updates at 144Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 24.9345
+          "value": 27.164291666666667
         },
         {
           "id": "cadence.1.144.bytes",
@@ -1876,7 +1840,7 @@
           "name": "1 updates at 240Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 19.283458333333332
+          "value": 24.337
         },
         {
           "id": "cadence.1.240.bytes",
@@ -1932,7 +1896,7 @@
           "name": "100 updates at 60Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 336.9655
+          "value": 442.23295833333333
         },
         {
           "id": "cadence.100.60.bytes",
@@ -1981,14 +1945,14 @@
           "name": "100 updates at 60Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 13
+          "value": 14
         },
         {
           "id": "cadence.100.120.visible",
           "name": "100 updates at 120Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 420.952625
+          "value": 588.3350833333334
         },
         {
           "id": "cadence.100.120.bytes",
@@ -2037,14 +2001,14 @@
           "name": "100 updates at 120Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 24
+          "value": 25
         },
         {
           "id": "cadence.100.144.visible",
           "name": "100 updates at 144Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 445.4906666666667
+          "value": 691.2190416666666
         },
         {
           "id": "cadence.100.144.bytes",
@@ -2093,14 +2057,14 @@
           "name": "100 updates at 144Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 27
+          "value": 30
         },
         {
           "id": "cadence.100.240.visible",
           "name": "100 updates at 240Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 624.8140416666666
+          "value": 996.0132083333334
         },
         {
           "id": "cadence.100.240.bytes",
@@ -2149,14 +2113,14 @@
           "name": "100 updates at 240Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 48
+          "value": 49
         },
         {
           "id": "cadence.1000.60.visible",
           "name": "1000 updates at 60Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 6366.78125
+          "value": 6374.336208333333
         },
         {
           "id": "cadence.1000.60.bytes",
@@ -2205,14 +2169,14 @@
           "name": "1000 updates at 60Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 243
+          "value": 188
         },
         {
           "id": "cadence.1000.120.visible",
           "name": "1000 updates at 120Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 6362.558541666667
+          "value": 8791.910958333334
         },
         {
           "id": "cadence.1000.120.bytes",
@@ -2261,14 +2225,14 @@
           "name": "1000 updates at 120Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 367
+          "value": 294
         },
         {
           "id": "cadence.1000.144.visible",
           "name": "1000 updates at 144Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 6361.722666666667
+          "value": 12808.693875
         },
         {
           "id": "cadence.1000.144.bytes",
@@ -2317,14 +2281,14 @@
           "name": "1000 updates at 144Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 386
+          "value": 416
         },
         {
           "id": "cadence.1000.240.visible",
           "name": "1000 updates at 240Hz decode-to-visible",
           "statistic": "sample",
           "unit": "ms",
-          "value": 6362.467208333333
+          "value": 14338.667708333334
         },
         {
           "id": "cadence.1000.240.bytes",
@@ -2373,7 +2337,7 @@
           "name": "1000 updates at 240Hz synthetic change-gated repaint count",
           "statistic": "exact",
           "unit": "repaints",
-          "value": 495
+          "value": 528
         },
         {
           "id": "idle.bytes",
@@ -2430,7 +2394,7 @@
     {
       "assertions": [
         {
-          "detail": "largest p50 increase 5.1883 ms versus the measured local frame budget of 8.3333 ms; full compositor mode applies this numeric correctness gate; paired injected transaction remained blocked through local visible completion in 640/640 probes=true; configured delay state was verified at the exact action boundary in 640/640 probes=true, with a nonzero transport delay still active in 480/480 nonzero-RTT probes; local_state_checks=truepaired p95/p99 deltas were 9.5023/12.5107 ms; production renderer callbacks=240",
+          "detail": "largest p50 increase 2.9034 ms versus the measured local frame budget of 8.3333 ms; full compositor mode applies this numeric correctness gate; paired injected transaction remained blocked through local visible completion in 640/640 probes=true; configured delay state was verified at the exact action boundary in 640/640 probes=true, with a nonzero transport delay still active in 480/480 nonzero-RTT probes; local_state_checks=true; paired p95/p99 deltas were 14.2338/97.3854 ms; production renderer callbacks=240",
           "id": "local_latency_independent",
           "name": "mounted local interactions do not acquire one RTT",
           "passed": true
@@ -2454,7 +2418,7 @@
           "passed": true
         },
         {
-          "detail": "sample 1: 16493 framed bytes / 1 message: measured 17.5221 ms >= theoretical 15.7290 ms; exact_event=true; sample 2: 16493 framed bytes / 1 message: measured 17.0053 ms >= theoretical 15.7290 ms; exact_event=true; sample 3: 16493 framed bytes / 1 message: measured 16.9598 ms >= theoretical 15.7290 ms; exact_event=true; 49479 total bandwidth bytes; lost and interrupted events remained in EventOutbox and replayed through replacement SessionControllers",
+          "detail": "sample 1: 16493 framed bytes / 1 message: measured 17.0364 ms >= theoretical 15.7290 ms; exact_event=true; sample 2: 16493 framed bytes / 1 message: measured 16.9824 ms >= theoretical 15.7290 ms; exact_event=true; sample 3: 16493 framed bytes / 1 message: measured 16.9623 ms >= theoretical 15.7290 ms; exact_event=true; 49479 total bandwidth bytes; lost and interrupted events remained in EventOutbox and replayed through replacement SessionControllers",
           "id": "impairments_use_session",
           "name": "bandwidth delay, loss, and interruption exercise session recovery",
           "passed": true
@@ -2476,7 +2440,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 13.537333333333335
+          "value": 16.40075
         },
         {
           "id": "interaction.caret_movement.rtt.0",
@@ -2485,7 +2449,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.060958333333332
+          "value": 24.605416666666667
         },
         {
           "id": "interaction.caret_movement.rtt.0",
@@ -2494,7 +2458,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.925208333333334
+          "value": 27.538625
         },
         {
           "id": "interaction.hover.rtt.0",
@@ -2503,7 +2467,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.519333333333332
+          "value": 15.769791666666666
         },
         {
           "id": "interaction.hover.rtt.0",
@@ -2512,7 +2476,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 24.5905
+          "value": 20.00958333333333
         },
         {
           "id": "interaction.hover.rtt.0",
@@ -2521,7 +2485,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 25.23229166666667
+          "value": 20.748166666666666
         },
         {
           "id": "interaction.ime_composition.rtt.0",
@@ -2530,7 +2494,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.371958333333335
+          "value": 17.66379166666667
         },
         {
           "id": "interaction.ime_composition.rtt.0",
@@ -2539,7 +2503,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.499333333333333
+          "value": 23.57475
         },
         {
           "id": "interaction.ime_composition.rtt.0",
@@ -2548,7 +2512,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.61145833333333
+          "value": 24.86779166666667
         },
         {
           "id": "interaction.menu_opening.rtt.0",
@@ -2557,7 +2521,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 32.937916666666666
+          "value": 46.898208333333336
         },
         {
           "id": "interaction.menu_opening.rtt.0",
@@ -2566,7 +2530,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 35.94954166666666
+          "value": 58.484833333333334
         },
         {
           "id": "interaction.menu_opening.rtt.0",
@@ -2575,7 +2539,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 63.644
+          "value": 140.70695833333335
         },
         {
           "id": "interaction.pressed.rtt.0",
@@ -2584,7 +2548,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 18.747666666666667
+          "value": 17.974833333333333
         },
         {
           "id": "interaction.pressed.rtt.0",
@@ -2593,7 +2557,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.641875
+          "value": 19.22908333333333
         },
         {
           "id": "interaction.pressed.rtt.0",
@@ -2602,7 +2566,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 24.65725
+          "value": 19.33054166666667
         },
         {
           "id": "interaction.scrolling.rtt.0",
@@ -2611,7 +2575,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.528583333333334
+          "value": 24.152458333333332
         },
         {
           "id": "interaction.scrolling.rtt.0",
@@ -2620,7 +2584,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.22958333333333
+          "value": 26.14695833333333
         },
         {
           "id": "interaction.scrolling.rtt.0",
@@ -2629,7 +2593,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.445125
+          "value": 26.566958333333332
         },
         {
           "id": "interaction.text_entry.rtt.0",
@@ -2638,7 +2602,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 13.4375
+          "value": 21.86295833333333
         },
         {
           "id": "interaction.text_entry.rtt.0",
@@ -2647,7 +2611,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.331208333333333
+          "value": 35.868291666666664
         },
         {
           "id": "interaction.text_entry.rtt.0",
@@ -2656,7 +2620,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.561791666666668
+          "value": 37.993125
         },
         {
           "id": "interaction.text_selection.rtt.0",
@@ -2665,7 +2629,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 13.210083333333333
+          "value": 17.856458333333332
         },
         {
           "id": "interaction.text_selection.rtt.0",
@@ -2674,7 +2638,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.843666666666667
+          "value": 26.6935
         },
         {
           "id": "interaction.text_selection.rtt.0",
@@ -2683,28 +2647,28 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 24.92670833333333
+          "value": 27.371208333333332
         },
         {
           "id": "server_feedback.rtt.0",
           "name": "server-dependent input-to-visible at 0ms RTT",
           "statistic": "p50",
           "unit": "ms",
-          "value": 10.518541666666666
+          "value": 11.053083333333333
         },
         {
           "id": "server_feedback.rtt.0",
           "name": "server-dependent input-to-visible at 0ms RTT",
           "statistic": "p95",
           "unit": "ms",
-          "value": 16.729708333333335
+          "value": 18.883166666666668
         },
         {
           "id": "server_feedback.rtt.0",
           "name": "server-dependent input-to-visible at 0ms RTT",
           "statistic": "p99",
           "unit": "ms",
-          "value": 16.729708333333335
+          "value": 18.883166666666668
         },
         {
           "id": "interaction.caret_movement.rtt.100",
@@ -2713,7 +2677,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.83366666666667
+          "value": 18.887
         },
         {
           "id": "interaction.caret_movement.rtt.100",
@@ -2722,7 +2686,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.331125
+          "value": 20.028166666666667
         },
         {
           "id": "interaction.caret_movement.rtt.100",
@@ -2731,7 +2695,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 22.17729166666667
+          "value": 27.11875
         },
         {
           "id": "interaction.hover.rtt.100",
@@ -2740,7 +2704,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 15.463125
+          "value": 18.855083333333333
         },
         {
           "id": "interaction.hover.rtt.100",
@@ -2749,7 +2713,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 18.38595833333333
+          "value": 21.354208333333332
         },
         {
           "id": "interaction.hover.rtt.100",
@@ -2758,7 +2722,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 18.42366666666667
+          "value": 25.53075
         },
         {
           "id": "interaction.ime_composition.rtt.100",
@@ -2767,7 +2731,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.47475
+          "value": 19.24970833333333
         },
         {
           "id": "interaction.ime_composition.rtt.100",
@@ -2776,7 +2740,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.03879166666667
+          "value": 19.66258333333333
         },
         {
           "id": "interaction.ime_composition.rtt.100",
@@ -2785,7 +2749,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 26.001416666666668
+          "value": 19.729833333333332
         },
         {
           "id": "interaction.menu_opening.rtt.100",
@@ -2794,7 +2758,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 33.90004166666667
+          "value": 38.426875
         },
         {
           "id": "interaction.menu_opening.rtt.100",
@@ -2803,7 +2767,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 36.49279166666666
+          "value": 64.07804166666666
         },
         {
           "id": "interaction.menu_opening.rtt.100",
@@ -2812,7 +2776,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 37.078916666666665
+          "value": 64.23933333333333
         },
         {
           "id": "interaction.pressed.rtt.100",
@@ -2821,7 +2785,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 18.710708333333333
+          "value": 19.362625
         },
         {
           "id": "interaction.pressed.rtt.100",
@@ -2830,7 +2794,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 25.074375
+          "value": 19.781458333333333
         },
         {
           "id": "interaction.pressed.rtt.100",
@@ -2839,7 +2803,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 25.19141666666667
+          "value": 20.022333333333332
         },
         {
           "id": "interaction.scrolling.rtt.100",
@@ -2848,7 +2812,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.91025
+          "value": 19.442125
         },
         {
           "id": "interaction.scrolling.rtt.100",
@@ -2857,7 +2821,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.99220833333333
+          "value": 27.203333333333333
         },
         {
           "id": "interaction.scrolling.rtt.100",
@@ -2866,7 +2830,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 18.547375
+          "value": 27.426125
         },
         {
           "id": "interaction.text_entry.rtt.100",
@@ -2875,7 +2839,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.327833333333334
+          "value": 18.795
         },
         {
           "id": "interaction.text_entry.rtt.100",
@@ -2884,7 +2848,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.111666666666668
+          "value": 19.57333333333333
         },
         {
           "id": "interaction.text_entry.rtt.100",
@@ -2893,7 +2857,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.688875
+          "value": 19.634
         },
         {
           "id": "interaction.text_selection.rtt.100",
@@ -2902,7 +2866,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.832708333333333
+          "value": 19.25795833333333
         },
         {
           "id": "interaction.text_selection.rtt.100",
@@ -2911,7 +2875,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 18.54433333333333
+          "value": 19.61595833333333
         },
         {
           "id": "interaction.text_selection.rtt.100",
@@ -2920,28 +2884,28 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.522125
+          "value": 19.843666666666667
         },
         {
           "id": "server_feedback.rtt.100",
           "name": "server-dependent input-to-visible at 100ms RTT",
           "statistic": "p50",
           "unit": "ms",
-          "value": 121.12608333333333
+          "value": 127.321625
         },
         {
           "id": "server_feedback.rtt.100",
           "name": "server-dependent input-to-visible at 100ms RTT",
           "statistic": "p95",
           "unit": "ms",
-          "value": 121.53725
+          "value": 127.86045833333333
         },
         {
           "id": "server_feedback.rtt.100",
           "name": "server-dependent input-to-visible at 100ms RTT",
           "statistic": "p99",
           "unit": "ms",
-          "value": 121.53725
+          "value": 127.86045833333333
         },
         {
           "id": "interaction.caret_movement.rtt.300",
@@ -2950,7 +2914,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.88825
+          "value": 11.042041666666666
         },
         {
           "id": "interaction.caret_movement.rtt.300",
@@ -2959,7 +2923,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.538708333333332
+          "value": 17.245708333333333
         },
         {
           "id": "interaction.caret_movement.rtt.300",
@@ -2968,7 +2932,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.01083333333333
+          "value": 17.50825
         },
         {
           "id": "interaction.hover.rtt.300",
@@ -2977,7 +2941,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 15.096083333333334
+          "value": 14.0305
         },
         {
           "id": "interaction.hover.rtt.300",
@@ -2986,7 +2950,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.982875
+          "value": 19.740625
         },
         {
           "id": "interaction.hover.rtt.300",
@@ -2995,7 +2959,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.56804166666667
+          "value": 21.086583333333333
         },
         {
           "id": "interaction.ime_composition.rtt.300",
@@ -3004,7 +2968,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.468625
+          "value": 16.491583333333335
         },
         {
           "id": "interaction.ime_composition.rtt.300",
@@ -3013,7 +2977,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.28516666666667
+          "value": 18.258125
         },
         {
           "id": "interaction.ime_composition.rtt.300",
@@ -3022,7 +2986,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.453875
+          "value": 18.48241666666667
         },
         {
           "id": "interaction.menu_opening.rtt.300",
@@ -3031,7 +2995,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 34.129625
+          "value": 45.44329166666667
         },
         {
           "id": "interaction.menu_opening.rtt.300",
@@ -3040,7 +3004,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 36.625625
+          "value": 61.64279166666667
         },
         {
           "id": "interaction.menu_opening.rtt.300",
@@ -3049,7 +3013,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 38.142875
+          "value": 155.87025
         },
         {
           "id": "interaction.pressed.rtt.300",
@@ -3058,7 +3022,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 13.370208333333334
+          "value": 17.27295833333333
         },
         {
           "id": "interaction.pressed.rtt.300",
@@ -3067,7 +3031,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 18.36929166666667
+          "value": 19.05466666666667
         },
         {
           "id": "interaction.pressed.rtt.300",
@@ -3076,7 +3040,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.53
+          "value": 19.07179166666667
         },
         {
           "id": "interaction.scrolling.rtt.300",
@@ -3085,7 +3049,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.264208333333332
+          "value": 18.620375
         },
         {
           "id": "interaction.scrolling.rtt.300",
@@ -3094,7 +3058,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 25.387958333333334
+          "value": 19.43425
         },
         {
           "id": "interaction.scrolling.rtt.300",
@@ -3103,7 +3067,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 25.69675
+          "value": 19.610041666666667
         },
         {
           "id": "interaction.text_entry.rtt.300",
@@ -3112,7 +3076,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.227041666666665
+          "value": 18.751416666666668
         },
         {
           "id": "interaction.text_entry.rtt.300",
@@ -3121,7 +3085,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 19.53954166666667
+          "value": 19.67066666666667
         },
         {
           "id": "interaction.text_entry.rtt.300",
@@ -3130,7 +3094,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.063041666666667
+          "value": 19.981375
         },
         {
           "id": "interaction.text_selection.rtt.300",
@@ -3139,7 +3103,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 14.090708333333334
+          "value": 16.1805
         },
         {
           "id": "interaction.text_selection.rtt.300",
@@ -3148,7 +3112,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.691041666666667
+          "value": 18.09120833333333
         },
         {
           "id": "interaction.text_selection.rtt.300",
@@ -3157,28 +3121,28 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.6975
+          "value": 18.11275
         },
         {
           "id": "server_feedback.rtt.300",
           "name": "server-dependent input-to-visible at 300ms RTT",
           "statistic": "p50",
           "unit": "ms",
-          "value": 329.42175
+          "value": 327.6006666666667
         },
         {
           "id": "server_feedback.rtt.300",
           "name": "server-dependent input-to-visible at 300ms RTT",
           "statistic": "p95",
           "unit": "ms",
-          "value": 333.977625
+          "value": 335.3484583333333
         },
         {
           "id": "server_feedback.rtt.300",
           "name": "server-dependent input-to-visible at 300ms RTT",
           "statistic": "p99",
           "unit": "ms",
-          "value": 333.977625
+          "value": 335.3484583333333
         },
         {
           "id": "interaction.caret_movement.rtt.600",
@@ -3187,7 +3151,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.363458333333334
+          "value": 10.555583333333335
         },
         {
           "id": "interaction.caret_movement.rtt.600",
@@ -3196,7 +3160,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.115166666666667
+          "value": 16.797833333333333
         },
         {
           "id": "interaction.caret_movement.rtt.600",
@@ -3205,7 +3169,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.77404166666667
+          "value": 16.985958333333333
         },
         {
           "id": "interaction.hover.rtt.600",
@@ -3214,7 +3178,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.40083333333333
+          "value": 13.773833333333334
         },
         {
           "id": "interaction.hover.rtt.600",
@@ -3223,7 +3187,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.659958333333332
+          "value": 19.059541666666668
         },
         {
           "id": "interaction.hover.rtt.600",
@@ -3232,7 +3196,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 20.863166666666668
+          "value": 19.425416666666667
         },
         {
           "id": "interaction.ime_composition.rtt.600",
@@ -3241,7 +3205,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.606
+          "value": 10.912541666666666
         },
         {
           "id": "interaction.ime_composition.rtt.600",
@@ -3250,7 +3214,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.452791666666666
+          "value": 18.53604166666667
         },
         {
           "id": "interaction.ime_composition.rtt.600",
@@ -3259,7 +3223,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.570416666666667
+          "value": 18.621291666666668
         },
         {
           "id": "interaction.menu_opening.rtt.600",
@@ -3268,7 +3232,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 33.459
+          "value": 40.211708333333334
         },
         {
           "id": "interaction.menu_opening.rtt.600",
@@ -3277,7 +3241,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 40.152375
+          "value": 60.53854166666667
         },
         {
           "id": "interaction.menu_opening.rtt.600",
@@ -3286,7 +3250,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 41.15475
+          "value": 64.09541666666667
         },
         {
           "id": "interaction.pressed.rtt.600",
@@ -3295,7 +3259,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.862625
+          "value": 18.640666666666668
         },
         {
           "id": "interaction.pressed.rtt.600",
@@ -3304,7 +3268,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.434875
+          "value": 19.048583333333333
         },
         {
           "id": "interaction.pressed.rtt.600",
@@ -3313,7 +3277,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.49729166666667
+          "value": 19.20070833333333
         },
         {
           "id": "interaction.scrolling.rtt.600",
@@ -3322,7 +3286,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.309708333333333
+          "value": 10.357625
         },
         {
           "id": "interaction.scrolling.rtt.600",
@@ -3331,7 +3295,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 25.154625
+          "value": 17.48275
         },
         {
           "id": "interaction.scrolling.rtt.600",
@@ -3340,7 +3304,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 25.20554166666667
+          "value": 18.2725
         },
         {
           "id": "interaction.text_entry.rtt.600",
@@ -3349,7 +3313,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 16.852625
+          "value": 11.155708333333333
         },
         {
           "id": "interaction.text_entry.rtt.600",
@@ -3358,7 +3322,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.071125
+          "value": 17.99875
         },
         {
           "id": "interaction.text_entry.rtt.600",
@@ -3367,7 +3331,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.1345
+          "value": 18.518708333333333
         },
         {
           "id": "interaction.text_selection.rtt.600",
@@ -3376,7 +3340,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 17.31533333333333
+          "value": 11.028416666666667
         },
         {
           "id": "interaction.text_selection.rtt.600",
@@ -3385,7 +3349,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.010291666666667
+          "value": 11.57425
         },
         {
           "id": "interaction.text_selection.rtt.600",
@@ -3394,42 +3358,42 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 21.120875
+          "value": 16.31
         },
         {
           "id": "server_feedback.rtt.600",
           "name": "server-dependent input-to-visible at 600ms RTT",
           "statistic": "p50",
           "unit": "ms",
-          "value": 637.8675833333334
+          "value": 635.6718333333333
         },
         {
           "id": "server_feedback.rtt.600",
           "name": "server-dependent input-to-visible at 600ms RTT",
           "statistic": "p95",
           "unit": "ms",
-          "value": 653.0959166666667
+          "value": 644.0220416666666
         },
         {
           "id": "server_feedback.rtt.600",
           "name": "server-dependent input-to-visible at 600ms RTT",
           "statistic": "p99",
           "unit": "ms",
-          "value": 653.0959166666667
+          "value": 644.0220416666666
         },
         {
           "id": "impairment.bandwidth_transfer",
           "name": "1MiB/s bandwidth-limited production event",
           "statistic": "p50",
           "unit": "ms",
-          "value": 17.00525
+          "value": 16.982375
         },
         {
           "id": "impairment.bandwidth_transfer",
           "name": "1MiB/s bandwidth-limited production event",
           "statistic": "p95",
           "unit": "ms",
-          "value": 17.522125
+          "value": 17.036417
         },
         {
           "id": "impairment.bandwidth_delivered_bytes",
@@ -3457,14 +3421,14 @@
           "name": "controlled production interruption detection",
           "statistic": "p50",
           "unit": "ms",
-          "value": 0.957333
+          "value": 1.58975
         },
         {
           "id": "session_wire.bytes",
           "name": "measured production session wire bytes",
           "statistic": "exact",
           "unit": "bytes",
-          "value": 142145
+          "value": 141506
         },
         {
           "id": "session_wire.messages",
@@ -3480,7 +3444,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 5.188333333333333
+          "value": 2.9033750000000005
         },
         {
           "id": "local_rtt_delta",
@@ -3489,7 +3453,7 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 9.50233333333333
+          "value": 14.23375
         },
         {
           "id": "local_rtt_delta",
@@ -3498,13 +3462,14 @@
           "target": 8.333333333333334,
           "target_direction": "max",
           "unit": "ms",
-          "value": 12.510708333333335
+          "value": 97.38541666666666
         }
       ],
       "name": "Network and local interaction",
       "notes": [
-        "Controls are mounted renderer TextArea, ScrollView, and Button. renderer-produced NSButton context menu was proven as a new exact owned menu-level WindowServer surface in the same ScreenCaptureKit frame used for its presentation timestamp.",
-        "Pressed state is observed between real NSWindow-dispatched mouseDown/mouseUp events and triggers the production ActionTrampoline. renderer-produced NSButton changed at least 1590 target-ROI pixels above the explicit 2/255 per-channel SCStream tolerance on the local AppKit hover path in 20/20 samples; mouseExited then restored every unmasked screenshot pixel within the explicit 5/255 same-API tolerance, with maximum observed channel delta 4/255; renderer-produced NSButton changed at least 1590 target-ROI pixels above the explicit 2/255 per-channel SCStream tolerance on the local AppKit hover path in 20/20 samples; mouseExited then restored every unmasked screenshot pixel within the explicit 5/255 same-API tolerance, with maximum observed channel delta 5/255. Permission-free hover invokes the renderer-produced NSButton's own AppKit entry/exit path and does not claim WindowServer pointer latency.",
+        "Controls are mounted renderer TextArea, ScrollView, and Button. the mounted renderer NSTextView supplied its native context menu, which was proven as a new exact owned menu-level WindowServer surface in the same ScreenCaptureKit frame used for its presentation timestamp.",
+        "The unbundled full benchmark runs with AppKit accessory activation policy so benchmark-only hosts can join the active Space/application set without pretending that foreground activation succeeded. The mounted NSTextView must still become the window first responder with a live input context, and every timed visual transition still requires exact WindowServer and ScreenCaptureKit evidence.",
+        "Pressed feedback uses performClick on the mounted renderer button, accepts its transient action-time composited frame, and triggers the production ActionTrampoline. renderer-produced NSButton changed at least 1590 target-ROI pixels above the explicit 2/255 per-channel SCStream tolerance after deterministic pointer-context injection into production hover reconciliation in 20/20 samples; the outside context then restored every unmasked screenshot pixel within the explicit 5/255 same-API tolerance, with maximum observed channel delta 5/255. Hover injects a deterministic pointer context through benchmark SPI into the production HoverFeedbackButton reconciliation path. These two trials measure SRUI local state-to-visible latency and explicitly exclude OS hardware-event routing latency.",
         "Local frame budget 8.333333 ms came from CGDisplayMode.refreshRate for the benchmark NSScreen.",
         "All impairment traffic traverses SessionController, EventOutbox, SRUIFraming, and replacement-session resume/replay; no benchmark calls Transport.send directly.",
         "For each 1 MiB/s sample, the proof takes the exact outbound framed-byte delta around one awaited SessionController.sendValueChanged call, requires exactly one matching event frame, and requires elapsed wall time >= framed bytes / 1,048,576 bytes/s. Encoding and outbox overhead are inside the measured interval and can only increase that elapsed time.",

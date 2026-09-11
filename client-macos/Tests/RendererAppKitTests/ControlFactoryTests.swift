@@ -1,7 +1,7 @@
 import AppKit
 import SemanticModel
 import Testing
-@testable import RendererAppKit
+@testable @_spi(Benchmark) import RendererAppKit
 @testable import Collections
 
 @MainActor
@@ -20,6 +20,22 @@ private func controlFactoryBitmapSignature(_ view: NSView) -> Data? {
     )
 }
 
+@MainActor
+private final class TestPointerContext {
+    var location = NSPoint(x: -10_000, y: -10_000)
+    var applicationIsActive = true
+    var windowIsVisible = true
+}
+
+@MainActor
+private final class ForcedHitTestView: NSView {
+    weak var forcedHitView: NSView?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        forcedHitView ?? super.hitTest(point)
+    }
+}
+
 private let controlFactoryRequiredTierTypes: [TypeRef] = [
     .surface, .row, .column, .grid, .spacer, .separator, .scroll,
     .text, .richText, .button, .toggle, .textInput, .textArea,
@@ -28,16 +44,21 @@ private let controlFactoryRequiredTierTypes: [TypeRef] = [
 
 private let controlFactoryUnsupportedTypes: [TypeRef] = [
     .dialog, .select, .choiceGroup, .slider, .numberInput,
-    .tabs, .split, .toolbar,
+    .tabs, .split, .menu, .toolbar,
 ]
 
 @MainActor
 struct ControlFactoryTests {
     @Test
-    func buttonHoverFeedbackChangesAndRestoresRaster() throws {
+    func buttonHoverFeedbackReconcilesMissedExitAgainstActualPointerContext() throws {
         let factory = ControlFactory()
         let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
         let button = try #require(handle.view as? HoverFeedbackButton)
+        let pointerContext = TestPointerContext()
+        button.screenPointerLocationProvider = { pointerContext.location }
+        button.applicationActiveProvider = { pointerContext.applicationIsActive }
+        button.windowVisibilityProvider = { _ in pointerContext.windowIsVisible }
+
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 180, height: 44),
             styleMask: [.titled],
@@ -53,40 +74,193 @@ struct ControlFactoryTests {
         button.updateTrackingAreas()
         #expect(button.trackingAreas.isEmpty == false)
 
-        let location = NSPoint(x: button.bounds.midX, y: button.bounds.midY)
-        let entered = try #require(NSEvent.enterExitEvent(
-            with: .mouseEntered,
-            location: location,
-            modifierFlags: [],
-            timestamp: ProcessInfo.processInfo.systemUptime,
-            windowNumber: window.windowNumber,
-            context: nil,
-            eventNumber: 1,
-            trackingNumber: 1,
-            userData: nil
-        ))
-        let exited = try #require(NSEvent.enterExitEvent(
-            with: .mouseExited,
-            location: location,
-            modifierFlags: [],
-            timestamp: ProcessInfo.processInfo.systemUptime,
-            windowNumber: window.windowNumber,
-            context: nil,
-            eventNumber: 2,
-            trackingNumber: 1,
-            userData: nil
-        ))
         let initial = try #require(controlFactoryBitmapSignature(button))
-
-        button.mouseEntered(with: entered)
+        let centerInWindow = button.convert(
+            NSPoint(x: button.bounds.midX, y: button.bounds.midY),
+            to: nil
+        )
+        let centerInScreen = window.convertPoint(toScreen: centerInWindow)
+        pointerContext.location = centerInScreen
+        button.reconcilePointerState()
         let hovered = try #require(controlFactoryBitmapSignature(button))
         #expect(button.isPointerInside)
         #expect(hovered != initial)
 
-        button.mouseExited(with: exited)
+        // No `mouseExited` call: a later paint must discard stale event state by consulting the
+        // real pointer position.
+        pointerContext.location = NSPoint(
+            x: centerInScreen.x + button.bounds.width + 100,
+            y: centerInScreen.y
+        )
         let restored = try #require(controlFactoryBitmapSignature(button))
         #expect(button.isPointerInside == false)
         #expect(restored == initial)
+
+        pointerContext.location = centerInScreen
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+        pointerContext.applicationIsActive = false
+        button.reconcilePointerState()
+        #expect(button.isPointerInside == false)
+
+        pointerContext.applicationIsActive = true
+        pointerContext.windowIsVisible = false
+        button.reconcilePointerState()
+        #expect(button.isPointerInside == false)
+
+        pointerContext.windowIsVisible = true
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+        window.contentView = nil
+        button.reconcilePointerState()
+        #expect(button.isPointerInside == false)
+    }
+
+    @Test
+    func applicationObserversDoNotRetainDiscardedHoverButton() throws {
+        weak var releasedButton: HoverFeedbackButton?
+        try autoreleasepool {
+            let factory = ControlFactory()
+            let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+            let button = try #require(handle.view as? HoverFeedbackButton)
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 180, height: 44),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            window.isReleasedWhenClosed = false
+            window.contentView = button
+            releasedButton = button
+            window.contentView = nil
+            window.close()
+        }
+
+        #expect(releasedButton == nil)
+        NotificationCenter.default.post(
+            name: NSApplication.didBecomeActiveNotification,
+            object: NSApplication.shared
+        )
+        NotificationCenter.default.post(
+            name: NSApplication.didResignActiveNotification,
+            object: NSApplication.shared
+        )
+    }
+
+    @Test
+    func buttonHoverFeedbackYieldsToSameWindowSiblingOverlapAndPressedState() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+        let button = try #require(handle.view as? HoverFeedbackButton)
+        let pointerContext = TestPointerContext()
+        button.screenPointerLocationProvider = { pointerContext.location }
+        button.applicationActiveProvider = { pointerContext.applicationIsActive }
+        button.windowVisibilityProvider = { _ in pointerContext.windowIsVisible }
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 180, height: 44))
+        button.frame = container.bounds
+        container.addSubview(button)
+        let window = NSWindow(
+            contentRect: container.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = container
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        let centerInScreen = window.convertPoint(
+            toScreen: button.convert(
+                NSPoint(x: button.bounds.midX, y: button.bounds.midY),
+                to: nil
+            )
+        )
+        let awayFromButton = NSPoint(
+            x: centerInScreen.x + button.bounds.width + 100,
+            y: centerInScreen.y
+        )
+        pointerContext.location = centerInScreen
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+
+        // Pressed: AppKit already draws its own highlight, so hover must contribute no pixels on
+        // top of it. Same press, pointer on and off the control, must raster identically.
+        button.isHighlighted = true
+        pointerContext.location = awayFromButton
+        button.reconcilePointerState()
+        let pressedWithoutPointer = try #require(controlFactoryBitmapSignature(button))
+        pointerContext.location = centerInScreen
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+        let pressedWithPointer = try #require(controlFactoryBitmapSignature(button))
+        #expect(pressedWithPointer == pressedWithoutPointer)
+        button.isHighlighted = false
+
+        // A sibling drawn over the control owns the pixels under the pointer, so the hover
+        // belongs to it and not to us -- `bounds.contains` alone cannot see that.
+        let overlay = NSView(frame: container.bounds)
+        container.addSubview(overlay, positioned: .above, relativeTo: button)
+        button.reconcilePointerState()
+        #expect(button.isPointerInside == false)
+
+        overlay.removeFromSuperview()
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+    }
+
+    @Test
+    func buttonHoverFeedbackRejectsPointerOutsideAncestorClip() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+        let button = try #require(handle.view as? HoverFeedbackButton)
+        let pointerContext = TestPointerContext()
+        button.screenPointerLocationProvider = { pointerContext.location }
+        button.applicationActiveProvider = { pointerContext.applicationIsActive }
+        button.windowVisibilityProvider = { _ in pointerContext.windowIsVisible }
+
+        let root = ForcedHitTestView(
+            frame: NSRect(x: 0, y: 0, width: 180, height: 44)
+        )
+        let clipView = NSClipView(
+            frame: NSRect(x: 0, y: 0, width: 90, height: 44)
+        )
+        let documentView = NSView(
+            frame: NSRect(x: 0, y: 0, width: 180, height: 44)
+        )
+        button.frame = documentView.bounds
+        documentView.addSubview(button)
+        clipView.documentView = documentView
+        root.addSubview(clipView)
+
+        let window = NSWindow(
+            contentRect: root.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = root
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        let clippedPoint = NSPoint(x: 140, y: button.bounds.midY)
+        #expect(button.bounds.contains(clippedPoint))
+        #expect(button.visibleRect.contains(clippedPoint) == false)
+
+        // Force the independent overlap check to accept the button so this assertion fails if
+        // the visibleRect guard is removed.
+        root.forcedHitView = button
+        pointerContext.location = window.convertPoint(
+            toScreen: button.convert(clippedPoint, to: nil)
+        )
+        button.reconcilePointerState()
+        #expect(button.isPointerInside == false)
     }
 
     @Test(arguments: controlFactoryRequiredTierTypes)
@@ -310,41 +484,6 @@ struct ControlFactoryTests {
         if let adapter = handle.modelAdapter as? TableCollectionAdapter {
             #expect(adapter.rows.isEmpty)
         }
-    }
-
-    @Test
-    func semanticMenuCreatesAndUpdatesRendererOwnedPopup() throws {
-        let factory = ControlFactory()
-        let handle = try factory.makeHandle(
-            for: Node(
-                id: 21,
-                nodeType: .menu,
-                properties: [
-                    .label: .string("Actions"),
-                    .items: .list([
-                        .string("One"),
-                        .string("Two"),
-                        .string("Three"),
-                    ]),
-                ]
-            )
-        )
-        let popUp = try #require(handle.view as? NSPopUpButton)
-
-        #expect(handle.nodeType == .menu)
-        #expect(handle.accessibilityMetadata.label == "Actions")
-        #expect(popUp.itemTitles == ["One", "Two", "Three"])
-        #expect(popUp.menu?.items.map(\.title) == ["One", "Two", "Three"])
-
-        factory.apply(
-            property: .items,
-            value: .list([.string("Updated")]),
-            to: handle
-        )
-        #expect(popUp.itemTitles == ["Updated"])
-
-        factory.apply(property: .items, value: nil, to: handle)
-        #expect(popUp.numberOfItems == 0)
     }
 
     @Test

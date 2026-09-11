@@ -9,12 +9,12 @@ Before changing or interpreting the §31 benchmark suite, read the documents at 
 level:
 
 - `benchmarks/README.md` defines the suite-wide execution, validation, and reporting contract.
-- `benchmarks/parse-render/README.md` is the operational guide for the §31.1 macOS renderer
-  benchmark and its optional diagnostics.
+- `benchmarks/parse-render/README.md` is the operational guide for the live §31.1 macOS renderer
+  benchmark.
 - `benchmarks/parse-render/INSTRUMENTATION_FINDINGS.md` records the detailed evidence, rejected
-  approaches, permission behavior, measurement semantics, reproduction commands, and
-  Linux/Windows portability notes. Read it before changing paint, allocation, footprint,
-  WindowServer, ScreenCaptureKit, or xctrace instrumentation.
+  approaches (including the removed xctrace prototype), permission behavior, measurement
+  semantics, reproduction commands, and Linux/Windows portability notes. Read it before changing
+  paint, allocation, footprint, WindowServer, ScreenCaptureKit, or profiler instrumentation.
 
 The findings document is explanatory, not authoritative: the design document remains the source
 of product requirements, while executable benchmark schemas and assertions define the checked

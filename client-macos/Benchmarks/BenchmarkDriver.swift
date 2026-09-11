@@ -99,48 +99,26 @@ struct BenchmarkDriver {
             cleanupCandidateLifetime()
         }
         // Candidate process-group ownership and parent-birth supervision are established above,
-        // synchronously, before this first AppKit access. Ordinary full renderer candidates
-        // must be eligible to become the foreground application because they provide the
-        // ScreenCaptureKit presentation evidence. Allocation candidates are separate,
-        // ad-hoc-signed xctrace hosts: they retain full-profile sample counts and production
-        // render submission, but provide no compositor evidence. They intentionally leave
-        // AppKit's process-selected policy untouched and never activate, so instrumentation
-        // does not depend on a successful activation-policy transition.
-        let requiresForegroundPresentation =
-            arguments.requiresCompositedPresentation
+        // synchronously, before this first AppKit access. Benchmark executables are unbundled
+        // command-line processes; a regular inactive application can be associated with a
+        // non-active Space, and activation is only a request. Accessory policy still supports the
+        // mounted AppKit controls, key/first-responder setup, menus, and exact compositor checks
+        // exercised below without treating foreground activation as presentation evidence.
         let application = NSApplication.shared
         let applicationDelegate = BenchmarkApplicationDelegate()
         application.delegate = applicationDelegate
-        let requestedActivationPolicy: NSApplication.ActivationPolicy?
-        if requiresForegroundPresentation {
-            requestedActivationPolicy = .regular
-        } else if arguments.isAllocationCaptureCandidate {
-            requestedActivationPolicy = nil
-        } else {
-            requestedActivationPolicy = .accessory
-        }
-        if let requestedActivationPolicy {
-            _ = application.setActivationPolicy(requestedActivationPolicy)
-            guard application.activationPolicy() == requestedActivationPolicy else {
-                cleanupCandidateLifetime()
-                FileHandle.standardError.write(
-                    Data(
-                        "BenchmarkDriver failed: could not establish \(requestedActivationPolicy) activation policy\n".utf8
-                    )
+        let requestedActivationPolicy: NSApplication.ActivationPolicy = .accessory
+        _ = application.setActivationPolicy(requestedActivationPolicy)
+        guard application.activationPolicy() == requestedActivationPolicy else {
+            cleanupCandidateLifetime()
+            FileHandle.standardError.write(
+                Data(
+                    "BenchmarkDriver failed: could not establish \(requestedActivationPolicy) activation policy\n".utf8
                 )
-                Darwin.exit(EXIT_FAILURE)
-            }
-        } else {
-            benchmarkPhase(
-                "allocation candidate leaves activation policy unchanged "
-                    + "rawValue=\(application.activationPolicy().rawValue)"
             )
+            Darwin.exit(EXIT_FAILURE)
         }
         application.finishLaunching()
-        if requiresForegroundPresentation {
-            application.activate()
-        }
-
         var failure: (any Error)?
         Task { @MainActor in
             do {
@@ -181,9 +159,16 @@ struct BenchmarkDriver {
             Fixture.self,
             from: Data(contentsOf: arguments.fixture)
         )
+        let fixtureIndex = try BenchmarkFixtureIndex(fixture: fixture)
         let fixtureOperations = try operations(for: fixture)
         let iterations = arguments.profile == "full" ? 20 : 3
         let fullPaint = arguments.requiresCompositedPresentation
+        if fullPaint, benchmarkConsoleSessionLockState() == true {
+            throw BenchmarkFailure.message(
+                "full benchmark requires an active, unlocked macOS console "
+                    + "session; CGSession reports the screen is locked"
+            )
+        }
 
         if ProcessInfo.processInfo.environment[
             "SRUI_BENCHMARK_WINDOW_ISOLATION_SELF_TEST"
@@ -207,21 +192,6 @@ struct BenchmarkDriver {
                 throw BenchmarkFailure.message(
                     "forced renderer candidate internal failure after descendant setup"
                 )
-            }
-            let allocationControl: AllocationCaptureControl?
-            if let directory = arguments.allocationControlDirectory,
-               let targetRole = arguments.allocationTargetRole {
-                guard candidate == "webkit" || targetRole == "host" else {
-                    throw BenchmarkFailure.message(
-                        "native allocation capture supports only the host role"
-                    )
-                }
-                allocationControl = try AllocationCaptureControl(
-                    directory: directory,
-                    targetRole: targetRole
-                )
-            } else {
-                allocationControl = nil
             }
             let candidatePointerOriginalLocation: CGPoint?
             if fullPaint {
@@ -252,16 +222,14 @@ struct BenchmarkDriver {
                     operations: fixtureOperations,
                     iterations: iterations,
                     fullPaint: fullPaint,
-                    driverPID: arguments.driverPID,
-                    allocationControl: allocationControl
+                    driverPID: arguments.driverPID
                 )
             case "webkit":
                 result = try await runWebCandidate(
                     fixture: fixture,
                     iterations: iterations,
                     fullPaint: fullPaint,
-                    driverPID: arguments.driverPID,
-                    allocationControl: allocationControl
+                    driverPID: arguments.driverPID
                 )
             default:
                 throw BenchmarkFailure.message("unknown renderer candidate \(candidate)")
@@ -277,8 +245,7 @@ struct BenchmarkDriver {
                 expectedDriverPID: arguments.driverPID,
                 expectedHostPID: getpid(),
                 expectedHostBirthUnixNanoseconds:
-                    candidateIdentity.birthUnixNanoseconds,
-                allocationTargetRole: arguments.allocationTargetRole
+                    candidateIdentity.birthUnixNanoseconds
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -330,6 +297,7 @@ struct BenchmarkDriver {
             sections.append(
                 try await mutationAndCadence(
                     fixtureOperations: fixtureOperations,
+                    fixtureIndex: fixtureIndex,
                     iterations: iterations,
                     fullPaint: fullPaint
                 )
@@ -340,6 +308,7 @@ struct BenchmarkDriver {
             sections.append(
                 try await networkAndLocalInteraction(
                     fixtureOperations: fixtureOperations,
+                    fixtureIndex: fixtureIndex,
                     iterations: max(5, iterations),
                     fullPaint: fullPaint
                 )
@@ -349,7 +318,8 @@ struct BenchmarkDriver {
             sections.append(
                 try await reconnect(
                     iterations: iterations,
-                    fixtureOperations: fixtureOperations
+                    fixtureOperations: fixtureOperations,
+                    fixtureIndex: fixtureIndex
                 )
             )
         }

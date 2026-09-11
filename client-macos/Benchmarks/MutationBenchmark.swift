@@ -11,347 +11,11 @@ import SwiftProtobuf
 import Terminal
 import TransportSSH
 import WebKit
-@MainActor
-func mutationRun(
-    baseStore: SemanticStore,
-    fixtureOperations: [SemanticModel.Operation],
-    operations: [SemanticModel.Operation],
-    fullPaint: Bool
-) async throws -> (
-    semanticLatency: Double,
-    visibleLatency: Double,
-    bytes: Int,
-    messages: Int,
-    classifications: [DirtyClassification],
-    rasterized: Bool,
-    stateParity: Bool
-) {
-    let transaction = Transaction(
-        baseRevision: baseStore.revision,
-        operations: operations
-    )
-    let wireBytes = try framed(transactionMessage(transaction))
-
-    let semanticApplier = TransactionApplier(store: baseStore)
-    let semanticStart = clock.now
-    let decodedMessage = try SRUIFraming.decodeFramed(
-        SRUIMessage.self,
-        from: wireBytes
-    )
-    guard case .transaction(let wireTransaction)? = decodedMessage.msg else {
-        throw BenchmarkFailure.message(
-            "framed mutation did not contain a transaction"
-        )
-    }
-    let decoded = try ProtocolDecoder().validateAndConvertTransaction(
-        wire: wireTransaction
-    )
-    guard case .success = semanticApplier.apply(record: decoded) else {
-        throw BenchmarkFailure.message(
-            "mutation transaction did not apply through TransactionApplier"
-        )
-    }
-    let semanticLatency = milliseconds(semanticStart.duration(to: clock.now))
-    let semanticSnapshot = semanticApplier.currentSnapshot
-    let classifications = DirtyClassifier.classify(decoded)
-    guard case .float64(let expectedProgress)? =
-        semanticSnapshot.store.getNode(NodeId(5))?.properties[.value] else {
-        throw BenchmarkFailure.message(
-            "semantic mutation produced no progress value"
-        )
-    }
-
-    let transport = BenchmarkTransport()
-    let renderer = AppKitRenderer()
-    let controller = try await startActiveSession(
-        transport: transport,
-        renderer: renderer,
-        fixtureOperations: fixtureOperations,
-        sessionID: "mutation-\(operations.count)"
-    )
-    do {
-        let warmObservation = try await observeNativePresentation(
-            renderer,
-            fullPaint: fullPaint
-        )
-        guard warmObservation.crossedDisplayRefresh else {
-            throw BenchmarkFailure.message(
-                "steady-state mutation renderer did not warm"
-            )
-        }
-
-        let beforeWire = await transport.snapshot()
-        let expectedRevision = Revision(baseStore.revision.value + 1)
-        let applyProductionMutation: @MainActor () async throws -> Void = {
-            try await transport.injectFromServer(wireBytes)
-            try await waitForRevision(
-                expectedRevision,
-                controller: controller
-            )
-            try await waitUntil {
-                guard let progress = renderer.registry.view(for: NodeId(5))
-                    as? NSProgressIndicator else {
-                    return false
-                }
-                return abs(progress.doubleValue - expectedProgress) < 0.000_001
-            }
-        }
-
-        let presentationObservation: OnScreenPaintObservation
-        let visibleLatency: Double
-        if fullPaint {
-            let windows = renderer.registry.surfaceHandles.compactMap(\.window)
-            guard windows.count == 1,
-                  let window = windows.first,
-                  let progress = renderer.registry.view(for: NodeId(5))
-                    as? NSProgressIndicator,
-                  progress.window === window else {
-                throw BenchmarkFailure.message(
-                    "steady-state mutation fixture must expose one attached "
-                        + "progress target in one presentation window"
-                )
-            }
-            let measured = try await benchmarkMeasurePassiveCompositedChange(
-                window,
-                targetView: progress
-            ) {
-                try await applyProductionMutation()
-            }
-            presentationObservation = measured.observation
-            visibleLatency = measured.presentationLatencyMilliseconds
-        } else {
-            let start = clock.now
-            try await applyProductionMutation()
-            presentationObservation = try await observeNativePresentation(
-                renderer,
-                fullPaint: false
-            )
-            visibleLatency = milliseconds(
-                start.duration(to: presentationObservation.presentedAt)
-            )
-        }
-
-        let afterWire = await transport.snapshot()
-        let productionSnapshot = controller.applier.currentSnapshot
-        let stateParity =
-            productionSnapshot.revision == semanticSnapshot.revision
-                && productionSnapshot.store.getNode(
-                    NodeId(5)
-                )?.properties[.value]
-                    == semanticSnapshot.store.getNode(
-                        NodeId(5)
-                    )?.properties[.value]
-        let measuredBytes =
-            afterWire.inboundBytes - beforeWire.inboundBytes
-        let measuredMessages =
-            afterWire.inboundMessages - beforeWire.inboundMessages
-        await controller.stop()
-        closeRenderer(renderer)
-        return (
-            semanticLatency,
-            visibleLatency,
-            measuredBytes,
-            measuredMessages,
-            classifications,
-            presentationObservation.crossedDisplayRefresh,
-            stateParity
-                && measuredBytes == wireBytes.count
-                && measuredMessages == 1
-        )
-    } catch {
-        await controller.stop()
-        closeRenderer(renderer)
-        throw error
-    }
-}
-
-@MainActor
-private final class CadenceProbe {
-    var repaintCount = 0
-    var pendingNativeUpdateIndex: Int?
-    var paintedUpdateIndex: Int?
-    var paintedRevision: Revision?
-}
-
-private enum CadenceProductionEventKind {
-    case activate
-    case valueChanged
-    case selectionChanged
-}
-
-private struct CadenceEventMilestone {
-    let updateIndex: Int
-    let kind: CadenceProductionEventKind
-}
-
-private struct CadenceEventArgumentSignature: Hashable {
-    let property: PropertyRef
-    let value: SemanticModel.Value
-}
-
-private struct CadenceEventOrderSignature: Hashable {
-    let sequence: UInt64
-    let observedRevision: UInt64
-    let eventType: TypeRef
-    let nodeID: NodeId
-    let arguments: [CadenceEventArgumentSignature]
-}
-
-private struct CapturedCadenceProductionEvent {
-    let returned: SemanticModel.Event
-    let captured: SemanticModel.Event
-    let frame: CapturedTransportFrame
-    let frameIndex: Int
-}
-
-private func cadenceEventMilestones(updateCount: Int) -> [CadenceEventMilestone] {
-    [
-        CadenceEventMilestone(updateIndex: 1, kind: .activate),
-        CadenceEventMilestone(
-            updateIndex: max(1, (updateCount + 1) / 2),
-            kind: .valueChanged
-        ),
-        CadenceEventMilestone(
-            updateIndex: updateCount,
-            kind: .selectionChanged
-        ),
-    ]
-}
-
-private func cadenceEventOrderSignature(
-    _ events: [SemanticModel.Event]
-) -> [CadenceEventOrderSignature] {
-    events.map { event in
-        CadenceEventOrderSignature(
-            sequence: event.eventSeq,
-            observedRevision: event.observedRevision.value,
-            eventType: event.eventType,
-            nodeID: event.nodeId,
-            arguments: event.arguments
-                .map {
-                    CadenceEventArgumentSignature(
-                        property: $0.key,
-                        value: $0.value
-                    )
-                }
-                .sorted { $0.property < $1.property }
-        )
-    }
-}
-
-private func cadenceEventSignatureDigest(
-    _ signature: [CadenceEventOrderSignature]
-) -> String {
-    let canonical = signature.map { event in
-        let arguments = event.arguments.map {
-            "\($0.property.namespaceID):\($0.property.localID)=\($0.value)"
-        }.joined(separator: ",")
-        return "\(event.sequence)@\(event.observedRevision):"
-            + "\(event.eventType.namespaceID):\(event.eventType.localID):"
-            + "\(event.nodeID.value):[\(arguments)]"
-    }.joined(separator: "|")
-    return SHA256.hash(data: Data(canonical.utf8))
-        .map { String(format: "%02x", $0) }
-        .joined()
-}
-
-private func cadenceEventFieldsMatch(
-    returned: SemanticModel.Event,
-    captured: SemanticModel.Event
-) -> Bool {
-    returned.eventId == captured.eventId
-        && returned.eventSeq == captured.eventSeq
-        && returned.observedRevision == captured.observedRevision
-        && returned.eventType == captured.eventType
-        && returned.nodeId == captured.nodeId
-        && returned.arguments == captured.arguments
-        && returned.clientInstanceId == captured.clientInstanceId
-        && returned.editSeq == captured.editSeq
-}
-
-@MainActor
-private func sendAndCaptureCadenceProductionEvent(
-    kind: CadenceProductionEventKind,
-    updateCount: Int,
-    controller: SessionController,
-    transport: BenchmarkTransport
-) async throws -> CapturedCadenceProductionEvent {
-    let firstPossibleFrameIndex = await transport.framesSent().count
-    let returned: SemanticModel.Event
-    switch kind {
-    case .activate:
-        returned = try await controller.sendActivate(nodeId: NodeId(16))
-    case .valueChanged:
-        returned = try await controller.sendValueChanged(
-            nodeId: NodeId(5),
-            value: .float64(Double(updateCount) / 1_000.0)
-        )
-    case .selectionChanged:
-        returned = try await controller.sendSelectionChanged(
-            nodeId: NodeId(7),
-            itemId: ItemId(UInt64(updateCount))
-        )
-    }
-
-    let frames = await transport.framesSent()
-    for frameIndex in firstPossibleFrameIndex..<frames.count {
-        let frame = frames[frameIndex]
-        guard frame.logicalClass == .input else { continue }
-        let message = try SRUIFraming.decodeFramed(
-            SRUIMessage.self,
-            from: frame.data
-        )
-        guard case .event(let wireEvent)? = message.msg else {
-            throw BenchmarkFailure.message(
-                "cadence input-channel frame was not an EVENT"
-            )
-        }
-        let captured = try ProtocolDecoder().validateAndConvertEvent(
-            wire: wireEvent
-        )
-        if cadenceEventFieldsMatch(returned: returned, captured: captured) {
-            return CapturedCadenceProductionEvent(
-                returned: returned,
-                captured: captured,
-                frame: frame,
-                frameIndex: frameIndex
-            )
-        }
-    }
-    throw BenchmarkFailure.message(
-        "production cadence event had no exact captured framed EVENT"
-    )
-}
-
-private struct CadenceObservation {
-    let updateCount: Int
-    let hz: Int
-    let inboundWireBytes: Int
-    let inboundMessages: Int
-    let outboundWireBytes: Int
-    let outboundMessages: Int
-    let repaintCount: Int
-    let decodeToVisibleMilliseconds: Double
-    let finalValue: Double
-    let revisionsPreserved: Bool
-    let idleBytes: Int
-    let idleMessages: Int
-    let eventFramesMatchReturned: Bool
-    let eventOrderSignature: [CadenceEventOrderSignature]
-    let eventSignatureDigest: String
-
-    var wireBytes: Int {
-        inboundWireBytes + outboundWireBytes
-    }
-
-    var messages: Int {
-        inboundMessages + outboundMessages
-    }
-}
 
 @MainActor
 func mutationAndCadence(
     fixtureOperations: [SemanticModel.Operation],
+    fixtureIndex: BenchmarkFixtureIndex,
     iterations: Int,
     fullPaint: Bool
 ) async throws -> Section {
@@ -369,10 +33,10 @@ func mutationAndCadence(
     var allMutationRastersCompleted = true
     var allMutationStateParityPassed = true
 
-    for count in [1, 100, 1_000] {
+    for count in MutationBenchmarkConfiguration.updateCounts {
         let updates = (0..<count).map { index in
             SemanticModel.Operation.setProperty(
-                id: NodeId(5),
+                id: fixtureIndex.progress,
                 property: .value,
                 value: .float64(Double(index + 1) / Double(count))
             )
@@ -385,6 +49,7 @@ func mutationAndCadence(
             let result = try await mutationRun(
                 baseStore: baseStore,
                 fixtureOperations: fixtureOperations,
+                fixtureIndex: fixtureIndex,
                 operations: updates,
                 fullPaint: fullPaint
             )
@@ -474,19 +139,20 @@ func mutationAndCadence(
             )
         )
     }
-
-    let configuredCadences = [60, 120, 144, 240]
-    let idleObservationMilliseconds = 1_000
+    let configuredCadences =
+        MutationBenchmarkConfiguration.configuredCadences
+    let idleObservationMilliseconds =
+        MutationBenchmarkConfiguration.idleObservationMilliseconds
     var observations = [CadenceObservation]()
 
-    for count in [1, 100, 1_000] {
+    for count in MutationBenchmarkConfiguration.updateCounts {
         // The exact same pre-encoded transaction sequence is replayed at every cadence.
         let framedUpdates = try (1...count).map { index in
             let transaction = Transaction(
                 baseRevision: Revision(UInt64(index)),
                 operations: [
                     .setProperty(
-                        id: NodeId(5),
+                        id: fixtureIndex.progress,
                         property: .value,
                         value: .float64(Double(index) / Double(count))
                     )
@@ -506,6 +172,7 @@ func mutationAndCadence(
                 transport: transport,
                 renderer: renderer,
                 fixtureOperations: fixtureOperations,
+                fixtureIndex: fixtureIndex,
                 sessionID: sessionID,
                 outbox: outbox
             )
@@ -530,7 +197,7 @@ func mutationAndCadence(
                     guard windows.count == 1,
                           let window = windows.first,
                           let progress =
-                            renderer.registry.view(for: NodeId(5))
+                            renderer.registry.view(for: fixtureIndex.progress)
                                 as? NSProgressIndicator,
                           progress.window === window else {
                         throw BenchmarkFailure.message(
@@ -572,7 +239,7 @@ func mutationAndCadence(
                             )
                         }
                         guard let progress =
-                            renderer.registry.view(for: NodeId(5))
+                            renderer.registry.view(for: fixtureIndex.progress)
                                 as? NSProgressIndicator else {
                             throw BenchmarkFailure.message(
                                 "cadence renderer has no native progress control"
@@ -614,7 +281,7 @@ func mutationAndCadence(
                             Double(offset + 1) / Double(count)
                         try await waitUntil {
                             guard let progress =
-                                renderer.registry.view(for: NodeId(5))
+                                renderer.registry.view(for: fixtureIndex.progress)
                                     as? NSProgressIndicator else {
                                 return false
                             }
@@ -622,7 +289,7 @@ func mutationAndCadence(
                                 < 0.000_001
                         }
                         guard let progress =
-                            renderer.registry.view(for: NodeId(5))
+                            renderer.registry.view(for: fixtureIndex.progress)
                                 as? NSProgressIndicator else {
                             throw BenchmarkFailure.message(
                                 "cadence renderer lost its native progress control"
@@ -652,6 +319,7 @@ func mutationAndCadence(
                                 try await sendAndCaptureCadenceProductionEvent(
                                     kind: milestone.kind,
                                     updateCount: count,
+                                    fixtureIndex: fixtureIndex,
                                     controller: controller,
                                     transport: transport
                                 )
@@ -784,10 +452,10 @@ func mutationAndCadence(
                 cadenceTask?.cancel()
                 try await cadenceTask?.value
                 cadenceTask = nil
-
                 guard let progress =
-                    renderer.registry.view(for: NodeId(5))
-                        as? NSProgressIndicator else {
+                    renderer.registry.view(
+                        for: fixtureIndex.progress
+                    ) as? NSProgressIndicator else {
                     throw BenchmarkFailure.message(
                         "cadence renderer lost its native progress control"
                     )
@@ -939,7 +607,8 @@ func mutationAndCadence(
         )
     )
 
-    let wireInvariant = [1, 100, 1_000].allSatisfy { count in
+    let wireInvariant =
+        MutationBenchmarkConfiguration.updateCounts.allSatisfy { count in
         let trials = observations.filter { $0.updateCount == count }
         return trials.count == configuredCadences.count
             && Set(trials.map(\.inboundWireBytes)).count == 1
@@ -954,7 +623,9 @@ func mutationAndCadence(
                         == cadenceEventMilestones(updateCount: count).count
             }
     }
-    let repaintIndependent = [100, 1_000].allSatisfy { count in
+    let repaintIndependent =
+        MutationBenchmarkConfiguration.coalescingUpdateCounts
+            .allSatisfy { count in
         let repaintCounts = observations
             .filter { $0.updateCount == count }
             .map(\.repaintCount)
@@ -964,7 +635,8 @@ func mutationAndCadence(
     let statePreserved = observations.allSatisfy {
         $0.revisionsPreserved && abs($0.finalValue - 1.0) < 0.000_001
     }
-    let eventOrderPreserved = [1, 100, 1_000].allSatisfy { count in
+    let eventOrderPreserved =
+        MutationBenchmarkConfiguration.updateCounts.allSatisfy { count in
         let trials = observations.filter { $0.updateCount == count }
         guard trials.count == configuredCadences.count,
               let reference = trials.first?.eventOrderSignature else {

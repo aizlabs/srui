@@ -609,36 +609,43 @@
       "slug": "semantic-inspection",
       "name": "Semantic inspection tests",
       "spec_sections": [
-        "\u00a724",
-        "\u00a725",
+        "\u00a74",
+        "\u00a77.7",
+        "\u00a722.9",
         "\u00a732.11"
       ],
-      "status": "known_gap",
-      "gaps": [
-        {
-          "scenario": "Inspection exposes semantic identity rather than AppKit object identity; automation actions route through the normal event/authorization path.",
-          "reason": "client-macos/Accessibility is a 4-line placeholder; no inspection or automation API exists on this base.",
-          "future_task": "Task 35 (local semantic inspection and automation API)",
-          "acceptance_criteria": [
-            "Inspection results are keyed by semantic NodeId, never by NSView identity.",
-            "Each inspected node exposes role, label, value, hierarchy position, and available actions.",
-            "Automation actions are dispatched through EventOutbox, not by invoking AppKit targets directly.",
-            "Actions on a disabled node are refused with the same authorization path as user input.",
-            "No AppKit type appears in the public inspection API surface."
-          ],
-          "gap_probe": {
-            "file": "client-macos/Accessibility/Accessibility.swift",
-            "absent_pattern": "public (struct|final class|protocol|func) +(Semantic)?Inspect",
-            "explanation": "Matches once Task 35 lands a public inspection API. A match means this suite must move from known_gap to active."
-          },
-          "languages": [
-            "swift"
-          ]
-        }
+      "status": "active",
+      "swift": [
+        [
+          "scripts/check-accessibility-api-boundary.sh"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SemanticInspectorTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SemanticInspectionAutomationTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "CodingAgentFallbackSocketTests"
+        ]
       ],
       "not_applicable": {
-        "rust": "Semantic inspection is a client-side API (\u00a724, \u00a725); there is no server half.",
-        "swift": "No implementation exists yet \u2014 the whole suite is the Task 35 gap."
+        "rust": "Semantic inspection and local automation are client-side APIs (\u00a722.9); the server has no inspection API surface."
       }
     },
     {

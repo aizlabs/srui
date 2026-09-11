@@ -38,6 +38,7 @@
 
 import Foundation
 import SemanticModel
+import Accessibility
 import Protocol
 import TransportSSH
 import RendererAppKit
@@ -169,7 +170,42 @@ private struct HandshakeSendOwnership {
     var task: Task<Void, Error>
 }
 
-/// Central coordinator managing client session lifecycle, message decoding, store application,
+private struct SemanticActionOwnership: Equatable, Sendable {
+    var binding: EventOutboxConnectionBinding
+    var sessionIncarnation: EventOutboxSessionIncarnation
+}
+
+private final class SemanticActionCancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isCancelled = false
+    private var operation: Task<Event, Error>?
+
+    func register(_ operation: Task<Event, Error>) {
+        lock.lock()
+        if isCancelled {
+            lock.unlock()
+            operation.cancel()
+            return
+        }
+        self.operation = operation
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let operation = operation
+        lock.unlock()
+        operation?.cancel()
+    }
+}
+
+private struct SemanticAutomationSessionState: Sendable {
+    var epoch: SemanticInspectionEpoch
+    var negotiatedCapabilities: CapabilitySet?
+    var isActive: Bool
+    var ownership: SemanticActionOwnership?
+}
 /// outbox event dispatch, resource assembly, and UI rendering (§22, §22.2).
 public final class SessionController: @unchecked Sendable {
     public let transport: any Transport
@@ -221,9 +257,14 @@ public final class SessionController: @unchecked Sendable {
     /// Invalidates callbacks queued by an older authoritative text incarnation even when a
     /// replacement session keeps the same outbox connection binding.
     @MainActor private var interactionIncarnation: UInt64 = 0
+    /// The renderer whose callback trampoline is wired, including attach-after-init use.
+    @MainActor private weak var interactionRenderer: AppKitRenderer?
     /// Actor-validated session-incarnation authority carried by every interaction admission.
     /// Protected by `lock` so public async send APIs can capture it before their first await.
     private var outboxSessionIncarnation: EventOutboxSessionIncarnation?
+    /// Monotonic identity for automation handles across semantic-tree replacement boundaries.
+    /// Protected by `lock`; ordinary transactions in the same semantic session do not change it.
+    private var semanticInspectionEpoch = SemanticInspectionEpoch(0)
     /// Deterministic internal fault seams for renderer lifecycle regression tests.
     @MainActor var rendererUpdateInterceptorForTesting: (() throws -> Void)?
     private var _liveTransactionPublishedInterceptorForTesting: (@Sendable () async -> Void)?
@@ -250,6 +291,16 @@ public final class SessionController: @unchecked Sendable {
     var interactionWillEnterOutboxForTesting: (@Sendable () async -> Void)? {
         get { withStateLock { _interactionWillEnterOutboxForTesting } }
         set { withStateLock { _interactionWillEnterOutboxForTesting = newValue } }
+    }
+    private var _semanticActionDidDrainTextForTesting: (@Sendable () async -> Void)?
+    var semanticActionDidDrainTextForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _semanticActionDidDrainTextForTesting } }
+        set { withStateLock { _semanticActionDidDrainTextForTesting = newValue } }
+    }
+    private var _semanticActionWillRegisterCancellationForTesting: (@Sendable () -> Void)?
+    var semanticActionWillRegisterCancellationForTesting: (@Sendable () -> Void)? {
+        get { withStateLock { _semanticActionWillRegisterCancellationForTesting } }
+        set { withStateLock { _semanticActionWillRegisterCancellationForTesting = newValue } }
     }
     private var _textEditWillAuthorizeForTesting: (@Sendable () async -> Void)?
     var textEditWillAuthorizeForTesting: (@Sendable () async -> Void)? {
@@ -346,6 +397,65 @@ public final class SessionController: @unchecked Sendable {
         return body()
     }
 
+    /// Must be called while `lock` is held.
+    private func advanceSemanticInspectionEpochLocked() {
+        precondition(
+            semanticInspectionEpoch.rawValue < UInt64.max,
+            "SessionController semantic inspection epoch exhausted"
+        )
+        semanticInspectionEpoch = SemanticInspectionEpoch(semanticInspectionEpoch.rawValue + 1)
+    }
+
+    private func semanticInspectionSourceSnapshot() -> SemanticInspectionSourceSnapshot {
+        // Pair a transaction snapshot with an epoch that stayed stable across its capture. A
+        // replacement racing either read is retried, so the exposed tree never borrows the
+        // identity of a different semantic session.
+        while true {
+            let epochBefore = withStateLock { semanticInspectionEpoch }
+            let transaction = applier.currentSnapshot
+            let epochAfter = withStateLock { semanticInspectionEpoch }
+            if epochBefore == epochAfter {
+                return SemanticInspectionSourceSnapshot(
+                    transaction: transaction,
+                    epoch: epochAfter
+                )
+            }
+        }
+    }
+
+    private func semanticAutomationSessionState() -> SemanticAutomationSessionState {
+        withStateLock {
+            let negotiated: CapabilitySet?
+            if case .active(let capabilities) = phase {
+                negotiated = capabilities
+            } else {
+                negotiated = nil
+            }
+
+            let ownership: SemanticActionOwnership?
+            if let binding = outboxConnectionBinding,
+               let sessionIncarnation = outboxSessionIncarnation {
+                ownership = SemanticActionOwnership(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                )
+            } else {
+                ownership = nil
+            }
+
+            return SemanticAutomationSessionState(
+                epoch: semanticInspectionEpoch,
+                negotiatedCapabilities: negotiated,
+                isActive: isRunning
+                    && !isStopping
+                    && !_isDiverged
+                    && eventDispatchEnabled
+                    && negotiated != nil,
+                ownership: ownership
+            )
+        }
+    }
+
     /// Whether resuming the committed tree requires a session-assigned extension namespace.
     private func committedStoreContainsExtensionNodes() -> Bool {
         let store = applier.currentSnapshot.store
@@ -403,6 +513,21 @@ public final class SessionController: @unchecked Sendable {
         withStateLock { currentSessionId }
     }
 
+    /// Creates an in-process, toolkit-independent view of the retained semantic tree.
+    ///
+    /// Every query captures a fresh immutable transaction snapshot. Action handles re-enter the
+    /// same admission queue as native controls and never expose or invoke AppKit objects.
+    public func makeSemanticInspector() -> SemanticInspector {
+        SemanticInspector(
+            snapshotProvider: { [self] in
+                semanticInspectionSourceSnapshot()
+            },
+            actionHandler: { [self] request in
+                try await performSemanticAction(request)
+            }
+        )
+    }
+
     /// Invoked when the session stops tracking the authoritative stream. Always also reported to
     /// stderr, so a session can never fail completely silently (§4 inv. 13).
     public var onFailure: (@Sendable (SessionFailure) -> Void)? {
@@ -420,148 +545,43 @@ public final class SessionController: @unchecked Sendable {
     private func wireActionHandler(for renderer: AppKitRenderer) {
         guard !actionHandlerWired else { return }
         actionHandlerWired = true
+        interactionRenderer = renderer
 
         renderer.textEditingSession.onAssignedIdentityRevoked = { [weak self] eventId in
             self?.outbox.revokeUnauthorizedPreparedTextEdit(eventId: eventId)
         }
 
         renderer.onInteraction = { [weak self, weak renderer] interaction in
-            guard let self else { return }
+            guard let self, let renderer else { return }
 
-            // §7.7: observed_revision is the revision the user was actually looking at when the
-            // control was interacted with. Record it synchronously even while disconnected so a
-            // locally committed text edit can be replayed if this same session resumes (§18.3).
-            // Dispatch remains gated below; a replacement/full resync discards the recorded draft.
-            let observedRev = self.applier.currentSnapshot.revision
-            if case .textEdit(let nodeID, let text, let editSeq, let laneEpoch) = interaction {
-                guard renderer?.textEditingSession.recordObservedRevision(
+            switch interaction {
+            case .activate(let nodeID):
+                self.enqueueNativeSemanticAction(
+                    nodeID: nodeID,
+                    action: .activate,
+                    renderer: renderer
+                )
+            case .valueChanged(let nodeID, let value):
+                self.enqueueNativeSemanticAction(
+                    nodeID: nodeID,
+                    action: .valueChanged(value),
+                    renderer: renderer
+                )
+            case .selectionChanged(let nodeID, let itemID):
+                self.enqueueNativeSemanticAction(
+                    nodeID: nodeID,
+                    action: .selectionChanged(itemID),
+                    renderer: renderer
+                )
+            case .textEdit(let nodeID, let text, let editSeq, let laneEpoch):
+                self.enqueueNativeTextEdit(
                     nodeID: nodeID,
                     text: text,
                     editSeq: editSeq,
                     laneEpoch: laneEpoch,
-                    observedRevision: observedRev
-                ) == true else {
-                    return
-                }
+                    renderer: renderer
+                )
             }
-
-            let acceptsInteraction = self.withStateLock {
-                (self.isRunning && !self.isStopping && !self._isDiverged)
-                    || self.isFlushingTextForDisconnect
-            }
-            guard acceptsInteraction else { return }
-
-            // AppKit can report the button/menu action before the editor's debounce fires. Flush
-            // every committed, non-composing native value synchronously; each recursive text-edit
-            // callback is appended to the same dispatch tail before this action is appended.
-            switch interaction {
-            case .textEdit:
-                break
-            case .activate, .valueChanged, .selectionChanged:
-                renderer?.textEditingSession.flushAllPending()
-            }
-
-            let drainCutoff: UInt64
-            switch interaction {
-            case .textEdit(let nodeID, _, _, _):
-                drainCutoff = renderer?.textEditingSession.unassignedFlushGeneration(for: nodeID)
-                    ?? renderer?.textEditingSession.currentFlushGeneration ?? 0
-            case .activate, .valueChanged, .selectionChanged:
-                drainCutoff = renderer?.textEditingSession.currentFlushGeneration ?? 0
-            }
-
-            guard let ownership = self.withStateLock({ () -> (
-                EventOutboxConnectionBinding,
-                EventOutboxSessionIncarnation
-            )? in
-                guard let binding = self.outboxConnectionBinding,
-                      let sessionIncarnation = self.outboxSessionIncarnation else {
-                    return nil
-                }
-                return (binding, sessionIncarnation)
-            }) else {
-                SessionDiagnostics.error("Interaction dispatch skipped without outbox session ownership")
-                return
-            }
-
-            // A text callback is the ordering boundary itself. Claim its exact snapshot before
-            // yielding MainActor; otherwise later typing can replace the coalesced slot before the
-            // queued dispatch task starts.
-            let initialTextEdit: LocalTextEdit?
-            if case .textEdit(let nodeID, let text, let editSeq, let laneEpoch) = interaction {
-                guard let claimed = renderer?.textEditingSession.claimUnassignedEdit(
-                    nodeID: nodeID,
-                    text: text,
-                    editSeq: editSeq,
-                    laneEpoch: laneEpoch
-                ) else {
-                    return
-                }
-                initialTextEdit = claimed
-            } else {
-                initialTextEdit = nil
-            }
-
-            let (binding, sessionIncarnation) = ownership
-            let incarnation = self.interactionIncarnation
-            let predecessor = self.interactionDispatchTail
-            let dispatch = Task { [weak self] in
-                _ = await predecessor?.result
-                guard let self else { return }
-                guard !Task.isCancelled,
-                      self.interactionIncarnation == incarnation else {
-                    if let initialTextEdit {
-                        self.renderer?.textEditingSession.releaseClaim(initialTextEdit)
-                    }
-                    return
-                }
-                if let interceptor = self.interactionWillEnterOutboxForTesting {
-                    await interceptor()
-                }
-                do {
-                    switch interaction {
-                    case .activate(let nodeID):
-                        try await self.sendActivate(
-                            nodeId: nodeID,
-                            observedRevision: observedRev,
-                            binding: binding,
-                            sessionIncarnation: sessionIncarnation,
-                            maxFlushGeneration: drainCutoff
-                        )
-                    case .valueChanged(let nodeID, let value):
-                        try await self.sendValueChanged(
-                            nodeId: nodeID,
-                            observedRevision: observedRev,
-                            value: value,
-                            binding: binding,
-                            sessionIncarnation: sessionIncarnation,
-                            maxFlushGeneration: drainCutoff
-                        )
-                    case .selectionChanged(let nodeID, let itemID):
-                        try await self.sendSelectionChanged(
-                            nodeId: nodeID,
-                            observedRevision: observedRev,
-                            itemId: itemID,
-                            binding: binding,
-                            sessionIncarnation: sessionIncarnation,
-                            maxFlushGeneration: drainCutoff
-                        )
-                    case .textEdit:
-                        try await self.dispatchUnassignedTextEdits(
-                            binding: binding,
-                            sessionIncarnation: sessionIncarnation,
-                            interactionIncarnation: incarnation,
-                            maxFlushGeneration: drainCutoff,
-                            initialEdit: initialTextEdit
-                        )
-                    }
-                } catch {
-                    // Before-admission failures leave the synchronous bridge intact for terminal
-                    // handoff. A post-retention send failure is harmlessly re-staged by identity.
-                    SessionDiagnostics.error("Interaction dispatch failed: \(error)")
-                }
-            }
-            self.interactionDispatchTail = dispatch
         }
 
         renderer.onTerminalInput = { [weak self] nodeID, data in
@@ -598,6 +618,288 @@ public final class SessionController: @unchecked Sendable {
                 renderer?.noteDroppedCollectionRange(request)
             }
         }
+    }
+
+    @MainActor
+    private func enqueueNativeSemanticAction(
+        nodeID: NodeId,
+        action: SemanticAction,
+        renderer: AppKitRenderer
+    ) {
+        let source = semanticInspectionSourceSnapshot()
+        let request = SemanticActionRequest(
+            nodeID: nodeID,
+            expectedEpoch: source.epoch,
+            action: action
+        )
+        do {
+            _ = try enqueueSemanticAction(
+                request,
+                observedSnapshot: source.transaction,
+                renderer: renderer
+            )
+        } catch is SemanticAutomationError {
+            // A native control can race a disabling/replacement transaction. Fail closed quietly;
+            // the server remains the final authorization boundary for an already-admitted event.
+        } catch {
+            SessionDiagnostics.error("Interaction dispatch failed: \(error)")
+        }
+    }
+
+    @MainActor
+    private func enqueueNativeTextEdit(
+        nodeID: NodeId,
+        text: String,
+        editSeq: EditSeq,
+        laneEpoch: UInt64,
+        renderer: AppKitRenderer
+    ) {
+        // Record what the user was looking at synchronously even while disconnected so a locally
+        // committed edit can replay if this same session resumes (§18.3).
+        let observedRevision = applier.currentSnapshot.revision
+        guard renderer.textEditingSession.recordObservedRevision(
+            nodeID: nodeID,
+            text: text,
+            editSeq: editSeq,
+            laneEpoch: laneEpoch,
+            observedRevision: observedRevision
+        ) else {
+            return
+        }
+
+        let acceptsInteraction = withStateLock {
+            (isRunning && !isStopping && !_isDiverged) || isFlushingTextForDisconnect
+        }
+        guard acceptsInteraction else { return }
+
+        let drainCutoff = renderer.textEditingSession.unassignedFlushGeneration(for: nodeID)
+            ?? renderer.textEditingSession.currentFlushGeneration
+        guard let ownership = withStateLock({ () -> SemanticActionOwnership? in
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }) else {
+            SessionDiagnostics.error(
+                "Interaction dispatch skipped without outbox session ownership"
+            )
+            return
+        }
+
+        // Claim this exact callback before yielding MainActor; later typing may otherwise replace
+        // the coalesced slot before the queued dispatch starts.
+        guard let initialTextEdit = renderer.textEditingSession.claimUnassignedEdit(
+            nodeID: nodeID,
+            text: text,
+            editSeq: editSeq,
+            laneEpoch: laneEpoch
+        ) else {
+            return
+        }
+
+        let incarnation = interactionIncarnation
+        let predecessor = interactionDispatchTail
+        let dispatch = Task { [weak self] in
+            _ = await predecessor?.result
+            guard let self else { return }
+            guard !Task.isCancelled,
+                  self.interactionIncarnation == incarnation else {
+                self.renderer?.textEditingSession.releaseClaim(initialTextEdit)
+                return
+            }
+            if let interceptor = self.interactionWillEnterOutboxForTesting {
+                await interceptor()
+            }
+            do {
+                try await self.dispatchUnassignedTextEdits(
+                    binding: ownership.binding,
+                    sessionIncarnation: ownership.sessionIncarnation,
+                    interactionIncarnation: incarnation,
+                    maxFlushGeneration: drainCutoff,
+                    initialEdit: initialTextEdit
+                )
+            } catch {
+                // Before-admission failures leave the synchronous bridge intact for terminal
+                // handoff. A post-retention send failure is harmlessly re-staged by identity.
+                SessionDiagnostics.error("Interaction dispatch failed: \(error)")
+            }
+        }
+        interactionDispatchTail = dispatch
+    }
+
+    private func validateSemanticAction(
+        _ request: SemanticActionRequest,
+        in snapshot: TransactionSnapshot
+    ) throws -> SemanticActionOwnership {
+        let state = semanticAutomationSessionState()
+        guard request.expectedEpoch == state.epoch else {
+            throw SemanticAutomationError.staleHandle(
+                expected: request.expectedEpoch,
+                actual: state.epoch
+            )
+        }
+        guard state.isActive, let ownership = state.ownership else {
+            throw SemanticAutomationError.sessionInactive
+        }
+        guard state.negotiatedCapabilities?.contains(.standardWidgetsV1) == true else {
+            throw SemanticAutomationError.capabilityNotNegotiated(request.action.eventType)
+        }
+        guard let node = snapshot.store.getNode(request.nodeID) else {
+            throw SemanticAutomationError.nodeNotFound(request.nodeID)
+        }
+        if case .bool(false) = node.getProperty(.enabled) {
+            throw SemanticAutomationError.nodeDisabled(request.nodeID)
+        }
+        guard standardEventsEmitted(by: node.nodeType).contains(request.action.eventType) else {
+            throw SemanticAutomationError.unsupportedAction(
+                nodeID: request.nodeID,
+                eventType: request.action.eventType
+            )
+        }
+        return ownership
+    }
+    private func revalidateSemanticActionForOutbox(
+        _ request: SemanticActionRequest?,
+        ownership: SemanticActionOwnership
+    ) async throws {
+        guard let request else { return }
+        if let interceptor = semanticActionDidDrainTextForTesting {
+            await interceptor()
+        }
+        try Task.checkCancellation()
+        let currentOwnership = try validateSemanticAction(
+            request,
+            in: applier.currentSnapshot
+        )
+        guard currentOwnership == ownership else {
+            throw SemanticAutomationError.sessionInactive
+        }
+    }
+
+    @MainActor
+    private func enqueueSemanticAction(
+        _ request: SemanticActionRequest,
+        observedSnapshot: TransactionSnapshot,
+        renderer: AppKitRenderer?,
+        cancellationState: SemanticActionCancellationState? = nil
+    ) throws -> Task<Event, Error> {
+        let ownership = try validateSemanticAction(request, in: observedSnapshot)
+
+        // A native action can end editing before its debounce fires. Flush synchronously so each
+        // recursive text callback appends itself to this same tail before the action captures it.
+        renderer?.textEditingSession.flushAllPending()
+        let drainCutoff = renderer?.textEditingSession.currentFlushGeneration ?? 0
+        let predecessor = interactionDispatchTail
+        let interactionIncarnation = interactionIncarnation
+
+        let operation: Task<Event, Error> = Task { @MainActor [weak self] in
+            _ = await predecessor?.result
+            try Task.checkCancellation()
+            guard let self,
+                  self.interactionIncarnation == interactionIncarnation else {
+                throw SemanticAutomationError.sessionInactive
+            }
+
+            if let interceptor = self.interactionWillEnterOutboxForTesting {
+                await interceptor()
+            }
+            try Task.checkCancellation()
+
+            // Re-authorize from a fresh snapshot after every suspension. The request-time revision
+            // remains the event's observed_revision, while current state decides whether it may
+            // still enter the outbox.
+            let latestSnapshot = self.applier.currentSnapshot
+            let latestOwnership = try self.validateSemanticAction(request, in: latestSnapshot)
+            guard latestOwnership == ownership else {
+                throw SemanticAutomationError.sessionInactive
+            }
+
+            do {
+                switch request.action {
+                case .activate:
+                    return try await self.sendActivate(
+                        nodeId: request.nodeID,
+                        observedRevision: observedSnapshot.revision,
+                        binding: ownership.binding,
+                        sessionIncarnation: ownership.sessionIncarnation,
+                        maxFlushGeneration: drainCutoff,
+                        semanticRequest: request
+                    )
+                case .valueChanged(let value):
+                    return try await self.sendValueChanged(
+                        nodeId: request.nodeID,
+                        observedRevision: observedSnapshot.revision,
+                        value: value,
+                        binding: ownership.binding,
+                        sessionIncarnation: ownership.sessionIncarnation,
+                        maxFlushGeneration: drainCutoff,
+                        semanticRequest: request
+                    )
+                case .selectionChanged(let itemID):
+                    return try await self.sendSelectionChanged(
+                        nodeId: request.nodeID,
+                        observedRevision: observedSnapshot.revision,
+                        itemId: itemID,
+                        binding: ownership.binding,
+                        sessionIncarnation: ownership.sessionIncarnation,
+                        maxFlushGeneration: drainCutoff,
+                        semanticRequest: request
+                    )
+                }
+            } catch SessionDispatchError.resumeNotConfirmed {
+                throw SemanticAutomationError.sessionInactive
+            }
+        }
+
+        // A newly created MainActor task cannot run until this synchronous method yields.
+        // Register it here so cancellation before MainActor admission cannot escape propagation.
+        if cancellationState != nil,
+           let interceptor = semanticActionWillRegisterCancellationForTesting {
+            interceptor()
+        }
+        cancellationState?.register(operation)
+
+        let tail = Task { @MainActor in
+            let result = await withTaskCancellationHandler(
+                operation: { await operation.result },
+                onCancel: { operation.cancel() }
+            )
+            if case .failure(let error) = result,
+               !(error is CancellationError),
+               !(error is SemanticAutomationError) {
+                SessionDiagnostics.error("Interaction dispatch failed: \(error)")
+            }
+        }
+        interactionDispatchTail = tail
+        return operation
+    }
+    private func performSemanticAction(_ request: SemanticActionRequest) async throws -> Event {
+        let cancellationState = SemanticActionCancellationState()
+        return try await withTaskCancellationHandler(
+            operation: {
+                try Task.checkCancellation()
+                // Capture one immutable transaction before the first suspension. That revision
+                // describes what automation observed even if later validation sees updates.
+                let source = semanticInspectionSourceSnapshot()
+                let operation = try await MainActor.run {
+                    try Task.checkCancellation()
+                    return try self.enqueueSemanticAction(
+                        request,
+                        observedSnapshot: source.transaction,
+                        renderer: self.interactionRenderer ?? self.renderer,
+                        cancellationState: cancellationState
+                    )
+                }
+                return try await operation.value
+            },
+            onCancel: {
+                cancellationState.cancel()
+            }
+        )
     }
 
     /// Drains TextEditingSession-owned drafts through retain, native authorization, then send.
@@ -1264,7 +1566,8 @@ public final class SessionController: @unchecked Sendable {
         observedRevision: Revision,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
-        maxFlushGeneration: UInt64
+        maxFlushGeneration: UInt64,
+        semanticRequest: SemanticActionRequest? = nil
     ) async throws -> Event {
         let incarnation = await MainActor.run { self.interactionIncarnation }
         try await dispatchUnassignedTextEdits(
@@ -1272,6 +1575,13 @@ public final class SessionController: @unchecked Sendable {
             sessionIncarnation: sessionIncarnation,
             interactionIncarnation: incarnation,
             maxFlushGeneration: maxFlushGeneration
+        )
+        try await revalidateSemanticActionForOutbox(
+            semanticRequest,
+            ownership: SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1330,7 +1640,8 @@ public final class SessionController: @unchecked Sendable {
         value: Value,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
-        maxFlushGeneration: UInt64
+        maxFlushGeneration: UInt64,
+        semanticRequest: SemanticActionRequest? = nil
     ) async throws -> Event {
         let incarnation = await MainActor.run { self.interactionIncarnation }
         try await dispatchUnassignedTextEdits(
@@ -1338,6 +1649,13 @@ public final class SessionController: @unchecked Sendable {
             sessionIncarnation: sessionIncarnation,
             interactionIncarnation: incarnation,
             maxFlushGeneration: maxFlushGeneration
+        )
+        try await revalidateSemanticActionForOutbox(
+            semanticRequest,
+            ownership: SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1397,7 +1715,8 @@ public final class SessionController: @unchecked Sendable {
         itemId: ItemId,
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation,
-        maxFlushGeneration: UInt64
+        maxFlushGeneration: UInt64,
+        semanticRequest: SemanticActionRequest? = nil
     ) async throws -> Event {
         let incarnation = await MainActor.run { self.interactionIncarnation }
         try await dispatchUnassignedTextEdits(
@@ -1405,6 +1724,13 @@ public final class SessionController: @unchecked Sendable {
             sessionIncarnation: sessionIncarnation,
             interactionIncarnation: incarnation,
             maxFlushGeneration: maxFlushGeneration
+        )
+        try await revalidateSemanticActionForOutbox(
+            semanticRequest,
+            ownership: SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
         )
         guard withStateLock({
             guard eventDispatchEnabled,
@@ -1918,6 +2244,7 @@ public final class SessionController: @unchecked Sendable {
         }
 
         withStateLock {
+            self.advanceSemanticInspectionEpochLocked()
             self.currentSessionId = welcome.sessionID
             self.requestedSessionId = nil
             self.resumeGeneration = nil
@@ -3054,6 +3381,7 @@ public final class SessionController: @unchecked Sendable {
     ) {
         withStateLock {
             outboxSessionIncarnation = sessionIncarnation
+            advanceSemanticInspectionEpochLocked()
         }
         advanceInteractionIncarnation()
         renderer?.textEditingSession.resetForReplacementSession()
@@ -3065,6 +3393,7 @@ public final class SessionController: @unchecked Sendable {
     ) {
         withStateLock {
             outboxSessionIncarnation = sessionIncarnation
+            advanceSemanticInspectionEpochLocked()
         }
         advanceInteractionIncarnation()
     }

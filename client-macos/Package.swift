@@ -67,6 +67,7 @@ let package = Package(
                 "TransportSSH",
                 "Protocol",
                 "SemanticModel",
+                "Accessibility",
                 "RendererAppKit",
                 "Resources",
                 "Collections",
@@ -110,6 +111,9 @@ let package = Package(
         ),
         .target(
             name: "Accessibility",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "Accessibility"
         ),
         .testTarget(
@@ -155,6 +159,14 @@ let package = Package(
                 "SemanticModel",
             ],
             path: "Tests/ResourcesTests"
+        ),
+        .testTarget(
+            name: "AccessibilityTests",
+            dependencies: [
+                "Accessibility",
+                "SemanticModel",
+            ],
+            path: "Tests/AccessibilityTests"
         ),
         .testTarget(
             name: "SRUITests",

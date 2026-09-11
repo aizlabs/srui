@@ -145,9 +145,7 @@ fn assert_terminal_negotiation_readvertised(
     assert!(required_profiles
         .iter()
         .any(|profile| profile == TERMINAL_PROFILE_URI));
-    assert!(optional_profiles
-        .iter()
-        .any(|profile| profile == "org.srui.richtext/1"));
+    assert!(optional_profiles.is_empty());
     let terminal_mapping = extension_namespaces
         .iter()
         .find(|mapping| mapping.extension_uri == TERMINAL_PROFILE_URI)

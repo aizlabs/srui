@@ -406,15 +406,15 @@ impl ServerCapabilities {
         Self { required, optional }
     }
 
-    /// Constructs a standard server capability configuration requiring standard widgets v1 (§7, §15).
+    /// Constructs a standard-only server capability configuration requiring standard widgets v1 (§7, §15).
     #[must_use]
     pub fn standard_widgets() -> Self {
         let mut required = CapabilitySet::new();
         required.insert(Profile::standard_widgets_v1());
-        let mut optional = CapabilitySet::new();
-        optional.insert(Profile::terminal_v1());
-        optional.insert(Profile::richtext_v1());
-        Self { required, optional }
+        Self {
+            required,
+            optional: CapabilitySet::new(),
+        }
     }
 
     /// Computes the negotiated capability set for a connecting client's offered profiles (§15).

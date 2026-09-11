@@ -211,6 +211,17 @@ fn test_capability_negotiation_version_mismatch_fails_required() {
 }
 
 #[test]
+fn test_standard_widgets_capabilities_are_standard_only() {
+    let capabilities = ServerCapabilities::standard_widgets();
+
+    assert_eq!(
+        capabilities.required.to_string_vec(),
+        vec!["org.srui.standard-widgets/1"]
+    );
+    assert!(capabilities.optional.is_empty());
+}
+
+#[test]
 fn test_server_capabilities_wrapper() {
     let server_caps = ServerCapabilities::new(
         CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).unwrap(),

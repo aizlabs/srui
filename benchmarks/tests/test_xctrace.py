@@ -1174,6 +1174,10 @@ def test_absent_optional_control_handshake_is_fail_closed(
         )
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="exact managed-process birth identity is available only on macOS",
+)
 def test_managed_watcher_assignment_window_reaps_real_child_on_signal(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

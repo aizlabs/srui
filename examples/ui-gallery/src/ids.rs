@@ -119,6 +119,8 @@ pub const PROGRESS_DETERMINATE: NodeId = NodeId::new(351);
 pub const PROGRESS_BUSY: NodeId = NodeId::new(352);
 
 pub const CTRL_STATUS: NodeId = NodeId::new(360);
+pub const MENU: NodeId = NodeId::new(361);
+pub const MENU_NOTE: NodeId = NodeId::new(362);
 
 // =============================================================================
 // Layout (400..499)

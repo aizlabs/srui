@@ -266,11 +266,11 @@ fn initial_graph_contains_every_supported_node_type() {
 
     assert_eq!(
         present, expected,
-        "the gallery must instantiate exactly the renderable required-tier node types"
+        "the gallery must instantiate exactly the node types implemented by the renderer"
     );
     // Surface, Scroll, Column, Row, Grid, Spacer, Separator, Text, RichText, Image, Button,
-    // Toggle, TextInput, TextArea, Progress, List, Table, Tree.
-    assert_eq!(expected.len(), 18);
+    // Toggle, TextInput, TextArea, Progress, List, Table, Tree, and deferred-tier Menu.
+    assert_eq!(expected.len(), 19);
 }
 
 #[test]
@@ -312,6 +312,19 @@ fn every_section_and_collection_is_present() {
             node.get()
         );
     }
+
+    let menu = app.session().get_node(ids::MENU).expect("menu node");
+    assert_eq!(menu.node_type, TypeRef::MENU);
+    assert_eq!(
+        menu.get_property(ITEMS),
+        Some(&Value::List(
+            ui::BASELINE_MENU_ITEMS
+                .iter()
+                .map(|item| Value::String((*item).to_string()))
+                .collect()
+        )),
+        "the deferred-tier Menu must publish the choices rendered by NSPopUpButton"
+    );
 
     app.session().with_store(|store| {
         assert_eq!(
@@ -419,6 +432,78 @@ fn toggle_value_changed_echoes_the_authoritative_value() {
         "the server echoes the value back rather than trusting the client's local view"
     );
     assert!(text_of(app.session(), ids::CTRL_STATUS).contains("VALUE_CHANGED"));
+}
+
+#[test]
+fn malformed_gallery_events_are_settled_as_rejected_without_side_effects() {
+    let app = app();
+    let mut client = Client::new();
+    let revision = app.session().current_revision();
+
+    let wrong_autoplay = client.value_changed(app.session(), ids::TOGGLE_AUTOPLAY, "not a bool");
+    let outcome = dispatch(app.session(), &wrong_autoplay);
+    match outcome {
+        EventOutcome::Rejected {
+            error: EventValidationError::PolicyRejected(reason),
+            ..
+        } => assert!(
+            reason.contains("requires a bool value"),
+            "rejection must explain the malformed autoplay value: {reason}"
+        ),
+        other => panic!("malformed autoplay event must be rejected, got {other:?}"),
+    }
+    assert!(!app.autoplay());
+    assert_eq!(app.session().current_revision(), revision);
+
+    assert!(
+        matches!(
+            dispatch(app.session(), &wrong_autoplay),
+            EventOutcome::Duplicate {
+                accepted: false,
+                ..
+            }
+        ),
+        "a replay must preserve the settled rejection instead of redispatching"
+    );
+
+    let wrong_demo = client.value_changed(app.session(), ids::TOGGLE_SWITCH, "not a bool");
+    assert!(
+        matches!(
+            dispatch(app.session(), &wrong_demo),
+            EventOutcome::Rejected {
+                error: EventValidationError::PolicyRejected(_),
+                ..
+            }
+        ),
+        "a malformed demo-toggle value must be rejected"
+    );
+    assert_eq!(
+        Toggle::value_of(
+            &app.session()
+                .get_node(ids::TOGGLE_SWITCH)
+                .expect("switch exists")
+        ),
+        Some(ui::BASELINE_TOGGLE_SWITCH)
+    );
+
+    let mut missing_selection = client.selection(app.session(), ids::LIST, ids::LIST_ITEMS[0]);
+    missing_selection.arguments.clear();
+    assert!(
+        matches!(
+            dispatch(app.session(), &missing_selection),
+            EventOutcome::Rejected {
+                error: EventValidationError::PolicyRejected(_),
+                ..
+            }
+        ),
+        "a selection without an item id must be rejected"
+    );
+    assert_eq!(app.with_state(|state| state.list_selection), None);
+    assert_eq!(
+        app.session().current_revision(),
+        revision,
+        "rejected events must not commit gallery mutations"
+    );
 }
 
 #[test]

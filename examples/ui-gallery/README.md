@@ -53,7 +53,7 @@ is enforced with `flock(2)`, not a connect probe.
 
 ## Support matrix
 
-### Rendered by the gallery (18 node types, §7.3 required tier)
+### Rendered by the gallery (19 node types)
 
 | Category | Node types | Where |
 | --- | --- | --- |
@@ -61,16 +61,18 @@ is enforced with `flock(2)`, not a connect probe.
 | Content | `Text`, `RichText`, `Image` | hero + typography sections |
 | Controls | `Button`, `Toggle`, `TextInput`, `TextArea`, `Progress` | controls section |
 | Collections | `List`, `Table`, `Tree` | collections + inspector sections |
+| Shell | `Menu` (explicitly implemented deferred tier) | controls section |
 
 `tests/gallery_test.rs::initial_graph_contains_every_supported_node_type` asserts this list is
 exactly what the initial graph instantiates — no more, no less.
 
 ### Deliberately absent
 
-`Dialog`, `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`, `Split`, `Menu`, `Toolbar`.
+`Dialog`, `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`, `Split`, `Toolbar`.
 
 These exist in `protocol/registry.yaml` but `ControlFactory` throws `unsupportedNodeType` for
-them. Creating one would put a node in the authoritative tree that no client can render — exactly
+them. `Menu` is intentionally not in this list: the renderer explicitly supports that deferred-tier
+type. Creating any listed type would put a node in the authoritative tree that no client can render — exactly
 the silent degradation §4 inv. 13 forbids. `unsupported_node_types_are_not_advertised` fails the
 build if one ever appears.
 
@@ -80,6 +82,7 @@ build if one ever appears.
 | --- | --- | --- |
 | Text editing (`TextInput`, `TextArea`) | **native-local only** | The renderer does not emit `TEXT_EDIT`. Keystrokes never reach the server and are discarded by the next server-driven `SET_PROPERTY`. |
 | Tree interaction | **presentation-only** | The outline is built from a flat inline `items` list. There is no hierarchical model type and no `EXPANSION_CHANGED` event, so expanding a row changes nothing on the server. |
+| Menu interaction | **presentation-only** | `Menu` is an explicitly rendered deferred-tier node, but the standard registry declares no events for it. |
 | Round-trip latency | **not measured** | The server never sees the client's clock, and `EVENT_ACK` is emitted below the `Session` API. The connection panel reports server-side handling time only. |
 
 ---
@@ -161,9 +164,9 @@ Throughput reports transactions committed strictly **before** the one being rend
 transaction's framed size is only knowable once its operation list is final, which is after the
 panel has been written. Latency does include the event that caused the current transaction.
 
-All session accessors are read *before* the transaction opens. `Session::transaction` holds the
-same inner mutex those accessors need, so capturing first is a deadlock-avoidance requirement,
-not an optimisation.
+All session accessors are read after the gallery state lock is acquired and *before* the
+transaction opens. `Session::transaction` holds the same inner mutex those accessors need, so this
+state → facts → transaction order prevents both deadlock and concurrent stale-fact snapshots.
 
 ---
 
@@ -211,7 +214,7 @@ cargo test --manifest-path examples/ui-gallery/Cargo.toml
 
 | Test | Claim |
 | --- | --- |
-| `initial_graph_contains_every_supported_node_type` | all 18 renderable node types appear, and only those |
+| `initial_graph_contains_every_supported_node_type` | all 19 renderer-supported node types appear, and only those |
 | `unsupported_node_types_are_not_advertised` | no unrenderable registry type is ever created |
 | `every_section_and_collection_is_present` | all seven sections, both models, all eight text roles |
 | `gallery_image_is_published_and_referenced_by_the_image_node` | the asset bytes are published and the node holds the resulting `ResourceHash` |

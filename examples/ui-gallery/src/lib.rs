@@ -327,19 +327,17 @@ impl GalleryApp {
             (ids::BTN_RESET, SceneAction::Reset),
         ] {
             let target: Weak<Self> = Arc::downgrade(self);
-            self.session.on(node, ACTIVATE, move |_, event| {
-                if let Some(app) = target.upgrade() {
-                    app.on_scene_action(scene_action, event);
-                }
+            self.session.on_result(node, ACTIVATE, move |_, event| {
+                let app = target.upgrade().ok_or_else(handler_target_unavailable)?;
+                app.on_scene_action(scene_action, event)
             });
         }
 
         let autoplay: Weak<Self> = Arc::downgrade(self);
         self.session
-            .on(ids::TOGGLE_AUTOPLAY, VALUE_CHANGED, move |_, event| {
-                if let Some(app) = autoplay.upgrade() {
-                    app.on_autoplay_changed(event);
-                }
+            .on_result(ids::TOGGLE_AUTOPLAY, VALUE_CHANGED, move |_, event| {
+                let app = autoplay.upgrade().ok_or_else(handler_target_unavailable)?;
+                app.on_autoplay_changed(event)
             });
 
         for (node, label) in [
@@ -349,10 +347,9 @@ impl GalleryApp {
             (ids::BTN_QUIET, "Quiet"),
         ] {
             let target: Weak<Self> = Arc::downgrade(self);
-            self.session.on(node, ACTIVATE, move |_, event| {
-                if let Some(app) = target.upgrade() {
-                    app.on_demo_button(label, event);
-                }
+            self.session.on_result(node, ACTIVATE, move |_, event| {
+                let app = target.upgrade().ok_or_else(handler_target_unavailable)?;
+                app.on_demo_button(label, event)
             });
         }
 
@@ -362,11 +359,11 @@ impl GalleryApp {
             (ids::TOGGLE_AUTOMATIC, "Automatic hint"),
         ] {
             let target: Weak<Self> = Arc::downgrade(self);
-            self.session.on(node, VALUE_CHANGED, move |_, event| {
-                if let Some(app) = target.upgrade() {
-                    app.on_demo_toggle(node, label, event);
-                }
-            });
+            self.session
+                .on_result(node, VALUE_CHANGED, move |_, event| {
+                    let app = target.upgrade().ok_or_else(handler_target_unavailable)?;
+                    app.on_demo_toggle(node, label, event)
+                });
         }
 
         for (node, collection) in [
@@ -374,15 +371,15 @@ impl GalleryApp {
             (ids::TABLE, Collection::Table),
         ] {
             let target: Weak<Self> = Arc::downgrade(self);
-            self.session.on(node, SELECTION_CHANGED, move |_, event| {
-                if let Some(app) = target.upgrade() {
-                    app.on_selection_changed(collection, event);
-                }
-            });
+            self.session
+                .on_result(node, SELECTION_CHANGED, move |_, event| {
+                    let app = target.upgrade().ok_or_else(handler_target_unavailable)?;
+                    app.on_selection_changed(collection, event)
+                });
         }
     }
 
-    fn on_scene_action(&self, action: SceneAction, event: &WireEvent) {
+    fn on_scene_action(&self, action: SceneAction, event: &WireEvent) -> Result<(), SessionError> {
         let started = Instant::now();
         let trigger = event_trigger(event, action.detail());
         let result = match action {
@@ -396,75 +393,81 @@ impl GalleryApp {
                 self.commit(trigger, Vec::new(), Some(started), Self::restore_baseline)
             }
         };
-        report("scene action", result);
+        result.map(|_| ())
     }
 
-    fn on_autoplay_changed(&self, event: &WireEvent) {
+    fn on_autoplay_changed(&self, event: &WireEvent) -> Result<(), SessionError> {
         let started = Instant::now();
-        let Some(enabled) = decode_bool(event) else {
-            tracing::warn!(
-                "rejecting VALUE_CHANGED on the autoplay toggle without a bool argument"
-            );
-            return;
-        };
+        let enabled = decode_bool(event).ok_or_else(|| {
+            SessionError::InvalidInput(
+                "VALUE_CHANGED on the autoplay toggle requires a bool value".to_string(),
+            )
+        })?;
         let trigger = event_trigger(event, format!("value = {enabled}"));
-        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
+        self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
             state.autoplay = enabled;
             Toggle::set_value_for(ui, ids::TOGGLE_AUTOPLAY, enabled)?;
             Ok(())
-        });
-        report("autoplay toggle", result);
+        })
+        .map(|_| ())
     }
 
-    fn on_demo_button(&self, label: &'static str, event: &WireEvent) {
+    fn on_demo_button(&self, label: &'static str, event: &WireEvent) -> Result<(), SessionError> {
         let started = Instant::now();
         let trigger = event_trigger(event, format!("button \"{label}\""));
         let seq = event.event_seq;
-        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, _| {
+        self.commit(trigger, Vec::new(), Some(started), move |ui, _| {
             Text::set_text_for(
                 ui,
                 ids::CTRL_STATUS,
-                format!("ACTIVATE on the {label} button \u{b7} client event seq {seq}"),
+                format!("ACTIVATE on the {label} button · client event seq {seq}"),
             )?;
             Ok(())
-        });
-        report("demo button", result);
+        })
+        .map(|_| ())
     }
 
-    fn on_demo_toggle(&self, node: NodeId, label: &'static str, event: &WireEvent) {
+    fn on_demo_toggle(
+        &self,
+        node: NodeId,
+        label: &'static str,
+        event: &WireEvent,
+    ) -> Result<(), SessionError> {
         let started = Instant::now();
-        let Some(value) = decode_bool(event) else {
-            tracing::warn!(
-                "rejecting VALUE_CHANGED on {} without a bool argument",
+        let value = decode_bool(event).ok_or_else(|| {
+            SessionError::InvalidInput(format!(
+                "VALUE_CHANGED on node {} requires a bool value",
                 node.get()
-            );
-            return;
-        };
+            ))
+        })?;
         let trigger = event_trigger(event, format!("value = {value}"));
-        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, _| {
+        self.commit(trigger, Vec::new(), Some(started), move |ui, _| {
             // The server is authoritative: it echoes the value back rather than trusting that the
             // client's local view already matches (§7.7).
             Toggle::set_value_for(ui, node, value)?;
             Text::set_text_for(
                 ui,
                 ids::CTRL_STATUS,
-                format!("VALUE_CHANGED on the {label} toggle \u{b7} now {value}"),
+                format!("VALUE_CHANGED on the {label} toggle · now {value}"),
             )?;
             Ok(())
-        });
-        report("demo toggle", result);
+        })
+        .map(|_| ())
     }
 
-    fn on_selection_changed(&self, collection: Collection, event: &WireEvent) {
+    fn on_selection_changed(
+        &self,
+        collection: Collection,
+        event: &WireEvent,
+    ) -> Result<(), SessionError> {
         let started = Instant::now();
-        let Some(item) = decode_item_id(event) else {
-            tracing::warn!("rejecting SELECTION_CHANGED without a usable item id argument");
-            return;
-        };
+        let item = decode_item_id(event).ok_or_else(|| {
+            SessionError::InvalidInput("SELECTION_CHANGED requires an item id value".to_string())
+        })?;
         let model = collection.model();
         let trigger = event_trigger(event, format!("item {}", item.get()));
 
-        let result = self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
+        self.commit(trigger, Vec::new(), Some(started), move |ui, state| {
             // Only the item id is trusted, and only if authoritative state still holds it. Row
             // text, index, and `action_key` from the client are never consulted (§7.7, §27).
             let resolved = ui
@@ -501,8 +504,8 @@ impl GalleryApp {
             }
             Text::set_text_for(ui, ids::COLL_SELECTION, text)?;
             Ok(())
-        });
-        report("selection", result);
+        })
+        .map(|_| ())
     }
 }
 
@@ -589,10 +592,8 @@ fn decode_item_id(event: &WireEvent) -> Option<ItemId> {
     }
 }
 
-fn report(what: &str, result: Result<Vec<Operation>, SessionError>) {
-    if let Err(error) = result {
-        tracing::warn!("{what} transaction failed: {error}");
-    }
+fn handler_target_unavailable() -> SessionError {
+    SessionError::InvalidConfiguration("gallery event handler target is unavailable".to_string())
 }
 
 /// Recovers a poisoned mutex rather than propagating the panic.

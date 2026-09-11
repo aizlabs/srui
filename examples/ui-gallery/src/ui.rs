@@ -5,10 +5,10 @@
 //! - **One transaction**: the entire gallery — models, items, and every node — is created by a
 //!   single all-or-nothing transaction, so a client either sees the whole gallery or none of it
 //!   (§12.1).
-//! - **Required tier only**: every node type built here is one the AppKit `ControlFactory`
-//!   actually renders. `Dialog`, `Select`, `ChoiceGroup`, `Slider`, `NumberInput`, `Tabs`,
-//!   `Split`, `Menu`, and `Toolbar` exist in the registry but are deliberately absent — advertising
-//!   an unrenderable node would be exactly the silent degradation §4 inv. 13 forbids.
+//! - **Renderer support set**: every node type built here is one the AppKit `ControlFactory`
+//!   actually renders: all required-tier types plus the explicitly implemented deferred `Menu`.
+//!   Other optional/deferred registry types remain absent because advertising an unrenderable node
+//!   would be exactly the silent degradation §4 inv. 13 forbids.
 //! - **Section builders**: each `build_*` function owns one 100-wide id block from [`crate::ids`]
 //!   and appends one column to the gallery. Adding a widget means extending one builder, adding
 //!   one scene entry in [`crate::scenes`], and one test.
@@ -50,6 +50,7 @@ pub const BASELINE_AUTOPLAY: bool = false;
 pub const BASELINE_TOGGLE_CHECKBOX: bool = true;
 pub const BASELINE_TOGGLE_SWITCH: bool = false;
 pub const BASELINE_TOGGLE_AUTOMATIC: bool = false;
+pub const BASELINE_MENU_ITEMS: [&str; 3] = ["Inspect", "Reconnect", "Close"];
 pub const BASELINE_CTRL_STATUS: &str = "No control has been activated yet";
 pub const BASELINE_COLL_SELECTION: &str = "Nothing selected";
 
@@ -87,8 +88,8 @@ pub const BASELINE_TREE_ITEMS: [&str; 6] = [
     "    sessiond/",
 ];
 
-/// Every node type this gallery instantiates, and therefore every node type the AppKit
-/// `ControlFactory` can render today (§7.3 required tier).
+/// Every node type this gallery instantiates, matching the AppKit `ControlFactory` support set:
+/// all §7.3 required-tier types plus explicitly implemented deferred-tier `Menu`.
 pub fn supported_node_types() -> Vec<TypeRef> {
     vec![
         Surface::NODE_TYPE,
@@ -109,6 +110,7 @@ pub fn supported_node_types() -> Vec<TypeRef> {
         List::NODE_TYPE,
         Table::NODE_TYPE,
         Tree::NODE_TYPE,
+        TypeRef::MENU,
     ]
 }
 
@@ -122,7 +124,6 @@ pub fn unsupported_node_type_names() -> Vec<&'static str> {
         "NumberInput",
         "Tabs",
         "Split",
-        "Menu",
         "Toolbar",
     ]
 }
@@ -477,7 +478,7 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         ids::CTRL_COLUMN,
         ids::CTRL_HEADING,
         ids::CTRL_SEPARATOR,
-        "Controls \u{b7} Buttons, toggles, inputs, progress",
+        "Controls · Buttons, toggles, inputs, progress, menu",
     )?;
 
     Row::builder(ids::CTRL_BUTTON_ROW)
@@ -638,6 +639,39 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         .value_description("idle")
         .busy(false)
         .grow(1.0)
+        .create(ui)?;
+
+    ui.create_node(
+        ids::MENU,
+        TypeRef::MENU,
+        Some(ids::CTRL_COLUMN),
+        None,
+        [
+            (LABEL, Value::String("Command menu".to_string())),
+            (
+                ITEMS,
+                Value::List(
+                    BASELINE_MENU_ITEMS
+                        .iter()
+                        .map(|item| Value::String((*item).to_string()))
+                        .collect(),
+                ),
+            ),
+            (
+                ACCESSIBLE_DESCRIPTION,
+                Value::String(
+                    "Renderer-owned deferred-tier Menu; the standard registry declares no events"
+                        .to_string(),
+                ),
+            ),
+            (ENABLED, Value::Bool(true)),
+        ],
+    )?;
+
+    Text::builder(ids::MENU_NOTE)
+        .parent(ids::CTRL_COLUMN)
+        .text("Menu is deferred-tier presentation only; the standard registry declares no events.")
+        .role(TextRole::Caption)
         .create(ui)?;
 
     Text::builder(ids::CTRL_STATUS)

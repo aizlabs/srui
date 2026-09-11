@@ -9,7 +9,7 @@ use srui_example_process_monitor::testing::{record, snapshot};
 use srui_example_process_monitor::*;
 use srui_protocol::{
     decode_framed, encode_framed, operation::Op, srui_message, ClientHello, SruiMessage,
-    Transaction,
+    Transaction, TERMINAL_PROFILE_URI,
 };
 use srui_sessiond::{handle_connection, Session};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -76,7 +76,10 @@ async fn connect(session: Arc<Session>, shutdown: CancellationToken) -> DuplexSt
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
             core_version: "0.5.0".to_string(),
-            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            profiles: vec![
+                "org.srui.standard-widgets/1".to_string(),
+                TERMINAL_PROFILE_URI.to_string(),
+            ],
             limits: None,
             client_instance_id: vec![9, 9, 9, 9],
             client_metadata: Default::default(),
@@ -91,16 +94,27 @@ async fn connect(session: Arc<Session>, shutdown: CancellationToken) -> DuplexSt
 }
 
 #[tokio::test]
-async fn fresh_hello_receives_welcome_then_the_complete_process_monitor_snapshot() {
+async fn terminal_capable_client_receives_standard_only_welcome_then_complete_snapshot() {
     let fixture = base_fixture();
     let shutdown = CancellationToken::new();
     let mut client = connect(fixture.session.clone(), shutdown.clone()).await;
 
-    let (_, welcome) = read_frame(&mut client).await;
-    assert!(
-        matches!(welcome.msg, Some(srui_message::Msg::ServerWelcome(_))),
-        "first frame must be ServerWelcome"
+    let (_, welcome_message) = read_frame(&mut client).await;
+    let welcome = match welcome_message.msg {
+        Some(srui_message::Msg::ServerWelcome(welcome)) => welcome,
+        other => panic!("first frame must be ServerWelcome, got {other:?}"),
+    };
+    assert_eq!(
+        welcome.required_profiles,
+        vec!["org.srui.standard-widgets/1"]
     );
+    assert!(welcome.optional_profiles.is_empty());
+    assert_eq!(welcome.extension_namespaces.len(), 1);
+    assert_eq!(
+        welcome.extension_namespaces[0].extension_uri,
+        "org.srui.standard-widgets"
+    );
+    assert_eq!(welcome.extension_namespaces[0].namespace_id, 0);
 
     let (_, snapshot_message) = read_frame(&mut client).await;
     let snapshot_transaction = expect_transaction(snapshot_message);

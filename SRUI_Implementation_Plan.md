@@ -832,7 +832,6 @@ authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.
 read-only and authoritative — do not edit it. This is Task 20 of a sequential implementation plan
 (Tasks 0–38). Task 19 made the transport real SSH; Task 7 already built the Rust-side
 CapabilitySet negotiation logic (in-process only, no wire I/O). Inspect both before starting.
-
 Read: §15 (capability negotiation) in full, §4 invariant 13 (unknown required semantics fail
 explicitly; optional semantics are negotiated or have documented fallbacks).
 
@@ -842,10 +841,17 @@ Build:
   negotiation logic (port equivalent matching logic to Swift if it doesn't exist yet). The
   handshake must complete, successfully or not, before any Transaction/Event traffic is
   permitted on the connection.
+- Treat the server's profile declaration and extension namespace table as one contract. Every
+  advertised non-standard required or optional profile has exactly one stable, non-zero mapping;
+  mapping URIs and IDs are unique; exactly one bare `org.srui.standard-widgets` sentinel maps
+  to namespace 0, which no other mapping may use. Validate the complete contract before snapshot export, subscription, or data-plane traffic. A standard-only
+  session advertises no dormant Terminal, RichText, or other extension profiles merely because
+  their implementations are compiled into the server.
 - Concrete failure path: if the server's required profile list isn't satisfied by the client's
-  offered profiles (or vice versa, if you want symmetry), the connection is cleanly closed with
-  a clear error surfaced to whichever side is easiest to test against — no partial/undefined
-  protocol traffic should be attempted afterward.
+  offered profiles (or vice versa, if you want symmetry), or if its advertised profile/namespace
+  contract is inconsistent, the connection is cleanly closed with a clear error surfaced to
+  whichever side is easiest to test against — no partial/undefined protocol traffic should be
+  attempted afterward.
 
 Out of scope: no extension-profile fallback subtree logic yet (that's exercised in Task 30), no
 reconnect/session-resume handshake yet (Task 22, though it shares this task's message framing
@@ -854,6 +860,9 @@ patterns).
 Verification:
 - end-to-end test: successful handshake with matching required profile (`org.srui.standard-
   widgets/1`), followed by the Task 18/19 counter demo working exactly as before;
+- connect a Terminal-capable client to a standard-only server and confirm only Standard Widgets
+  are negotiated; separately confirm that a missing, duplicate, zero, malformed, or orphaned
+  extension mapping fails before a snapshot or subscription side effect;
 - a mismatched-required-profile test (temporarily configure the server to require a profile the
   test client doesn't offer) confirms the connection fails cleanly at handshake time rather than
   failing confusingly later or being silently accepted;
@@ -1879,14 +1888,21 @@ list across machines; no new protocol message kinds or unrelated server-side beh
 allowed prerequisite is the minimal additive, wire-compatible resume-negotiation extension to the
 existing messages: `CLIENT_RESUME.core_version`/`profiles`, and
 `SERVER_RESUME_OK`/`SERVER_RESYNC_REQUIRED.required_profiles`, `optional_profiles`, and
-`extension_namespaces`, with fail-closed validation before subscription or data-plane traffic. All
-other work remains a UI layer over existing transport/session APIs. A literal revision-N cold
-resume is also out of scope: it requires one atomic durable checkpoint of the semantic replica,
-outbox, pending event and text state, terminal offsets, resource-continuity state, negotiated
-capabilities, and extension/Terminal namespace and type mappings, and MUST NOT be approximated
-from saved-list presentation metadata.
+`extension_namespaces`, with fail-closed validation before subscription or data-plane traffic.
+Every non-standard profile advertised as required or optional in these responses must have exactly
+one stable, non-zero namespace mapping; duplicate, malformed, zero, orphaned, or missing mappings
+fail before snapshot export, replay collection, subscription, or any data-plane traffic. A
+standard-only session must not advertise dormant extensions merely because their implementations
+are available in the server binary. All other work remains a UI layer over existing
+transport/session APIs. A literal revision-N cold resume is also out of scope: it requires one
+atomic durable checkpoint of the semantic replica, outbox, pending event and text state, terminal
+offsets, resource-continuity state, negotiated capabilities, and extension/Terminal namespace and
+type mappings, and MUST NOT be approximated from saved-list presentation metadata.
 
 Verification:
+- connect the default Terminal-capable client to the standard-only Task 21 process monitor and
+  confirm the server advertises and negotiates only Standard Widgets and delivers the complete
+  snapshot;
 - connect to a fresh host/user with no prior saved session: a new session is established and an
   entry is added to the saved list afterward with its session_id recorded;
 - disconnect and reconnect without quitting: confirm `CLIENT RESUME` uses the same `session_id`

@@ -274,7 +274,13 @@ org.srui.vector-scene/1
 org.example.coding/2
 ```
 
-During capability negotiation, both sides assign an extension a compact session-local namespace number. Wire references are then encoded as:
+Before capability negotiation completes, the server assigns each advertised non-standard profile
+one stable, non-zero session-local namespace and carries the authoritative URI-to-number mapping in
+the handshake. The client uses and validates the mappings required by profiles and types it
+implements; clients do not independently choose namespace numbers. Mapping URIs and IDs are unique,
+namespace `0` remains reserved for standard
+widgets, and an inconsistent advertised profile/mapping contract fails before snapshot, replay, or
+data-plane traffic. Wire references are then encoded as:
 
 ```text
 (namespace_id, local_id)
@@ -969,8 +975,29 @@ SERVER WELCOME
   core_version = 1.0
   required_profiles = [org.srui.standard-widgets/1]
   optional_profiles = [org.srui.terminal/1]
+  extension_namespaces = [
+    { extension_uri = org.srui.standard-widgets, namespace_id = 0 },
+    { extension_uri = org.srui.terminal/1, namespace_id = 1 }
+  ]
   session = ...
 ```
+
+The active negotiated set is the server's required profiles plus the intersection of the server's
+optional profiles and the client's offered profiles. An optional profile is therefore active when
+the client offers it; it is not a dormant declaration. Every non-standard profile advertised as
+required or optional MUST have exactly one stable, non-zero entry in `extension_namespaces`.
+Mappings MUST have unique canonical URIs and unique namespace IDs. The table MUST contain
+exactly one bare `org.srui.standard-widgets` sentinel mapped to namespace `0`; no other mapping
+may use namespace `0`. The server validates this complete advertised contract before
+sending `SERVER WELCOME`, `SERVER RESUME_OK`, or `SERVER RESYNC_REQUIRED`, and before exporting a
+snapshot, collecting replay, subscribing the client, or entering the data plane. The client
+independently validates mapping-table uniqueness and the mappings needed by profiles and types it
+implements, installs those server-authoritative mappings, and fails closed when required semantics
+cannot be resolved.
+
+A standard-only session advertises only `org.srui.standard-widgets/1`; support compiled into the
+server does not by itself activate Terminal, RichText, or another extension for that session.
+Registering an extension allocates its namespace before the profile may be advertised.
 
 A client is never required to announce `macos-appkit`; renderer identity is diagnostic only.
 

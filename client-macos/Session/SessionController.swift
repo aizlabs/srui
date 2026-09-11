@@ -82,6 +82,32 @@ public enum SessionDispatchError: Error, Equatable, Sendable {
     case resumeNotConfirmed
 }
 
+/// Handshake selected for one connection lifecycle.
+public enum SessionConnectionKind: Equatable, Sendable {
+    case fresh
+    case resume(sessionID: String, lastAppliedRevision: UInt64)
+}
+
+/// Authoritative continuity decision that requires a replacement snapshot before the UI is ready.
+public enum SessionResynchronization: Equatable, Sendable {
+    case fresh(sessionID: String)
+    case sameSession(sessionID: String)
+    case replaced(previousSessionID: String?, newSessionID: String)
+}
+
+/// Low-volume lifecycle transitions for connection UI and orchestration.
+///
+/// The ready event is emitted only after any required event replay, snapshot commit, native render,
+/// and outbox resync latch have completed. The stream remains open across stop() because a
+/// controller may be restarted; releasing the controller finishes it.
+public enum SessionLifecycleEvent: Sendable {
+    case connecting(SessionConnectionKind)
+    case resynchronizing(SessionResynchronization)
+    case ready(sessionID: String, revision: UInt64)
+    case failed(SessionFailure)
+    case stopped
+}
+
 /// Core protocol version this build speaks (§15).
 public let SRUICoreVersion = "0.5.0"
 
@@ -218,7 +244,10 @@ public final class SessionController: @unchecked Sendable {
     public let resourceCache: ResourceCache
     public let clientCapabilities: CapabilitySet
     public let requiredServerProfiles: CapabilitySet
+    /// Ordered lifecycle transitions retained in a small newest-value buffer for one UI consumer.
+    public let lifecycleEvents: AsyncStream<SessionLifecycleEvent>
 
+    private let lifecycleEventContinuation: AsyncStream<SessionLifecycleEvent>.Continuation
     private let lock = NSLock()
     private let transactionIngressGate: TransactionIngressGate
     /// Ordered data-plane work runs separately from control-message dispatch. The transport's
@@ -387,6 +416,12 @@ public final class SessionController: @unchecked Sendable {
         /// (§26, §18).
         transactionIngressGate: TransactionIngressGate? = nil
     ) {
+        let lifecycleEventPipe = AsyncStream.makeStream(
+            of: SessionLifecycleEvent.self,
+            bufferingPolicy: .bufferingNewest(16)
+        )
+        self.lifecycleEvents = lifecycleEventPipe.stream
+        self.lifecycleEventContinuation = lifecycleEventPipe.continuation
         self.transport = transport
         self.applier = applier
         self.outbox = outbox
@@ -398,6 +433,47 @@ public final class SessionController: @unchecked Sendable {
         self.requiredServerProfiles = requiredServerProfiles
         self.transactionIngressGate = transactionIngressGate
             ?? TransactionIngressGate(limits: transactionRateLimits)
+    }
+
+    deinit {
+        lifecycleEventContinuation.finish()
+    }
+
+    /// Must be called while the state lock is held so stop-generation changes cannot overtake a yield.
+    private func emitRunningLifecycleEventLocked(
+        _ event: SessionLifecycleEvent,
+        for generation: UInt64
+    ) {
+        guard lifecycleGeneration == generation, isRunning, !isStopping else { return }
+        _ = lifecycleEventContinuation.yield(event)
+    }
+
+    private func emitRunningLifecycleEvent(
+        _ event: SessionLifecycleEvent,
+        for generation: UInt64
+    ) {
+        withStateLock {
+            emitRunningLifecycleEventLocked(event, for: generation)
+        }
+    }
+
+    private func emitReadyIfCurrent(
+        sessionID: String,
+        revision: UInt64,
+        lifecycleGeneration: UInt64
+    ) {
+        withStateLock {
+            guard currentSessionId == sessionID,
+                  eventDispatchEnabled,
+                  !_isDiverged else {
+                return
+            }
+            guard case .active = phase else { return }
+            emitRunningLifecycleEventLocked(
+                .ready(sessionID: sessionID, revision: revision),
+                for: lifecycleGeneration
+            )
+        }
     }
 
     private func withStateLock<T>(_ body: () -> T) -> T {
@@ -1355,6 +1431,7 @@ public final class SessionController: @unchecked Sendable {
                         "resume start lost its outbox connection binding"
                     )
                 }
+                let lastAppliedRevision = applier.lastAppliedRevision.value
                 let adoptedResume = withStateLock { () -> Bool in
                     guard self.lifecycleGeneration == lifecycleGeneration,
                           isRunning,
@@ -1363,6 +1440,13 @@ public final class SessionController: @unchecked Sendable {
                     }
                     self.requestedSessionId = requestedId
                     self.resumeGeneration = resumeGeneration
+                    self.emitRunningLifecycleEventLocked(
+                        .connecting(.resume(
+                            sessionID: requestedId,
+                            lastAppliedRevision: lastAppliedRevision
+                        )),
+                        for: lifecycleGeneration
+                    )
                     return true
                 }
                 guard adoptedResume else {
@@ -1374,7 +1458,7 @@ public final class SessionController: @unchecked Sendable {
                 var resume = SRUIClientResume()
                 resume.sessionID = requestedId
                 resume.clientInstanceID = clientInstanceId.bytes
-                resume.lastAppliedRevision = applier.lastAppliedRevision.value
+                resume.lastAppliedRevision = lastAppliedRevision
                 resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
                 resume.limits = limits
                 resume.knownResourceHashes = knownResourceHashes
@@ -1425,7 +1509,19 @@ public final class SessionController: @unchecked Sendable {
 
                 var envelope = SRUIMessage()
                 envelope.clientHello = hello
-                guard ownsRunningLifecycle(lifecycleGeneration) else {
+                let announcedFreshConnection = withStateLock { () -> Bool in
+                    guard self.lifecycleGeneration == lifecycleGeneration,
+                          isRunning,
+                          !isStopping else {
+                        return false
+                    }
+                    self.emitRunningLifecycleEventLocked(
+                        .connecting(.fresh),
+                        for: lifecycleGeneration
+                    )
+                    return true
+                }
+                guard announcedFreshConnection else {
                     throw SessionFailure.superseded(
                         "fresh start lost lifecycle ownership before send"
                     )
@@ -1490,6 +1586,12 @@ public final class SessionController: @unchecked Sendable {
             }
             await receiveStartGate.release()
         } catch {
+            let lifecycleFailure = (error as? SessionFailure)
+                ?? SessionFailure.transportEnded("session start failed: \(error)")
+            emitRunningLifecycleEvent(
+                .failed(lifecycleFailure),
+                for: lifecycleGeneration
+            )
             await cleanUpFailedStart(generation: lifecycleGeneration)
             if let activatedResourceOwnerEpoch {
                 _ = await resourceCache.deactivateReferenceOwner(
@@ -2233,6 +2335,7 @@ public final class SessionController: @unchecked Sendable {
     }
 
     private func handleWelcome(_ welcome: SRUIServerWelcome) async {
+        let lifecycleGeneration = withStateLock { self.lifecycleGeneration }
         // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
         // version would let two peers that disagree about required semantics reach the data plane
         // (§4 inv. 13).
@@ -2316,6 +2419,10 @@ public final class SessionController: @unchecked Sendable {
                 self.pendingResync = true
                 self.eventDispatchEnabled = false
                 self.phase = .awaitingSnapshot(negotiated: negotiated)
+                self.emitRunningLifecycleEventLocked(
+                    .resynchronizing(.fresh(sessionID: welcome.sessionID)),
+                    for: lifecycleGeneration
+                )
             } else {
                 self.phase = .active(negotiated: negotiated)
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
@@ -2340,6 +2447,11 @@ public final class SessionController: @unchecked Sendable {
             }
         } else {
             await reissueCollectionRangeRequestsIfAllowed()
+            emitReadyIfCurrent(
+                sessionID: welcome.sessionID,
+                revision: applier.lastAppliedRevision.value,
+                lifecycleGeneration: lifecycleGeneration
+            )
         }
         SessionDiagnostics.log(
             "Handshake completed successfully with session \(welcome.sessionID), negotiated: \(negotiated)"
@@ -2486,7 +2598,11 @@ public final class SessionController: @unchecked Sendable {
             )
             return
         }
-        await finalizeResumeAttempt(generation) {
+        let readyRevision = applier.lastAppliedRevision.value
+        let finalized = await finalizeResumeAttempt(
+            generation,
+            lifecycleGeneration: lifecycleGeneration
+        ) {
             let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
             self.requestedSessionId = nil
@@ -2495,6 +2611,12 @@ public final class SessionController: @unchecked Sendable {
             self.phase = .active(negotiated: negotiated)
             self.eventDispatchEnabled = !self._isDiverged
         }
+        guard finalized else { return }
+        emitReadyIfCurrent(
+            sessionID: resumeOk.sessionID,
+            revision: readyRevision,
+            lifecycleGeneration: lifecycleGeneration
+        )
         await reissueCollectionRangeRequestsIfAllowed()
         guard let resumedIncarnation = withStateLock({
             outboxSessionIncarnation
@@ -2734,6 +2856,10 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
+                emitRunningLifecycleEvent(
+                    .resynchronizing(.sameSession(sessionID: resync.sessionID)),
+                    for: lifecycleGeneration
+                )
 
             case .replaced:
                 guard resync.sessionID != requested else {
@@ -2786,6 +2912,13 @@ public final class SessionController: @unchecked Sendable {
                     sessionId: resync.sessionID,
                     negotiated: replacementCapabilities
                 )
+                emitRunningLifecycleEvent(
+                    .resynchronizing(.replaced(
+                        previousSessionID: requested,
+                        newSessionID: resync.sessionID
+                    )),
+                    for: lifecycleGeneration
+                )
 
             case .unspecified:
                 await reportFailure(.protocolViolation(
@@ -2818,6 +2951,10 @@ public final class SessionController: @unchecked Sendable {
                     ) {
                     case .applied:
                         enterAwaitingSnapshot(sessionId: resync.sessionID, negotiated: negotiated)
+                        emitRunningLifecycleEvent(
+                            .resynchronizing(.sameSession(sessionID: resync.sessionID)),
+                            for: lifecycleGeneration
+                        )
 
                     case .resumeRequired:
                         await reportFailure(.transportEnded(
@@ -2883,6 +3020,13 @@ public final class SessionController: @unchecked Sendable {
                 enterAwaitingSnapshot(
                     sessionId: resync.sessionID,
                     negotiated: replacementCapabilities
+                )
+                emitRunningLifecycleEvent(
+                    .resynchronizing(.replaced(
+                        previousSessionID: currentId,
+                        newSessionID: resync.sessionID
+                    )),
+                    for: lifecycleGeneration
                 )
 
             case .unspecified:
@@ -3781,7 +3925,7 @@ public final class SessionController: @unchecked Sendable {
             binding: ownership.binding,
             sessionIncarnation: ownership.sessionIncarnation,
             { [weak self] in
-                self?.markFailure(requiring: ownership)
+                self?.markFailure(failure, requiring: ownership)
             }
         ), let failureState = authorized else {
             return
@@ -3790,9 +3934,18 @@ public final class SessionController: @unchecked Sendable {
     }
 
     /// Commits controller state after resume replay and abandons background retries when teardown raced completion.
-    private func finalizeResumeAttempt(_ generation: UInt64, mutate: () -> Void) async {
+    private func finalizeResumeAttempt(
+        _ generation: UInt64,
+        lifecycleGeneration: UInt64,
+        mutate: () -> Void
+    ) async -> Bool {
         let didCommitControllerState = withStateLock { () -> Bool in
-            guard isRunning, !_isDiverged else { return false }
+            guard self.lifecycleGeneration == lifecycleGeneration,
+                  isRunning,
+                  !isStopping,
+                  !_isDiverged else {
+                return false
+            }
             mutate()
             activeReplayRetryGeneration = generation
             return true
@@ -3802,6 +3955,7 @@ public final class SessionController: @unchecked Sendable {
         } else {
             await outbox.stopResumeWork(generation: generation)
         }
+        return didCommitControllerState
     }
 
     /// Reports the terminal failure for a resume decision the outbox refused (§18).
@@ -3840,16 +3994,30 @@ public final class SessionController: @unchecked Sendable {
     /// Releases the snapshot latch only after authoritative state has rendered and the full-resync
     /// text boundary has reached the outbox.
     private func completeSnapshotCatchUp() async {
-        let (generation, connectionBinding, sessionIncarnation) = withStateLock {
+        let (
+            generation,
+            connectionBinding,
+            sessionIncarnation,
+            lifecycleGeneration,
+            sessionID
+        ) = withStateLock {
             (
                 self.resumeGeneration,
                 self.outboxConnectionBinding,
-                self.outboxSessionIncarnation
+                self.outboxSessionIncarnation,
+                self.lifecycleGeneration,
+                self.currentSessionId
             )
         }
         guard let connectionBinding, let sessionIncarnation else {
             await reportFailure(.protocolViolation(
                 "resync snapshot finalization lost its outbox connection binding"
+            ))
+            return
+        }
+        guard let sessionID else {
+            await reportFailure(.protocolViolation(
+                "resync snapshot finalization lost its session identity"
             ))
             return
         }
@@ -3872,13 +4040,17 @@ public final class SessionController: @unchecked Sendable {
 
         withStateLock { self.pendingResync = false }
         if let generation {
-            await finalizeResumeAttempt(generation) {
+            let finalized = await finalizeResumeAttempt(
+                generation,
+                lifecycleGeneration: lifecycleGeneration
+            ) {
                 self.resumeGeneration = nil
                 self.eventDispatchEnabled = true
                 if case .awaitingSnapshot(let negotiated) = self.phase {
                     self.phase = .active(negotiated: negotiated)
                 }
             }
+            guard finalized else { return }
         } else {
             withStateLock {
                 self.eventDispatchEnabled = self.isRunning && !self._isDiverged
@@ -3887,6 +4059,11 @@ public final class SessionController: @unchecked Sendable {
                 }
             }
         }
+        emitReadyIfCurrent(
+            sessionID: sessionID,
+            revision: applier.lastAppliedRevision.value,
+            lifecycleGeneration: lifecycleGeneration
+        )
         await reissueCollectionRangeRequestsIfAllowed()
         await dispatchReadyTextEdits(
             binding: connectionBinding,
@@ -3920,6 +4097,7 @@ public final class SessionController: @unchecked Sendable {
     }
 
     private func markFailure(
+        _ failure: SessionFailure,
         requiring ownership: PendingReplayFailureOwnership? = nil
     ) -> SessionFailureTeardownState? {
         withStateLock {
@@ -3938,6 +4116,10 @@ public final class SessionController: @unchecked Sendable {
             _isDiverged = true
             eventDispatchEnabled = false
             phase = .failed
+            emitRunningLifecycleEventLocked(
+                .failed(failure),
+                for: lifecycleGeneration
+            )
             let replayGeneration = resumeGeneration ?? activeReplayRetryGeneration
             activeReplayRetryGeneration = nil
             let transactionTasks = Array(transactionIngressTasks.values)
@@ -3968,7 +4150,7 @@ public final class SessionController: @unchecked Sendable {
     }
 
     private func reportFailure(_ failure: SessionFailure) async {
-        guard let state = markFailure() else { return }
+        guard let state = markFailure(failure) else { return }
         await finishFailureReport(failure, state: state)
     }
 
@@ -4301,6 +4483,7 @@ public final class SessionController: @unchecked Sendable {
             phase = .idle
             isRunning = false
             isStopping = false
+            _ = lifecycleEventContinuation.yield(.stopped)
             return true
         }
     }

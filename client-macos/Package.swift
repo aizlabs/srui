@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "Protocol", targets: ["Protocol"]),
         .library(name: "SemanticModel", targets: ["SemanticModel"]),
         .library(name: "Session", targets: ["Session"]),
+        .library(name: "ConnectionManager", targets: ["ConnectionManager"]),
         .library(name: "RendererAppKit", targets: ["RendererAppKit"]),
         .library(name: "Collections", targets: ["Collections"]),
         .library(name: "Text", targets: ["Text"]),
@@ -76,9 +77,21 @@ let package = Package(
             ],
             path: "Session"
         ),
+        .target(
+            name: "ConnectionManager",
+            dependencies: [
+                "Session",
+                "RendererAppKit",
+                "TransportSSH",
+                "SemanticModel",
+                "Resources",
+            ],
+            path: "ConnectionManager"
+        ),
         .executableTarget(
             name: "RendererDemoApp",
             dependencies: [
+                "ConnectionManager",
                 "Session",
                 "RendererAppKit",
                 "TransportSSH",
@@ -175,6 +188,7 @@ let package = Package(
                 "Protocol",
                 "SemanticModel",
                 "Session",
+                "ConnectionManager",
                 "RendererAppKit",
                 "Collections",
                 "Text",

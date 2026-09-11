@@ -12,6 +12,30 @@ private final class BenchmarkHoverPointerContext {
 }
 
 @MainActor
+func benchmarkScreenCenter(
+    of targetView: NSView,
+    in window: NSWindow
+) -> NSPoint {
+    let centerInWindow = targetView.convert(
+        NSPoint(x: targetView.bounds.midX, y: targetView.bounds.midY),
+        to: nil
+    )
+    return window.convertPoint(toScreen: centerInWindow)
+}
+
+@MainActor
+func benchmarkScreenPointOutside(
+    _ targetView: NSView,
+    in window: NSWindow
+) -> NSPoint {
+    let center = benchmarkScreenCenter(of: targetView, in: window)
+    return NSPoint(
+        x: center.x + max(targetView.bounds.width, 1) + 100,
+        y: center.y
+    )
+}
+
+@MainActor
 func localInteractionSamples(
     renderer: AppKitRenderer,
     fixtureIndex: BenchmarkFixtureIndex,
@@ -101,16 +125,10 @@ func localInteractionSamples(
         _ = button.reconcilePointerState()
     }
 
-    let centerInWindow = button.convert(
-        NSPoint(x: button.bounds.midX, y: button.bounds.midY),
-        to: nil
+    hoverContext.screenLocation = benchmarkScreenPointOutside(
+        button,
+        in: window
     )
-    let centerInScreen = window.convertPoint(toScreen: centerInWindow)
-    let outsideInScreen = NSPoint(
-        x: centerInScreen.x + button.bounds.width + 100,
-        y: centerInScreen.y
-    )
-    hoverContext.screenLocation = outsideInScreen
     guard button.reconcilePointerState() == false,
           button.isPointerInside == false else {
         throw BenchmarkFailure.message(
@@ -287,19 +305,28 @@ func localInteractionSamples(
             requiresExactCompositedRestoration: true,
             acceptFramesDuringAction: true,
             action: {
-                hoverContext.screenLocation = centerInScreen
+                hoverContext.screenLocation = benchmarkScreenCenter(
+                    of: button,
+                    in: window
+                )
                 return button.reconcilePointerState()
                     && button.isPointerInside
             },
             cleanup: {
-                hoverContext.screenLocation = outsideInScreen
+                hoverContext.screenLocation = benchmarkScreenPointOutside(
+                    button,
+                    in: window
+                )
                 return button.reconcilePointerState() == false
                     && button.isPointerInside == false
             }
         )
         hoverCompletedCompositedCycles += 1
 
-        hoverContext.screenLocation = centerInScreen
+        hoverContext.screenLocation = benchmarkScreenCenter(
+            of: button,
+            in: window
+        )
         guard button.reconcilePointerState(), button.isPointerInside else {
             throw BenchmarkFailure.message(
                 "pressed benchmark could not establish its hovered baseline"
@@ -322,7 +349,10 @@ func localInteractionSamples(
                     && callbackCount == callbacksBefore + 1
             }
         )
-        hoverContext.screenLocation = outsideInScreen
+        hoverContext.screenLocation = benchmarkScreenPointOutside(
+            button,
+            in: window
+        )
         _ = button.reconcilePointerState()
         benchmarkSettleLocalFeedback(button)
     }

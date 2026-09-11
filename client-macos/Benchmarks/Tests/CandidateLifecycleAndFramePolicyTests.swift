@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Foundation
 import Testing
@@ -168,6 +169,35 @@ func windowAcceptanceRejectsForeignAndOverlap() {
     default:
         Issue.record("intersecting WindowServer evidence was accepted")
     }
+}
+
+@Test("local interaction pointer targets follow window relocation")
+@MainActor
+func localInteractionPointerTargetsFollowWindowRelocation() throws {
+    let window = NSWindow(
+        contentRect: NSRect(x: 100, y: 100, width: 300, height: 200),
+        styleMask: .borderless,
+        backing: .buffered,
+        defer: false
+    )
+    let button = NSButton(
+        frame: NSRect(x: 20, y: 30, width: 100, height: 40)
+    )
+    let contentView = try #require(window.contentView)
+    contentView.addSubview(button)
+
+    let beforeMove = benchmarkScreenCenter(of: button, in: window)
+    window.setFrameOrigin(NSPoint(x: 300, y: 400))
+    let afterMove = benchmarkScreenCenter(of: button, in: window)
+
+    #expect(abs((afterMove.x - beforeMove.x) - 200) < 0.001)
+    #expect(abs((afterMove.y - beforeMove.y) - 300) < 0.001)
+    let outside = benchmarkScreenPointOutside(button, in: window)
+    let outsideInWindow = window.convertPoint(fromScreen: outside)
+    #expect(
+        button.bounds.contains(button.convert(outsideInWindow, from: nil))
+            == false
+    )
 }
 
 @Test("console lock-state parser distinguishes locked, unlocked, and absent")

@@ -71,10 +71,14 @@ func benchmarkMeasureExplicitCompositedPaint(
             from: captureSession.frames,
             operation: "explicit pre-action display baseline"
         )
-        _ = try benchmarkParkPointerOutsideMeasurementROI(
-            on: screen,
-            side: .left
-        )
+        let preActionPointerLocation =
+            try benchmarkParkPointerOutsideMeasurementROI(
+                on: screen,
+                side: .left
+            )
+        defer {
+            benchmarkRestorePointer(preActionPointerLocation)
+        }
         let actionStartedMachTicks = mach_absolute_time()
         let actionStartedAt = clock.now
         try onActionStarted?(actionStartedAt, actionStartedMachTicks)

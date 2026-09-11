@@ -80,11 +80,13 @@ WebKit positions its already-created hidden window at that point; the native pat
 positions its hidden window during the timed production attach. This closes physical pointer
 movement during child warm-up or capture startup without moving the cursor inside a reported
 interval. Each park and restore also posts the matching public session-level `mouseMoved` event:
-Quartz warping alone emits no mouse event and can otherwise leave the previously hovered app\'s
-tooltip frozen ahead of the benchmark after that app deactivates. Non-compositor smoke passes use deterministic hidden geometry without requiring or moving the
-pointer. The child-side guard is
-authoritative: it closes the parent-to-child build/spawn race and completes before any candidate
-measurement interval starts.
+Quartz warping alone emits no mouse event and can otherwise leave the previously hovered app's
+tooltip frozen ahead of the benchmark after that app deactivates. The explicit-paint helper saves
+its pre-refresh location and restores it only after the accepted frame (or on failure). This matters
+when §31.3 uses that helper for an initial mount: the nested left-side renderer park cannot overwrite
+the passive section's outer right-side park. Non-compositor smoke passes use deterministic hidden
+geometry without requiring or moving the pointer. The child-side guard is authoritative: it closes
+the parent-to-child build/spawn race and completes before any candidate measurement interval starts.
 
 That interior position remains outside the right-corner 960-point renderer ROI. Each hidden native
 or WebKit window chooses the visible-frame corner farthest from the parked pointer with 64 points

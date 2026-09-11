@@ -268,11 +268,17 @@ corner, hover state, or cursor overlay. Full parse/render mode uses two nested g
 
 The child-side guard closes the build/spawn interval during which the user or system can move the
 pointer. Every full paint refreshes the child park after accepting its pre-action display baseline
-and before recording the action-start timestamp. Both guards restore the exact saved location
-during normal return and failure unwinding.
+and before recording the action-start timestamp. Each explicit-paint invocation saves the location
+it supersedes and restores it only after the accepted frame, or while unwinding a failure. This is
+also required outside §31.1: §31.3 uses explicit paint to mount a window before measuring passive
+mutation. A real consolidated run exposed the missing nested restore when the helper's left-side
+park replaced the passive section's right-side park; WindowServer then reported its cursor window
+(ID 4, layer 2,147,483,630, 9×18 points) intersecting the left-side host, and the unobscured-z-order
+gate correctly aborted without writing a report. Restoring the nested location preserves both
+scopes without moving the pointer inside a reported interval.
 
 `CGWarpMouseCursorPosition` deliberately changes location without emitting a mouse event. That can
-leave the previously hovered application\'s tooltip alive after it deactivates. This occurred in a
+leave the previously hovered application's tooltip alive after it deactivates. This occurred in a
 real full run as a 43×19-point ChatGPT message-time tooltip (`23:24`) at WindowServer layer 103;
 all 1,167 post-cutoff frames were correctly rejected because it overlapped the target. A controlled
 Swift/Quartz probe showed that a matching `.mouseMoved` event posted at `.cgSessionEventTap`

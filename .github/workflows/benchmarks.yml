@@ -23,6 +23,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  python-harness:
+    name: Benchmark harness unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Python tooling
+        run: uv sync --frozen --extra dev
+      - name: Verify generated metric-contract descriptors
+        run: uv run --frozen python benchmarks/generate_metric_contract.py --check
+      - name: Test benchmark harness explicitly
+        run: uv run --frozen pytest benchmarks/tests
+
   rust-driver:
     name: Rust benchmark driver unit tests
     runs-on: ubuntu-latest
@@ -32,6 +46,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Compile and test workspace benchmark driver
         run: cargo test --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver
+
+  swift-driver:
+    name: Swift benchmark driver build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test isolated benchmark package
+        run: swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release
 
   # Measurements remain opt-in: runner load and display state make hosted PR-run numbers noisy.
   smoke:

@@ -13,6 +13,18 @@ members = [
     "sdk",
     "unix-security",
 ]
+default-members = [
+    "protocol",
+    "ssh-bridge",
+    "sessiond",
+    "semantic-tree",
+    "journal",
+    "event-dedupe",
+    "resources",
+    "pty",
+    "sdk",
+    "unix-security",
+]
 
 [workspace.package]
 version = "0.1.0"

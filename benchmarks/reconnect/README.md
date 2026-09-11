@@ -1,8 +1,8 @@
 # §31.5 reconnect benchmark
 
-Rust owner: `server-rust/benchmark-driver/src/reconnect.rs::reconnect`, including
-`wire_pre_receipt_disconnect`, `wire_lost_ack_reconnect`, and the partial transaction/event wire
-helpers. It exercises the production resource lane, codec, `Session`, semantic store transaction
+Rust owners: `server-rust/benchmark-driver/src/reconnect.rs::reconnect` and
+`reconnect_wire.rs::{wire_pre_receipt_disconnect,wire_lost_ack_reconnect,
+wire_partial_transaction_reconnect,wire_partial_event_reconnect}`. It exercises the production resource lane, codec, `Session`, semantic store transaction
 rollback, journal retention, and event result cache. The lost-ACK replay must return
 `DUPLICATE` with the cached result and exact settled event sequence while the side-effect counter
 remains one.
@@ -15,8 +15,8 @@ runner separately times `scripts/run-conformance --suite 8 --implementation both
 
 Commands (the Rust invocation emits §31.2, §31.5, and §31.6 together; Swift can be focused):
 
-    cargo run --quiet --release --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver -- --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --output /tmp/srui-rust.json
-    client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.5 --output /tmp/srui-macos-31.5.json
+    cargo run --quiet --release --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver -- --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --output /tmp/srui-rust.json
+    client-macos/Benchmarks/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.5 --output /tmp/srui-macos-31.5.json
 
 The Rust metric family includes `disconnect_before_event_receipt_ms`,
 `lost_ack_wire_duplicate_ms`, `mid_resource_reconnect_ms`, partial transaction/event replay, and

@@ -41,7 +41,7 @@ idle repainting: the synthetic cadence task suppresses unchanged-state draws by 
 
 Focused command:
 
-    client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.3 --output /tmp/srui-31.3.json
+    client-macos/Benchmarks/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.3 --output /tmp/srui-31.3.json
 
 Metric families are `updates.{1,100,1000}.{semantic,visible,bytes,messages}` and
 `cadence.{1,100,1000}.{60,120,144,240}`. For each cadence, `.bytes`/`.messages` are

@@ -1,8 +1,9 @@
 # §31.1 parse/render benchmark
 
-Owners: `client-macos/Benchmarks/ParseRenderBenchmark.swift` (`localRenderer`,
-`runSRUICandidate`, `runWebCandidate`, and `loadAndObserveWebStates`) and
-`benchmarks/parse-render/run_xctrace.py` (capture, export, attribution, and reconciliation).
+Owners: `client-macos/Benchmarks/ParseRenderBenchmark.swift` defines the shared fixture and
+measurement plan; `LocalRendererBenchmark.swift` emits the §31.1 metrics;
+`NativeRendererCandidate.swift` owns `runSRUICandidate`; and
+`WebRendererCandidate.swift` owns `runWebCandidate` and `loadAndObserveWebStates`.
 The same fixture is split at its declared `first_paint_node_count` into two canonical
 transactions: revision 0→1 creates a useful Surface → Column → Row → Text + Progress subtree, and
 revision 1→2 creates the remaining representative UI. Rust and Swift hash the identical
@@ -60,14 +61,14 @@ unavailable; the suite never opens a permission prompt.
 
 Focused driver command:
 
-    client-macos/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.1 --output /tmp/srui-31.1.json
+    client-macos/Benchmarks/.build/release/BenchmarkDriver --fixture benchmarks/fixtures/coding-agent-ui.json --profile smoke --only-section 31.1 --output /tmp/srui-31.1.json
 
 The renderer metric set includes `srui.first_paint`, `srui.complete_paint`, `srui.cpu`,
 `srui.host_net_live_allocation_blocks`, `srui.host_net_live_allocation_bytes`,
 `srui.process_footprint_peak`, and the corresponding `webkit.*` comparison-control metrics.
 Allocation values are signed default-zone endpoint deltas, not cumulative allocation events; the
-count metric's unit is live `blocks`, not allocation calls. Xctrace is diagnostic-only and
-contributes no committed §31.1 metric or workload-interval total.
+count metric's unit is live `blocks`, not allocation calls. The rejected xctrace prototype was
+removed and contributes no §31.1 metric or workload-interval total.
 
 ## Full-mode compositor isolation and evidence chain
 
@@ -137,63 +138,25 @@ separate resource pass. See
 [the detailed findings](INSTRUMENTATION_FINDINGS.md#35-deferred-cumulative-allocation-event-count)
 for the rejected experiment, source links, and acceptance criteria.
 
-Xctrace is not part of the authoritative suite or committed baseline. Use it only to investigate
-the SRUI host:
-
-    benchmarks/parse-render/profile-allocations.sh /tmp/srui-allocations.trace
-
-The destination must not already exist. The output sidecar uses schema version 4 and explicitly
-sets `diagnostic_only=true` and `authoritative_benchmark_metric=false`. It contains exact
-PID/process-birth/liveness evidence, tool metadata, internally validated whole-trace Statistics,
-the final live Allocations List, and signed Statistics-minus-List discrepancies. The recorded
-workload window is context only and has
-`used_for_allocation_attribution=false`. No List timestamp is converted to wall-clock time and no
-interval allocation total is reported.
-
-On Xcode 26.0 (17C52), the supported Allocations view-detail paths are discovered from the trace
-TOC and exported as:
-
-    /trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]
-    /trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Allocations List"]
-
-Do not substitute the generic `/trace-toc/run/data/table[@schema="allocations"]` path.
-`count-events` is not an allocation count. List and Statistics are independently materialized
-diagnostics and are not required to match.
-
-The diagnostic deliberately instruments SRUI's host only. Attaching Allocations to warmed WebKit
-was observed to stall during JavaScriptCore/libmalloc root enumeration and would materially
-perturb the control. Separate helper traces would not be one coherent multiprocess sample.
+Xctrace is not part of the authoritative suite or committed baseline. The Task 34 prototype was
+removed after real Xcode 26 captures disproved interval timestamp alignment and exact
+List/Statistics reconciliation, and warmed WebKit attachment materially stalled. It produced
+whole-trace Statistics plus a final live list, not an exact count of allocations made inside the
+resource pass. There is deliberately no supported repository command for that rejected method.
+The exact observations, exporter paths, process-attribution rules, and discarded runnable design
+remain in [the historical findings](INSTRUMENTATION_FINDINGS.md).
 
 ## Authorization and safety
 
-The optional diagnostic requires all of the following:
+Full visual measurements require Screen Recording permission for the responsible application and
+an active, unlocked display. The harness checks authorization without prompting. Smoke paint and
+resource measurements require neither Screen Recording nor Developer Tools permission. Full Disk
+Access is not required.
 
-- developer mode enabled according to `/usr/sbin/DevToolsSecurity -status`;
-- the responsible terminal or Codex app enabled in **System Settings → Privacy & Security →
-  Developer Tools**;
-- a staged target carrying `com.apple.security.get-task-allow=true`.
-
-Full Disk Access is not required. Screen Recording is a separate permission used only by
-ScreenCaptureKit full-paint evidence.
-
-The harness copies the release driver into a token-owned private workspace, ad-hoc signs only the
-copy, verifies its entitlement, and never modifies the SwiftPM build artifact. It enforces a 2 GiB
-recursive trace limit, 256 MiB export limit, and 4 GiB free-space reserve by default. Override
-these with `SRUI_XCTRACE_MAX_BYTES`, `SRUI_XCTRACE_MAX_EXPORT_BYTES`, and
-`SRUI_XCTRACE_MIN_FREE_BYTES`. A trace is a directory; `stat` reports only its directory
-entry, while `du -sk` is an approximate on-disk diagnostic. Failed staging and capture state is
-ownership-token checked and removed; repeated failed traces are not retained.
-
-If capture fails, inspect in this order:
-
-1. `xcrun xctrace version` and the exported TOC;
-2. advertised Statistics/List view paths;
-3. developer-mode and app privacy authorization;
-4. the staged `get-task-allow` entitlement;
-5. exact PID plus process-birth identity;
-6. recursive trace/export/free-space bounds.
-
-Do not infer flags or schemas from a different Xcode release.
+The consolidated runner checks its free-space reserve throughout execution, supervises exact
+process groups, verifies process-birth identities after candidate exit, and publishes JSON and
+Markdown as an atomic rollback-protected pair. A failed correctness assertion produces a report
+and a nonzero exit; a missing or malformed production-conformance count aborts publication.
 
 ## Detailed findings
 

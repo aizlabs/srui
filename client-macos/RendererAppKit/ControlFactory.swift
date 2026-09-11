@@ -8,52 +8,6 @@ public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
 }
 
-/// Native button whose pointer feedback is owned entirely by the local renderer (§22.5).
-@MainActor
-final class HoverFeedbackButton: NSButton {
-    private var feedbackTrackingArea: NSTrackingArea?
-    private(set) var isPointerInside = false
-
-    override func updateTrackingAreas() {
-        if let feedbackTrackingArea {
-            removeTrackingArea(feedbackTrackingArea)
-        }
-        super.updateTrackingAreas()
-        let trackingArea = NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea)
-        feedbackTrackingArea = trackingArea
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        super.mouseEntered(with: event)
-        isPointerInside = true
-        needsDisplay = true
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        super.mouseExited(with: event)
-        isPointerInside = false
-        needsDisplay = true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        guard isPointerInside, isEnabled else { return }
-        let overlayRect = bounds.insetBy(dx: 1, dy: 1)
-        guard overlayRect.isEmpty == false else { return }
-        NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
-        NSBezierPath(
-            roundedRect: overlayRect,
-            xRadius: 6,
-            yRadius: 6
-        ).fill()
-    }
-}
 
 /// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
 @MainActor
@@ -83,16 +37,9 @@ public final class ActionTrampoline: NSObject {
     }
 }
 
-/// Creates native controls for the required §7.3 tier and any explicitly implemented optional tiers.
+/// Creates native controls for the required §7.3 tier and applies scalar properties in place.
 @MainActor
 public final class ControlFactory {
-    /// Standard types this renderer implements. Optional/deferred additions stay explicit so
-    /// conformance can distinguish supported semantics from an accidental fallback.
-    static let implementedStandardNodeTypes: Set<TypeRef> = [
-        .surface, .row, .column, .grid, .spacer, .separator, .scroll,
-        .text, .richText, .button, .toggle, .textInput, .textArea,
-        .progress, .image, .list, .table, .tree, .menu,
-    ]
 
     /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
@@ -366,11 +313,6 @@ public final class ControlFactory {
             let outline = makeOutline(for: node, store: store)
             result = (outline.0, outline.1, outline.2, nil)
 
-        case .menu:
-            let popUp = NSPopUpButton(frame: .zero, pullsDown: false)
-            popUp.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
-            result = (popUp, nil, nil, nil)
-
         default:
             throw ControlFactoryError.unsupportedNodeType(node.nodeType)
         }
@@ -550,14 +492,7 @@ public final class ControlFactory {
             applyResourceProperty(value?.asResourceHash, to: handle)
 
         case .items, .modelRef, .columns, .selectionMode:
-            if property == .items,
-               handle.nodeType == .menu,
-               let popUp = handle.view as? NSPopUpButton {
-                popUp.removeAllItems()
-                popUp.addItems(
-                    withTitles: value?.asList?.compactMap { $0.asString } ?? []
-                )
-            } else if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+            if let adapter = handle.modelAdapter as? TableCollectionAdapter,
                let tableView = tableView(in: handle) {
                 if property == .columns {
                     let colStrings = value?.asList?.compactMap { $0.asString }

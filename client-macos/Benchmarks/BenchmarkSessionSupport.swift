@@ -337,6 +337,7 @@ func startActiveSession(
     transport: BenchmarkTransport,
     renderer: AppKitRenderer,
     fixtureOperations: [SemanticModel.Operation],
+    fixtureIndex: BenchmarkFixtureIndex,
     sessionID: String,
     outbox: EventOutbox = EventOutbox()
 ) async throws -> SessionController {
@@ -356,9 +357,11 @@ func startActiveSession(
     )
     try await waitForRevision(Revision(1), controller: controller)
     try await waitUntil {
-        renderer.registry.handle(for: NodeId(1)) != nil
-            && renderer.registry.handle(for: NodeId(14)) != nil
-            && renderer.registry.handle(for: NodeId(16)) != nil
+        renderer.registry.handle(for: fixtureIndex.surface) != nil
+            && renderer.registry.handle(for: fixtureIndex.progress) != nil
+            && renderer.registry.handle(for: fixtureIndex.fileTree) != nil
+            && renderer.registry.handle(for: fixtureIndex.textEditor) != nil
+            && renderer.registry.handle(for: fixtureIndex.primaryAction) != nil
     }
     guard controller.isEventDispatchEnabled else {
         throw BenchmarkFailure.message("benchmark session did not enable event dispatch")

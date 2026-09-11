@@ -20,12 +20,12 @@ also says that benchmark layers must remain separate. Nothing in this file overr
 | CPU | Process CPU counters around the representative resource pass | SRUI host; WebKit host plus exact helper PIDs | Wall-clock delay and process-name matching |
 | Allocations | Signed `malloc_zone_statistics` endpoint deltas | Candidate host's default malloc zone | Allocation-call traffic, every malloc zone, WebKit helper allocations, and xctrace |
 | Peak memory | Periodic physical-footprint sampling in a separate pass | SRUI host; WebKit host plus exact helper PIDs | A sum of per-process lifetime maxima |
-| Xcode Allocations data | Optional `xctrace` diagnostic | Exact SRUI host PID and process birth, whole trace/final live view | §31.1 acceptance, committed baseline metrics, WebKit comparison, and workload-interval attribution |
+| Xcode Allocations prototype (removed) | Historical rejected `xctrace` experiment | Exact SRUI host PID and process birth, whole trace/final live view | §31.1 acceptance, committed metrics, WebKit comparison, and workload-interval attribution |
 
-The most important outcome is that xctrace is not the authoritative allocation measurement.
-The normal benchmark is complete without Developer Tools access. Xctrace remains useful for
-investigation, but its output is explicitly marked `diagnostic_only=true` and
-`authoritative_benchmark_metric=false`.
+The most important outcome is that xctrace is not the authoritative allocation measurement. The
+normal benchmark is complete without Developer Tools access. The prototype marked its output
+`diagnostic_only=true` and `authoritative_benchmark_metric=false`; it was later removed so that
+output cannot be mistaken for current §31.1 evidence.
 
 ## 1. Authoritative §31.1 workload boundaries
 
@@ -214,10 +214,61 @@ menu-bar, and hot-corner activation. The cursor is not removed from WindowServer
 cursor or another nonzero-alpha surface intersects the target ahead, the sample remains invalid.
 
 A locked or inactive login session can make the necessary display/window evidence unavailable.
-`caffeinate` can keep an already available display awake for the runner's lifetime; it cannot
-unlock a session, grant Screen Recording, or override secure UI.
+A real failed full run showed the characteristic state: the window was `NSWindow.isVisible=true`
+and present through `.optionIncludingWindow`, but the console dictionary reported
+`CGSSessionScreenIsLocked=1`, `NSApplication.isActive=false`, `isKeyWindow=false`, and the exact
+window was absent from `.optionOnScreenOnly`. The driver now rejects an explicitly locked session
+before measurement; if that diagnostic dictionary key is unavailable, exact WindowServer and pixel
+checks remain authoritative and fail closed. `caffeinate` can keep an already available display
+awake for the runner's lifetime; it cannot unlock a session, grant Screen Recording, or override
+secure UI.
 
-### 2.6 Pixel acceptance
+### 2.6 §31.4 real-input-routing experiment and accepted scope
+
+A late §31.4 prototype tried to extend the local-feedback benchmark from mounted-control state
+changes to real session-level pointer delivery. It saved and warped the Quartz pointer, posted
+`.mouseMoved`, `.leftMouseDown`, and `.leftMouseUp` events through public CoreGraphics event taps,
+pumped `NSApplication` events, and attempted to prove the button's highlighted interval before an
+independent watchdog released the mouse. `CGPreflightPostEventAccess()` returned true on the test
+host, so denial of event-posting authorization was not the observed failure.
+
+The failure was foreground ownership. The unbundled SwiftPM executable could create an exact
+on-screen status-level WindowServer surface, but neither `NSApplication.activate()`, the legacy
+`NSRunningApplication.activate(.activateIgnoringOtherApps)`, nor a posted title-bar click made the
+process active and the window key on the macOS 14 test host. The fail-closed diagnostic reported
+`post_access=true`, `active=false`, and `key=false`. Without active/key ownership, a posted pointer
+sequence cannot honestly be called the control's normal AppKit input route.
+
+An app-bundle launcher with a real `Info.plist` and LaunchServices lifecycle might make end-to-end
+input routing measurable, but it would add a second packaging/launch system and could change the
+subject. Task 34 rejected that expansion. It also rejected direct `sendEvent` as proof of
+WindowServer delivery: constructing an `NSEvent` and calling the application directly bypasses the
+boundary the experiment was supposed to establish.
+
+The accepted §31.4 boundary is therefore explicit:
+
+- text editing, selection, IME, scrolling, and menu work run on controls mounted by the production
+  renderer;
+- hover injects deterministic pointer/application/window context through benchmark SPI into the
+  production `HoverFeedbackButton.reconcilePointerState()` implementation;
+- pressed feedback invokes AppKit `performClick(nil)` on the mounted button and requires exactly
+  one production `ActionTrampoline` callback;
+- full mode still requires the real compositor-visible target transition and, for hover, exact
+  bounded restoration;
+- every local action overlaps an exact held production transaction at the configured RTT.
+
+This measures whether SRUI adds a synchronous network dependency between native local state and
+visible output. It does **not** measure keyboard/mouse hardware delivery or WindowServer/AppKit
+event-dispatch latency. Fresh reports and the network README must preserve that non-claim. The
+current accepted path does not post input events and therefore requires no input-event permission;
+full pixel evidence still requires Screen Recording.
+
+If a future task requires true end-to-end input latency, it must launch an identified app bundle,
+prove active/key state before timing, preserve and restore the previous application and pointer,
+correlate the injected event timestamp with the accepted compositor frame, bound mouse-up cleanup,
+and treat any authorization or focus failure as missing evidence rather than zero latency.
+
+### 2.7 Pixel acceptance
 
 A frame must be complete and its exact target-view crop must be:
 
@@ -236,7 +287,7 @@ accepting a stale surface and checking later.
 SHA-256 image fingerprints are retained as diagnostics. Hash inequality alone is not evidence of a
 material UI change: a one-pixel capture artifact could change a hash.
 
-### 2.7 Precise presentation claims
+### 2.8 Precise presentation claims
 
 A passing full metric supports this claim:
 
@@ -521,8 +572,7 @@ the instrumented workload did not make bounded progress and cannot be reported a
 sample.
 
 Separate host, WebContent, Networking, and GPU attachments would also be sequential views, not one
-simultaneous coherent multiprocess snapshot. The optional diagnostic therefore rejects a WebKit
-capture and targets only the SRUI host.
+simultaneous coherent multiprocess snapshot. The rejected prototype therefore targeted only the SRUI host and refused a WebKit capture.
 
 ### 4.6 AppKit activation-policy experiments
 
@@ -530,9 +580,9 @@ Early auxiliary candidates attempted `NSApplication.setActivationPolicy`. Raw va
 (regular) and raw value 1 (accessory) both failed through LaunchServices policy modification in
 the instrumented context. Switching between those values was not a reliable fix.
 
-The diagnostic candidate now leaves AppKit's process-selected activation policy unchanged. It
-does not call `activate` and does not order a foreground window. It performs the hidden
-production layout/draw path and `CATransaction.flush()`. Ordinary full visual candidates remain
+The prototype ultimately left AppKit's process-selected activation policy unchanged. It did not
+call `activate` or order a foreground window; it performed the hidden production layout/draw path
+and `CATransaction.flush()`. Ordinary full visual candidates remain
 regular foreground applications and are the only candidates used for ScreenCaptureKit
 presentation evidence.
 
@@ -540,322 +590,113 @@ Initializing `NSApplication.shared` can still emit a LaunchServices assertion. T
 does not determine failure. The exact subsequent render/control handshake, process identity, and
 exit status determine whether the diagnostic candidate succeeded.
 
-### 4.7 Resulting xctrace contract
+### 4.7 Disposition of the xctrace prototype
 
-The optional capture is intentionally narrow:
+The capture prototype was diagnostic-only and never supplied a §31.1 metric. It proved that the
+available Xcode 26 exports cannot support the required claim:
 
-- one exact SRUI host process per sample;
-- the Allocations template attached by PID;
-- PID corroborated by Darwin process birth and liveness bounds;
-- recording readiness proved by the requested Darwin notification;
-- equivalent hidden resource workload;
-- whole-trace Statistics, including the attach-time live baseline;
-- final live Allocations List totals;
-- signed Statistics-minus-List discrepancy;
-- workload timestamps retained as descriptive metadata only;
-- no WebKit capture;
-- no committed §31.1 metric;
-- no baseline gate.
+- Statistics covers the whole recording, including the attach-time live heap;
+- Allocations List is a final live view and omits allocations freed before finalization;
+- their timestamps were not shown to share the TOC or Swift clock origin;
+- the two views were independently materialized and did not reconcile exactly;
+- attaching to warmed WebKit materially stalled the comparison workload.
 
-The summary uses schema version 4 and records:
+The runnable controller, exporter, entitlement, shell wrapper, and tests were therefore removed.
+Keeping a polished command for a rejected method made it too easy to present diagnostic output as
+benchmark evidence. Sections 3, 4, and 10 retain the exact observations so the experiment need not
+be repeated. A future implementation must satisfy issue #48's bounded in-process event-counter
+criteria before cumulative allocation traffic can become authoritative.
 
-- `diagnostic_only=true`;
-- `authoritative_benchmark_metric=false`;
-- `diagnostic_target="srui_host"`;
-- `capture_scope="exact_process_diagnostic"`;
-- `workload_window.used_for_allocation_attribution=false`.
+## 5. Process-attribution lessons retained
 
-Any future code that changes one of those fields is changing the evidence claim, not merely
-renaming output.
+A numeric PID alone is not stable evidence because the operating system can reuse it. Any future
+process-scoped diagnostic must bind the supervised child PID to process birth, prove liveness
+through the measurement boundary, and prove that exact PID/birth identity is gone afterward.
+Process-name matching is insufficient.
 
-## 5. Exact process attribution
+WindowServer attribution is a separate chain: AppKit window number, owner PID, dynamically
+resolved layer, bounds, display, target crop, and z-order before and after pixel verification.
+Neither process identity nor window identity can substitute for the other.
 
-A numeric PID alone is not stable evidence because the operating system can reuse it. The
-diagnostic protocol therefore binds:
+## 6. Permission and signing findings (historical)
 
-1. the candidate child PID created under managed supervision;
-2. its Darwin process-birth timestamp;
-3. the target PID published by the candidate handshake;
-4. the PID reported as attached in the trace TOC;
-5. an observed-alive-through timestamp that spans the workload;
-6. post-run proof that the exact PID/birth identity is gone.
+The rejected prototype required three distinct mechanisms:
 
-A process name is retained only for diagnostics. It is never used to select or attribute a target.
-A same-named unrelated process and a reused numeric PID must both be rejected.
+- Developer Tools privacy access for the responsible terminal or Codex application;
+- system developer mode as reported by `/usr/sbin/DevToolsSecurity -status`;
+- `com.apple.security.get-task-allow=true` on a private staged copy of the target.
 
-The WindowServer proof uses a separate exact identity chain: AppKit window number plus current
-owner PID, layer, bounds, display, and z-order. Process attribution cannot substitute for window
-identity, and window identity cannot substitute for allocator-process attribution.
+Screen Recording is unrelated: it authorizes ScreenCaptureKit pixels for full visible-paint
+measurements. Full Disk Access is required for neither measurement and must not be suggested as a
+workaround. Changing a privacy grant may require restarting the responsible application.
 
-## 6. Staged signing and authorization
+The prototype never re-signed the SwiftPM product in place. It copied the executable into a
+private, token-owned directory and signed only that copy. This avoided mutating a shared build
+artifact. These details are historical constraints, not current benchmark setup steps: the normal
+suite does not invoke xctrace or require Developer Tools access.
 
-### 6.1 Why a private copy is signed
+## 7. Recorder-lifecycle findings (historical)
 
-Exact-process attachment requires the target to permit task inspection. The harness must not
-modify `client-macos/.build/release/BenchmarkDriver` in place because that is a SwiftPM build
-artifact. Re-signing it can corrupt freshness/signature assumptions and race concurrent builds.
+A created trace directory and recorder progress text did not prove that instrumentation was ready.
+The experiment used a unique Darwin tracing-started notification, exact identity checks, and a
+bounded control handshake before releasing the workload. After the workload it used a synchronous
+`access(2)`/`usleep(3)` acknowledgement loop so Swift concurrency wakeups did not add avoidable
+heap-tail traffic during finalization.
 
-The diagnostic creates a token-owned private workspace, copies the release binary, and ad-hoc signs
-only that copy with exactly:
+That quiescence reduced noise but could not make the two exports simultaneous or turn whole-trace
+and final-live data into an inner-workload event stream. Recorder, watcher, candidate, supervisor,
+and process-group termination all needed independent bounds. Those requirements remain applicable
+if a new profiler experiment is proposed.
 
-```text
-com.apple.security.get-task-allow = true
-```
+## 8. Disk and artifact findings
 
-It then verifies both the signature and the observed entitlement. The staged binary is local
-instrumentation and must never be distributed.
+A `.trace` is a directory bundle; `stat -f %z` reports only the directory entry, not recursive
+content. A real non-compacting `malloc_history -allEvents` pre-workload export reached
+1,902,439,272 bytes. Six interval snapshots would therefore have been an unsafe benchmark default.
+Repeated retained traces and redundant full builds exhausted local disk during Task 34.
 
-### 6.2 Distinct permission systems
+Future diagnostic artifacts must have recursive byte limits, a free-space reserve, ownership-token
+checked cleanup, bounded exports, and interruption cleanup that preserves the original failure.
+Normal benchmark runs create no xctrace data.
 
-Developer Tools and Screen Recording solve different problems:
+## 9. Supported reproduction and troubleshooting
 
-- **Screen Recording** authorizes ScreenCaptureKit to obtain pixels for full visible-paint
-  measurements. The benchmark checks access and fails without opening a permission prompt.
-- **System developer mode** is reported by
-  `/usr/sbin/DevToolsSecurity -status` and may be enabled administratively with
-  `sudo /usr/sbin/DevToolsSecurity -enable`.
-- **Per-application Developer Tools privacy access** must be granted to the terminal or Codex app
-  responsible for xctrace. Changing this grant may require restarting that app.
-- **The target entitlement** permits task attachment to the staged benchmark copy.
-
-Developer mode alone does not imply the per-application privacy grant, and neither grants Screen
-Recording. Screen Recording does not authorize task inspection. Full Disk Access is not required
-for either measurement and should not be granted as a workaround.
-
-The xctrace command uses `--no-prompt`; a missing grant should fail closed rather than leaving an
-unattended benchmark behind a consent dialog.
-
-## 7. Recorder lifecycle and quiescence
-
-### 7.1 Readiness
-
-A created trace directory or recorder progress text is not readiness evidence. Before releasing
-the candidate workload, the harness:
-
-1. starts a one-shot `notifyutil` watcher for a unique notification name;
-2. starts xctrace with `--notify-tracing-started <notification>`;
-3. waits up to 15 seconds for that Darwin notification;
-4. verifies that the exact PID/birth identity still matches;
-5. creates the candidate's exclusive `go` control signal.
-
-The xctrace segment itself has a 60-second bound. Control-file waits are bounded at 60 seconds, and
-candidate shutdown is independently bounded.
-
-### 7.2 Synchronous post-workload acknowledgement
-
-After the production resource work ends, the candidate publishes a `done` payload containing the
-workload timestamps and liveness evidence. It then waits for a `captured` acknowledgement using a
-synchronous `access(2)` loop with `usleep(3)`.
-
-This is deliberate. An asynchronous `Task.sleep` loop wakes Swift concurrency machinery and can
-continue allocating while xctrace stops and materializes Statistics and List views. The synchronous
-post-workload loop reduces that avoidable heap-tail activity.
-
-The sequence is:
-
-1. candidate finishes the workload and publishes `done`;
-2. controller sends SIGINT to xctrace;
-3. xctrace finalizes the trace;
-4. controller exports and validates both view details;
-5. controller publishes `captured`;
-6. candidate exits the synchronous wait.
-
-This quiescence reduces observer noise. It does not make Statistics and List simultaneous, repair
-their observed mismatch, or turn their whole-trace/final-live data into workload-interval data.
-
-## 8. Disk, artifact, and cleanup safeguards
-
-A `.trace` is a directory bundle. On macOS:
-
-```sh
-stat -f %z /tmp/srui-allocations.trace
-```
-
-reports the directory entry size, not the total size of its contents.
-`du -sk` is useful for an approximate allocated-disk check. The harness's authoritative safety
-counter recursively sums logical file sizes without following symlinks.
-
-Default diagnostic limits are:
-
-- `SRUI_XCTRACE_MAX_BYTES=2147483648` — 2 GiB recursive trace limit;
-- `SRUI_XCTRACE_MAX_EXPORT_BYTES=268435456` — 256 MiB per XML export;
-- `SRUI_XCTRACE_MIN_FREE_BYTES=4294967296` — 4 GiB free-space reserve.
-
-The consolidated benchmark runner has its own larger free-space reserve, currently 12 GiB by
-default. The limits answer different questions and should not be conflated.
-
-The capture workspace contains an ownership sentinel. Destructive cleanup verifies that token and
-refuses to remove a path if ownership changed. Candidate, recorder, notification watcher,
-supervisor, and process-group lifecycles are bounded. Termination paths attempt cleanup while
-preserving the original and cleanup failures. Publication of a retained standalone diagnostic is
-exclusive and rollback-protected.
-
-Normal benchmark runs do not create xctrace data. The standalone diagnostic publishes only the
-trace explicitly requested by the operator, its summary, and its driver result. Temporary XML
-exports and failed staging workspaces are removed. Retaining every failed trace is intentionally
-avoided: redundant full captures exhausted local disk during Task 34.
-
-## 9. Reproduction and troubleshooting
-
-Run commands from the repository root unless noted otherwise.
-
-### 9.1 Build the release benchmark driver
+Build and run the isolated nested Swift package from the repository root:
 
 ```sh
 swift build --disable-automatic-resolution \
-  --package-path client-macos \
+  --package-path client-macos/Benchmarks \
   -c release \
   --product BenchmarkDriver
-```
 
-`--disable-automatic-resolution` ensures the measurement uses the committed SwiftPM resolution
-instead of mutating dependency state.
-
-### 9.2 Run focused §31.1 smoke evidence
-
-```sh
-client-macos/.build/release/BenchmarkDriver \
+client-macos/Benchmarks/.build/release/BenchmarkDriver \
   --fixture benchmarks/fixtures/coding-agent-ui.json \
   --profile smoke \
   --only-section 31.1 \
   --output /tmp/srui-31.1.json
 ```
 
-This validates the offscreen fallback and authoritative resource metrics. It does not claim visible
-paint.
-
-### 9.3 Run the normal benchmark suite
+Run the consolidated suite and its Python validation separately:
 
 ```sh
 scripts/run-benchmarks --profile smoke
 scripts/run-benchmarks --profile full
+uv run --frozen pytest benchmarks/tests
+python3 benchmarks/generate_metric_contract.py --check
 ```
 
-Full mode needs an active unlocked display and Screen Recording permission for the responsible
-app. Neither command needs Developer Tools permission because xctrace is not part of the normal
-suite.
+Full mode needs an active unlocked display and Screen Recording permission. Neither mode requires
+Developer Tools permission. There is no supported xctrace command in this repository.
 
-### 9.4 Produce one optional retained xctrace diagnostic
-
-Choose a destination that does not exist:
-
-```sh
-benchmarks/parse-render/profile-allocations.sh \
-  /tmp/srui-allocations.trace \
-  /tmp/srui-render-profile.json
-```
-
-The outputs are:
-
-```text
-/tmp/srui-allocations.trace
-/tmp/srui-allocations.trace.summary.json
-/tmp/srui-render-profile.json
-```
-
-Before running, verify system developer mode:
-
-```sh
-/usr/sbin/DevToolsSecurity -status
-```
-
-Also grant Developer Tools privacy access to the responsible terminal or Codex application.
-Do not grant Full Disk Access as a substitute.
-
-### 9.5 Inspect the tool and trace TOC
-
-```sh
-xcodebuild -version
-xcrun xctrace version
-xcrun xctrace help export
-xcrun xctrace export --input /tmp/srui-allocations.trace --toc
-```
-
-Verify the installed trace actually advertises both Allocations view details before trying to
-export them.
-
-### 9.6 Export the two supported view details
-
-```sh
-xcrun xctrace export \
-  --input /tmp/srui-allocations.trace \
-  --output /tmp/srui-statistics.xml \
-  --xpath '/trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Statistics"]'
-
-xcrun xctrace export \
-  --input /tmp/srui-allocations.trace \
-  --output /tmp/srui-list.xml \
-  --xpath '/trace-toc/run[@number="1"]/tracks/track[@name="Allocations"]/details/detail[@name="Allocations List"]'
-```
-
-Do not replace these paths with the generic raw-table query and assume equivalent semantics.
-
-### 9.7 Verify staged signing manually
-
-Never sign the SwiftPM output in place. Use a disposable copy:
-
-```sh
-srui_sign_stage=$(mktemp -d /tmp/srui-sign-check.XXXXXX)
-cp client-macos/.build/release/BenchmarkDriver "$srui_sign_stage/BenchmarkDriver"
-codesign --force --sign - \
-  --entitlements benchmarks/parse-render/BenchmarkDriver.entitlements \
-  "$srui_sign_stage/BenchmarkDriver"
-codesign --verify --strict --verbose=2 "$srui_sign_stage/BenchmarkDriver"
-codesign --display --entitlements - --xml "$srui_sign_stage/BenchmarkDriver"
-```
-
-The displayed entitlement must contain only the expected task-allow grant. Remove the disposable
-directory after inspection.
-
-### 9.8 Sample a stalled process
-
-When a diagnostic candidate stops making progress, first identify the exact supervised PID rather
-than searching by process name, then capture a short stack sample:
-
-```sh
-sample PID 5 1
-```
-
-A stack sample is a point observation. Preserve the process identity, timestamp, xctrace version,
-and candidate/control state alongside it. Do not promote one stack frame into a causal root-cause
-claim.
-
-### 9.9 Check disk use correctly
-
-```sh
-du -sk /tmp/srui-allocations.trace
-df -h /tmp
-```
-
-The harness enforces recursive logical size and free-byte limits itself. These commands are
-operator diagnostics, not replacements for the built-in checks.
-
-### 9.10 Run focused validation tests
-
-```sh
-uv run --frozen pytest benchmarks/tests/test_xctrace.py
-uv run --frozen pytest benchmarks/tests/test_report.py
-```
-
-The xctrace tests verify TOC/detail parsing, internal Statistics arithmetic, live-list parsing,
-signed discrepancy handling, exact SRUI-host scope, explicit rejection of interval attribution,
-staged signing behavior, lifecycle bounds, and cleanup.
-
-### 9.11 Symptom guide
-
-| Symptom | Likely contract involved | Next check |
-|---|---|---|
-| No displays or frames in full mode | Screen Recording, active display, or locked session | Check the responsible app's Screen Recording grant and unlock the session |
-| Window never becomes eligible | Exact WindowServer identity, level, geometry, or z-order | Inspect the diagnostic entry list and ahead-surface intersection |
-| A Dock or menu appears during preparation | Pointer-edge activation or unsettled WindowServer state | Confirm pointer park, wait for bounded settling, and do not whitelist the surface |
-| xctrace never emits readiness | Developer Tools privacy, task attachment, or recorder startup | Check `DevToolsSecurity`, per-app Developer Tools access, staged entitlement, and recorder tail |
-| Candidate exits before `go` | Failed render/control setup or identity publication | Read the supervised candidate stderr and control directory |
-| WebKit freezes under Allocations attach | Known material observer interference | Do not use it as evidence; xctrace diagnostic scope is SRUI host only |
-| List timestamps exceed TOC duration | Unproven timestamp basis | Do not convert to wall clock or slice by workload interval |
-| Statistics and List differ | Independently materialized views | Validate each internally and retain the signed discrepancy |
-| Trace appears tiny under `stat` | A `.trace` is a directory | Use recursive harness accounting or `du -sk` |
-| Disk fills after experiments | Retained trace bundles or redundant builds | Remove only explicitly identified artifacts and rerun one bounded diagnostic |
-| LaunchServices logs an assertion | AppKit policy initialization | Judge success by the exact render/control handshake and exit status, not the log alone |
+| Symptom | Evidence boundary to inspect |
+|---|---|
+| No displays or frames in full mode | Screen Recording, active display, and unlocked session |
+| Window never becomes eligible | Exact WindowServer identity, level, geometry, crop, and z-order |
+| Dock or menu appears during preparation | Pointer park, bounded settling, and no surface whitelist |
+| Candidate exits before measurement | Supervised stderr, exact process identity, and cleanup result |
+| Trace/export data is proposed as §31.1 allocations | Reject it unless a new method proves the exact workload interval and event semantics |
+| Disk pressure follows experiments | Identify trace bundles and build artifacts explicitly; do not repeat full captures |
+| LaunchServices logs an assertion | Judge the exact render/control handshake and exit status, not the log alone |
 
 ## 10. Discarded approaches
 
@@ -1044,31 +885,28 @@ captures and regression tests:
 - Can it be negative, and if so is the sign preserved?
 - Has observer interference been measured on SRUI and the comparison control?
 - Are two exported views proven simultaneous before equality is required?
-- Are permissions distinct and documented?
-- Are artifacts and processes bounded and cleaned after interruption?
-- Does the report state what the metric cannot prove?
-- Does the committed baseline work without optional diagnostic privileges?
-
-If any answer is unknown, keep the source diagnostic until it is proven.
 
 ## 14. Repository reference points
 
-The implementation and executable contracts live in:
+The live implementation and executable contracts are:
 
 - `SRUI_Semantic_Remote_UI_Design_v0.6.md`, §31.1;
-- `client-macos/Benchmarks/ParseRenderBenchmark.swift`;
-- `client-macos/Benchmarks/BenchmarkPlatformSupport.swift`;
-- `client-macos/Benchmarks/BenchmarkSupport.swift`;
-- `benchmarks/run.py`;
+- `benchmarks/metric-contract.json` and `benchmarks/contract.py`;
 - `benchmarks/schema.json`;
-- `benchmarks/parse-render/run_xctrace.py`;
-- `benchmarks/parse-render/xctrace_allocations.py`;
-- `benchmarks/parse-render/BenchmarkDriver.entitlements`;
-- `benchmarks/parse-render/profile-allocations.sh`;
-- `benchmarks/tests/test_report.py`;
-- `benchmarks/tests/test_xctrace.py`.
+- `benchmarks/run.py`, `benchmarks/validation.py`, and `benchmarks/reporting.py`;
+- `benchmarks/generate_metric_contract.py` and its checked-in Swift/Rust descriptors;
+- `client-macos/Benchmarks/ParseRenderBenchmark.swift` and
+  `LocalRendererBenchmark.swift`;
+- `client-macos/Benchmarks/NativeRendererCandidate.swift`,
+  `WebRendererCandidate.swift`, and `RendererCandidateGeometry.swift`;
+- `client-macos/Benchmarks/FrameAcceptancePolicy.swift`,
+  `BenchmarkExplicitPresentation.swift`, `BenchmarkPassivePresentation.swift`, and
+  `BenchmarkMenuPresentation.swift`;
+- `client-macos/Benchmarks/BenchmarkPlatformSupport.swift` and
+  `BenchmarkSupport.swift`;
+- `benchmarks/tests/`.
 
-For platform behavior, prefer the installed `xctrace(1)`, `DevToolsSecurity(8)`,
-`codesign(1)`, `heap(1)`, and `malloc_history(1)` manuals over examples written for another
-Xcode version. The repository's operational README also cites Apple Developer Forums threads
-664347 and 799351 for TOC-discovered Allocations view exports.
+The deleted xctrace controller/exporter, entitlement, wrapper, and tests are intentionally not
+repository reference points. Historical tool behavior in this document was observed with Xcode
+26.0 (17C52); do not infer current flags or schemas from it. For a new investigation, inspect the
+installed `xctrace(1)`, `codesign(1)`, `heap(1)`, and `malloc_history(1)` manuals first.

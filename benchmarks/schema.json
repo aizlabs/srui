@@ -26,17 +26,11 @@
       "additionalProperties": false,
       "required": [
         "started_unix_ns",
-        "ended_unix_ns",
-        "required_allocation_pids"
+        "ended_unix_ns"
       ],
       "properties": {
         "started_unix_ns": {"type": "integer", "minimum": 1},
-        "ended_unix_ns": {"type": "integer", "minimum": 1},
-        "required_allocation_pids": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {"type": "integer", "minimum": 1}
-        }
+        "ended_unix_ns": {"type": "integer", "minimum": 1}
       }
     },
     "renderer_process_attribution": {
@@ -191,8 +185,18 @@
     "driver_output": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["artifacts", "sections"],
+      "required": [
+        "contract_schema_version",
+        "contract_sha256",
+        "artifacts",
+        "sections"
+      ],
       "properties": {
+        "contract_schema_version": {"const": 1},
+        "contract_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
         "artifacts": {"$ref": "#/$defs/artifact"},
         "sections": {
           "type": "array",
@@ -207,6 +211,8 @@
       "additionalProperties": false,
       "required": [
         "schema_version",
+        "contract_schema_version",
+        "contract_sha256",
         "generated_at",
         "profile",
         "fixture",
@@ -216,6 +222,11 @@
       ],
       "properties": {
         "schema_version": {"const": 1},
+        "contract_schema_version": {"const": 1},
+        "contract_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
         "generated_at": {"type": "string", "format": "date-time"},
         "profile": {"enum": ["smoke", "full"]},
         "fixture": {"type": "string", "minLength": 1},

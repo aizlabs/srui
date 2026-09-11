@@ -1,8 +1,14 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+const NO_SAMPLES_ERROR: &str = "no samples";
+const NONFINITE_SAMPLES_ERROR: &str = "samples must be finite";
+const INVALID_FRACTION_ERROR: &str = "percentile fraction must be finite and between zero and one";
+
 #[derive(Serialize)]
 pub(crate) struct Output {
+    pub(crate) contract_schema_version: u32,
+    pub(crate) contract_sha256: &'static str,
     pub(crate) artifacts: Artifacts,
     pub(crate) sections: Vec<Section>,
 }
@@ -72,7 +78,7 @@ pub(crate) fn metric(
         "terminal reconnect retention-loss decision" => "terminal_retention_loss_ms",
         "terminal payload" => "terminal_payload_bytes",
         "embedded terminal frame count" => "embedded_terminal_frame_count",
-        _ => panic!("metric `{name}` is missing a stable benchmark ID"),
+        _ => panic!("metric {name:?} is missing a stable benchmark ID"),
     };
     Metric {
         id,
@@ -85,23 +91,83 @@ pub(crate) fn metric(
     }
 }
 
-pub(crate) fn percentile(mut values: Vec<f64>, fraction: f64) -> f64 {
+pub(crate) fn percentile(mut values: Vec<f64>, fraction: f64) -> Result<f64, String> {
+    if values.is_empty() {
+        return Err(NO_SAMPLES_ERROR.to_string());
+    }
+    if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+        return Err(INVALID_FRACTION_ERROR.to_string());
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(NONFINITE_SAMPLES_ERROR.to_string());
+    }
     values.sort_by(f64::total_cmp);
-    let index = ((values.len() - 1) as f64 * fraction).round() as usize;
-    values[index.min(values.len() - 1)]
+    let scaled_index = (values.len() - 1) as f64 * fraction;
+    let half_up_index = (scaled_index + 0.5).floor() as usize;
+    Ok(values[half_up_index.min(values.len() - 1)])
 }
 
-pub(crate) fn p50(values: Vec<f64>) -> f64 {
+pub(crate) fn p50(values: Vec<f64>) -> Result<f64, String> {
     percentile(values, 0.50)
 }
 
 pub(crate) fn push_timing_distributions(
     metrics: &mut Vec<Metric>,
     timings: BTreeMap<&'static str, Vec<f64>>,
-) {
+) -> Result<(), String> {
+    if timings.values().any(Vec::is_empty) {
+        return Err(NO_SAMPLES_ERROR.to_string());
+    }
     for (name, values) in timings {
-        metrics.push(metric(name, p50(values.clone()), "ms", "p50"));
-        metrics.push(metric(name, percentile(values.clone(), 0.95), "ms", "p95"));
-        metrics.push(metric(name, percentile(values, 0.99), "ms", "p99"));
+        metrics.push(metric(name, p50(values.clone())?, "ms", "p50"));
+        metrics.push(metric(name, percentile(values.clone(), 0.95)?, "ms", "p95"));
+        metrics.push(metric(name, percentile(values, 0.99)?, "ms", "p99"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_percentile_p50_and_distribution_report_exact_error() {
+        assert_eq!(
+            percentile(Vec::new(), 0.95),
+            Err(NO_SAMPLES_ERROR.to_string())
+        );
+        assert_eq!(p50(Vec::new()), Err(NO_SAMPLES_ERROR.to_string()));
+
+        let mut metrics = Vec::new();
+        let timings = BTreeMap::from([("abstract state generation", Vec::new())]);
+        assert_eq!(
+            push_timing_distributions(&mut metrics, timings),
+            Err(NO_SAMPLES_ERROR.to_string())
+        );
+        assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn percentile_uses_half_up_tie_rule() {
+        assert_eq!(percentile(vec![0.0, 1.0, 2.0], 0.25).unwrap(), 1.0);
+        assert_eq!(p50(vec![1.0, 2.0]).unwrap(), 2.0);
+    }
+
+    #[test]
+    fn percentile_rejects_nonfinite_samples_and_invalid_fractions() {
+        assert_eq!(
+            percentile(vec![1.0, f64::NAN], 0.5),
+            Err(NONFINITE_SAMPLES_ERROR.to_string())
+        );
+        assert_eq!(
+            percentile(vec![1.0, f64::INFINITY], 0.5),
+            Err(NONFINITE_SAMPLES_ERROR.to_string())
+        );
+        for fraction in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                percentile(vec![1.0], fraction),
+                Err(INVALID_FRACTION_ERROR.to_string())
+            );
+        }
     }
 }

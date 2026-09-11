@@ -317,10 +317,13 @@ def main() -> int:
         gaps = suite.get("gaps", [])
         if suite_status == FAIL:
             reasons = sorted(set(failed_languages))
-            note = "failed: " + ", ".join(reasons) if reasons else ""
+            note = f"{len(commands)} runner(s)"
+            if reasons:
+                note += "; failed: " + ", ".join(reasons)
             if missing_languages:
-                note = (note + "; " if note else "") + (
-                    f"undeclared missing runner: {', '.join(missing_languages)}"
+                note += (
+                    f"; undeclared missing runner: "
+                    f"{', '.join(missing_languages)}"
                 )
         elif not commands:
             # A gap only concerns a run that selected the language it blocks. Suite 11's gap is a

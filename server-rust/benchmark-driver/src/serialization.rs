@@ -151,37 +151,37 @@ pub(crate) fn serialization(fixture: &Fixture, iterations: usize) -> Result<Sect
         metrics: vec![
             metric(
                 "abstract state generation",
-                p50(generation_ms.clone()),
+                p50(generation_ms.clone())?,
                 "ms",
                 "p50",
             ),
             metric(
                 "abstract state generation",
-                percentile(generation_ms.clone(), 0.95),
+                percentile(generation_ms.clone(), 0.95)?,
                 "ms",
                 "p95",
             ),
             metric(
                 "abstract state generation",
-                percentile(generation_ms, 0.99),
+                percentile(generation_ms, 0.99)?,
                 "ms",
                 "p99",
             ),
             metric(
                 "protobuf serialization",
-                p50(serialization_ms.clone()),
+                p50(serialization_ms.clone())?,
                 "ms",
                 "p50",
             ),
             metric(
                 "protobuf serialization",
-                percentile(serialization_ms.clone(), 0.95),
+                percentile(serialization_ms.clone(), 0.95)?,
                 "ms",
                 "p95",
             ),
             metric(
                 "protobuf serialization",
-                percentile(serialization_ms, 0.99),
+                percentile(serialization_ms, 0.99)?,
                 "ms",
                 "p99",
             ),

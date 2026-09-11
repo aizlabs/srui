@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "fixture": "benchmarks/fixtures/coding-agent-ui.json",
+  "sections": ["31.1", "31.2", "31.3", "31.4", "31.5", "31.6"],
+  "distribution": ["p50", "p95", "p99"],
+  "percentile_semantics": {
+    "rank": "(n - 1) * p",
+    "index": "nearest integer; half-up ties",
+    "empty": "error",
+    "values": "finite-only",
+    "fraction": "finite 0..1 inclusive"
+  },
+  "dimensions": {
+    "count": [1, 100, 1000],
+    "cadence": [60, 120, 144, 240],
+    "rtt": [0, 100, 300, 600],
+    "direction": ["inbound", "outbound"],
+    "interaction": [
+      {"interaction": "text_entry", "interaction_name": "text entry"},
+      {"interaction": "caret_movement", "interaction_name": "caret movement"},
+      {"interaction": "text_selection", "interaction_name": "text selection"},
+      {"interaction": "ime_composition", "interaction_name": "ime composition"},
+      {"interaction": "scrolling", "interaction_name": "scrolling"},
+      {"interaction": "hover", "interaction_name": "hover"},
+      {"interaction": "pressed", "interaction_name": "pressed"},
+      {"interaction": "menu_opening", "interaction_name": "menu opening"}
+    ]
+  },
+  "profiles": {
+    "smoke": {"iterations": {"rust": 25, "macos": 3}},
+    "full": {"iterations": {"rust": 500, "macos": 20}}
+  },
+  "signed_metric_ids": [
+    "srui.host_net_live_allocation_blocks",
+    "srui.host_net_live_allocation_bytes",
+    "webkit.host_net_live_allocation_blocks",
+    "webkit.host_net_live_allocation_bytes"
+  ],
+  "drivers": {
+    "rust": {
+      "command": ["cargo", "run", "--quiet", "--release", "--locked", "--manifest-path", "server-rust/Cargo.toml", "-p", "srui-benchmark-driver", "--"],
+      "sections": {
+        "31.2": {
+          "metrics": [
+            {"id": "abstract_state_generation_ms", "name": "abstract state generation", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "protobuf_serialization_ms", "name": "protobuf serialization", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "serialized_transaction_bytes", "name": "serialized transaction size", "unit": "bytes", "statistics": ["exact"]}
+          ],
+          "assertions": ["fixture_protobuf_valid"],
+          "sample_counts": [
+            {"id": "rust.generation", "formula": {"base": "iterations"}},
+            {"id": "rust.serialization", "formula": {"base": "iterations"}}
+          ]
+        },
+        "31.5": {
+          "metrics": [
+            {"id": "disconnect_before_event_receipt_ms", "name": "disconnect immediately before event receipt", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "event_to_settled_side_effect_ms", "name": "event receipt through settled side effect", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "cached_duplicate_response_ms", "name": "in-process cached DUPLICATE response", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "lost_ack_wire_duplicate_ms", "name": "lost ACK wire reconnect through DUPLICATE acknowledgement", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "mid_resource_reconnect_ms", "name": "mid-resource reconnect and exact replay", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "mid_transaction_codec_replay_ms", "name": "mid-transaction frame discard and atomic replay", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "mid_transaction_wire_replay_ms", "name": "mid-transaction wire disconnect and exact atomic replay", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "partial_event_wire_replay_ms", "name": "partial EVENT disconnect and one processed replay", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "resume_beyond_retention_ms", "name": "resume beyond journal retention", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "resume_within_retention_ms", "name": "resume within journal retention", "unit": "ms", "statistics": ["p50", "p95", "p99"]}
+          ],
+          "assertions": ["mid_resource_exact_restart", "mid_transaction_wire_atomic", "partial_event_wire_once", "lost_ack_wire_duplicate_once", "journal_retention_boundary"],
+          "sample_counts": [
+            {"id": "rust.mid_resource", "formula": {"base": "iterations"}},
+            {"id": "rust.mid_transaction_codec", "formula": {"base": "iterations"}},
+            {"id": "rust.event_side_effect", "formula": {"base": "iterations"}},
+            {"id": "rust.cached_duplicate", "formula": {"base": "iterations"}},
+            {"id": "rust.resume_within_retention", "formula": {"base": "iterations"}},
+            {"id": "rust.resume_beyond_retention", "formula": {"base": "iterations"}},
+            {"id": "rust.pre_receipt_wire", "formula": {"base": "iterations", "maximum": 50}},
+            {"id": "rust.lost_ack_wire", "formula": {"base": "iterations", "maximum": 50}},
+            {"id": "rust.mid_transaction_wire", "formula": {"base": "iterations", "maximum": 50}},
+            {"id": "rust.partial_event_wire", "formula": {"base": "iterations", "maximum": 50}}
+          ]
+        },
+        "31.6": {
+          "metrics": [
+            {"id": "embedded_pty_interaction_ms", "name": "embedded SRUI PTY exact ANSI capture and framing", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "standalone_pty_interaction_ms", "name": "standalone PTY exact ANSI interaction", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "terminal_retention_loss_ms", "name": "terminal reconnect retention-loss decision", "unit": "ms", "statistics": ["sample"]},
+            {"id": "terminal_payload_bytes", "name": "terminal payload", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "embedded_terminal_frame_count", "name": "embedded terminal frame count", "unit": "messages", "statistics": ["p50", "p95", "p99"]}
+          ],
+          "assertions": ["pty_payload_identical", "standalone_pty_exit_success", "embedded_pty_eof_exact", "embedded_terminal_frame_bounds", "terminal_ring_retention_loss"],
+          "sample_counts": [
+            {"id": "rust.standalone_pty", "formula": {"base": "iterations", "maximum": 20}},
+            {"id": "rust.embedded_pty", "formula": {"base": "iterations", "maximum": 20}},
+            {"id": "rust.ring_exhaustion", "formula": {"constant": 1}}
+          ]
+        }
+      }
+    },
+    "macos": {
+      "platform": "darwin",
+      "command": ["swift", "run", "--disable-automatic-resolution", "--package-path", "client-macos/Benchmarks", "-c", "release", "BenchmarkDriver"],
+      "sections": {
+        "31.1": {
+          "metrics": [
+            {"id": "srui.first_paint", "profile_names": {"smoke": "SRUI first offscreen raster fallback", "full": "SRUI first on-screen paint crossing display refresh"}, "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "srui.complete_paint", "profile_names": {"smoke": "SRUI complete offscreen raster fallback", "full": "SRUI complete on-screen paint crossing display refresh"}, "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "srui.cpu", "name": "SRUI candidate process CPU time", "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "srui.host_net_live_allocation_blocks", "name": "SRUI host-process net live allocation block delta", "unit": "blocks", "statistics": ["p50", "p95", "p99"]},
+            {"id": "srui.host_net_live_allocation_bytes", "name": "SRUI host-process net live allocation byte delta", "unit": "bytes", "statistics": ["p50", "p95", "p99"]},
+            {"id": "srui.process_footprint_peak", "name": "SRUI maximum concurrently sampled process footprint", "unit": "MiB", "statistics": ["max"]},
+            {"id": "srui.process_footprint_growth", "name": "SRUI host allocated footprint growth", "unit": "MiB", "statistics": ["p50"]},
+            {"id": "webkit.first_paint", "profile_names": {"smoke": "WKWebView first offscreen snapshot fallback", "full": "WKWebView first on-screen paint crossing display refresh"}, "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "webkit.complete_paint", "profile_names": {"smoke": "WKWebView complete offscreen snapshot fallback", "full": "WKWebView complete on-screen paint crossing display refresh"}, "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "webkit.cpu", "name": "WKWebView host plus attributed helper CPU time", "unit": "ms", "statistics": ["p50"]},
+            {"id": "webkit.host_net_live_allocation_blocks", "name": "WKWebView comparison host-process net live allocation block delta", "unit": "blocks", "statistics": ["p50", "p95", "p99"]},
+            {"id": "webkit.host_net_live_allocation_bytes", "name": "WKWebView comparison host-process net live allocation byte delta", "unit": "bytes", "statistics": ["p50", "p95", "p99"]},
+            {"id": "webkit.process_footprint_peak", "name": "WKWebView maximum concurrently sampled host-plus-helper footprint", "unit": "MiB", "statistics": ["max"]},
+            {"id": "webkit.process_footprint_growth", "name": "WKWebView host plus helpers allocated footprint growth", "unit": "MiB", "statistics": ["p50"]},
+            {"id": "representation.srui_bytes", "name": "SRUI representation", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "representation.html_bytes", "name": "HTML representation", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "paint.capture_authorization", "name": "screen capture authorization", "unit": "boolean", "statistics": ["exact"]}
+          ],
+          "assertions": ["semantic_representation_parity", "paint_completion_observed", "webkit_helpers_attributed", "host_net_live_allocation_scope"],
+          "sample_counts": [
+            {"id": "macos.srui.render", "formula": {"base": "iterations"}},
+            {"id": "macos.webkit.render", "formula": {"base": "iterations"}}
+          ]
+        },
+        "31.3": {
+          "metrics": [
+            {"id": "updates.{count}.semantic", "dimensions": ["count"], "name": "{count} updates semantic decode/apply", "unit": "ms", "statistics": ["p50", "p95", "p99"], "target_overrides": {"updates.100.semantic": {"p50": {"value": 1.0, "direction": "max"}}, "updates.1000.semantic": {"p50": {"value": 5.0, "direction": "max"}}}},
+            {"id": "updates.{count}.visible", "dimensions": ["count"], "name": "{count} updates decode-to-visible", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "updates.{count}.bytes", "dimensions": ["count"], "name": "{count} updates wire bytes", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "updates.{count}.messages", "dimensions": ["count"], "name": "{count} updates message count", "unit": "messages", "statistics": ["exact"]},
+            {"id": "cadence.{count}.{cadence}.visible", "dimensions": ["count", "cadence"], "name": "{count} updates at {cadence}Hz decode-to-visible", "unit": "ms", "statistics": ["sample"]},
+            {"id": "cadence.{count}.{cadence}.bytes", "dimensions": ["count", "cadence"], "name": "{count} updates at {cadence}Hz total SRUI wire bytes", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "cadence.{count}.{cadence}.messages", "dimensions": ["count", "cadence"], "name": "{count} updates at {cadence}Hz total SRUI message count", "unit": "messages", "statistics": ["exact"]},
+            {"id": "cadence.{count}.{cadence}.{direction}_bytes", "dimensions": ["count", "cadence", "direction"], "name": "{count} updates at {cadence}Hz {direction} {direction_transport} bytes", "context": {"inbound": {"direction_transport": "TRANSACTION"}, "outbound": {"direction_transport": "EVENT"}}, "unit": "bytes", "statistics": ["exact"]},
+            {"id": "cadence.{count}.{cadence}.{direction}_messages", "dimensions": ["count", "cadence", "direction"], "name": "{count} updates at {cadence}Hz {direction} {direction_transport} message count", "context": {"inbound": {"direction_transport": "TRANSACTION"}, "outbound": {"direction_transport": "EVENT"}}, "unit": "messages", "statistics": ["exact"]},
+            {"id": "cadence.{count}.{cadence}.repaints", "dimensions": ["count", "cadence"], "name": "{count} updates at {cadence}Hz synthetic change-gated repaint count", "unit": "repaints", "statistics": ["exact"]},
+            {"id": "idle.bytes", "name": "settled idle SRUI wire bytes", "unit": "bytes", "statistics": ["observed max"]},
+            {"id": "idle.messages", "name": "settled idle SRUI message count", "unit": "messages", "statistics": ["observed max"]}
+          ],
+          "assertions": ["mutation_raster_completion", "idle_zero_traffic", "cadence_wire_invariant", "cadence_repaint_independent", "cadence_state_event_order"],
+          "sample_counts": [
+            {"id": "macos.mutation.{count}", "dimensions": ["count"], "formula": {"base": "iterations"}},
+            {"id": "macos.cadence.{count}.{cadence}", "dimensions": ["count", "cadence"], "formula": {"constant": 1}},
+            {"id": "macos.cadence.events.{count}.{cadence}", "dimensions": ["count", "cadence"], "formula": {"constant": 3}}
+          ]
+        },
+        "31.4": {
+          "metrics": [
+            {"id": "interaction.{interaction}.rtt.{rtt}", "dimensions": ["interaction", "rtt"], "name": "{interaction_name} at {rtt}ms RTT", "unit": "ms", "statistics": ["p50", "p95", "p99"], "targets": {"*": {"metric": "display.frame_budget", "direction": "max"}}},
+            {"id": "server_feedback.rtt.{rtt}", "dimensions": ["rtt"], "name": "server-dependent input-to-visible at {rtt}ms RTT", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "impairment.bandwidth_transfer", "name": "1MiB/s bandwidth-limited production event", "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "impairment.bandwidth_delivered_bytes", "name": "bandwidth-limited delivered bytes", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "impairment.loss_attempts", "name": "deterministic production loss attempts", "unit": "messages", "statistics": ["exact"]},
+            {"id": "impairment.loss_delivered_messages", "name": "deterministic production loss delivered messages", "unit": "messages", "statistics": ["exact"]},
+            {"id": "impairment.interruption_detection", "name": "controlled production interruption detection", "unit": "ms", "statistics": ["p50"]},
+            {"id": "session_wire.bytes", "name": "measured production session wire bytes", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "session_wire.messages", "name": "measured production session wire messages", "unit": "messages", "statistics": ["exact"]},
+            {"id": "local_rtt_delta", "name": "maximum RTT-induced local latency delta", "unit": "ms", "statistics": ["p50", "p95", "p99"], "targets": {"*": {"metric": "display.frame_budget", "direction": "max"}}},
+            {"id": "display.frame_budget", "name": "local display frame budget", "unit": "ms", "statistics": ["exact"]}
+          ],
+          "assertions": ["local_latency_independent", "production_text_edit_framed", "server_latency_tracks_rtt", "no_sync_rtt", "impairments_use_session"],
+          "sample_counts": [
+            {"id": "macos.interaction.{interaction}.rtt.{rtt}", "dimensions": ["interaction", "rtt"], "formula": {"base": "iterations", "minimum": 5}},
+            {"id": "macos.server_feedback.rtt.{rtt}", "dimensions": ["rtt"], "formula": {"base": "iterations", "minimum": 5, "maximum": 7}},
+            {"id": "macos.local_held_response", "formula": {"base": "iterations", "minimum": 5, "multiply_dimension_sizes": ["interaction", "rtt"]}},
+            {"id": "macos.bandwidth", "formula": {"constant": 3}},
+            {"id": "macos.loss", "formula": {"constant": 1}},
+            {"id": "macos.interruption", "formula": {"constant": 1}}
+          ]
+        },
+        "31.5": {
+          "metrics": [
+            {"id": "pre_receipt_event_replay", "name": "pre-receipt retained-event replay", "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "mid_resource_recovery", "name": "mid-resource reconnect recovery", "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "superseded_response", "name": "superseded resume response handling", "unit": "ms", "statistics": ["p50", "p95"]},
+            {"id": "active_response", "name": "active resume response handling", "unit": "ms", "statistics": ["p50", "p95"]}
+          ],
+          "assertions": ["pre_receipt_pending_replay", "mid_resource_recovery", "superseded_response_inert"],
+          "sample_counts": [
+            {"id": "macos.pre_receipt", "formula": {"base": "iterations", "minimum": 2, "maximum": 5}},
+            {"id": "macos.mid_resource", "formula": {"base": "iterations", "minimum": 2, "maximum": 5}},
+            {"id": "macos.superseded_response", "formula": {"base": "iterations", "minimum": 2, "maximum": 5}},
+            {"id": "macos.active_response", "formula": {"base": "iterations", "minimum": 2, "maximum": 5}}
+          ]
+        },
+        "31.6": {
+          "metrics": [
+            {"id": "client_terminal.decode_visible", "name": "embedded SRUI Terminal decode-to-visible", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "client_terminal.draw_only", "name": "embedded SRUI Terminal draw-only", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "client_terminal.frame_bytes", "name": "client terminal framed envelope", "unit": "bytes", "statistics": ["exact"]},
+            {"id": "client_terminal.raster_completions", "name": "embedded terminal draw completions", "unit": "frames", "statistics": ["exact"]},
+            {"id": "standalone_terminal.decode_visible", "name": "standalone TerminalSession and TerminalView decode-to-visible", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "standalone_terminal.draw_only", "name": "standalone TerminalView draw-only", "unit": "ms", "statistics": ["p50", "p95", "p99"]},
+            {"id": "standalone_terminal.raster_completions", "name": "standalone terminal draw completions", "unit": "frames", "statistics": ["exact"]},
+            {"id": "terminal_display.embedded_to_standalone_decode_ratio", "name": "embedded-to-standalone terminal decode-to-visible", "unit": "ratio", "statistics": ["p50"]},
+            {"id": "terminal_display.embedded_to_standalone_draw_ratio", "name": "embedded-to-standalone terminal draw-only", "unit": "ratio", "statistics": ["p50"]}
+          ],
+          "assertions": ["terminal_offsets_exact", "standalone_terminal_offsets_exact", "terminal_display_draw_completion", "terminal_display_equivalent", "terminal_fresh_state"],
+          "sample_counts": [
+            {"id": "macos.embedded_display", "formula": {"base": "iterations", "minimum": 10}},
+            {"id": "macos.standalone_display", "formula": {"base": "iterations", "minimum": 10}}
+          ]
+        }
+      }
+    }
+  },
+  "report_additions": {
+    "31.1": {"assertions": ["candidate_failure_cleanup", "window_isolation_fail_closed"], "smoke_excluded_assertions": ["window_isolation_fail_closed"]},
+    "31.2": {"assertions": ["canonical_transaction_parity"]},
+    "31.5": {
+      "metrics": [{"id": "production_reconnect_suite_ms", "name": "production reconnect boundary suite", "unit": "ms", "statistics": ["wall"]}],
+      "assertions": ["production_reconnect_suite"],
+      "sample_counts": [{"id": "runner.production_conformance", "formula": {"constant": 9}}]
+    }
+  },
+  "verification": {
+    "name": "production reconnect boundary suite",
+    "section": "31.5",
+    "command": ["scripts/run-conformance", "--suite", "8", "--implementation", "both"],
+    "timeout": 1200,
+    "required_output": ["8  reconnect", "PASS    9 runner(s)", "1 passed, 0 failed"]
+  }
+}

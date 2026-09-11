@@ -12,7 +12,7 @@
       "name": "macos",
       "sections": ["31.1", "31.3", "31.4", "31.5", "31.6"],
       "platform": "darwin",
-      "command": ["swift", "run", "--disable-automatic-resolution", "--package-path", "client-macos", "-c", "release", "BenchmarkDriver"]
+      "command": ["swift", "run", "--disable-automatic-resolution", "--package-path", "client-macos/Benchmarks", "-c", "release", "BenchmarkDriver"]
     }
   ],
   "verification_commands": [

@@ -208,17 +208,6 @@ impl PTYManager {
             .map(|stream| stream.snapshot_offsets())
     }
 
-    /// Waits until the terminal reader reaches EOF and the child has been reaped.
-    ///
-    /// Compiled only for the opt-in benchmark observer or this crate's tests. Default production
-    /// builds expose no process-exit observer. A concurrent [`Self::close`] or [`Self::shutdown`]
-    /// reports the child status after teardown completes.
-    #[cfg(any(test, feature = "benchmark-observability"))]
-    #[doc(hidden)]
-    pub async fn benchmark_wait_for_exit(&self, id: NodeId) -> Result<bool, PTYManagerError> {
-        Ok(self.stream(id)?.wait_for_exit().await)
-    }
-
     #[cfg(test)]
     pub(crate) fn process_id(&self, id: NodeId) -> Option<u32> {
         self.lock()
@@ -614,8 +603,8 @@ mod tests {
         assert!(manager.live_stream_ids().is_empty());
     }
 
-    #[tokio::test]
-    async fn natural_exit_reaps_the_child() {
+    #[test]
+    fn natural_exit_reaps_the_child() {
         let manager = PTYManager::default();
         let id = NodeId::new(22);
         manager
@@ -624,30 +613,19 @@ mod tests {
         let pid = manager
             .process_id(id)
             .expect("spawned child must expose a pid");
-        let exit_success =
-            tokio::time::timeout(Duration::from_secs(2), manager.benchmark_wait_for_exit(id))
-                .await
-                .expect("natural child exit timed out")
-                .unwrap();
-        let bytes = retained_bytes(&manager, id);
-        assert!(
-            bytes
-                .windows(b"SRUI_EXIT_OK".len())
-                .any(|window| window == b"SRUI_EXIT_OK"),
-            "sentinel missing after natural EOF from {:?}",
-            String::from_utf8_lossy(&bytes)
-        );
-        assert!(
-            is_child_reaped(pid),
-            "child {pid} was not reaped by natural exit"
-        );
-        assert!(
-            exit_success,
-            "natural zero exit must remain observable after reap"
-        );
+        wait_for_output(&manager, id, b"SRUI_EXIT_OK");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut reaped = false;
+        while std::time::Instant::now() < deadline {
+            if is_child_reaped(pid) {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         manager.close(id).unwrap();
+        assert!(reaped, "child {pid} was not reaped by natural exit");
     }
-
     fn is_child_reaped(pid: u32) -> bool {
         #[cfg(unix)]
         {

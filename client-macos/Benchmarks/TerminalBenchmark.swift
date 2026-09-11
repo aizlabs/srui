@@ -526,7 +526,8 @@ func terminal(iterations: Int, fullPaint: Bool) async throws -> Section {
     var observedStandaloneCompositedFingerprints = Set<String>()
     var observedFramedBytes = Set<Int>()
 
-    let streamID = NodeId(14)
+    // Terminal streams use their own benchmark namespace and are not UI node IDs.
+    let streamID = NodeId(9_001)
     let namespaceID: UInt32 = 31
     var embeddedDecodeVisibleSamples = [Double]()
     var embeddedDrawOnlySamples = [Double]()

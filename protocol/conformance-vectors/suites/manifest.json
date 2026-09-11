@@ -636,6 +636,12 @@
           "SemanticInspectionAutomationTests"
         ],
         [
+          "cargo",
+          "build",
+          "--manifest-path",
+          "examples/coding-agent-demo/Cargo.toml"
+        ],
+        [
           "swift",
           "test",
           "--package-path",

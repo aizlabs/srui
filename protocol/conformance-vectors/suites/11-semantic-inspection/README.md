@@ -11,9 +11,10 @@ scripts/run-conformance --suite 11
 
 ## Fixtures
 
-Code-driven suite: no shared fixtures. Inspection reads the client's semantic snapshot, and
-available actions come from the generated registry tables rather than from AppKit widget classes
-or a second hand-maintained oracle.
+Code-driven suite: no shared conformance-vector files. Inspection reads the client's semantic
+snapshot, and available actions come from the generated registry tables rather than from AppKit
+widget classes or a second hand-maintained oracle. The suite builds the Rust coding-agent demo
+before the live fallback-socket runner so it also works from a clean checkout.
 
 ## Runners
 
@@ -23,6 +24,7 @@ or a second hand-maintained oracle.
 scripts/check-accessibility-api-boundary.sh
 swift test --package-path client-macos --filter SemanticInspectorTests
 swift test --package-path client-macos --filter SemanticInspectionAutomationTests
+cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
 swift test --package-path client-macos --filter CodingAgentFallbackSocketTests
 ```
 

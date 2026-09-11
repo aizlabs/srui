@@ -275,15 +275,18 @@ jobs:
       # `Text` owns TextEditingSession, the toolkit-free half of native text editing (§18.3,
       # §22.6); NativeTextEditorAdapter in RendererAppKit is the only AppKit-touching half.
       # `Terminal` owns the VT parser and grid; TerminalView in RendererAppKit is the only
-      # AppKit-touching half of the terminal island (§21).
-      - name: Verify toolkit-free targets do not import AppKit or Cocoa (§1, §21)
+      # AppKit-touching half of the terminal island (§21). `Accessibility` inspects semantic
+      # snapshots and must not expose the native controls RendererAppKit builds (§22.9).
+      - name: Verify toolkit-free targets do not import AppKit or Cocoa (§1, §21, §22.9)
         run: |
-          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel client-macos/Text client-macos/Terminal; then
-            echo "Error: SemanticModel, Text, and Terminal must never import AppKit or Cocoa"
+          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel client-macos/Text client-macos/Terminal client-macos/Accessibility; then
+            echo "Error: SemanticModel, Text, Terminal, and Accessibility must never import AppKit or Cocoa"
             exit 1
           fi
       - name: Test portable LogicalChannelScheduling module
         run: swift test --package-path client-macos/LogicalChannelScheduling
+      - name: Verify Accessibility API boundary (§22.9, §32.11)
+        run: scripts/check-accessibility-api-boundary.sh
       - name: Build and test client-macos
         run: swift test
         working-directory: client-macos

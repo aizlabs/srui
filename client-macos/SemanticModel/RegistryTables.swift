@@ -35,6 +35,31 @@ public let standardNodeTypesTable: [(id: UInt32, name: String, tier: String)] = 
     (27, "Toolbar", "deferred"),
 ]
 
+/// Returns the intrinsic standard events emitted by a standard node type.
+///
+/// This is generated from each node type's `emits` entry in the canonical registry.
+/// Passive node properties such as `actions` and `action_key` do not add capability.
+public func standardEventsEmitted(by nodeType: TypeRef) -> [TypeRef] {
+    guard nodeType.isStandard else { return [] }
+    switch nodeType.localID {
+    case 1: return [TypeRef.EVENT_VIEWPORT_CHANGED]
+    case 11: return [TypeRef.EVENT_ACTIVATE]
+    case 12: return [TypeRef.EVENT_VALUE_CHANGED]
+    case 13: return [TypeRef.EVENT_TEXT_EDIT]
+    case 14: return [TypeRef.EVENT_TEXT_EDIT]
+    case 17: return [TypeRef.EVENT_SELECTION_CHANGED]
+    case 18: return [TypeRef.EVENT_SELECTION_CHANGED]
+    case 19: return [TypeRef.EVENT_SELECTION_CHANGED, TypeRef.EVENT_EXPANSION_CHANGED]
+    case 20: return [TypeRef.EVENT_SELECTION_CHANGED]
+    case 21: return [TypeRef.EVENT_SELECTION_CHANGED]
+    case 22: return [TypeRef.EVENT_VALUE_CHANGED]
+    case 23: return [TypeRef.EVENT_VALUE_CHANGED]
+    case 24: return [TypeRef.EVENT_SELECTION_CHANGED]
+    case 25: return [TypeRef.EVENT_VALUE_CHANGED]
+    default: return []
+    }
+}
+
 public let standardPropertiesTable: [(id: UInt32, name: String)] = [
     (1, "label"),
     (2, "accessible_description"),

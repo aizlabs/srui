@@ -1,5 +1,6 @@
 // Live Task 31 composition against the Rust coding-agent demo (§11.1, §20.2, §30).
 
+import Accessibility
 import AppKit
 import Foundation
 import Protocol
@@ -141,10 +142,11 @@ struct CodingAgentFallbackSocketTests {
             "Terminal did not publish the minimum PTY size: \(reportedTerminalSizes)"
         )
 
-        let approveButton = try #require(
-            renderer.registry.view(for: NodeId(17)) as? NSButton
+        let semanticInspector = controller.makeSemanticInspector()
+        let semanticApprove = try #require(
+            semanticInspector.find(role: .button, label: "Approve")
         )
-        approveButton.performClick(nil)
+        _ = try await semanticApprove.activate()
         try await Self.waitForRevision(applier, expected: Revision(4))
         try await AsyncTestSupport.eventually(description: "approval rendered") {
             let conversation = (renderer.registry.view(for: NodeId(9)) as? NSScrollView)?
@@ -153,7 +155,9 @@ struct CodingAgentFallbackSocketTests {
                 && (renderer.registry.view(for: NodeId(5)) as? NSProgressIndicator)?.doubleValue
                     == 0.75
         }
-        surfaceWindow.contentView?.layoutSubtreeIfNeeded()
+        let approveButton = try #require(
+            renderer.registry.view(for: NodeId(17)) as? NSButton
+        )
         let conversationScroll = try #require(
             renderer.registry.view(for: NodeId(9)) as? NSScrollView
         )

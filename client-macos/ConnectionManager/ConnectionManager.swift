@@ -170,6 +170,8 @@ public struct ConnectionAlert: Identifiable, Equatable, Sendable {
 public actor SavedConnectionStore {
     public nonisolated let url: URL
 
+    private let beforeSave: (@Sendable ([SavedConnection]) async -> Void)?
+
     public static var defaultURL: URL {
         let applicationSupport = FileManager.default.urls(
             for: .applicationSupportDirectory,
@@ -183,6 +185,15 @@ public actor SavedConnectionStore {
 
     public init(url: URL = SavedConnectionStore.defaultURL) {
         self.url = url
+        self.beforeSave = nil
+    }
+
+    init(
+        url: URL,
+        beforeSave: @escaping @Sendable ([SavedConnection]) async -> Void
+    ) {
+        self.url = url
+        self.beforeSave = beforeSave
     }
 
     public func load() throws -> [SavedConnection] {
@@ -191,7 +202,11 @@ public actor SavedConnectionStore {
         return try JSONDecoder().decode([SavedConnection].self, from: data)
     }
 
-    public func save(_ connections: [SavedConnection]) throws {
+    public func save(_ connections: [SavedConnection]) async throws {
+        if let beforeSave {
+            await beforeSave(connections)
+        }
+
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: directory,
@@ -343,6 +358,7 @@ public final class ConnectionManager {
     @ObservationIgnored private var attemptsByToken: [UInt64: any ConnectionAttempt] = [:]
     @ObservationIgnored private var tasksByToken: [UInt64: Task<Void, Never>] = [:]
     @ObservationIgnored private var pendingFirstSuccess: Set<SavedConnection.ID> = []
+    @ObservationIgnored private var persistenceTail: Task<String?, Never>?
     @ObservationIgnored private var nextAttemptToken: UInt64 = 0
     @ObservationIgnored private var isShuttingDown = false
 
@@ -378,11 +394,11 @@ public final class ConnectionManager {
         } catch {
             entries = []
             statuses = [:]
-            alert = ConnectionAlert(
+            presentAlert(ConnectionAlert(
                 kind: .persistenceFailed,
                 title: "Couldn’t Load Connections",
                 message: String(describing: error)
-            )
+            ))
         }
     }
 
@@ -394,25 +410,47 @@ public final class ConnectionManager {
         alert = nil
     }
 
+    private func presentAlert(_ candidate: ConnectionAlert) {
+        guard let current = alert, current.kind == .sessionReplaced else {
+            alert = candidate
+            return
+        }
+
+        let detail: String
+        if candidate.kind == .connectionFailed,
+           candidate.connectionID == current.connectionID {
+            detail = "The replacement connection then failed: \(candidate.message)"
+        } else {
+            detail = "\(candidate.title): \(candidate.message)"
+        }
+        alert = ConnectionAlert(
+            id: current.id,
+            kind: .sessionReplaced,
+            connectionID: current.connectionID,
+            title: current.title,
+            message: "\(current.message)\n\n\(detail)"
+        )
+    }
+
     @discardableResult
     public func connect(_ draft: ConnectDraft) -> SavedConnection.ID? {
         guard isShuttingDown == false else { return nil }
         guard let connection = draft.savedConnection else {
-            alert = ConnectionAlert(
+            presentAlert(ConnectionAlert(
                 kind: .invalidInput,
                 connectionID: draft.id,
                 title: "Can’t Connect",
                 message: draft.validationMessage ?? "The connection details are invalid."
-            )
+            ))
             return nil
         }
         guard entries.contains(where: { $0.id == connection.id }) == false else {
-            alert = ConnectionAlert(
+            presentAlert(ConnectionAlert(
                 kind: .invalidInput,
                 connectionID: connection.id,
                 title: "Can’t Connect",
                 message: "A saved connection with this identifier already exists."
-            )
+            ))
             return nil
         }
 
@@ -426,32 +464,36 @@ public final class ConnectionManager {
     public func connect(id connectionID: SavedConnection.ID) {
         guard isShuttingDown == false else { return }
         guard let connection = entries.first(where: { $0.id == connectionID }) else {
-            alert = ConnectionAlert(
+            presentAlert(ConnectionAlert(
                 kind: .invalidInput,
                 connectionID: connectionID,
                 title: "Can’t Connect",
                 message: "This saved connection no longer exists."
-            )
+            ))
             return
         }
         beginAttempt(for: connection)
     }
 
-    public func remove(id connectionID: SavedConnection.ID) async {
+    public func remove(id connectionID: SavedConnection.ID) {
         guard isShuttingDown == false else { return }
         guard entries.contains(where: { $0.id == connectionID }) else { return }
 
         entries.removeAll(where: { $0.id == connectionID })
         statuses.removeValue(forKey: connectionID)
         pendingFirstSuccess.remove(connectionID)
+        if activeTokens[connectionID] == nil {
+            contexts.removeValue(forKey: connectionID)
+        }
 
-        if let errorMessage = await save(entries) {
-            alert = ConnectionAlert(
+        enqueueSave(entries) { [weak self] errorMessage in
+            guard let self, let errorMessage else { return }
+            self.presentAlert(ConnectionAlert(
                 kind: .persistenceFailed,
                 connectionID: connectionID,
                 title: "Couldn’t Delete Connection",
                 message: errorMessage
-            )
+            ))
         }
     }
 
@@ -501,11 +543,11 @@ public final class ConnectionManager {
         }
 
         if let errorMessage = await save(entries) {
-            alert = ConnectionAlert(
+            presentAlert(ConnectionAlert(
                 kind: .persistenceFailed,
                 title: "Couldn’t Save Connections",
                 message: errorMessage
-            )
+            ))
         }
     }
 
@@ -570,7 +612,9 @@ public final class ConnectionManager {
         }
         attemptsByToken[token] = attempt
         statuses[connection.id] = .connecting
-        alert = nil
+        if alert?.kind != .sessionReplaced {
+            alert = nil
+        }
 
         let task = Task { [weak self] in
             guard let self else {
@@ -682,12 +726,12 @@ public final class ConnectionManager {
             if let persistenceError {
                 message += "\n\nThe replacement could not be saved: \(persistenceError)"
             }
-            alert = ConnectionAlert(
+            presentAlert(ConnectionAlert(
                 kind: .sessionReplaced,
                 connectionID: connectionID,
                 title: "Session Replaced",
                 message: message
-            )
+            ))
             return false
 
         case .ready(let sessionID, let revision):
@@ -699,12 +743,12 @@ public final class ConnectionManager {
             let persistenceError = await save(entries)
             guard activeTokens[connectionID] == token else { return true }
             if let persistenceError {
-                alert = ConnectionAlert(
+                presentAlert(ConnectionAlert(
                     kind: .persistenceFailed,
                     connectionID: connectionID,
                     title: "Couldn’t Save Connection",
                     message: persistenceError
-                )
+                ))
             }
             return false
 
@@ -739,12 +783,12 @@ public final class ConnectionManager {
         if let persistenceError {
             fullMessage += "\n\nThe latest connection metadata could not be saved: \(persistenceError)"
         }
-        alert = ConnectionAlert(
+        presentAlert(ConnectionAlert(
             kind: .connectionFailed,
             connectionID: connectionID,
             title: "Connection Failed",
             message: fullMessage
-        )
+        ))
         return true
     }
 
@@ -757,12 +801,12 @@ public final class ConnectionManager {
             connectionID: connectionID,
             token: token
         ), activeTokens[connectionID] == token {
-            alert = ConnectionAlert(
+            presentAlert(ConnectionAlert(
                 kind: .persistenceFailed,
                 connectionID: connectionID,
                 title: "Couldn’t Save Connection",
                 message: persistenceError
-            )
+            ))
         }
     }
 
@@ -794,12 +838,48 @@ public final class ConnectionManager {
         return await save(entries)
     }
 
-    private func save(_ snapshot: [SavedConnection]) async -> String? {
-        do {
-            try await store.save(snapshot)
-            return nil
-        } catch {
-            return String(describing: error)
+    @discardableResult
+    private func enqueueSave(
+        _ snapshot: [SavedConnection],
+        completion: (@MainActor @Sendable (String?) -> Void)? = nil
+    ) -> Task<String?, Never> {
+        let pendingConnectionIDs = pendingFirstSuccess
+        let persistableSnapshot = snapshot.filter {
+            pendingConnectionIDs.contains($0.id) == false
         }
+        let predecessor = persistenceTail
+        let store = self.store
+
+        let task = Task { @MainActor in
+            _ = await predecessor?.value
+
+            let errorMessage: String?
+            do {
+                try await store.save(persistableSnapshot)
+                errorMessage = nil
+            } catch {
+                errorMessage = String(describing: error)
+            }
+            completion?(errorMessage)
+            return errorMessage
+        }
+        persistenceTail = task
+        return task
+    }
+
+    private func save(_ snapshot: [SavedConnection]) async -> String? {
+        await enqueueSave(snapshot).value
+    }
+
+    func waitForPersistenceForTesting() async {
+        _ = await persistenceTail?.value
+    }
+
+    func hasActiveAttemptForTesting(_ connectionID: SavedConnection.ID) -> Bool {
+        activeTokens[connectionID] != nil
+    }
+
+    var isShuttingDownForTesting: Bool {
+        isShuttingDown
     }
 }

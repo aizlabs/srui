@@ -154,6 +154,26 @@ private struct TemporaryConnectionStore {
     }
 }
 
+private actor PersistenceSaveProbe {
+    private let firstSaveGate: AsyncGate
+    private var recordedSnapshots: [[SavedConnection]] = []
+
+    init(firstSaveGate: AsyncGate) {
+        self.firstSaveGate = firstSaveGate
+    }
+
+    func observe(_ snapshot: [SavedConnection]) async {
+        recordedSnapshots.append(snapshot)
+        if recordedSnapshots.count == 1 {
+            await firstSaveGate.pause()
+        }
+    }
+
+    func snapshots() -> [[SavedConnection]] {
+        recordedSnapshots
+    }
+}
+
 @MainActor
 @Suite("Connection Manager Tests (§6.3, §17, §18, §19.1)")
 struct ConnectionManagerTests {
@@ -655,6 +675,171 @@ struct ConnectionManagerTests {
         await manager.shutdown()
     }
 
+    @Test("pending first-success rows are filtered from unrelated saves")
+    func pendingFirstSuccessIsNeverPersistedIncidentally() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Existing",
+            host: "existing.example",
+            user: "alice",
+            sessionID: "existing-session"
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+
+        let pendingID = try #require(manager.connect(ConnectDraft(
+            label: "Pending",
+            host: "pending.example",
+            user: "bob"
+        )))
+        manager.remove(id: saved.id)
+
+        #expect(manager.entries.map(\.id) == [pendingID])
+        await manager.waitForPersistenceForTesting()
+        #expect(try await temporary.store.load().isEmpty)
+        await manager.shutdown()
+    }
+
+    @Test("removing a disconnected connection releases its session context")
+    func removalReleasesDisconnectedContext() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Disconnected",
+            host: "disconnected.example",
+            user: "alice",
+            sessionID: "disconnected-session"
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+
+        let attempt = try #require(harness.attempts.first)
+        let context = WeakConnectionSessionContext(
+            try #require(harness.requests.first).context
+        )
+        harness.discardRequests()
+        await attempt.emit(.stopped)
+        try await AsyncTestSupport.eventually(description: "attempt ownership released") {
+            manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
+                && manager.hasActiveAttemptForTesting(saved.id) == false
+        }
+
+        #expect(context.value != nil)
+        manager.remove(id: saved.id)
+        #expect(manager.entries.isEmpty)
+        #expect(context.value == nil)
+        await manager.waitForPersistenceForTesting()
+        await manager.shutdown()
+    }
+
+    @Test("removal saves remain ordered and shutdown waits for them")
+    func removalPersistenceIsOrderedThroughShutdown() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let first = SavedConnection(
+            label: "First",
+            host: "first.example",
+            user: "alice",
+            sessionID: "first-session"
+        )
+        let second = SavedConnection(
+            label: "Second",
+            host: "second.example",
+            user: "bob",
+            sessionID: "second-session"
+        )
+        try await temporary.store.save([first, second])
+
+        let firstSaveGate = AsyncGate()
+        let probe = PersistenceSaveProbe(firstSaveGate: firstSaveGate)
+        let orderedStore = SavedConnectionStore(
+            url: temporary.file,
+            beforeSave: { snapshot in
+                await probe.observe(snapshot)
+            }
+        )
+        let manager = ConnectionManager(
+            store: orderedStore,
+            attemptFactory: { _ in TestConnectionAttempt() }
+        )
+        await manager.load()
+
+        manager.remove(id: first.id)
+        #expect(manager.entries == [second])
+        await firstSaveGate.waitUntilPaused()
+
+        manager.remove(id: second.id)
+        #expect(manager.entries.isEmpty)
+        let shutdownTask = Task { @MainActor in
+            await manager.shutdown()
+        }
+        try await AsyncTestSupport.eventually(description: "shutdown entered") {
+            manager.isShuttingDownForTesting
+        }
+
+        await firstSaveGate.release()
+        await shutdownTask.value
+
+        let snapshots = await probe.snapshots()
+        #expect(snapshots == [[second], [], []])
+        #expect(try await temporary.store.load().isEmpty)
+    }
+
+    @Test("replacement disclosure survives an immediate failure until dismissal")
+    func replacementDisclosureSurvivesImmediateFailure() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Replacement Failure",
+            host: "replacement-failure.example",
+            user: "alice",
+            sessionID: "old-session",
+            lastKnownRevision: 9
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.first)
+
+        await attempt.emit(.replaced(
+            previousSessionID: "old-session",
+            newSessionID: "new-session"
+        ))
+        await attempt.emit(.failed("catch-up failed"))
+        try await AsyncTestSupport.eventually(description: "replacement failure disclosed") {
+            manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
+                && manager.alert?.kind == .sessionReplaced
+                && manager.alert?.message.contains("new-session") == true
+                && manager.alert?.message.contains(
+                    "The replacement connection then failed: catch-up failed"
+                ) == true
+        }
+
+        manager.dismissAlert()
+        #expect(manager.alert == nil)
+        await manager.shutdown()
+    }
+
     @Test("shutdown does not persist a connection that never became ready")
     func shutdownBeforeReadyDoesNotPersistDraft() async throws {
         let temporary = TemporaryConnectionStore()
@@ -708,8 +893,9 @@ struct ConnectionManagerTests {
             await attempt.startCount() == 1
         }
 
-        await manager.remove(id: saved.id)
+        manager.remove(id: saved.id)
         #expect(manager.entries.isEmpty)
+        await manager.waitForPersistenceForTesting()
         #expect(try await temporary.store.load().isEmpty)
         #expect(await attempt.stopCount() == 0)
         #expect(context.value != nil)

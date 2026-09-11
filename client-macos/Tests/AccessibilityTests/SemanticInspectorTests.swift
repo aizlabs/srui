@@ -27,7 +27,7 @@ struct SemanticInspectorTests {
         #expect(button.roleHint == EnumToken.actionRolePrimary)
         #expect(button.label == "Approve")
         #expect(button.text == "Approve request")
-        #expect(button.description == "Accept the pending request")
+        #expect(button.accessibleDescription == "Accept the pending request")
         #expect(button.valueDescription == "Not yet approved")
         #expect(button.value == Value.bool(false))
         #expect(button.parentID == NodeId(2))
@@ -39,6 +39,8 @@ struct SemanticInspectorTests {
         #expect(button.state.selected == false)
         #expect(button.actionKey == "approve")
         #expect(button.actions == ["announce", "show_details"])
+        #expect(snapshot[NodeId(4)] == button)
+        #expect(snapshot[NodeId(404)] == nil)
     }
 
     @Test("Each query takes a fresh source while old snapshots remain immutable")
@@ -61,6 +63,33 @@ struct SemanticInspectorTests {
         #expect(second.revision == Revision(2))
         #expect(second.epoch == SemanticInspectionEpoch(10))
         #expect(first.node(NodeId(4))?.label == "Before")
+    }
+
+    @Test("Existing snapshots mint handles without recapturing or mixing snapshot identity")
+    func handlesFromExistingSnapshot() throws {
+        let firstSource = try makeSource(buttonLabel: "Before", revision: 11, epoch: 20)
+        let secondSource = try makeSource(buttonLabel: "After", revision: 12, epoch: 20)
+        let sequence = LockedSnapshotSequence([firstSource, secondSource])
+        let inspector = SemanticInspector(
+            snapshotProvider: { sequence.next() },
+            actionHandler: { _ in throw SemanticAutomationError.sessionInactive }
+        )
+
+        let firstTree = inspector.snapshot()
+        let firstNode = try #require(firstTree.node(NodeId(4)))
+        let byID = try #require(inspector.handle(for: NodeId(4), in: firstTree))
+        let byNode = try #require(inspector.handle(for: firstNode, in: firstTree))
+
+        #expect(sequence.consumedCount() == 1)
+        #expect(byID.node == firstNode)
+        #expect(byNode.node == firstNode)
+        #expect(byID.observedRevision == Revision(11))
+        #expect(byNode.expectedEpoch == SemanticInspectionEpoch(20))
+
+        let secondTree = inspector.snapshot()
+        let secondNode = try #require(secondTree.node(NodeId(4)))
+        #expect(inspector.handle(for: secondNode, in: firstTree) == nil)
+        #expect(sequence.consumedCount() == 2)
     }
 
     @Test("Find uses role and label in semantic tree order")
@@ -235,6 +264,12 @@ private final class LockedSnapshotSequence: @unchecked Sendable {
         let snapshot = snapshots[min(index, snapshots.count - 1)]
         index += 1
         return snapshot
+    }
+
+    func consumedCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return index
     }
 }
 

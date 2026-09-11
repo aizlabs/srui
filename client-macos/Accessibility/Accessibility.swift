@@ -142,7 +142,7 @@ public struct SemanticNodeSnapshot: Equatable, Sendable {
     public let roleHint: EnumToken?
     public let label: String?
     public let text: String?
-    public let description: String?
+    public let accessibleDescription: String?
     public let valueDescription: String?
     public let value: Value?
     public let parentID: NodeId?
@@ -166,7 +166,7 @@ public struct SemanticNodeSnapshot: Equatable, Sendable {
         roleHint: EnumToken?,
         label: String?,
         text: String?,
-        description: String?,
+        accessibleDescription: String?,
         valueDescription: String?,
         value: Value?,
         parentID: NodeId?,
@@ -184,7 +184,7 @@ public struct SemanticNodeSnapshot: Equatable, Sendable {
         self.roleHint = roleHint
         self.label = label
         self.text = text
-        self.description = description
+        self.accessibleDescription = accessibleDescription
         self.valueDescription = valueDescription
         self.value = value
         self.parentID = parentID
@@ -207,7 +207,7 @@ public struct SemanticTreeSnapshot: Equatable, Sendable {
     /// Nodes in deterministic root-order pre-order traversal.
     public let nodes: [SemanticNodeSnapshot]
 
-    private let nodesByID: [NodeId: SemanticNodeSnapshot]
+    private let nodeIndicesByID: [NodeId: Int]
 
     public init(
         epoch: SemanticInspectionEpoch,
@@ -220,20 +220,21 @@ public struct SemanticTreeSnapshot: Equatable, Sendable {
         self.rootIDs = rootIDs
         self.nodes = nodes
 
-        var lookup: [NodeId: SemanticNodeSnapshot] = [:]
+        var lookup: [NodeId: Int] = [:]
         lookup.reserveCapacity(nodes.count)
-        for node in nodes {
-            lookup[node.id] = node
+        for (index, node) in nodes.enumerated() {
+            lookup[node.id] = index
         }
-        self.nodesByID = lookup
+        self.nodeIndicesByID = lookup
     }
 
     public func node(_ id: NodeId) -> SemanticNodeSnapshot? {
-        nodesByID[id]
+        guard let index = nodeIndicesByID[id] else { return nil }
+        return nodes[index]
     }
 
     public subscript(id: NodeId) -> SemanticNodeSnapshot? {
-        nodesByID[id]
+        node(id)
     }
 }
 
@@ -314,11 +315,31 @@ public struct SemanticInspector: Sendable {
         Self.makeTreeSnapshot(from: snapshotProvider())
     }
 
+    /// Creates a handle by identifier from an existing snapshot without recapturing the tree.
+    public func handle(
+        for id: NodeId,
+        in tree: SemanticTreeSnapshot
+    ) -> SemanticNodeHandle? {
+        guard let node = tree.node(id) else { return nil }
+        return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
+    }
+
+    /// Creates a handle for a node that belongs to an existing snapshot.
+    ///
+    /// A node from a different snapshot is rejected rather than borrowing this tree's epoch and
+    /// revision.
+    public func handle(
+        for node: SemanticNodeSnapshot,
+        in tree: SemanticTreeSnapshot
+    ) -> SemanticNodeHandle? {
+        guard tree.node(node.id) == node else { return nil }
+        return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
+    }
+
     /// Finds one node by identifier in one fresh snapshot.
     public func node(id: NodeId) -> SemanticNodeHandle? {
         let tree = snapshot()
-        guard let node = tree.node(id) else { return nil }
-        return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
+        return handle(for: id, in: tree)
     }
 
     /// Finds the first exact role/label match in deterministic tree order using one fresh snapshot.
@@ -394,7 +415,7 @@ public struct SemanticInspector: Sendable {
                     roleHint: properties[.role]?.asEnumToken,
                     label: properties[.label]?.asString,
                     text: properties[.text]?.asString,
-                    description: properties[.accessibleDescription]?.asString,
+                    accessibleDescription: properties[.accessibleDescription]?.asString,
                     valueDescription: properties[.valueDescription]?.asString,
                     value: properties[.value],
                     parentID: node.parentID,

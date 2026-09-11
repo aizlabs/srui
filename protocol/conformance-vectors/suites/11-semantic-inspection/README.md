@@ -16,6 +16,11 @@ snapshot, and available actions come from the generated registry tables rather t
 widget classes or a second hand-maintained oracle. The suite builds the Rust coding-agent demo
 before the live fallback-socket runner so it also works from a clean checkout.
 
+Programmatic text entry is intentionally not exposed by Task 35. `TEXT_EDIT` is not a generic value
+change: it requires per-editor `edit_seq`, composition/coalescing, resume, and acknowledgement
+handling owned by `TextEditingSession`. Text editors remain inspectable and advertise their
+registry-owned `EVENT_TEXT_EDIT`; `setValue` is not an alias for text entry.
+
 ## Runners
 
 **Swift**

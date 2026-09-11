@@ -786,6 +786,9 @@ public final class SessionController: @unchecked Sendable {
         guard state.isActive, let ownership = state.ownership else {
             throw SemanticAutomationError.sessionInactive
         }
+        // Every event admitted below comes from the canonical standard-widget registry.
+        // Extension events need their own registry-backed profile mapping before automation can
+        // authorize them; treating an arbitrary negotiated extension as equivalent would fail open.
         guard state.negotiatedCapabilities?.contains(.standardWidgetsV1) == true else {
             throw SemanticAutomationError.capabilityNotNegotiated(request.action.eventType)
         }
@@ -930,11 +933,12 @@ public final class SessionController: @unchecked Sendable {
         return try await withTaskCancellationHandler(
             operation: {
                 try Task.checkCancellation()
-                // Capture current state before the first suspension for initial authorization.
-                // The request separately retains the revision represented by its immutable handle.
-                let source = semanticInspectionSourceSnapshot()
                 let operation = try await MainActor.run {
                     try Task.checkCancellation()
+                    // Capture current state after entering MainActor so no actor wait separates the
+                    // initial validation snapshot from synchronous admission. The request retains
+                    // the revision represented by its immutable handle.
+                    let source = self.semanticInspectionSourceSnapshot()
                     return try self.enqueueSemanticAction(
                         request,
                         validationSnapshot: source.transaction,

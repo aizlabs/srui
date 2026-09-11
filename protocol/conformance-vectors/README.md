@@ -46,7 +46,7 @@ and which scenarios are open gaps.
 | 8 | [`08-reconnect/`](suites/08-reconnect/) | Reconnect tests | `PASS` | code-driven | — |
 | 9 | [`09-security-limits/`](suites/09-security-limits/) | Security limits | `PASS` | code-driven | — |
 | 10 | [`10-renderer-semantics/`](suites/10-renderer-semantics/) | Renderer semantic tests | `PASS` | code-driven | — |
-| 11 | [`11-semantic-inspection/`](suites/11-semantic-inspection/) | Semantic inspection tests | `GAP` | code-driven | Task 35 (local semantic inspection and automation API) |
+| 11 | [`11-semantic-inspection/`](suites/11-semantic-inspection/) | Semantic inspection tests | `PASS` | code-driven | — |
 | 12 | [`12-toolkit-mapping/`](suites/12-toolkit-mapping/) | Toolkit mapping tests | `PASS` | generated from `registry.yaml` | — |
 
 ### Running the suites
@@ -131,5 +131,4 @@ are in the manifest and in each suite's README.
   untested. The positive subscribed-scene half has no implementation either. Owned by **Task 36**.
 - **Suite 7** — capability negotiation and must-understand rejection are covered; the
   fallback-subtree half is **Task 31** work not yet merged to `origin/main`.
-- **Suite 11** — `client-macos/Accessibility` is a placeholder; the whole suite awaits **Task 35**.
 

@@ -586,6 +586,27 @@ struct TextEditingIntegrationTests {
             sessionId: "stop-text-before-action"
         )
 
+        // Use a real interactive node: native semantic admission now rejects nonexistent nodes
+        // synchronously, while this test needs a valid action queued behind the pending draft.
+        let actionID = NodeId(99)
+        var actionMount = SRUIMessage()
+        actionMount.transaction = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .createNode(
+                    id: actionID,
+                    nodeType: .button,
+                    parentID: surfaceID
+                ),
+            ]
+        ).toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(actionMount))
+        try await AsyncTestSupport.eventually(description: "action button mounted") {
+            applier.lastAppliedRevision == Revision(2)
+                && renderer.registry.handle(for: actionID) != nil
+        }
+
         let collector = EventCollector()
         await collector.start(draining: serverTransport)
         renderer.textEditingSession.noteLocalValue(
@@ -601,7 +622,7 @@ struct TextEditingIntegrationTests {
             composing: false,
             flushImmediately: false
         )
-        renderer.onInteraction?(.activate(nodeID: NodeId(99)))
+        renderer.onInteraction?(.activate(nodeID: actionID))
         #expect(await outbox.eventSeq == 1)
         #expect(await collector.eventCount() == 1)
 

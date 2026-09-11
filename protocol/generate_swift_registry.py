@@ -157,6 +157,31 @@ def generate_swift_registry(registry_path: Path, output_path: Path) -> None:
     lines.append("]")
     lines.append("")
 
+    lines.extend(
+        [
+            "/// Returns the intrinsic standard events emitted by a standard node type.",
+            "///",
+            "/// This is generated from each node type's `emits` entry in the canonical registry.",
+            "/// Passive node properties such as `actions` and `action_key` do not add capability.",
+            "public func standardEventsEmitted(by nodeType: TypeRef) -> [TypeRef] {",
+            "    guard nodeType.isStandard else { return [] }",
+            "    switch nodeType.localID {",
+        ]
+    )
+    for item in node_types:
+        emitted = item.get("emits", [])
+        if emitted:
+            swift_events = ", ".join(f"TypeRef.EVENT_{event}" for event in emitted)
+            lines.append(f"    case {item['id']}: return [{swift_events}]")
+    lines.extend(
+        [
+            "    default: return []",
+            "    }",
+            "}",
+            "",
+        ]
+    )
+
     lines.append("public let standardPropertiesTable: [(id: UInt32, name: String)] = [")
     for item in properties:
         lines.append(f'    ({item["id"]}, "{item["name"]}"),')

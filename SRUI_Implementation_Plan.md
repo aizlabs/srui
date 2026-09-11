@@ -1823,9 +1823,10 @@ Read: §17 (session states — ATTACHED/DETACHED/TERMINATING/EXPIRED, so the UI 
 meaningful status rather than a raw boolean — plus the incarnation-token paragraph, since a saved
 entry's `session_id` may simply no longer exist by the time the user reconnects), §18 (reconnect
 — the complete process-local continuity checkpoint; the cold-relaunch rule requiring a fresh
-`client_instance_id` and revision 0 when no durable checkpoint exists; the continuity decision the
-server returns; and the generation-bound resume-attempt rule, which this UI can trigger directly
-if the user clicks Connect twice), §19.1 (recommended SSH posture — host-key verification behavior
+`client_instance_id` and revision 0 when no durable checkpoint exists; resume-time core/profile and
+extension-namespace re-advertisement; the continuity decision the server returns; and the
+generation-bound resume-attempt rule, which this UI can trigger directly if the user clicks Connect
+twice), §19.1 (recommended SSH posture — host-key verification behavior
 must stay visible to the user, not silently bypassed), §6.3's state ownership table (this task's
 saved-connection list is purely local "presentation state," owned by the client, never
 synchronized to the server — the server has no concept of it).
@@ -1845,9 +1846,14 @@ Session/TransportSSH, not inside SemanticModel/Protocol:
   mappings in memory so a warm reconnect can resume from those exact values. After a cold
   relaunch without a durable continuity checkpoint, attempt `CLIENT RESUME`
   for the saved `session_id` from revision 0 with a fresh `client_instance_id` and empty event,
-  text, and terminal continuity state; never advertise the persisted last-known revision. This
-  list is never sent to the server and has no protocol meaning; it is exactly the kind of local
-  presentation state §6.3 says the client owns unilaterally.
+  text, and terminal continuity state; never advertise the persisted last-known revision. Every
+  resume also re-advertises the current client's `core_version` and supported `profiles`. Before
+  replay or snapshot traffic enters the data plane, validate the server-authoritative
+  `required_profiles`, `optional_profiles`, and `extension_namespaces` carried by
+  `SERVER_RESUME_OK` or `SERVER_RESYNC_REQUIRED`, then install the negotiated capability result
+  and session-assigned namespace/type mappings. This list is never sent to the server and has no
+  protocol meaning; it is exactly the kind of local presentation state §6.3 says the client owns
+  unilaterally.
 - A session list window showing saved entries with a status derived from the last known
   transport/session state (e.g. "connected," "disconnected — will resume," "unknown"), letting
   the user pick one to (re)connect or remove. Removing an entry only forgets it locally — it has
@@ -1869,8 +1875,12 @@ Session/TransportSSH, not inside SemanticModel/Protocol:
 Out of scope: no keychain-integrated secret storage beyond what the user's own ssh-agent/
 known_hosts already provide; no simultaneous-multi-session window management beyond whatever
 falls out naturally (one window per active connection is fine); no syncing the saved-connection
-list across machines; no new protocol messages or server-side changes of any kind — this task
-only adds a UI layer over transport/session APIs that already exist. A literal revision-N cold
+list across machines; no new protocol message kinds or unrelated server-side behavior. The one
+allowed prerequisite is the minimal additive, wire-compatible resume-negotiation extension to the
+existing messages: `CLIENT_RESUME.core_version`/`profiles`, and
+`SERVER_RESUME_OK`/`SERVER_RESYNC_REQUIRED.required_profiles`, `optional_profiles`, and
+`extension_namespaces`, with fail-closed validation before subscription or data-plane traffic. All
+other work remains a UI layer over existing transport/session APIs. A literal revision-N cold
 resume is also out of scope: it requires one atomic durable checkpoint of the semantic replica,
 outbox, pending event and text state, terminal offsets, resource-continuity state, negotiated
 capabilities, and extension/Terminal namespace and type mappings, and MUST NOT be approximated
@@ -1886,13 +1896,18 @@ Verification:
   confirm a recreated controller does not fall back to fresh negotiation;
 - quit and relaunch the client, then reconnect via the saved entry without a durable checkpoint:
   confirm (via a log/test hook) that it attempts Task 23's `CLIENT RESUME` with the remembered
-  `session_id`, a fresh `client_instance_id`, revision 0, event frontier 0, and empty terminal/text
-  continuity state — never the saved last-known revision — and that replay or
-  `RESYNC_REQUIRED` rebuilds the UI to the session's actual current state;
+  `session_id`, a fresh `client_instance_id`, revision 0, event frontier 0, empty terminal/text
+  continuity state, and the current `core_version`/supported `profiles` — never the saved last-known
+  revision. Exercise a Terminal session and both journal replay and same-session snapshot resync:
+  confirm each resume response re-advertises the authoritative profile sets and Terminal namespace,
+  the client validates and installs that mapping before replay/snapshot/Terminal data, and the UI is
+  rebuilt to the session's actual current state;
 - restart the remote sessiond (or otherwise force a `REPLACED` continuity outcome) and then
-  reconnect via a saved entry: confirm the UI clearly communicates that the session was replaced
-  rather than presenting it as a normal resume, and that the saved entry is updated to the new
-  session_id;
+  reconnect via a saved Terminal entry: confirm `SERVER_RESYNC_REQUIRED{continuity=REPLACED}`
+  carries the replacement's required/optional profiles and extension namespaces, the client
+  validates and installs the replacement Terminal mapping before its snapshot/data plane, the UI
+  clearly communicates that the session was replaced rather than presenting it as a normal resume,
+  and the saved entry is updated to the new `session_id`;
 - double-click Connect on the same saved entry in quick succession: confirm only the newer resume
   attempt's outcome is reflected in the UI and no duplicate side effects or duplicated windows
   result from the superseded attempt;

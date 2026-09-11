@@ -27,6 +27,15 @@ private final class TestPointerContext {
     var windowIsVisible = true
 }
 
+@MainActor
+private final class ForcedHitTestView: NSView {
+    weak var forcedHitView: NSView?
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        forcedHitView ?? super.hitTest(point)
+    }
+}
+
 private let controlFactoryRequiredTierTypes: [TypeRef] = [
     .surface, .row, .column, .grid, .spacer, .separator, .scroll,
     .text, .richText, .button, .toggle, .textInput, .textArea,
@@ -201,6 +210,57 @@ struct ControlFactoryTests {
         overlay.removeFromSuperview()
         button.reconcilePointerState()
         #expect(button.isPointerInside)
+    }
+
+    @Test
+    func buttonHoverFeedbackRejectsPointerOutsideAncestorClip() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+        let button = try #require(handle.view as? HoverFeedbackButton)
+        let pointerContext = TestPointerContext()
+        button.screenPointerLocationProvider = { pointerContext.location }
+        button.applicationActiveProvider = { pointerContext.applicationIsActive }
+        button.windowVisibilityProvider = { _ in pointerContext.windowIsVisible }
+
+        let root = ForcedHitTestView(
+            frame: NSRect(x: 0, y: 0, width: 180, height: 44)
+        )
+        let clipView = NSClipView(
+            frame: NSRect(x: 0, y: 0, width: 90, height: 44)
+        )
+        let documentView = NSView(
+            frame: NSRect(x: 0, y: 0, width: 180, height: 44)
+        )
+        button.frame = documentView.bounds
+        documentView.addSubview(button)
+        clipView.documentView = documentView
+        root.addSubview(clipView)
+
+        let window = NSWindow(
+            contentRect: root.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = root
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        let clippedPoint = NSPoint(x: 140, y: button.bounds.midY)
+        #expect(button.bounds.contains(clippedPoint))
+        #expect(button.visibleRect.contains(clippedPoint) == false)
+
+        // Force the independent overlap check to accept the button so this assertion fails if
+        // the visibleRect guard is removed.
+        root.forcedHitView = button
+        pointerContext.location = window.convertPoint(
+            toScreen: button.convert(clippedPoint, to: nil)
+        )
+        button.reconcilePointerState()
+        #expect(button.isPointerInside == false)
     }
 
     @Test(arguments: controlFactoryRequiredTierTypes)

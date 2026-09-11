@@ -72,72 +72,238 @@ violations=$(
         }
     '
 )
-
-spawn_violations=$(
-    find "${scan_roots[@]}" -name '*.swift' -print0 |
-        xargs -0 awk '
-        # Collect one posix_spawn argument list at a time. Depth tracking keeps a comma inside a
-        # nested call or a string literal from looking like an argument separator, so the third
-        # argument really is file_actions and not whatever the text happens to split into.
-        function reset_scan() {
+scan_posix_spawn_violations() {
+    xargs -0 awk '
+        function reset_call() {
             scanning = 0
             depth = 0
             argc = 0
-            in_string = 0
+            detached = 0
             delete args
         }
 
-        FNR == 1 { reset_scan() }
+        function reset_lexer() {
+            block_comment_depth = 0
+            in_string = 0
+            in_multiline_string = 0
+            raw_string_hashes = 0
+            raw_multiline_string = 0
+            escaped = 0
+        }
 
-        {
-            line = $0
-            if (scanning == 0) {
-                if (match(line, /posix_spawnp?[ \t]*\(/) == 0) next
-                if (line ~ /stdio:[ \t]*detached/) next
-                start_line = FNR
-                line = substr(line, RSTART + RLENGTH)
-                scanning = 1
-                depth = 1
-                argc = 0
-                args[0] = ""
-            }
-
-            for (i = 1; i <= length(line); i++) {
-                c = substr(line, i, 1)
-                if (c == "\"") {
-                    in_string = (in_string == 0)
-                    args[argc] = args[argc] c
+        # Strip comments and string contents before recognizing call syntax. This keeps
+        # look-alike text inert while preserving delimiters in actual Swift expressions.
+        function code_only(text, output, i, c, pair, triple, closing, hash_index, raw_start, raw_count) {
+            output = ""
+            for (i = 1; i <= length(text); i++) {
+                c = substr(text, i, 1)
+                pair = substr(text, i, 2)
+                triple = substr(text, i, 3)
+                if (block_comment_depth > 0) {
+                    if (pair == "/*") {
+                        block_comment_depth++
+                        i++
+                    } else if (pair == "*/") {
+                        block_comment_depth--
+                        i++
+                    }
+                    continue
+                }
+                if (raw_string_hashes > 0) {
+                    closing = raw_multiline_string ? "\"\"\"" : "\""
+                    for (hash_index = 0; hash_index < raw_string_hashes; hash_index++) {
+                        closing = closing "#"
+                    }
+                    if (substr(text, i, length(closing)) == closing) {
+                        raw_string_hashes = 0
+                        raw_multiline_string = 0
+                        i += length(closing) - 1
+                    }
+                    continue
+                }
+                if (in_multiline_string) {
+                    if (triple == "\"\"\"") {
+                        in_multiline_string = 0
+                        i += 2
+                    }
                     continue
                 }
                 if (in_string) {
-                    args[argc] = args[argc] c
-                    continue
-                }
-                if (c == "(" || c == "[" || c == "{") {
-                    depth++
-                } else if (c == ")" || c == "]" || c == "}") {
-                    depth--
-                    if (depth == 0) {
-                        # posix_spawn(pid, path, file_actions, attrp, argv, envp)
-                        actions = args[2]
-                        gsub(/^[ \t]+|[ \t]+$/, "", actions)
-                        if (argc >= 2 && actions == "nil") {
-                            printf "%s:%d: posix_spawn passes nil file_actions, so the child inherits fds 0/1/2\n", \
-                                FILENAME, start_line
-                        }
-                        reset_scan()
-                        break
+                    if (escaped) {
+                        escaped = 0
+                    } else if (c == "\\") {
+                        escaped = 1
+                    } else if (c == "\"") {
+                        in_string = 0
                     }
-                }
-                if (c == "," && depth == 1) {
-                    argc++
-                    args[argc] = ""
                     continue
                 }
-                args[argc] = args[argc] c
+                if (pair == "//") break
+                if (pair == "/*") {
+                    block_comment_depth = 1
+                    output = output " "
+                    i++
+                } else if (c == "#") {
+                    raw_start = i
+                    while (substr(text, raw_start, 1) == "#") raw_start++
+                    raw_count = raw_start - i
+                    if (substr(text, raw_start, 3) == "\"\"\"") {
+                        raw_string_hashes = raw_count
+                        raw_multiline_string = 1
+                        output = output "\"\""
+                        i = raw_start + 2
+                    } else if (substr(text, raw_start, 1) == "\"") {
+                        raw_string_hashes = raw_count
+                        raw_multiline_string = 0
+                        output = output "\"\""
+                        i = raw_start
+                    } else {
+                        output = output c
+                    }
+                } else if (triple == "\"\"\"") {
+                    in_multiline_string = 1
+                    output = output "\"\""
+                    i += 2
+                } else if (c == "\"") {
+                    in_string = 1
+                    escaped = 0
+                    output = output "\"\""
+                } else {
+                    output = output c
+                }
+            }
+            return output
+        }
+
+        FNR == 1 {
+            reset_call()
+            reset_lexer()
+        }
+
+        {
+            line = code_only($0)
+            if (scanning && $0 ~ /stdio:[ 	]*detached/) detached = 1
+            while (length(line) > 0) {
+                if (!scanning) {
+                    # The leading boundary excludes fake_posix_spawn and other identifiers.
+                    if (match(line, /(^|[^A-Za-z0-9_])posix_spawnp?[ 	]*\(/) == 0) break
+                    start_line = FNR
+                    line = substr(line, RSTART + RLENGTH)
+                    scanning = 1
+                    depth = 1
+                    argc = 0
+                    args[0] = ""
+                    detached = $0 ~ /stdio:[ 	]*detached/
+                }
+
+                completed = 0
+                for (i = 1; i <= length(line); i++) {
+                    c = substr(line, i, 1)
+                    if (c == "(" || c == "[" || c == "{") {
+                        depth++
+                    } else if (c == ")" || c == "]" || c == "}") {
+                        depth--
+                        if (depth == 0) {
+                            actions = args[2]
+                            gsub(/^[ 	]+|[ 	]+$/, "", actions)
+                            if (!detached && argc >= 2 && actions == "nil") {
+                                printf "%s:%d: posix_spawn passes nil file_actions, so the child inherits fds 0/1/2\n", \
+                                    FILENAME, start_line
+                            }
+                            reset_call()
+                            line = substr(line, i + 1)
+                            completed = 1
+                            break
+                        }
+                    }
+                    if (c == "," && depth == 1) {
+                        argc++
+                        args[argc] = ""
+                        continue
+                    }
+                    args[argc] = args[argc] c
+                }
+                if (!completed) {
+                    if (scanning) args[argc] = args[argc] " "
+                    break
+                }
             }
         }
     '
+}
+
+run_posix_spawn_scanner_self_test() (
+    test_directory=$(mktemp -d "${TMPDIR:-/tmp}/srui-stdio-scanner.XXXXXX")
+    trap 'rm -rf -- "$test_directory"' EXIT
+    cases="$test_directory/cases.swift"
+    cat >"$cases" <<'SWIFT'
+func scannerCases() {
+    // posix_spawn(&pid, path, nil, nil, argv, envp)
+    let source = "posix_spawn(&pid, path, nil, nil, argv, envp)"
+    fake_posix_spawn(&pid, path, nil, nil, argv, envp)
+    let raw = #"quoted " posix_spawn(&pid, path, nil, nil, argv, envp)"#
+    let rawMultiline = #"""
+    posix_spawn(&pid, path, nil, nil, argv, envp)
+    """#
+    let multiline = """
+    posix_spawn(&pid, path, nil, nil, argv, envp)
+    """
+    /*
+     posix_spawnp(&pid, path, nil, nil, argv, envp)
+     */
+    posix_spawn(
+        &pid,
+        path,
+        nil,
+        nil,
+        argv,
+        envp
+    )
+    posix_spawnp(
+        &pid,
+        path,
+        nil,
+        nil,
+        argv,
+        envp
+    )
+    posix_spawn(
+        &pid,
+        path,
+        &actions,
+        nil,
+        argv,
+        envp
+    )
+    posix_spawn(&pid, path, &actions, nil, argv, envp); posix_spawnp(&pid, path, nil, nil, argv, envp)
+}
+SWIFT
+
+    actual=$(printf '%s\0' "$cases" | scan_posix_spawn_violations)
+    expected=$(printf \
+        '%s:15: posix_spawn passes nil file_actions, so the child inherits fds 0/1/2\n%s:23: posix_spawn passes nil file_actions, so the child inherits fds 0/1/2\n%s:39: posix_spawn passes nil file_actions, so the child inherits fds 0/1/2' \
+        "$cases" "$cases" "$cases")
+    if [[ "$actual" != "$expected" ]]; then
+        echo "error: posix_spawn scanner self-test failed" >&2
+        printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+        exit 1
+    fi
+)
+
+if [[ $# -gt 1 || ($# -eq 1 && $1 != "--self-test") ]]; then
+    echo "usage: $0 [--self-test]" >&2
+    exit 2
+fi
+run_posix_spawn_scanner_self_test
+if [[ ${1:-} == "--self-test" ]]; then
+    echo "posix_spawn scanner self-test passed."
+    exit 0
+fi
+
+spawn_violations=$(
+    rg --files-with-matches --null --glob '*.swift' \
+        'posix_spawnp?[[:space:]]*\(' "${scan_roots[@]}" |
+        scan_posix_spawn_violations
 )
 
 if [ -n "$violations" ] || [ -n "$spawn_violations" ]; then

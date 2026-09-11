@@ -12,6 +12,7 @@ from benchmarks.errors import (
     BenchmarkError,
     CandidateCleanupAssertionError,
 )
+from benchmarks.process_control import ManagedCommandError, ManagedCommandTimeout
 from benchmarks.tests.support import (
     payload_for_driver,
     valid_manifest,
@@ -245,3 +246,175 @@ def test_missing_runner_count_aborts_with_the_runner_diagnostic(
                 str(output_dir),
             ]
         )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    (
+        (
+            ManagedCommandTimeout("expired"),
+            "candidate cleanup probe timed out after 7s",
+        ),
+        (
+            ManagedCommandError("sentinel broke"),
+            "candidate cleanup probe supervision failed: sentinel broke",
+        ),
+    ),
+)
+def test_cleanup_probe_classifies_infrastructure_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: BaseException,
+    expected: str,
+) -> None:
+    binary = tmp_path / "BenchmarkDriver"
+    binary.touch()
+    monkeypatch.setattr(
+        benchmark_run,
+        "_macos_release_driver_path",
+        lambda: binary,
+    )
+    monkeypatch.setattr(
+        benchmark_run,
+        "ensure_free_space",
+        lambda _path: None,
+    )
+
+    def fail_supervision(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(
+        benchmark_run,
+        "run_managed_command",
+        fail_supervision,
+    )
+
+    with pytest.raises(BenchmarkError, match=expected) as caught:
+        benchmark_run.run_candidate_cleanup_probe(
+            tmp_path / "fixture.json",
+            timeout=7,
+        )
+    assert not isinstance(
+        caught.value,
+        CandidateCleanupAssertionError,
+    )
+
+
+def test_cleanup_probe_classifies_surviving_identity_as_assertion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    binary = tmp_path / "BenchmarkDriver"
+    binary.touch()
+    monkeypatch.setattr(
+        benchmark_run,
+        "_macos_release_driver_path",
+        lambda: binary,
+    )
+    monkeypatch.setattr(
+        benchmark_run,
+        "ensure_free_space",
+        lambda _path: None,
+    )
+
+    def fail_after_recording_identities(
+        command: list[str],
+        **_kwargs: Any,
+    ) -> Any:
+        prefixes = (
+            "SRUI_BENCHMARK_CANDIDATE_IDENTITY_PATH=",
+            "SRUI_BENCHMARK_CANDIDATE_DESCENDANT_IDENTITY_PATH=",
+        )
+        for index, prefix in enumerate(prefixes, start=1):
+            path = Path(
+                next(
+                    argument.removeprefix(prefix)
+                    for argument in command
+                    if argument.startswith(prefix)
+                )
+            )
+            path.write_text(
+                json.dumps(
+                    {
+                        "pid": 100 + index,
+                        "birth_unix_ns": 1_000 + index,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr=("renderer candidate srui birth identity was unavailable"),
+            child_pid=99,
+        )
+
+    def identity_survived(
+        _identities: list[tuple[int, int]],
+        *,
+        label: str,
+    ) -> None:
+        raise ManagedCommandError(
+            f"{label} still has original process identities alive"
+        )
+
+    monkeypatch.setattr(
+        benchmark_run,
+        "run_managed_command",
+        fail_after_recording_identities,
+    )
+    monkeypatch.setattr(
+        benchmark_run,
+        "wait_for_process_identities_gone",
+        identity_survived,
+    )
+
+    with pytest.raises(
+        CandidateCleanupAssertionError,
+        match="still has original process identities alive",
+    ):
+        benchmark_run.run_candidate_cleanup_probe(
+            tmp_path / "fixture.json",
+            timeout=7,
+        )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    (
+        (ManagedCommandTimeout("expired"), "timed out after 7s"),
+        (
+            ManagedCommandError("sentinel broke"),
+            "process supervision failed: sentinel broke",
+        ),
+    ),
+)
+def test_verification_retains_infrastructure_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    expected: str,
+) -> None:
+    monkeypatch.setattr(
+        benchmark_run,
+        "ensure_free_space",
+        lambda _path: None,
+    )
+
+    def fail_supervision(*_args: Any, **_kwargs: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(
+        benchmark_run,
+        "run_managed_command",
+        fail_supervision,
+    )
+    spec = valid_manifest()["verification_commands"][0].copy()
+    spec["timeout"] = 7
+
+    _elapsed, passed, detail, sample_count = benchmark_run.run_verification(
+        spec, default_timeout=99
+    )
+
+    assert passed is False
+    assert sample_count is None
+    assert detail == expected

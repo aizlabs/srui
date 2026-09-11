@@ -1,0 +1,22 @@
+[package]
+name = "srui-benchmark-driver"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+libc = "0.2"
+portable-pty = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+srui-protocol = { path = "../protocol" }
+srui-pty = { path = "../pty" }
+srui-resources = { path = "../resources" }
+srui-sdk = { path = "../sdk" }
+srui-semantic-tree = { path = "../semantic-tree" }
+srui-sessiond = { path = "../sessiond" }

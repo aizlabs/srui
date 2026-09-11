@@ -1,6 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
+    "benchmark-driver",
+    "protocol",
+    "ssh-bridge",
+    "sessiond",
+    "semantic-tree",
+    "journal",
+    "event-dedupe",
+    "resources",
+    "pty",
+    "sdk",
+    "unix-security",
+]
+default-members = [
     "protocol",
     "ssh-bridge",
     "sessiond",

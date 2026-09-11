@@ -7,15 +7,13 @@
 // Implements: §7.2 (standard node types), §7.3 (implementation tiers), §7.6 (semantic events),
 // §7.7 (no coordinate streams from standard controls), §7.4/§27 (authorization),
 // §4 inv. 13 (unknown required semantics fail explicitly), §32.2, §32.5.
-//
 // This asserts what widgets *do*: which interaction each control originates, that a disabled
 // control originates nothing, that the renderer has no way to emit a coordinate stream at all,
-// and that node types outside the required tier are refused rather than approximated.
+// and that exactly the required node types construct. Standard node types outside the required
+// tier are refused rather than approximated.
 //
 // `ControlFactoryTests` remains the detailed per-widget construction and property coverage; the
 // manifest lists both files under suites 2 and 10. Nothing here re-derives the registry: tier
-// facts come from `standardNodeTypesTable`, which protocol/generate_swift_registry.py already
-// generates from registry.yaml.
 //
 
 import AppKit
@@ -56,7 +54,7 @@ struct WidgetSemanticsConformanceTests {
                     handle.nodeType == nodeType,
                     "required-tier '\(entry.name)' produced a handle for the wrong node type")
             } else {
-                #expect(throws: (any Error).self) {
+                #expect(throws: ControlFactoryError.unsupportedNodeType(nodeType)) {
                     _ = try factory.makeHandle(for: node)
                 }
             }

@@ -302,6 +302,14 @@ impl TerminalSubscription {
     }
 
     /// Waits until the ring advances past `cursor`, then drains.
+    ///
+    /// An **empty vector means the subscription producer has stopped and all retained bytes have
+    /// been drained**, not a spurious wake. The reader thread owns the only sender, so channel
+    /// closure is sticky after that thread exits -- whether because the PTY returned EOF, a
+    /// terminal read failed, or output could not be appended to the ring. `recv` does not
+    /// distinguish those causes. Callers must treat an empty result as terminal and stop polling:
+    /// every later call also returns empty immediately. A non-empty result always carries at
+    /// least one event.
     pub async fn recv(&mut self) -> Vec<TerminalEvent> {
         loop {
             let drained = self.try_drain();
@@ -603,6 +611,48 @@ mod tests {
         assert!(manager.live_stream_ids().is_empty());
     }
 
+    #[tokio::test]
+    async fn recv_drains_then_reports_end_of_stream_after_natural_eof() {
+        let manager = PTYManager::default();
+        let id = NodeId::new(24);
+        manager
+            .spawn(id, echo_spec("printf 'SRUI_EOF_OK'; exit 0", 4_096))
+            .unwrap();
+        let SubscribeOutcome {
+            mut subscription, ..
+        } = manager.subscribe(id, 0).unwrap();
+
+        let mut received = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = subscription.recv().await;
+                if events.is_empty() {
+                    // Channel closure, not a spurious wake: the reader has exited.
+                    return true;
+                }
+                for event in events {
+                    if let TerminalEvent::Data(data) = event {
+                        received.extend_from_slice(&data.data);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("recv must report end of stream after natural EOF");
+
+        assert!(ended);
+        assert!(
+            received
+                .windows(b"SRUI_EOF_OK".len())
+                .any(|window| window == b"SRUI_EOF_OK"),
+            "end of stream arrived before the retained bytes: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        // Terminal, and stays terminal: a caller that ignored the empty result would spin here.
+        assert!(subscription.recv().await.is_empty());
+        manager.shutdown();
+    }
+
     #[test]
     fn natural_exit_reaps_the_child() {
         let manager = PTYManager::default();
@@ -626,7 +676,6 @@ mod tests {
         manager.close(id).unwrap();
         assert!(reaped, "child {pid} was not reaped by natural exit");
     }
-
     fn is_child_reaped(pid: u32) -> bool {
         #[cfg(unix)]
         {
@@ -637,7 +686,11 @@ mod tests {
             }
             if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
                 if let Some(after) = stat.rsplit(')').next() {
-                    if let Some(state) = after.split_whitespace().next().and_then(|s| s.chars().next()) {
+                    if let Some(state) = after
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.chars().next())
+                    {
                         return state != 'Z';
                     }
                 }

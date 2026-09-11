@@ -350,6 +350,7 @@ fn test_protocol_envelope_carries_no_frame_or_cadence_concept() {
         client_instance_id: _,
         event_id: _,
         last_processed_event_seq: _,
+        settled_event_seq: _,
         status: _,
         revision_after_effect: _,
         reject_reason: _,

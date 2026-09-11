@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "fixture": "benchmarks/fixtures/coding-agent-ui.json",
+  "required_sections": ["31.1", "31.2", "31.3", "31.4", "31.5", "31.6"],
+  "drivers": [
+    {
+      "name": "rust",
+      "sections": ["31.2", "31.5", "31.6"],
+      "command": ["cargo", "run", "--quiet", "--release", "--locked", "--manifest-path", "server-rust/Cargo.toml", "-p", "srui-benchmark-driver", "--"]
+    },
+    {
+      "name": "macos",
+      "sections": ["31.1", "31.3", "31.4", "31.5", "31.6"],
+      "platform": "darwin",
+      "command": ["swift", "run", "--disable-automatic-resolution", "--package-path", "client-macos/Benchmarks", "-c", "release", "BenchmarkDriver"]
+    }
+  ],
+  "verification_commands": [
+    {
+      "name": "production reconnect boundary suite",
+      "section": "31.5",
+      "command": ["scripts/run-conformance", "--suite", "8", "--implementation", "both"],
+      "timeout": 1200,
+      "required_output": [
+        "8  reconnect",
+        "PASS    9 runner(s)",
+        "1 passed, 0 failed"
+      ]
+    }
+  ]
+}

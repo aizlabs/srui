@@ -66,7 +66,7 @@ type CommandSender = Arc<Mutex<Option<mpsc::Sender<StreamCommand>>>>;
 pub(crate) struct TerminalStream {
     pub id: NodeId,
     ring: Arc<Mutex<OutputRing>>,
-    next_offset_watch: watch::Sender<u64>,
+    next_offset_watch: watch::Receiver<u64>,
     command_tx: CommandSender,
     child: ChildSlot,
     child_pid: Arc<Mutex<Option<u32>>>,
@@ -137,7 +137,7 @@ impl TerminalStream {
 
         let child_pid = Arc::new(Mutex::new(child_pid));
         let ring = Arc::new(Mutex::new(OutputRing::new(spec.ring_capacity)));
-        let (next_offset_watch, _) = watch::channel(0_u64);
+        let (next_offset_watch_tx, next_offset_watch_rx) = watch::channel(0_u64);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         let command_tx = Arc::new(Mutex::new(Some(command_tx)));
         let child = Arc::new(Mutex::new(Some(child)));
@@ -145,7 +145,7 @@ impl TerminalStream {
         let stream = Arc::new(Self {
             id,
             ring: Arc::clone(&ring),
-            next_offset_watch: next_offset_watch.clone(),
+            next_offset_watch: next_offset_watch_rx,
             command_tx: Arc::clone(&command_tx),
             child: Arc::clone(&child),
             child_pid: Arc::clone(&child_pid),
@@ -154,7 +154,10 @@ impl TerminalStream {
         });
 
         let reader_ring = Arc::clone(&ring);
-        let reader_watch = next_offset_watch;
+        // The reader owns the only sender. Whenever it exits -- after PTY EOF, a terminal read
+        // error, or a ring-append error -- every subscription observes channel closure after
+        // draining the bytes successfully retained before that failure.
+        let reader_watch = next_offset_watch_tx;
         let reader_child = Arc::clone(&child);
         let reader_child_pid = Arc::clone(&child_pid);
         let reader = thread::Builder::new()
@@ -266,7 +269,7 @@ impl TerminalStream {
         let subscription = crate::manager::TerminalSubscription {
             stream_id: self.id,
             ring: Arc::clone(&self.ring),
-            watch: self.next_offset_watch.subscribe(),
+            watch: self.next_offset_watch.clone(),
             cursor,
         };
         (snapshot, subscription)
@@ -364,8 +367,8 @@ fn read_loop(
         let _ = child.wait();
         *child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    // Natural exit: close the command worker so it does not sit on blocking_recv
-    // for the rest of the session.
+    // Any reader termination closes the command worker so it does not sit on blocking_recv for
+    // the rest of the session.
     drop(command_tx.lock().unwrap_or_else(|e| e.into_inner()).take());
 }
 

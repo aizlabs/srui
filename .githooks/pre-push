@@ -32,13 +32,18 @@ run() {
 
 # --- Registry Validation (CI: job `registry`) --------------------------------
 run "registry: validate_registry.py" uv run python protocol/validate_registry.py
-run "registry: pytest" uv run pytest protocol/tests -q
+run "python: protocol pytest" uv run --frozen pytest -q protocol/tests
+run "benchmarks: generated metric contract" \
+	uv run --frozen python benchmarks/generate_metric_contract.py --check
+run "benchmarks: Python harness" uv run --frozen pytest -q benchmarks/tests
 
 # --- Rust Build (CI: job `rust`) ---------------------------------------------
 # `--all-targets` compiles tests, benches and examples, so CI's separate `cargo check` adds
 # nothing beyond what these two already build.
-run "rust: cargo test" cargo test --manifest-path server-rust/Cargo.toml --workspace --all-targets
-run "rust: cargo clippy" cargo clippy --manifest-path server-rust/Cargo.toml --workspace --all-targets -- -D warnings
+run "rust: cargo test" cargo test --manifest-path server-rust/Cargo.toml --all-targets
+run "rust: cargo clippy" cargo clippy --manifest-path server-rust/Cargo.toml --all-targets -- -D warnings
+run "benchmarks: Rust driver tests" \
+	cargo test --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver
 run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
 run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
 
@@ -85,6 +90,8 @@ if [ "$(uname -s)" = Darwin ]; then
 	run "swift: build server binaries" cargo build --manifest-path server-rust/Cargo.toml
 	run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
 	run "swift: swift test" swift test --package-path client-macos
+	run "benchmarks: isolated Swift driver tests" \
+		swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release
 
 	# --- Generated-file freshness (CI: job `swift`, final step) -------------------
 	# The committed protobuf, registry, and scheduling bindings are generated output; CI fails on

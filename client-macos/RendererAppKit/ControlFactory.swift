@@ -8,6 +8,7 @@ public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
 }
 
+
 /// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
 @MainActor
 public final class ActionTrampoline: NSObject {
@@ -39,6 +40,7 @@ public final class ActionTrampoline: NSObject {
 /// Creates native controls for the required §7.3 tier and applies scalar properties in place.
 @MainActor
 public final class ControlFactory {
+
     /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
 
@@ -217,7 +219,7 @@ public final class ControlFactory {
             result = (scrollView, nil, nil, nil)
 
         case .button:
-            let button = NSButton(title: "Button", target: nil, action: nil)
+            let button = HoverFeedbackButton(title: "Button", target: nil, action: nil)
             button.bezelStyle = .rounded
             let trampoline = ActionTrampoline(nodeID: node.id) { [weak self] interaction in
                 self?.onInteraction?(interaction)

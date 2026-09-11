@@ -116,12 +116,12 @@ def test_failing_runner_is_reported_without_fail_fast(manifest_backup) -> None:
     suites[0]["rust"] = [FALSE]
     suites[11]["swift"] = [FALSE]
     write_manifest(suites)
-
     result = run()
     assert result.returncode == 1
-    # Both failures reported: one failing suite must not hide another.
+    # Both failures reported: one failing suite must not hide another, and each
+    # row preserves how many production runners executed for benchmark accounting.
     assert result.stdout.count("FAIL") >= 2
-
+    assert result.stdout.count("2 runner(s); failed:") >= 2
 
 def test_runner_that_executes_no_tests_is_a_failure(manifest_backup) -> None:
     """A filter matching nothing exits 0, so a renamed test would silently turn a suite green."""

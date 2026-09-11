@@ -452,6 +452,9 @@ impl Session {
                 reason: String,
                 last_processed_event_seq: u64,
                 discarded_text_edits: Vec<srui_protocol::PendingTextEditRef>,
+                required_profiles: Vec<String>,
+                optional_profiles: Vec<String>,
+                extension_namespaces: Vec<srui_protocol::ExtensionNamespaceMapping>,
                 pending_text_edit_cancellation:
                     Option<super::text_edit::PendingTextEditCancellation>,
             },
@@ -503,6 +506,9 @@ impl Session {
                         session_id: inner_guard.session_id.clone(),
                         replay_from_revision: resume.last_applied_revision,
                         last_processed_event_seq,
+                        required_profiles: inner_guard.capabilities.required.to_string_vec(),
+                        optional_profiles: inner_guard.capabilities.optional.to_string_vec(),
+                        extension_namespaces: inner_guard.extension_namespaces.clone(),
                     },
                     replayed: iter.cloned().collect(),
                 };
@@ -581,6 +587,9 @@ impl Session {
                 reason: cause.reason().to_string(),
                 last_processed_event_seq,
                 discarded_text_edits,
+                required_profiles: inner_guard.capabilities.required.to_string_vec(),
+                optional_profiles: inner_guard.capabilities.optional.to_string_vec(),
+                extension_namespaces: inner_guard.extension_namespaces.clone(),
                 pending_text_edit_cancellation,
             };
             break (inner_guard, plan);
@@ -686,6 +695,9 @@ impl Session {
                 reason,
                 last_processed_event_seq,
                 discarded_text_edits,
+                required_profiles,
+                optional_profiles,
+                extension_namespaces,
                 pending_text_edit_cancellation: _,
             } => ResumeOutcome::Resync {
                 resync_msg: ServerResyncRequired {
@@ -695,6 +707,9 @@ impl Session {
                     continuity: continuity as i32,
                     last_processed_event_seq,
                     discarded_text_edits,
+                    required_profiles,
+                    optional_profiles,
+                    extension_namespaces,
                 },
                 snapshot_transaction,
             },

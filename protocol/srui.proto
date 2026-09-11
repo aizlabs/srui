@@ -578,6 +578,11 @@ message ServerResumeOk {
   uint64 replay_from_revision = 2;
   // Highest contiguous settled event sequence for this client in this session.
   uint64 last_processed_event_seq = 3;
+  // Re-advertised so a fresh client process can validate the session's required semantics
+  // and restore session-assigned TypeRefs before applying replay (§15, §18).
+  repeated string required_profiles = 4;
+  repeated string optional_profiles = 5;
+  repeated ExtensionNamespaceMapping extension_namespaces = 6;
 }
 
 message ServerResyncRequired {
@@ -590,6 +595,10 @@ message ServerResyncRequired {
   // Confirmed discarded TEXT_EDIT identities for a same-session forced resync (§18.3).
   // MUST echo the client's declared pending_text_edits; a mismatch fails closed.
   repeated PendingTextEditRef discarded_text_edits = 6;
+  // Re-advertised before the replacement snapshot for cold-process resume (§15, §18).
+  repeated string required_profiles = 7;
+  repeated string optional_profiles = 8;
+  repeated ExtensionNamespaceMapping extension_namespaces = 9;
 }
 
 // -----------------------------------------------------------------------------

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use srui_protocol::{
-    srui_message, ClientHello, ClientResume, TerminalInput, TerminalResize, TERMINAL_LOCAL_TYPE_ID,
-    TERMINAL_PROFILE_URI,
+    srui_message, ClientHello, ClientResume, SessionContinuity, TerminalInput, TerminalResize,
+    TERMINAL_LOCAL_TYPE_ID, TERMINAL_PROFILE_URI,
 };
 use srui_sdk::*;
 use srui_sessiond::{handle_connection, Session, SessionError, TerminalSpec};
@@ -135,6 +135,24 @@ fn terminal_profiles() -> Vec<String> {
         "org.srui.standard-widgets/1".to_string(),
         "org.srui.terminal/1".to_string(),
     ]
+}
+
+fn assert_terminal_negotiation_readvertised(
+    required_profiles: &[String],
+    optional_profiles: &[String],
+    extension_namespaces: &[srui_protocol::ExtensionNamespaceMapping],
+) {
+    assert!(required_profiles
+        .iter()
+        .any(|profile| profile == TERMINAL_PROFILE_URI));
+    assert!(optional_profiles
+        .iter()
+        .any(|profile| profile == "org.srui.richtext/1"));
+    let terminal_mapping = extension_namespaces
+        .iter()
+        .find(|mapping| mapping.extension_uri == TERMINAL_PROFILE_URI)
+        .expect("resume response must re-advertise the terminal namespace");
+    assert_ne!(terminal_mapping.namespace_id, 0);
 }
 
 #[tokio::test]
@@ -267,7 +285,7 @@ async fn resize_reaches_tiocswinsz() {
 }
 
 #[tokio::test]
-async fn reconnect_within_retention_replays_without_duplicate_gap() {
+async fn cold_revision_zero_resume_readvertises_terminal_negotiation_before_replay() {
     let (session, _, term) = terminal_session();
     session
         .pty()
@@ -283,7 +301,7 @@ async fn reconnect_within_retention_replays_without_duplicate_gap() {
         Some(ClientResume {
             session_id: "terminal-session".to_string(),
             client_instance_id: CLIENT.to_vec(),
-            last_applied_revision: 1,
+            last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: HashMap::from([(term.get(), 0)]),
             limits: None,
@@ -294,7 +312,14 @@ async fn reconnect_within_retention_replays_without_duplicate_gap() {
     .await;
     let first = recv(&mut read).await;
     match first.msg {
-        Some(srui_message::Msg::ServerResumeOk(_)) => {}
+        Some(srui_message::Msg::ServerResumeOk(resume_ok)) => {
+            assert_eq!(resume_ok.replay_from_revision, 0);
+            assert_terminal_negotiation_readvertised(
+                &resume_ok.required_profiles,
+                &resume_ok.optional_profiles,
+                &resume_ok.extension_namespaces,
+            );
+        }
         other => panic!("expected resume ok, got {other:?}"),
     }
     let mut replayed = Vec::new();
@@ -706,7 +731,18 @@ async fn semantic_journal_gap_still_replays_retained_terminal() {
             continue;
         };
         match msg.msg {
-            Some(srui_message::Msg::ServerResyncRequired(_)) => saw_semantic_resync = true,
+            Some(srui_message::Msg::ServerResyncRequired(resync)) => {
+                assert_eq!(
+                    SessionContinuity::try_from(resync.continuity),
+                    Ok(SessionContinuity::SameSession)
+                );
+                assert_terminal_negotiation_readvertised(
+                    &resync.required_profiles,
+                    &resync.optional_profiles,
+                    &resync.extension_namespaces,
+                );
+                saw_semantic_resync = true;
+            }
             Some(srui_message::Msg::TerminalData(data)) => replayed.extend_from_slice(&data.data),
             _ => {}
         }

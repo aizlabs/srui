@@ -10,7 +10,7 @@ use srui_sdk::{Button, Surface, ACTIVATE};
 use srui_semantic_tree::{Event as DomainEvent, NodeId};
 use srui_sessiond::{
     EventOutcome, LogicalChannelClass, OutboundItem, OutboundReceiver, ResumeOutcome, Session,
-    SessionConfig,
+    SessionConfig, CORE_VERSION,
 };
 use std::collections::BTreeMap;
 use std::sync::{
@@ -42,6 +42,8 @@ fn empty_wire_transaction(base_revision: u64) -> srui_protocol::Transaction {
 
 fn resume_request(session: &Session, client: &[u8], revision: u64) -> ClientResume {
     ClientResume {
+        core_version: CORE_VERSION.to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: session.session_id(),
         client_instance_id: client.to_vec(),
         last_applied_revision: revision,

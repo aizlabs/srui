@@ -208,6 +208,8 @@ async fn event_fresh_handshake(
 
 fn resume_request(fixture: &EventFixture, last_applied_revision: u64) -> ClientResume {
     ClientResume {
+        core_version: CORE_VERSION.to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: fixture.session.session_id(),
         client_instance_id: fixture.client_instance_id.clone(),
         last_applied_revision,
@@ -375,6 +377,8 @@ pub(crate) async fn wire_partial_transaction_reconnect(
     let mut resumed = WireConnection::open(Arc::clone(&session));
     resumed
         .resume(ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: session.session_id(),
             client_instance_id,
             last_applied_revision: 0,

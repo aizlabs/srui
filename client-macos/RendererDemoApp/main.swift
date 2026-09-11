@@ -17,6 +17,10 @@ import TransportSSH
 struct RendererDemoApp {
     @MainActor
     static func main() {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.regular)
+        SRUIApplicationMenu.install(on: application)
+
         let args = CommandLine.arguments
 
         if let sshIndex = args.firstIndex(of: "--ssh"), sshIndex + 1 < args.count {
@@ -80,7 +84,6 @@ struct RendererDemoApp {
     @MainActor
     private static func runConnectionManager() -> Never {
         let application = NSApplication.shared
-        application.setActivationPolicy(.regular)
 
         let manager = ConnectionManager()
         let delegate = ConnectionManagerApplicationDelegate(manager: manager)
@@ -96,7 +99,6 @@ struct RendererDemoApp {
     private static func runLiveSession(transport: any Transport) -> Never {
         RendererDiagnostics.log("Launching SRUI Client with live transport...")
         let application = NSApplication.shared
-        application.setActivationPolicy(.regular)
 
         let renderer = AppKitRenderer()
         let applier = TransactionApplier()

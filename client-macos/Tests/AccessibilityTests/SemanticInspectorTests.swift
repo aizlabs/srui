@@ -33,6 +33,7 @@ struct SemanticInspectorTests {
         #expect(button.parentID == NodeId(2))
         #expect(button.index == 1)
         #expect(button.depth == 3)
+        #expect(button.state.visibility == .visibilityVisible)
         #expect(button.state.enabled)
         #expect(button.state.readOnly)
         #expect(button.state.busy)

@@ -394,7 +394,7 @@ public struct SemanticInspector: Sendable {
 
             let properties = node.properties
             let state = SemanticNodeState(
-                visibility: properties[.visibility]?.asEnumToken,
+                visibility: properties[.visibility]?.asEnumToken ?? .visibilityVisible,
                 enabled: properties[.enabled]?.asBool ?? true,
                 readOnly: properties[.readOnly]?.asBool ?? false,
                 busy: properties[.busy]?.asBool ?? false,

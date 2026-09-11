@@ -1241,6 +1241,34 @@ public actor EventOutbox {
         }
         return body()
     }
+
+    /// Runs a synchronous MainActor lifecycle mutation only for the exact active incarnation.
+    ///
+    /// The nonisolated fence closes the actor-to-MainActor reentrancy window: a newer binding
+    /// invalidates the incarnation before its actor work can proceed, and waits for any already
+    /// authorized native mutation to finish.
+    func performNativeLifecycleIfActive<Value: Sendable>(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation,
+        _ handler: @escaping @MainActor @Sendable () -> Value
+    ) async -> Value? {
+        guard activeConnectionBinding == binding,
+              activeSessionIncarnation == sessionIncarnation else {
+            return nil
+        }
+        if let nativeTextLifecycleWillHopForTesting {
+            await nativeTextLifecycleWillHopForTesting()
+        }
+        guard activeConnectionBinding == binding,
+              activeSessionIncarnation == sessionIncarnation else {
+            return nil
+        }
+        return await textLifecycleFence.performIfActive(
+            sessionIncarnation: sessionIncarnation,
+            handler: handler
+        )
+    }
+
     /// Acquires exclusive ownership for one controller/transport attempt before its handshake.
     ///
     /// Acquiring a newer binding immediately suspends allocation and supersedes every older
@@ -1248,6 +1276,23 @@ public actor EventOutbox {
     /// `confirmFreshSession(id:binding:)` after a fresh WELCOME snapshot is committed; resume
     /// handshakes use the resume lifecycle APIs. Every send must carry the returned opaque binding.
     public func beginConnectionBinding() async -> EventOutboxConnectionBinding {
+        await beginConnectionBinding(onActivated: { _ in })
+    }
+
+    /// Cancellation-aware acquisition for connection orchestrators.
+    ///
+    /// The check executes on the outbox actor immediately before ownership changes, so a canceled
+    /// task that was queued behind a newer click cannot wake later and steal its binding.
+    func beginConnectionBindingUnlessCancelled(
+        onActivated: @Sendable (EventOutboxConnectionBinding) -> Void
+    ) async throws -> EventOutboxConnectionBinding {
+        try Task.checkCancellation()
+        return await beginConnectionBinding(onActivated: onActivated)
+    }
+
+    private func beginConnectionBinding(
+        onActivated: @Sendable (EventOutboxConnectionBinding) -> Void
+    ) async -> EventOutboxConnectionBinding {
         let binding = EventOutboxConnectionBinding(
             epoch: EventOutboxConnectionBindingEpochAllocator.shared.next()
         )
@@ -1262,6 +1307,7 @@ public actor EventOutbox {
         textLifecycleFence.beginActivation(sessionIncarnation)
         activeConnectionBinding = binding
         activeSessionIncarnation = sessionIncarnation
+        onActivated(binding)
         activeResumeGeneration = nil
         pendingResumeFinalizationGeneration = nil
         acceptsNewEvents = false

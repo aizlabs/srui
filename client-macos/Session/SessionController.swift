@@ -108,6 +108,94 @@ public enum SessionLifecycleEvent: Sendable {
     case stopped
 }
 
+private struct SessionNegotiationContinuitySnapshot: Sendable {
+    var capabilities: CapabilitySet?
+    var terminalTypeRef: TypeRef?
+}
+
+/// Per-saved-connection state that must survive replacement SessionController instances.
+///
+/// ConnectionManager owns one context per entry. Negotiation metadata lets a recreated controller
+/// resume extension sessions, while the binding fence prevents an older controller from mutating
+/// a renderer after a newer transport attempt has taken ownership.
+public final class SessionContinuityContext: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeBinding: EventOutboxConnectionBinding?
+    private var retainedCapabilities: CapabilitySet?
+    private var negotiatedTerminalTypeRef: TypeRef?
+
+    public init() {}
+
+    fileprivate func negotiationSnapshot() -> SessionNegotiationContinuitySnapshot {
+        withLock {
+            SessionNegotiationContinuitySnapshot(
+                capabilities: retainedCapabilities,
+                terminalTypeRef: negotiatedTerminalTypeRef
+            )
+        }
+    }
+
+    fileprivate func activate(binding: EventOutboxConnectionBinding) {
+        withLock {
+            activeBinding = binding
+        }
+    }
+
+    fileprivate func retire(binding: EventOutboxConnectionBinding) {
+        withLock {
+            guard activeBinding == binding else { return }
+            activeBinding = nil
+        }
+    }
+
+    @discardableResult
+    fileprivate func updateNegotiationIfActive(
+        binding: EventOutboxConnectionBinding,
+        capabilities: CapabilitySet?,
+        terminalTypeRef: TypeRef?
+    ) -> Bool {
+        withLock {
+            guard activeBinding == binding else { return false }
+            retainedCapabilities = capabilities
+            negotiatedTerminalTypeRef = terminalTypeRef
+            return true
+        }
+    }
+
+    @MainActor
+    fileprivate func performIfActive<Value: Sendable>(
+        binding: EventOutboxConnectionBinding,
+        _ body: @MainActor @Sendable () -> Value
+    ) -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeBinding == binding else { return nil }
+        return body()
+    }
+
+    @MainActor
+    fileprivate func publishNegotiationIfActive(
+        binding: EventOutboxConnectionBinding,
+        capabilities: CapabilitySet,
+        terminalTypeRef: TypeRef?,
+        rendererMutation: @MainActor @Sendable () throws -> Void
+    ) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeBinding == binding else { return false }
+        try rendererMutation()
+        retainedCapabilities = capabilities
+        negotiatedTerminalTypeRef = terminalTypeRef
+        return true
+    }
+
+    private func withLock<Value>(_ body: () -> Value) -> Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+}
+
 /// Core protocol version this build speaks (§15).
 public let SRUICoreVersion = "0.5.0"
 
@@ -164,8 +252,10 @@ private struct SessionFailureTeardownState: Sendable {
     var handler: @Sendable (SessionFailure) -> Void
     var replayGeneration: UInt64?
     var connectionBinding: EventOutboxConnectionBinding?
+    var sessionIncarnation: EventOutboxSessionIncarnation?
     var lifecycleGeneration: UInt64
     var transactionTasks: [Task<Void, Never>]
+    var discardsNegotiationContinuity: Bool
 }
 
 private actor ReceiveLoopStartGate {
@@ -248,6 +338,7 @@ public final class SessionController: @unchecked Sendable {
     public let lifecycleEvents: AsyncStream<SessionLifecycleEvent>
 
     private let lifecycleEventContinuation: AsyncStream<SessionLifecycleEvent>.Continuation
+    private let continuityContext: SessionContinuityContext
     private let lock = NSLock()
     private let transactionIngressGate: TransactionIngressGate
     /// Ordered data-plane work runs separately from control-message dispatch. The transport's
@@ -365,6 +456,11 @@ public final class SessionController: @unchecked Sendable {
         get { withStateLock { _stopWillRetireMountForTesting } }
         set { withStateLock { _stopWillRetireMountForTesting = newValue } }
     }
+    private var _nativeDisconnectMutationForTesting: (@MainActor @Sendable () -> Void)?
+    var nativeDisconnectMutationForTesting: (@MainActor @Sendable () -> Void)? {
+        get { withStateLock { _nativeDisconnectMutationForTesting } }
+        set { withStateLock { _nativeDisconnectMutationForTesting = newValue } }
+    }
     private var _resourceReferencesSynchronizedInterceptorForTesting:
         (@Sendable () async -> Void)?
     var resourceReferencesSynchronizedInterceptorForTesting: (@Sendable () async -> Void)? {
@@ -408,6 +504,7 @@ public final class SessionController: @unchecked Sendable {
         sessionId: String? = nil,
         clientCapabilities: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1],
         requiredServerProfiles: CapabilitySet = [],
+        continuityContext: SessionContinuityContext = SessionContinuityContext(),
         transactionRateLimits: TransactionRateLimits = .standard,
         /// Inject a shared gate across reconnecting controller instances so §26's update-rate
         /// budget stays scoped to the *session*; the default constructs a fresh budget, which is
@@ -416,12 +513,14 @@ public final class SessionController: @unchecked Sendable {
         /// (§26, §18).
         transactionIngressGate: TransactionIngressGate? = nil
     ) {
+        let retainedNegotiation = continuityContext.negotiationSnapshot()
         let lifecycleEventPipe = AsyncStream.makeStream(
             of: SessionLifecycleEvent.self,
             bufferingPolicy: .bufferingNewest(16)
         )
         self.lifecycleEvents = lifecycleEventPipe.stream
         self.lifecycleEventContinuation = lifecycleEventPipe.continuation
+        self.continuityContext = continuityContext
         self.transport = transport
         self.applier = applier
         self.outbox = outbox
@@ -431,6 +530,8 @@ public final class SessionController: @unchecked Sendable {
         self.currentSessionId = sessionId
         self.clientCapabilities = clientCapabilities
         self.requiredServerProfiles = requiredServerProfiles
+        self.retainedCapabilities = retainedNegotiation.capabilities
+        self.negotiatedTerminalTypeRef = retainedNegotiation.terminalTypeRef
         self.transactionIngressGate = transactionIngressGate
             ?? TransactionIngressGate(limits: transactionRateLimits)
     }
@@ -1348,14 +1449,29 @@ public final class SessionController: @unchecked Sendable {
         // `adoptFreshSessionIngressBudget()`: §26's update rate is bounded per session, and
         // resetting per connection would let a server replay a full burst after every disconnect.
         var activatedResourceOwnerEpoch: UInt64?
+        var acquiredConnectionBinding: EventOutboxConnectionBinding?
 
         startRangeRequestPump()
 
         do {
-            let connectionBinding = await outbox.beginConnectionBinding()
-            guard ownsRunningLifecycle(lifecycleGeneration) else {
+            let connectionBinding = try await outbox.beginConnectionBindingUnlessCancelled {
+                [continuityContext] binding in
+                continuityContext.activate(binding: binding)
+            }
+            acquiredConnectionBinding = connectionBinding
+            let retainedBinding = withStateLock { () -> Bool in
+                guard self.lifecycleGeneration == lifecycleGeneration,
+                      isRunning,
+                      !isStopping else {
+                    return false
+                }
+                outboxConnectionBinding = connectionBinding
+                return true
+            }
+            guard retainedBinding else {
                 throw SessionFailure.superseded("start lost lifecycle ownership during binding")
             }
+            try Task.checkCancellation()
             let currentResourceReferences = await currentLiveResourceReferences()
             guard await resourceCache.activateReferenceOwner(
                 epoch: connectionBinding.resourceOwnershipEpoch,
@@ -1597,6 +1713,9 @@ public final class SessionController: @unchecked Sendable {
                 _ = await resourceCache.deactivateReferenceOwner(
                     epoch: activatedResourceOwnerEpoch
                 )
+            }
+            if let acquiredConnectionBinding {
+                continuityContext.retire(binding: acquiredConnectionBinding)
             }
             throw error
         }
@@ -2432,7 +2551,8 @@ public final class SessionController: @unchecked Sendable {
             try await applyExtensionNamespaces(
                 welcome.extensionNamespaces,
                 negotiated: negotiated,
-                terminalRequired: serverRequired.contains(.terminalV1)
+                terminalRequired: serverRequired.contains(.terminalV1),
+                binding: connectionBinding
             )
         } catch {
             await reportFailure(.protocolViolation("\(error)"))
@@ -2475,15 +2595,25 @@ public final class SessionController: @unchecked Sendable {
             }
             return adopted ? binding : nil
         }
-        let binding = await outbox.beginConnectionBinding()
+        let binding: EventOutboxConnectionBinding
+        do {
+            binding = try await outbox.beginConnectionBindingUnlessCancelled {
+                [continuityContext] binding in
+                continuityContext.activate(binding: binding)
+            }
+        } catch {
+            return nil
+        }
         let currentResourceReferences = await currentLiveResourceReferences()
         guard await resourceCache.activateReferenceOwner(
             epoch: binding.resourceOwnershipEpoch,
             liveReferences: currentResourceReferences
         ) else {
+            continuityContext.retire(binding: binding)
             return nil
         }
         guard let sessionIncarnation = await outbox.sessionIncarnation(binding: binding) else {
+            continuityContext.retire(binding: binding)
             return nil
         }
         withStateLock {
@@ -2891,7 +3021,16 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
-                adoptReplacementCapabilities(replacementCapabilities)
+                guard adoptReplacementCapabilities(
+                    replacementCapabilities,
+                    binding: connectionBinding
+                ) else {
+                    await failRefusedResumeDecision(
+                        generation,
+                        "replacement resync lost negotiation continuity ownership"
+                    )
+                    return
+                }
                 await adoptFreshSessionIngressBudget()
                 // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
                 if let renderer {
@@ -3003,7 +3142,15 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                adoptReplacementCapabilities(replacementCapabilities)
+                guard adoptReplacementCapabilities(
+                    replacementCapabilities,
+                    binding: connectionBinding
+                ) else {
+                    await reportFailure(.superseded(
+                        "live replacement resync lost negotiation continuity ownership"
+                    ))
+                    return
+                }
                 await adoptFreshSessionIngressBudget()
                 if let renderer {
                     await renderer.terminalSession.resetForReplacementSession()
@@ -3070,11 +3217,23 @@ public final class SessionController: @unchecked Sendable {
         return baseCapabilities
     }
 
-    private func adoptReplacementCapabilities(_ capabilities: CapabilitySet) {
+    @discardableResult
+    private func adoptReplacementCapabilities(
+        _ capabilities: CapabilitySet,
+        binding: EventOutboxConnectionBinding
+    ) -> Bool {
+        guard continuityContext.updateNegotiationIfActive(
+            binding: binding,
+            capabilities: capabilities,
+            terminalTypeRef: nil
+        ) else {
+            return false
+        }
         withStateLock {
             retainedCapabilities = capabilities
             negotiatedTerminalTypeRef = nil
         }
+        return true
     }
 
     /// Drops replica state that the fresh CLIENT_HELLO replacing an abandoned session cannot repair.
@@ -3109,11 +3268,19 @@ public final class SessionController: @unchecked Sendable {
 
     /// Invalidates resume identity when only a fresh WELCOME can restore required semantics.
     private func requireFreshHelloOnReconnect() {
-        withStateLock {
+        let binding = withStateLock { () -> EventOutboxConnectionBinding? in
             currentSessionId = nil
             requestedSessionId = nil
             retainedCapabilities = nil
             negotiatedTerminalTypeRef = nil
+            return outboxConnectionBinding
+        }
+        if let binding {
+            _ = continuityContext.updateNegotiationIfActive(
+                binding: binding,
+                capabilities: nil,
+                terminalTypeRef: nil
+            )
         }
     }
 
@@ -3131,7 +3298,8 @@ public final class SessionController: @unchecked Sendable {
     private func applyExtensionNamespaces(
         _ mappings: [Srui_Protocol_ExtensionNamespaceMapping],
         negotiated: CapabilitySet,
-        terminalRequired: Bool
+        terminalRequired: Bool,
+        binding: EventOutboxConnectionBinding
     ) async throws {
         var seenIDs = Set<UInt32>()
         var seenURIs = Set<String>()
@@ -3161,16 +3329,26 @@ public final class SessionController: @unchecked Sendable {
         let resolvedType = negotiated.contains(.terminalV1)
             ? mapping.map { terminalTypeRef(namespaceID: $0.namespaceID) }
             : nil
-        withStateLock {
-            negotiatedTerminalTypeRef = resolvedType
-        }
-        if let renderer {
-            try await MainActor.run {
+        let published = try await continuityContext.publishNegotiationIfActive(
+            binding: binding,
+            capabilities: negotiated,
+            terminalTypeRef: resolvedType
+        ) {
+            if let renderer {
                 renderer.resetExtensionRegistry()
                 if let resolvedType {
                     try renderer.registerTerminalType(resolvedType)
                 }
             }
+        }
+        guard published else {
+            throw SessionFailure.superseded(
+                "extension namespace registration lost connection ownership"
+            )
+        }
+        withStateLock {
+            retainedCapabilities = negotiated
+            negotiatedTerminalTypeRef = resolvedType
         }
     }
 
@@ -4133,7 +4311,8 @@ public final class SessionController: @unchecked Sendable {
             // at all (§11.1, §15). Keeping the session id would make every reconnect re-send the
             // same doomed resume, so the next connect must renegotiate from CLIENT_HELLO. A
             // transport flap mid-resume costs one snapshot; the alternative is an unbreakable loop.
-            if resumeGeneration != nil {
+            let discardsNegotiationContinuity = resumeGeneration != nil
+            if discardsNegotiationContinuity {
                 currentSessionId = nil
                 requestedSessionId = nil
                 retainedCapabilities = nil
@@ -4143,14 +4322,23 @@ public final class SessionController: @unchecked Sendable {
                 handler: _onFailure ?? { _ in },
                 replayGeneration: replayGeneration,
                 connectionBinding: outboxConnectionBinding,
+                sessionIncarnation: outboxSessionIncarnation,
                 lifecycleGeneration: lifecycleGeneration,
-                transactionTasks: transactionTasks
+                transactionTasks: transactionTasks,
+                discardsNegotiationContinuity: discardsNegotiationContinuity
             )
         }
     }
 
     private func reportFailure(_ failure: SessionFailure) async {
         guard let state = markFailure(failure) else { return }
+        if state.discardsNegotiationContinuity, let binding = state.connectionBinding {
+            _ = continuityContext.updateNegotiationIfActive(
+                binding: binding,
+                capabilities: nil,
+                terminalTypeRef: nil
+            )
+        }
         await finishFailureReport(failure, state: state)
     }
 
@@ -4162,7 +4350,8 @@ public final class SessionController: @unchecked Sendable {
             task.cancel()
         }
         await retainNativeTextBeforeDisconnect(
-            binding: state.connectionBinding
+            binding: state.connectionBinding,
+            sessionIncarnation: state.sessionIncarnation
         )
         guard ownsRunningLifecycle(state.lifecycleGeneration) else { return }
         if let replayGeneration = state.replayGeneration {
@@ -4301,17 +4490,28 @@ public final class SessionController: @unchecked Sendable {
     /// Suspends allocation, then leaves every flushed edit in TextEditingSession for same-session
     /// resume. Assigned envelopes remain in EventOutbox; a forced resync clears native drafts.
     private func retainNativeTextBeforeDisconnect(
-        binding: EventOutboxConnectionBinding?
+        binding: EventOutboxConnectionBinding?,
+        sessionIncarnation: EventOutboxSessionIncarnation?
     ) async {
-        guard let binding,
+        guard let binding, let sessionIncarnation,
               await outbox.suspendForTeardown(binding: binding) else {
             return
         }
         withStateLock { isFlushingTextForDisconnect = true }
-        await MainActor.run {
-            self.renderer?.textEditingSession.flushAllPending()
-            self.withStateLock { self.isFlushingTextForDisconnect = false }
-            self.advanceInteractionIncarnation()
+        let retained = await outbox.performNativeLifecycleIfActive(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) { () -> Bool in
+            self.continuityContext.performIfActive(binding: binding) {
+                self.renderer?.textEditingSession.flushAllPending()
+                self.withStateLock { self.isFlushingTextForDisconnect = false }
+                self.advanceInteractionIncarnation()
+                self.nativeDisconnectMutationForTesting?()
+                return true
+            } ?? false
+        }
+        if retained != true {
+            withStateLock { isFlushingTextForDisconnect = false }
         }
     }
 
@@ -4374,14 +4574,27 @@ public final class SessionController: @unchecked Sendable {
         guard stoppedState.shouldStop else { return }
         stoppedState.handshakeSendTask?.cancel()
         await retainNativeTextBeforeDisconnect(
-            binding: stoppedState.connectionBinding
+            binding: stoppedState.connectionBinding,
+            sessionIncarnation: stoppedState.sessionIncarnation
         )
         await terminalPump.disconnect()
         stopRangeRequestPump()
         await MainActor.run {
             self.interactionDispatchTail?.cancel()
             self.interactionDispatchTail = nil
-            self.renderer?.clearCollectionRangeTrackers()
+        }
+        if let binding = stoppedState.connectionBinding,
+           let sessionIncarnation = stoppedState.sessionIncarnation {
+            _ = await outbox.performNativeLifecycleIfActive(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            ) { () -> Bool in
+                self.continuityContext.performIfActive(binding: binding) {
+                    self.renderer?.clearCollectionRangeTrackers()
+                    self.nativeDisconnectMutationForTesting?()
+                    return true
+                } ?? false
+            }
         }
 
         // Restart stays inadmissible until this close and receive drain complete, so the old
@@ -4446,6 +4659,7 @@ public final class SessionController: @unchecked Sendable {
             _ = await resourceCache.deactivateReferenceOwner(
                 epoch: connectionBinding.resourceOwnershipEpoch
             )
+            continuityContext.retire(binding: connectionBinding)
         }
         _ = clearSessionStateAfterStop(
             generation: stoppedState.lifecycleGeneration

@@ -7,9 +7,11 @@
 
 import Foundation
 import Protocol
+import RendererAppKit
 import SemanticModel
 @testable import Session
 import Testing
+import Terminal
 import TransportSSH
 
 private final class LifecycleEventTransport: @unchecked Sendable, Transport {
@@ -24,7 +26,7 @@ private final class LifecycleEventTransport: @unchecked Sendable, Transport {
     private let sendGate: AsyncGate?
     private let closeGate: AsyncGate?
     private var inbound = LifecycleEventTransport.makeInbound()
-    private var sentFrameCount = 0
+    private var sentFrames: [Data] = []
     private var closeCount = 0
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -38,10 +40,11 @@ private final class LifecycleEventTransport: @unchecked Sendable, Transport {
         self.closeGate = closeGate
     }
 
-    func send(data _: Data, logicalClass _: LogicalChannelClass) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         let sendIndex = withLock { () -> Int in
-            defer { sentFrameCount += 1 }
-            return sentFrameCount
+            let sendIndex = sentFrames.count
+            sentFrames.append(data)
+            return sendIndex
         }
         if sendIndex == gatedSendIndex, let sendGate {
             await sendGate.pause()
@@ -76,6 +79,13 @@ private final class LifecycleEventTransport: @unchecked Sendable, Transport {
         continuation.finish()
     }
 
+    func sentFrame(at index: Int) -> Data? {
+        withLock {
+            guard sentFrames.indices.contains(index) else { return nil }
+            return sentFrames[index]
+        }
+    }
+
     func waitUntilClosed() async {
         await withCheckedContinuation { continuation in
             lock.lock()
@@ -102,6 +112,23 @@ private final class LifecycleEventTransport: @unchecked Sendable, Transport {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+}
+
+private final class LifecycleMutationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func increment() {
+        lock.lock()
+        storedValue += 1
+        lock.unlock()
     }
 }
 
@@ -469,6 +496,157 @@ struct SessionLifecycleEventTests {
         }
 
         await controller.stop()
+    }
+
+    @Test(
+        "shared continuity lets a recreated Terminal controller resume",
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func recreatedTerminalControllerResumesWithSharedContinuity() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let firstTransport = LifecycleEventTransport()
+        let firstController = SessionController(
+            transport: firstTransport,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            requiredServerProfiles: [.terminalV1],
+            continuityContext: continuityContext
+        )
+        firstController.attachRenderer(renderer)
+        try await firstController.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "shared-terminal"
+        welcome.requiredProfiles = [
+            "org.srui.standard-widgets/1",
+            terminalProfileURI,
+        ]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        await firstController.handleIncomingMessage(welcomeMessage)
+        #expect(firstController.isHandshakeComplete)
+        #expect(renderer.controlFactory.extensionKind(
+            for: TypeRef(namespaceID: 3, localID: 1)
+        ) == .terminal)
+
+        await firstController.stop()
+
+        let secondTransport = LifecycleEventTransport()
+        let secondController = SessionController(
+            transport: secondTransport,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "shared-terminal",
+            requiredServerProfiles: [.terminalV1],
+            continuityContext: continuityContext
+        )
+        secondController.attachRenderer(renderer)
+        try await secondController.start()
+
+        let frame = try #require(secondTransport.sentFrame(at: 0))
+        var decoder = SRUIMessageStreamDecoder()
+        let messages = try decoder.appendAndExtract(incoming: frame)
+        let handshake = try #require(messages.first)
+        guard case .clientResume(let resume) = handshake.msg else {
+            Issue.record("recreated controller abandoned negotiated Terminal continuity")
+            await secondController.stop()
+            return
+        }
+        #expect(resume.sessionID == "shared-terminal")
+
+        await secondController.handleIncomingMessage(
+            resumeOK(sessionID: "shared-terminal", lastProcessedEventSeq: 0)
+        )
+        #expect(secondController.negotiatedCapabilities?.contains(.terminalV1) == true)
+
+        await secondController.stop()
+    }
+
+    @Test(
+        "superseded stop cannot mutate a shared renderer",
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func supersededStopCannotMutateSharedRenderer() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let renderer = AppKitRenderer()
+        let oldController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            renderer: renderer,
+            continuityContext: continuityContext
+        )
+        oldController.attachRenderer(renderer)
+        try await oldController.start()
+        await oldController.handleIncomingMessage(welcome(sessionID: "shared-renderer"))
+
+        let lifecycleHopGate = AsyncGate()
+        await outbox.setNativeTextLifecycleWillHopForTesting {
+            await lifecycleHopGate.pause()
+        }
+        let mutationCounter = LifecycleMutationCounter()
+        oldController.nativeDisconnectMutationForTesting = {
+            mutationCounter.increment()
+        }
+        let oldStop = Task {
+            await oldController.stop()
+        }
+        await lifecycleHopGate.waitUntilPaused()
+
+        let newController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "shared-renderer",
+            continuityContext: continuityContext
+        )
+        newController.attachRenderer(renderer)
+        try await newController.start()
+
+        await lifecycleHopGate.release()
+        await oldStop.value
+        #expect(mutationCounter.value == 0)
+
+        await outbox.setNativeTextLifecycleWillHopForTesting(nil)
+        await newController.stop()
+    }
+
+    @Test(
+        "canceled queued binding acquisition cannot supersede the active binding",
+        .timeLimit(.minutes(1))
+    )
+    func canceledBindingAcquisitionDoesNotStealOwnership() async throws {
+        let outbox = EventOutbox()
+        let activeBinding = await outbox.beginConnectionBinding()
+        let entryGate = AsyncGate()
+        let activationCounter = LifecycleMutationCounter()
+        let canceledAcquisition = Task {
+            await entryGate.pause()
+            return try await outbox.beginConnectionBindingUnlessCancelled { _ in
+                activationCounter.increment()
+            }
+        }
+        await entryGate.waitUntilPaused()
+        canceledAcquisition.cancel()
+        await entryGate.release()
+
+        await #expect(throws: CancellationError.self) {
+            try await canceledAcquisition.value
+        }
+        #expect(activationCounter.value == 0)
+        #expect(await outbox.activeConnectionBindingForTesting == activeBinding)
     }
 
     @Test("releasing the controller finishes the lifecycle stream")

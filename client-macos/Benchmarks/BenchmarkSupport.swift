@@ -86,6 +86,8 @@ struct FixtureNode: Decodable {
     let properties: [String: FixtureValue]?
 }
 
+/// Cross-language fixture subset. Untagged JSON numbers normalize to binary64; signed and
+/// unsigned semantic integers require a future explicit tagged representation.
 enum FixtureValue: Codable, Equatable {
     case string(String)
     case bool(Bool)

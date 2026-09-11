@@ -24,10 +24,18 @@ fn terminal_script(lines: usize) -> String {
     )
 }
 
+#[cfg(unix)]
+fn standalone_signal_target(pid: Option<u32>) -> Option<libc::pid_t> {
+    pid.and_then(|pid| libc::pid_t::try_from(pid).ok())
+        .filter(|pid| *pid > 1)
+}
+
 fn signal_standalone_process_group(pid: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = pid {
-        let pid = pid as libc::pid_t;
+    if let Some(pid) = standalone_signal_target(pid) {
+        // SAFETY: portable-pty's Unix backend calls setsid before exec, so this validated
+        // child PID is also its process-group ID. A representable PID greater than one
+        // excludes kill(2)'s caller-group, broadcast, and system-process special cases.
         unsafe {
             let _ = libc::kill(-pid, libc::SIGHUP);
             let _ = libc::kill(-pid, libc::SIGKILL);
@@ -243,7 +251,7 @@ fn terminal_spec(script: &str, ring_capacity: usize) -> TerminalSpec {
 }
 
 fn append_frame(
-    frame: TerminalData,
+    frame: &TerminalData,
     id: NodeId,
     payload_len: usize,
     received: &mut Vec<u8>,
@@ -294,7 +302,7 @@ async fn embedded_pty_roundtrip(
             SubscribeSnapshot::Replay { frames } => {
                 for frame in frames {
                     append_frame(
-                        frame,
+                        &frame,
                         id,
                         payload.len(),
                         &mut received,
@@ -332,7 +340,7 @@ async fn embedded_pty_roundtrip(
                 match event {
                     TerminalEvent::Data(frame) => {
                         append_frame(
-                            frame,
+                            &frame,
                             id,
                             payload.len(),
                             &mut received,
@@ -367,6 +375,8 @@ async fn embedded_pty_roundtrip(
         Ok((elapsed, received, frame_count, offsets_exact))
     }
     .await;
+    // PTYManager::drop also calls shutdown(), so cancellation or unwinding before this
+    // normal-path cleanup still kills and reaps every managed child.
     manager.shutdown();
     result
 }
@@ -434,6 +444,8 @@ async fn ring_exhaustion(payload: &[u8], script: &str) -> Result<(f64, bool), St
         Ok((elapsed, detected))
     }
     .await;
+    // PTYManager::drop also calls shutdown(), so cancellation or unwinding before this
+    // normal-path cleanup still kills and reaps every managed child.
     manager.shutdown();
     result
 }
@@ -566,6 +578,16 @@ pub(crate) async fn terminal(iterations: usize) -> Result<Section, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_target_rejects_posix_special_and_unrepresentable_process_ids() {
+        assert_eq!(standalone_signal_target(None), None);
+        assert_eq!(standalone_signal_target(Some(0)), None);
+        assert_eq!(standalone_signal_target(Some(1)), None);
+        assert_eq!(standalone_signal_target(Some(u32::MAX)), None);
+        assert_eq!(standalone_signal_target(Some(2)), Some(2));
+    }
 
     #[test]
     fn terminal_fixture_matches_cross_language_contract() {

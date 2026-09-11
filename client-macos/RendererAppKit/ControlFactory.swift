@@ -43,6 +43,8 @@ public final class ControlFactory {
 
     /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
+
+    /// Primitive cache-miss callback. Session encodes this as `ClientModelRangeRequest` (§8, §22.7).
     public var onCollectionRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
 
     /// Synchronous main-actor resolver from content hash to a retained `NSImage` (§14).

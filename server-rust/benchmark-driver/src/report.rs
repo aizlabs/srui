@@ -50,6 +50,14 @@ pub(crate) struct Assertion {
     pub(crate) detail: String,
 }
 
+/// Constructs a metric from an internal, statically declared display name.
+///
+/// # Panics
+///
+/// Panics when a developer adds a metric call site without registering its stable ID. Metric
+/// names are never external input, so this is an internal invariant rather than a recoverable
+/// runtime condition.
+#[track_caller]
 pub(crate) fn metric(
     name: impl Into<String>,
     value: f64,
@@ -102,9 +110,13 @@ pub(crate) fn percentile(mut values: Vec<f64>, fraction: f64) -> Result<f64, Str
         return Err(NONFINITE_SAMPLES_ERROR.to_string());
     }
     values.sort_by(f64::total_cmp);
+    Ok(percentile_from_sorted(&values, fraction))
+}
+
+fn percentile_from_sorted(values: &[f64], fraction: f64) -> f64 {
     let scaled_index = (values.len() - 1) as f64 * fraction;
     let half_up_index = (scaled_index + 0.5).floor() as usize;
-    Ok(values[half_up_index.min(values.len() - 1)])
+    values[half_up_index.min(values.len() - 1)]
 }
 
 pub(crate) fn p50(values: Vec<f64>) -> Result<f64, String> {
@@ -115,13 +127,34 @@ pub(crate) fn push_timing_distributions(
     metrics: &mut Vec<Metric>,
     timings: BTreeMap<&'static str, Vec<f64>>,
 ) -> Result<(), String> {
-    if timings.values().any(Vec::is_empty) {
-        return Err(NO_SAMPLES_ERROR.to_string());
+    for values in timings.values() {
+        if values.is_empty() {
+            return Err(NO_SAMPLES_ERROR.to_string());
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(NONFINITE_SAMPLES_ERROR.to_string());
+        }
     }
-    for (name, values) in timings {
-        metrics.push(metric(name, p50(values.clone())?, "ms", "p50"));
-        metrics.push(metric(name, percentile(values.clone(), 0.95)?, "ms", "p95"));
-        metrics.push(metric(name, percentile(values, 0.99)?, "ms", "p99"));
+    for (name, mut values) in timings {
+        values.sort_by(f64::total_cmp);
+        metrics.push(metric(
+            name,
+            percentile_from_sorted(&values, 0.50),
+            "ms",
+            "p50",
+        ));
+        metrics.push(metric(
+            name,
+            percentile_from_sorted(&values, 0.95),
+            "ms",
+            "p95",
+        ));
+        metrics.push(metric(
+            name,
+            percentile_from_sorted(&values, 0.99),
+            "ms",
+            "p99",
+        ));
     }
     Ok(())
 }
@@ -145,6 +178,30 @@ mod tests {
             Err(NO_SAMPLES_ERROR.to_string())
         );
         assert!(metrics.is_empty());
+
+        let timings = BTreeMap::from([("abstract state generation", vec![1.0, f64::NAN])]);
+        assert_eq!(
+            push_timing_distributions(&mut metrics, timings),
+            Err(NONFINITE_SAMPLES_ERROR.to_string())
+        );
+        assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn timing_distributions_sort_once_and_preserve_all_statistics() {
+        let timings =
+            BTreeMap::from([("abstract state generation", vec![4.0, 0.0, 3.0, 1.0, 2.0])]);
+        let mut metrics = Vec::new();
+
+        push_timing_distributions(&mut metrics, timings).unwrap();
+
+        assert_eq!(metrics.len(), 3);
+        assert_eq!(metrics[0].statistic, "p50");
+        assert_eq!(metrics[0].value, 2.0);
+        assert_eq!(metrics[1].statistic, "p95");
+        assert_eq!(metrics[1].value, 4.0);
+        assert_eq!(metrics[2].statistic, "p99");
+        assert_eq!(metrics[2].value, 4.0);
     }
 
     #[test]

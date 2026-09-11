@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import BenchmarkDriver
 
@@ -22,6 +23,25 @@ func percentileRejectsInvalidInputs() {
         checkedPercentile([1.0], 1.1)
             == .failure(.invalidFraction)
     )
+}
+
+@Test("fixture values use the shared binary64 subset")
+func fixtureValueBinary64Contract() throws {
+    let values = try JSONDecoder().decode(
+        [FixtureValue].self,
+        from: Data("[1, -2, 0.5]".utf8)
+    )
+    #expect(values == [.number(1), .number(-2), .number(0.5)])
+    #expect(
+        values.map(\.semanticValue)
+            == [.float64(1), .float64(-2), .float64(0.5)]
+    )
+    #expect(throws: DecodingError.self) {
+        _ = try JSONDecoder().decode(
+            FixtureValue.self,
+            from: Data("null".utf8)
+        )
+    }
 }
 
 @Test("fixture roles resolve by semantic type instead of numeric convention")

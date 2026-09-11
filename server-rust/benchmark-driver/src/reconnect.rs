@@ -176,7 +176,7 @@ pub(crate) async fn reconnect(iterations: usize) -> Result<Section, String> {
             && matches!(
                 resumed_transaction.outcome,
                 ResumeOutcome::Replay { replayed, .. }
-                    if replayed == vec![committed]
+                    if replayed.as_slice() == std::slice::from_ref(&committed)
             );
 
         // Keep the direct admission/result-cache timings as component measurements. The

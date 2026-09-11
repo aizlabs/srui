@@ -107,6 +107,37 @@ struct ControlFactoryTests {
         #expect(button.isPointerInside == false)
     }
 
+    @Test
+    func applicationObserversDoNotRetainDiscardedHoverButton() throws {
+        weak var releasedButton: HoverFeedbackButton?
+        try autoreleasepool {
+            let factory = ControlFactory()
+            let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+            let button = try #require(handle.view as? HoverFeedbackButton)
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 180, height: 44),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            window.isReleasedWhenClosed = false
+            window.contentView = button
+            releasedButton = button
+            window.contentView = nil
+            window.close()
+        }
+
+        #expect(releasedButton == nil)
+        NotificationCenter.default.post(
+            name: NSApplication.didBecomeActiveNotification,
+            object: NSApplication.shared
+        )
+        NotificationCenter.default.post(
+            name: NSApplication.didResignActiveNotification,
+            object: NSApplication.shared
+        )
+    }
+
     @Test(arguments: controlFactoryRequiredTierTypes)
     func requiredTierCreatesExpectedViewAndDefaults(nodeType: TypeRef) throws {
         let factory = ControlFactory()

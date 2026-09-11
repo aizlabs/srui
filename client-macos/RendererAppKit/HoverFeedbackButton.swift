@@ -40,6 +40,12 @@ public final class HoverFeedbackButton: NSButton {
         NSWindow.didChangeOcclusionStateNotification,
     ]
 
+    deinit {
+        // Selector observers are zeroing-weak on supported macOS versions.
+        // Explicit removal still releases registrations immediately.
+        NotificationCenter.default.removeObserver(self)
+    }
+
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         installApplicationStateObserversIfNeeded()

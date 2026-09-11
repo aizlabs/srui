@@ -74,7 +74,88 @@ struct HandshakeNegotiationTests {
         await controller.stop()
         await serverTransport.close()
     }
+    @Test("Default Terminal-capable client accepts a standard-only SERVER WELCOME")
+    func defaultClientAcceptsStandardOnlyWelcome() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(transport: clientTransport)
 
+        try await controller.start()
+
+        let serverStream = serverTransport.receiveStream()
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var receivedHello: SRUIClientHello?
+        for try await chunk in serverStream {
+            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .clientHello(let hello) = message.msg {
+                    receivedHello = hello
+                    break
+                }
+            }
+            if receivedHello != nil { break }
+        }
+
+        let hello = try #require(receivedHello)
+        #expect(hello.profiles.contains("org.srui.standard-widgets/1"))
+        #expect(hello.profiles.contains("org.srui.terminal/1"))
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "standard-only-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 0
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+
+        try await AsyncTestSupport.eventually(description: "standard-only handshake completion") {
+            controller.isHandshakeComplete
+        }
+        #expect(controller.negotiatedCapabilities == [Profile.standardWidgetsV1])
+        #expect(!controller.isDiverged)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    @Test("SERVER WELCOME rejects negotiated optional Terminal without a namespace mapping")
+    func optionalTerminalWithoutMappingFailsHandshake() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(transport: clientTransport)
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-without-mapping"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.optionalProfiles = ["org.srui.terminal/1"]
+        welcome.initialRevision = 0
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+
+        try await AsyncTestSupport.eventually(description: "missing Terminal mapping rejected") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+        #expect(!controller.isHandshakeComplete)
+        #expect(controller.negotiatedCapabilities == nil)
+
+        if case .protocolViolation(let message)? = failurePromise.load() {
+            #expect(message.contains("negotiated org.srui.terminal/1"))
+            #expect(message.contains("omitted its namespace mapping"))
+        } else {
+            Issue.record("Expected protocolViolation, got \(String(describing: failurePromise.load()))")
+        }
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    /// §15: core_version is part of the handshake, not decoration.
     /// §15: `core_version` is part of the handshake, not decoration.
     ///
     /// A proto3 string field that is absent decodes to `""`, so "omitted" and "empty" are the same

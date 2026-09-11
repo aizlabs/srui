@@ -257,12 +257,9 @@ public struct ServerCapabilities: Equatable, Sendable {
         self.optional = optional
     }
 
-    /// Standard server capability specification requiring standard widgets v1.
+    /// Standard-only server capability specification requiring standard widgets v1.
     public static var standardWidgets: ServerCapabilities {
-        ServerCapabilities(
-            required: [Profile.standardWidgetsV1],
-            optional: [Profile.terminalV1, Profile.richtextV1]
-        )
+        ServerCapabilities(required: [Profile.standardWidgetsV1])
     }
 
     /// Computes the negotiated capability set for a connecting client's offered profiles (§15).

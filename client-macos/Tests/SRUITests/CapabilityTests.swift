@@ -204,14 +204,15 @@ struct CapabilityTests {
         #expect(negotiated == [Profile.standardWidgetsV1])
     }
 
-    @Test("ServerCapabilities wrapper negotiates correctly")
-    func serverCapabilitiesNegotiate() throws {
+    @Test("Standard server capabilities do not advertise unused extensions")
+    func standardServerCapabilitiesAreStandardOnly() throws {
         let serverCaps = ServerCapabilities.standardWidgets
         let clientOffered: CapabilitySet = [Profile.standardWidgetsV1, Profile.terminalV1]
 
+        #expect(serverCaps.required == [Profile.standardWidgetsV1])
+        #expect(serverCaps.optional.isEmpty)
         let negotiated = try serverCaps.negotiate(clientOffered: clientOffered)
-        #expect(negotiated.contains(Profile.standardWidgetsV1))
-        #expect(negotiated.contains(Profile.terminalV1))
+        #expect(negotiated == [Profile.standardWidgetsV1])
     }
 
     @Test("CapabilitySet fromStrings and fromValidStrings handling")

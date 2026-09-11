@@ -78,28 +78,93 @@ func benchmarkMeasurePassiveCompositedChange(
             )
         }
     }
-    _ = try requireStableTarget("pre-capture")
+    // Starting ScreenCaptureKit can itself coincide with a transient Dock/menu
+    // surface. Accept a baseline only when the exact target is unobscured both
+    // immediately before stream startup and immediately after the first
+    // complete post-start frame. If either snapshot is contaminated, discard
+    // that entire stream and retry while timing is still disarmed.
+    let baselineDeadline = clock.now + .seconds(10)
+    var acceptedCaptureSession: BenchmarkScreenCaptureSession?
+    var acceptedBaselineFrame: BenchmarkScreenCaptureFrame?
+    var acceptedBaselineCapture: BenchmarkCompositedCaptureEvidence?
+    var acceptedPreActionTarget: FrameTargetEvidence?
+    var lastBaselineRejection = "no baseline attempt completed"
 
-    let captureSession = try await benchmarkStartScreenCaptureStream(
-        displayID: prepared.evidence.displayID,
-        globalSourceRect: targetBounds,
-        operation: "passive target-ROI capture"
-    )
-    do {
-        let baselineFrame = try await benchmarkAwaitFirstCompleteFrame(
-            from: captureSession.frames,
-            operation: "passive target-ROI baseline"
+    while clock.now < baselineDeadline {
+        do {
+            _ = try requireStableTarget("pre-baseline")
+        } catch {
+            lastBaselineRejection = String(describing: error)
+            try await Task.sleep(for: .milliseconds(10))
+            continue
+        }
+
+        let streamStartBoundaryMachTicks = mach_absolute_time()
+        let candidateSession = try await benchmarkStartScreenCaptureStream(
+            displayID: prepared.evidence.displayID,
+            globalSourceRect: targetBounds,
+            operation: "passive target-ROI capture"
         )
-        guard let baselineCapture =
-            benchmarkNormalizedFrameEvidence(baselineFrame),
-              baselineCapture.content.hasNonblankContent,
-              baselineCapture.content.hasNonuniformContent else {
+        let frameWaitBudget = clock.now.duration(to: baselineDeadline)
+        guard frameWaitBudget > .zero else {
+            lastBaselineRejection =
+                "ScreenCaptureKit startup exhausted the baseline retry budget"
+            await candidateSession.stop()
+            break
+        }
+        let candidateFrame: BenchmarkScreenCaptureFrame
+        do {
+            candidateFrame = try await benchmarkAwaitFirstCompleteFrame(
+                from: candidateSession.frames,
+                operation: "passive target-ROI baseline",
+                afterDisplayTime: streamStartBoundaryMachTicks,
+                timeout: frameWaitBudget
+            )
+        } catch {
+            await candidateSession.stop()
+            throw error
+        }
+        guard let candidateCapture =
+            benchmarkNormalizedFrameEvidence(candidateFrame),
+              candidateCapture.content.hasNonblankContent,
+              candidateCapture.content.hasNonuniformContent else {
+            await candidateSession.stop()
             throw BenchmarkFailure.message(
                 "passive target-ROI baseline was blank or uniform"
             )
         }
-        let preActionTarget = try requireStableTarget("pre-action")
 
+        do {
+            let candidateTarget = try requireStableTarget("post-baseline")
+            acceptedCaptureSession = candidateSession
+            acceptedBaselineFrame = candidateFrame
+            acceptedBaselineCapture = candidateCapture
+            acceptedPreActionTarget = candidateTarget
+            break
+        } catch {
+            lastBaselineRejection = String(describing: error)
+            benchmarkTrace(
+                "discarding contaminated passive baseline: "
+                    + lastBaselineRejection
+            )
+            await candidateSession.stop()
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    guard let captureSession = acceptedCaptureSession,
+          let baselineFrame = acceptedBaselineFrame,
+          let baselineCapture = acceptedBaselineCapture,
+          let preActionTarget = acceptedPreActionTarget else {
+        throw BenchmarkFailure.message(
+            "passive target-ROI baseline did not remain unobscured before and "
+                + "after a complete post-start frame within the untimed "
+                + "10-second deadline; last rejection: "
+                + lastBaselineRejection
+        )
+    }
+
+    do {
         let restorationReferenceCapture:
             BenchmarkCompositedCaptureEvidence?
         if restorationAction != nil {

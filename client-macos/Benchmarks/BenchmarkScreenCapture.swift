@@ -522,14 +522,21 @@ func benchmarkStartScreenCaptureStream(
 
 func benchmarkAwaitFirstCompleteFrame(
     from frames: AsyncStream<BenchmarkScreenCaptureFrame>,
-    operation: String
+    operation: String,
+    afterDisplayTime: UInt64? = nil,
+    timeout: Duration = .seconds(10)
 ) async throws -> BenchmarkScreenCaptureFrame {
-    try await withBenchmarkDeadline(operation) {
+    try await withBenchmarkDeadline(operation, timeout: timeout) {
         for await frame in frames {
+            if let afterDisplayTime,
+               frame.displayTime <= afterDisplayTime {
+                continue
+            }
             return frame
         }
         throw BenchmarkFailure.message(
-            "\(operation) ended before a complete ScreenCaptureKit frame"
+            "\(operation) ended before a complete post-cutoff "
+                + "ScreenCaptureKit frame"
         )
     }
 }

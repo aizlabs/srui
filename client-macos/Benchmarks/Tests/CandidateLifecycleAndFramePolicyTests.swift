@@ -116,6 +116,64 @@ func frameAcceptanceRejectsStaleAndUnchangedPixels() throws {
     }
 }
 
+@Test("baseline frame wait skips stale frames and obeys supplied deadline")
+func baselineFrameWaitSkipsStaleFramesAndTimesOut() async throws {
+    let image = try policyTestImage()
+    let now = ContinuousClock().now
+    let (frames, continuation) =
+        AsyncStream<BenchmarkScreenCaptureFrame>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+    continuation.yield(
+        BenchmarkScreenCaptureFrame(
+            displayTime: 10,
+            receivedAt: now,
+            receivedUnixNanoseconds: 1,
+            isPostArmCandidate: false,
+            image: image
+        )
+    )
+    continuation.yield(
+        BenchmarkScreenCaptureFrame(
+            displayTime: 11,
+            receivedAt: now,
+            receivedUnixNanoseconds: 2,
+            isPostArmCandidate: false,
+            image: image
+        )
+    )
+    continuation.finish()
+
+    let accepted = try await benchmarkAwaitFirstCompleteFrame(
+        from: frames,
+        operation: "stale-to-fresh test",
+        afterDisplayTime: 10,
+        timeout: .seconds(1)
+    )
+    #expect(accepted.displayTime == 11)
+
+    let (stalledFrames, stalledContinuation) =
+        AsyncStream<BenchmarkScreenCaptureFrame>.makeStream(
+            bufferingPolicy: .unbounded
+        )
+    defer { stalledContinuation.finish() }
+    let timeoutStarted = clock.now
+    do {
+        _ = try await benchmarkAwaitFirstCompleteFrame(
+            from: stalledFrames,
+            operation: "bounded stalled-frame test",
+            afterDisplayTime: 10,
+            timeout: .milliseconds(20)
+        )
+        Issue.record("stalled frame stream crossed its supplied deadline")
+    } catch let error as BenchmarkFailure {
+        #expect(error.description.contains("timed out"))
+    } catch {
+        Issue.record("unexpected stalled-frame error: \(error)")
+    }
+    #expect(milliseconds(timeoutStarted.duration(to: clock.now)) < 250)
+}
+
 @Test("passive frame boundary optionally accepts frames during action")
 func passiveFrameBoundarySelection() {
     let actionStartedAt = ContinuousClock().now

@@ -66,8 +66,18 @@ relocation can still start the retraction of an already activated Dock or menu s
 preparation therefore allows up to 10 seconds to acquire the exact `.optionOnScreenOnly`
 WindowServer identity. A separate 10-second geometry-settling deadline must contain two identical
 observations of that exact identity, window bounds, and client-content ROI spaced 300 ms apart.
-Preparation then allows up to 10 seconds for a genuinely clear z-order before capture. A geometry
-timeout reports the prepared AppKit frame and current WindowServer entry fields.
+Preparation then allows up to 10 seconds for a genuinely clear z-order before capture. Passive
+measurement also brackets its baseline: the exact target must be unobscured immediately before a
+new ScreenCaptureKit stream starts, the accepted complete frame must have a display timestamp after
+that start boundary, and the exact target must still be unobscured immediately afterward. A
+contaminated stream and its frame are discarded together. The remaining portion of one untimed
+10-second stability budget is passed to post-cutoff frame acquisition, and a stream whose startup
+returns after that budget is stopped. ScreenCaptureKit's framework startup call exposes no separate
+safe timeout; a startup that never returns remains covered by the runner's hard per-driver timeout.
+No owner or window level is whitelisted. These WindowServer observations bracket the captured frame;
+they are not described as an atomic z-order snapshot at the frame timestamp. Exact captured pixels
+and the later material-delta gates remain separate evidence. A geometry or baseline timeout reports
+the last exact rejection.
 
 Full §31.1 instead has two nested guards. The top-level parent saves the user's exact Quartz
 location, parks at `display.minX + 160` and the vertical midpoint before spawning either

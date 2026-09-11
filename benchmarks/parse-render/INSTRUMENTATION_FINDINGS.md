@@ -291,6 +291,25 @@ The 960×720 renderer ROI is placed in a visible-frame corner away from the park
 menu-bar, and hot-corner activation. The cursor is not removed from WindowServer evidence. If a
 cursor or another nonzero-alpha surface intersects the target ahead, the sample remains invalid.
 
+A later consolidated run exposed a second untimed race after the initial clear-z-order preparation:
+while ScreenCaptureKit was acquiring the passive baseline, Dock published a full-display,
+nonzero-alpha layer-20 surface ahead of the target. The immediate pre-action gate rejected it and no
+report was written. Passive baselines now require a clear exact target immediately before starting a
+fresh capture stream, a complete frame whose display timestamp is after that start boundary, and the
+same clear exact target immediately afterward. Queued frames at or before the stream-start Mach
+cutoff are skipped. If either WindowServer snapshot is contaminated, that entire stream and frame
+are discarded. Every post-cutoff frame wait receives only the remaining portion of one 10-second
+stability budget; if ScreenCaptureKit startup returns after the budget, its session is stopped.
+Apple's framework startup await has no independent safe cancellation boundary, so that call is
+still governed by the canonical runner's hard per-driver timeout. A deterministic stale→fresh test
+and a stalled-frame deadline test constrain the code-owned portions of this boundary.
+
+The before/after WindowServer observations bracket the frame rather than atomically sampling z-order
+at its display timestamp. The report therefore does not call them atomic same-frame z-order proof;
+it separately requires exact ScreenCaptureKit pixels and the later material-delta gates. The rule
+does not trust the Dock owner or its lower layer, and a persistent surface still fails closed with
+the last rejection.
+
 A locked or inactive login session can make the necessary display/window evidence unavailable.
 A real failed full run showed the characteristic state: the window was `NSWindow.isVisible=true`
 and present through `.optionIncludingWindow`, but the console dictionary reported

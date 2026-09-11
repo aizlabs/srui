@@ -113,14 +113,27 @@ private struct SessionNegotiationContinuitySnapshot: Sendable {
     var terminalTypeRef: TypeRef?
 }
 
+private struct SessionContinuityOwnership: Hashable, Sendable {
+    var binding: EventOutboxConnectionBinding
+    var sessionIncarnation: EventOutboxSessionIncarnation
+}
+
+private struct SessionContinuityMutationLease: Sendable {
+    var ownership: SessionContinuityOwnership
+}
+
 /// Per-saved-connection state that must survive replacement SessionController instances.
 ///
 /// ConnectionManager owns one context per entry. Negotiation metadata lets a recreated controller
-/// resume extension sessions, while the binding fence prevents an older controller from mutating
-/// a renderer after a newer transport attempt has taken ownership.
+/// resume extension sessions. Exact binding/incarnation ownership fences every shared native,
+/// Terminal, rate-budget, and replica mutation across replacement controller instances.
 public final class SessionContinuityContext: @unchecked Sendable {
     private let lock = NSLock()
-    private var activeBinding: EventOutboxConnectionBinding?
+    private var activeOwnership: SessionContinuityOwnership?
+    private var retiredOwnerships: Set<SessionContinuityOwnership> = []
+    private var mutationCounts: [SessionContinuityOwnership: Int] = [:]
+    private var mutationDrainWaiters:
+        [SessionContinuityOwnership: [CheckedContinuation<Void, Never>]] = [:]
     private var retainedCapabilities: CapabilitySet?
     private var negotiatedTerminalTypeRef: TypeRef?
 
@@ -135,27 +148,134 @@ public final class SessionContinuityContext: @unchecked Sendable {
         }
     }
 
-    fileprivate func activate(binding: EventOutboxConnectionBinding) {
+    fileprivate func activate(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async {
+        let next = SessionContinuityOwnership(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
+        let ownershipsToDrain = withLock { () -> Set<SessionContinuityOwnership> in
+            var ownerships = retiredOwnerships
+            if let activeOwnership, activeOwnership != next {
+                ownerships.insert(activeOwnership)
+            }
+            retiredOwnerships.formUnion(ownerships)
+            activeOwnership = next
+            return ownerships
+        }
+        for ownership in ownershipsToDrain {
+            await waitForMutationDrain(ownership)
+        }
         withLock {
-            activeBinding = binding
+            retiredOwnerships.subtract(ownershipsToDrain)
+        }
+    }
+
+    @discardableResult
+    fileprivate func advanceSessionIncarnationIfActive(
+        binding: EventOutboxConnectionBinding,
+        from previousSessionIncarnation: EventOutboxSessionIncarnation,
+        to sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        let previous = SessionContinuityOwnership(
+            binding: binding,
+            sessionIncarnation: previousSessionIncarnation
+        )
+        let next = SessionContinuityOwnership(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
+        if previous == next {
+            return isActive(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+        let advanced = withLock { () -> Bool in
+            guard activeOwnership == previous else { return false }
+            retiredOwnerships.insert(previous)
+            activeOwnership = next
+            return true
+        }
+        guard advanced else { return false }
+        await waitForMutationDrain(previous)
+        return withLock {
+            retiredOwnerships.remove(previous)
+            return activeOwnership == next
         }
     }
 
     fileprivate func retire(binding: EventOutboxConnectionBinding) {
         withLock {
-            guard activeBinding == binding else { return }
-            activeBinding = nil
+            guard activeOwnership?.binding == binding,
+                  let activeOwnership else {
+                return
+            }
+            retiredOwnerships.insert(activeOwnership)
+            self.activeOwnership = nil
+        }
+    }
+
+    fileprivate func isActive(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) -> Bool {
+        withLock {
+            activeOwnership == SessionContinuityOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+    }
+
+    fileprivate func acquireMutation(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) -> SessionContinuityMutationLease? {
+        withLock {
+            let ownership = SessionContinuityOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+            guard activeOwnership == ownership else { return nil }
+            mutationCounts[ownership, default: 0] += 1
+            return SessionContinuityMutationLease(ownership: ownership)
+        }
+    }
+
+    fileprivate func releaseMutation(_ lease: SessionContinuityMutationLease) {
+        let waiters = withLock {
+            guard let count = mutationCounts[lease.ownership] else {
+                return [CheckedContinuation<Void, Never>]()
+            }
+            if count > 1 {
+                mutationCounts[lease.ownership] = count - 1
+                return []
+            }
+            mutationCounts.removeValue(forKey: lease.ownership)
+            return mutationDrainWaiters.removeValue(forKey: lease.ownership) ?? []
+        }
+        for waiter in waiters {
+            waiter.resume()
         }
     }
 
     @discardableResult
     fileprivate func updateNegotiationIfActive(
         binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation,
         capabilities: CapabilitySet?,
         terminalTypeRef: TypeRef?
     ) -> Bool {
         withLock {
-            guard activeBinding == binding else { return false }
+            guard activeOwnership == SessionContinuityOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            ) else {
+                return false
+            }
             retainedCapabilities = capabilities
             negotiatedTerminalTypeRef = terminalTypeRef
             return true
@@ -165,28 +285,69 @@ public final class SessionContinuityContext: @unchecked Sendable {
     @MainActor
     fileprivate func performIfActive<Value: Sendable>(
         binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation,
+        _ body: @MainActor @Sendable () -> Value
+    ) -> Value? {
+        guard let lease = acquireMutation(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return nil
+        }
+        defer { releaseMutation(lease) }
+        return body()
+    }
+
+    /// Authorizes native state captured after a clean stop but before the next binding activates.
+    ///
+    /// Holding the continuity lock across this synchronous MainActor mutation linearizes it with
+    /// activation: the edit lands wholly before the next controller owns the shared renderer, or
+    /// is refused wholly after that ownership is published.
+    @MainActor
+    fileprivate func performIfNoConnectionIsActive<Value: Sendable>(
         _ body: @MainActor @Sendable () -> Value
     ) -> Value? {
         lock.lock()
         defer { lock.unlock() }
-        guard activeBinding == binding else { return nil }
+        guard activeOwnership == nil else { return nil }
         return body()
     }
 
     @MainActor
     fileprivate func publishNegotiationIfActive(
         binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation,
         capabilities: CapabilitySet,
         terminalTypeRef: TypeRef?,
         rendererMutation: @MainActor @Sendable () throws -> Void
     ) throws -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard activeBinding == binding else { return false }
+        guard let lease = acquireMutation(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return false
+        }
+        defer { releaseMutation(lease) }
         try rendererMutation()
-        retainedCapabilities = capabilities
-        negotiatedTerminalTypeRef = terminalTypeRef
-        return true
+        return withLock {
+            guard activeOwnership == lease.ownership else { return false }
+            retainedCapabilities = capabilities
+            negotiatedTerminalTypeRef = terminalTypeRef
+            return true
+        }
+    }
+
+    private func waitForMutationDrain(_ ownership: SessionContinuityOwnership) async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if mutationCounts[ownership] == nil {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                mutationDrainWaiters[ownership, default: []].append(continuation)
+                lock.unlock()
+            }
+        }
     }
 
     private func withLock<Value>(_ body: () -> Value) -> Value {
@@ -195,7 +356,6 @@ public final class SessionContinuityContext: @unchecked Sendable {
         return body()
     }
 }
-
 /// Core protocol version this build speaks (§15).
 public let SRUICoreVersion = "0.5.0"
 
@@ -255,7 +415,6 @@ private struct SessionFailureTeardownState: Sendable {
     var sessionIncarnation: EventOutboxSessionIncarnation?
     var lifecycleGeneration: UInt64
     var transactionTasks: [Task<Void, Never>]
-    var discardsNegotiationContinuity: Bool
 }
 
 private actor ReceiveLoopStartGate {
@@ -289,6 +448,11 @@ private struct HandshakeSendOwnership {
 private struct SemanticActionOwnership: Equatable, Sendable {
     var binding: EventOutboxConnectionBinding
     var sessionIncarnation: EventOutboxSessionIncarnation
+}
+
+private struct OwnedCollectionRangeRequest: Sendable {
+    var request: CollectionRangeRequest
+    var ownership: SemanticActionOwnership
 }
 
 private final class SemanticActionCancellationState: @unchecked Sendable {
@@ -436,6 +600,21 @@ public final class SessionController: @unchecked Sendable {
         get { withStateLock { _textEditWillAuthorizeForTesting } }
         set { withStateLock { _textEditWillAuthorizeForTesting = newValue } }
     }
+    private var _sharedMutationWillAuthorizeForTesting: (@Sendable () async -> Void)?
+    var sharedMutationWillAuthorizeForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _sharedMutationWillAuthorizeForTesting } }
+        set { withStateLock { _sharedMutationWillAuthorizeForTesting = newValue } }
+    }
+    private var _terminalCommandWillAuthorizeForTesting: (@Sendable () async -> Void)?
+    var terminalCommandWillAuthorizeForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _terminalCommandWillAuthorizeForTesting } }
+        set { withStateLock { _terminalCommandWillAuthorizeForTesting = newValue } }
+    }
+    private var _collectionRangeDispatchDidFinishForTesting: (@Sendable () -> Void)?
+    var collectionRangeDispatchDidFinishForTesting: (@Sendable () -> Void)? {
+        get { withStateLock { _collectionRangeDispatchDidFinishForTesting } }
+        set { withStateLock { _collectionRangeDispatchDidFinishForTesting = newValue } }
+    }
     private var _receiveLoopWillAdoptForTesting: (@Sendable () async -> Void)?
     var receiveLoopWillAdoptForTesting: (@Sendable () async -> Void)? {
         get { withStateLock { _receiveLoopWillAdoptForTesting } }
@@ -488,7 +667,7 @@ public final class SessionController: @unchecked Sendable {
     private var rejectedResourceHashes: Set<ResourceHash> = []
     /// Exact Terminal type assigned by the latest fresh welcome; retained across same-session resume.
     private var negotiatedTerminalTypeRef: TypeRef?
-    private var rangeRequestContinuation: AsyncStream<CollectionRangeRequest>.Continuation?
+    private var rangeRequestContinuation: AsyncStream<OwnedCollectionRangeRequest>.Continuation?
     private var rangeRequestTask: Task<Void, Never>?
     private let terminalPump = TerminalCommandPump()
 
@@ -581,6 +760,66 @@ public final class SessionController: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body()
+    }
+
+    private func currentSharedOwnership() -> SemanticActionOwnership? {
+        withStateLock {
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+    }
+
+    private func acquireSharedMutationLease(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> SessionContinuityMutationLease? {
+        if let interceptor = sharedMutationWillAuthorizeForTesting {
+            await interceptor()
+        }
+        return continuityContext.acquireMutation(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
+    }
+
+    private func performSharedMainActorMutationIfActive<Value: Sendable>(
+        ownership: SemanticActionOwnership,
+        _ body: @escaping @MainActor @Sendable () -> Value
+    ) async -> Value? {
+        await MainActor.run {
+            self.continuityContext.performIfActive(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation,
+                body
+            )
+        }
+    }
+
+    private func terminalCommandSender(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) -> TerminalCommandPump.SendIfAuthorized {
+        { [weak self] data, logicalClass in
+            guard let self else { return false }
+            if let interceptor = self.terminalCommandWillAuthorizeForTesting {
+                await interceptor()
+            }
+            guard let lease = await self.acquireSharedMutationLease(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            ) else {
+                return false
+            }
+            defer { self.continuityContext.releaseMutation(lease) }
+            try await self.transport.send(data: data, logicalClass: logicalClass)
+            return true
+        }
     }
 
     /// Must be called while `lock` is held.
@@ -729,11 +968,21 @@ public final class SessionController: @unchecked Sendable {
     /// Attaches the renderer action trampoline to forward UI events to the outbox (§7.7, §22).
     @MainActor
     public func attachRenderer(_ renderer: AppKitRenderer) {
-        wireActionHandler(for: renderer)
+        interactionRenderer = renderer
+        guard let ownership = currentSharedOwnership() else { return }
+        _ = continuityContext.performIfActive(
+            binding: ownership.binding,
+            sessionIncarnation: ownership.sessionIncarnation
+        ) {
+            self.wireActionHandler(for: renderer, ownership: ownership)
+        }
     }
 
     @MainActor
-    private func wireActionHandler(for renderer: AppKitRenderer) {
+    private func wireActionHandler(
+        for renderer: AppKitRenderer,
+        ownership: SemanticActionOwnership
+    ) {
         guard !actionHandlerWired else { return }
         actionHandlerWired = true
         interactionRenderer = renderer
@@ -780,7 +1029,14 @@ public final class SessionController: @unchecked Sendable {
             let predecessor = self.interactionDispatchTail
             let dispatch = Task { [weak self] in
                 _ = await predecessor?.result
-                guard let self, !Task.isCancelled else { return }
+                guard let self, !Task.isCancelled,
+                      let lease = await self.acquireSharedMutationLease(
+                          binding: ownership.binding,
+                          sessionIncarnation: ownership.sessionIncarnation
+                      ) else {
+                    return
+                }
+                defer { self.continuityContext.releaseMutation(lease) }
                 await self.terminalPump.enqueueInput(streamID: nodeID, data: data)
             }
             self.interactionDispatchTail = dispatch
@@ -790,23 +1046,45 @@ public final class SessionController: @unchecked Sendable {
             let predecessor = self.interactionDispatchTail
             let dispatch = Task { [weak self] in
                 _ = await predecessor?.result
-                guard let self, !Task.isCancelled else { return }
-                await self.terminalPump.enqueueResize(streamID: nodeID, columns: cols, rows: rows, pixelWidth: width, pixelHeight: height)
+                guard let self, !Task.isCancelled,
+                      let lease = await self.acquireSharedMutationLease(
+                          binding: ownership.binding,
+                          sessionIncarnation: ownership.sessionIncarnation
+                      ) else {
+                    return
+                }
+                defer { self.continuityContext.releaseMutation(lease) }
+                await self.terminalPump.enqueueResize(
+                    streamID: nodeID,
+                    columns: cols,
+                    rows: rows,
+                    pixelWidth: width,
+                    pixelHeight: height
+                )
             }
             self.interactionDispatchTail = dispatch
         }
 
         renderer.onCollectionRangeRequest = { [weak self, weak renderer] request in
             guard let self else { return }
-            // A request emitted while the pump is torn down (between sessions) would
-            // otherwise stay marked in-flight in the adapter's tracker and suppress the
-            // re-request after reconnect. Give the coverage straight back (§8, §22.7).
-            guard let continuation = self.rangeRequestContinuation else {
-                renderer?.noteDroppedCollectionRange(request)
-                return
-            }
-            if case .terminated = continuation.yield(request) {
-                renderer?.noteDroppedCollectionRange(request)
+            _ = self.continuityContext.performIfActive(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation
+            ) {
+                // A request emitted while the pump is torn down (between sessions) would
+                // otherwise stay marked in-flight in the adapter's tracker and suppress the
+                // re-request after reconnect. Give the coverage straight back (§8, §22.7).
+                guard let continuation = self.rangeRequestContinuation else {
+                    renderer?.noteDroppedCollectionRange(request)
+                    return
+                }
+                let ownedRequest = OwnedCollectionRangeRequest(
+                    request: request,
+                    ownership: ownership
+                )
+                if case .terminated = continuation.yield(ownedRequest) {
+                    renderer?.noteDroppedCollectionRange(request)
+                }
             }
         }
     }
@@ -872,61 +1150,82 @@ public final class SessionController: @unchecked Sendable {
         laneEpoch: UInt64,
         renderer: AppKitRenderer
     ) {
-        // Record what the user was looking at synchronously even while disconnected so a locally
-        // committed edit can replay if this same session resumes (§18.3).
         let observedRevision = applier.currentSnapshot.revision
-        guard renderer.textEditingSession.recordObservedRevision(
-            nodeID: nodeID,
-            text: text,
-            editSeq: editSeq,
-            laneEpoch: laneEpoch,
-            observedRevision: observedRevision
-        ) else {
-            return
-        }
-
-        let acceptsInteraction = withStateLock {
-            (isRunning && !isStopping && !_isDiverged) || isFlushingTextForDisconnect
-        }
-        guard acceptsInteraction else { return }
-
-        let drainCutoff = renderer.textEditingSession.unassignedFlushGeneration(for: nodeID)
-            ?? renderer.textEditingSession.currentFlushGeneration
-        guard let ownership = withStateLock({ () -> SemanticActionOwnership? in
-            guard let binding = outboxConnectionBinding,
-                  let sessionIncarnation = outboxSessionIncarnation else {
-                return nil
+        guard let ownership = currentSharedOwnership() else {
+            // A committed edit may arrive after stop() has retired the binding. Record its
+            // observed revision only while the shared renderer is explicitly unowned; activation
+            // of a replacement controller is atomic with this mutation.
+            _ = continuityContext.performIfNoConnectionIsActive {
+                renderer.textEditingSession.recordObservedRevision(
+                    nodeID: nodeID,
+                    text: text,
+                    editSeq: editSeq,
+                    laneEpoch: laneEpoch,
+                    observedRevision: observedRevision
+                )
             }
-            return SemanticActionOwnership(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation
-            )
-        }) else {
             SessionDiagnostics.error(
                 "Interaction dispatch skipped without outbox session ownership"
             )
             return
         }
-
-        // Claim this exact callback before yielding MainActor; later typing may otherwise replace
-        // the coalesced slot before the queued dispatch starts.
-        guard let initialTextEdit = renderer.textEditingSession.claimUnassignedEdit(
-            nodeID: nodeID,
-            text: text,
-            editSeq: editSeq,
-            laneEpoch: laneEpoch
-        ) else {
+        guard let preparation = continuityContext.performIfActive(
+            binding: ownership.binding,
+            sessionIncarnation: ownership.sessionIncarnation,
+            { () -> (LocalTextEdit, UInt64, UInt64, Task<Void, Never>?)? in
+            // Record what the user was looking at synchronously even while disconnecting so a
+            // locally committed edit can replay if this same session resumes (§18.3).
+            guard renderer.textEditingSession.recordObservedRevision(
+                nodeID: nodeID,
+                text: text,
+                editSeq: editSeq,
+                laneEpoch: laneEpoch,
+                observedRevision: observedRevision
+            ) else {
+                return nil
+            }
+            let acceptsInteraction = self.withStateLock {
+                (self.isRunning && !self.isStopping && !self._isDiverged)
+                    || self.isFlushingTextForDisconnect
+            }
+            guard acceptsInteraction else { return nil }
+            let drainCutoff =
+                renderer.textEditingSession.unassignedFlushGeneration(for: nodeID)
+                    ?? renderer.textEditingSession.currentFlushGeneration
+            guard let edit = renderer.textEditingSession.claimUnassignedEdit(
+                nodeID: nodeID,
+                text: text,
+                editSeq: editSeq,
+                laneEpoch: laneEpoch
+            ) else {
+                return nil
+            }
+            return (
+                edit,
+                drainCutoff,
+                self.interactionIncarnation,
+                self.interactionDispatchTail
+            )
+        }) ?? nil else {
             return
         }
 
-        let incarnation = interactionIncarnation
-        let predecessor = interactionDispatchTail
-        let dispatch = Task { [weak self] in
+        let (initialTextEdit, drainCutoff, incarnation, predecessor) = preparation
+        let dispatch = Task { @MainActor [weak self] in
             _ = await predecessor?.result
             guard let self else { return }
             guard !Task.isCancelled,
-                  self.interactionIncarnation == incarnation else {
-                self.renderer?.textEditingSession.releaseClaim(initialTextEdit)
+                  self.interactionIncarnation == incarnation,
+                  self.continuityContext.isActive(
+                      binding: ownership.binding,
+                      sessionIncarnation: ownership.sessionIncarnation
+                  ) else {
+                _ = self.continuityContext.performIfActive(
+                    binding: ownership.binding,
+                    sessionIncarnation: ownership.sessionIncarnation
+                ) {
+                    self.renderer?.textEditingSession.releaseClaim(initialTextEdit)
+                }
                 return
             }
             if let interceptor = self.interactionWillEnterOutboxForTesting {
@@ -941,14 +1240,11 @@ public final class SessionController: @unchecked Sendable {
                     initialEdit: initialTextEdit
                 )
             } catch {
-                // Before-admission failures leave the synchronous bridge intact for terminal
-                // handoff. A post-retention send failure is harmlessly re-staged by identity.
                 SessionDiagnostics.error("Interaction dispatch failed: \(error)")
             }
         }
         interactionDispatchTail = dispatch
     }
-
     private func validateSemanticAction(
         _ request: SemanticActionRequest,
         in snapshot: TransactionSnapshot
@@ -960,7 +1256,11 @@ public final class SessionController: @unchecked Sendable {
                 actual: state.epoch
             )
         }
-        guard state.isActive, let ownership = state.ownership else {
+        guard state.isActive, let ownership = state.ownership,
+              continuityContext.isActive(
+                  binding: ownership.binding,
+                  sessionIncarnation: ownership.sessionIncarnation
+              ) else {
             throw SemanticAutomationError.sessionInactive
         }
         // Every event admitted below comes from the canonical standard-widget registry.
@@ -1022,12 +1322,24 @@ public final class SessionController: @unchecked Sendable {
     ) throws -> Task<Event, Error> {
         let ownership = try validateSemanticAction(request, in: validationSnapshot)
 
-        // An action can end editing before its debounce fires. Flush synchronously so each
-        // recursive text callback appends itself to this same tail before the action captures it.
-        renderer?.textEditingSession.flushAllPending()
-        let drainCutoff = renderer?.textEditingSession.currentFlushGeneration ?? 0
-        let predecessor = interactionDispatchTail
-        let interactionIncarnation = interactionIncarnation
+        // An action can end editing before its debounce fires. Flush synchronously while
+        // this exact shared incarnation owns the editor callbacks, so each recursive text
+        // callback appends itself to the same tail before the action captures it.
+        guard let preparation = continuityContext.performIfActive(
+            binding: ownership.binding,
+            sessionIncarnation: ownership.sessionIncarnation,
+            { () -> (UInt64, Task<Void, Never>?, UInt64) in
+                renderer?.textEditingSession.flushAllPending()
+                return (
+                    renderer?.textEditingSession.currentFlushGeneration ?? 0,
+                    self.interactionDispatchTail,
+                    self.interactionIncarnation
+                )
+            }
+        ) else {
+            throw SemanticAutomationError.sessionInactive
+        }
+        let (drainCutoff, predecessor, interactionIncarnation) = preparation
 
         let operation: Task<Event, Error> = Task { @MainActor [weak self] in
             _ = await predecessor?.result
@@ -1154,6 +1466,10 @@ public final class SessionController: @unchecked Sendable {
         maxFlushGeneration: UInt64,
         initialEdit: LocalTextEdit? = nil
     ) async throws {
+        let ownership = SemanticActionOwnership(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
         var queuedEdit = initialEdit
         while true {
             let edit: LocalTextEdit
@@ -1164,15 +1480,22 @@ public final class SessionController: @unchecked Sendable {
                 guard withStateLock({
                     outboxConnectionBinding == binding
                         && outboxSessionIncarnation == sessionIncarnation
-                }) else {
+                }), continuityContext.isActive(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                ) else {
                     return
                 }
-                guard let claimed = await MainActor.run(body: { () -> LocalTextEdit? in
-                    guard self.interactionIncarnation == interactionIncarnation else { return nil }
+                guard let claimed = await performSharedMainActorMutationIfActive(
+                    ownership: ownership,
+                    { () -> LocalTextEdit? in
+                    guard self.interactionIncarnation == interactionIncarnation else {
+                        return nil
+                    }
                     return self.renderer?.textEditingSession.claimNextUnassignedEdit(
                         maxFlushGeneration: maxFlushGeneration
                     )
-                }) else {
+                }) ?? nil else {
                     return
                 }
                 edit = claimed
@@ -1184,8 +1507,11 @@ public final class SessionController: @unchecked Sendable {
                 guard withStateLock({
                     outboxConnectionBinding == binding
                         && outboxSessionIncarnation == sessionIncarnation
-                }) else {
-                    await MainActor.run {
+                }), continuityContext.isActive(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                ) else {
+                    _ = await performSharedMainActorMutationIfActive(ownership: ownership) {
                         self.renderer?.textEditingSession.releaseClaim(edit)
                     }
                     return
@@ -1195,12 +1521,15 @@ public final class SessionController: @unchecked Sendable {
                     binding: binding,
                     sessionIncarnation: sessionIncarnation
                 )
-                let snapshotStillValid = await MainActor.run { () -> Bool in
-                    guard self.interactionIncarnation == interactionIncarnation else { return false }
-                    return self.renderer?.textEditingSession.isSnapshotStillValid(edit) == true
-                }
+                let snapshotStillValid =
+                    await performSharedMainActorMutationIfActive(ownership: ownership) {
+                        guard self.interactionIncarnation == interactionIncarnation else {
+                            return false
+                        }
+                        return self.renderer?.textEditingSession.isSnapshotStillValid(edit) == true
+                    } ?? false
                 if !snapshotStillValid {
-                    await MainActor.run {
+                    _ = await performSharedMainActorMutationIfActive(ownership: ownership) {
                         self.renderer?.textEditingSession.releaseClaim(edit)
                     }
                     continue
@@ -1215,28 +1544,29 @@ public final class SessionController: @unchecked Sendable {
                     sessionIncarnation: sessionIncarnation,
                     via: transport
                 ) else {
-                    await MainActor.run {
+                    _ = await performSharedMainActorMutationIfActive(ownership: ownership) {
                         self.renderer?.textEditingSession.releaseClaim(edit)
                     }
                     continue
                 }
                 prepared = retained
-                let assigned = await MainActor.run { () -> Bool in
-                    guard self.interactionIncarnation == interactionIncarnation,
-                          self.withStateLock({
-                              self.outboxConnectionBinding == binding
-                                  && self.outboxSessionIncarnation == sessionIncarnation
-                          }) else {
-                        return false
-                    }
-                    return self.renderer?.textEditingSession.noteAssigned(
-                        retained.event,
-                        matching: edit
-                    ) == true
-                }
+                let assigned =
+                    await performSharedMainActorMutationIfActive(ownership: ownership) {
+                        guard self.interactionIncarnation == interactionIncarnation,
+                              self.withStateLock({
+                                  self.outboxConnectionBinding == binding
+                                      && self.outboxSessionIncarnation == sessionIncarnation
+                              }) else {
+                            return false
+                        }
+                        return self.renderer?.textEditingSession.noteAssigned(
+                            retained.event,
+                            matching: edit
+                        ) == true
+                    } ?? false
                 if !assigned {
                     let rejected = await outbox.rejectPreparedTextEdit(retained)
-                    await MainActor.run {
+                    _ = await performSharedMainActorMutationIfActive(ownership: ownership) {
                         self.renderer?.textEditingSession.releaseClaim(edit)
                     }
                     if rejected {
@@ -1248,7 +1578,7 @@ public final class SessionController: @unchecked Sendable {
                     await interceptor()
                 }
                 guard await outbox.authorizePreparedTextEdit(retained) else {
-                    await MainActor.run {
+                    _ = await performSharedMainActorMutationIfActive(ownership: ownership) {
                         self.renderer?.textEditingSession.restoreUnassigned(
                             edit,
                             from: retained.event
@@ -1262,7 +1592,7 @@ public final class SessionController: @unchecked Sendable {
                     continue
                 }
                 guard try await outbox.releasePreparedTextEdit(retained) != nil else {
-                    await MainActor.run {
+                    _ = await performSharedMainActorMutationIfActive(ownership: ownership) {
                         self.renderer?.textEditingSession.restoreUnassigned(
                             edit,
                             from: retained.event
@@ -1272,7 +1602,7 @@ public final class SessionController: @unchecked Sendable {
                 }
             } catch {
                 if prepared == nil {
-                    await MainActor.run {
+                    _ = await performSharedMainActorMutationIfActive(ownership: ownership) {
                         self.renderer?.textEditingSession.releaseClaim(edit)
                     }
                 }
@@ -1293,21 +1623,26 @@ public final class SessionController: @unchecked Sendable {
     }
 
     @MainActor
-    private func ensureActionHandlerWired() {
-        guard let renderer else { return }
-        wireActionHandler(for: renderer)
+    private func ensureActionHandlerWired(ownership: SemanticActionOwnership) {
+        guard let renderer = interactionRenderer ?? renderer else { return }
+        _ = continuityContext.performIfActive(
+            binding: ownership.binding,
+            sessionIncarnation: ownership.sessionIncarnation
+        ) {
+            self.wireActionHandler(for: renderer, ownership: ownership)
+        }
     }
 
     private func startRangeRequestPump() {
         stopRangeRequestPump()
         let (stream, continuation) = AsyncStream.makeStream(
-            of: CollectionRangeRequest.self
+            of: OwnedCollectionRangeRequest.self
         )
         rangeRequestContinuation = continuation
         rangeRequestTask = Task { [weak self] in
-            for await request in stream {
+            for await ownedRequest in stream {
                 guard let self, !Task.isCancelled else { break }
-                await self.sendCollectionRangeRequest(request)
+                await self.sendCollectionRangeRequest(ownedRequest)
             }
         }
     }
@@ -1319,10 +1654,29 @@ public final class SessionController: @unchecked Sendable {
         rangeRequestTask = nil
     }
 
-    private func sendCollectionRangeRequest(_ request: CollectionRangeRequest) async {
-        let allowed = withStateLock { allowsDataPlane(phase) && isRunning && !_isDiverged }
+    private func sendCollectionRangeRequest(
+        _ ownedRequest: OwnedCollectionRangeRequest
+    ) async {
+        defer { collectionRangeDispatchDidFinishForTesting?() }
+        let request = ownedRequest.request
+        let ownership = ownedRequest.ownership
+        guard let lease = await acquireSharedMutationLease(
+            binding: ownership.binding,
+            sessionIncarnation: ownership.sessionIncarnation
+        ) else {
+            return
+        }
+        defer { continuityContext.releaseMutation(lease) }
+
+        let allowed = withStateLock {
+            allowsDataPlane(phase)
+                && isRunning
+                && !_isDiverged
+                && outboxConnectionBinding == ownership.binding
+                && outboxSessionIncarnation == ownership.sessionIncarnation
+        }
         guard allowed else {
-            await noteDroppedCollectionRange(request)
+            await noteDroppedCollectionRange(request, ownership: ownership)
             return
         }
 
@@ -1341,14 +1695,22 @@ public final class SessionController: @unchecked Sendable {
                 logicalClass: .ui
             )
         } catch {
-            await noteDroppedCollectionRange(request)
+            await noteDroppedCollectionRange(request, ownership: ownership)
             SessionDiagnostics.error("Collection range request send failed: \(error)")
         }
     }
 
-    private func noteDroppedCollectionRange(_ request: CollectionRangeRequest) async {
+    private func noteDroppedCollectionRange(
+        _ request: CollectionRangeRequest,
+        ownership: SemanticActionOwnership
+    ) async {
         await MainActor.run {
-            self.renderer?.noteDroppedCollectionRange(request)
+            _ = self.continuityContext.performIfActive(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation
+            ) {
+                self.renderer?.noteDroppedCollectionRange(request)
+            }
         }
     }
 
@@ -1358,9 +1720,14 @@ public final class SessionController: @unchecked Sendable {
     /// `.awaitingWelcome`, so this waits until the session becomes `.active`.
     private func reissueCollectionRangeRequestsIfAllowed() async {
         let allowed = withStateLock { allowsDataPlane(phase) && isRunning && !_isDiverged }
-        guard allowed else { return }
+        guard allowed, let ownership = currentSharedOwnership() else { return }
         await MainActor.run {
-            self.renderer?.reissueCollectionRangeRequests()
+            _ = self.continuityContext.performIfActive(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation
+            ) {
+                self.renderer?.reissueCollectionRangeRequests()
+            }
         }
     }
 
@@ -1455,8 +1822,11 @@ public final class SessionController: @unchecked Sendable {
 
         do {
             let connectionBinding = try await outbox.beginConnectionBindingUnlessCancelled {
-                [continuityContext] binding in
-                continuityContext.activate(binding: binding)
+                [continuityContext] binding, sessionIncarnation in
+                await continuityContext.activate(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                )
             }
             acquiredConnectionBinding = connectionBinding
             let retainedBinding = withStateLock { () -> Bool in
@@ -1503,35 +1873,29 @@ public final class SessionController: @unchecked Sendable {
             }
 
             await MainActor.run {
-                ensureActionHandlerWired()
+                let ownership = SemanticActionOwnership(
+                    binding: connectionBinding,
+                    sessionIncarnation: sessionIncarnation
+                )
+                _ = self.continuityContext.performIfActive(
+                    binding: ownership.binding,
+                    sessionIncarnation: ownership.sessionIncarnation
+                ) {
+                    self.renderer?.textEditingSession
+                        .releaseUnassignedClaimsForConnectionTransition()
+                }
+                ensureActionHandlerWired(ownership: ownership)
             }
             guard ownsRunningLifecycle(lifecycleGeneration) else {
                 throw SessionFailure.superseded("start lost lifecycle ownership before handshake")
             }
 
             let clientInstanceId = outbox.clientInstanceId
-            let resumeNeedsNamespaceMapping = renderer != nil
-                && committedStoreContainsExtensionNodes()
-            let (requestedId, abandonedUnresumableSession) = withStateLock {
-                () -> (String?, Bool) in
-                let requestedId = currentSessionId ?? requestedSessionId
-                guard requestedId != nil else { return (nil, false) }
-
-                // A controller-local welcome is the only authoritative source for negotiated
-                // profiles and session-assigned extension namespaces. A recreated controller can
-                // safely resume standard-only state, but must use a fresh hello when it needs
-                // profile validation or Terminal registration and no negotiation was retained.
-                let requiresFreshNegotiation = retainedCapabilities == nil
-                    && (!requiredServerProfiles.isEmpty || resumeNeedsNamespaceMapping)
-                if requiresFreshNegotiation {
-                    currentSessionId = nil
-                    self.requestedSessionId = nil
-                    return (nil, true)
-                }
-                return (requestedId, false)
-            }
-            if abandonedUnresumableSession {
-                await discardReplicaForFreshNegotiation()
+            // Resume responses re-advertise server-authoritative profiles and namespace mappings
+            // before replay/snapshot traffic. A recreated process can therefore attempt resume
+            // without trusting controller-local negotiation metadata.
+            let requestedId = withStateLock {
+                currentSessionId ?? requestedSessionId
             }
             let limits = makeClientLimits()
             let knownResourceHashes = await resourceCache.knownHashes().map(\.bytes)
@@ -1574,6 +1938,8 @@ public final class SessionController: @unchecked Sendable {
                 var resume = SRUIClientResume()
                 resume.sessionID = requestedId
                 resume.clientInstanceID = clientInstanceId.bytes
+                resume.coreVersion = SRUICoreVersion
+                resume.profiles = clientCapabilities.toStringArray()
                 resume.lastAppliedRevision = lastAppliedRevision
                 resume.lastAckedEventSeq = await outbox.lastAckedEventSeq
                 resume.limits = limits
@@ -1668,7 +2034,12 @@ public final class SessionController: @unchecked Sendable {
                 )
             }
 
-            await terminalPump.attach(transport: transport)
+            await terminalPump.attach(
+                sendIfAuthorized: terminalCommandSender(
+                    binding: connectionBinding,
+                    sessionIncarnation: sessionIncarnation
+                )
+            )
 
             // The detached loop waits behind this gate until its task is published under the
             // lifecycle lock. A concurrent stop therefore either owns and awaits the task, or
@@ -1802,17 +2173,37 @@ public final class SessionController: @unchecked Sendable {
     /// `interactionDispatchTail`. Capturing that tail on the same MainActor hop is required:
     /// the later inline drain skips claimed identities, so returning without waiting would
     /// allocate the non-text event first.
-    private func flushPendingTextForManualNonTextInteraction() async -> UInt64 {
-        let (drainCutoff, predecessor) = await MainActor.run {
-            () -> (UInt64, Task<Void, Never>?) in
-            self.renderer?.textEditingSession.flushAllPending()
-            return (
-                self.renderer?.textEditingSession.currentFlushGeneration ?? 0,
-                self.interactionDispatchTail
-            )
+    private func flushPendingTextForManualNonTextInteraction(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async throws -> UInt64 {
+        let ownership = SemanticActionOwnership(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
+        guard let preparation = await performSharedMainActorMutationIfActive(
+            ownership: ownership,
+            { () -> (UInt64, Task<Void, Never>?) in
+                self.renderer?.textEditingSession.flushAllPending()
+                return (
+                    self.renderer?.textEditingSession.currentFlushGeneration ?? 0,
+                    self.interactionDispatchTail
+                )
+            }
+        ) else {
+            throw SessionDispatchError.resumeNotConfirmed
         }
-        _ = await predecessor?.result
-        return drainCutoff
+        _ = await preparation.1?.result
+        guard continuityContext.isActive(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ), withStateLock({
+            outboxConnectionBinding == binding
+                && outboxSessionIncarnation == sessionIncarnation
+        }) else {
+            throw SessionDispatchError.resumeNotConfirmed
+        }
+        return preparation.0
     }
 
     /// Dispatches a manual activation event for the given node ID (§7.7).
@@ -1834,7 +2225,10 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
-        let drainCutoff = await flushPendingTextForManualNonTextInteraction()
+        let drainCutoff = try await flushPendingTextForManualNonTextInteraction(
+            binding: ownership.0,
+            sessionIncarnation: ownership.1
+        )
         return try await sendActivate(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
@@ -1906,7 +2300,10 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
-        let drainCutoff = await flushPendingTextForManualNonTextInteraction()
+        let drainCutoff = try await flushPendingTextForManualNonTextInteraction(
+            binding: ownership.0,
+            sessionIncarnation: ownership.1
+        )
         return try await sendValueChanged(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
@@ -1981,7 +2378,10 @@ public final class SessionController: @unchecked Sendable {
         if let interceptor = interactionWillEnterOutboxForTesting {
             await interceptor()
         }
-        let drainCutoff = await flushPendingTextForManualNonTextInteraction()
+        let drainCutoff = try await flushPendingTextForManualNonTextInteraction(
+            binding: ownership.0,
+            sessionIncarnation: ownership.1
+        )
         return try await sendSelectionChanged(
             nodeId: nodeId,
             observedRevision: snapshot.revision,
@@ -2129,7 +2529,16 @@ public final class SessionController: @unchecked Sendable {
                 rejectedPhase = currentPhase
                 return nil
             }
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                rejectedPhase = currentPhase
+                return nil
+            }
             let generation = lifecycleGeneration
+            let ownership = SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
             let predecessor = transactionIngressTail
             let task = Task { [weak self] in
                 guard let self else { return }
@@ -2137,7 +2546,8 @@ public final class SessionController: @unchecked Sendable {
                     wireTransaction,
                     taskID: taskID,
                     predecessor: predecessor,
-                    lifecycleGeneration: generation
+                    lifecycleGeneration: generation,
+                    ownership: ownership
                 )
             }
             transactionIngressTasks[taskID] = task
@@ -2157,7 +2567,8 @@ public final class SessionController: @unchecked Sendable {
         _ wireTransaction: SRUITransaction,
         taskID: UUID,
         predecessor: Task<Void, Never>?,
-        lifecycleGeneration: UInt64
+        lifecycleGeneration: UInt64,
+        ownership: SemanticActionOwnership
     ) async {
         defer { finishQueuedTransaction(taskID) }
         await predecessor?.value
@@ -2166,7 +2577,7 @@ public final class SessionController: @unchecked Sendable {
         }
 
         do {
-            try await transactionIngressGate.waitForAdmission()
+            guard try await waitForTransactionAdmission(ownership: ownership) else { return }
         } catch is CancellationError {
             // Teardown cancelled the wait. The transaction is intentionally dropped along with the
             // rest of the connection; there is no replica to diverge from.
@@ -2183,10 +2594,37 @@ public final class SessionController: @unchecked Sendable {
 
         guard !Task.isCancelled,
               ownsTransactionIngressLifecycle(lifecycleGeneration),
+              continuityContext.isActive(
+                  binding: ownership.binding,
+                  sessionIncarnation: ownership.sessionIncarnation
+              ),
               allowsDataPlane(withStateLock({ phase })) else {
             return
         }
         await handleTransaction(wireTransaction)
+    }
+
+    private func waitForTransactionAdmission(
+        ownership: SemanticActionOwnership
+    ) async throws -> Bool {
+        while true {
+            try Task.checkCancellation()
+            guard let lease = await acquireSharedMutationLease(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation
+            ) else {
+                return false
+            }
+            let admission = await transactionIngressGate.admissionAttempt()
+            continuityContext.releaseMutation(lease)
+
+            switch admission {
+            case .admitted:
+                return true
+            case .wait(let nanoseconds):
+                try await Task.sleep(for: .nanoseconds(Int64(nanoseconds)))
+            }
+        }
     }
 
     private func finishQueuedTransaction(_ taskID: UUID) {
@@ -2256,8 +2694,20 @@ public final class SessionController: @unchecked Sendable {
     /// the same `transactionIngressGate` it gave the original, alongside the shared `outbox` and
     /// `resourceCache`. A replacement that constructs its own gate starts at full capacity and
     /// reopens exactly the hole this method exists to close.
-    private func adoptFreshSessionIngressBudget() async {
+    @discardableResult
+    private func adoptFreshSessionIngressBudget(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        guard let lease = await acquireSharedMutationLease(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return false
+        }
+        defer { continuityContext.releaseMutation(lease) }
         await transactionIngressGate.reset()
+        return true
     }
 
     /// Test seam for the budget's scope: whole transactions of ingress credit still available.
@@ -2265,6 +2715,19 @@ public final class SessionController: @unchecked Sendable {
     /// wall-clock timing, not as part of the client API.
     var availableTransactionIngressCredit: UInt64 {
         get async { await transactionIngressGate.availableTokens() }
+    }
+
+    var retainedTerminalResizeCountForTesting: Int {
+        get async { await terminalPump.retainedResizeCountForTesting }
+    }
+
+    func waitForTerminalCommandDrainForTesting() async {
+        await terminalPump.waitUntilIdleForTesting()
+    }
+
+    func waitForInteractionDispatchForTesting() async {
+        let tail = await MainActor.run { self.interactionDispatchTail }
+        await tail?.value
     }
 
     /// Test seam for the queue-depth bound: decoded transactions currently parked on the lane.
@@ -2332,8 +2795,11 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
+                guard let ownership = currentSharedOwnership() else { return }
                 do {
-                    try await transactionIngressGate.waitForAdmission()
+                    guard try await waitForTransactionAdmission(ownership: ownership) else {
+                        return
+                    }
                 } catch is CancellationError {
                     return
                 } catch {
@@ -2342,7 +2808,12 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                guard allowsDataPlane(withStateLock({ self.phase })) else { return }
+                guard continuityContext.isActive(
+                    binding: ownership.binding,
+                    sessionIncarnation: ownership.sessionIncarnation
+                ), allowsDataPlane(withStateLock({ self.phase })) else {
+                    return
+                }
                 await handleTransaction(transaction)
             }
 
@@ -2515,17 +2986,28 @@ public final class SessionController: @unchecked Sendable {
             ))
             return
         }
-        await adoptFreshSessionIngressBudget()
+        guard let sessionIncarnation = withStateLock({ outboxSessionIncarnation }),
+              await adoptFreshSessionIngressBudget(
+                  binding: connectionBinding,
+                  sessionIncarnation: sessionIncarnation
+              ) else {
+            await reportFailure(.superseded(
+                "SERVER WELCOME lost shared ingress-budget ownership"
+            ))
+            return
+        }
 
-        // A revision-zero WELCOME carries no snapshot (§18), which makes it the authoritative
-        // statement that the new session holds no state. Anything left in the replica belongs to
-        // a session this controller no longer has, and `start()` cannot always see that: a resume
-        // that failed unanswered erases the session identity, so the next start finds nothing to
-        // abandon and never reaches its own discard. Emptying here — before the phase turns active
-        // — is the one point every path passes through, so no stale control survives to emit
-        // events for nodes the new server never created (§4 inv. 13).
-        if welcome.initialRevision == 0 {
-            await discardReplicaForFreshNegotiation()
+        // Every fresh WELCOME abandons the prior session's semantic and Terminal state.
+        // A positive initial revision still waits for an authoritative snapshot, so leaving old
+        // Terminal offsets or mounted controls visible until that snapshot arrives is unsafe.
+        guard await discardReplicaForFreshNegotiation(
+            binding: connectionBinding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            await reportFailure(.superseded(
+                "SERVER WELCOME lost shared replica-discard ownership"
+            ))
+            return
         }
 
         withStateLock {
@@ -2552,7 +3034,8 @@ public final class SessionController: @unchecked Sendable {
                 welcome.extensionNamespaces,
                 negotiated: negotiated,
                 terminalRequired: serverRequired.contains(.terminalV1),
-                binding: connectionBinding
+                binding: connectionBinding,
+                sessionIncarnation: sessionIncarnation
             )
         } catch {
             await reportFailure(.protocolViolation("\(error)"))
@@ -2598,8 +3081,11 @@ public final class SessionController: @unchecked Sendable {
         let binding: EventOutboxConnectionBinding
         do {
             binding = try await outbox.beginConnectionBindingUnlessCancelled {
-                [continuityContext] binding in
-                continuityContext.activate(binding: binding)
+                [continuityContext] binding, sessionIncarnation in
+                await continuityContext.activate(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                )
             }
         } catch {
             return nil
@@ -2621,6 +3107,56 @@ public final class SessionController: @unchecked Sendable {
             outboxSessionIncarnation = sessionIncarnation
         }
         return binding
+    }
+
+    private func validatedResumeNegotiation(
+        requiredProfiles: [String],
+        optionalProfiles: [String],
+        extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping],
+        context: String
+    ) throws -> (
+        negotiated: CapabilitySet,
+        terminalRequired: Bool,
+        extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping]
+    )? {
+        let advertised = !requiredProfiles.isEmpty
+            || !optionalProfiles.isEmpty
+            || !extensionNamespaces.isEmpty
+        guard advertised else { return nil }
+
+        let serverRequired: CapabilitySet
+        do {
+            serverRequired = try CapabilitySet.fromStrings(requiredProfiles)
+        } catch {
+            throw SessionFailure.protocolViolation(
+                "\(context) required_profiles could not be parsed: \(error)"
+            )
+        }
+        let serverOptional = CapabilitySet.fromValidStrings(optionalProfiles)
+        let negotiated: CapabilitySet
+        do {
+            negotiated = try CapabilitySet.negotiate(
+                clientOffered: clientCapabilities,
+                serverRequired: serverRequired,
+                serverOptional: serverOptional
+            )
+        } catch {
+            throw SessionFailure.protocolViolation(
+                "\(context) capability negotiation failed: \(error)"
+            )
+        }
+        guard requiredServerProfiles.isEmpty
+                || negotiated.isSuperset(of: requiredServerProfiles) else {
+            let missing = requiredServerProfiles.subtracting(negotiated)
+            throw SessionFailure.protocolViolation(
+                "\(context) does not satisfy client required profiles: \(missing)"
+            )
+        }
+        return (
+            negotiated,
+            serverRequired.contains(.terminalV1),
+            extensionNamespaces
+        )
     }
 
     private func handleResumeOk(_ resumeOk: SRUIServerResumeOk) async {
@@ -2653,6 +3189,39 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
+        let negotiated: CapabilitySet
+        do {
+            if let advertisement = try validatedResumeNegotiation(
+                requiredProfiles: resumeOk.requiredProfiles,
+                optionalProfiles: resumeOk.optionalProfiles,
+                extensionNamespaces: resumeOk.extensionNamespaces,
+                context: "SERVER RESUME_OK"
+            ) {
+                try await applyExtensionNamespaces(
+                    advertisement.extensionNamespaces,
+                    negotiated: advertisement.negotiated,
+                    terminalRequired: advertisement.terminalRequired,
+                    binding: connectionBinding,
+                    sessionIncarnation: sessionIncarnation
+                )
+                negotiated = advertisement.negotiated
+            } else if let retained = withStateLock({ retainedCapabilities }) {
+                negotiated = retained
+            } else if requiredServerProfiles.isEmpty
+                        && !committedStoreContainsExtensionNodes() {
+                // Legacy 0.5 peers omitted resume metadata. The standard registry is fixed and
+                // can be resumed without session-assigned TypeRefs; extensions still fail closed.
+                negotiated = CapabilitySet([Profile.standardWidgetsV1])
+            } else {
+                throw SessionFailure.protocolViolation(
+                    "SERVER RESUME_OK omitted cold-resume negotiation metadata"
+                )
+            }
+        } catch {
+            await reportFailure((error as? SessionFailure) ?? .protocolViolation("\(error)"))
+            return
+        }
+
         do {
             guard let preparation = try await outbox.prepareSameSessionResume(
                 id: resumeOk.sessionID,
@@ -2666,20 +3235,26 @@ public final class SessionController: @unchecked Sendable {
                 )
                 return
             }
-            let adoptedAssignments = await MainActor.run { () -> Bool in
-                guard self.withStateLock({
-                    self.outboxConnectionBinding == preparation.binding
-                        && self.outboxSessionIncarnation == preparation.sessionIncarnation
-                        && self.resumeGeneration == preparation.generation
-                }) else {
-                    return false
-                }
-                self.reconcileFrontierSettledTextEdits(
-                    preparation.frontierSettledTextEdits
-                )
-                self.noteAssignedTextEdits(preparation.assignedTextEdits)
-                return true
-            }
+            let adoptedAssignments =
+                await performSharedMainActorMutationIfActive(
+                    ownership: SemanticActionOwnership(
+                        binding: preparation.binding,
+                        sessionIncarnation: preparation.sessionIncarnation
+                    )
+                ) { () -> Bool in
+                    guard self.withStateLock({
+                        self.outboxConnectionBinding == preparation.binding
+                            && self.outboxSessionIncarnation == preparation.sessionIncarnation
+                            && self.resumeGeneration == preparation.generation
+                    }) else {
+                        return false
+                    }
+                    self.reconcileFrontierSettledTextEdits(
+                        preparation.frontierSettledTextEdits
+                    )
+                    self.noteAssignedTextEdits(preparation.assignedTextEdits)
+                    return true
+                } ?? false
             guard adoptedAssignments else {
                 await failRefusedResumeDecision(
                     generation,
@@ -2733,7 +3308,6 @@ public final class SessionController: @unchecked Sendable {
             generation,
             lifecycleGeneration: lifecycleGeneration
         ) {
-            let negotiated = self.retainedCapabilities ?? self.clientCapabilities
             self.currentSessionId = resumeOk.sessionID
             self.requestedSessionId = nil
             self.resumeGeneration = nil
@@ -2873,12 +3447,13 @@ public final class SessionController: @unchecked Sendable {
     }
 
     private func handleResyncRequired(_ resync: SRUIServerResyncRequired, phase: ProtocolPhase) async {
-        let negotiated: CapabilitySet
+        let phaseNegotiated: CapabilitySet
         switch phase {
         case .active(let caps), .awaitingSnapshot(let caps):
-            negotiated = caps
+            phaseNegotiated = caps
         case .awaitingResume:
-            negotiated = withStateLock { retainedCapabilities ?? clientCapabilities }
+            phaseNegotiated = withStateLock({ retainedCapabilities })
+                ?? CapabilitySet([Profile.standardWidgetsV1])
         case .idle, .awaitingWelcome, .failed:
             await reportFailure(.protocolViolation(
                 "Received SERVER RESYNC_REQUIRED before handshake completed"
@@ -2908,6 +3483,32 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
+        let responseNegotiation: (
+            negotiated: CapabilitySet,
+            terminalRequired: Bool,
+            extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping]
+        )?
+        do {
+            responseNegotiation = try validatedResumeNegotiation(
+                requiredProfiles: resync.requiredProfiles,
+                optionalProfiles: resync.optionalProfiles,
+                extensionNamespaces: resync.extensionNamespaces,
+                context: "SERVER RESYNC_REQUIRED"
+            )
+        } catch {
+            await reportFailure((error as? SessionFailure) ?? .protocolViolation("\(error)"))
+            return
+        }
+        let negotiated = responseNegotiation?.negotiated ?? phaseNegotiated
+        if case .awaitingResume = phase, responseNegotiation == nil,
+           withStateLock({ retainedCapabilities }) == nil,
+           (!requiredServerProfiles.isEmpty || committedStoreContainsExtensionNodes()) {
+            await reportFailure(.protocolViolation(
+                "SERVER RESYNC_REQUIRED omitted cold-resume negotiation metadata"
+            ))
+            return
+        }
+
         if let requested, let generation {
             switch resync.continuity {
             case .sameSession:
@@ -2918,6 +3519,15 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
+                    if let responseNegotiation {
+                        try await applyExtensionNamespaces(
+                            responseNegotiation.extensionNamespaces,
+                            negotiated: responseNegotiation.negotiated,
+                            terminalRequired: responseNegotiation.terminalRequired,
+                            binding: connectionBinding,
+                            sessionIncarnation: sessionIncarnation
+                        )
+                    }
                     guard let preparation = try await outbox.prepareSameSessionResume(
                         id: resync.sessionID,
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
@@ -2926,7 +3536,11 @@ public final class SessionController: @unchecked Sendable {
                         discardedTextEdits: resync.discardedTextEdits,
                         requireExactTextMatch: true,
                         onTextEditsCanceled: { [weak self] descriptors in
-                            self?.noteCanceledTextEdits(descriptors)
+                            self?.noteCanceledTextEdits(
+                                descriptors,
+                                binding: connectionBinding,
+                                sessionIncarnation: sessionIncarnation
+                            )
                         }
                     ) else {
                         await failRefusedResumeDecision(
@@ -2935,17 +3549,24 @@ public final class SessionController: @unchecked Sendable {
                         )
                         return
                     }
-                    let adoptedAssignments = await MainActor.run { () -> Bool in
-                        guard self.withStateLock({
-                            self.outboxConnectionBinding == preparation.binding
-                                && self.outboxSessionIncarnation == preparation.sessionIncarnation
-                                && self.resumeGeneration == preparation.generation
-                        }) else {
-                            return false
-                        }
-                        self.noteAssignedTextEdits(preparation.assignedTextEdits)
-                        return true
-                    }
+                    let adoptedAssignments =
+                        await performSharedMainActorMutationIfActive(
+                            ownership: SemanticActionOwnership(
+                                binding: preparation.binding,
+                                sessionIncarnation: preparation.sessionIncarnation
+                            )
+                        ) { () -> Bool in
+                            guard self.withStateLock({
+                                self.outboxConnectionBinding == preparation.binding
+                                    && self.outboxSessionIncarnation
+                                        == preparation.sessionIncarnation
+                                    && self.resumeGeneration == preparation.generation
+                            }) else {
+                                return false
+                            }
+                            self.noteAssignedTextEdits(preparation.assignedTextEdits)
+                            return true
+                        } ?? false
                     guard adoptedAssignments else {
                         await failRefusedResumeDecision(
                             generation,
@@ -2998,11 +3619,13 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                guard let replacementCapabilities = await validatedReplacementCapabilities(
-                    from: negotiated
-                ) else {
+                guard let responseNegotiation else {
+                    await reportFailure(.protocolViolation(
+                        "replacement resync omitted negotiation metadata for its new session"
+                    ))
                     return
                 }
+                let replacementCapabilities = responseNegotiation.negotiated
                 let accepted = await outbox.prepareReplacedSession(
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq,
@@ -3021,23 +3644,47 @@ public final class SessionController: @unchecked Sendable {
                     )
                     return
                 }
-                guard adoptReplacementCapabilities(
-                    replacementCapabilities,
-                    binding: connectionBinding
+                guard let replacementSessionIncarnation = withStateLock({
+                    outboxSessionIncarnation
+                }), await continuityContext.advanceSessionIncarnationIfActive(
+                    binding: connectionBinding,
+                    from: sessionIncarnation,
+                    to: replacementSessionIncarnation
                 ) else {
                     await failRefusedResumeDecision(
                         generation,
-                        "replacement resync lost negotiation continuity ownership"
+                        "replacement resync lost shared incarnation ownership"
                     )
                     return
                 }
-                await adoptFreshSessionIngressBudget()
-                // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
-                if let renderer {
-                    await renderer.terminalSession.resetForReplacementSession()
-                    await MainActor.run { renderer.resetExtensionRegistry() }
+                guard await adoptFreshSessionIngressBudget(
+                    binding: connectionBinding,
+                    sessionIncarnation: replacementSessionIncarnation
+                ), await resetSharedStateForReplacement(
+                    binding: connectionBinding,
+                    sessionIncarnation: replacementSessionIncarnation
+                ) else {
+                    await failRefusedResumeDecision(
+                        generation,
+                        "replacement resync lost shared reset ownership"
+                    )
+                    return
                 }
-                await terminalPump.prune(retainedStreamIDs: [])
+                do {
+                    try await applyExtensionNamespaces(
+                        responseNegotiation.extensionNamespaces,
+                        negotiated: replacementCapabilities,
+                        terminalRequired: responseNegotiation.terminalRequired,
+                        binding: connectionBinding,
+                        sessionIncarnation: replacementSessionIncarnation
+                    )
+                } catch {
+                    await reportFailure(
+                        (error as? SessionFailure) ?? .protocolViolation("\(error)")
+                    )
+                    return
+                }
+                // Replacement tears down in-flight resource assemblies; committed CAS is retained (§14, §18).
                 guard await resourceCache.clearPartials(
                     ownerEpoch: connectionBinding.resourceOwnershipEpoch
                 ) else {
@@ -3081,11 +3728,24 @@ public final class SessionController: @unchecked Sendable {
                     return
                 }
                 do {
+                    if let responseNegotiation {
+                        try await applyExtensionNamespaces(
+                            responseNegotiation.extensionNamespaces,
+                            negotiated: responseNegotiation.negotiated,
+                            terminalRequired: responseNegotiation.terminalRequired,
+                            binding: connectionBinding,
+                            sessionIncarnation: sessionIncarnation
+                        )
+                    }
                     switch try await outbox.applyLiveSameSessionResync(
                         lastProcessedEventSeq: resync.lastProcessedEventSeq,
                         binding: connectionBinding,
                         onTextEditsCanceled: { [weak self] descriptors in
-                            self?.noteCanceledTextEdits(descriptors)
+                            self?.noteCanceledTextEdits(
+                                descriptors,
+                                binding: connectionBinding,
+                                sessionIncarnation: sessionIncarnation
+                            )
                         }
                     ) {
                     case .applied:
@@ -3122,11 +3782,13 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                guard let replacementCapabilities = await validatedReplacementCapabilities(
-                    from: negotiated
-                ) else {
+                guard let responseNegotiation else {
+                    await reportFailure(.protocolViolation(
+                        "live replacement resync omitted negotiation metadata for its new session"
+                    ))
                     return
                 }
+                let replacementCapabilities = responseNegotiation.negotiated
                 guard await outbox.applyReplacementFrontier(
                     id: resync.sessionID,
                     lastProcessedEventSeq: resync.lastProcessedEventSeq,
@@ -3142,19 +3804,43 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                guard adoptReplacementCapabilities(
-                    replacementCapabilities,
-                    binding: connectionBinding
+                guard let replacementSessionIncarnation = withStateLock({
+                    outboxSessionIncarnation
+                }), await continuityContext.advanceSessionIncarnationIfActive(
+                    binding: connectionBinding,
+                    from: sessionIncarnation,
+                    to: replacementSessionIncarnation
                 ) else {
                     await reportFailure(.superseded(
-                        "live replacement resync lost negotiation continuity ownership"
+                        "live replacement resync lost shared incarnation ownership"
                     ))
                     return
                 }
-                await adoptFreshSessionIngressBudget()
-                if let renderer {
-                    await renderer.terminalSession.resetForReplacementSession()
-                    await MainActor.run { renderer.resetExtensionRegistry() }
+                guard await adoptFreshSessionIngressBudget(
+                    binding: connectionBinding,
+                    sessionIncarnation: replacementSessionIncarnation
+                ), await resetSharedStateForReplacement(
+                    binding: connectionBinding,
+                    sessionIncarnation: replacementSessionIncarnation
+                ) else {
+                    await reportFailure(.superseded(
+                        "live replacement resync lost shared reset ownership"
+                    ))
+                    return
+                }
+                do {
+                    try await applyExtensionNamespaces(
+                        responseNegotiation.extensionNamespaces,
+                        negotiated: replacementCapabilities,
+                        terminalRequired: responseNegotiation.terminalRequired,
+                        binding: connectionBinding,
+                        sessionIncarnation: replacementSessionIncarnation
+                    )
+                } catch {
+                    await reportFailure(
+                        (error as? SessionFailure) ?? .protocolViolation("\(error)")
+                    )
+                    return
                 }
                 guard await resourceCache.clearPartials(
                     ownerEpoch: connectionBinding.resourceOwnershipEpoch
@@ -3194,90 +3880,94 @@ public final class SessionController: @unchecked Sendable {
         )
     }
 
-    /// A replacement incarnation has not negotiated extension profiles or session-local IDs.
+    /// Drops semantic, Terminal, and native state that a fresh session cannot inherit.
     ///
-    /// Standard widgets remain usable because their namespace is fixed. Any client-required
-    /// extension instead makes the replacement unusable until a fresh WELCOME supplies both the
-    /// profile result and its session-assigned namespace.
-    private func validatedReplacementCapabilities(
-        from negotiated: CapabilitySet
-    ) async -> CapabilitySet? {
-        let baseCapabilities = CapabilitySet(
-            negotiated.filter { $0.name == StandardProfiles.standardWidgets }
-        )
-        guard baseCapabilities.isSuperset(of: requiredServerProfiles) else {
-            let missing = requiredServerProfiles.subtracting(baseCapabilities)
-            requireFreshHelloOnReconnect()
-            await reportFailure(.protocolViolation(
-                "replacement session cannot satisfy client required profiles \(missing); "
-                    + "reconnect must use CLIENT_HELLO/SERVER_WELCOME"
-            ))
-            return nil
-        }
-        return baseCapabilities
-    }
-
-    @discardableResult
-    private func adoptReplacementCapabilities(
-        _ capabilities: CapabilitySet,
-        binding: EventOutboxConnectionBinding
-    ) -> Bool {
-        guard continuityContext.updateNegotiationIfActive(
+    /// This runs for every fresh WELCOME. Revision zero has no snapshot, while a positive initial
+    /// revision awaits one; neither state may expose controls, Terminal offsets, or queued PTY
+    /// commands from the abandoned session in the meantime.
+    private func discardReplicaForFreshNegotiation(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        guard let lease = await acquireSharedMutationLease(
             binding: binding,
-            capabilities: capabilities,
-            terminalTypeRef: nil
+            sessionIncarnation: sessionIncarnation
         ) else {
             return false
         }
-        withStateLock {
-            retainedCapabilities = capabilities
-            negotiatedTerminalTypeRef = nil
+        defer { continuityContext.releaseMutation(lease) }
+
+        let hadReplica = applier.lastAppliedRevision > .initial
+            || !applier.currentSnapshot.store.rootIDs.isEmpty
+        if hadReplica {
+            applier.resetReplica()
+        }
+        let emptyStore = applier.currentSnapshot.store
+        await terminalPump.prune(retainedStreamIDs: [])
+        if let renderer {
+            await renderer.terminalSession.resetForReplacementSession()
+        }
+        await MainActor.run {
+            self.advanceInteractionIncarnation()
+            self.renderer?.textEditingSession.resetForReplacementSession()
+            self.renderer?.resetExtensionRegistry()
+            // An empty store unmounts every surface; the next session mounts from its own state.
+            if hadReplica {
+                try? self.renderer?.attach(store: emptyStore)
+            }
+            self.hasMountedInitialTree = false
+            self.lastRenderedRevision = 0
+        }
+        SessionDiagnostics.log("Discarded state from the abandoned session before fresh negotiation")
+        return true
+    }
+
+    private func resetSharedStateForReplacement(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        guard let lease = await acquireSharedMutationLease(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return false
+        }
+        defer { continuityContext.releaseMutation(lease) }
+        await terminalPump.resetForReplacementSession(
+            sendIfAuthorized: terminalCommandSender(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        )
+        if let renderer {
+            await renderer.terminalSession.resetForReplacementSession()
+            await MainActor.run {
+                renderer.resetExtensionRegistry()
+            }
         }
         return true
     }
 
-    /// Drops replica state that the fresh CLIENT_HELLO replacing an abandoned session cannot repair.
-    ///
-    /// A revision-zero `SERVER WELCOME` deliberately carries no snapshot (§18), so a controller
-    /// that shares a nonempty applier would otherwise keep the abandoned session's store and its
-    /// mounted windows alive across the hello: active controls that can emit events for nodes the
-    /// new server has never heard of (§4 inv. 13).
-    ///
-    /// Called from two points, both before anything can observe the stale tree as current:
-    /// `start()` discards as soon as it decides a session cannot be resumed — the Terminal case,
-    /// where `resumeNeedsNamespaceMapping` forces renegotiation — and `handleWelcome` discards on
-    /// any revision-zero welcome, which also covers the paths `start()` cannot see, such as a
-    /// resume that failed unanswered and erased the session identity before the next start.
-    /// Idempotent: an already-empty replica returns immediately.
-    private func discardReplicaForFreshNegotiation() async {
-        guard applier.lastAppliedRevision > .initial else { return }
-        applier.resetReplica()
-        let emptyStore = applier.currentSnapshot.store
-        await MainActor.run {
-            self.advanceInteractionIncarnation()
-            self.renderer?.textEditingSession.resetForReplacementSession()
-            // An empty store unmounts every surface; the next session mounts from its own state.
-            try? self.renderer?.attach(store: emptyStore)
-            self.hasMountedInitialTree = false
-            self.lastRenderedRevision = 0
-        }
-        SessionDiagnostics.log(
-            "Discarded replica state for a session that can only be renegotiated with CLIENT_HELLO"
-        )
-    }
-
     /// Invalidates resume identity when only a fresh WELCOME can restore required semantics.
     private func requireFreshHelloOnReconnect() {
-        let binding = withStateLock { () -> EventOutboxConnectionBinding? in
+        let ownership = withStateLock { () -> SemanticActionOwnership? in
             currentSessionId = nil
             requestedSessionId = nil
             retainedCapabilities = nil
             negotiatedTerminalTypeRef = nil
-            return outboxConnectionBinding
-        }
-        if let binding {
-            _ = continuityContext.updateNegotiationIfActive(
+            guard let binding = outboxConnectionBinding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return SemanticActionOwnership(
                 binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+        if let ownership {
+            _ = continuityContext.updateNegotiationIfActive(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation,
                 capabilities: nil,
                 terminalTypeRef: nil
             )
@@ -3299,7 +3989,8 @@ public final class SessionController: @unchecked Sendable {
         _ mappings: [Srui_Protocol_ExtensionNamespaceMapping],
         negotiated: CapabilitySet,
         terminalRequired: Bool,
-        binding: EventOutboxConnectionBinding
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
     ) async throws {
         var seenIDs = Set<UInt32>()
         var seenURIs = Set<String>()
@@ -3316,9 +4007,9 @@ public final class SessionController: @unchecked Sendable {
             }
         }
         let mapping = mappings.first(where: { $0.extensionUri == terminalProfileURI })
-        if terminalRequired && mapping == nil {
+        if negotiated.contains(.terminalV1) && mapping == nil {
             throw SessionFailure.protocolViolation(
-                "required \(terminalProfileURI) but ServerWelcome omitted its namespace mapping"
+                "negotiated \(terminalProfileURI) but the server omitted its namespace mapping"
             )
         }
         if let mapping, mapping.namespaceID == 0 {
@@ -3331,6 +4022,7 @@ public final class SessionController: @unchecked Sendable {
             : nil
         let published = try await continuityContext.publishNegotiationIfActive(
             binding: binding,
+            sessionIncarnation: sessionIncarnation,
             capabilities: negotiated,
             terminalTypeRef: resolvedType
         ) {
@@ -3383,7 +4075,14 @@ public final class SessionController: @unchecked Sendable {
     /// recoverable drops: silently discarding an oversized frame would leave the local cursor
     /// behind and turn the next frame into a fake local gap that clears the screen.
     private func handleTerminalData(_ data: SRUITerminalData) async {
-        guard let renderer else { return }
+        guard let renderer, let ownership = currentSharedOwnership(),
+              let lease = await acquireSharedMutationLease(
+                  binding: ownership.binding,
+                  sessionIncarnation: ownership.sessionIncarnation
+              ) else {
+            return
+        }
+        defer { continuityContext.releaseMutation(lease) }
         do {
             _ = try await renderer.terminalSession.applyData(
                 streamID: NodeId(data.streamID),
@@ -3391,13 +4090,26 @@ public final class SessionController: @unchecked Sendable {
                 data: data.data
             )
         } catch {
+            guard continuityContext.isActive(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation
+            ) else {
+                return
+            }
             await reportFailure(.protocolViolation("TerminalData rejected: \(error)"))
         }
     }
 
     /// Island resync. Must not enter `ServerResyncRequired` handling.
     private func handleTerminalResync(_ resync: SRUITerminalResyncRequired) async {
-        guard let renderer else { return }
+        guard let renderer, let ownership = currentSharedOwnership(),
+              let lease = await acquireSharedMutationLease(
+                  binding: ownership.binding,
+                  sessionIncarnation: ownership.sessionIncarnation
+              ) else {
+            return
+        }
+        defer { continuityContext.releaseMutation(lease) }
         let cause: TerminalResyncCause
         switch resync.reason {
         case .retentionLoss: cause = .retentionLoss
@@ -3415,6 +4127,12 @@ public final class SessionController: @unchecked Sendable {
                 cause: cause
             )
         } catch {
+            guard continuityContext.isActive(
+                binding: ownership.binding,
+                sessionIncarnation: ownership.sessionIncarnation
+            ) else {
+                return
+            }
             await reportFailure(.protocolViolation("TerminalResyncRequired rejected: \(error)"))
         }
     }
@@ -3751,12 +4469,21 @@ public final class SessionController: @unchecked Sendable {
     }
 
     @MainActor
-    private func noteCanceledTextEdits(_ descriptors: [PendingTextEditDescriptor]) {
-        for descriptor in descriptors {
-            renderer?.textEditingSession.noteCanceled(
-                nodeID: descriptor.nodeId,
-                eventId: descriptor.eventId
-            )
+    private func noteCanceledTextEdits(
+        _ descriptors: [PendingTextEditDescriptor],
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) {
+        _ = continuityContext.performIfActive(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) {
+            for descriptor in descriptors {
+                self.renderer?.textEditingSession.noteCanceled(
+                    nodeID: descriptor.nodeId,
+                    eventId: descriptor.eventId
+                )
+            }
         }
     }
 
@@ -3810,35 +4537,45 @@ public final class SessionController: @unchecked Sendable {
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
     ) {
-        guard withStateLock({
-            outboxConnectionBinding == binding
-                && outboxSessionIncarnation == sessionIncarnation
-        }) else {
-            return
-        }
-
-        let incarnation = interactionIncarnation
-        let drainCutoff = renderer?.textEditingSession.currentFlushGeneration ?? 0
-        let predecessor = interactionDispatchTail
-        let dispatch = Task { [weak self] in
-            _ = await predecessor?.result
-            guard let self,
-                  !Task.isCancelled,
-                  self.interactionIncarnation == incarnation else {
+        _ = continuityContext.performIfActive(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) {
+            guard self.withStateLock({
+                self.outboxConnectionBinding == binding
+                    && self.outboxSessionIncarnation == sessionIncarnation
+            }) else {
                 return
             }
-            do {
-                try await self.dispatchUnassignedTextEdits(
-                    binding: binding,
-                    sessionIncarnation: sessionIncarnation,
-                    interactionIncarnation: incarnation,
-                    maxFlushGeneration: drainCutoff
-                )
-            } catch {
-                SessionDiagnostics.error("Failed to dispatch local text edits: \(error)")
+
+            let incarnation = self.interactionIncarnation
+            let drainCutoff =
+                self.renderer?.textEditingSession.currentFlushGeneration ?? 0
+            let predecessor = self.interactionDispatchTail
+            let dispatch = Task { @MainActor [weak self] in
+                _ = await predecessor?.result
+                guard let self,
+                      !Task.isCancelled,
+                      self.interactionIncarnation == incarnation,
+                      self.continuityContext.isActive(
+                          binding: binding,
+                          sessionIncarnation: sessionIncarnation
+                      ) else {
+                    return
+                }
+                do {
+                    try await self.dispatchUnassignedTextEdits(
+                        binding: binding,
+                        sessionIncarnation: sessionIncarnation,
+                        interactionIncarnation: incarnation,
+                        maxFlushGeneration: drainCutoff
+                    )
+                } catch {
+                    SessionDiagnostics.error("Failed to dispatch local text edits: \(error)")
+                }
             }
+            self.interactionDispatchTail = dispatch
         }
-        interactionDispatchTail = dispatch
     }
 
     private func handleTransaction(_ wireTx: SRUITransaction) async {
@@ -3944,6 +4681,19 @@ public final class SessionController: @unchecked Sendable {
                 await reportFailure(.protocolViolation(
                     "committed resync snapshot did not advance interaction ownership"
                 ))
+                return
+            }
+            guard await continuityContext.advanceSessionIncarnationIfActive(
+                binding: connectionBinding,
+                from: deliveredIncarnation,
+                to: snapshotIncarnation
+            ) else {
+                let context = "resync snapshot lost shared incarnation ownership"
+                if let outstandingGeneration {
+                    await failRefusedResumeDecision(outstandingGeneration, context)
+                } else {
+                    await reportFailure(.superseded(context))
+                }
                 return
             }
             applyResult = published.result
@@ -4278,7 +5028,7 @@ public final class SessionController: @unchecked Sendable {
         _ failure: SessionFailure,
         requiring ownership: PendingReplayFailureOwnership? = nil
     ) -> SessionFailureTeardownState? {
-        withStateLock {
+        withStateLock { () -> SessionFailureTeardownState? in
             if let ownership {
                 guard lifecycleGeneration == ownership.lifecycleGeneration,
                       isRunning,
@@ -4305,40 +5055,22 @@ public final class SessionController: @unchecked Sendable {
             transactionIngressOrder.removeAll(keepingCapacity: false)
             transactionIngressTail = nil
 
-            // A CLIENT_RESUME that failed before RESUME_OK or RESYNC_REQUIRED answered it is the
-            // server refusing this identity outright — a replaced incarnation whose required
-            // profiles this client never negotiated here is rejected with no replacement response
-            // at all (§11.1, §15). Keeping the session id would make every reconnect re-send the
-            // same doomed resume, so the next connect must renegotiate from CLIENT_HELLO. A
-            // transport flap mid-resume costs one snapshot; the alternative is an unbreakable loop.
-            let discardsNegotiationContinuity = resumeGeneration != nil
-            if discardsNegotiationContinuity {
-                currentSessionId = nil
-                requestedSessionId = nil
-                retainedCapabilities = nil
-                negotiatedTerminalTypeRef = nil
-            }
+            // A transport failure before RESUME_OK/RESYNC_REQUIRED says nothing about whether
+            // the server retained this identity. Preserve the warm checkpoint so the next
+            // transport retries CLIENT_RESUME and lets the server decide continuity (§18).
             return SessionFailureTeardownState(
                 handler: _onFailure ?? { _ in },
                 replayGeneration: replayGeneration,
                 connectionBinding: outboxConnectionBinding,
                 sessionIncarnation: outboxSessionIncarnation,
                 lifecycleGeneration: lifecycleGeneration,
-                transactionTasks: transactionTasks,
-                discardsNegotiationContinuity: discardsNegotiationContinuity
+                transactionTasks: transactionTasks
             )
         }
     }
 
     private func reportFailure(_ failure: SessionFailure) async {
         guard let state = markFailure(failure) else { return }
-        if state.discardsNegotiationContinuity, let binding = state.connectionBinding {
-            _ = continuityContext.updateNegotiationIfActive(
-                binding: binding,
-                capabilities: nil,
-                terminalTypeRef: nil
-            )
-        }
         await finishFailureReport(failure, state: state)
     }
 
@@ -4502,7 +5234,10 @@ public final class SessionController: @unchecked Sendable {
             binding: binding,
             sessionIncarnation: sessionIncarnation
         ) { () -> Bool in
-            self.continuityContext.performIfActive(binding: binding) {
+            self.continuityContext.performIfActive(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            ) {
                 self.renderer?.textEditingSession.flushAllPending()
                 self.withStateLock { self.isFlushingTextForDisconnect = false }
                 self.advanceInteractionIncarnation()
@@ -4589,7 +5324,10 @@ public final class SessionController: @unchecked Sendable {
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
             ) { () -> Bool in
-                self.continuityContext.performIfActive(binding: binding) {
+                self.continuityContext.performIfActive(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                ) {
                     self.renderer?.clearCollectionRangeTrackers()
                     self.nativeDisconnectMutationForTesting?()
                     return true

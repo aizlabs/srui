@@ -54,6 +54,10 @@ struct HandshakeNegotiationTests {
         welcome.sessionID = "handshake-session-1"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         welcome.optionalProfiles = ["org.srui.terminal/1"]
+        var terminalMapping = Srui_Protocol_ExtensionNamespaceMapping()
+        terminalMapping.extensionUri = "org.srui.terminal/1"
+        terminalMapping.namespaceID = 3
+        welcome.extensionNamespaces = [terminalMapping]
         welcome.initialRevision = 0
 
         var welcomeMsg = SRUIMessage()
@@ -559,9 +563,20 @@ struct HandshakeNegotiationTests {
         #expect(resume.hasLimits)
         #expect(resume.limits.maxResourceSize == 50 * 1024 * 1024)
         #expect(resume.knownResourceHashes.isEmpty)
+        #expect(resume.coreVersion == SRUICoreVersion)
+        #expect(resume.profiles.contains("org.srui.standard-widgets/1"))
+        #expect(resume.profiles.contains("org.srui.terminal/1"))
 
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = "org.srui.terminal/1"
+        mapping.namespaceID = 3
         var resumeOk = SRUIServerResumeOk()
         resumeOk.sessionID = "resume-session"
+        resumeOk.requiredProfiles = [
+            "org.srui.standard-widgets/1",
+            "org.srui.terminal/1",
+        ]
+        resumeOk.extensionNamespaces = [mapping]
         var resumeMsg = SRUIMessage()
         resumeMsg.serverResumeOk = resumeOk
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMsg))

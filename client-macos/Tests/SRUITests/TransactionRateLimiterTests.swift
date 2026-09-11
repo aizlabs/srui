@@ -195,6 +195,7 @@ struct TransactionRateLimiterTests {
             resync.snapshotRevision = 1
             resync.reason = "budget probe"
             resync.continuity = continuity
+            resync.requiredProfiles = ["org.srui.standard-widgets/1"]
             var envelope = SRUIMessage()
             envelope.serverResyncRequired = resync
             await controller.handleIncomingMessage(envelope)

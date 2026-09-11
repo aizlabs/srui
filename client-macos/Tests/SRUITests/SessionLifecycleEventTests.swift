@@ -5,6 +5,7 @@
 // Deterministic coverage for the low-volume SessionController lifecycle observation stream.
 //
 
+import Collections
 import Foundation
 import Protocol
 import RendererAppKit
@@ -106,6 +107,40 @@ private final class LifecycleEventTransport: @unchecked Sendable, Transport {
             stream: pair.stream,
             continuation: pair.continuation
         )
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+}
+
+private final class LifecycleCompletionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSignaled = false
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func signal() {
+        let waiter = withLock { () -> CheckedContinuation<Void, Never>? in
+            isSignaled = true
+            defer { self.waiter = nil }
+            return self.waiter
+        }
+        waiter?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if isSignaled {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiter = continuation
+                lock.unlock()
+            }
+        }
     }
 
     private func withLock<T>(_ body: () -> T) -> T {
@@ -499,11 +534,11 @@ struct SessionLifecycleEventTests {
     }
 
     @Test(
-        "shared continuity lets a recreated Terminal controller resume",
+        "unanswered Terminal resume preserves the checkpoint for a third controller",
         .timeLimit(.minutes(1))
     )
     @MainActor
-    func recreatedTerminalControllerResumesWithSharedContinuity() async throws {
+    func unansweredTerminalResumePreservesCheckpoint() async throws {
         let continuityContext = SessionContinuityContext()
         let outbox = EventOutbox()
         let applier = TransactionApplier()
@@ -534,10 +569,14 @@ struct SessionLifecycleEventTests {
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         await firstController.handleIncomingMessage(welcomeMessage)
+        await firstController.handleIncomingMessage(
+            terminalData(streamID: 9, byteOffset: 0, bytes: [0x78])
+        )
         #expect(firstController.isHandshakeComplete)
         #expect(renderer.controlFactory.extensionKind(
             for: TypeRef(namespaceID: 3, localID: 1)
         ) == .terminal)
+        #expect(await renderer.terminalSession.snapshot(for: NodeId(9))?.nextOffset == 1)
 
         await firstController.stop()
 
@@ -552,25 +591,65 @@ struct SessionLifecycleEventTests {
             continuityContext: continuityContext
         )
         secondController.attachRenderer(renderer)
+        let failureSignal = LifecycleFailureSignal()
+        secondController.onFailure = { failure in
+            failureSignal.record(failure)
+        }
         try await secondController.start()
 
-        let frame = try #require(secondTransport.sentFrame(at: 0))
-        var decoder = SRUIMessageStreamDecoder()
-        let messages = try decoder.appendAndExtract(incoming: frame)
-        let handshake = try #require(messages.first)
-        guard case .clientResume(let resume) = handshake.msg else {
-            Issue.record("recreated controller abandoned negotiated Terminal continuity")
+        let secondFrame = try #require(secondTransport.sentFrame(at: 0))
+        var secondDecoder = SRUIMessageStreamDecoder()
+        let secondHandshake = try #require(
+            try secondDecoder.appendAndExtract(incoming: secondFrame).first
+        )
+        guard case .clientResume(let secondResume) = secondHandshake.msg else {
+            Issue.record("second controller abandoned Terminal continuity")
             await secondController.stop()
             return
         }
-        #expect(resume.sessionID == "shared-terminal")
+        #expect(secondResume.sessionID == "shared-terminal")
+        #expect(secondResume.coreVersion == SRUICoreVersion)
+        #expect(secondResume.profiles.contains("org.srui.standard-widgets/1"))
+        #expect(secondResume.profiles.contains(terminalProfileURI))
+        #expect(secondResume.terminalStreamOffsets[9] == 1)
 
-        await secondController.handleIncomingMessage(
-            resumeOK(sessionID: "shared-terminal", lastProcessedEventSeq: 0)
-        )
-        #expect(secondController.negotiatedCapabilities?.contains(.terminalV1) == true)
-
+        secondTransport.finishPeer()
+        _ = await failureSignal.next()
+        await secondTransport.waitUntilClosed()
         await secondController.stop()
+
+        let thirdTransport = LifecycleEventTransport()
+        let thirdController = SessionController(
+            transport: thirdTransport,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "shared-terminal",
+            requiredServerProfiles: [.terminalV1],
+            continuityContext: continuityContext
+        )
+        thirdController.attachRenderer(renderer)
+        try await thirdController.start()
+
+        let thirdFrame = try #require(thirdTransport.sentFrame(at: 0))
+        var thirdDecoder = SRUIMessageStreamDecoder()
+        let thirdHandshake = try #require(
+            try thirdDecoder.appendAndExtract(incoming: thirdFrame).first
+        )
+        guard case .clientResume(let thirdResume) = thirdHandshake.msg else {
+            Issue.record("third controller sent CLIENT_HELLO after unanswered resume")
+            await thirdController.stop()
+            return
+        }
+        #expect(thirdResume.sessionID == "shared-terminal")
+        #expect(thirdResume.coreVersion == SRUICoreVersion)
+        #expect(thirdResume.profiles.contains(terminalProfileURI))
+        #expect(thirdResume.terminalStreamOffsets[9] == 1)
+        #expect(renderer.controlFactory.extensionKind(
+            for: TypeRef(namespaceID: 3, localID: 1)
+        ) == .terminal)
+
+        await thirdController.stop()
     }
 
     @Test(
@@ -623,6 +702,409 @@ struct SessionLifecycleEventTests {
         await newController.stop()
     }
 
+
+    @Test(
+        "terminal data paused before authorization cannot mutate after supersession",
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func staleTerminalDataCannotMutateSharedSession() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let renderer = AppKitRenderer()
+        let oldTransport = LifecycleEventTransport()
+        let oldController = SessionController(
+            transport: oldTransport,
+            outbox: outbox,
+            renderer: renderer,
+            requiredServerProfiles: [.terminalV1],
+            continuityContext: continuityContext
+        )
+        oldController.attachRenderer(renderer)
+        try await oldController.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-race"
+        welcome.requiredProfiles = [
+            "org.srui.standard-widgets/1",
+            terminalProfileURI,
+        ]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        await oldController.handleIncomingMessage(welcomeMessage)
+
+        let authorizationGate = AsyncGate()
+        oldController.sharedMutationWillAuthorizeForTesting = {
+            await authorizationGate.pause()
+        }
+        let oldDelivery = Task {
+            await oldController.handleIncomingMessage(
+                terminalData(streamID: 41, byteOffset: 0, bytes: [0x78])
+            )
+        }
+        await authorizationGate.waitUntilPaused()
+
+        let newController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "terminal-race",
+            requiredServerProfiles: [.terminalV1],
+            continuityContext: continuityContext
+        )
+        newController.attachRenderer(renderer)
+        try await newController.start()
+
+        await authorizationGate.release()
+        await oldDelivery.value
+        #expect(await renderer.terminalSession.snapshot(for: NodeId(41)) == nil)
+
+        await oldController.stop()
+        await newController.stop()
+    }
+
+    @Test(
+        "replacement reset paused before authorization cannot clear newer shared state",
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func staleReplacementResetCannotClearSharedTerminal() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let renderer = AppKitRenderer()
+        let oldTransport = LifecycleEventTransport()
+        let oldController = SessionController(
+            transport: oldTransport,
+            outbox: outbox,
+            renderer: renderer,
+            requiredServerProfiles: [.terminalV1],
+            continuityContext: continuityContext
+        )
+        oldController.attachRenderer(renderer)
+        try await oldController.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "replacement-old"
+        welcome.requiredProfiles = [
+            "org.srui.standard-widgets/1",
+            terminalProfileURI,
+        ]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        await oldController.handleIncomingMessage(welcomeMessage)
+        await oldController.handleIncomingMessage(
+            terminalData(streamID: 51, byteOffset: 0, bytes: [0x78])
+        )
+        #expect(await renderer.terminalSession.snapshot(for: NodeId(51))?.nextOffset == 1)
+
+        let authorizationGate = AsyncGate()
+        oldController.sharedMutationWillAuthorizeForTesting = {
+            await authorizationGate.pause()
+        }
+        let oldReplacement = Task {
+            await oldController.handleIncomingMessage(
+                resync(
+                    sessionID: "replacement-new",
+                    continuity: .replaced,
+                    snapshotRevision: 1,
+                    requiredProfiles: [
+                        "org.srui.standard-widgets/1",
+                        terminalProfileURI,
+                    ],
+                    extensionNamespaces: [mapping]
+                )
+            )
+        }
+        await authorizationGate.waitUntilPaused()
+
+        let newController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "replacement-old",
+            continuityContext: continuityContext
+        )
+        newController.attachRenderer(renderer)
+        try await newController.start()
+
+        await authorizationGate.release()
+        await oldReplacement.value
+        #expect(await renderer.terminalSession.snapshot(for: NodeId(51))?.nextOffset == 1)
+
+        await oldController.stop()
+        await newController.stop()
+    }
+
+    @Test(
+        "superseded manual action cannot flush the replacement controller's draft",
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func supersededManualActionCannotFlushReplacementDraft() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 10_000_000_000
+        let oldController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            renderer: renderer,
+            continuityContext: continuityContext
+        )
+        oldController.attachRenderer(renderer)
+        try await oldController.start()
+        await oldController.handleIncomingMessage(welcome(sessionID: "manual-flush-race"))
+
+        let actionGate = AsyncGate()
+        oldController.interactionWillEnterOutboxForTesting = {
+            await actionGate.pause()
+        }
+        let staleAction = Task {
+            do {
+                _ = try await oldController.sendActivate(nodeId: NodeId(1))
+                return false
+            } catch {
+                return error as? SessionDispatchError == .resumeNotConfirmed
+            }
+        }
+        await actionGate.waitUntilPaused()
+
+        let newController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "manual-flush-race",
+            continuityContext: continuityContext
+        )
+        newController.attachRenderer(renderer)
+        try await newController.start()
+        renderer.textEditingSession.noteLocalValue(
+            "replacement draft",
+            nodeID: NodeId(12),
+            composing: false,
+            flushImmediately: false
+        )
+
+        await actionGate.release()
+        #expect(await staleAction.value)
+        #expect(renderer.textEditingSession.localValue(for: NodeId(12)) == "replacement draft")
+        #expect(renderer.textEditingSession.nextEditSeqValue(for: NodeId(12)) == 1)
+
+        await oldController.stop()
+        await newController.stop()
+    }
+
+    @Test(
+        "superseded queued transaction cannot consume the shared ingress budget",
+        .timeLimit(.minutes(1))
+    )
+    func supersededTransactionCannotConsumeReplacementBudget() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let ingressGate = TransactionIngressGate()
+        let oldController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            continuityContext: continuityContext,
+            transactionIngressGate: ingressGate
+        )
+        try await oldController.start()
+        await oldController.handleIncomingMessage(welcome(sessionID: "ingress-race"))
+
+        let authorizationGate = AsyncGate()
+        oldController.sharedMutationWillAuthorizeForTesting = {
+            await authorizationGate.pause()
+        }
+        let staleTransaction = Task {
+            await oldController.handleIncomingMessage(
+                snapshot(revision: 1, text: "stale")
+            )
+        }
+        await authorizationGate.waitUntilPaused()
+
+        let newController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            sessionId: "ingress-race",
+            continuityContext: continuityContext,
+            transactionIngressGate: ingressGate
+        )
+        try await newController.start()
+
+        await authorizationGate.release()
+        await staleTransaction.value
+        #expect(await newController.availableTransactionIngressCredit == 240)
+
+        oldController.sharedMutationWillAuthorizeForTesting = nil
+        await oldController.stop()
+        await newController.stop()
+    }
+
+    @Test(
+        "replacement clears queued Terminal commands before stale authorization resumes",
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func replacementClearsStaleTerminalCommands() async throws {
+        let continuityContext = SessionContinuityContext()
+        let transport = LifecycleEventTransport()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: transport,
+            renderer: renderer,
+            continuityContext: continuityContext
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var terminalWelcome = SRUIServerWelcome()
+        terminalWelcome.coreVersion = SRUICoreVersion
+        terminalWelcome.sessionID = "terminal-command-old"
+        terminalWelcome.requiredProfiles = [
+            "org.srui.standard-widgets/1",
+            terminalProfileURI,
+        ]
+        terminalWelcome.extensionNamespaces = [mapping]
+        var terminalWelcomeMessage = SRUIMessage()
+        terminalWelcomeMessage.serverWelcome = terminalWelcome
+        await controller.handleIncomingMessage(terminalWelcomeMessage)
+
+        let sendGate = AsyncGate()
+        controller.terminalCommandWillAuthorizeForTesting = {
+            await sendGate.pause()
+        }
+        renderer.onTerminalResize?(NodeId(30), 100, 40, 800, 600)
+        await sendGate.waitUntilPaused()
+
+        var replacementMapping = Srui_Protocol_ExtensionNamespaceMapping()
+        replacementMapping.extensionUri = terminalProfileURI
+        replacementMapping.namespaceID = 4
+        await controller.handleIncomingMessage(
+            resync(
+                sessionID: "terminal-command-new",
+                continuity: .replaced,
+                snapshotRevision: 1,
+                requiredProfiles: [
+                    "org.srui.standard-widgets/1",
+                    terminalProfileURI,
+                ],
+                extensionNamespaces: [replacementMapping]
+            )
+        )
+        #expect(await controller.retainedTerminalResizeCountForTesting == 0)
+
+        await sendGate.release()
+        await controller.waitForTerminalCommandDrainForTesting()
+        #expect(transport.sentFrame(at: 1) == nil)
+
+        controller.terminalCommandWillAuthorizeForTesting = nil
+        await controller.stop()
+    }
+
+    @Test(
+        "queued collection request cannot send through a superseded controller",
+        .timeLimit(.minutes(1))
+    )
+    @MainActor
+    func staleCollectionRequestCannotSendAfterSupersession() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let renderer = AppKitRenderer()
+        let oldTransport = LifecycleEventTransport()
+        let oldController = SessionController(
+            transport: oldTransport,
+            outbox: outbox,
+            renderer: renderer,
+            continuityContext: continuityContext
+        )
+        oldController.attachRenderer(renderer)
+        try await oldController.start()
+        await oldController.handleIncomingMessage(welcome(sessionID: "collection-race"))
+        let staleCallback = try #require(renderer.onCollectionRangeRequest)
+
+        let authorizationGate = AsyncGate()
+        let completion = LifecycleCompletionSignal()
+        oldController.sharedMutationWillAuthorizeForTesting = {
+            await authorizationGate.pause()
+        }
+        oldController.collectionRangeDispatchDidFinishForTesting = {
+            completion.signal()
+        }
+        staleCallback(
+            CollectionRangeRequest(
+                nodeID: NodeId(20),
+                modelID: ModelId(7),
+                startIndex: 0,
+                count: 10
+            )
+        )
+        await authorizationGate.waitUntilPaused()
+
+        let newController = SessionController(
+            transport: LifecycleEventTransport(),
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "collection-race",
+            continuityContext: continuityContext
+        )
+        newController.attachRenderer(renderer)
+        try await newController.start()
+
+        await authorizationGate.release()
+        await completion.wait()
+        #expect(oldTransport.sentFrame(at: 1) == nil)
+
+        oldController.sharedMutationWillAuthorizeForTesting = nil
+        await oldController.stop()
+        await newController.stop()
+    }
+
+    @Test(
+        "binding replacement rolls back an unauthorized prepared text identity",
+        .timeLimit(.minutes(1))
+    )
+    func bindingReplacementRollsBackUnauthorizedPreparedTextEdit() async throws {
+        let transport = LifecycleEventTransport()
+        let outbox = EventOutbox()
+        let oldBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "text-old", binding: oldBinding))
+        let editSeq = try #require(EditSeq(1))
+        let prepared = try #require(try await outbox.prepareTextEdit(
+            nodeId: NodeId(12),
+            text: "prepared",
+            editSeq: editSeq,
+            observedRevision: Revision(1),
+            binding: oldBinding,
+            via: transport
+        ))
+        #expect(prepared.event.eventSeq == 1)
+        #expect(await outbox.assignedTextEditDescriptors().count == 1)
+
+        let newBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.assignedTextEditDescriptors().isEmpty)
+        #expect(await outbox.confirmFreshSession(id: "text-new", binding: newBinding))
+        let next = try await outbox.sendActivate(
+            nodeId: NodeId(13),
+            observedRevision: Revision(1),
+            binding: newBinding,
+            via: transport
+        )
+        #expect(next.eventSeq == 1)
+    }
+
     @Test(
         "canceled queued binding acquisition cannot supersede the active binding",
         .timeLimit(.minutes(1))
@@ -634,7 +1116,7 @@ struct SessionLifecycleEventTests {
         let activationCounter = LifecycleMutationCounter()
         let canceledAcquisition = Task {
             await entryGate.pause()
-            return try await outbox.beginConnectionBindingUnlessCancelled { _ in
+            return try await outbox.beginConnectionBindingUnlessCancelled { _, _ in
                 activationCounter.increment()
             }
         }
@@ -699,15 +1181,33 @@ struct SessionLifecycleEventTests {
     private func resync(
         sessionID: String,
         continuity: Srui_Protocol_SessionContinuity,
-        snapshotRevision: UInt64
+        snapshotRevision: UInt64,
+        requiredProfiles: [String] = ["org.srui.standard-widgets/1"],
+        extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping] = []
     ) -> SRUIMessage {
         var resync = SRUIServerResyncRequired()
         resync.sessionID = sessionID
         resync.snapshotRevision = snapshotRevision
         resync.reason = "lifecycle test"
         resync.continuity = continuity
+        resync.requiredProfiles = requiredProfiles
+        resync.extensionNamespaces = extensionNamespaces
         var message = SRUIMessage()
         message.serverResyncRequired = resync
+        return message
+    }
+
+    private func terminalData(
+        streamID: UInt64,
+        byteOffset: UInt64,
+        bytes: [UInt8]
+    ) -> SRUIMessage {
+        var data = SRUITerminalData()
+        data.streamID = streamID
+        data.byteOffset = byteOffset
+        data.data = Data(bytes)
+        var message = SRUIMessage()
+        message.terminalData = data
         return message
     }
 

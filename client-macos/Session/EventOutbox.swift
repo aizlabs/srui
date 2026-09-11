@@ -1276,7 +1276,7 @@ public actor EventOutbox {
     /// `confirmFreshSession(id:binding:)` after a fresh WELCOME snapshot is committed; resume
     /// handshakes use the resume lifecycle APIs. Every send must carry the returned opaque binding.
     public func beginConnectionBinding() async -> EventOutboxConnectionBinding {
-        await beginConnectionBinding(onActivated: { _ in })
+        await beginConnectionBinding(onActivated: { _, _ in })
     }
 
     /// Cancellation-aware acquisition for connection orchestrators.
@@ -1284,14 +1284,20 @@ public actor EventOutbox {
     /// The check executes on the outbox actor immediately before ownership changes, so a canceled
     /// task that was queued behind a newer click cannot wake later and steal its binding.
     func beginConnectionBindingUnlessCancelled(
-        onActivated: @Sendable (EventOutboxConnectionBinding) -> Void
+        onActivated: @Sendable (
+            EventOutboxConnectionBinding,
+            EventOutboxSessionIncarnation
+        ) async -> Void
     ) async throws -> EventOutboxConnectionBinding {
         try Task.checkCancellation()
         return await beginConnectionBinding(onActivated: onActivated)
     }
 
     private func beginConnectionBinding(
-        onActivated: @Sendable (EventOutboxConnectionBinding) -> Void
+        onActivated: @Sendable (
+            EventOutboxConnectionBinding,
+            EventOutboxSessionIncarnation
+        ) async -> Void
     ) async -> EventOutboxConnectionBinding {
         let binding = EventOutboxConnectionBinding(
             epoch: EventOutboxConnectionBindingEpochAllocator.shared.next()
@@ -1307,13 +1313,13 @@ public actor EventOutbox {
         textLifecycleFence.beginActivation(sessionIncarnation)
         activeConnectionBinding = binding
         activeSessionIncarnation = sessionIncarnation
-        onActivated(binding)
+        await onActivated(binding, sessionIncarnation)
         activeResumeGeneration = nil
         pendingResumeFinalizationGeneration = nil
         acceptsNewEvents = false
         signalTextLaneStateChange()
         cancelReplayRetryLoop()
-        cancelPendingWrites()
+        cancelPendingWrites(retainUnauthorizedPreparedTextEdits: false)
 
         let boundaryCleanup = adoptOrBeginResyncBoundaryCleanup()
         let liveInvalidation = adoptOrBeginLiveRenderInvalidation()
@@ -2722,17 +2728,46 @@ public actor EventOutbox {
     /// generation must not chain its replay behind it. Cancellation is cooperative: the replay
     /// loop checks it between frames, but a `transport.send` already in flight still runs to
     /// completion, so this bounds the overlap rather than eliminating it.
-    private func cancelPendingWrites() {
+    private func cancelPendingWrites(
+        retainUnauthorizedPreparedTextEdits: Bool = true
+    ) {
         let hadPreparedSlots = !preparedTextEditSends.isEmpty
             || !authorizedPreparedTextEditSends.isEmpty
+            || !lifecycleSuspendedPreparedTextEdits.isEmpty
+        var unauthorizedEventsToRollback = [Event]()
         for (token, retained) in preparedTextEditSends {
             _ = retained.gate.cancelIfUnresolved()
             retained.task.cancel()
-            if pendingEvents[retained.event.eventId] == retained.event {
+            guard pendingEvents[retained.event.eventId] == retained.event else { continue }
+            if retainUnauthorizedPreparedTextEdits {
                 lifecycleSuspendedPreparedTextEdits[token] = retained.event
+            } else {
+                preparedTextEditAuthorizationFence.retire(retained.event.eventId)
+                unauthorizedEventsToRollback.append(retained.event)
             }
         }
         preparedTextEditSends.removeAll(keepingCapacity: true)
+
+        if !retainUnauthorizedPreparedTextEdits {
+            for event in lifecycleSuspendedPreparedTextEdits.values {
+                preparedTextEditAuthorizationFence.retire(event.eventId)
+                unauthorizedEventsToRollback.append(event)
+            }
+            lifecycleSuspendedPreparedTextEdits.removeAll(keepingCapacity: true)
+            for event in unauthorizedEventsToRollback.sorted(
+                by: { $0.eventSeq > $1.eventSeq }
+            ) {
+                guard pendingOrder.last == event.eventId,
+                      pendingEvents[event.eventId] == event,
+                      currentEventSeq == event.eventSeq else {
+                    continue
+                }
+                pendingEvents.removeValue(forKey: event.eventId)
+                pendingOrder.removeLast()
+                currentEventSeq -= 1
+            }
+        }
+
         for (token, retained) in authorizedPreparedTextEditSends {
             retained.task.cancel()
             if pendingEvents[retained.event.eventId] == retained.event {

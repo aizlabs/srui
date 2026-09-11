@@ -448,6 +448,16 @@ public final class TextEditingSession {
         nodes[edit.nodeId] = state
     }
 
+    /// Returns pre-admission claims to the shared draft queue when a new transport binding takes
+    /// ownership. Assigned identities stay intact for resume replay.
+    public func releaseUnassignedClaimsForConnectionTransition() {
+        for nodeID in unassignedNodeOrder {
+            guard var state = nodes[nodeID], state.unassignedClaimed else { continue }
+            state.unassignedClaimed = false
+            nodes[nodeID] = state
+        }
+    }
+
     @discardableResult
     public func noteAssigned(_ event: Event, matching edit: LocalTextEdit) -> Bool {
         guard event.eventType == .EVENT_TEXT_EDIT,

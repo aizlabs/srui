@@ -157,21 +157,17 @@ struct SessionControllerTerminalTests {
         await serverTransport.close()
     }
 
-    @Test("Replacement resync requires fresh extension negotiation before Terminal remount")
+    @Test("Replacement resync installs fresh extension negotiation before Terminal remount")
     @MainActor
-    func replacementResyncRejectsTerminalSnapshotBeforeRemount() async throws {
+    func replacementResyncInstallsTerminalMappingBeforeRemount() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
-        let failures = SessionFailureRecorder()
         let controller = SessionController(
             transport: clientTransport,
             applier: applier,
             renderer: renderer
         )
-        controller.onFailure = { failure in
-            Task { await failures.record(failure) }
-        }
         controller.attachRenderer(renderer)
         try await controller.start()
 
@@ -203,40 +199,46 @@ struct SessionControllerTerminalTests {
         let mountedTerminal = try #require(renderer.registry.view(for: NodeId(30)))
         #expect(mountedTerminal is TerminalView)
 
+        var replacementMapping = Srui_Protocol_ExtensionNamespaceMapping()
+        replacementMapping.extensionUri = terminalProfileURI
+        replacementMapping.namespaceID = 4
         var resync = SRUIServerResyncRequired()
         resync.sessionID = "terminal-after-replacement"
         resync.snapshotRevision = 2
         resync.reason = "replacement"
         resync.continuity = .replaced
+        resync.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        resync.extensionNamespaces = [replacementMapping]
         var resyncMessage = SRUIMessage()
         resyncMessage.serverResyncRequired = resync
         await controller.handleIncomingMessage(resyncMessage)
 
-        #expect(controller.negotiatedCapabilities == [Profile.standardWidgetsV1])
+        let replacementTerminalType = TypeRef(namespaceID: 4, localID: 1)
+        #expect(controller.negotiatedCapabilities?.contains(.terminalV1) == true)
         #expect(renderer.controlFactory.extensionKind(for: terminalType) == nil)
+        #expect(renderer.controlFactory.extensionKind(for: replacementTerminalType) == .terminal)
 
         let replacement = Transaction(
             baseRevision: .initial,
             newRevision: Revision(2),
             operations: [
                 .createNode(id: NodeId(1), nodeType: .surface),
-                .createNode(id: NodeId(30), nodeType: terminalType, parentID: NodeId(1)),
+                .createNode(
+                    id: NodeId(30),
+                    nodeType: replacementTerminalType,
+                    parentID: NodeId(1)
+                ),
             ]
         )
         var replacementMessage = SRUIMessage()
         replacementMessage.transaction = replacement.toWire()
         await controller.handleIncomingMessage(replacementMessage)
 
-        let failure = try #require(await failures.wait())
-        guard case .protocolViolation(let message) = failure else {
-            Issue.record("Expected protocolViolation, got \(failure)")
-            await controller.stop()
-            await serverTransport.close()
-            return
-        }
-        #expect(message.contains("capability renegotiation"))
-        #expect(controller.sessionId == nil)
-        #expect(renderer.registry.view(for: NodeId(30)) === mountedTerminal)
+        #expect(controller.sessionId == "terminal-after-replacement")
+        #expect(controller.isHandshakeComplete)
+        #expect(applier.lastAppliedRevision == Revision(2))
+        #expect(renderer.registry.view(for: NodeId(30)) is TerminalView)
+        #expect(renderer.registry.view(for: NodeId(30)) !== mountedTerminal)
 
         await controller.stop()
         await serverTransport.close()
@@ -286,102 +288,110 @@ struct SessionControllerTerminalTests {
             await serverTransport.close()
             return
         }
-        #expect(message.contains("client required profiles"))
-        #expect(message.contains("CLIENT_HELLO/SERVER_WELCOME"))
-        #expect(controller.sessionId == nil)
+        #expect(message.contains("live replacement resync omitted negotiation metadata"))
+        #expect(controller.sessionId == "required-terminal")
         #expect(controller.isDiverged)
 
         await controller.stop()
         await serverTransport.close()
     }
 
-    @Test("A recreated Terminal renderer forces a fresh hello without namespace state")
+    @Test("Cold resume rejects optional Terminal without its namespace mapping")
     @MainActor
-    func recreatedRendererWithoutNamespaceStateSendsFreshHello() async throws {
-        let (firstClientTransport, firstServerTransport) = await PipeTransport.createPair()
-        let applier = TransactionApplier()
-        let outbox = EventOutbox()
-        let firstRenderer = AppKitRenderer()
-        let firstController = SessionController(
-            transport: firstClientTransport,
-            applier: applier,
-            outbox: outbox,
-            renderer: firstRenderer
+    func coldResumeRejectsOptionalTerminalWithoutMapping() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            sessionId: "optional-terminal",
+            clientCapabilities: [.standardWidgetsV1, .terminalV1]
         )
-        firstController.attachRenderer(firstRenderer)
-        try await firstController.start()
+        try await controller.start()
+
+        var resume = SRUIServerResumeOk()
+        resume.sessionID = "optional-terminal"
+        resume.requiredProfiles = ["org.srui.standard-widgets/1"]
+        resume.optionalProfiles = [terminalProfileURI]
+        var message = SRUIMessage()
+        message.serverResumeOk = resume
+        await controller.handleIncomingMessage(message)
+
+        #expect(controller.isDiverged)
+        #expect(!controller.isHandshakeComplete)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    @Test("A recreated process cold-resumes Terminal after authoritative negotiation")
+    @MainActor
+    func recreatedProcessColdResumesTerminalWithServerMapping() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            outbox: EventOutbox(),
+            renderer: renderer,
+            sessionId: "recreated-terminal-controller",
+            requiredServerProfiles: [.terminalV1],
+            continuityContext: SessionContinuityContext()
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        let serverStream = serverTransport.receiveStream()
+        var streamDecoder = SRUIMessageStreamDecoder()
+        var resumeOffer: SRUIClientResume?
+        for try await chunk in serverStream {
+            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
+                if case .clientResume(let resume) = message.msg {
+                    resumeOffer = resume
+                }
+            }
+            if resumeOffer != nil { break }
+        }
+
+        let offer = try #require(resumeOffer)
+        #expect(offer.sessionID == "recreated-terminal-controller")
+        #expect(offer.lastAppliedRevision == 0)
+        #expect(offer.coreVersion == SRUICoreVersion)
+        #expect(offer.profiles.contains("org.srui.standard-widgets/1"))
+        #expect(offer.profiles.contains(terminalProfileURI))
 
         var mapping = Srui_Protocol_ExtensionNamespaceMapping()
         mapping.extensionUri = terminalProfileURI
         mapping.namespaceID = 3
-        var welcome = SRUIServerWelcome()
-        welcome.coreVersion = SRUICoreVersion
-        welcome.sessionID = "recreated-terminal-controller"
-        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
-        welcome.extensionNamespaces = [mapping]
-        var welcomeMessage = SRUIMessage()
-        welcomeMessage.serverWelcome = welcome
-        await firstController.handleIncomingMessage(welcomeMessage)
+        var resume = SRUIServerResumeOk()
+        resume.sessionID = "recreated-terminal-controller"
+        resume.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        resume.extensionNamespaces = [mapping]
+        var resumeMessage = SRUIMessage()
+        resumeMessage.serverResumeOk = resume
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeMessage))
 
-        let transaction = Transaction(
+        let terminalType = TypeRef(namespaceID: 3, localID: 1)
+        let replay = Transaction(
             baseRevision: .initial,
             newRevision: Revision(1),
             operations: [
                 .createNode(id: NodeId(1), nodeType: .surface),
-                .createNode(
-                    id: NodeId(30),
-                    nodeType: TypeRef(namespaceID: 3, localID: 1),
-                    parentID: NodeId(1)
-                ),
+                .createNode(id: NodeId(30), nodeType: terminalType, parentID: NodeId(1)),
             ]
         )
-        var transactionMessage = SRUIMessage()
-        transactionMessage.transaction = transaction.toWire()
-        await firstController.handleIncomingMessage(transactionMessage)
-        #expect(applier.lastAppliedRevision == Revision(1))
-        await firstController.stop()
-        await firstServerTransport.close()
+        var replayMessage = SRUIMessage()
+        replayMessage.transaction = replay.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(replayMessage))
 
-        let (secondClientTransport, secondServerTransport) = await PipeTransport.createPair()
-        let secondRenderer = AppKitRenderer()
-        let secondController = SessionController(
-            transport: secondClientTransport,
-            applier: applier,
-            outbox: outbox,
-            renderer: secondRenderer,
-            sessionId: "recreated-terminal-controller"
-        )
-        secondController.attachRenderer(secondRenderer)
-        try await secondController.start()
-
-        let serverStream = secondServerTransport.receiveStream()
-        var streamDecoder = SRUIMessageStreamDecoder()
-        var sentFreshHello = false
-        for try await chunk in serverStream {
-            for message in try streamDecoder.appendAndExtract(incoming: chunk) {
-                switch message.msg {
-                case .clientHello:
-                    sentFreshHello = true
-                case .clientResume:
-                    Issue.record("Expected CLIENT_HELLO when Terminal namespace state is unavailable")
-                default:
-                    break
-                }
-            }
-            if sentFreshHello { break }
+        try await AsyncTestSupport.eventually(description: "cold Terminal replay mounted") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.view(for: NodeId(30)) is TerminalView
         }
+        #expect(controller.isHandshakeComplete)
+        #expect(renderer.controlFactory.extensionKind(for: terminalType) == .terminal)
 
-        #expect(sentFreshHello)
-        #expect(secondController.sessionId == nil)
-        // A revision-zero WELCOME carries no snapshot, so nothing after the hello would clear the
-        // replica this controller inherited from the session it just abandoned: stale windows
-        // would stay mounted and could emit events for nodes the new server never created (§18).
-        #expect(applier.lastAppliedRevision == .initial)
-        #expect(applier.currentSnapshot.store.rootIDs.isEmpty)
-        #expect(secondRenderer.registry.count == 0)
-
-        await secondController.stop()
-        await secondServerTransport.close()
+        await controller.stop()
+        await serverTransport.close()
     }
 
     @Test("Only the negotiated terminal namespace is registered when local IDs collide")
@@ -447,17 +457,18 @@ struct SessionControllerTerminalTests {
         await serverTransport.close()
     }
 
-    /// `start()` can only discard the replica for a session it can still name. A resume that fails
-    /// unanswered erases the session identity (`unansweredResumeFailureForcesFreshHello`), so the
-    /// next start finds nothing to abandon — which is the state this test reproduces by starting a
-    /// controller with no session id over a nonempty shared applier. A revision-zero WELCOME
-    /// carries no snapshot, so it must empty the replica itself (§18).
-    @Test("A revision-zero WELCOME empties a replica left by an abandoned session")
+    /// A fresh WELCOME abandons both the semantic replica and the independent Terminal island.
+    /// A positive initial revision waits for a snapshot, but stale state must already be gone.
+    @Test(
+        "Fresh WELCOME clears abandoned semantic and Terminal state",
+        arguments: [UInt64(0), UInt64(2)]
+    )
     @MainActor
-    func revisionZeroWelcomeDiscardsAbandonedReplica() async throws {
+    func freshWelcomeDiscardsAbandonedState(initialRevision: UInt64) async throws {
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
         let outbox = EventOutbox()
+        let continuityContext = SessionContinuityContext()
 
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let seedController = SessionController(
@@ -465,11 +476,25 @@ struct SessionControllerTerminalTests {
             applier: applier,
             outbox: outbox,
             renderer: renderer,
-            clientCapabilities: [Profile.standardWidgetsV1]
+            continuityContext: continuityContext
         )
         seedController.attachRenderer(renderer)
         try await seedController.start()
-        await seedController.handleIncomingMessage(welcomeMessage(sessionID: "seeded-session"))
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var seedWelcome = SRUIServerWelcome()
+        seedWelcome.coreVersion = SRUICoreVersion
+        seedWelcome.sessionID = "seeded-session"
+        seedWelcome.requiredProfiles = [
+            "org.srui.standard-widgets/1",
+            terminalProfileURI,
+        ]
+        seedWelcome.extensionNamespaces = [mapping]
+        var seedWelcomeMessage = SRUIMessage()
+        seedWelcomeMessage.serverWelcome = seedWelcome
+        await seedController.handleIncomingMessage(seedWelcomeMessage)
 
         let seeded = Transaction(
             baseRevision: .initial,
@@ -482,42 +507,57 @@ struct SessionControllerTerminalTests {
         var seededMessage = SRUIMessage()
         seededMessage.transaction = seeded.toWire()
         await seedController.handleIncomingMessage(seededMessage)
-        try await AsyncTestSupport.eventually(description: "seeded tree mounted") {
-            applier.lastAppliedRevision == Revision(1)
-                && renderer.registry.handle(for: NodeId(2)) != nil
-        }
+        var terminalData = SRUITerminalData()
+        terminalData.streamID = 30
+        terminalData.byteOffset = 0
+        terminalData.data = Data([0x78])
+        var terminalMessage = SRUIMessage()
+        terminalMessage.terminalData = terminalData
+        await seedController.handleIncomingMessage(terminalMessage)
+
+        #expect(applier.lastAppliedRevision == Revision(1))
+        #expect(renderer.registry.handle(for: NodeId(2)) != nil)
+        #expect(await renderer.terminalSession.snapshot(for: NodeId(30))?.nextOffset == 1)
         await seedController.stop()
         await seedServer.close()
 
-        // No session id: exactly what a failed unanswered resume leaves behind.
         let (freshClient, freshServer) = await PipeTransport.createPair()
         let freshController = SessionController(
             transport: freshClient,
             applier: applier,
             outbox: outbox,
             renderer: renderer,
-            clientCapabilities: [Profile.standardWidgetsV1]
+            clientCapabilities: [.standardWidgetsV1],
+            continuityContext: continuityContext
         )
         freshController.attachRenderer(renderer)
         try await freshController.start()
         #expect(freshController.sessionId == nil)
-        await freshController.handleIncomingMessage(welcomeMessage(sessionID: "replacement-session"))
+        await freshController.handleIncomingMessage(
+            welcomeMessage(
+                sessionID: "replacement-session",
+                initialRevision: initialRevision
+            )
+        )
 
         #expect(applier.lastAppliedRevision == .initial)
         #expect(applier.currentSnapshot.store.rootIDs.isEmpty)
         #expect(renderer.registry.count == 0)
+        #expect(await renderer.terminalSession.snapshot(for: NodeId(30)) == nil)
 
         await freshController.stop()
         await freshServer.close()
     }
 
-    /// A fresh session at revision 0: the server sends no snapshot with it (§18).
-    private func welcomeMessage(sessionID: String) -> SRUIMessage {
+    private func welcomeMessage(
+        sessionID: String,
+        initialRevision: UInt64 = 0
+    ) -> SRUIMessage {
         var welcome = SRUIServerWelcome()
         welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = sessionID
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
-        welcome.initialRevision = 0
+        welcome.initialRevision = initialRevision
         var message = SRUIMessage()
         message.serverWelcome = welcome
         return message

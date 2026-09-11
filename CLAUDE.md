@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Branch and worktree discipline
+
+Before any repository file write, check `git status --short --branch`, `git branch --show-current`, and `git worktree list`. This applies to code, documentation, instructions, generated files, formatting, and test artifacts.
+
+- Never change any file in a checkout on `main`; never stage or commit directly on `main`.
+- Create a new task branch, normally `codex/<task>`, in a dedicated worktree based on the intended `origin/main` revision before making changes. Continue there for edits, generation, builds, and tests.
+- Do not switch branches in the shared main checkout or reuse another task's worktree without explicit authorization. Preserve unrelated changes and other worktrees.
+- Commit and push the task branch, then open a pull request. Main changes only through merged pull requests; do not merge locally into main or push directly to main.
+- If this task already has edits in the main checkout, first preserve them in the task worktree and verify the transfer. Restore only this task's known edits when authorized; never discard someone else's work.
+
 ## What this is
 
 SRUI (Semantic Remote UI) replicates application UI *meaning* and authoritative state to a native local renderer instead of streaming pixels. The server owns the semantic tree; the client applies atomic transactions and renders with the platform toolkit (AppKit today).

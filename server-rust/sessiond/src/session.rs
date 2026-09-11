@@ -336,9 +336,8 @@ pub(crate) struct SessionInner {
     pub(crate) capabilities: ServerCapabilities,
     pub(crate) limits: ServerLimits,
     pub(crate) resources: ResourceStore,
-    /// Negotiated per-`client_instance_id` resource ceilings from ClientHello (§15, §26).
-    ///
-    /// Retained so ClientResume (which carries no limits) can reuse the last negotiated value.
+    /// Negotiated per-`client_instance_id` resource ceilings from ClientHello/ClientResume
+    /// (§15, §26). Retained as a fallback when a resume omits its optional limits.
     pub(crate) client_resource_ceilings: HashMap<Vec<u8>, u64>,
     pub(crate) handlers: HashMap<(NodeId, TypeRef), Vec<RegisteredHandler>>,
     /// Sparse-collection window providers keyed by [`srui_semantic_tree::ModelId`] (§8, §22.7).
@@ -1414,6 +1413,8 @@ mod tests {
 
         let session = Session::new("oversized-instance-id-resume");
         let resume = srui_protocol::ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: "oversized-instance-id-resume".to_string(),
             client_instance_id: vec![7u8; MAX_CLIENT_INSTANCE_ID_BYTES + 1],
             last_applied_revision: 0,

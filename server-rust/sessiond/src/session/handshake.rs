@@ -72,7 +72,7 @@ pub struct ResumeClientBootstrap {
     pub outcome: ResumeOutcome,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
-    /// Whether this client may send terminal input/resize (prior negotiation or required profile).
+    /// Whether this resume re-advertised and negotiated `org.srui.terminal/1`.
     pub terminal_negotiated: bool,
     /// Terminal catch-up captured before resume so live bytes cannot fall through (§21.2).
     pub terminal: TerminalAttach,
@@ -93,6 +93,30 @@ pub enum ResumeOutcome {
     },
 }
 
+fn negotiate_client(
+    inner: &super::SessionInner,
+    core_version: &str,
+    profiles: &[String],
+) -> Result<CapabilitySet, SessionError> {
+    // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
+    // version would let two peers that disagree about required semantics reach the data plane
+    // (§4 inv. 13).
+    if !core_version_is_compatible(core_version) {
+        return Err(SessionError::UnsupportedCoreVersion {
+            requested: core_version.to_string(),
+            supported: CORE_VERSION.to_string(),
+        });
+    }
+
+    let mut client_caps = CapabilitySet::new();
+    for profile in profiles {
+        if let Ok(profile) = Profile::parse(profile) {
+            client_caps.insert(profile);
+        }
+    }
+    Ok(inner.capabilities.negotiate(&client_caps)?)
+}
+
 fn negotiate_hello(
     inner: &super::SessionInner,
     hello: &ClientHello,
@@ -100,24 +124,7 @@ fn negotiate_hello(
     // Refuse an unretainable identity before any per-client table copies it (§15, §26).
     validate_client_instance_id(&hello.client_instance_id)?;
 
-    // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
-    // version would let two peers that disagree about required semantics reach the data plane
-    // (§4 inv. 13).
-    if !core_version_is_compatible(&hello.core_version) {
-        return Err(SessionError::UnsupportedCoreVersion {
-            requested: hello.core_version.clone(),
-            supported: CORE_VERSION.to_string(),
-        });
-    }
-
-    let mut client_caps = CapabilitySet::new();
-    for p_str in &hello.profiles {
-        if let Ok(p) = Profile::parse(p_str) {
-            client_caps.insert(p);
-        }
-    }
-
-    let negotiated = inner.capabilities.negotiate(&client_caps)?;
+    let negotiated = negotiate_client(inner, &hello.core_version, &hello.profiles)?;
     let terminal_negotiated = negotiated.contains(&Profile::terminal_v1());
 
     let initial_revision = inner.store.revision().get();
@@ -404,10 +411,11 @@ impl Session {
 
     /// Atomically prepares a client resume and subscribes it to transactions (§18, §18.1, §20.2).
     ///
-    /// Replaced session incarnations are evaluated first (§18.1). If the session incarnation matches
-    /// but the client detached due to outbound queue overflow (§20.2), full state resync is forced.
-    /// If neither applies and `last_applied_revision` is within the retained journal window,
-    /// a replay is prepared; otherwise, same-session snapshot resync is returned.
+    /// Core/profile compatibility is validated before selecting or exporting any catch-up.
+    /// Replaced session incarnations are evaluated first (§18.1). If the session incarnation
+    /// matches but the client detached due to outbound queue overflow (§20.2), full state resync
+    /// is forced. If neither applies and `last_applied_revision` is within the retained journal
+    /// window, a replay is prepared; otherwise, same-session snapshot resync is returned.
     pub fn bootstrap_resume(
         &self,
         resume: &ClientResume,
@@ -491,8 +499,11 @@ impl Session {
 
         let mut before_subscribe = Some(before_subscribe);
         let mut optimistic_attempts = 0usize;
-        let (mut inner_guard, mut plan) = loop {
+        let (mut inner_guard, mut plan, terminal_negotiated) = loop {
             let inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            let negotiated =
+                negotiate_client(&inner_guard, &resume.core_version, &resume.profiles)?;
+            let terminal_negotiated = negotiated.contains(&Profile::terminal_v1());
             let Some(cause) = determine_resync_cause(&inner_guard) else {
                 let last_processed_event_seq = inner_guard
                     .dedupe
@@ -512,7 +523,7 @@ impl Session {
                     },
                     replayed: iter.cloned().collect(),
                 };
-                break (inner_guard, plan);
+                break (inner_guard, plan, terminal_negotiated);
             };
 
             let snapshot_revision = inner_guard.store.revision().get();
@@ -592,41 +603,8 @@ impl Session {
                 extension_namespaces: inner_guard.extension_namespaces.clone(),
                 pending_text_edit_cancellation,
             };
-            break (inner_guard, plan);
+            break (inner_guard, plan, terminal_negotiated);
         };
-
-        // A replaced incarnation was never negotiated with this client: CLIENT_RESUME carries no
-        // profile list, so the server cannot know whether the peer implements the extension
-        // profiles this incarnation requires. Inferring support from server state would push a
-        // Terminal node and terminal frames at a client that cannot mount them. Fail explicitly
-        // and make the client re-handshake instead of degrading silently (§11.1, §15, §4 inv. 13).
-        //
-        // The standard-widgets baseline is exempt: no peer can reach the data plane without it,
-        // so a resume already proves it was negotiated.
-        if matches!(
-            &plan,
-            ResumePlan::Resync {
-                continuity: SessionContinuity::Replaced,
-                ..
-            }
-        ) {
-            let unproven: Vec<String> = inner_guard
-                .capabilities
-                .required
-                .iter()
-                .filter(|profile| **profile != Profile::standard_widgets_v1())
-                .map(ToString::to_string)
-                .collect();
-            if !unproven.is_empty() {
-                let unproven = unproven.join(", ");
-                drop(inner_guard);
-                return Err(SessionError::InvalidInput(format!(
-                    "CLIENT_RESUME names a replaced incarnation, but this session requires \
-                     [{unproven}], which this client never negotiated here. Reconnect with \
-                     CLIENT_HELLO (§11.1, §15)"
-                )));
-            }
-        }
 
         before_subscribe
             .take()
@@ -667,14 +645,6 @@ impl Session {
                 ..
             }
         );
-        let terminal_negotiated = inner_guard
-            .capabilities
-            .required
-            .contains(&Profile::terminal_v1())
-            || inner_guard
-                .extension_namespaces
-                .iter()
-                .any(|mapping| mapping.extension_uri == srui_protocol::TERMINAL_PROFILE_URI);
         drop(inner_guard);
 
         let terminal = self.attach_terminals(&resume.terminal_stream_offsets, replaced)?;
@@ -783,6 +753,8 @@ mod tests {
         let mut invalid_ref = pending_text_edit_ref();
         invalid_ref.event_id.clear();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: vec![8, 1],
             last_applied_revision: 0,
@@ -803,6 +775,8 @@ mod tests {
     fn replaced_resume_validates_pending_text_edit_ref_bound() {
         let session = Session::new("replacement-pending-validation");
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "replaced-session".into(),
             client_instance_id: vec![8, 2],
             last_applied_revision: 0,
@@ -840,6 +814,8 @@ mod tests {
 
         let pending = pending_text_edit_ref();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 2,
@@ -903,6 +879,8 @@ mod tests {
         conflicting.event_seq = 1;
         conflicting.event_id = b"conflicting-text-edit".to_vec();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 2,
@@ -969,6 +947,8 @@ mod tests {
             .expect("existing subscriber");
         install_unrepresentable_snapshot(&session);
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "replaced-session".into(),
             client_instance_id: client,
             last_applied_revision: 0,
@@ -1024,6 +1004,8 @@ mod tests {
         let session = Session::new("known-resume");
         let published = session.publish_resource(b"already-cached").unwrap();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: vec![3, 4],
             last_applied_revision: 0,
@@ -1047,6 +1029,8 @@ mod tests {
         let session = Session::new("limited-resume");
         session.publish_resource(b"larger-than-eight").unwrap();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: vec![5, 6],
             last_applied_revision: 0,
@@ -1085,6 +1069,8 @@ mod tests {
         assert!(session.outbound_hub().is_client_stale(&client));
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "old-incarnation".to_string(),
             client_instance_id: client,
             last_applied_revision: 0,
@@ -1124,6 +1110,8 @@ mod tests {
         assert!(session.outbound_hub().is_client_stale(&client));
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 0,
@@ -1188,6 +1176,8 @@ mod tests {
         assert_eq!(snapshot.new_revision, 1);
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "test-session".to_string(),
             client_instance_id: vec![1, 2],
             last_applied_revision: 0,
@@ -1232,6 +1222,8 @@ mod tests {
         assert_eq!(session.current_revision(), 1025);
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "resync-test".to_string(),
             client_instance_id: vec![1],
             last_applied_revision: 0,
@@ -1398,6 +1390,8 @@ mod tests {
         seed_revision_one(&session);
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "test-resume-no-gap".to_string(),
             client_instance_id: vec![7, 8],
             last_applied_revision: 0,
@@ -1567,6 +1561,8 @@ mod tests {
         let session = Session::new("resume-export-outside-lock");
         seed_revision_one(&session);
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "replaced-incarnation".to_string(),
             client_instance_id: vec![4, 5],
             last_applied_revision: 0,
@@ -1635,6 +1631,8 @@ mod tests {
         assert!(session.outbound_hub.is_client_stale(&client));
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 3,

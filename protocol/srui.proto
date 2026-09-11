@@ -561,6 +561,10 @@ message ClientResume {
   // Assigned, unacknowledged TEXT_EDIT events. Ignored on RESUME_OK; settled and echoed
   // on same-session RESYNC_REQUIRED so canceling them cannot open an event_seq gap (§18.3).
   repeated PendingTextEditRef pending_text_edits = 8;
+  // Re-advertised on every resume so the server can fail closed before replay or resync
+  // when this client does not implement the session's core/profile semantics (§15, §18).
+  string core_version = 9;
+  repeated string profiles = 10;
 }
 
 // Machine-readable session identity continuity for a full snapshot response.

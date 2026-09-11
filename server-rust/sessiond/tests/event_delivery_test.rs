@@ -122,6 +122,8 @@ async fn resume_client(
 
     let resume = SruiMessage {
         msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: session.session_id(),
             client_instance_id: client_instance_id.to_vec(),
             last_applied_revision,

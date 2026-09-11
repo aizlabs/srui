@@ -144,6 +144,8 @@ fn test_handle_resume_resync_snapshot_reconstructs_tree_and_models() {
     });
 
     let resume = srui_protocol::ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "resync-snapshot-test".to_string(),
         client_instance_id: vec![7],
         last_applied_revision: 0,
@@ -232,6 +234,8 @@ fn test_resync_snapshot_chunks_cached_ranges_within_item_limit() {
     evict_journal_window(&session, seeded_revision);
 
     let resume = srui_protocol::ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "resync-chunked-model".to_string(),
         client_instance_id: vec![9],
         last_applied_revision: 0,
@@ -298,6 +302,8 @@ async fn test_connection_resync_delivers_snapshot_matching_authoritative_store()
 
     let resume = SruiMessage {
         msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: "resync-e2e-session".to_string(),
             client_instance_id: vec![42],
             last_applied_revision: 0,
@@ -541,6 +547,8 @@ async fn oversized_catch_up_snapshot_fails_the_handshake_instead_of_being_sent()
 
     // The same refusal must apply on the resync path, which is the one a stranded client retries.
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "a-different-incarnation".to_string(),
         client_instance_id: vec![7],
         last_applied_revision: 0,
@@ -592,6 +600,8 @@ fn same_session_resync_cancels_declared_text_edits_before_snapshot() {
         edit_seq: 4,
     };
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "resync-cancel-text".to_string(),
         client_instance_id: b"client-a".to_vec(),
         last_applied_revision: 0,
@@ -659,6 +669,8 @@ fn replacement_resync_ignores_pending_text_edit_refs() {
         .expect("evict");
 
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "expired-incarnation".to_string(),
         client_instance_id: b"client-b".to_vec(),
         last_applied_revision: 0,
@@ -729,6 +741,8 @@ fn same_session_resync_does_not_track_canceled_refs_for_missing_nodes() {
         })
         .collect();
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "resync-cancel-missing".to_string(),
         client_instance_id: b"client-ghost".to_vec(),
         last_applied_revision: 0,
@@ -799,6 +813,8 @@ fn same_session_resync_settles_oversized_pending_event_id_with_bounded_identity(
 
     let oversized_id = vec![0x41; MAX_EVENT_ID_BYTES + 1];
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "resync-oversized-event-id".to_string(),
         client_instance_id: b"client-oversized".to_vec(),
         last_applied_revision: 0,
@@ -900,6 +916,8 @@ fn same_session_resync_refuses_oversized_pending_text_edits() {
         })
         .collect();
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "resync-pending-overflow".to_string(),
         client_instance_id: b"client-overflow".to_vec(),
         last_applied_revision: 0,
@@ -950,6 +968,8 @@ fn same_session_resync_validates_pending_text_edits_before_settling() {
         .expect("evict seed from journal");
 
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "resync-pending-partial".to_string(),
         client_instance_id: b"client-partial".to_vec(),
         last_applied_revision: 0,

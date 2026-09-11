@@ -161,6 +161,8 @@ async fn test_sessiond_connection_resume_replay() {
     // Send ClientResume requesting replay from revision 0
     let resume = SruiMessage {
         msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: "test-session-resume".to_string(),
             client_instance_id: vec![99],
             last_applied_revision: 0,
@@ -331,6 +333,8 @@ async fn test_connection_resume_resync_backpressured_snapshot_and_concurrent_com
 
     let resume = SruiMessage {
         msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: "replaced-incarnation".to_string(),
             client_instance_id: vec![42],
             last_applied_revision: 0,

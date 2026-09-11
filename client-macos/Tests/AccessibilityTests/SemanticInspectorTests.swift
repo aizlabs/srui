@@ -66,31 +66,34 @@ struct SemanticInspectorTests {
         #expect(first.node(NodeId(4))?.label == "Before")
     }
 
-    @Test("Existing snapshots mint handles without recapturing or mixing snapshot identity")
-    func handlesFromExistingSnapshot() throws {
-        let firstSource = try makeSource(buttonLabel: "Before", revision: 11, epoch: 20)
-        let secondSource = try makeSource(buttonLabel: "After", revision: 12, epoch: 20)
-        let sequence = LockedSnapshotSequence([firstSource, secondSource])
+    @Test("Existing snapshots mint handles only through their originating inspector")
+    func existingSnapshotHandlesRequireOrigin() throws {
+        let source = try makeSource(buttonLabel: "Before", revision: 11, epoch: 20)
+        let sequence = LockedSnapshotSequence([source])
         let inspector = SemanticInspector(
             snapshotProvider: { sequence.next() },
             actionHandler: { _ in throw SemanticAutomationError.sessionInactive }
         )
+        let otherInspector = makeInspector(source: source)
 
-        let firstTree = inspector.snapshot()
-        let firstNode = try #require(firstTree.node(NodeId(4)))
-        let byID = try #require(inspector.handle(for: NodeId(4), in: firstTree))
-        let byNode = try #require(inspector.handle(for: firstNode, in: firstTree))
+        let tree = inspector.snapshot()
+        let handle = try #require(inspector.handle(for: NodeId(4), in: tree))
 
         #expect(sequence.consumedCount() == 1)
-        #expect(byID.node == firstNode)
-        #expect(byNode.node == firstNode)
-        #expect(byID.observedRevision == Revision(11))
-        #expect(byNode.expectedEpoch == SemanticInspectionEpoch(20))
+        #expect(handle.node == tree.node(NodeId(4)))
+        #expect(handle.observedRevision == Revision(11))
+        #expect(handle.expectedEpoch == SemanticInspectionEpoch(20))
+        #expect(otherInspector.handle(for: NodeId(4), in: tree) == nil)
 
-        let secondTree = inspector.snapshot()
-        let secondNode = try #require(secondTree.node(NodeId(4)))
-        #expect(inspector.handle(for: secondNode, in: firstTree) == nil)
-        #expect(sequence.consumedCount() == 2)
+        let fabricated = SemanticTreeSnapshot(
+            epoch: tree.epoch,
+            revision: tree.revision,
+            rootIDs: tree.rootIDs,
+            nodes: tree.nodes
+        )
+        #expect(fabricated == tree)
+        #expect(inspector.handle(for: NodeId(4), in: fabricated) == nil)
+        #expect(sequence.consumedCount() == 1)
     }
 
     @Test("Find uses role and label in semantic tree order")

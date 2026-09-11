@@ -804,6 +804,17 @@ public final class SessionController: @unchecked Sendable {
                 eventType: request.action.eventType
             )
         }
+        if case .selectionChanged = request.action,
+           node.nodeType == .list || node.nodeType == .table || node.nodeType == .tree {
+            let modeToken = node.getProperty(.selectionMode)?.asEnumToken
+            let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+            guard selectionMode != .none else {
+                throw SemanticAutomationError.unsupportedAction(
+                    nodeID: request.nodeID,
+                    eventType: request.action.eventType
+                )
+            }
+        }
         return ownership
     }
     private func revalidateSemanticActionForOutbox(

@@ -7,6 +7,8 @@
 
 import SemanticModel
 
+fileprivate final class SemanticSnapshotOrigin: @unchecked Sendable {}
+
 /// Monotonic identity for a semantic session.
 ///
 /// A handle may act only while its captured epoch is still current. This prevents a node identifier
@@ -208,6 +210,7 @@ public struct SemanticTreeSnapshot: Equatable, Sendable {
     public let nodes: [SemanticNodeSnapshot]
 
     private let nodeIndicesByID: [NodeId: Int]
+    fileprivate let snapshotOrigin: SemanticSnapshotOrigin
 
     public init(
         epoch: SemanticInspectionEpoch,
@@ -215,10 +218,27 @@ public struct SemanticTreeSnapshot: Equatable, Sendable {
         rootIDs: [NodeId],
         nodes: [SemanticNodeSnapshot]
     ) {
+        self.init(
+            epoch: epoch,
+            revision: revision,
+            rootIDs: rootIDs,
+            nodes: nodes,
+            snapshotOrigin: SemanticSnapshotOrigin()
+        )
+    }
+
+    fileprivate init(
+        epoch: SemanticInspectionEpoch,
+        revision: Revision,
+        rootIDs: [NodeId],
+        nodes: [SemanticNodeSnapshot],
+        snapshotOrigin: SemanticSnapshotOrigin
+    ) {
         self.epoch = epoch
         self.revision = revision
         self.rootIDs = rootIDs
         self.nodes = nodes
+        self.snapshotOrigin = snapshotOrigin
 
         var lookup: [NodeId: Int] = [:]
         lookup.reserveCapacity(nodes.count)
@@ -226,6 +246,13 @@ public struct SemanticTreeSnapshot: Equatable, Sendable {
             lookup[node.id] = index
         }
         self.nodeIndicesByID = lookup
+    }
+
+    public static func == (lhs: SemanticTreeSnapshot, rhs: SemanticTreeSnapshot) -> Bool {
+        lhs.epoch == rhs.epoch
+            && lhs.revision == rhs.revision
+            && lhs.rootIDs == rhs.rootIDs
+            && lhs.nodes == rhs.nodes
     }
 
     public func node(_ id: NodeId) -> SemanticNodeSnapshot? {
@@ -301,6 +328,7 @@ public struct SemanticInspector: Sendable {
 
     private let snapshotProvider: SnapshotProvider
     private let actionHandler: ActionHandler
+    private let snapshotOrigin: SemanticSnapshotOrigin
 
     public init(
         snapshotProvider: @escaping SnapshotProvider,
@@ -308,31 +336,26 @@ public struct SemanticInspector: Sendable {
     ) {
         self.snapshotProvider = snapshotProvider
         self.actionHandler = actionHandler
+        snapshotOrigin = SemanticSnapshotOrigin()
     }
 
     /// Captures and converts one fresh transaction snapshot.
     public func snapshot() -> SemanticTreeSnapshot {
-        Self.makeTreeSnapshot(from: snapshotProvider())
+        Self.makeTreeSnapshot(
+            from: snapshotProvider(),
+            snapshotOrigin: snapshotOrigin
+        )
     }
 
-    /// Creates a handle by identifier from an existing snapshot without recapturing the tree.
+    /// Creates a handle by identifier from a snapshot issued by this inspector.
     public func handle(
         for id: NodeId,
         in tree: SemanticTreeSnapshot
     ) -> SemanticNodeHandle? {
-        guard let node = tree.node(id) else { return nil }
-        return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
-    }
-
-    /// Creates a handle for a node that belongs to an existing snapshot.
-    ///
-    /// A node from a different snapshot is rejected rather than borrowing this tree's epoch and
-    /// revision.
-    public func handle(
-        for node: SemanticNodeSnapshot,
-        in tree: SemanticTreeSnapshot
-    ) -> SemanticNodeHandle? {
-        guard tree.node(node.id) == node else { return nil }
+        guard tree.snapshotOrigin === snapshotOrigin,
+              let node = tree.node(id) else {
+            return nil
+        }
         return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
     }
 
@@ -379,7 +402,8 @@ public struct SemanticInspector: Sendable {
     }
 
     private static func makeTreeSnapshot(
-        from source: SemanticInspectionSourceSnapshot
+        from source: SemanticInspectionSourceSnapshot,
+        snapshotOrigin: SemanticSnapshotOrigin
     ) -> SemanticTreeSnapshot {
         let store = source.transaction.store
         var nodes: [SemanticNodeSnapshot] = []
@@ -443,7 +467,8 @@ public struct SemanticInspector: Sendable {
             epoch: source.epoch,
             revision: source.transaction.revision,
             rootIDs: store.rootIDs,
-            nodes: nodes
+            nodes: nodes,
+            snapshotOrigin: snapshotOrigin
         )
     }
 }

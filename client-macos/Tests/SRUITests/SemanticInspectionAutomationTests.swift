@@ -378,6 +378,35 @@ struct SemanticInspectionAutomationTests {
         }
     }
 
+    @Test("Collection selection is rejected when selection mode defaults to none")
+    @MainActor
+    func defaultNoneSelectionIsRejectedWithoutAnOutboundEvent() async throws {
+        try await withHarness { harness in
+            let inspector = harness.controller.makeSemanticInspector()
+            let collection = try #require(
+                inspector.find(role: .list, label: SemanticInspectionFixture.collectionLabel)
+            )
+
+            do {
+                _ = try await collection.select(ItemId(1))
+                Issue.record("Expected default-none collection selection to be unsupported")
+            } catch SemanticAutomationError.unsupportedAction(let nodeID, let eventType) {
+                #expect(nodeID == SemanticInspectionFixture.collectionID)
+                #expect(eventType == .EVENT_SELECTION_CHANGED)
+            } catch {
+                Issue.record("Expected unsupportedAction, got \(error)")
+            }
+
+            let sentinel = try #require(
+                inspector.find(role: .button, label: SemanticInspectionFixture.sentinelLabel)
+            )
+            _ = try await sentinel.activate()
+
+            let captured = await harness.transport.recordedEvents()
+            #expect(captured.map(\.event.nodeId) == [SemanticInspectionFixture.sentinelID])
+        }
+    }
+
     @Test("A node that does not emit ACTIVATE is rejected without an outbound event")
     @MainActor
     func unsupportedActionIsRejectedWithoutAnOutboundEvent() async throws {
@@ -585,10 +614,12 @@ private enum SemanticInspectionFixture {
     static let sentinelID = NodeId(3)
     static let progressID = NodeId(4)
     static let editorID = NodeId(5)
+    static let collectionID = NodeId(6)
 
     static let approveLabel = "Approve"
     static let sentinelLabel = "Sentinel"
     static let progressLabel = "Status"
+    static let collectionLabel = "Items"
 
     static var operations: [SemanticModel.Operation] {
         [
@@ -624,6 +655,14 @@ private enum SemanticInspectionFixture {
                 parentID: surfaceID,
                 properties: [
                     Property(property: .value, value: .string("")),
+                ]
+            ),
+            .createNode(
+                id: collectionID,
+                nodeType: .list,
+                parentID: surfaceID,
+                properties: [
+                    Property(property: .label, value: .string(collectionLabel)),
                 ]
             ),
         ]
@@ -699,6 +738,7 @@ private final class SemanticInspectionHarness {
                     && renderer.registry.handle(for: SemanticInspectionFixture.sentinelID) != nil
                     && renderer.registry.handle(for: SemanticInspectionFixture.progressID) != nil
                     && renderer.registry.handle(for: SemanticInspectionFixture.editorID) != nil
+                    && renderer.registry.handle(for: SemanticInspectionFixture.collectionID) != nil
             }
             return harness
         } catch {

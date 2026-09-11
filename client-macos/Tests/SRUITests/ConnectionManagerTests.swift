@@ -92,6 +92,19 @@ private final class ConnectionAttemptHarness {
         attempts.append(attempt)
         return attempt
     }
+
+    func discardRequests() {
+        requests.removeAll()
+    }
+}
+
+@MainActor
+private final class WeakConnectionSessionContext {
+    weak var value: ConnectionSessionContext?
+
+    init(_ value: ConnectionSessionContext) {
+        self.value = value
+    }
 }
 
 private actor ConnectionManagerCaptureTransport: Transport {
@@ -538,6 +551,10 @@ struct ConnectionManagerTests {
         await manager.load()
         manager.connect(id: saved.id)
         let attempt = try #require(harness.attempts.first)
+        let context = WeakConnectionSessionContext(
+            try #require(harness.requests.first).context
+        )
+        harness.discardRequests()
         try await AsyncTestSupport.eventuallyAsync(description: "attempt start") {
             await attempt.startCount() == 1
         }
@@ -546,6 +563,12 @@ struct ConnectionManagerTests {
         #expect(manager.entries.isEmpty)
         #expect(try await temporary.store.load().isEmpty)
         #expect(await attempt.stopCount() == 0)
+        #expect(context.value != nil)
+
+        await attempt.emit(.stopped)
+        try await AsyncTestSupport.eventually(description: "removed connection context release") {
+            context.value == nil
+        }
 
         await manager.shutdown()
     }

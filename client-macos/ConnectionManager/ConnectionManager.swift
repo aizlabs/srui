@@ -612,6 +612,9 @@ public final class ConnectionManager {
         tasksByToken.removeValue(forKey: token)
         if activeTokens[connectionID] == token {
             activeTokens.removeValue(forKey: connectionID)
+            if entries.contains(where: { $0.id == connectionID }) == false {
+                contexts.removeValue(forKey: connectionID)
+            }
         }
     }
 

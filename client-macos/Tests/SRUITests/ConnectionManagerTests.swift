@@ -307,6 +307,41 @@ struct ConnectionManagerTests {
         await manager.shutdown()
     }
 
+    @Test("back-to-back connects never start the superseded attempt")
+    func supersededAttemptIsCancelledBeforeStart() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Queued",
+            host: "queued.example",
+            user: "alice",
+            sessionID: "queued-session"
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+
+        manager.connect(id: saved.id)
+        manager.connect(id: saved.id)
+        let firstAttempt = try #require(harness.attempts.first)
+        let secondAttempt = try #require(harness.attempts.last)
+
+        try await AsyncTestSupport.eventuallyAsync(
+            description: "superseded attempt stopped without starting"
+        ) {
+            let firstStops = await firstAttempt.stopCount()
+            let secondStarts = await secondAttempt.startCount()
+            return firstStops > 0 && secondStarts == 1
+        }
+        #expect(await firstAttempt.startCount() == 0)
+        await manager.shutdown()
+    }
+
     @Test("a late failed start cannot overwrite a newer attempt")
     func staleAttemptOutcomeIsIgnored() async throws {
         let temporary = TemporaryConnectionStore()
@@ -352,6 +387,38 @@ struct ConnectionManagerTests {
         await manager.shutdown()
     }
 
+    @Test("a failed first connection discards its session context")
+    func failedFirstConnectionDiscardsContext() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let draft = ConnectDraft(
+            id: UUID(),
+            label: "Retry",
+            host: "retry.example",
+            user: "alice"
+        )
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+
+        let connectionID = try #require(manager.connect(draft))
+        let firstAttempt = try #require(harness.attempts.first)
+        await firstAttempt.emit(.failed("initial failure"))
+
+        try await AsyncTestSupport.eventually(description: "failed draft removed") {
+            manager.entries.isEmpty && manager.alert?.kind == .connectionFailed
+        }
+
+        #expect(manager.connect(draft) == connectionID)
+        let firstRequest = try #require(harness.requests.first)
+        let secondRequest = try #require(harness.requests.last)
+        #expect(firstRequest.context !== secondRequest.context)
+        #expect(secondRequest.isWarmReconnect == false)
+        await manager.shutdown()
+    }
+
     @Test("warm reconnect reuses one renderer and all continuity state")
     func warmReconnectReusesSessionContext() async throws {
         let temporary = TemporaryConnectionStore()
@@ -384,6 +451,7 @@ struct ConnectionManagerTests {
         #expect(first.context.outbox === second.context.outbox)
         #expect(first.context.resourceCache === second.context.resourceCache)
         #expect(first.context.transactionIngressGate === second.context.transactionIngressGate)
+        #expect(first.context.continuityContext === second.context.continuityContext)
         #expect(first.context.renderer === second.context.renderer)
 
         #expect(first.configuration.strictHostKeyChecking == .yes)
@@ -423,6 +491,31 @@ struct ConnectionManagerTests {
         #expect(manager.alert?.message == "Host key verification failed.")
         #expect(manager.status(for: saved.id) == .disconnected(resumeAvailable: true))
         await manager.shutdown()
+    }
+
+    @Test("shutdown does not persist a connection that never became ready")
+    func shutdownBeforeReadyDoesNotPersistDraft() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+
+        let connectionID = try #require(manager.connect(ConnectDraft(
+            label: "Pending",
+            host: "pending.example",
+            user: "alice"
+        )))
+        let attempt = try #require(harness.attempts.first)
+
+        await manager.shutdown()
+
+        #expect(manager.entries.isEmpty)
+        #expect(manager.status(for: connectionID) == .unknown)
+        #expect(try await temporary.store.load().isEmpty)
+        #expect(await attempt.stopCount() > 0)
     }
 
     @Test("deleting a row is local bookkeeping and does not stop its session")

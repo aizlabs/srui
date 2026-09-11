@@ -225,6 +225,7 @@ final class ConnectionSessionContext {
     let outbox = EventOutbox()
     let resourceCache = ResourceCache()
     let transactionIngressGate = TransactionIngressGate()
+    let continuityContext = SessionContinuityContext()
     let renderer = AppKitRenderer()
     var hasStartedAttempt = false
 }
@@ -265,6 +266,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
     }
 
     func start() async throws {
+        try Task.checkCancellation()
         guard forwardingTask == nil else { return }
 
         let lifecycleEvents = controller.lifecycleEvents
@@ -296,6 +298,7 @@ private actor SessionControllerConnectionAttempt: ConnectionAttempt {
             continuation.finish()
         }
 
+        try Task.checkCancellation()
         try await controller.start()
     }
 
@@ -460,6 +463,14 @@ public final class ConnectionManager {
         attemptsByToken.removeAll()
         activeTokens.removeAll()
 
+        let neverConnected = pendingFirstSuccess
+        pendingFirstSuccess.removeAll()
+        entries.removeAll { neverConnected.contains($0.id) }
+        for connectionID in neverConnected {
+            statuses.removeValue(forKey: connectionID)
+            contexts.removeValue(forKey: connectionID)
+        }
+
         for index in entries.indices {
             guard let context = contexts[entries[index].id] else { continue }
             entries[index].lastKnownRevision = context.applier.lastAppliedRevision.value
@@ -488,6 +499,7 @@ public final class ConnectionManager {
             renderer: request.context.renderer,
             resourceCache: request.context.resourceCache,
             sessionId: request.requestedSessionID,
+            continuityContext: request.context.continuityContext,
             transactionIngressGate: request.context.transactionIngressGate
         )
         controller.attachRenderer(request.context.renderer)
@@ -532,6 +544,9 @@ public final class ConnectionManager {
 
         let attempt = attemptFactory(request)
         activeTokens[connection.id] = token
+        if let previousToken {
+            tasksByToken[previousToken]?.cancel()
+        }
         attemptsByToken[token] = attempt
         statuses[connection.id] = .connecting
         alert = nil
@@ -544,8 +559,7 @@ public final class ConnectionManager {
             await self.runAttempt(
                 attempt,
                 connectionID: connection.id,
-                token: token,
-                supersededToken: previousToken
+                token: token
             )
         }
         tasksByToken[token] = task
@@ -554,16 +568,16 @@ public final class ConnectionManager {
     private func runAttempt(
         _ attempt: any ConnectionAttempt,
         connectionID: SavedConnection.ID,
-        token: UInt64,
-        supersededToken: UInt64?
+        token: UInt64
     ) async {
         var handledTerminalEvent = false
 
         do {
-            try await attempt.start()
-            if let supersededToken {
-                tasksByToken[supersededToken]?.cancel()
+            guard activeTokens[connectionID] == token else {
+                throw CancellationError()
             }
+            try Task.checkCancellation()
+            try await attempt.start()
             try Task.checkCancellation()
 
             for await event in attempt.events {
@@ -580,9 +594,6 @@ public final class ConnectionManager {
         } catch is CancellationError {
             // Supersession and application shutdown are ordinary ownership transitions.
         } catch {
-            if let supersededToken {
-                tasksByToken[supersededToken]?.cancel()
-            }
             handledTerminalEvent = await recordFailure(
                 String(describing: error),
                 connectionID: connectionID,
@@ -741,6 +752,7 @@ public final class ConnectionManager {
         if wasPending {
             entries.remove(at: index)
             statuses.removeValue(forKey: connectionID)
+            contexts.removeValue(forKey: connectionID)
         } else {
             if let context = contexts[connectionID] {
                 entries[index].lastKnownRevision = context.applier.lastAppliedRevision.value

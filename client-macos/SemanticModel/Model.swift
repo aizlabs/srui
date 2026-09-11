@@ -163,6 +163,25 @@ public struct Model: Equatable, Sendable, CustomStringConvertible {
         items[index] != nil
     }
 
+    /// Drops up to `count` cached items whose indices lie outside `[keepStart, keepEnd)`.
+    /// Farthest from the keep-window midpoint are removed first (§8, §26).
+    mutating func evictFarthestOutside(keepStart: UInt64, keepEnd: UInt64, count: Int) {
+        guard count > 0 else { return }
+        let keepEnd = max(keepEnd, keepStart)
+        let mid = keepStart + (keepEnd - keepStart) / 2
+        let candidates = items.keys.filter { $0 < keepStart || $0 >= keepEnd }.sorted { a, b in
+            let da = a > mid ? a - mid : mid - a
+            let db = b > mid ? b - mid : mid - b
+            if da != db { return da > db }
+            return a < b
+        }
+        for index in candidates.prefix(count) {
+            if let item = items.removeValue(forKey: index) {
+                idToIndex.removeValue(forKey: item.itemID)
+            }
+        }
+    }
+
     /// Returns the current index for a cached `ItemId`, if present.
     public func indexOf(_ itemID: ItemId) -> UInt64? {
         idToIndex[itemID]

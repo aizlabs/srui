@@ -290,20 +290,44 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
     node_types_by_id = {entry["id"]: entry["name"] for entry in registry["node_types"]}
     properties_by_id = {entry["id"]: entry["name"] for entry in registry["properties"]}
     enums_by_id = {entry["id"]: entry["name"] for entry in registry["enums"]}
+    events_by_id = {entry["id"]: entry["name"] for entry in registry["events"]}
 
     vectors = spec["vectors"]
-    assert "golden_node_record" in vectors
-    assert "golden_transaction" in vectors
+    required_vectors = {
+        "golden_node_record",
+        "golden_transaction",
+        "golden_client_model_range_request",
+        "golden_text_edit_event",
+        "golden_terminal_data",
+        "golden_terminal_input",
+        "golden_terminal_resize",
+        "golden_terminal_resync_required",
+    }
+    assert required_vectors <= vectors.keys()
 
-    for key, vector in vectors.items():
-        filename = vector["file"]
-        fixture_path = REGISTRY_PATH.parent / "conformance-vectors" / filename
-        assert fixture_path.exists(), f"Fixture file missing: {fixture_path}"
-        data = fixture_path.read_bytes()
+    malformed = spec["malformed_vectors"]
+    required_malformed = {
+        "malformed_overlong_varint",
+        "malformed_truncated_frame",
+        "malformed_text_edit_zero_edit_seq",
+        "malformed_activate_nonzero_edit_seq",
+        "malformed_terminal_input_empty",
+        "malformed_terminal_data_empty",
+    }
+    assert required_malformed <= malformed.keys()
 
-        assert len(data) == vector["byte_length"]
-        assert hashlib.sha256(data).hexdigest() == vector["sha256"]
-        assert data.hex() == vector["hex"]
+    for family in (vectors, malformed):
+        for key, vector in family.items():
+            filename = vector["file"]
+            fixture_path = REGISTRY_PATH.parent / "conformance-vectors" / filename
+            assert fixture_path.exists(), f"Fixture file missing: {fixture_path}"
+            data = fixture_path.read_bytes()
+
+            assert len(data) == vector["byte_length"], f"{key} byte length mismatch"
+            assert hashlib.sha256(data).hexdigest() == vector["sha256"], (
+                f"{key} SHA-256 mismatch"
+            )
+            assert data.hex() == vector["hex"], f"{key} hex mismatch"
 
     # Validate node record IDs in expected.json against registry
     node_exp = vectors["golden_node_record"]["expected"]
@@ -316,3 +340,27 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
         if "enum_value" in prop["value"]:
             ev = prop["value"]["enum_value"]
             assert enums_by_id[ev["enum_id"]] == ev["enum_name"]
+
+    text_edit_exp = vectors["golden_text_edit_event"]["expected"]
+    event_type = text_edit_exp["event_type"]
+    assert events_by_id[event_type["local_id"]] == event_type["name"]
+    for argument in text_edit_exp["arguments"]:
+        property_exp = argument["property"]
+        assert properties_by_id[property_exp["local_id"]] == property_exp["name"]
+
+    assert (
+        malformed["malformed_text_edit_zero_edit_seq"]["expected_error"]
+        == "event error: TEXT_EDIT requires a positive edit_seq"
+    )
+    assert (
+        malformed["malformed_activate_nonzero_edit_seq"]["expected_error"]
+        == "event error: only TEXT_EDIT may carry edit_seq"
+    )
+    assert (
+        malformed["malformed_terminal_input_empty"]["expected_error"]
+        == "empty TerminalInput is forbidden"
+    )
+    assert (
+        malformed["malformed_terminal_data_empty"]["expected_error"]
+        == "empty TerminalData frame is forbidden"
+    )

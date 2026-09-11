@@ -641,6 +641,7 @@ final class DecoderTests: XCTestCase {
 
         // 3. Missing eventType in Event
         var wireEvent = SRUIEvent()
+        wireEvent.eventID = Data("missing-type".utf8)
         wireEvent.nodeID = 10
         XCTAssertThrowsError(try Event(wire: wireEvent)) { error in
             guard case ProtocolDecodeError.missingField(let field) = error else {
@@ -699,6 +700,67 @@ final class DecoderTests: XCTestCase {
         // Store state untouched
         XCTAssertEqual(store.revision, originalSnapshot.revision)
         XCTAssertEqual(store.nodeCount, originalSnapshot.nodeCount)
+    }
+
+    // MARK: - Event identifier limit
+
+    func testOversizedEventIdentifierRejectedByBothSwiftDecoders() throws {
+        var wireEvent = SRUIEvent()
+        wireEvent.eventID = Data(repeating: 0x41, count: maxEventIDBytes + 1)
+        wireEvent.eventType = TypeRef.EVENT_ACTIVATE.toWire()
+
+        for decode in [
+            { try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent) },
+            { try Event(wire: wireEvent) },
+        ] {
+            XCTAssertThrowsError(try decode()) { error in
+                guard case ProtocolDecodeError.eventIDSizeLimitExceeded(let limit, let actual) = error else {
+                    XCTFail("Expected eventIDSizeLimitExceeded, got \(error)")
+                    return
+                }
+                XCTAssertEqual(limit, maxEventIDBytes)
+                XCTAssertEqual(actual, maxEventIDBytes + 1)
+            }
+        }
+    }
+
+    // MARK: - Event edit-sequence conformance
+    func testGoldenTextEditEventAcceptedByBothSwiftDecoders() throws {
+        let fileURL = conformanceVectorsDir.appendingPathComponent("golden_text_edit_event.bin")
+        let message = try decodeFramedMessage(from: Data(contentsOf: fileURL))
+        guard case .event(let wireEvent) = message.msg else {
+            XCTFail("Expected event conformance vector")
+            return
+        }
+
+        let validated = try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent)
+        let converted = try Event(wire: wireEvent)
+        XCTAssertEqual(validated, converted)
+        XCTAssertEqual(validated.eventType, .EVENT_TEXT_EDIT)
+        XCTAssertEqual(validated.editSeq?.rawValue, 3)
+    }
+
+    func testMalformedEventEditSequencesRejectedByBothSwiftDecoders() throws {
+        for filename in [
+            "malformed_text_edit_zero_edit_seq.bin",
+            "malformed_activate_nonzero_edit_seq.bin",
+        ] {
+            let fileURL = conformanceVectorsDir.appendingPathComponent(filename)
+            let message = try decodeFramedMessage(from: Data(contentsOf: fileURL))
+            guard case .event(let wireEvent) = message.msg else {
+                XCTFail("Expected event in \(filename)")
+                continue
+            }
+
+            XCTAssertThrowsError(
+                try ProtocolDecoder().validateAndConvertEvent(wire: wireEvent),
+                "validated decoder accepted \(filename)"
+            )
+            XCTAssertThrowsError(
+                try Event(wire: wireEvent),
+                "wire conversion accepted \(filename)"
+            )
+        }
     }
 
     // MARK: - §22.2 Thread Safety / Off-Main Execution Test

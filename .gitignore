@@ -33,5 +33,7 @@ __pycache__/
 
 # Tooling
 .lemoncrow/
+.benchmark-results/
 scripts/test-swarm/.env
 scripts/test-swarm/logs/*.log
+.swift-version

@@ -4,4 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Internal completion hook for the benchmark driver; not a production lifecycle API.
+benchmark-observability = []
+
 [dependencies]
+libc = "0.2"
+portable-pty = "0.8"
+srui-protocol = { path = "../protocol" }
+srui-semantic-tree = { path = "../semantic-tree" }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true

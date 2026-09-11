@@ -151,6 +151,7 @@ fn test_handle_resume_resync_snapshot_reconstructs_tree_and_models() {
         terminal_stream_offsets: Default::default(),
         limits: None,
         known_resource_hashes: vec![],
+        pending_text_edits: vec![],
     };
 
     let (resync_msg, snapshot_tx) = match session
@@ -238,6 +239,7 @@ fn test_resync_snapshot_chunks_cached_ranges_within_item_limit() {
         terminal_stream_offsets: Default::default(),
         limits: None,
         known_resource_hashes: vec![],
+        pending_text_edits: vec![],
     };
     let snapshot_tx = match session
         .bootstrap_resume(&resume)
@@ -303,6 +305,7 @@ async fn test_connection_resync_delivers_snapshot_matching_authoritative_store()
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         })),
     };
     framed_write.send(resume).await.expect("send client resume");
@@ -363,7 +366,7 @@ async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
     assert!(seeded_revision > 0);
 
     let hello = ClientHello {
-        core_version: "0.4.0".to_string(),
+        core_version: "0.5.0".to_string(),
         profiles: vec!["org.srui.standard-widgets/1".to_string()],
         limits: None,
         client_instance_id: vec![1, 2, 3],
@@ -420,7 +423,7 @@ async fn test_fresh_client_bootstrap_populated_session_and_immediate_commit() {
 
     let received = bootstrap
         .transactions
-        .recv()
+        .recv_class(srui_sessiond::LogicalChannelClass::Ui)
         .await
         .expect("receive transaction")
         .into_transaction()
@@ -435,7 +438,7 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
     assert_eq!(session.current_revision(), 0);
 
     let hello = ClientHello {
-        core_version: "0.4.0".to_string(),
+        core_version: "0.5.0".to_string(),
         profiles: vec!["org.srui.standard-widgets/1".to_string()],
         limits: None,
         client_instance_id: vec![4, 5, 6],
@@ -465,7 +468,7 @@ async fn test_fresh_client_bootstrap_revision_zero_captures_first_transaction() 
 
     let received = bootstrap
         .transactions
-        .recv()
+        .recv_class(srui_sessiond::LogicalChannelClass::Ui)
         .await
         .expect("receive first transaction")
         .into_transaction()
@@ -545,9 +548,450 @@ async fn oversized_catch_up_snapshot_fails_the_handshake_instead_of_being_sent()
         terminal_stream_offsets: Default::default(),
         limits: None,
         known_resource_hashes: vec![],
+        pending_text_edits: vec![],
     };
     assert!(matches!(
         session.bootstrap_resume(&resume),
         Err(SessionError::SnapshotUnrepresentable { .. })
     ));
+}
+
+#[test]
+fn same_session_resync_cancels_declared_text_edits_before_snapshot() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_semantic_tree::{EditSeq, Event as DomainEvent};
+    use srui_sessiond::{EventOutcome, SessionConfig};
+
+    let session = Session::with_config(
+        "resync-cancel-text",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let pending = PendingTextEditRef {
+        event_id: b"text-pending".to_vec(),
+        event_seq: 1,
+        node_id: 2,
+        edit_seq: 4,
+    };
+    let resume = ClientResume {
+        session_id: "resync-cancel-text".to_string(),
+        client_instance_id: b"client-a".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![pending.clone()],
+    };
+
+    match session.bootstrap_resume(&resume).expect("resume").outcome {
+        ResumeOutcome::Resync {
+            resync_msg,
+            snapshot_transaction,
+        } => {
+            assert_eq!(
+                SessionContinuity::try_from(resync_msg.continuity),
+                Ok(SessionContinuity::SameSession)
+            );
+            assert_eq!(resync_msg.discarded_text_edits, vec![pending.clone()]);
+            assert_eq!(resync_msg.last_processed_event_seq, 1);
+            assert_eq!(snapshot_transaction.new_revision, 2);
+        }
+        other => panic!("expected same-session resync, got {other:?}"),
+    }
+
+    let replay = DomainEvent::text_edit(1, "text-pending", 0u64, 2, "x", EditSeq::new(4).unwrap())
+        .with_client_instance_id(b"client-a".as_slice())
+        .to_wire();
+    match session.process_event(&replay).expect("replay canceled") {
+        EventOutcome::Duplicate {
+            accepted: false,
+            last_processed_event_seq,
+            ..
+        } => assert_eq!(last_processed_event_seq, 1),
+        other => panic!("canceled TEXT_EDIT must be answered from the result cache, got {other:?}"),
+    }
+}
+
+#[test]
+fn replacement_resync_ignores_pending_text_edit_refs() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_sessiond::SessionConfig;
+
+    let session = Session::with_config(
+        "live-incarnation",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            Ok(())
+        })
+        .expect("seed");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict");
+
+    let resume = ClientResume {
+        session_id: "expired-incarnation".to_string(),
+        client_instance_id: b"client-b".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![PendingTextEditRef {
+            event_id: b"old-text".to_vec(),
+            event_seq: 7,
+            node_id: 9,
+            edit_seq: 3,
+        }],
+    };
+
+    match session
+        .bootstrap_resume(&resume)
+        .expect("replacement")
+        .outcome
+    {
+        ResumeOutcome::Resync { resync_msg, .. } => {
+            assert_eq!(
+                SessionContinuity::try_from(resync_msg.continuity),
+                Ok(SessionContinuity::Replaced)
+            );
+            assert!(resync_msg.discarded_text_edits.is_empty());
+            assert_eq!(resync_msg.last_processed_event_seq, 0);
+        }
+        other => panic!("expected replacement resync, got {other:?}"),
+    }
+}
+
+#[test]
+fn same_session_resync_does_not_track_canceled_refs_for_missing_nodes() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_semantic_tree::{EditSeq, Event as DomainEvent};
+    use srui_sessiond::{EventOutcome, SessionConfig, MAX_TEXT_EDIT_STREAMS};
+
+    let session = Session::with_config(
+        "resync-cancel-missing",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let pending: Vec<PendingTextEditRef> = (0..MAX_TEXT_EDIT_STREAMS)
+        .map(|i| PendingTextEditRef {
+            event_id: format!("ghost-{i}").into_bytes(),
+            event_seq: i as u64 + 1,
+            node_id: 1_000 + i as u64,
+            edit_seq: 1,
+        })
+        .collect();
+    let resume = ClientResume {
+        session_id: "resync-cancel-missing".to_string(),
+        client_instance_id: b"client-ghost".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: pending.clone(),
+    };
+
+    match session.bootstrap_resume(&resume).expect("resume").outcome {
+        ResumeOutcome::Resync { resync_msg, .. } => {
+            assert_eq!(resync_msg.discarded_text_edits.len(), MAX_TEXT_EDIT_STREAMS);
+            assert_eq!(
+                resync_msg.last_processed_event_seq,
+                MAX_TEXT_EDIT_STREAMS as u64
+            );
+        }
+        other => panic!("expected same-session resync, got {other:?}"),
+    }
+
+    let live = DomainEvent::text_edit(
+        (MAX_TEXT_EDIT_STREAMS as u64) + 1,
+        "live-editor",
+        0u64,
+        2,
+        "ok",
+        EditSeq::new(1).unwrap(),
+    )
+    .with_client_instance_id(b"client-ghost".as_slice())
+    .to_wire();
+    match session.process_event(&live).expect("live editor") {
+        EventOutcome::Processed { .. } => {}
+        other => {
+            panic!("canceled missing-node refs must not exhaust the text tracker, got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn same_session_resync_settles_oversized_pending_event_id_with_bounded_identity() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_semantic_tree::{EditSeq, Event as DomainEvent, MAX_EVENT_ID_BYTES};
+    use srui_sessiond::{EventOutcome, SessionConfig};
+
+    let session = Session::with_config(
+        "resync-oversized-event-id",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let oversized_id = vec![0x41; MAX_EVENT_ID_BYTES + 1];
+    let resume = ClientResume {
+        session_id: "resync-oversized-event-id".to_string(),
+        client_instance_id: b"client-oversized".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![PendingTextEditRef {
+            event_id: oversized_id.clone(),
+            event_seq: 1,
+            node_id: 2,
+            edit_seq: 1,
+        }],
+    };
+
+    match session.bootstrap_resume(&resume).expect("resume").outcome {
+        ResumeOutcome::Resync { resync_msg, .. } => {
+            assert_eq!(resync_msg.discarded_text_edits.len(), 1);
+            let discarded = &resync_msg.discarded_text_edits[0];
+            assert_eq!(discarded.event_seq, 1);
+            assert!(discarded.event_id.len() <= MAX_EVENT_ID_BYTES);
+            assert_ne!(discarded.event_id, oversized_id);
+            assert_eq!(resync_msg.last_processed_event_seq, 1);
+        }
+        other => panic!("expected same-session resync, got {other:?}"),
+    }
+
+    let oversized_replay = DomainEvent::text_edit(
+        1,
+        "temporary",
+        0u64,
+        2,
+        "discarded",
+        EditSeq::new(1).unwrap(),
+    )
+    .with_client_instance_id(b"client-oversized".as_slice())
+    .to_wire();
+    let oversized_replay = srui_protocol::Event {
+        event_id: oversized_id,
+        ..oversized_replay
+    };
+    assert!(matches!(
+        session
+            .process_event(&oversized_replay)
+            .expect("oversized replay returns settled rejection"),
+        EventOutcome::Duplicate {
+            accepted: false,
+            last_processed_event_seq: 1,
+            ..
+        }
+    ));
+
+    let live = DomainEvent::text_edit(2, "next-valid", 0u64, 2, "ok", EditSeq::new(2).unwrap())
+        .with_client_instance_id(b"client-oversized".as_slice())
+        .to_wire();
+    assert!(matches!(
+        session.process_event(&live).expect("next valid event"),
+        EventOutcome::Processed {
+            last_processed_event_seq: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn same_session_resync_refuses_oversized_pending_text_edits() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_sessiond::{SessionConfig, SessionError, MAX_TEXT_EDIT_STREAMS};
+
+    let session = Session::with_config(
+        "resync-pending-overflow",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let pending: Vec<PendingTextEditRef> = (0..=MAX_TEXT_EDIT_STREAMS)
+        .map(|i| PendingTextEditRef {
+            event_id: format!("overflow-{i}").into_bytes(),
+            event_seq: i as u64 + 1,
+            node_id: 2,
+            edit_seq: 1,
+        })
+        .collect();
+    let resume = ClientResume {
+        session_id: "resync-pending-overflow".to_string(),
+        client_instance_id: b"client-overflow".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: pending,
+    };
+
+    match session.bootstrap_resume(&resume) {
+        Err(SessionError::InvalidInput(message)) => {
+            assert!(
+                message.contains("pending_text_edits"),
+                "diagnostic must name the field, got {message:?}"
+            );
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn same_session_resync_validates_pending_text_edits_before_settling() {
+    use srui_protocol::PendingTextEditRef;
+    use srui_sessiond::{SessionConfig, SessionError};
+
+    let session = Session::with_config(
+        "resync-pending-partial",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    );
+    session
+        .transaction(|ui| {
+            Surface::builder(1).create(ui)?;
+            TextInput::builder(2).parent(1).value("snap").create(ui)?;
+            Ok(())
+        })
+        .expect("seed editor");
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict seed from journal");
+
+    let resume = ClientResume {
+        session_id: "resync-pending-partial".to_string(),
+        client_instance_id: b"client-partial".to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: Default::default(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![
+            PendingTextEditRef {
+                event_id: b"ok".to_vec(),
+                event_seq: 1,
+                node_id: 2,
+                edit_seq: 1,
+            },
+            PendingTextEditRef {
+                event_id: b"bad".to_vec(),
+                event_seq: 2,
+                node_id: 2,
+                edit_seq: 0,
+            },
+        ],
+    };
+
+    match session.bootstrap_resume(&resume) {
+        Err(SessionError::InvalidInput(message)) => {
+            assert!(
+                message.contains("edit_seq"),
+                "diagnostic must name edit_seq, got {message:?}"
+            );
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+
+    let retry = ClientResume {
+        pending_text_edits: vec![],
+        ..resume
+    };
+    match session.bootstrap_resume(&retry).expect("retry").outcome {
+        ResumeOutcome::Resync { resync_msg, .. } => {
+            assert_eq!(resync_msg.last_processed_event_seq, 0);
+            assert!(resync_msg.discarded_text_edits.is_empty());
+        }
+        other => panic!("expected same-session resync, got {other:?}"),
+    }
 }

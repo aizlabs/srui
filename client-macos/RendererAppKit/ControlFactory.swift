@@ -1,8 +1,58 @@
 import AppKit
 import SemanticModel
+import Collections
+import Text
+import Terminal
 
 public enum ControlFactoryError: Error, Equatable, Sendable {
     case unsupportedNodeType(TypeRef)
+}
+
+/// Native button whose pointer feedback is owned entirely by the local renderer (§22.5).
+@MainActor
+final class HoverFeedbackButton: NSButton {
+    private var feedbackTrackingArea: NSTrackingArea?
+    private(set) var isPointerInside = false
+
+    override func updateTrackingAreas() {
+        if let feedbackTrackingArea {
+            removeTrackingArea(feedbackTrackingArea)
+        }
+        super.updateTrackingAreas()
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        feedbackTrackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        isPointerInside = true
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        isPointerInside = false
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard isPointerInside, isEnabled else { return }
+        let overlayRect = bounds.insetBy(dx: 1, dy: 1)
+        guard overlayRect.isEmpty == false else { return }
+        NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
+        NSBezierPath(
+            roundedRect: overlayRect,
+            xRadius: 6,
+            yRadius: 6
+        ).fill()
+    }
 }
 
 /// Target-action trampoline for interactive AppKit controls (§7.6, §7.7, §22).
@@ -33,11 +83,20 @@ public final class ActionTrampoline: NSObject {
     }
 }
 
-/// Creates native controls for the required §7.3 tier and applies scalar properties in place.
+/// Creates native controls for the required §7.3 tier and any explicitly implemented optional tiers.
 @MainActor
 public final class ControlFactory {
+    /// Standard types this renderer implements. Optional/deferred additions stay explicit so
+    /// conformance can distinguish supported semantics from an accidental fallback.
+    static let implementedStandardNodeTypes: Set<TypeRef> = [
+        .surface, .row, .column, .grid, .spacer, .separator, .scroll,
+        .text, .richText, .button, .toggle, .textInput, .textArea,
+        .progress, .image, .list, .table, .tree, .menu,
+    ]
+
     /// Semantic interaction callback invoked when a native interactive control is activated or changed (§7.6, §7.7).
     public var onInteraction: (@MainActor (SemanticInteraction) -> Void)?
+    public var onCollectionRangeRequest: (@MainActor (CollectionRangeRequest) -> Void)?
 
     /// Synchronous main-actor resolver from content hash to a retained `NSImage` (§14).
     ///
@@ -45,31 +104,109 @@ public final class ControlFactory {
     /// resource paints immediately; a missing hash keeps the system placeholder.
     public var resolveResourceImage: (@MainActor (ResourceHash) -> NSImage?)?
 
-    public init() {}
+    public let textEditingSession: TextEditingSession
+    public let terminalSession: TerminalSession
+    public var onTerminalInput: (@MainActor (NodeId, Data) -> Void)?
+    public var onTerminalResize: (@MainActor (NodeId, UInt32, UInt32, UInt32, UInt32) -> Void)?
+
+    public let extensionMountResolver: ExtensionMountResolver
+
+    public init(
+        textEditingSession: TextEditingSession = TextEditingSession(),
+        terminalSession: TerminalSession = TerminalSession(),
+        extensionMountResolver: ExtensionMountResolver = ExtensionMountResolver()
+    ) {
+        self.textEditingSession = textEditingSession
+        self.terminalSession = terminalSession
+        self.extensionMountResolver = extensionMountResolver
+        self.textEditingSession.onCommit = { [weak self] nodeID, text, seq, epoch in
+            self?.onInteraction?(.textEdit(nodeID: nodeID, text: text, editSeq: seq, laneEpoch: epoch))
+        }
+    }
+
+    public func registerExtension(typeRef: TypeRef, kind: ExtensionControlKind) throws {
+        try extensionMountResolver.register(typeRef: typeRef, kind: kind)
+    }
+
+    public func resetExtensionRegistry() {
+        extensionMountResolver.reset()
+    }
+
+    public func extensionKind(for typeRef: TypeRef) -> ExtensionControlKind? {
+        extensionMountResolver.extensionKind(for: typeRef)
+    }
 
     public func makeHandle(for node: Node, store: SemanticStore? = nil) throws -> RenderHandle {
-        let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
+        try makeHandle(
+            for: node,
+            store: store,
+            mountDecision: extensionMountResolver.decision(for: node, in: store)
+        )
+    }
 
-        switch node.nodeType {
+    func makeHandle(
+        for node: Node,
+        store: SemanticStore?,
+        mountDecision: ExtensionMountDecision
+    ) throws -> RenderHandle {
+        let result: (view: NSView, window: NSWindow?, adapter: AnyObject?, trampoline: AnyObject?)
+        var textAdapter: NativeTextEditorAdapter?
+
+        switch mountDecision {
+        case .native(let kind):
+            switch kind {
+            case .terminal:
+                let view = makeTerminalView(for: node)
+                result = (view, nil, nil, nil)
+            }
+        case .fallback:
+            let stack = NSStackView()
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.distribution = .fill
+            stack.spacing = 8
+            result = (stack, nil, nil, nil)
+        case .rejected(let error):
+            throw error
+        case .standard:
+            switch node.nodeType {
         case .surface:
-            let contentView = NSStackView(frame: NSRect(x: 0, y: 0, width: 440, height: 320))
-            contentView.orientation = .vertical
-            contentView.alignment = .leading
-            contentView.distribution = .fill
-            contentView.spacing = 14
-            contentView.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+            let initialFrame = NSRect(x: 0, y: 0, width: 440, height: 320)
+            let surfaceView = NSStackView(frame: initialFrame)
+            surfaceView.orientation = .vertical
+            surfaceView.alignment = .leading
+            surfaceView.distribution = .fill
+            surfaceView.spacing = 14
+            surfaceView.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
             let window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: 320),
+                contentRect: initialFrame,
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
             )
+            // Keep window geometry independent from the semantic stack's intrinsic fitting size.
+            // Otherwise content growth can resize the NSWindow and user resizing never reaches
+            // flexible descendants such as Terminal.
+            let windowContentView = NSView(frame: initialFrame)
+            windowContentView.autoresizingMask = [.width, .height]
+            window.contentView = windowContentView
+            // Semantic minimum-size constraints may raise the window's fitting minimum, but they
+            // must never collapse its maximum to that same value. Keep both resize axes open.
+            window.contentMaxSize = NSSize(width: 10_000, height: 10_000)
+            window.maxSize = NSSize(width: 10_000, height: 10_000)
+            surfaceView.translatesAutoresizingMaskIntoConstraints = false
+            windowContentView.addSubview(surfaceView)
+            NSLayoutConstraint.activate([
+                surfaceView.leadingAnchor.constraint(equalTo: windowContentView.leadingAnchor),
+                surfaceView.trailingAnchor.constraint(equalTo: windowContentView.trailingAnchor),
+                surfaceView.topAnchor.constraint(equalTo: windowContentView.topAnchor),
+                surfaceView.bottomAnchor.constraint(equalTo: windowContentView.bottomAnchor),
+            ])
             // RenderHandle keeps a strong reference and LayoutRenderer.tearDown() closes the
             // window on remount; AppKit's default would then release it a second time.
             window.isReleasedWhenClosed = false
-            window.contentView = contentView
             window.center()
-            result = (contentView, window, nil, nil)
+            result = (surfaceView, window, nil, nil)
 
         case .row:
             let stack = NSStackView()
@@ -111,16 +248,29 @@ public final class ControlFactory {
             result = (label, nil, nil, nil)
 
         case .richText:
+            let scrollView = NSScrollView(frame: .zero)
+            scrollView.hasVerticalScroller = true
+            scrollView.hasHorizontalScroller = false
+            scrollView.drawsBackground = false
             let textView = NSTextView(frame: .zero)
             textView.isEditable = false
             textView.isSelectable = true
             textView.drawsBackground = false
+            textView.isVerticallyResizable = true
+            textView.isHorizontallyResizable = false
+            textView.autoresizingMask = [.width]
+            textView.textContainer?.widthTracksTextView = true
+            textView.textContainer?.containerSize = NSSize(
+                width: 0,
+                height: CGFloat.greatestFiniteMagnitude
+            )
             textView.textContainerInset = NSSize(width: 0, height: 4)
-            textView.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
-            result = (textView, nil, nil, nil)
+            scrollView.documentView = textView
+            scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 52).isActive = true
+            result = (scrollView, nil, nil, nil)
 
         case .button:
-            let button = NSButton(title: "Button", target: nil, action: nil)
+            let button = HoverFeedbackButton(title: "Button", target: nil, action: nil)
             button.bezelStyle = .rounded
             let trampoline = ActionTrampoline(nodeID: node.id) { [weak self] interaction in
                 self?.onInteraction?(interaction)
@@ -141,6 +291,12 @@ public final class ControlFactory {
         case .textInput:
             let field = NSTextField(frame: .zero)
             field.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
+            let adapter = NativeTextEditorAdapter(
+                nodeID: node.id,
+                session: textEditingSession,
+                textField: field
+            )
+            textAdapter = adapter
             result = (field, nil, nil, nil)
 
         case .textArea:
@@ -155,6 +311,12 @@ public final class ControlFactory {
             scrollView.documentView = textView
             scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 88).isActive = true
+            let adapter = NativeTextEditorAdapter(
+                nodeID: node.id,
+                session: textEditingSession,
+                textView: textView
+            )
+            textAdapter = adapter
             result = (scrollView, nil, nil, nil)
 
         case .progress:
@@ -201,11 +363,17 @@ public final class ControlFactory {
             result = (table.0, table.1, table.2, nil)
 
         case .tree:
-            let outline = makeOutline(for: node)
+            let outline = makeOutline(for: node, store: store)
             result = (outline.0, outline.1, outline.2, nil)
+
+        case .menu:
+            let popUp = NSPopUpButton(frame: .zero, pullsDown: false)
+            popUp.widthAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
+            result = (popUp, nil, nil, nil)
 
         default:
             throw ControlFactoryError.unsupportedNodeType(node.nodeType)
+        }
         }
 
         if node.nodeType != .surface {
@@ -219,7 +387,8 @@ public final class ControlFactory {
             parentID: node.parentID,
             childIDs: node.orderedChildren,
             modelAdapter: result.adapter,
-            actionTrampoline: result.trampoline
+            actionTrampoline: result.trampoline,
+            textAdapter: textAdapter
         )
         apply(node: node, to: handle, store: store)
         return handle
@@ -234,11 +403,33 @@ public final class ControlFactory {
         node.propertyEntries.sorted { $0.0 < $1.0 }
     }
 
+    /// Returns whether canonical editor `.value` should suppress the legacy `.text` fallback.
+    public static func shouldSkipTextFallback(for handle: RenderHandle, node: Node) -> Bool {
+        handle.textAdapter != nil && node.getProperty(.value) != nil
+    }
+
+    /// Displayed editor string: canonical `.value` when present, otherwise `.text`.
+    ///
+    /// Incremental clears of `.value` must reapply this so they match a remount, which
+    /// stops skipping `.text` once `.value` is gone.
+    public static func displayedEditorText(for node: Node) -> Value? {
+        node.getProperty(.value) ?? node.getProperty(.text)
+    }
+
     public func apply(node: Node, to handle: RenderHandle, store: SemanticStore? = nil) {
-        for (property, value) in Self.orderedPropertyEntries(of: node) {
+        let entries = Self.orderedPropertyEntries(of: node)
+        for (property, value) in entries {
+            if property == .text, Self.shouldSkipTextFallback(for: handle, node: node) {
+                continue
+            }
             apply(property: property, value: value, to: handle, store: store)
         }
-        if handle.nodeType == .table || handle.nodeType == .list {
+        if let adapter = handle.textAdapter, Self.displayedEditorText(for: node) == nil {
+            // Neither `.value` nor `.text` is defined. Seed the empty store baseline so a
+            // later rejection-only ack can revert and a remount can keepLocal (§22.6).
+            adapter.applyAuthoritativeString("")
+        }
+        if handle.nodeType == .table || handle.nodeType == .list || handle.nodeType == .tree {
             refreshCollection(in: handle, for: node, store: store ?? SemanticStore())
         }
     }
@@ -291,17 +482,24 @@ public final class ControlFactory {
 
         case .enabled:
             let enabled = value?.asBool ?? true
+            if let adapter = handle.textAdapter {
+                adapter.applyEnabled(enabled)
+            }
             if let control = handle.view as? NSControl {
                 control.isEnabled = enabled
             }
 
         case .readOnly:
             let readOnly = value?.asBool ?? false
-            if let field = handle.view as? NSTextField {
-                field.isEditable = !readOnly
-            }
-            if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
-                textView.isEditable = !readOnly
+            if let adapter = handle.textAdapter {
+                adapter.applyReadOnly(readOnly)
+            } else {
+                if let field = handle.view as? NSTextField {
+                    field.isEditable = !readOnly
+                }
+                if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+                    textView.isEditable = !readOnly
+                }
             }
 
         case .busy:
@@ -322,18 +520,26 @@ public final class ControlFactory {
             }
 
         case .text:
-            if let field = handle.view as? NSTextField {
-                field.stringValue = value?.asString ?? ""
-            }
-            if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
-                textView.string = value?.asString ?? ""
-            }
-            if let textView = handle.view as? NSTextView {
-                textView.string = value?.asString ?? ""
+            if let adapter = handle.textAdapter {
+                adapter.applyAuthoritative(value)
+            } else {
+                if let field = handle.view as? NSTextField {
+                    field.stringValue = value?.asString ?? ""
+                }
+                if let textView = (handle.view as? NSScrollView)?.documentView as? NSTextView {
+                    textView.string = value?.asString ?? ""
+                }
+                if let textView = handle.view as? NSTextView {
+                    textView.string = value?.asString ?? ""
+                }
             }
 
         case .value:
-            applyValue(value, to: handle)
+            if let adapter = handle.textAdapter {
+                adapter.applyAuthoritative(resolvedEditorValue(value, handle: handle, store: store))
+            } else {
+                applyValue(value, to: handle)
+            }
 
         case .placeholder:
             if let field = handle.view as? NSTextField {
@@ -344,7 +550,14 @@ public final class ControlFactory {
             applyResourceProperty(value?.asResourceHash, to: handle)
 
         case .items, .modelRef, .columns, .selectionMode:
-            if let adapter = handle.modelAdapter as? TableCollectionAdapter,
+            if property == .items,
+               handle.nodeType == .menu,
+               let popUp = handle.view as? NSPopUpButton {
+                popUp.removeAllItems()
+                popUp.addItems(
+                    withTitles: value?.asList?.compactMap { $0.asString } ?? []
+                )
+            } else if let adapter = handle.modelAdapter as? TableCollectionAdapter,
                let tableView = tableView(in: handle) {
                 if property == .columns {
                     let colStrings = value?.asList?.compactMap { $0.asString }
@@ -358,15 +571,10 @@ public final class ControlFactory {
                     applySelectionMode(mode, to: tableView)
                 } else if property == .modelRef {
                     let modelID = value?.asUnsignedInt.map { ModelId($0) }
-                    if let modelID, let store, let model = store.getModel(modelID) {
-                        let rows = model.iterCachedItems().map { (_, item) in
-                            TableCollectionAdapter.TableRow(itemID: item.itemID, cells: cells(from: item.value))
-                        }
-                        adapter.update(rows: rows, tableView: tableView)
-                    } else {
-                        adapter.update(rows: [], tableView: tableView)
-                    }
+                    let model = modelID.flatMap { store?.getModel($0) }
+                    adapter.update(model: model, modelID: modelID, tableView: tableView)
                 } else if property == .items {
+                    if adapter.isModelBacked { break }
                     let rows = (value?.asList ?? []).map { val in
                         TableCollectionAdapter.TableRow(itemID: nil, cells: cells(from: val))
                     }
@@ -374,8 +582,18 @@ public final class ControlFactory {
                 }
             } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
                       let outlineView = outlineView(in: handle) {
-                let rows = inlineOutlineRows(from: value)
-                adapter.update(rows: rows, outlineView: outlineView)
+                if property == .modelRef {
+                    let modelID = value?.asUnsignedInt.map { ModelId($0) }
+                    let model = modelID.flatMap { store?.getModel($0) }
+                    adapter.update(model: model, modelID: modelID, outlineView: outlineView)
+                } else if property == .selectionMode {
+                    adapter.selectionMode = value?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+                    applySelectionMode(adapter.selectionMode, to: outlineView)
+                } else if property == .items {
+                    if adapter.isModelBacked { break }
+                    let rows = inlineOutlineRows(from: value)
+                    adapter.update(rows: rows, outlineView: outlineView)
+                }
             }
 
         case .horizontalAlignment:
@@ -387,12 +605,14 @@ public final class ControlFactory {
             applyAlignment(to: handle)
 
         case .grow:
-            let priority: NSLayoutConstraint.Priority = (value?.asBool ?? false) ? .defaultLow : .defaultHigh
+            let priority: NSLayoutConstraint.Priority =
+                (numericValue(value) ?? 0) > 0 ? Self.flexibleHuggingPriority : Self.rigidHuggingPriority
             handle.view.setContentHuggingPriority(priority, for: .horizontal)
             handle.view.setContentHuggingPriority(priority, for: .vertical)
 
         case .shrink:
-            let priority: NSLayoutConstraint.Priority = (value?.asBool ?? false) ? .defaultLow : .defaultHigh
+            let priority: NSLayoutConstraint.Priority =
+                (numericValue(value) ?? 0) > 0 ? .defaultLow : .defaultHigh
             handle.view.setContentCompressionResistancePriority(priority, for: .horizontal)
             handle.view.setContentCompressionResistancePriority(priority, for: .vertical)
 
@@ -431,8 +651,11 @@ public final class ControlFactory {
         case .role:
             applyRole(value?.asEnumToken, to: handle)
 
-        case .presentationHint, .validationState, .actionKey:
+        case .presentationHint, .actionKey:
             break
+
+        case .validationState:
+            handle.textAdapter?.applyValidation(value)
 
         default:
             break
@@ -462,10 +685,10 @@ public final class ControlFactory {
     func configureCollectionScrolling(nested: Bool, handle: RenderHandle) {
         guard let scrollView = handle.view as? NSScrollView else { return }
         if let adapter = handle.modelAdapter as? TableCollectionAdapter,
-           let tableView = scrollView.documentView as? NSTableView {
+           let tableView = tableView(in: handle) {
             adapter.setNestedInScroll(nested, scrollView: scrollView, tableView: tableView)
         } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
-                  let outlineView = scrollView.documentView as? NSOutlineView {
+                  let outlineView = outlineView(in: handle) {
             adapter.setNestedInScroll(nested, scrollView: scrollView, outlineView: outlineView)
         }
     }
@@ -487,11 +710,22 @@ public final class ControlFactory {
             applySelectionMode(mode, to: tableView)
 
             let newRows = tableRows(for: node, store: store)
-            adapter.update(rows: newRows, tableView: tableView)
+            if let modelID = node.modelRef {
+                adapter.update(model: store.getModel(modelID), modelID: modelID, tableView: tableView)
+            } else {
+                adapter.update(rows: newRows, tableView: tableView)
+            }
         } else if let adapter = handle.modelAdapter as? OutlineCollectionAdapter,
                   let outlineView = outlineView(in: handle) {
-            let rows = inlineOutlineRows(from: node.getProperty(.items))
-            adapter.update(rows: rows, outlineView: outlineView)
+            if let modelID = node.modelRef {
+                adapter.update(model: store.getModel(modelID), modelID: modelID, outlineView: outlineView)
+            } else {
+                let rows = inlineOutlineRows(from: node.getProperty(.items))
+                adapter.update(rows: rows, outlineView: outlineView)
+            }
+            let mode = node.getProperty(.selectionMode)?.asEnumToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+            adapter.selectionMode = mode
+            applySelectionMode(mode, to: outlineView)
         }
     }
 
@@ -542,14 +776,21 @@ public final class ControlFactory {
         let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
         applySelectionMode(selectionMode, to: tableView)
 
-        let rows = tableRows(for: node, store: store)
+        let modelID = node.modelRef
+        let model = modelID.flatMap { store?.getModel($0) }
+        let rows = modelID == nil ? tableRows(for: node, store: store) : []
         let adapter = TableCollectionAdapter(
             nodeID: node.id,
             rows: rows,
+            model: model,
+            modelID: modelID,
             hasExplicitColumns: columnValues?.isEmpty == false,
             selectionMode: selectionMode,
-            onInteraction: { [weak self] interaction in
-                self?.onInteraction?(interaction)
+            onSelectionChanged: { [weak self] nodeID, itemID in
+                self?.onInteraction?(.selectionChanged(nodeID: nodeID, itemID: itemID))
+            },
+            onRangeRequest: { [weak self] request in
+                self?.onCollectionRangeRequest?(request)
             }
         )
         tableView.dataSource = adapter
@@ -559,45 +800,56 @@ public final class ControlFactory {
         let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
         minHeight.isActive = true
         adapter.minHeightConstraint = minHeight
+        adapter.attachViewportObservation(scrollView: scrollView, tableView: tableView)
         return (scrollView, nil, adapter)
     }
 
-    private func makeOutline(for node: Node) -> (NSView, NSWindow?, AnyObject?) {
+    private func makeOutline(for node: Node, store: SemanticStore?) -> (NSView, NSWindow?, AnyObject?) {
         let scrollView = NSScrollView(frame: .zero)
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .bezelBorder
-
         let outlineView = NSOutlineView(frame: .zero)
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("tree"))
         column.title = "Tree"
-        column.width = 360
+        column.width = 180
+        column.minWidth = 120
+        column.resizingMask = .autoresizingMask
+        outlineView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         outlineView.addTableColumn(column)
-        outlineView.outlineTableColumn = column
         outlineView.headerView = nil
 
-        let rows = inlineOutlineRows(from: node.getProperty(.items))
-        let adapter = OutlineCollectionAdapter(rows: rows)
+        let modelID = node.modelRef
+        let model = modelID.flatMap { store?.getModel($0) }
+        let modeToken = node.getProperty(.selectionMode)?.asEnumToken
+        let selectionMode = modeToken.flatMap(StandardSelectionMode.init(enumToken:)) ?? .none
+        TableCollectionAdapter.applySelectionMode(selectionMode, to: outlineView)
+        let rows = modelID == nil ? inlineOutlineRows(from: node.getProperty(.items)) : []
+        let adapter = OutlineCollectionAdapter(
+            nodeID: node.id,
+            rows: rows,
+            model: model,
+            modelID: modelID,
+            selectionMode: selectionMode,
+            onSelectionChanged: { [weak self] nodeID, itemID in
+                self?.onInteraction?(.selectionChanged(nodeID: nodeID, itemID: itemID))
+            },
+            onRangeRequest: { [weak self] request in
+                self?.onCollectionRangeRequest?(request)
+            }
+        )
         outlineView.dataSource = adapter
         outlineView.delegate = adapter
         scrollView.documentView = outlineView
-        scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 320).isActive = true
+        scrollView.widthAnchor.constraint(greaterThanOrEqualToConstant: 180).isActive = true
         let minHeight = scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 100)
         minHeight.isActive = true
         adapter.minHeightConstraint = minHeight
+        adapter.attachViewportObservation(scrollView: scrollView, outlineView: outlineView)
         return (scrollView, nil, adapter)
     }
 
-    private func cellString(from value: Value) -> String {
-        if let str = value.asString { return str }
-        if value == .null { return "" }
-        return value.description
-    }
-
     private func cells(from value: Value) -> [String] {
-        if case .list(let items) = value {
-            return items.map(cellString(from:))
-        }
-        return [cellString(from: value)]
+        CollectionCells.cells(from: value)
     }
 
     public func tableRows(for node: Node, store: SemanticStore?) -> [TableCollectionAdapter.TableRow] {
@@ -626,18 +878,38 @@ public final class ControlFactory {
     }
 
     private func tableView(in handle: RenderHandle) -> NSTableView? {
-        (handle.view as? NSScrollView)?.documentView as? NSTableView
+        guard let table = (handle.view as? NSScrollView)?.documentView as? NSTableView,
+              !(table is NSOutlineView) else {
+            return nil
+        }
+        return table
     }
 
     private func outlineView(in handle: RenderHandle) -> NSOutlineView? {
         (handle.view as? NSScrollView)?.documentView as? NSOutlineView
     }
 
+
     private func textView(in handle: RenderHandle) -> NSTextView? {
         if let textView = handle.view as? NSTextView {
             return textView
         }
         return (handle.view as? NSScrollView)?.documentView as? NSTextView
+    }
+
+    /// When canonical `.value` is cleared, reapply remaining `.text` from the updated node.
+    private func resolvedEditorValue(
+        _ value: Value?,
+        handle: RenderHandle,
+        store: SemanticStore?
+    ) -> Value? {
+        if value != nil {
+            return value
+        }
+        guard let node = store?.getNode(handle.nodeID) else {
+            return nil
+        }
+        return Self.displayedEditorText(for: node)
     }
 
     private func applyValue(_ value: Value?, to handle: RenderHandle) {
@@ -800,6 +1072,52 @@ public final class ControlFactory {
         }
         NSLayoutConstraint.activate(constraints)
         handle.propertyConstraints[property] = constraints
+    }
+
+    private static let flexibleHuggingPriority = NSLayoutConstraint.Priority(
+        rawValue: NSLayoutConstraint.Priority.defaultLow.rawValue - 1
+    )
+
+    /// Hugging for `grow == 0`. AppKit pins a window's current size in the layout engine at
+    /// `windowSizeStayPut` (500), so any content hugging above that overrules an interactive
+    /// resize and snaps the window back to its fitting size on the next layout pass. Staying
+    /// below 500 keeps `grow` a sibling-ordering hint (it still outranks
+    /// `flexibleHuggingPriority`) instead of a hard cap on the surface window.
+    private static let rigidHuggingPriority = NSLayoutConstraint.Priority(
+        rawValue: NSLayoutConstraint.Priority.windowSizeStayPut.rawValue - 1
+    )
+
+    private func makeTerminalView(for node: Node) -> TerminalView {
+        let view = TerminalView(nodeID: node.id)
+        view.setContentHuggingPriority(Self.flexibleHuggingPriority, for: .horizontal)
+        view.setContentHuggingPriority(Self.flexibleHuggingPriority, for: .vertical)
+        view.heightAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
+        view.onInput = { [weak self] data in
+            self?.onTerminalInput?(node.id, data)
+        }
+        view.onResize = { [weak self] cols, rows, width, height in
+            Task { @MainActor in
+                await self?.terminalSession.resize(streamID: node.id, columns: Int(cols), rows: Int(rows))
+            }
+            self?.onTerminalResize?(node.id, cols, rows, width, height)
+        }
+        let session = terminalSession
+        let streamID = node.id
+        view.onAcknowledgeRedraw = {
+            Task { @MainActor in
+                await session.acknowledgeRedraw(streamID: streamID)
+            }
+        }
+        view.snapshotSubscriptionTask = Task { @MainActor [weak view] in
+            if let current = await session.snapshot(for: streamID) {
+                view?.apply(current)
+            }
+            for await snapshot in await session.snapshots(for: streamID) {
+                guard let view else { break }
+                view.apply(snapshot)
+            }
+        }
+        return view
     }
 
     private func spacing(for token: EnumToken?) -> CGFloat {

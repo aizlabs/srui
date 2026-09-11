@@ -5,34 +5,34 @@ import Foundation
 
 // MARK: - Registry Tables
 
-public let standardNodeTypesTable: [(id: UInt32, name: String)] = [
-    (1, "Surface"),
-    (2, "Dialog"),
-    (3, "Row"),
-    (4, "Column"),
-    (5, "Grid"),
-    (6, "Spacer"),
-    (7, "Separator"),
-    (8, "Scroll"),
-    (9, "Text"),
-    (10, "RichText"),
-    (11, "Button"),
-    (12, "Toggle"),
-    (13, "TextInput"),
-    (14, "TextArea"),
-    (15, "Progress"),
-    (16, "Image"),
-    (17, "List"),
-    (18, "Table"),
-    (19, "Tree"),
-    (20, "Select"),
-    (21, "ChoiceGroup"),
-    (22, "Slider"),
-    (23, "NumberInput"),
-    (24, "Tabs"),
-    (25, "Split"),
-    (26, "Menu"),
-    (27, "Toolbar"),
+public let standardNodeTypesTable: [(id: UInt32, name: String, tier: String)] = [
+    (1, "Surface", "required"),
+    (2, "Dialog", "standard"),
+    (3, "Row", "required"),
+    (4, "Column", "required"),
+    (5, "Grid", "required"),
+    (6, "Spacer", "required"),
+    (7, "Separator", "required"),
+    (8, "Scroll", "required"),
+    (9, "Text", "required"),
+    (10, "RichText", "required"),
+    (11, "Button", "required"),
+    (12, "Toggle", "required"),
+    (13, "TextInput", "required"),
+    (14, "TextArea", "required"),
+    (15, "Progress", "required"),
+    (16, "Image", "required"),
+    (17, "List", "required"),
+    (18, "Table", "required"),
+    (19, "Tree", "required"),
+    (20, "Select", "should"),
+    (21, "ChoiceGroup", "should"),
+    (22, "Slider", "should"),
+    (23, "NumberInput", "should"),
+    (24, "Tabs", "should"),
+    (25, "Split", "should"),
+    (26, "Menu", "deferred"),
+    (27, "Toolbar", "deferred"),
 ]
 
 public let standardPropertiesTable: [(id: UInt32, name: String)] = [
@@ -67,6 +67,57 @@ public let standardPropertiesTable: [(id: UInt32, name: String)] = [
     (29, "columns"),
     (30, "selection_mode"),
 ]
+
+/// Runtime value kinds declared by the standard property registry.
+public enum StandardPropertyValueType: String, Sendable {
+    case any = "value"
+    case bool
+    case enumToken = "enum"
+    case float64
+    case list
+    case resourceHash = "resource_hash"
+    case size
+    case string
+    case unsignedInt = "uint64"
+}
+
+/// Returns the canonical runtime value kind for a standard property.
+public func standardPropertyValueType(_ property: PropertyRef) -> StandardPropertyValueType? {
+    guard property.isStandard else { return nil }
+    switch property.localID {
+    case 1: return .string
+    case 2: return .string
+    case 3: return .enumToken
+    case 4: return .string
+    case 5: return .list
+    case 6: return .enumToken
+    case 7: return .bool
+    case 8: return .bool
+    case 9: return .bool
+    case 10: return .bool
+    case 11: return .enumToken
+    case 12: return .string
+    case 13: return .any
+    case 14: return .string
+    case 15: return .resourceHash
+    case 16: return .list
+    case 17: return .unsignedInt
+    case 18: return .enumToken
+    case 19: return .enumToken
+    case 20: return .float64
+    case 21: return .float64
+    case 22: return .size
+    case 23: return .size
+    case 24: return .size
+    case 25: return .enumToken
+    case 26: return .enumToken
+    case 27: return .enumToken
+    case 28: return .string
+    case 29: return .list
+    case 30: return .enumToken
+    default: return nil
+    }
+}
 
 public let standardEventsTable: [(id: UInt32, name: String)] = [
     (1, "ACTIVATE"),

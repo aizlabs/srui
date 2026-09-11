@@ -158,6 +158,7 @@ fn main() {
             revision_after_effect: 1843,
             reject_reason: String::new(),
             session_id: "s-91c".to_string(),
+            settled_event_seq: 593,
         })),
     };
     let event_ack_bytes = encode_framed(&event_ack).expect("encode framed ServerEventAck");
@@ -192,5 +193,245 @@ fn main() {
     println!(
         "Wrote malformed_truncated_frame.bin ({} bytes)",
         truncated_frame_bytes.len()
+    );
+
+    // 7. Construct golden framed ClientModelRangeRequest (§8, §22.7)
+    let range_request = SruiMessage {
+        msg: Some(srui_message::Msg::ClientModelRangeRequest(
+            ClientModelRangeRequest {
+                node_id: 7,
+                model_id: 11,
+                start_index: 128,
+                count: 64,
+                observed_revision: 5,
+            },
+        )),
+    };
+    let range_bytes = encode_framed(&range_request).expect("encode framed ClientModelRangeRequest");
+    fs::write(
+        out_dir.join("golden_client_model_range_request.bin"),
+        &range_bytes,
+    )
+    .expect("write golden_client_model_range_request.bin");
+    println!(
+        "Wrote golden_client_model_range_request.bin ({} bytes)",
+        range_bytes.len()
+    );
+
+    // 8. Construct golden framed TEXT_EDIT (§18.3, §22.6).
+    let text_edit_event = SruiMessage {
+        msg: Some(srui_message::Msg::Event(Event {
+            client_instance_id: b"client-29".to_vec(),
+            event_seq: 29,
+            event_id: b"event-text-29".to_vec(),
+            observed_revision: 41,
+            node_id: 7,
+            event_type: Some(TypeRef {
+                namespace_id: STANDARD_NAMESPACE_ID,
+                local_id: StandardEvent::EventTextEdit as u32,
+            }),
+            arguments: vec![Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyText as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::StringValue("composed text".to_string())),
+                }),
+            }],
+            edit_seq: 3,
+        })),
+    };
+    let text_edit_bytes = encode_framed(&text_edit_event).expect("encode framed TEXT_EDIT event");
+    fs::write(out_dir.join("golden_text_edit_event.bin"), &text_edit_bytes)
+        .expect("write golden_text_edit_event.bin");
+    println!(
+        "Wrote golden_text_edit_event.bin ({} bytes)",
+        text_edit_bytes.len()
+    );
+
+    // 9. Construct protobuf-valid TEXT_EDIT missing its required positive edit_seq.
+    let malformed_text_edit = SruiMessage {
+        msg: Some(srui_message::Msg::Event(Event {
+            client_instance_id: b"client-29".to_vec(),
+            event_seq: 30,
+            event_id: b"bad-text-zero".to_vec(),
+            observed_revision: 41,
+            node_id: 7,
+            event_type: Some(TypeRef {
+                namespace_id: STANDARD_NAMESPACE_ID,
+                local_id: StandardEvent::EventTextEdit as u32,
+            }),
+            arguments: vec![Property {
+                property: Some(PropertyRef {
+                    namespace_id: STANDARD_NAMESPACE_ID,
+                    local_id: StandardProperty::PropertyText as u32,
+                }),
+                value: Some(Value {
+                    value: Some(value::Value::StringValue("rejected text".to_string())),
+                }),
+            }],
+            edit_seq: 0,
+        })),
+    };
+    let malformed_text_edit_bytes =
+        encode_framed(&malformed_text_edit).expect("encode malformed framed TEXT_EDIT event");
+    fs::write(
+        out_dir.join("malformed_text_edit_zero_edit_seq.bin"),
+        &malformed_text_edit_bytes,
+    )
+    .expect("write malformed_text_edit_zero_edit_seq.bin");
+    println!(
+        "Wrote malformed_text_edit_zero_edit_seq.bin ({} bytes)",
+        malformed_text_edit_bytes.len()
+    );
+
+    // 10. Construct protobuf-valid ACTIVATE carrying a forbidden edit_seq.
+    let malformed_activate = SruiMessage {
+        msg: Some(srui_message::Msg::Event(Event {
+            client_instance_id: b"client-29".to_vec(),
+            event_seq: 31,
+            event_id: b"bad-activate-seq".to_vec(),
+            observed_revision: 41,
+            node_id: 7,
+            event_type: Some(TypeRef {
+                namespace_id: STANDARD_NAMESPACE_ID,
+                local_id: StandardEvent::EventActivate as u32,
+            }),
+            arguments: Vec::new(),
+            edit_seq: 1,
+        })),
+    };
+    let malformed_activate_bytes =
+        encode_framed(&malformed_activate).expect("encode malformed framed ACTIVATE event");
+    fs::write(
+        out_dir.join("malformed_activate_nonzero_edit_seq.bin"),
+        &malformed_activate_bytes,
+    )
+    .expect("write malformed_activate_nonzero_edit_seq.bin");
+    println!(
+        "Wrote malformed_activate_nonzero_edit_seq.bin ({} bytes)",
+        malformed_activate_bytes.len()
+    );
+
+    // 11–14. Terminal compatibility envelopes (§21)
+    let terminal_data = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalData(TerminalData {
+            stream_id: 7,
+            byte_offset: 4096,
+            data: b"pty-ok".to_vec(),
+        })),
+    };
+    let terminal_data_bytes = encode_framed(&terminal_data).expect("encode framed TerminalData");
+    fs::write(
+        out_dir.join("golden_terminal_data.bin"),
+        &terminal_data_bytes,
+    )
+    .expect("write golden_terminal_data.bin");
+    println!(
+        "Wrote golden_terminal_data.bin ({} bytes)",
+        terminal_data_bytes.len()
+    );
+
+    let terminal_input = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalInput(TerminalInput {
+            stream_id: 7,
+            data: b"ls\n".to_vec(),
+        })),
+    };
+    let terminal_input_bytes = encode_framed(&terminal_input).expect("encode framed TerminalInput");
+    fs::write(
+        out_dir.join("golden_terminal_input.bin"),
+        &terminal_input_bytes,
+    )
+    .expect("write golden_terminal_input.bin");
+    println!(
+        "Wrote golden_terminal_input.bin ({} bytes)",
+        terminal_input_bytes.len()
+    );
+
+    let terminal_resize = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalResize(TerminalResize {
+            stream_id: 7,
+            columns: 80,
+            rows: 24,
+            pixel_width: 1280,
+            pixel_height: 720,
+        })),
+    };
+    let terminal_resize_bytes =
+        encode_framed(&terminal_resize).expect("encode framed TerminalResize");
+    fs::write(
+        out_dir.join("golden_terminal_resize.bin"),
+        &terminal_resize_bytes,
+    )
+    .expect("write golden_terminal_resize.bin");
+    println!(
+        "Wrote golden_terminal_resize.bin ({} bytes)",
+        terminal_resize_bytes.len()
+    );
+
+    let terminal_resync = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalResyncRequired(
+            TerminalResyncRequired {
+                stream_id: 7,
+                requested_offset: 100,
+                retained_from_offset: 64,
+                resume_at_offset: 240,
+                reason: TerminalResyncReason::RetentionLoss as i32,
+            },
+        )),
+    };
+    let terminal_resync_bytes =
+        encode_framed(&terminal_resync).expect("encode framed TerminalResyncRequired");
+    fs::write(
+        out_dir.join("golden_terminal_resync_required.bin"),
+        &terminal_resync_bytes,
+    )
+    .expect("write golden_terminal_resync_required.bin");
+    println!(
+        "Wrote golden_terminal_resync_required.bin ({} bytes)",
+        terminal_resync_bytes.len()
+    );
+
+    // 15. Protobuf-valid TERMINAL_INPUT carrying no payload: forbidden by §21 (the
+    // server must never enqueue an empty write onto a PTY master).
+    let malformed_terminal_input = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalInput(TerminalInput {
+            stream_id: 20,
+            data: Vec::new(),
+        })),
+    };
+    let malformed_terminal_input_bytes =
+        encode_framed(&malformed_terminal_input).expect("encode malformed framed TerminalInput");
+    fs::write(
+        out_dir.join("malformed_terminal_input_empty.bin"),
+        &malformed_terminal_input_bytes,
+    )
+    .expect("write malformed_terminal_input_empty.bin");
+    println!(
+        "Wrote malformed_terminal_input_empty.bin ({} bytes)",
+        malformed_terminal_input_bytes.len()
+    );
+
+    // 16. Protobuf-valid TERMINAL_DATA carrying no payload: forbidden by §21 (an empty
+    // frame advances no offset and must be rejected instead of silently applied).
+    let malformed_terminal_data = SruiMessage {
+        msg: Some(srui_message::Msg::TerminalData(TerminalData {
+            stream_id: 20,
+            byte_offset: 4096,
+            data: Vec::new(),
+        })),
+    };
+    let malformed_terminal_data_bytes =
+        encode_framed(&malformed_terminal_data).expect("encode malformed framed TerminalData");
+    fs::write(
+        out_dir.join("malformed_terminal_data_empty.bin"),
+        &malformed_terminal_data_bytes,
+    )
+    .expect("write malformed_terminal_data_empty.bin");
+    println!(
+        "Wrote malformed_terminal_data_empty.bin ({} bytes)",
+        malformed_terminal_data_bytes.len()
     );
 }

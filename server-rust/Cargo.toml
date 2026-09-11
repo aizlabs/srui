@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "benchmark-driver",
     "protocol",
     "ssh-bridge",
     "sessiond",
@@ -10,6 +11,7 @@ members = [
     "resources",
     "pty",
     "sdk",
+    "unix-security",
 ]
 
 [workspace.package]

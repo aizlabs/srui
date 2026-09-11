@@ -200,8 +200,14 @@ struct SessionRobustnessTests {
         )
         try await serverTransport.send(data: try Self.framed(mountTx))
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+        try await AsyncTestSupport.eventually(
+            description: "revision 1 button render completes"
+        ) {
+            renderer.registry.handle(for: buttonID) != nil
+        }
 
         let buttonHandle = try #require(renderer.registry.handle(for: buttonID))
+        #expect(buttonHandle.nodeID == buttonID)
         let trampoline = try #require(buttonHandle.actionTrampoline as? ActionTrampoline)
 
         // The user clicks while looking at revision 1.
@@ -239,11 +245,14 @@ struct SessionRobustnessTests {
     func outboxBoundsPendingEventCache() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "bounded-outbox", binding: binding))
 
         for _ in 0..<EventOutbox.defaultMaxPendingEvents {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(1),
+                binding: binding,
                 via: clientTransport
             )
         }
@@ -252,6 +261,7 @@ struct SessionRobustnessTests {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(1),
+                binding: binding,
                 via: clientTransport
             )
         }
@@ -399,7 +409,14 @@ struct SessionRobustnessTests {
                 )
             )
         )
-        #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+        #expect(await Self.waitUntil {
+            await MainActor.run {
+                applier.lastAppliedRevision == Revision(1)
+                    && renderer.registry.count == 2
+                    && (renderer.registry.handle(for: NodeId(2))?.view as? NSTextField)?
+                        .stringValue == "Count: 0"
+            }
+        })
         #expect(renderer.registry.count == 2)
 
         // Force the view tree out of sync with the committed store, so the next incremental apply
@@ -435,7 +452,13 @@ struct SessionRobustnessTests {
         )
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(3) })
 
-        #expect(await Self.waitUntil { await MainActor.run { renderer.registry.count == 2 } })
+        #expect(await Self.waitUntil {
+            await MainActor.run {
+                renderer.registry.count == 2
+                    && (renderer.registry.handle(for: NodeId(2))?.view as? NSTextField)?
+                        .stringValue == "Count: 2"
+            }
+        })
         let textHandle = try #require(renderer.registry.handle(for: NodeId(2)))
         let textField = try #require(textHandle.view as? NSTextField)
         #expect(textField.stringValue == "Count: 2")
@@ -528,6 +551,7 @@ struct SessionRobustnessTests {
 
         #expect(await failures.count == 0, "an intentional stop is not a session failure")
         #expect(!controller.isDiverged)
+        try await controller.resourceCache.clearPartials()
 
         await serverTransport.close()
     }
@@ -581,6 +605,22 @@ struct SessionRobustnessTests {
         welcomeMsg.serverWelcome = welcome
         await controller.handleIncomingMessage(welcomeMsg)
 
+        // The revision-zero welcome states that the new session holds nothing, so it also empties
+        // the replica: the next session rebuilds from its own revision 1 rather than continuing
+        // the abandoned one's numbering (§18).
+        #expect(applier.lastAppliedRevision == .initial)
+
+        var rebuild = SRUIMessage()
+        rebuild.transaction = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: Self.surfaceAndText("Count: 0")
+        ).toWire()
+        await controller.handleIncomingMessage(rebuild)
+
+        // A surviving `pendingResync` would take this down the snapshot path, where a nonzero
+        // `base_revision` is rejected outright — so this still fails closed on a stuck latch,
+        // exactly as the old `Revision(1) -> Revision(2)` delta did.
         var msg = SRUIMessage()
         msg.transaction = Transaction(
             baseRevision: Revision(1),
@@ -608,6 +648,7 @@ struct SessionRobustnessTests {
             try await controller.start()
         }
         #expect(await transport.sentFrameCount == 0)
+        try await controller.resourceCache.clearPartials()
 
         // The failed attempt started nothing, so the second attempt must actually run — not return
         // early on a stale `isRunning` latch.
@@ -703,7 +744,7 @@ private actor BlockingTransport: Transport {
     var isSendBlocked: Bool { sendBlocked }
     var isClosed: Bool { closed }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         guard !closed else { throw TransportError.closed }
         sendBlocked = true
         await withCheckedContinuation { sendWaiters.append($0) }
@@ -745,7 +786,7 @@ private actor FlakyTransport: Transport {
 
     var sentFrameCount: Int { sentFrames.count }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         if failNextSend {
             failNextSend = false
             throw TransportError.closed

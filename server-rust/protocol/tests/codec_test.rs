@@ -91,7 +91,7 @@ async fn test_async_codec_roundtrip() {
 
     let msg = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["core".to_string(), "widgets.standard".to_string()],
             limits: Some(ClientLimits {
                 max_frame_size: 16 * 1024 * 1024,
@@ -176,7 +176,7 @@ async fn test_async_codec_cancel_safety_in_select() {
 
     let msg = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["core".to_string()],
             limits: None,
             client_instance_id: vec![42],

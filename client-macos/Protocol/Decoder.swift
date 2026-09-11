@@ -22,6 +22,8 @@ import SemanticModel
 public typealias Operation = SemanticModel.StoreOperation
 
 // MARK: - Protocol Decode Error (§16, §26)
+/// Protocol-wide maximum encoded event identifier length (§7.7, §18.2, §26).
+public let maxEventIDBytes = 64
 
 /// Typed errors returned during wire decoding and §26 safety limits validation (§16, §26).
 public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvertible {
@@ -47,6 +49,8 @@ public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvert
     case maxRecordPropertiesExceeded(limit: Int, actual: Int)
     /// Model operation items count exceeds allowable limit (§26).
     case maxItemsPerModelOperationExceeded(limit: Int, actual: Int)
+    /// Event identifier byte length exceeds the protocol-wide limit (§26).
+    case eventIDSizeLimitExceeded(limit: Int, actual: Int)
     /// Resource hash byte length is invalid (expected 32 bytes).
     case invalidResourceHashLength(Int)
     /// Operation payload variant is invalid or unknown.
@@ -78,6 +82,8 @@ public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvert
             return "Record properties limit exceeded: max allowed is \(limit), actual count is \(actual) (§26)"
         case .maxItemsPerModelOperationExceeded(let limit, let actual):
             return "Items per model operation limit exceeded: max allowed is \(limit), actual count is \(actual) (§26)"
+        case .eventIDSizeLimitExceeded(let limit, let actual):
+            return "Event ID length limit exceeded: max allowed is \(limit) bytes, actual is \(actual) bytes (§26)"
         case .invalidResourceHashLength(let len):
             return "Expected 32-byte resource hash, got \(len) bytes"
         case .invalidOperation(let msg):
@@ -101,6 +107,7 @@ public enum ProtocolDecodeError: Error, Equatable, Sendable, CustomStringConvert
         case .maxListElementsExceeded: return "max_list_length_exceeded"
         case .maxRecordPropertiesExceeded: return "max_record_properties_exceeded"
         case .maxItemsPerModelOperationExceeded: return "max_items_per_model_operation_exceeded"
+        case .eventIDSizeLimitExceeded: return "event_id_size_limit_exceeded"
         case .invalidResourceHashLength: return "invalid_resource_hash_length"
         case .invalidOperation: return "invalid_operation"
         case .custom: return "custom_error"
@@ -116,7 +123,6 @@ public struct ProtocolDecoder: Sendable {
     public var limits: StoreLimits
     /// Maximum allowed wire frame size in bytes (§26).
     public var maxFrameSize: Int
-
     /// Constructs a `ProtocolDecoder` with the specified limits.
     public init(
         limits: StoreLimits = StoreLimits(),
@@ -449,11 +455,13 @@ public struct ProtocolDecoder: Sendable {
     }
 
     public func validateAndConvertEvent(wire: SRUIEvent) throws -> Event {
+        let eventID = try validateAndConvertEventID(wire.eventID)
         let clientInstanceId = wire.clientInstanceID.isEmpty ? nil : ClientInstanceId(wire.clientInstanceID)
         guard wire.hasEventType else {
             throw ProtocolDecodeError.missingField("Event.eventType")
         }
         let eventType = TypeRef(wire: wire.eventType)
+        let editSeq = try decodeEventEditSequence(wire.editSeq, eventType: eventType)
 
         var args: [PropertyRef: Value] = [:]
         args.reserveCapacity(wire.arguments.count)
@@ -469,11 +477,12 @@ public struct ProtocolDecoder: Sendable {
         return Event(
             clientInstanceId: clientInstanceId,
             eventSeq: wire.eventSeq,
-            eventId: EventId(wire.eventID),
+            eventId: eventID,
             observedRevision: Revision(wire.observedRevision),
             nodeId: NodeId(wire.nodeID),
             eventType: eventType,
-            arguments: args
+            arguments: args,
+            editSeq: editSeq
         )
     }
 

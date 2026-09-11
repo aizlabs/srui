@@ -1,7 +1,9 @@
 import AppKit
 import SemanticModel
 import Testing
+import Text
 @testable import RendererAppKit
+@testable import Collections
 
 @MainActor
 struct LayoutRendererTests {
@@ -41,6 +43,89 @@ struct LayoutRendererTests {
     }
 
     @Test
+    func structuralRemountKeepsUnflushedTextInputDraft() throws {
+        let renderer = LayoutRenderer()
+        renderer.controlFactory.textEditingSession.debounceNanoseconds = 1_000_000_000
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .textInput,
+                parentID: 1,
+                properties: [(.value, .string("hello"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        let field = try #require(handle.view as? NSTextField)
+        #expect(field.stringValue == "hello")
+
+        field.stringValue = "hello!"
+        adapter.notifyTextDidChangeForTests()
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+
+        let structural = SemanticModel.Operation.createNode(id: 3, nodeType: .text, parentID: 1)
+        let newStore = try makeStore(base + [structural])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [structural]),
+            newStore: newStore
+        )
+
+        let after = try #require(renderer.registry.handle(for: editorID))
+        let fieldAfter = try #require(after.view as? NSTextField)
+        #expect(fieldAfter.stringValue == "hello!")
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+    }
+
+    @Test
+    func structuralRemountAbandonsCompositionInsteadOfDeferringStoreString() throws {
+        let renderer = LayoutRenderer()
+        renderer.controlFactory.textEditingSession.debounceNanoseconds = 0
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .textInput,
+                parentID: 1,
+                properties: [(.value, .string("hello"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: editorID))
+        let adapter = try #require(handle.textAdapter)
+        adapter.compositionOverride = true
+        let field = try #require(handle.view as? NSTextField)
+        field.stringValue = "hel"
+        adapter.notifyTextDidChangeForTests()
+        #expect(renderer.controlFactory.textEditingSession.isComposing(for: editorID))
+
+        let structural = SemanticModel.Operation.createNode(id: 3, nodeType: .text, parentID: 1)
+        let newStore = try makeStore(base + [structural])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [structural]),
+            newStore: newStore
+        )
+
+        let after = try #require(renderer.registry.handle(for: editorID))
+        let adapterAfter = try #require(after.textAdapter)
+        let fieldAfter = try #require(after.view as? NSTextField)
+        #expect(!renderer.controlFactory.textEditingSession.isComposing(for: editorID))
+        #expect(fieldAfter.stringValue == "hello")
+
+        fieldAfter.stringValue = "hello!"
+        adapterAfter.notifyTextDidChangeForTests()
+        #expect(fieldAfter.stringValue == "hello!")
+        #expect(renderer.controlFactory.textEditingSession.localValue(for: editorID) == "hello!")
+    }
+
+    @Test
     func scalarPropertyUpdatePreservesViewIdentityWithoutRemounting() throws {
         let base: [SemanticModel.Operation] = [
             .createNode(id: 1, nodeType: .surface),
@@ -76,6 +161,45 @@ struct LayoutRendererTests {
         #expect(textBefore === textAfter)
         #expect(surfaceWindowBefore === surfaceWindowAfter)
         #expect((textAfter as? NSTextField)?.stringValue == "After")
+    }
+
+    @Test(arguments: [TypeRef.textInput, .textArea])
+    func clearingValueRestoresTextFallbackWithoutRemount(nodeType: TypeRef) throws {
+        let editorID = NodeId(2)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: nodeType,
+                parentID: 1,
+                properties: [
+                    (.text, .string("from-text")),
+                    (.value, .string("from-value")),
+                ]
+            ),
+        ]
+        let store = try makeStore(base)
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let handleBefore = try #require(renderer.registry.handle(for: editorID))
+        #expect(renderedEditorText(in: handleBefore) == "from-value")
+        let viewBefore = handleBefore.view
+
+        let clear = SemanticModel.Operation.clearProperty(id: editorID, property: .value)
+        let newStore = try makeStore(base + [clear])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [clear]),
+            newStore: newStore
+        )
+
+        let handleAfter = try #require(renderer.registry.handle(for: editorID))
+        #expect(handleAfter.view === viewBefore)
+        #expect(renderedEditorText(in: handleAfter) == "from-text")
+
+        try renderer.mount(store: newStore)
+        let remounted = try #require(renderer.registry.handle(for: editorID))
+        #expect(renderedEditorText(in: remounted) == "from-text")
     }
 
     @Test
@@ -689,6 +813,83 @@ struct LayoutRendererTests {
     }
 
     @Test
+    func nestedModelBackedCollectionKeepsBoundedScroller() throws {
+        var store = SemanticStore()
+        let modelID = ModelId(7)
+        try store.createModel(id: modelID, modelType: .table, itemCount: 500_000)
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(id: 2, nodeType: .scroll, parentID: 1)
+        try store.createNode(
+            id: 3,
+            nodeType: .table,
+            parentID: 2,
+            properties: [
+                Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+            ]
+        )
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+
+        let tableScroll = try #require(renderer.registry.view(for: 3) as? NSScrollView)
+        let adapter = try #require(renderer.registry.handle(for: 3)?.modelAdapter as? TableCollectionAdapter)
+        let table = try #require(tableScroll.documentView as? NSTableView)
+
+        #expect(adapter.isModelBacked)
+        #expect(adapter.isNestedInScroll)
+        #expect(tableScroll.hasVerticalScroller)
+        #expect(tableScroll.borderType == .bezelBorder)
+        #expect(adapter.fitHeightConstraint?.isActive != true)
+        #expect(adapter.minHeightConstraint?.isActive == true)
+        #expect(table.numberOfRows == 500_000)
+        #expect(type(of: table) == NSTableView.self)
+    }
+
+    @Test
+    func modelBackedTreeRefreshesWithoutReplacingOutline() throws {
+        let modelID = ModelId(8)
+        var store = SemanticStore()
+        try store.createModel(id: modelID, modelType: .tree, itemCount: 0)
+        try store.modelInsert(
+            id: modelID,
+            index: 0,
+            items: [ModelItem(itemID: ItemId(1), value: .string("Root A"))]
+        )
+        try store.createNode(id: 1, nodeType: .surface)
+        try store.createNode(
+            id: 2,
+            nodeType: .tree,
+            parentID: 1,
+            properties: [
+                Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+            ]
+        )
+        let renderer = LayoutRenderer()
+        try renderer.mount(store: store)
+        let outlineBefore = try #require(
+            (renderer.registry.view(for: 2) as? NSScrollView)?.documentView as? NSOutlineView
+        )
+        #expect(type(of: outlineBefore) == NSOutlineView.self)
+        #expect(outlineBefore.numberOfRows == 1)
+
+        let insertOp = Operation.modelInsert(
+            id: modelID,
+            index: 1,
+            items: [ModelItem(itemID: ItemId(2), value: .string("Root B"))]
+        )
+        var newStore = store
+        try insertOp.apply(to: &newStore)
+        try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [insertOp]),
+            newStore: newStore
+        )
+        let outlineAfter = try #require(
+            (renderer.registry.view(for: 2) as? NSScrollView)?.documentView as? NSOutlineView
+        )
+        #expect(outlineAfter === outlineBefore)
+        #expect(outlineAfter.numberOfRows == 2)
+    }
+
+    @Test
     func standaloneCollectionKeepsItsOwnScroller() throws {
         let store = try makeStore([
             SemanticModel.Operation.createNode(id: 1, nodeType: .surface),
@@ -711,6 +912,227 @@ struct LayoutRendererTests {
         #expect(adapter.isNestedInScroll == false)
         #expect(adapter.minHeightConstraint?.isActive == true)
     }
+    @Test
+    func unsupportedExtensionMountsValidatedStandardFallback() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(id: 3, nodeType: .column, parentID: 2),
+            .createNode(
+                id: 4,
+                nodeType: .text,
+                parentID: 3,
+                properties: [(.text, .string("Fallback"))]
+            ),
+        ])
+        let renderer = LayoutRenderer()
+
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is NSStackView)
+        #expect((renderer.registry.view(for: 4) as? NSTextField)?.stringValue == "Fallback")
+    }
+
+    @Test
+    func unsupportedExtensionMountsMultipleFallbackRoots() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(
+                id: 3,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("First fallback"))]
+            ),
+            .createNode(
+                id: 4,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("Second fallback"))]
+            ),
+        ])
+        let renderer = LayoutRenderer()
+
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is NSStackView)
+        #expect((renderer.registry.view(for: 3) as? NSTextField)?.stringValue == "First fallback")
+        #expect((renderer.registry.view(for: 4) as? NSTextField)?.stringValue == "Second fallback")
+    }
+
+    @Test
+    func unsupportedExtensionFallbackCanContainNegotiatedExtension() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let nestedExtension = TypeRef(namespaceID: 5, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(
+                id: 3,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("Standard fallback"))]
+            ),
+            .createNode(id: 4, nodeType: nestedExtension, parentID: 2),
+        ])
+        let renderer = LayoutRenderer()
+        try renderer.controlFactory.registerExtension(typeRef: nestedExtension, kind: .terminal)
+
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is NSStackView)
+        #expect((renderer.registry.view(for: 3) as? NSTextField)?.stringValue == "Standard fallback")
+        #expect(renderer.registry.view(for: 4) is TerminalView)
+    }
+
+    @Test
+    func malformedExtensionFallbackIsRejected() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let nestedExtension = TypeRef(namespaceID: 5, localID: 1)
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(id: 3, nodeType: .column, parentID: 2),
+            .createNode(id: 4, nodeType: nestedExtension, parentID: 3),
+        ])
+        let renderer = LayoutRenderer()
+
+        #expect(throws: ExtensionMountError.unsupportedExtensionWithoutFallback(nestedExtension)) {
+            try renderer.mount(store: store)
+        }
+    }
+
+    @Test
+    func registeredExtensionSuppressesFallbackAndIgnoresItsUpdates() throws {
+        let extensionType = TypeRef(namespaceID: 4, localID: 1)
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(id: 2, nodeType: extensionType, parentID: 1),
+            .createNode(id: 3, nodeType: .column, parentID: 2),
+            .createNode(
+                id: 4,
+                nodeType: .text,
+                parentID: 3,
+                properties: [(.text, .string("Fallback"))]
+            ),
+        ]
+        let store = try makeStore(base)
+        let renderer = LayoutRenderer()
+        try renderer.controlFactory.registerExtension(typeRef: extensionType, kind: .terminal)
+        try renderer.mount(store: store)
+
+        #expect(renderer.registry.view(for: 2) is TerminalView)
+        #expect(renderer.registry.view(for: 3) == nil)
+        #expect(renderer.registry.view(for: 4) == nil)
+
+        let update = SemanticModel.Operation.setProperty(
+            id: 4,
+            property: .text,
+            value: .string("Updated fallback")
+        )
+        let newStore = try makeStore(base + [update])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [update]),
+            newStore: newStore
+        )
+        #expect(renderer.registry.view(for: 4) == nil)
+    }
+
+    /// `padding_role` is layout-affecting, not structural, so it mutates `edgeInsets` in place.
+    /// The fill constraints carry that inset as a constant, so they must be rebuilt with it or
+    /// children stay sized for the previous padding.
+    @Test
+    func paddingChangeRebuildsFillConstraints() throws {
+        let renderer = LayoutRenderer()
+        let base: [SemanticModel.Operation] = [
+            .createNode(id: 1, nodeType: .surface),
+            .createNode(
+                id: 2,
+                nodeType: .column,
+                parentID: 1,
+                properties: [
+                    (.horizontalAlignment, .enumToken(.horizontalAlignmentFill)),
+                    (.paddingRole, .enumToken(.paddingRoleTight)),
+                ]
+            ),
+            .createNode(id: 3, nodeType: .text, parentID: 2),
+        ]
+        let store = try makeStore(base)
+        try renderer.mount(store: store)
+
+        let handle = try #require(renderer.registry.handle(for: 2))
+        // Tight padding is 4 points per edge.
+        #expect(handle.propertyConstraints[.horizontalAlignment]?.first?.constant == -8)
+
+        let update = SemanticModel.Operation.setProperty(
+            id: 2,
+            property: .paddingRole,
+            value: .enumToken(.paddingRoleRelaxed)
+        )
+        let newStore = try makeStore(base + [update])
+        _ = try renderer.apply(
+            transaction: Transaction(baseRevision: store.revision, operations: [update]),
+            newStore: newStore
+        )
+
+        let afterHandle = try #require(renderer.registry.handle(for: 2))
+        let stack = try #require(afterHandle.view as? NSStackView)
+        #expect(stack.edgeInsets.left == 16)
+        // Relaxed padding is 16 points per edge; a stale constant would still read -8.
+        #expect(afterHandle.propertyConstraints[.horizontalAlignment]?.first?.constant == -32)
+    }
+
+    /// A `grow == 0` sibling must not veto an interactive window resize. AppKit holds the window's
+    /// current size at `windowSizeStayPut` (500), so content hugging above that snaps the window
+    /// back to its fitting width on the next layout pass — and a fill-aligned column welds every
+    /// sibling to the same width, so one over-eager hugger caps the whole surface.
+    @Test
+    func widenedSurfaceWindowSurvivesTheNextLayoutPass() throws {
+        let renderer = LayoutRenderer()
+        let store = try makeStore([
+            .createNode(
+                id: 1,
+                nodeType: .surface,
+                properties: [(.horizontalAlignment, .enumToken(.horizontalAlignmentFill))]
+            ),
+            .createNode(
+                id: 2,
+                nodeType: .column,
+                parentID: 1,
+                properties: [
+                    (.horizontalAlignment, .enumToken(.horizontalAlignmentFill)),
+                    (.grow, .float64(1)),
+                ]
+            ),
+            // grow == 0: the node that used to pin the window to its fitting width.
+            .createNode(
+                id: 3,
+                nodeType: .text,
+                parentID: 2,
+                properties: [(.text, .string("Activity")), (.grow, .float64(0))]
+            ),
+            .createNode(
+                id: 4,
+                nodeType: .richText,
+                parentID: 2,
+                properties: [(.text, .string("Body")), (.grow, .float64(1))]
+            ),
+        ])
+        try renderer.mount(store: store)
+
+        let window = try #require(renderer.registry.handle(for: 1)?.window)
+        window.setContentSize(NSSize(width: 1200, height: 700))
+        // A live edge drag runs a layout pass per mouse-moved event; this is that pass.
+        window.layoutIfNeeded()
+
+        #expect(abs(window.contentLayoutRect.width - 1200) < 1)
+        let hugging = renderer.registry.view(for: 3)?
+            .contentHuggingPriority(for: .horizontal).rawValue
+        #expect((hugging ?? .greatestFiniteMagnitude)
+            < NSLayoutConstraint.Priority.windowSizeStayPut.rawValue)
+    }
 
     private func makeStore(_ operations: [SemanticModel.Operation]) throws -> SemanticStore {
         var store = SemanticStore()
@@ -718,6 +1140,12 @@ struct LayoutRendererTests {
             try operation.apply(to: &store)
         }
         return store
+    }
+
+    private func renderedEditorText(in handle: RenderHandle) -> String? {
+        if let field = handle.view as? NSTextField { return field.stringValue }
+        if let textView = handle.view as? NSTextView { return textView.string }
+        return ((handle.view as? NSScrollView)?.documentView as? NSTextView)?.string
     }
 
     private func assertEveryHandleIsMounted(in renderer: LayoutRenderer) {

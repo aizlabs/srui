@@ -99,7 +99,7 @@ public actor TCPSocketTransport: Transport {
         startReadingLoop()
     }
 
-    public func send(data: Data) async throws {
+    public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
         guard !isClosed else {
             throw TransportError.closed
         }
@@ -112,7 +112,7 @@ public actor TCPSocketTransport: Transport {
 
         // Off the actor executor: see `SocketWriter` for why a blocking write here would make
         // `close()` unreachable while a peer is not draining its buffer (§22.2).
-        try await writer.write(data, claiming: readLatch)
+        try await writer.write(data, logicalClass: logicalClass, claiming: readLatch)
     }
 
     public func acknowledgeReceived(byteCount: Int) async {

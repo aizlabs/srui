@@ -37,7 +37,7 @@ final class TransactionTests: XCTestCase {
                 nodeType: .column,
                 parentID: rootID,
                 childIndex: nil,
-                properties: [Property(property: .spacingRole, value: .unsignedInt(1))]
+                properties: [Property(property: .spacingRole, value: .enumToken(.spacingRoleNone))]
             ),
             .createNode(
                 id: btnID,

@@ -19,10 +19,56 @@ import Resources
 @Suite("Counter Socket Integration Tests")
 struct CounterSocketIntegrationTests {
 
+    /// The reference consumer must publish its endpoint under the same §27 layout the daemon does:
+    /// a 0600 socket owned by the effective UID inside a 0700 parent it created itself. App authors
+    /// copy this example, so an incomplete boundary here propagates.
+    @Test("Counter publishes a 0600 socket inside a parent it creates as 0700")
+    @MainActor
+    func counterPublishesAPrivateEndpoint() async throws {
+        let repoRoot = Self.repositoryRoot()
+        let counterBinary = repoRoot
+            .appendingPathComponent("examples/counter/target/debug/counter")
+        guard FileManager.default.fileExists(atPath: counterBinary.path) else { return }
+
+        // Deliberately *not* pre-created: the server must build the private parent itself.
+        let runtimeDirectory = URL(fileURLWithPath: "/tmp/srui-counter-private-\(UUID().uuidString)")
+        let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
+        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+
+        let server = Process()
+        server.executableURL = counterBinary
+        server.arguments = ["--socket", socketPath]
+        server.standardOutput = FileHandle.nullDevice
+        server.standardError = FileHandle.nullDevice
+        try server.run()
+        defer {
+            if server.isRunning { server.terminate() }
+            server.waitUntilExit()
+        }
+
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
+
+        var socketStat = stat()
+        try #require(socketPath.withCString { lstat($0, &socketStat) } == 0)
+        #expect(socketStat.st_mode & S_IFMT == S_IFSOCK)
+        #expect(socketStat.st_mode & 0o777 == 0o600)
+        #expect(socketStat.st_uid == geteuid())
+
+        var parentStat = stat()
+        try #require(runtimeDirectory.path.withCString { lstat($0, &parentStat) } == 0)
+        #expect(parentStat.st_mode & S_IFMT == S_IFDIR)
+        #expect(parentStat.st_mode & 0o777 == 0o700)
+        #expect(parentStat.st_uid == geteuid())
+
+        // A client that enforces the same rules must accept the endpoint the server published.
+        let transport = UnixSocketTransport(socketPath: socketPath)
+        try await transport.connect()
+        await transport.close()
+    }
+
     @Test("Three activate cycles over Unix socket against live counter server")
     @MainActor
     func threeActivateCyclesOverUnixSocket() async throws {
-        let socketPath = "/tmp/srui-counter-test-\(UUID().uuidString).sock"
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
             .appendingPathComponent("examples/counter/target/debug/counter")
@@ -30,6 +76,17 @@ struct CounterSocketIntegrationTests {
         guard FileManager.default.fileExists(atPath: counterBinary.path) else {
             // Soft-skip if Rust binary is not built locally or in CI
             return
+        }
+
+        let tempDir = URL(fileURLWithPath: "/tmp/srui-counter-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempDir.path
+        )
+        let socketPath = tempDir.appendingPathComponent("counter.sock").path
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
         }
 
         let server = Process()
@@ -44,7 +101,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -65,13 +121,34 @@ struct CounterSocketIntegrationTests {
 
         let textID = NodeId(2)
         let buttonID = NodeId(4)
+        try await AsyncTestSupport.eventually(
+            description: "initial counter render reaches Count: 0"
+        ) {
+            guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
+                return false
+            }
+            return field.stringValue == "Count: 0"
+        }
 
         for cycle in 1...3 {
             _ = try await controller.sendActivate(nodeId: buttonID)
-            try await Self.waitForRevision(applier, expected: Revision(UInt64(cycle + 1)), timeoutSeconds: 5)
+            try await Self.waitForRevision(
+                applier,
+                expected: Revision(UInt64(cycle + 1)),
+                timeoutSeconds: 5
+            )
+            try await AsyncTestSupport.eventually(
+                description: "counter render reaches Count: \(cycle)"
+            ) {
+                guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
+                    return false
+                }
+                return field.stringValue == "Count: \(cycle)"
+            }
 
             let textHandle = try #require(renderer.registry.handle(for: textID))
             let textField = try #require(textHandle.view as? NSTextField)
+            #expect(textHandle.nodeID == textID)
             #expect(textField.stringValue == "Count: \(cycle)")
         }
 
@@ -81,7 +158,19 @@ struct CounterSocketIntegrationTests {
     @Test("Fresh HELLO against a seeded counter session applies the catch-up snapshot")
     @MainActor
     func helloCatchUpSnapshotOverUnixSocket() async throws {
-        let socketPath = "/tmp/srui-counter-hello-\(UUID().uuidString).sock"
+        let runtimeDirectory = URL(
+            fileURLWithPath: "/tmp/srui-counter-hello-\(UUID().uuidString)"
+        )
+        try FileManager.default.createDirectory(
+            at: runtimeDirectory,
+            withIntermediateDirectories: false
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: runtimeDirectory.path
+        )
+        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
             .appendingPathComponent("examples/counter/target/debug/counter")
@@ -130,9 +219,18 @@ struct CounterSocketIntegrationTests {
 
         _ = try await controller.sendActivate(nodeId: buttonID)
         try await Self.waitForRevision(applier, expected: Revision(2), timeoutSeconds: 5)
+        try await AsyncTestSupport.eventually(
+            description: "HELLO catch-up counter render reaches Count: 1"
+        ) {
+            guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
+                return false
+            }
+            return field.stringValue == "Count: 1"
+        }
 
         let textHandle = try #require(renderer.registry.handle(for: textID))
         let textField = try #require(textHandle.view as? NSTextField)
+        #expect(textHandle.nodeID == textID)
         #expect(textField.stringValue == "Count: 1")
 
         await controller.stop()
@@ -141,7 +239,19 @@ struct CounterSocketIntegrationTests {
     @Test("Connection fails cleanly at handshake time when server requires an unsupported profile (§4 inv. 13)")
     @MainActor
     func mismatchedRequiredProfileFailsAtHandshake() async throws {
-        let socketPath = "/tmp/srui-counter-mismatch-\(UUID().uuidString).sock"
+        let runtimeDirectory = URL(
+            fileURLWithPath: "/tmp/srui-counter-mismatch-\(UUID().uuidString)"
+        )
+        try FileManager.default.createDirectory(
+            at: runtimeDirectory,
+            withIntermediateDirectories: false
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: runtimeDirectory.path
+        )
+        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
             .appendingPathComponent("examples/counter/target/debug/counter")
@@ -197,7 +307,19 @@ struct CounterSocketIntegrationTests {
     @Test("Image fixture delivers a committed resource that paints the Image node (§14)")
     @MainActor
     func imageFixtureCommitsAndPaintsImageView() async throws {
-        let socketPath = "/tmp/srui-counter-image-\(UUID().uuidString).sock"
+        let runtimeDirectory = URL(
+            fileURLWithPath: "/tmp/srui-counter-image-\(UUID().uuidString)"
+        )
+        try FileManager.default.createDirectory(
+            at: runtimeDirectory,
+            withIntermediateDirectories: false
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: runtimeDirectory.path
+        )
+        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
             .appendingPathComponent("examples/counter/target/debug/counter")
@@ -273,7 +395,19 @@ struct CounterSocketIntegrationTests {
     @Test("Corrupted resource chunk is dropped; session and placeholder survive (§14)")
     @MainActor
     func corruptedResourceChunkKeepsPlaceholderAndSession() async throws {
-        let socketPath = "/tmp/srui-counter-image-corrupt-\(UUID().uuidString).sock"
+        let runtimeDirectory = URL(
+            fileURLWithPath: "/tmp/srui-counter-image-corrupt-\(UUID().uuidString)"
+        )
+        try FileManager.default.createDirectory(
+            at: runtimeDirectory,
+            withIntermediateDirectories: false
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: runtimeDirectory.path
+        )
+        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
             .appendingPathComponent("examples/counter/target/debug/counter")
@@ -449,8 +583,8 @@ private final class ResourceChunkCorruptingTransport: Transport, @unchecked Send
         self.inner = inner
     }
 
-    func send(data: Data) async throws {
-        try await inner.send(data: data)
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        try await inner.send(data: data, logicalClass: logicalClass)
     }
 
     func close() async {

@@ -1,4 +1,4 @@
-//! Client-originated semantic events and validation helpers (§6.1, §7.6, §7.7, §16, §18.2, §27).
+//! Client-originated semantic events and validation helpers (§6.1, §7.6, §7.7, §16, §18.2, §18.3, §22.6, §27).
 //!
 //! # Architecture & Protocol Invariants
 //!
@@ -10,6 +10,8 @@
 //!   event-specific arguments.
 //! - **§18.2 Retry Safety & Deduplication**: Every event that can cause side effects contains a stable
 //!   `event_id` unique within session lifetime, enabling retry-safe delivery across network disconnects.
+//! - **§18.3 / §22.6 Native text editing**: `TEXT_EDIT` carries a positive per-editor `edit_seq` and a
+//!   whole-value `TEXT` snapshot; other event types omit `edit_seq`.
 //! - **§27 Server Validation**: The server validates every client event against the current graph
 //!   (verifying node existence, interactive/enabled status, and revision freshness) before dispatching to handlers.
 
@@ -19,13 +21,57 @@ use crate::transaction::Revision;
 use crate::value::{Size, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::num::NonZeroU64;
+
+/// Protocol-wide maximum encoded event identifier length (§7.7, §18.2, §26).
+pub const MAX_EVENT_ID_BYTES: usize = 64;
+
+/// A peer supplied an event identifier that cannot be retained safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventIdLengthError {
+    actual: usize,
+}
+
+impl EventIdLengthError {
+    #[must_use]
+    pub const fn actual(self) -> usize {
+        self.actual
+    }
+
+    #[must_use]
+    pub const fn limit(self) -> usize {
+        MAX_EVENT_ID_BYTES
+    }
+}
+
+impl fmt::Display for EventIdLengthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "event_id is {} bytes; at most {} are accepted (§26)",
+            self.actual, MAX_EVENT_ID_BYTES
+        )
+    }
+}
+
+impl std::error::Error for EventIdLengthError {}
 
 /// Globally unique event identifier for deduplication and retry-safety (§7.7, §16, §18.2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EventId(pub Vec<u8>);
 
 impl EventId {
-    /// Constructs a new `EventId` from a raw byte vector.
+    /// Constructs an event identifier at a wire boundary, enforcing the protocol-wide bound.
+    pub fn try_new(bytes: Vec<u8>) -> Result<Self, EventIdLengthError> {
+        if bytes.len() > MAX_EVENT_ID_BYTES {
+            return Err(EventIdLengthError {
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Constructs a trusted in-process `EventId` from a raw byte vector.
     pub const fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
@@ -183,6 +229,35 @@ impl From<String> for ClientInstanceId {
         Self(s.into_bytes())
     }
 }
+/// Positive per-editor sequence for `TEXT_EDIT` events (§18.3, §22.6).
+///
+/// Zero is unrepresentable, and the non-zero representation lets `Option<EditSeq>` retain the
+/// same one-word layout as the wire `u64` whose zero value means absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EditSeq(NonZeroU64);
+
+impl EditSeq {
+    /// Constructs a positive editor sequence. `0` is absent on the wire.
+    #[must_use]
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the positive integer carried on the wire.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for EditSeq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Client-originated semantic event representing a user interaction (§6.1, §7.6, §7.7, §16).
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +276,8 @@ pub struct Event {
     pub event_type: TypeRef,
     /// Event payload arguments mapped by property reference (§7.6, §7.7, §16).
     pub arguments: HashMap<PropertyRef, Value>,
+    /// Positive editor sequence required on `TEXT_EDIT` and absent (`None`) on every other type (§18.3).
+    pub edit_seq: Option<EditSeq>,
 }
 
 impl Event {
@@ -222,6 +299,7 @@ impl Event {
             node_id: node_id.into(),
             event_type,
             arguments: arguments.into_iter().collect(),
+            edit_seq: None,
         }
     }
 
@@ -288,8 +366,9 @@ impl Event {
         observed_revision: impl Into<Revision>,
         node_id: impl Into<NodeId>,
         text: impl Into<String>,
+        edit_seq: EditSeq,
     ) -> Self {
-        Self::new(
+        let mut event = Self::new(
             None,
             event_seq,
             event_id,
@@ -297,7 +376,9 @@ impl Event {
             node_id,
             TypeRef::EVENT_TEXT_EDIT,
             [(PropertyRef::TEXT, Value::String(text.into()))],
-        )
+        );
+        event.edit_seq = Some(edit_seq);
+        event
     }
 
     /// Convenience constructor for expansion change events (`EXPANSION_CHANGED`, §7.6).
@@ -344,6 +425,12 @@ impl Event {
         client_instance_id: impl Into<ClientInstanceId>,
     ) -> Self {
         self.client_instance_id = Some(client_instance_id.into());
+        self
+    }
+
+    /// Sets the editor sequence on this event (`TEXT_EDIT` only, §18.3).
+    pub fn with_edit_seq(mut self, edit_seq: EditSeq) -> Self {
+        self.edit_seq = Some(edit_seq);
         self
     }
 
@@ -442,12 +529,15 @@ impl fmt::Display for Event {
             .unwrap_or_else(|| self.event_type.to_string());
         write!(
             f,
-            "Event(seq={}, id={}, node={}, type={}, rev={}, args={})",
+            "Event(seq={}, id={}, node={}, type={}, rev={}, edit_seq={}, args={})",
             self.event_seq,
             self.event_id,
             self.node_id,
             type_label,
             self.observed_revision,
+            self.edit_seq
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "none".to_string()),
             self.arguments.len()
         )
     }
@@ -467,6 +557,24 @@ pub enum EventValidationError {
     },
     /// Event is missing an expected argument property.
     MissingArgument(PropertyRef),
+    /// `TEXT_EDIT` is missing a positive `edit_seq`, or a non-text event carried one (§18.3).
+    InvalidEditSeq,
+    /// `edit_seq` is at or behind the terminal watermark for this editor stream (§18.3).
+    StaleEditSeq { observed: u64, watermark: u64 },
+    /// A newer reservation superseded this in-flight policy before commit (§18.3, §22.6).
+    SupersededGeneration,
+    /// Per-stream generation counter exhausted; refuse rather than alias concurrent validators.
+    GenerationOverflow,
+    /// Target node has `read_only = true` and cannot accept `TEXT_EDIT` (§7.4, §22.6).
+    NodeReadOnly(NodeId),
+    /// Target node is not a `TextInput` or `TextArea` (§7.2, §22.6).
+    UnsupportedNodeType(TypeRef),
+    /// Submitted text exceeds the negotiated §26 string bound.
+    StringTooLong { length: usize, limit: usize },
+    /// Bounded editor-stream table is full; a new `(client, node)` key was refused (§26).
+    TextTrackerFull { limit: usize },
+    /// Application policy refused the submitted text (§22.6).
+    PolicyRejected(String),
 }
 
 impl fmt::Display for EventValidationError {
@@ -482,6 +590,36 @@ impl fmt::Display for EventValidationError {
             Self::MissingArgument(prop) => {
                 write!(f, "event is missing required argument property {}", prop)
             }
+            Self::InvalidEditSeq => {
+                write!(
+                    f,
+                    "TEXT_EDIT requires a positive edit_seq; other events must omit it"
+                )
+            }
+            Self::StaleEditSeq {
+                observed,
+                watermark,
+            } => write!(
+                f,
+                "edit_seq {observed} is not above terminal watermark {watermark}"
+            ),
+            Self::SupersededGeneration => {
+                write!(f, "TEXT_EDIT superseded by a newer in-flight reservation")
+            }
+            Self::GenerationOverflow => {
+                write!(f, "text-edit stream generation counter overflowed")
+            }
+            Self::NodeReadOnly(id) => write!(f, "event target node {id} is read-only"),
+            Self::UnsupportedNodeType(ty) => {
+                write!(f, "TEXT_EDIT target node type {ty} is not an editor")
+            }
+            Self::StringTooLong { length, limit } => {
+                write!(f, "TEXT_EDIT string length {length} exceeds limit {limit}")
+            }
+            Self::TextTrackerFull { limit } => {
+                write!(f, "text-edit tracker is full (limit {limit})")
+            }
+            Self::PolicyRejected(reason) => write!(f, "{reason}"),
         }
     }
 }

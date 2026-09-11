@@ -1282,6 +1282,54 @@ public nonisolated enum Srui_Protocol_ResourcePriority: SwiftProtobuf.Enum, Swif
 
 }
 
+public nonisolated enum Srui_Protocol_TerminalResyncReason: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+
+  /// The requested next offset is older than the ring's retained start.
+  case retentionLoss // = 1
+
+  /// The client advertised a next offset ahead of the server's next_offset.
+  case offsetAhead // = 2
+
+  /// A connected subscriber's cursor fell behind ring eviction.
+  case subscriberFallbehind // = 3
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .retentionLoss
+    case 2: self = .offsetAhead
+    case 3: self = .subscriberFallbehind
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .retentionLoss: return 1
+    case .offsetAhead: return 2
+    case .subscriberFallbehind: return 3
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_TerminalResyncReason] = [
+    .unspecified,
+    .retentionLoss,
+    .offsetAhead,
+    .subscriberFallbehind,
+  ]
+
+}
+
 public nonisolated struct Srui_Protocol_TypeRef: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2117,6 +2165,10 @@ public nonisolated struct Srui_Protocol_Event: Sendable {
 
   public var arguments: [Srui_Protocol_Property] = []
 
+  /// Positive per-(session_id, client_instance_id, node_id) editor sequence for TEXT_EDIT (§18.3, §22.6).
+  /// Zero is absent: TEXT_EDIT requires a positive value; every other event type MUST send zero.
+  public var editSeq: UInt64 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2124,10 +2176,30 @@ public nonisolated struct Srui_Protocol_Event: Sendable {
   fileprivate var _eventType: Srui_Protocol_TypeRef? = nil
 }
 
+/// Assigned, unacknowledged TEXT_EDIT identity declared on resume and echoed on same-session
+/// forced resync so those events can be settled without opening a global event_seq gap (§18.3).
+public nonisolated struct Srui_Protocol_PendingTextEditRef: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var eventID: Data = Data()
+
+  public var eventSeq: UInt64 = 0
+
+  public var nodeID: UInt64 = 0
+
+  public var editSeq: UInt64 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
 /// Server acknowledgement settling exactly one client event (§18, §18.2, §19.2).
 ///
 /// The dedupe cache keyed on (client_instance_id, event_id) is the *idempotency*
-/// mechanism; this ack selectively settles event_id. The client raises
+/// mechanism; this ack selectively settles settled_event_seq. The client raises
 /// `ClientResume.last_acked_event_seq` only across a contiguous settled prefix.
 public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
@@ -2136,7 +2208,7 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
 
   public var clientInstanceID: Data = Data()
 
-  /// The event this ack settles (§18.2)
+  /// Normally echoes the event ID. A rejection of an oversized ID carries a bounded marker instead.
   public var eventID: Data = Data()
 
   /// Highest contiguous settled event_seq (§18.2)
@@ -2152,6 +2224,9 @@ public nonisolated struct Srui_Protocol_ServerEventAck: Sendable {
 
   /// Non-empty; incarnation that produced this acknowledgement (§18, §18.2)
   public var sessionID: String = String()
+
+  /// Exact positive sequence slot settled by this ack. Zero means a legacy sender omitted the field.
+  public var settledEventSeq: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2312,6 +2387,10 @@ public nonisolated struct Srui_Protocol_ClientResume: Sendable {
   /// Verified committed CAS entries the server need not transfer again (§14, §18).
   public var knownResourceHashes: [Data] = []
 
+  /// Assigned, unacknowledged TEXT_EDIT events. Ignored on RESUME_OK; settled and echoed
+  /// on same-session RESYNC_REQUIRED so canceling them cannot open an event_seq gap (§18.3).
+  public var pendingTextEdits: [Srui_Protocol_PendingTextEditRef] = []
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2352,6 +2431,10 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
 
   /// Highest contiguous settled event sequence for this client in session_id.
   public var lastProcessedEventSeq: UInt64 = 0
+
+  /// Confirmed discarded TEXT_EDIT identities for a same-session forced resync (§18.3).
+  /// MUST echo the client's declared pending_text_edits; a mismatch fails closed.
+  public var discardedTextEdits: [Srui_Protocol_PendingTextEditRef] = []
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2398,6 +2481,100 @@ public nonisolated struct Srui_Protocol_ResourceChunk: Sendable {
   public var byteOffset: UInt64 = 0
 
   public var data: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_TerminalData: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var byteOffset: UInt64 = 0
+
+  public var data: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_TerminalInput: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var data: Data = Data()
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_TerminalResize: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var columns: UInt32 = 0
+
+  public var rows: UInt32 = 0
+
+  public var pixelWidth: UInt32 = 0
+
+  public var pixelHeight: UInt32 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+public nonisolated struct Srui_Protocol_TerminalResyncRequired: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var streamID: UInt64 = 0
+
+  public var requestedOffset: UInt64 = 0
+
+  public var retainedFromOffset: UInt64 = 0
+
+  public var resumeAtOffset: UInt64 = 0
+
+  public var reason: Srui_Protocol_TerminalResyncReason = .unspecified
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Client → server request for a missing cached window of a sparse collection
+/// model. Idempotent and replaceable: not journaled, not replayed, and not an
+/// Event. The server answers with an authoritative Transaction containing
+/// MODEL_RESET_RANGE (§12.1). Viewport geometry remains EVENT_VIEWPORT_CHANGED.
+public nonisolated struct Srui_Protocol_ClientModelRangeRequest: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var nodeID: UInt64 = 0
+
+  public var modelID: UInt64 = 0
+
+  public var startIndex: UInt64 = 0
+
+  public var count: UInt64 = 0
+
+  public var observedRevision: UInt64 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2491,6 +2668,46 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     set {msg = .resourceChunk(newValue)}
   }
 
+  public var clientModelRangeRequest: Srui_Protocol_ClientModelRangeRequest {
+    get {
+      if case .clientModelRangeRequest(let v)? = msg {return v}
+      return Srui_Protocol_ClientModelRangeRequest()
+    }
+    set {msg = .clientModelRangeRequest(newValue)}
+  }
+
+  public var terminalData: Srui_Protocol_TerminalData {
+    get {
+      if case .terminalData(let v)? = msg {return v}
+      return Srui_Protocol_TerminalData()
+    }
+    set {msg = .terminalData(newValue)}
+  }
+
+  public var terminalInput: Srui_Protocol_TerminalInput {
+    get {
+      if case .terminalInput(let v)? = msg {return v}
+      return Srui_Protocol_TerminalInput()
+    }
+    set {msg = .terminalInput(newValue)}
+  }
+
+  public var terminalResize: Srui_Protocol_TerminalResize {
+    get {
+      if case .terminalResize(let v)? = msg {return v}
+      return Srui_Protocol_TerminalResize()
+    }
+    set {msg = .terminalResize(newValue)}
+  }
+
+  public var terminalResyncRequired: Srui_Protocol_TerminalResyncRequired {
+    get {
+      if case .terminalResyncRequired(let v)? = msg {return v}
+      return Srui_Protocol_TerminalResyncRequired()
+    }
+    set {msg = .terminalResyncRequired(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Msg: Equatable, Sendable {
@@ -2504,6 +2721,11 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     case serverEventAck(Srui_Protocol_ServerEventAck)
     case resourceMetadata(Srui_Protocol_ResourceMetadata)
     case resourceChunk(Srui_Protocol_ResourceChunk)
+    case clientModelRangeRequest(Srui_Protocol_ClientModelRangeRequest)
+    case terminalData(Srui_Protocol_TerminalData)
+    case terminalInput(Srui_Protocol_TerminalInput)
+    case terminalResize(Srui_Protocol_TerminalResize)
+    case terminalResyncRequired(Srui_Protocol_TerminalResyncRequired)
 
   }
 
@@ -2596,6 +2818,10 @@ nonisolated extension Srui_Protocol_SessionContinuity: SwiftProtobuf._ProtoNameP
 
 nonisolated extension Srui_Protocol_ResourcePriority: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0RESOURCE_PRIORITY_UNSPECIFIED\0\u{1}RESOURCE_PRIORITY_NORMAL\0\u{1}RESOURCE_PRIORITY_LOW\0")
+}
+
+nonisolated extension Srui_Protocol_TerminalResyncReason: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0TERMINAL_RESYNC_REASON_UNSPECIFIED\0\u{1}TERMINAL_RESYNC_REASON_RETENTION_LOSS\0\u{1}TERMINAL_RESYNC_REASON_OFFSET_AHEAD\0\u{1}TERMINAL_RESYNC_REASON_SUBSCRIBER_FALLBEHIND\0")
 }
 
 nonisolated extension Srui_Protocol_TypeRef: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
@@ -4183,7 +4409,7 @@ nonisolated extension Srui_Protocol_Transaction: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Srui_Protocol_Event: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Event"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_seq\0\u{3}event_id\0\u{3}observed_revision\0\u{3}node_id\0\u{3}event_type\0\u{1}arguments\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_seq\0\u{3}event_id\0\u{3}observed_revision\0\u{3}node_id\0\u{3}event_type\0\u{1}arguments\0\u{3}edit_seq\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4198,6 +4424,7 @@ nonisolated extension Srui_Protocol_Event: SwiftProtobuf.Message, SwiftProtobuf.
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
       case 6: try { try decoder.decodeSingularMessageField(value: &self._eventType) }()
       case 7: try { try decoder.decodeRepeatedMessageField(value: &self.arguments) }()
+      case 8: try { try decoder.decodeSingularUInt64Field(value: &self.editSeq) }()
       default: break
       }
     }
@@ -4229,6 +4456,9 @@ nonisolated extension Srui_Protocol_Event: SwiftProtobuf.Message, SwiftProtobuf.
     if !self.arguments.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.arguments, fieldNumber: 7)
     }
+    if self.editSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.editSeq, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4240,6 +4470,52 @@ nonisolated extension Srui_Protocol_Event: SwiftProtobuf.Message, SwiftProtobuf.
     if lhs.nodeID != rhs.nodeID {return false}
     if lhs._eventType != rhs._eventType {return false}
     if lhs.arguments != rhs.arguments {return false}
+    if lhs.editSeq != rhs.editSeq {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_PendingTextEditRef: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".PendingTextEditRef"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}event_id\0\u{3}event_seq\0\u{3}node_id\0\u{3}edit_seq\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularBytesField(value: &self.eventID) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.eventSeq) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.editSeq) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if !self.eventID.isEmpty {
+      try visitor.visitSingularBytesField(value: self.eventID, fieldNumber: 1)
+    }
+    if self.eventSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.eventSeq, fieldNumber: 2)
+    }
+    if self.nodeID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 3)
+    }
+    if self.editSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.editSeq, fieldNumber: 4)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_PendingTextEditRef, rhs: Srui_Protocol_PendingTextEditRef) -> Bool {
+    if lhs.eventID != rhs.eventID {return false}
+    if lhs.eventSeq != rhs.eventSeq {return false}
+    if lhs.nodeID != rhs.nodeID {return false}
+    if lhs.editSeq != rhs.editSeq {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4247,7 +4523,7 @@ nonisolated extension Srui_Protocol_Event: SwiftProtobuf.Message, SwiftProtobuf.
 
 nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerEventAck"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_id\0\u{3}last_processed_event_seq\0\u{1}status\0\u{3}revision_after_effect\0\u{3}reject_reason\0\u{3}session_id\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_instance_id\0\u{3}event_id\0\u{3}last_processed_event_seq\0\u{1}status\0\u{3}revision_after_effect\0\u{3}reject_reason\0\u{3}session_id\0\u{3}settled_event_seq\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4262,6 +4538,7 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.revisionAfterEffect) }()
       case 6: try { try decoder.decodeSingularStringField(value: &self.rejectReason) }()
       case 7: try { try decoder.decodeSingularStringField(value: &self.sessionID) }()
+      case 8: try { try decoder.decodeSingularUInt64Field(value: &self.settledEventSeq) }()
       default: break
       }
     }
@@ -4289,6 +4566,9 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
     if !self.sessionID.isEmpty {
       try visitor.visitSingularStringField(value: self.sessionID, fieldNumber: 7)
     }
+    if self.settledEventSeq != 0 {
+      try visitor.visitSingularUInt64Field(value: self.settledEventSeq, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4300,6 +4580,7 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
     if lhs.revisionAfterEffect != rhs.revisionAfterEffect {return false}
     if lhs.rejectReason != rhs.rejectReason {return false}
     if lhs.sessionID != rhs.sessionID {return false}
+    if lhs.settledEventSeq != rhs.settledEventSeq {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4575,7 +4856,7 @@ nonisolated extension Srui_Protocol_ServerWelcome: SwiftProtobuf.Message, SwiftP
 
 nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ClientResume"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}client_instance_id\0\u{3}last_applied_revision\0\u{3}last_acked_event_seq\0\u{3}terminal_stream_offsets\0\u{1}limits\0\u{3}known_resource_hashes\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}client_instance_id\0\u{3}last_applied_revision\0\u{3}last_acked_event_seq\0\u{3}terminal_stream_offsets\0\u{1}limits\0\u{3}known_resource_hashes\0\u{3}pending_text_edits\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4590,6 +4871,7 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
       case 5: try { try decoder.decodeMapField(fieldType: SwiftProtobuf._ProtobufMap<SwiftProtobuf.ProtobufUInt64,SwiftProtobuf.ProtobufUInt64>.self, value: &self.terminalStreamOffsets) }()
       case 6: try { try decoder.decodeSingularMessageField(value: &self._limits) }()
       case 7: try { try decoder.decodeRepeatedBytesField(value: &self.knownResourceHashes) }()
+      case 8: try { try decoder.decodeRepeatedMessageField(value: &self.pendingTextEdits) }()
       default: break
       }
     }
@@ -4621,6 +4903,9 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
     if !self.knownResourceHashes.isEmpty {
       try visitor.visitRepeatedBytesField(value: self.knownResourceHashes, fieldNumber: 7)
     }
+    if !self.pendingTextEdits.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.pendingTextEdits, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4632,6 +4917,7 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
     if lhs.terminalStreamOffsets != rhs.terminalStreamOffsets {return false}
     if lhs._limits != rhs._limits {return false}
     if lhs.knownResourceHashes != rhs.knownResourceHashes {return false}
+    if lhs.pendingTextEdits != rhs.pendingTextEdits {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4679,7 +4965,7 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
 
 nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerResyncRequired"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0\u{1}continuity\0\u{3}last_processed_event_seq\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0\u{1}continuity\0\u{3}last_processed_event_seq\0\u{3}discarded_text_edits\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4692,6 +4978,7 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
       case 3: try { try decoder.decodeSingularStringField(value: &self.reason) }()
       case 4: try { try decoder.decodeSingularEnumField(value: &self.continuity) }()
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.lastProcessedEventSeq) }()
+      case 6: try { try decoder.decodeRepeatedMessageField(value: &self.discardedTextEdits) }()
       default: break
       }
     }
@@ -4713,6 +5000,9 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if self.lastProcessedEventSeq != 0 {
       try visitor.visitSingularUInt64Field(value: self.lastProcessedEventSeq, fieldNumber: 5)
     }
+    if !self.discardedTextEdits.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.discardedTextEdits, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4722,6 +5012,7 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if lhs.reason != rhs.reason {return false}
     if lhs.continuity != rhs.continuity {return false}
     if lhs.lastProcessedEventSeq != rhs.lastProcessedEventSeq {return false}
+    if lhs.discardedTextEdits != rhs.discardedTextEdits {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4822,9 +5113,234 @@ nonisolated extension Srui_Protocol_ResourceChunk: SwiftProtobuf.Message, SwiftP
   }
 }
 
+nonisolated extension Srui_Protocol_TerminalData: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TerminalData"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}stream_id\0\u{3}byte_offset\0\u{1}data\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.byteOffset) }()
+      case 3: try { try decoder.decodeSingularBytesField(value: &self.data) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.streamID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.streamID, fieldNumber: 1)
+    }
+    if self.byteOffset != 0 {
+      try visitor.visitSingularUInt64Field(value: self.byteOffset, fieldNumber: 2)
+    }
+    if !self.data.isEmpty {
+      try visitor.visitSingularBytesField(value: self.data, fieldNumber: 3)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_TerminalData, rhs: Srui_Protocol_TerminalData) -> Bool {
+    if lhs.streamID != rhs.streamID {return false}
+    if lhs.byteOffset != rhs.byteOffset {return false}
+    if lhs.data != rhs.data {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_TerminalInput: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TerminalInput"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}stream_id\0\u{1}data\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
+      case 2: try { try decoder.decodeSingularBytesField(value: &self.data) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.streamID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.streamID, fieldNumber: 1)
+    }
+    if !self.data.isEmpty {
+      try visitor.visitSingularBytesField(value: self.data, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_TerminalInput, rhs: Srui_Protocol_TerminalInput) -> Bool {
+    if lhs.streamID != rhs.streamID {return false}
+    if lhs.data != rhs.data {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_TerminalResize: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TerminalResize"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}stream_id\0\u{1}columns\0\u{1}rows\0\u{3}pixel_width\0\u{3}pixel_height\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
+      case 2: try { try decoder.decodeSingularUInt32Field(value: &self.columns) }()
+      case 3: try { try decoder.decodeSingularUInt32Field(value: &self.rows) }()
+      case 4: try { try decoder.decodeSingularUInt32Field(value: &self.pixelWidth) }()
+      case 5: try { try decoder.decodeSingularUInt32Field(value: &self.pixelHeight) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.streamID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.streamID, fieldNumber: 1)
+    }
+    if self.columns != 0 {
+      try visitor.visitSingularUInt32Field(value: self.columns, fieldNumber: 2)
+    }
+    if self.rows != 0 {
+      try visitor.visitSingularUInt32Field(value: self.rows, fieldNumber: 3)
+    }
+    if self.pixelWidth != 0 {
+      try visitor.visitSingularUInt32Field(value: self.pixelWidth, fieldNumber: 4)
+    }
+    if self.pixelHeight != 0 {
+      try visitor.visitSingularUInt32Field(value: self.pixelHeight, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_TerminalResize, rhs: Srui_Protocol_TerminalResize) -> Bool {
+    if lhs.streamID != rhs.streamID {return false}
+    if lhs.columns != rhs.columns {return false}
+    if lhs.rows != rhs.rows {return false}
+    if lhs.pixelWidth != rhs.pixelWidth {return false}
+    if lhs.pixelHeight != rhs.pixelHeight {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_TerminalResyncRequired: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".TerminalResyncRequired"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}stream_id\0\u{3}requested_offset\0\u{3}retained_from_offset\0\u{3}resume_at_offset\0\u{1}reason\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.streamID) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.requestedOffset) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.retainedFromOffset) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.resumeAtOffset) }()
+      case 5: try { try decoder.decodeSingularEnumField(value: &self.reason) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.streamID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.streamID, fieldNumber: 1)
+    }
+    if self.requestedOffset != 0 {
+      try visitor.visitSingularUInt64Field(value: self.requestedOffset, fieldNumber: 2)
+    }
+    if self.retainedFromOffset != 0 {
+      try visitor.visitSingularUInt64Field(value: self.retainedFromOffset, fieldNumber: 3)
+    }
+    if self.resumeAtOffset != 0 {
+      try visitor.visitSingularUInt64Field(value: self.resumeAtOffset, fieldNumber: 4)
+    }
+    if self.reason != .unspecified {
+      try visitor.visitSingularEnumField(value: self.reason, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_TerminalResyncRequired, rhs: Srui_Protocol_TerminalResyncRequired) -> Bool {
+    if lhs.streamID != rhs.streamID {return false}
+    if lhs.requestedOffset != rhs.requestedOffset {return false}
+    if lhs.retainedFromOffset != rhs.retainedFromOffset {return false}
+    if lhs.resumeAtOffset != rhs.resumeAtOffset {return false}
+    if lhs.reason != rhs.reason {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_ClientModelRangeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ClientModelRangeRequest"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}node_id\0\u{3}model_id\0\u{3}start_index\0\u{1}count\0\u{3}observed_revision\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularUInt64Field(value: &self.nodeID) }()
+      case 2: try { try decoder.decodeSingularUInt64Field(value: &self.modelID) }()
+      case 3: try { try decoder.decodeSingularUInt64Field(value: &self.startIndex) }()
+      case 4: try { try decoder.decodeSingularUInt64Field(value: &self.count) }()
+      case 5: try { try decoder.decodeSingularUInt64Field(value: &self.observedRevision) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.nodeID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.nodeID, fieldNumber: 1)
+    }
+    if self.modelID != 0 {
+      try visitor.visitSingularUInt64Field(value: self.modelID, fieldNumber: 2)
+    }
+    if self.startIndex != 0 {
+      try visitor.visitSingularUInt64Field(value: self.startIndex, fieldNumber: 3)
+    }
+    if self.count != 0 {
+      try visitor.visitSingularUInt64Field(value: self.count, fieldNumber: 4)
+    }
+    if self.observedRevision != 0 {
+      try visitor.visitSingularUInt64Field(value: self.observedRevision, fieldNumber: 5)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ClientModelRangeRequest, rhs: Srui_Protocol_ClientModelRangeRequest) -> Bool {
+    if lhs.nodeID != rhs.nodeID {return false}
+    if lhs.modelID != rhs.modelID {return false}
+    if lhs.startIndex != rhs.startIndex {return false}
+    if lhs.count != rhs.count {return false}
+    if lhs.observedRevision != rhs.observedRevision {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
 nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SruiMessage"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0\u{3}resource_metadata\0\u{3}resource_chunk\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0\u{3}resource_metadata\0\u{3}resource_chunk\0\u{3}client_model_range_request\0\u{3}terminal_data\0\u{3}terminal_input\0\u{3}terminal_resize\0\u{3}terminal_resync_required\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4962,6 +5478,71 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
           self.msg = .resourceChunk(v)
         }
       }()
+      case 11: try {
+        var v: Srui_Protocol_ClientModelRangeRequest?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .clientModelRangeRequest(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .clientModelRangeRequest(v)
+        }
+      }()
+      case 12: try {
+        var v: Srui_Protocol_TerminalData?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .terminalData(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .terminalData(v)
+        }
+      }()
+      case 13: try {
+        var v: Srui_Protocol_TerminalInput?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .terminalInput(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .terminalInput(v)
+        }
+      }()
+      case 14: try {
+        var v: Srui_Protocol_TerminalResize?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .terminalResize(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .terminalResize(v)
+        }
+      }()
+      case 15: try {
+        var v: Srui_Protocol_TerminalResyncRequired?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .terminalResyncRequired(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .terminalResyncRequired(v)
+        }
+      }()
       default: break
       }
     }
@@ -5012,6 +5593,26 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
     case .resourceChunk?: try {
       guard case .resourceChunk(let v)? = self.msg else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 10)
+    }()
+    case .clientModelRangeRequest?: try {
+      guard case .clientModelRangeRequest(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 11)
+    }()
+    case .terminalData?: try {
+      guard case .terminalData(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 12)
+    }()
+    case .terminalInput?: try {
+      guard case .terminalInput(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 13)
+    }()
+    case .terminalResize?: try {
+      guard case .terminalResize(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 14)
+    }()
+    case .terminalResyncRequired?: try {
+      guard case .terminalResyncRequired(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 15)
     }()
     case nil: break
     }

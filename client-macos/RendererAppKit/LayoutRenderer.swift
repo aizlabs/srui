@@ -1,5 +1,6 @@
 import AppKit
 import SemanticModel
+import Text
 
 public enum LayoutRendererError: Error, Equatable, Sendable {
     case missingSemanticNode(NodeId)
@@ -25,17 +26,31 @@ public final class LayoutRenderer {
         self.controlFactory = controlFactory
     }
 
-    public func mount(store: SemanticStore) throws {
+    public func mount(store: SemanticStore, preserveLocalText: Bool = false) throws {
         RendererDiagnostics.log(
             "mount begin revision=\(store.revision) roots=\(store.rootIDs.count)"
         )
-        tearDown()
-        for rootID in store.rootIDs {
-            try mount(nodeID: rootID, from: store)
+        let remount: () throws -> Void = {
+            // Window close emits end-editing synchronously. That callback must not flush
+            // pending drafts before rebuild, or the new adapter reapplies the stale store string (§22.6).
+            self.tearDown()
+            for rootID in store.rootIDs {
+                try self.mount(nodeID: rootID, from: store)
+            }
+        }
+        if preserveLocalText {
+            try controlFactory.textEditingSession.withPreservedLocalText(remount)
+        } else {
+            try remount()
         }
         // tearDown() closed the previous surfaces; a remount must not leave the UI invisible.
         if surfacesShown {
             showWindows()
+        }
+        let present = Set(registry.allHandles.map(\.nodeID))
+        controlFactory.textEditingSession.syncPresentNodes(present)
+        Task {
+            await controlFactory.terminalSession.syncPresentNodes(present)
         }
         RendererDiagnostics.log("mount complete handles=\(registry.count)")
     }
@@ -50,7 +65,7 @@ public final class LayoutRenderer {
             RendererDiagnostics.log(
                 "transaction revision=\(transaction.newRevision) structural; remounting"
             )
-            try mount(store: newStore)
+            try mount(store: newStore, preserveLocalText: true)
             return classifications
         }
 
@@ -58,18 +73,22 @@ public final class LayoutRenderer {
             "transaction revision=\(transaction.newRevision) non-structural operations=\(transaction.operations.count)"
         )
 
-        var changedModelIDs: Set<ModelId> = []
-        for classification in classifications {
+        let changedModelIDs = Set(classifications.compactMap { classification -> ModelId? in
             if case .modelContent(let modelID) = classification {
-                changedModelIDs.insert(modelID)
+                return modelID
             }
-        }
+            return nil
+        })
 
         var affectedCollectionNodeIDs: Set<NodeId> = []
         for operation in transaction.operations {
             switch operation {
             case .setProperty(let nodeID, let property, _),
                  .clearProperty(let nodeID, let property):
+                guard !controlFactory.extensionMountResolver.isSuppressedFallbackNode(
+                    nodeID,
+                    in: newStore
+                ) else { continue }
                 if isCollectionProperty(property) {
                     affectedCollectionNodeIDs.insert(nodeID)
                 } else {
@@ -77,6 +96,10 @@ public final class LayoutRenderer {
                 }
 
             case .batchPropertySet(let nodeID, let properties):
+                guard !controlFactory.extensionMountResolver.isSuppressedFallbackNode(
+                    nodeID,
+                    in: newStore
+                ) else { continue }
                 for property in properties {
                     if isCollectionProperty(property.property) {
                         affectedCollectionNodeIDs.insert(nodeID)
@@ -124,12 +147,21 @@ public final class LayoutRenderer {
         }
     }
 
+    /// Validates extension negotiation and fallback structure without mutating AppKit state.
+    public func validateExtensionMounts(in store: SemanticStore) throws {
+        try controlFactory.extensionMountResolver.validateMountableExtensions(in: store)
+    }
     private func mount(nodeID: NodeId, from store: SemanticStore) throws {
         guard let node = store.getNode(nodeID) else {
             throw LayoutRendererError.missingSemanticNode(nodeID)
         }
 
-        let handle = try controlFactory.makeHandle(for: node, store: store)
+        let mountDecision = controlFactory.extensionMountResolver.decision(for: node, in: store)
+        let handle = try controlFactory.makeHandle(
+            for: node,
+            store: store,
+            mountDecision: mountDecision
+        )
         try registry.register(handle)
         RendererDiagnostics.log(
             "mounted node=\(node.id) type=\(node.nodeType) parent=\(node.parentID?.description ?? "root")"
@@ -141,16 +173,19 @@ public final class LayoutRenderer {
             }
             attach(handle.view, to: parentHandle)
         }
-        configureCollectionScrolling(for: handle)
-
+        if case .native = mountDecision {
+            return
+        }
         for childID in node.orderedChildren {
             try mount(nodeID: childID, from: store)
         }
+        configureCollectionScrolling(for: handle)
     }
 
     private func attach(_ child: NSView, to parent: RenderHandle) {
         if let stack = parent.view as? NSStackView {
             stack.addArrangedSubview(child)
+            reconcileFillConstraints(for: parent)
             return
         }
 
@@ -192,15 +227,73 @@ public final class LayoutRenderer {
         guard let node = store.getNode(nodeID) else {
             throw LayoutRendererError.missingSemanticNode(nodeID)
         }
+        if property == .text, ControlFactory.shouldSkipTextFallback(for: handle, node: node) {
+            return
+        }
+        let appliedValue: Value?
+        if property == .value, handle.textAdapter != nil {
+            appliedValue = ControlFactory.displayedEditorText(for: node)
+        } else {
+            appliedValue = node.getProperty(property)
+        }
         controlFactory.apply(
             property: property,
-            value: node.getProperty(property),
+            value: appliedValue,
             to: handle,
             store: store
         )
+        // `.paddingRole` rewrites the stack's `edgeInsets`, and the fill constraints hold that
+        // inset as a constant: without a rebuild children stay sized for the previous padding.
+        if property == .horizontalAlignment
+            || property == .verticalAlignment
+            || property == .paddingRole {
+            reconcileFillConstraints(for: handle)
+        }
         RendererDiagnostics.log(
             "updated node=\(nodeID) property=\(property) view=\(ObjectIdentifier(handle.view))"
         )
+    }
+
+    private func reconcileFillConstraints(for handle: RenderHandle) {
+        guard let stack = handle.view as? NSStackView else { return }
+        let property: PropertyRef
+        let shouldFill: Bool
+        let inset: CGFloat
+        if stack.orientation == .vertical {
+            property = .horizontalAlignment
+            shouldFill = handle.layoutMetadata.horizontalAlignment == .horizontalAlignmentFill
+                || !handle.nodeType.isStandard
+            inset = stack.edgeInsets.left + stack.edgeInsets.right
+        } else {
+            property = .verticalAlignment
+            shouldFill = handle.layoutMetadata.verticalAlignment == .verticalAlignmentFill
+            inset = stack.edgeInsets.top + stack.edgeInsets.bottom
+        }
+
+        handle.propertyConstraints[property]?.forEach { $0.isActive = false }
+        guard shouldFill else {
+            handle.propertyConstraints[property] = []
+            return
+        }
+
+        let constraints = stack.arrangedSubviews.map { child in
+            let constraint: NSLayoutConstraint
+            if stack.orientation == .vertical {
+                constraint = child.widthAnchor.constraint(
+                    equalTo: stack.widthAnchor,
+                    constant: -inset
+                )
+            } else {
+                constraint = child.heightAnchor.constraint(
+                    equalTo: stack.heightAnchor,
+                    constant: -inset
+                )
+            }
+            constraint.priority = .init(999)
+            return constraint
+        }
+        NSLayoutConstraint.activate(constraints)
+        handle.propertyConstraints[property] = constraints
     }
 
     private func isCollectionProperty(_ property: PropertyRef) -> Bool {

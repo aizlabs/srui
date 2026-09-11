@@ -570,30 +570,39 @@ extension Transaction {
 
 // MARK: - Event <-> SRUIEvent
 
+/// Converts one wire identifier through the protocol-wide retained-ID contract.
+public func validateAndConvertEventID(_ eventID: Data) throws -> EventId {
+    guard !eventID.isEmpty else {
+        throw ProtocolDecodeError.missingField("event_id")
+    }
+    guard eventID.count <= maxEventIDBytes else {
+        throw ProtocolDecodeError.eventIDSizeLimitExceeded(
+            limit: maxEventIDBytes,
+            actual: eventID.count
+        )
+    }
+    return EventId(eventID)
+}
+
+/// Enforces the cross-language `edit_seq` shape before either Swift event decoder constructs
+/// a domain event. Protobuf's scalar default cannot distinguish omitted from explicit zero, so
+/// TEXT_EDIT requires a positive value and every other event requires the zero default.
+func decodeEventEditSequence(_ rawValue: UInt64, eventType: TypeRef) throws -> EditSeq? {
+    if eventType == .EVENT_TEXT_EDIT {
+        guard let editSeq = EditSeq(rawValue) else {
+            throw ProtocolDecodeError.custom("event error: TEXT_EDIT requires a positive edit_seq")
+        }
+        return editSeq
+    }
+    guard rawValue == 0 else {
+        throw ProtocolDecodeError.custom("event error: only TEXT_EDIT may carry edit_seq")
+    }
+    return nil
+}
+
 extension Event {
     public init(wire: SRUIEvent) throws {
-        let clientInstanceId = wire.clientInstanceID.isEmpty ? nil : ClientInstanceId(wire.clientInstanceID)
-        guard wire.hasEventType else {
-            throw ProtocolDecodeError.missingField("Event.eventType")
-        }
-        let eventType = TypeRef(wire: wire.eventType)
-
-        var args: [PropertyRef: Value] = [:]
-        args.reserveCapacity(wire.arguments.count)
-        for p in wire.arguments {
-            let prop = try Property(wire: p)
-            args[prop.property] = prop.value
-        }
-
-        self.init(
-            clientInstanceId: clientInstanceId,
-            eventSeq: wire.eventSeq,
-            eventId: EventId(wire.eventID),
-            observedRevision: Revision(wire.observedRevision),
-            nodeId: NodeId(wire.nodeID),
-            eventType: eventType,
-            arguments: args
-        )
+        self = try ProtocolDecoder().validateAndConvertEvent(wire: wire)
     }
 
     public func toWire() -> SRUIEvent {
@@ -612,6 +621,7 @@ extension Event {
             wireProp.value = v.toWire()
             return wireProp
         }
+        wire.editSeq = editSeq?.rawValue ?? 0
         return wire
     }
 }

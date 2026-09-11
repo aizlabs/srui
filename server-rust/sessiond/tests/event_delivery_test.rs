@@ -18,7 +18,7 @@ use srui_protocol::{
     srui_message, ClientHello, ClientResume, EventAckStatus, ServerEventAck, ServerResumeOk,
     SruiCodec, SruiMessage,
 };
-use srui_sdk::{Button, NodeId, ACTIVATE, LABEL};
+use srui_sdk::{Button, NodeId, ACTIVATE, LABEL, TEXT_EDIT};
 use srui_semantic_tree::Event;
 use srui_sessiond::{handle_connection, ConnectionError, EventOutcome, Session, SessionError};
 
@@ -52,7 +52,7 @@ async fn connect_client(
 
     let hello = SruiMessage {
         msg: Some(srui_message::Msg::ClientHello(ClientHello {
-            core_version: "0.4.0".to_string(),
+            core_version: "0.5.0".to_string(),
             profiles: vec!["org.srui.standard-widgets/1".to_string()],
             limits: None,
             client_instance_id: client_instance_id.to_vec(),
@@ -129,6 +129,7 @@ async fn resume_client(
             terminal_stream_offsets: Default::default(),
             limits: None,
             known_resource_hashes: vec![],
+            pending_text_edits: vec![],
         })),
     };
     client_framed_write.send(resume).await.expect("send resume");
@@ -658,6 +659,113 @@ async fn test_missing_node_event_rejected_without_mutation() {
 }
 
 #[tokio::test]
+async fn malformed_events_are_rejected_without_tearing_down_the_connection() {
+    let session = Arc::new(Session::new("malformed-events"));
+    let btn = NodeId::new(1);
+    seed_button(&session, btn);
+
+    let invocations = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&invocations);
+    session.on(btn, ACTIVATE, move |_, _| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let shutdown = CancellationToken::new();
+    let (mut client_write, mut client_read, server_task) =
+        connect_client(session.clone(), shutdown, CLIENT_A).await;
+
+    let mut missing_event_type = Event::activate(1, "missing-type", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    missing_event_type.event_type = None;
+
+    let mut missing_edit_seq = Event::activate(2, "missing-edit-seq", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    missing_edit_seq.event_type = Some(TEXT_EDIT.into());
+    missing_edit_seq.edit_seq = 0;
+
+    let mut unexpected_edit_seq = Event::activate(3, "unexpected-edit-seq", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    unexpected_edit_seq.edit_seq = 1;
+
+    let mut undecodable_argument = Event::activate(4, "undecodable-argument", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    undecodable_argument
+        .arguments
+        .push(srui_protocol::Property {
+            property: Some(LABEL.into()),
+            value: Some(srui_protocol::Value { value: None }),
+        });
+
+    let mut oversized_event_id = Event::activate(5, "placeholder", 1, btn)
+        .with_client_instance_id(CLIENT_A)
+        .to_wire();
+    oversized_event_id.event_id = vec![0x41; srui_semantic_tree::MAX_EVENT_ID_BYTES + 1];
+
+    let malformed = [
+        missing_event_type,
+        missing_edit_seq,
+        unexpected_edit_seq,
+        undecodable_argument,
+        oversized_event_id,
+    ];
+    for (index, event) in malformed.iter().enumerate() {
+        client_write
+            .send(SruiMessage {
+                msg: Some(srui_message::Msg::Event(event.clone())),
+            })
+            .await
+            .expect("send malformed event");
+        let ack = recv_event_ack(&mut client_read).await;
+        assert_eq!(ack.status(), EventAckStatus::Rejected);
+        assert_eq!(ack.last_processed_event_seq, (index + 1) as u64);
+        if event.event_id.len() > srui_semantic_tree::MAX_EVENT_ID_BYTES {
+            assert!(ack.event_id.len() <= srui_semantic_tree::MAX_EVENT_ID_BYTES);
+            assert_ne!(ack.event_id, event.event_id);
+        } else {
+            assert_eq!(ack.event_id, event.event_id);
+        }
+        assert!(
+            ack.reject_reason.contains("malformed event:"),
+            "unexpected rejection: {:?}",
+            ack.reject_reason
+        );
+
+        if index == 0 {
+            client_write
+                .send(SruiMessage {
+                    msg: Some(srui_message::Msg::Event(event.clone())),
+                })
+                .await
+                .expect("replay malformed event");
+            let replay_ack = recv_event_ack(&mut client_read).await;
+            assert_eq!(replay_ack.status(), EventAckStatus::Rejected);
+            assert_eq!(replay_ack.reject_reason, ack.reject_reason);
+            assert_eq!(replay_ack.last_processed_event_seq, 1);
+        }
+    }
+
+    send_activate(
+        &mut client_write,
+        CLIENT_A,
+        6,
+        "valid-after-malformed",
+        1,
+        btn,
+    )
+    .await;
+    let ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(ack.status(), EventAckStatus::Processed);
+    assert_eq!(ack.last_processed_event_seq, 6);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    assert_connection_survived(client_write, client_read, server_task).await;
+}
+
+#[tokio::test]
 async fn test_disabled_node_event_rejected_without_mutation() {
     let session = Arc::new(Session::new("disabled-node"));
     let enabled_btn = NodeId::new(1);
@@ -871,6 +979,33 @@ fn test_handler_panic_abandons_in_flight_admission_for_retry() {
         })
     ));
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn fallible_handler_error_is_rejected_without_tearing_down_the_connection() {
+    let session = Arc::new(Session::new("fallible-handler-rejection"));
+    let btn = NodeId::new(1);
+    seed_button(&session, btn);
+    session.on_result(btn, ACTIVATE, |_, _| {
+        Err(SessionError::InvalidInput("handler failed".to_string()))
+    });
+
+    let shutdown = CancellationToken::new();
+    let (mut client_write, mut client_read, server_task) =
+        connect_client(session, shutdown, CLIENT_A).await;
+
+    send_activate(&mut client_write, CLIENT_A, 1, "evt-error", 1, btn).await;
+    let first_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(first_ack.status(), EventAckStatus::Rejected);
+    assert!(first_ack.reject_reason.contains("handler failed"));
+
+    send_activate(&mut client_write, CLIENT_A, 1, "evt-error", 1, btn).await;
+    let replay_ack = recv_event_ack(&mut client_read).await;
+    assert_eq!(replay_ack.status(), EventAckStatus::Rejected);
+    assert_eq!(replay_ack.reject_reason, first_ack.reject_reason);
+    assert_eq!(replay_ack.last_processed_event_seq, 1);
+
+    assert_connection_survived(client_write, client_read, server_task).await;
 }
 
 #[tokio::test]

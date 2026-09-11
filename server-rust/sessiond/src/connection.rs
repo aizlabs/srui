@@ -7,25 +7,44 @@
 //! a retry can read the settled result. Validation refusals are acknowledged as `REJECTED` rather
 //! than closing the stream; only protocol violations are fatal.
 //!
+//! Post-handshake, reading and writing are concurrently driven futures over the already-split
+//! socket halves: the read future consumes semantic events independently of resource output, and
+//! the write future selects exactly one frame through
+//! [`crate::outbound::LogicalChannelScheduler`]. Acks are enqueued one-at-a-time on a bounded control channel (`send().await`) rather than dropped.
+//!
 //! Conforms strictly to:
 //! - [`async-cancel-safety`](rules/async-cancel-safety.md): uses [`SruiCodec`] with `tokio_util::codec::FramedRead`
 //!   inside `tokio::select!` so mid-frame cancellations do not corrupt stream buffers.
-//! - [`async-bounded-channel`](rules/async-bounded-channel.md): all transaction and event flows use bounded queues.
-//! - [`async-cancellation-token`](rules/async-cancellation-token.md): uses [`CancellationToken`] for clean disconnection.
+//! - [`async-bounded-channel`](rules/async-bounded-channel.md): all transaction, control, and event flows use bounded queues.
+//! - [`async-cancellation-token`](rules/async-cancellation-token.md): uses a connection-local [`CancellationToken`] for clean disconnection.
+//! - [`async-no-lock-await`](rules/async-no-lock-await.md): no locks are held across `.await`.
 
+mod writer;
+
+use self::writer::write_loop;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::outbound::{OutboundItem, OutboundReceiver, OutboundRecvError};
-use crate::session::{EventOutcome, ResumeOutcome, Session, SessionError};
+use crate::outbound::{
+    server_envelope_matches_class, LogicalChannelClass, OutboundReceiver, OutboundRecvError,
+};
+use crate::session::terminal::{event_to_message, live_class_for_event};
+use crate::session::{
+    run_model_range_worker, EventOutcome, ModelRangeRequestInbox, ResumeOutcome, Session,
+    SessionError,
+};
 use srui_protocol::{
     srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
+    MAX_TERMINAL_INPUT_BYTES,
 };
+use srui_pty::TerminalSubscription;
+use srui_semantic_tree::NodeId;
 use thiserror::Error;
 
 /// Handshake timeout in seconds (5 seconds, §18.1).
@@ -38,6 +57,11 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the queue nor the disconnect token ever fires because nothing else is trying to publish to it.
 /// The deadline turns that indefinite park into a detach, after which the client resyncs (§20.2).
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded per-connection queue of control-class frames (SERVER EVENT_ACK, §18.2, §19.2).
+///
+/// send().await applies backpressure into the read future instead of dropping acknowledgements.
+const CONTROL_CHANNEL_CAPACITY: usize = 64;
 
 /// Errors occurring during connection lifecycle.
 #[derive(Debug, Error)]
@@ -75,6 +99,11 @@ pub enum ConnectionError {
 /// Returns `Ok(true)` if the frame was written, `Ok(false)` if the connection should
 /// unwind cleanly (shutdown or hub close). A lagged queue is a hard resync error.
 ///
+/// `logical_class` documents the [`LogicalChannelClass`] of this write. Handshake writes
+/// keep their original order; the active-session writer selects classes through the
+/// scheduler. WELCOME/resume responses are control; snapshots and replayed transactions
+/// are UI (§19.2).
+///
 /// # Cancellation
 ///
 /// The write is polled first (`biased`), so a frame the socket can accept immediately is always
@@ -86,40 +115,85 @@ pub enum ConnectionError {
 async fn send_message<W>(
     framed_write: &mut FramedWrite<W, SruiCodec>,
     envelope: SruiMessage,
+    logical_class: LogicalChannelClass,
     shutdown: &CancellationToken,
     outbound: &OutboundReceiver,
 ) -> Result<bool, ConnectionError>
 where
     W: AsyncWrite + Unpin,
 {
-    tokio::select! {
-        biased;
-        // Bounded: a client that stops reading its socket parks this write in the kernel, where
-        // neither the shutdown token nor the outbound queue can observe it (§20.2).
-        res = tokio::time::timeout(WRITE_TIMEOUT, framed_write.send(envelope)) => {
-            match res {
-                Ok(sent) => {
-                    sent?;
-                    Ok(true)
+    send_message_with_read_state(
+        framed_write,
+        envelope,
+        logical_class,
+        shutdown,
+        outbound,
+        None,
+    )
+    .await
+}
+
+async fn send_message_with_read_state<W>(
+    framed_write: &mut FramedWrite<W, SruiCodec>,
+    envelope: SruiMessage,
+    logical_class: LogicalChannelClass,
+    shutdown: &CancellationToken,
+    outbound: &OutboundReceiver,
+    read_finished: Option<&CancellationToken>,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWrite + Unpin,
+{
+    debug_assert!(
+        server_envelope_matches_class(&envelope, logical_class),
+        "envelope class must match the annotated write class"
+    );
+    debug!(?logical_class, "sending outbound frame");
+
+    // Keep the same send future across state changes. Once the read side finishes, aborting an
+    // in-flight frame is not cancellation-safe and could also discard accepted control frames
+    // behind it, so outbound close/lag stops preempting this bounded write.
+    let send = tokio::time::timeout(WRITE_TIMEOUT, framed_write.send(envelope));
+    tokio::pin!(send);
+    let mut draining_after_read = read_finished.is_some_and(CancellationToken::is_cancelled);
+
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut send => {
+                return match res {
+                    Ok(sent) => {
+                        sent?;
+                        Ok(true)
+                    }
+                    Err(_) => {
+                        warn!(timeout = ?WRITE_TIMEOUT, "Client did not accept an outbound frame; detaching for resync");
+                        Err(ConnectionError::WriteTimeout(WRITE_TIMEOUT))
+                    }
+                };
+            }
+            _ = shutdown.cancelled() => return Ok(false),
+            _ = async {
+                if let Some(read_finished) = read_finished {
+                    read_finished.cancelled().await;
                 }
-                Err(_) => {
-                    warn!(timeout = ?WRITE_TIMEOUT, "Client did not accept an outbound frame; detaching for resync");
-                    Err(ConnectionError::WriteTimeout(WRITE_TIMEOUT))
-                }
+            }, if !draining_after_read && read_finished.is_some() => {
+                draining_after_read = true;
+            }
+            _ = outbound.disconnect_token().cancelled(), if !draining_after_read => {
+                return match outbound.termination() {
+                    Some(OutboundRecvError::Closed) => Ok(false),
+                    Some(OutboundRecvError::Lagged(reason)) => {
+                        warn!(%reason, "Client outbound queue overflowed during send; closing connection to force resync");
+                        Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
+                    }
+                    None => {
+                        warn!("Client outbound subscriber disconnected during send; closing connection to force resync");
+                        Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
+                    }
+                };
             }
         }
-        _ = shutdown.cancelled() => Ok(false),
-        _ = outbound.disconnect_token().cancelled() => match outbound.termination() {
-            Some(OutboundRecvError::Closed) => Ok(false),
-            Some(OutboundRecvError::Lagged(reason)) => {
-                warn!(%reason, "Client outbound queue overflowed during send; closing connection to force resync");
-                Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
-            }
-            None => {
-                warn!("Client outbound subscriber disconnected during send; closing connection to force resync");
-                Err(ConnectionError::Session(SessionError::LaggedResyncRequired))
-            }
-        },
     }
 }
 
@@ -175,7 +249,7 @@ where
         }
     };
 
-    let (client_instance_id, mut tx_rx) = match handshake_msg.msg {
+    let (client_instance_id, tx_rx, terminal) = match handshake_msg.msg {
         Some(srui_message::Msg::ClientHello(hello)) => {
             info!(
                 client_instance_id = ?hello.client_instance_id,
@@ -188,6 +262,7 @@ where
             if !send_message(
                 &mut framed_write,
                 welcome_envelope,
+                LogicalChannelClass::Control,
                 &shutdown,
                 &bootstrap.transactions,
             )
@@ -202,6 +277,7 @@ where
                 if !send_message(
                     &mut framed_write,
                     snapshot_envelope,
+                    LogicalChannelClass::Ui,
                     &shutdown,
                     &bootstrap.transactions,
                 )
@@ -211,7 +287,15 @@ where
                 }
             }
             clear_stale_if_settled(&session, &hello.client_instance_id, &bootstrap.transactions);
-            (hello.client_instance_id, bootstrap.transactions)
+            (
+                hello.client_instance_id,
+                bootstrap.transactions,
+                TerminalConnection {
+                    negotiated: bootstrap.terminal_negotiated,
+                    live: bootstrap.terminal.live,
+                    catch_up: bootstrap.terminal.catch_up,
+                },
+            )
         }
         Some(srui_message::Msg::ClientResume(resume)) => {
             info!(
@@ -231,6 +315,7 @@ where
                     if !send_message(
                         &mut framed_write,
                         envelope,
+                        LogicalChannelClass::Control,
                         &shutdown,
                         &bootstrap.transactions,
                     )
@@ -245,6 +330,7 @@ where
                         if !send_message(
                             &mut framed_write,
                             tx_env,
+                            LogicalChannelClass::Ui,
                             &shutdown,
                             &bootstrap.transactions,
                         )
@@ -264,6 +350,7 @@ where
                     if !send_message(
                         &mut framed_write,
                         envelope,
+                        LogicalChannelClass::Control,
                         &shutdown,
                         &bootstrap.transactions,
                     )
@@ -277,6 +364,7 @@ where
                     if !send_message(
                         &mut framed_write,
                         snapshot_env,
+                        LogicalChannelClass::Ui,
                         &shutdown,
                         &bootstrap.transactions,
                     )
@@ -291,7 +379,15 @@ where
                     );
                 }
             }
-            (resume.client_instance_id, bootstrap.transactions)
+            (
+                resume.client_instance_id,
+                bootstrap.transactions,
+                TerminalConnection {
+                    negotiated: bootstrap.terminal_negotiated,
+                    live: bootstrap.terminal.live,
+                    catch_up: bootstrap.terminal.catch_up,
+                },
+            )
         }
         _ => {
             return Err(ConnectionError::UnexpectedMessage(
@@ -300,35 +396,273 @@ where
         }
     };
 
-    // -------------------------------------------------------------------------
-    // Phase 2: Multiplexed Event & Transaction Streaming (§18, §20)
-    // -------------------------------------------------------------------------
-    //
-    // Fair select: a pipelined burst of inbound events must not starve outbound
-    // delivery (bounded queue → LaggedResyncRequired). Within outbound selection,
-    // transactions usually precede one resource frame, with aging so continuous UI
-    // traffic cannot starve resource progress entirely (§19.2).
+    run_active_session(
+        framed_read,
+        framed_write,
+        session,
+        client_instance_id,
+        tx_rx,
+        terminal,
+        shutdown,
+    )
+    .await
+}
 
+const TERMINAL_LANE_CAPACITY: usize = 64;
+
+struct TerminalConnection {
+    negotiated: bool,
+    live: Vec<TerminalSubscription>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+}
+
+pub(super) struct TerminalLanes {
+    high_rx: mpsc::Receiver<SruiMessage>,
+    normal_rx: mpsc::Receiver<SruiMessage>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+    catch_up_released: tokio::sync::watch::Sender<bool>,
+}
+
+pub(super) struct WriterCancel {
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+    read_finished: CancellationToken,
+}
+
+fn spawn_terminal_live_pumps(
+    live: Vec<TerminalSubscription>,
+    catch_up: Vec<(LogicalChannelClass, SruiMessage)>,
+    shutdown: CancellationToken,
+    session_cancel: CancellationToken,
+) -> (TerminalLanes, Vec<tokio::task::JoinHandle<()>>) {
+    let (high_tx, high_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let (normal_tx, normal_rx) = mpsc::channel(TERMINAL_LANE_CAPACITY);
+    let (catch_up_released, released_rx) = tokio::sync::watch::channel(catch_up.is_empty());
+    let mut tasks = Vec::new();
+
+    // Live High must not race handshake replay: the Swift client treats an
+    // ahead-of-cursor frame as a local reset and then drops older replay as
+    // duplicates. Gate pumps until the writer has put every catch-up frame
+    // on the wire through TerminalNormal / TerminalHigh scheduler slots.
+    for mut subscription in live {
+        let high_tx = high_tx.clone();
+        let normal_tx = normal_tx.clone();
+        let shutdown = shutdown.clone();
+        let session_cancel = session_cancel.clone();
+        let mut released = released_rx.clone();
+        tasks.push(tokio::spawn(async move {
+            // Do not drain the ring while the gate is closed. Staging live output here
+            // would bypass both the bounded output ring and the bounded terminal lane, so a
+            // continuously writing child could grow the server heap for as long as the socket
+            // blocks. Leaving the bytes in the ring keeps the §21.2 retention bound; a cursor
+            // that falls behind the retained window emits the existing SubscriberFallbehind
+            // resync on the first drain after release.
+            while !*released.borrow() {
+                tokio::select! {
+                    biased;
+                    _ = session_cancel.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
+                    changed = released.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = session_cancel.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
+                    events = subscription.recv() => {
+                        if events.is_empty() {
+                            return;
+                        }
+                        for event in events {
+                            let class = live_class_for_event(&event);
+                            let msg = event_to_message(event);
+                            match class {
+                                LogicalChannelClass::TerminalHigh => {
+                                    if high_tx.send(msg).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                LogicalChannelClass::TerminalNormal => {
+                                    if normal_tx.send(msg).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => {
+                                    if high_tx.send(msg).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    drop(high_tx);
+    drop(normal_tx);
+    drop(released_rx);
+    (
+        TerminalLanes {
+            high_rx,
+            normal_rx,
+            catch_up,
+            catch_up_released,
+        },
+        tasks,
+    )
+}
+
+/// Concurrently drives inbound events and scheduled outbound writes (§18.2, §19.2, §20).
+///
+/// Inbound event handling never waits for the physical writer, so socket backpressure cannot stall
+/// semantic input. Clean inbound EOF drops the control sender and lets the writer drain every
+/// acknowledgement already accepted by the bounded channel before closing the connection.
+async fn run_active_session<R, W>(
+    framed_read: FramedRead<R, SruiCodec>,
+    framed_write: FramedWrite<W, SruiCodec>,
+    session: Arc<Session>,
+    client_instance_id: Vec<u8>,
+    outbound: OutboundReceiver,
+    terminal: TerminalConnection,
+    shutdown: CancellationToken,
+) -> Result<(), ConnectionError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let session_cancel = CancellationToken::new();
+    let read_finished = CancellationToken::new();
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_CAPACITY);
+    let range_inbox = ModelRangeRequestInbox::new();
+    let range_worker = {
+        let session = Arc::clone(&session);
+        let inbox = range_inbox.clone();
+        let shutdown = shutdown.clone();
+        let session_cancel = session_cancel.clone();
+        tokio::spawn(async move {
+            run_model_range_worker(session, inbox, shutdown, session_cancel).await;
+        })
+    };
+
+    let (terminal_lanes, terminal_pumps) = spawn_terminal_live_pumps(
+        terminal.live,
+        terminal.catch_up,
+        shutdown.clone(),
+        session_cancel.clone(),
+    );
+    let read = read_loop(
+        framed_read,
+        session,
+        client_instance_id,
+        control_tx,
+        range_inbox.clone(),
+        terminal.negotiated,
+        WriterCancel {
+            shutdown: shutdown.clone(),
+            session_cancel: session_cancel.clone(),
+            read_finished: read_finished.clone(),
+        },
+    );
+    let write = write_loop(
+        framed_write,
+        outbound,
+        control_rx,
+        terminal_lanes,
+        WriterCancel {
+            shutdown,
+            session_cancel: session_cancel.clone(),
+            read_finished: read_finished.clone(),
+        },
+    );
+
+    tokio::pin!(read);
+    tokio::pin!(write);
+    let result = tokio::select! {
+        biased;
+        result = &mut read => {
+            // Stop selecting new low-priority work while the closed control sender is drained.
+            read_finished.cancel();
+            match result {
+                // The completed reader has dropped control_tx. Drain queued acknowledgements
+                // rather than cancelling the writer on a clean inbound half-close.
+                Ok(()) => write.await,
+                Err(error) => {
+                    // The reader has dropped control_tx even on failure. Preserve its error as
+                    // the connection result, but first give already accepted acknowledgements the
+                    // same bounded drain opportunity as a clean inbound half-close.
+                    if let Err(drain_error) = write.await {
+                        warn!(
+                            error = %drain_error,
+                            "Connection writer failed while draining acknowledgements after read error"
+                        );
+                    }
+                    Err(error)
+                }
+            }
+        }
+        result = &mut write => {
+            session_cancel.cancel();
+            result
+        }
+    };
+    range_inbox.close();
+    session_cancel.cancel();
+    for task in terminal_pumps {
+        let _ = task.await;
+    }
+    let _ = range_worker.await;
+    result
+}
+
+async fn read_loop<R>(
+    mut framed_read: FramedRead<R, SruiCodec>,
+    session: Arc<Session>,
+    client_instance_id: Vec<u8>,
+    control_tx: mpsc::Sender<ServerEventAck>,
+    range_inbox: ModelRangeRequestInbox,
+    terminal_negotiated: bool,
+    cancel: WriterCancel,
+) -> Result<(), ConnectionError>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
         tokio::select! {
-            // Cancel-safe incoming message receiver (async-cancel-safety)
+            biased;
+            _ = cancel.session_cancel.cancelled() => return Ok(()),
+            _ = cancel.shutdown.cancelled() => {
+                debug!("Connection read loop terminating due to shutdown signal");
+                return Ok(());
+            }
             incoming = framed_read.next() => {
                 match incoming {
                     Some(Ok(msg)) => {
-                        // Acks are control-class traffic (§19.2): emitted on the same connection,
-                        // in order, never coalesced or dropped.
-                        if let Some(response) =
-                            handle_incoming_message(msg, &session, &client_instance_id).await?
-                        {
-                            if !send_message(
-                                &mut framed_write,
-                                response,
-                                &shutdown,
-                                &tx_rx,
+                        if let Some(ack) =
+                            handle_incoming_message(
+                                msg,
+                                &session,
+                                &client_instance_id,
+                                &range_inbox,
+                                terminal_negotiated,
                             )
                             .await?
-                            {
-                                break;
+                        {
+                            tokio::select! {
+                                biased;
+                                sent = control_tx.send(ack) => {
+                                    if sent.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                _ = cancel.session_cancel.cancelled() => return Ok(()),
+                                _ = cancel.shutdown.cancelled() => return Ok(()),
                             }
                         }
                     }
@@ -338,63 +672,21 @@ where
                     }
                     None => {
                         info!("Client disconnected normally");
-                        break;
+                        return Ok(());
                     }
                 }
-            }
-
-            // Outgoing selector: UI transaction first, else exactly one resource frame (§14, §19.2)
-            outbound_item = tx_rx.recv() => {
-                match outbound_item {
-                    Ok(item) => {
-                        let envelope = match item {
-                            OutboundItem::Transaction(tx) => SruiMessage {
-                                msg: Some(srui_message::Msg::Transaction(tx)),
-                            },
-                            OutboundItem::ResourceMetadata(meta) => SruiMessage {
-                                msg: Some(srui_message::Msg::ResourceMetadata(meta)),
-                            },
-                            OutboundItem::ResourceChunk(chunk) => SruiMessage {
-                                msg: Some(srui_message::Msg::ResourceChunk(chunk)),
-                            },
-                        };
-                        if !send_message(
-                            &mut framed_write,
-                            envelope,
-                            &shutdown,
-                            &tx_rx,
-                        )
-                        .await?
-                        {
-                            break;
-                        }
-                    }
-                    Err(OutboundRecvError::Lagged(reason)) => {
-                        warn!(%reason, "Client outbound queue overflowed; closing connection to force resync");
-                        return Err(ConnectionError::Session(SessionError::LaggedResyncRequired));
-                    }
-                    Err(OutboundRecvError::Closed) => {
-                        break;
-                    }
-                }
-            }
-
-            // Clean shutdown signal (async-cancellation-token)
-            _ = shutdown.cancelled() => {
-                debug!("Connection loop terminating due to shutdown signal");
-                break;
             }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_incoming_message(
     msg: SruiMessage,
     session: &Session,
     client_instance_id: &[u8],
-) -> Result<Option<SruiMessage>, ConnectionError> {
+    range_inbox: &ModelRangeRequestInbox,
+    terminal_negotiated: bool,
+) -> Result<Option<ServerEventAck>, ConnectionError> {
     match msg.msg {
         Some(srui_message::Msg::Event(event)) => {
             if event.client_instance_id.as_slice() != client_instance_id {
@@ -411,26 +703,35 @@ async fn handle_incoming_message(
             let outcome = session.process_event(&event)?;
             match &outcome {
                 EventOutcome::Processed { .. } => {
-                    debug!("Handled event {:?}", event.event_id);
+                    debug!(
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        "Handled event"
+                    );
                 }
                 EventOutcome::Pending { .. } => {
                     debug!(
-                        "Event {:?} (seq {}) is already in flight",
-                        event.event_id, event.event_seq
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        "Event is already in flight"
                     );
                 }
                 EventOutcome::Duplicate { .. } => {
                     debug!(
-                        "Ignored duplicate event {:?} (seq {})",
-                        event.event_id, event.event_seq
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        "Ignored duplicate event"
                     );
                 }
                 EventOutcome::Rejected { error, .. } => {
-                    // Not connection-fatal: a rejected event that closed the stream would be
-                    // replayed on the next resume and close it again, forever (§18, §18.2).
+                    // Never log the peer-controlled identifier itself. Oversized identifiers land
+                    // here deliberately, and formatting them would turn rejection into log
+                    // amplification.
                     warn!(
-                        "Rejecting event {:?} (seq {}): {}",
-                        event.event_id, event.event_seq, error
+                        event_seq = event.event_seq,
+                        event_id_bytes = event.event_id.len(),
+                        error = %error,
+                        "Rejecting event"
                     );
                 }
             }
@@ -439,10 +740,11 @@ async fn handle_incoming_message(
                 &outcome,
                 session.max_string_length(),
                 session.session_id(),
-            )
-            .map(|ack| SruiMessage {
-                msg: Some(srui_message::Msg::ServerEventAck(ack)),
-            }))
+            ))
+        }
+        Some(srui_message::Msg::ClientModelRangeRequest(request)) => {
+            range_inbox.submit(request);
+            Ok(None)
         }
         Some(srui_message::Msg::Transaction(tx)) => {
             warn!(
@@ -451,12 +753,24 @@ async fn handle_incoming_message(
             );
             Err(ConnectionError::ClientTransactionRejected)
         }
+        Some(srui_message::Msg::TerminalInput(input)) => {
+            handle_terminal_input(session, terminal_negotiated, input)?;
+            Ok(None)
+        }
+        Some(srui_message::Msg::TerminalResize(resize)) => {
+            handle_terminal_resize(session, terminal_negotiated, resize)?;
+            Ok(None)
+        }
         Some(srui_message::Msg::ClientHello(_)) => Err(ConnectionError::UnexpectedMessage(
             "ClientHello is valid only during handshake",
         )),
         Some(srui_message::Msg::ClientResume(_)) => Err(ConnectionError::UnexpectedMessage(
             "ClientResume is valid only during handshake",
         )),
+        Some(srui_message::Msg::TerminalData(_))
+        | Some(srui_message::Msg::TerminalResyncRequired(_)) => Err(
+            ConnectionError::UnexpectedMessage("server-only terminal message received from client"),
+        ),
         Some(_) => Err(ConnectionError::UnexpectedMessage(
             "server-only or unsupported message during active session",
         )),
@@ -468,6 +782,92 @@ async fn handle_incoming_message(
             warn!("Ignoring empty or unrecognized active-session envelope");
             Ok(None)
         }
+    }
+}
+
+fn handle_terminal_input(
+    session: &Session,
+    terminal_negotiated: bool,
+    input: srui_protocol::TerminalInput,
+) -> Result<(), ConnectionError> {
+    if !terminal_negotiated {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalInput is legal only after org.srui.terminal/1 negotiation",
+        ));
+    }
+    if input.data.is_empty() {
+        return Err(ConnectionError::UnexpectedMessage(
+            "empty TerminalInput is forbidden",
+        ));
+    }
+    if input.data.len() > MAX_TERMINAL_INPUT_BYTES {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalInput exceeds MAX_TERMINAL_INPUT_BYTES",
+        ));
+    }
+    let stream_id = NodeId::new(input.stream_id);
+    match session.pty().input(stream_id, input.data) {
+        Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::UnknownStream(_)) => {
+            Err(ConnectionError::UnexpectedMessage(
+                "TerminalInput targeted an unknown or unnegotiated stream",
+            ))
+        }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
+            warn!("dropping TerminalInput because the PTY command queue is full");
+            Ok(())
+        }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::Closed)) => {
+            tracing::debug!(
+                "dropping TerminalInput because stream {} is closed",
+                stream_id.get()
+            );
+            Ok(())
+        }
+        Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
+            error.to_string(),
+        ))),
+    }
+}
+
+fn handle_terminal_resize(
+    session: &Session,
+    terminal_negotiated: bool,
+    resize: srui_protocol::TerminalResize,
+) -> Result<(), ConnectionError> {
+    if !terminal_negotiated {
+        return Err(ConnectionError::UnexpectedMessage(
+            "TerminalResize is legal only after org.srui.terminal/1 negotiation",
+        ));
+    }
+    let stream_id = NodeId::new(resize.stream_id);
+    match session.pty().resize(
+        stream_id,
+        resize.columns,
+        resize.rows,
+        resize.pixel_width,
+        resize.pixel_height,
+    ) {
+        Ok(()) => Ok(()),
+        Err(srui_pty::PTYManagerError::UnknownStream(_)) => {
+            Err(ConnectionError::UnexpectedMessage(
+                "TerminalResize targeted an unknown or unnegotiated stream",
+            ))
+        }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::CommandQueueFull)) => {
+            warn!("dropping TerminalResize because the PTY command queue is full");
+            Ok(())
+        }
+        Err(srui_pty::PTYManagerError::Stream(srui_pty::TerminalStreamError::Closed)) => {
+            tracing::debug!(
+                "dropping TerminalResize because stream {} is closed",
+                stream_id.get()
+            );
+            Ok(())
+        }
+        Err(error) => Err(ConnectionError::Session(SessionError::InvalidInput(
+            error.to_string(),
+        ))),
     }
 }
 
@@ -521,18 +921,20 @@ fn build_event_ack(
 
     Some(ServerEventAck {
         client_instance_id: event.client_instance_id.clone(),
-        event_id: event.event_id.clone(),
+        event_id: crate::session::bounded_event_id_for_response(event),
         last_processed_event_seq,
         status: status as i32,
         revision_after_effect,
         reject_reason: crate::session::bound_diagnostic_string(reject_reason, max_string_length),
         session_id,
+        settled_event_seq: event.event_seq,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbound::logical_class_for_server_envelope;
     use srui_sdk::{NodeId, Surface};
     use tokio::io::duplex;
 
@@ -543,6 +945,31 @@ mod tests {
                 ..Default::default()
             })),
         }
+    }
+
+    #[test]
+    fn rejected_ack_names_oversized_event_sequence_without_reflecting_identifier() {
+        let event = srui_protocol::Event {
+            client_instance_id: b"oversized-client".to_vec(),
+            event_seq: 2,
+            event_id: vec![0x41; srui_semantic_tree::MAX_EVENT_ID_BYTES + 1],
+            ..Default::default()
+        };
+        let outcome = EventOutcome::Rejected {
+            error: srui_semantic_tree::EventValidationError::PolicyRejected(
+                "event_id exceeds limit".to_owned(),
+            ),
+            revision_after_effect: 0,
+            last_processed_event_seq: 0,
+        };
+
+        let ack = build_event_ack(&event, &outcome, 256, "session-a".to_owned())
+            .expect("terminal rejection must produce an acknowledgement");
+
+        assert_eq!(ack.settled_event_seq, event.event_seq);
+        assert_eq!(ack.last_processed_event_seq, 0);
+        assert_ne!(ack.event_id, event.event_id);
+        assert!(ack.event_id.len() <= srui_semantic_tree::MAX_EVENT_ID_BYTES);
     }
 
     fn overflow_client_queue(session: &Session) {
@@ -574,9 +1001,15 @@ mod tests {
         let mut framed_read = FramedRead::new(client_io, SruiCodec::new());
 
         for seq in 0..FRAMES {
-            let sent = send_message(&mut framed_write, ack_envelope(seq), &shutdown, &outbound)
-                .await
-                .expect("send must not fail on a writable sink");
+            let sent = send_message(
+                &mut framed_write,
+                ack_envelope(seq),
+                LogicalChannelClass::Control,
+                &shutdown,
+                &outbound,
+            )
+            .await
+            .expect("send must not fail on a writable sink");
             assert!(
                 sent,
                 "frame {seq} was abandoned even though the sink could accept it immediately"
@@ -643,5 +1076,18 @@ mod tests {
             !session.outbound_hub.is_client_stale(&client),
             "a settled catch-up write must clear the overflow marker"
         );
+    }
+
+    #[test]
+    fn server_event_ack_is_control_class() {
+        let ack = ack_envelope(3);
+        assert_eq!(
+            logical_class_for_server_envelope(&ack),
+            Some(LogicalChannelClass::Control)
+        );
+        match ack.msg {
+            Some(srui_message::Msg::ServerEventAck(_)) => {}
+            other => panic!("fixture must stay an individual ServerEventAck, got {other:?}"),
+        }
     }
 }

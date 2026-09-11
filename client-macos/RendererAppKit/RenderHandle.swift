@@ -1,5 +1,6 @@
 import AppKit
 import SemanticModel
+import Text
 
 public struct RenderLayoutMetadata: Equatable, Sendable {
     public internal(set) var minimumSize: Size?
@@ -55,6 +56,8 @@ public final class RenderHandle {
     public internal(set) var accessibilityMetadata: RenderAccessibilityMetadata
     public internal(set) var modelAdapter: AnyObject?
     public internal(set) var actionTrampoline: AnyObject?
+    /// Native text-editor observer, retained separately from collection adapters (§22.6).
+    public internal(set) var textAdapter: NativeTextEditorAdapter?
     /// Content hash of the resource most recently referenced by this node (§14).
     public internal(set) var pendingResourceHash: ResourceHash?
 
@@ -70,7 +73,8 @@ public final class RenderHandle {
         layoutMetadata: RenderLayoutMetadata = RenderLayoutMetadata(),
         accessibilityMetadata: RenderAccessibilityMetadata = RenderAccessibilityMetadata(),
         modelAdapter: AnyObject? = nil,
-        actionTrampoline: AnyObject? = nil
+        actionTrampoline: AnyObject? = nil,
+        textAdapter: NativeTextEditorAdapter? = nil
     ) {
         self.nodeID = nodeID
         self.nodeType = nodeType
@@ -82,5 +86,6 @@ public final class RenderHandle {
         self.accessibilityMetadata = accessibilityMetadata
         self.modelAdapter = modelAdapter
         self.actionTrampoline = actionTrampoline
+        self.textAdapter = textAdapter
     }
 }

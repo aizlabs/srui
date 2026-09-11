@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+runner=(uv run --frozen python "$repo_root/benchmarks/run.py" "$@")
+
+if [[ "$(uname -s)" == "Darwin" ]] && command -v caffeinate >/dev/null 2>&1; then
+    # Full compositor evidence requires an active capture display. Wake it and
+    # prevent idle display/system sleep for exactly the runner's lifetime.
+    exec caffeinate -d -i -u "${runner[@]}"
+fi
+
+exec "${runner[@]}"

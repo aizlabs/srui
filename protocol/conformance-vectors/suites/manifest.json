@@ -1,0 +1,669 @@
+{
+  "version": 1,
+  "spec_section": "\u00a732",
+  "description": "Machine-readable index of the twelve SRUI conformance suites required by \u00a732. Consumed by scripts/run-conformance, by protocol/tests/test_conformance_manifest.py, and by the Rust and Swift vector loaders (which assert the declared vector counts exactly).",
+  "suites": [
+    {
+      "id": 1,
+      "slug": "core-state-machine",
+      "name": "Core state-machine tests",
+      "spec_sections": [
+        "\u00a712.1",
+        "\u00a712.2",
+        "\u00a76.2",
+        "\u00a713",
+        "\u00a726",
+        "\u00a732.1"
+      ],
+      "status": "active",
+      "vectors": {
+        "dir": "suites/01-core-state-machine/vectors",
+        "count": 48
+      },
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "state_machine_conformance_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "StateMachineConformanceTests"
+        ]
+      ]
+    },
+    {
+      "id": 2,
+      "slug": "widget-semantics",
+      "name": "Widget semantic tests",
+      "spec_sections": [
+        "\u00a77.2",
+        "\u00a77.3",
+        "\u00a77.6",
+        "\u00a732.2"
+      ],
+      "status": "active",
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sdk",
+          "--test",
+          "widgets_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "WidgetSemanticsConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryPropertyTests"
+        ]
+      ],
+      "gaps": [
+        {
+          "scenario": "Tree EXPANSION_CHANGED and Surface VIEWPORT_CHANGED are declared in \u00a77.6 but the renderer has no interaction path that can originate them.",
+          "reason": "RendererAppKit/SemanticInteraction.swift models only activate, valueChanged, selectionChanged and textEdit. A required-tier widget can therefore never emit the disclosure or viewport events the registry declares for it.",
+          "future_task": "unowned \u2014 needs a SemanticInteraction case plus the AppKit outline/window wiring",
+          "gap_probe": {
+            "file": "client-macos/RendererAppKit/SemanticInteraction.swift",
+            "absent_pattern": "case +(expansionChanged|viewportChanged)",
+            "explanation": "Matches once the renderer can originate disclosure or viewport events. A match means suite 2 must assert the behaviour instead of documenting its absence."
+          },
+          "languages": [
+            "swift"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "slug": "semantic-not-paint",
+      "name": "Semantic-not-paint tests",
+      "spec_sections": [
+        "\u00a74.7",
+        "\u00a74.16",
+        "\u00a74.17",
+        "\u00a77.1",
+        "\u00a710",
+        "\u00a732.3"
+      ],
+      "status": "active",
+      "vectors": {
+        "dir": "suites/03-semantic-not-paint/vectors",
+        "count": 1
+      },
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "conformance_semantic_not_paint_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SemanticNotPaintConformanceTests"
+        ]
+      ]
+    },
+    {
+      "id": 4,
+      "slug": "frame-independence",
+      "name": "Frame-independence tests",
+      "spec_sections": [
+        "\u00a74.16",
+        "\u00a712.2",
+        "\u00a723",
+        "\u00a732.4"
+      ],
+      "status": "active",
+      "vectors": {
+        "dir": "suites/04-frame-independence"
+      },
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "conformance_frame_independence_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "FrameIndependenceConformanceTests"
+        ]
+      ]
+    },
+    {
+      "id": 5,
+      "slug": "semantic-input",
+      "name": "Semantic-input tests",
+      "spec_sections": [
+        "\u00a77.6",
+        "\u00a77.7",
+        "\u00a718.3",
+        "\u00a732.5"
+      ],
+      "status": "active",
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "conformance_semantic_input_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SemanticInputConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "WidgetSemanticsConformanceTests"
+        ]
+      ],
+      "gaps": [
+        {
+          "scenario": "Event validation performs no event-type/node-type compatibility check: POINTER_* is accepted against an ordinary Button, and ACTIVATE is accepted against non-interactive Text/Progress/Image/Separator nodes.",
+          "reason": "Event::validate (server-rust/semantic-tree/src/event.rs) checks observed revision, node existence and enabled state, but never compares the event type against the target node type. \u00a732.5's rule that coordinates are refused outside a subscribed scene, and \u00a77.6's per-node event sets, are therefore unenforced. Both are pinned by #[should_panic] tests in conformance_semantic_input_test.rs rather than papered over.",
+          "future_task": "Task 36 (VectorScene) for the coordinate half; the event-type/node-type check is unowned",
+          "gap_probe": {
+            "file": "server-rust/semantic-tree/src/event.rs",
+            "absent_pattern": "CoordinateEvent|coordinate event .*(subscrib|scene)|NodeNotSubscribed",
+            "explanation": "Matches once event validation gains a coordinate-vs-node-type rule. A match means suite 5 must assert the rejection instead of documenting its absence."
+          },
+          "languages": [
+            "rust",
+            "swift"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "slug": "local-text-interaction",
+      "name": "Local text-interaction tests",
+      "spec_sections": [
+        "\u00a79",
+        "\u00a718.3",
+        "\u00a722.6",
+        "\u00a732.6"
+      ],
+      "status": "active",
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "text_edit_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "TextEditingSessionTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "TextEditingSessionDebounceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "TextEditingIntegrationTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "NativeTextEditorAdapterTests"
+        ]
+      ]
+    },
+    {
+      "id": 7,
+      "slug": "extension-negotiation",
+      "name": "Extension-negotiation tests",
+      "spec_sections": [
+        "\u00a75",
+        "\u00a717",
+        "\u00a722.4",
+        "\u00a732.7"
+      ],
+      "status": "active",
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "capability_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "CapabilityTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "HandshakeNegotiationTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "CodingAgentFallbackSocketTests"
+        ]
+      ]
+    },
+    {
+      "id": 8,
+      "slug": "reconnect",
+      "name": "Reconnect tests",
+      "spec_sections": [
+        "\u00a718",
+        "\u00a718.2",
+        "\u00a718.3",
+        "\u00a721",
+        "\u00a732.8"
+      ],
+      "status": "active",
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "conformance_reconnect_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "session_resume_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "session_resync_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "text_edit_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "event_delivery_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ReconnectConformanceTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SessionResumeContinuityTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "EventOutboxTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SessionControllerResyncTests"
+        ]
+      ]
+    },
+    {
+      "id": 9,
+      "slug": "security-limits",
+      "name": "Security limits",
+      "spec_sections": [
+        "\u00a726",
+        "\u00a720.1",
+        "\u00a727",
+        "\u00a732.9"
+      ],
+      "status": "active",
+      "vectors": {
+        "dir": "malformed"
+      },
+      "rust": [
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "security_limits_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-protocol",
+          "--test",
+          "framing_decoder_matrix_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "conformance_security_limits_test"
+        ]
+      ],
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "FramingDecoderMatrixTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "DecoderTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SSHTransportPostureTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "TransactionRateLimiterTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SecurityLimitsConformanceTests"
+        ]
+      ]
+    },
+    {
+      "id": 10,
+      "slug": "renderer-semantics",
+      "name": "Renderer semantic tests",
+      "spec_sections": [
+        "\u00a722",
+        "\u00a723",
+        "\u00a724",
+        "\u00a732.10"
+      ],
+      "status": "active",
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "AppKitRendererTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryPropertyTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "CollectionAdaptersTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "NativeTextEditorAdapterTests"
+        ]
+      ],
+      "not_applicable": {
+        "rust": "Renderer semantics are AppKit-only; RendererAppKit cannot build on Linux."
+      }
+    },
+    {
+      "id": 11,
+      "slug": "semantic-inspection",
+      "name": "Semantic inspection tests",
+      "spec_sections": [
+        "\u00a724",
+        "\u00a725",
+        "\u00a732.11"
+      ],
+      "status": "known_gap",
+      "gaps": [
+        {
+          "scenario": "Inspection exposes semantic identity rather than AppKit object identity; automation actions route through the normal event/authorization path.",
+          "reason": "client-macos/Accessibility is a 4-line placeholder; no inspection or automation API exists on this base.",
+          "future_task": "Task 35 (local semantic inspection and automation API)",
+          "acceptance_criteria": [
+            "Inspection results are keyed by semantic NodeId, never by NSView identity.",
+            "Each inspected node exposes role, label, value, hierarchy position, and available actions.",
+            "Automation actions are dispatched through EventOutbox, not by invoking AppKit targets directly.",
+            "Actions on a disabled node are refused with the same authorization path as user input.",
+            "No AppKit type appears in the public inspection API surface."
+          ],
+          "gap_probe": {
+            "file": "client-macos/Accessibility/Accessibility.swift",
+            "absent_pattern": "public (struct|final class|protocol|func) +(Semantic)?Inspect",
+            "explanation": "Matches once Task 35 lands a public inspection API. A match means this suite must move from known_gap to active."
+          },
+          "languages": [
+            "swift"
+          ]
+        }
+      ],
+      "not_applicable": {
+        "rust": "Semantic inspection is a client-side API (\u00a724, \u00a725); there is no server half.",
+        "swift": "No implementation exists yet \u2014 the whole suite is the Task 35 gap."
+      }
+    },
+    {
+      "id": 12,
+      "slug": "toolkit-mapping",
+      "name": "Toolkit mapping tests",
+      "spec_sections": [
+        "\u00a722.4",
+        "\u00a732.12"
+      ],
+      "status": "active",
+      "normative": false,
+      "swift": [
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "ControlFactoryTests"
+        ]
+      ],
+      "not_applicable": {
+        "rust": "Native toolkit mapping is renderer-side and informative (\u00a722.4); the server has no half."
+      }
+    }
+  ]
+}

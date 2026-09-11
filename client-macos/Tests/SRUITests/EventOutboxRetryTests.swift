@@ -12,45 +12,7 @@ import Protocol
 @testable import Session
 import TransportSSH
 
-/// Drains one side of a transport and decodes the framed messages it carries.
-private actor OutboxWireCollector {
-    private var messages: [SRUIMessage] = []
-    private var task: Task<Void, Never>?
-
-    func start(draining transport: any Transport) {
-        guard task == nil else { return }
-        let stream = transport.receiveStream()
-        task = Task { [weak self] in
-            var decoder = SRUIMessageStreamDecoder()
-            do {
-                for try await chunk in stream {
-                    for message in try decoder.appendAndExtract(incoming: chunk) {
-                        await self?.append(message)
-                    }
-                }
-            } catch {
-                // Stream teardown at end of test; whatever was collected stays valid.
-            }
-        }
-    }
-
-    private func append(_ message: SRUIMessage) {
-        messages.append(message)
-    }
-
-    func stop() {
-        task?.cancel()
-        task = nil
-    }
-
-    func wait(forAtLeast count: Int, timeout: Double = 2.0) async -> [SRUIMessage] {
-        let deadline = Date().addingTimeInterval(timeout)
-        while messages.count < count && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
-        return messages
-    }
-}
+typealias OutboxWireCollector = ResyncWireCollector
 
 /// Transport that records each send before suspending it until the test releases that write.
 private actor GatedTransport: Transport {
@@ -85,7 +47,7 @@ private actor GatedTransport: Transport {
         sendReleaseContinuation.yield()
     }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         sentFrames.append(data)
         var releases = sendReleaseStream.makeAsyncIterator()
         _ = await releases.next()
@@ -112,7 +74,7 @@ private actor FailingTransport: Transport {
         self.streamContinuation = continuation
     }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         throw TransportError.ioError("simulated replay transport failure")
     }
 
@@ -140,7 +102,7 @@ private actor FailAfterFirstSendTransport: Transport {
 
     var closeCallCount: Int { closeCount }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         sendCount += 1
         if sendCount > 1 {
             throw TransportError.ioError("simulated background replay failure")
@@ -168,6 +130,41 @@ struct EventOutboxRetryTests {
         }
     }
 
+    private func activeBinding(
+        for outbox: EventOutbox
+    ) async throws -> EventOutboxConnectionBinding {
+        let binding = await outbox.beginConnectionBinding()
+        let allowed = await outbox.allowNewEvents(binding: binding)
+        try #require(allowed)
+        return binding
+    }
+
+    private func resumeSameSession(
+        _ outbox: EventOutbox,
+        id: String,
+        lastProcessedEventSeq: UInt64,
+        generation: UInt64,
+        binding: EventOutboxConnectionBinding,
+        via transport: any Transport,
+        enableNewEventsAfterReplay: Bool,
+        onReplayFailure: (@Sendable (String) async -> Void)? = nil
+    ) async throws -> Bool {
+        guard let preparation = try await outbox.prepareSameSessionResume(
+            id: id,
+            lastProcessedEventSeq: lastProcessedEventSeq,
+            generation: generation,
+            binding: binding
+        ) else {
+            return false
+        }
+        return try await outbox.completeSameSessionResume(
+            preparation,
+            via: transport,
+            enableNewEventsAfterReplay: enableNewEventsAfterReplay,
+            onReplayFailure: onReplayFailure
+        )
+    }
+
     @Test("Replaying an unacknowledged event reuses its original identity (§18.2)")
     func replayReusesOriginalEventIdentity() async throws {
         let (client, server) = await PipeTransport.createPair()
@@ -175,15 +172,17 @@ struct EventOutboxRetryTests {
         await collector.start(draining: server)
 
         let outbox = EventOutbox()
+        let binding = try await activeBinding(for: outbox)
         let original = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
 
         // The connection died before the acknowledgement arrived; the resume replays the event.
         // A fresh event_id here would be a second, semantically independent action (§18.2).
-        try await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(binding: binding, via: client)
 
         let messages = await collector.wait(forAtLeast: 2)
         let decoded = try events(in: messages)
@@ -203,27 +202,30 @@ struct EventOutboxRetryTests {
     func acknowledgementAdvancesResumeState() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-ack"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-ack", binding: binding))
 
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
         #expect(await outbox.pendingCount == 1)
 
         #expect(await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: event.eventId,
             throughSeq: 0,
             sessionId: "session-ack"
-        ))
+        ).bound)
 
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == event.eventSeq)
 
         // Nothing is pending, so a resume replays nothing.
-        try await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(binding: binding, via: client)
 
         await client.close()
         await server.close()
@@ -233,21 +235,28 @@ struct EventOutboxRetryTests {
     func replayFailureBlocksDispatchEnablement() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = try await activeBinding(for: outbox)
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
-        let generation = await outbox.beginResumeAttempt()
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
         let failing = FailingTransport()
 
         var replayFailed = false
         do {
-            _ = try await outbox.completeSameSessionResume(
+            _ = try await resumeSameSession(
+                outbox,
                 id: "session-a",
                 lastProcessedEventSeq: 0,
                 generation: generation,
+                binding: resumedBinding,
                 via: failing,
                 enableNewEventsAfterReplay: true
             )
@@ -267,6 +276,7 @@ struct EventOutboxRetryTests {
             try await outbox.sendActivate(
                 nodeId: NodeId(8),
                 observedRevision: Revision(3),
+                binding: resumedBinding,
                 via: seedClient
             )
         }
@@ -287,19 +297,26 @@ struct EventOutboxRetryTests {
             replayRetryInitialDelay: .zero,
             replayRetryMaximumDelay: .zero
         )
+        let seedBinding = try await activeBinding(for: outbox)
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
         let resumedTransport = GatedTransport()
-        let generation = await outbox.beginResumeAttempt()
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
         let resumeTask = Task {
-            try await outbox.completeSameSessionResume(
+            try await resumeSameSession(
+                outbox,
                 id: "session-a",
                 lastProcessedEventSeq: 0,
                 generation: generation,
+                binding: resumedBinding,
                 via: resumedTransport,
                 enableNewEventsAfterReplay: true
             )
@@ -326,6 +343,7 @@ struct EventOutboxRetryTests {
         #expect(await outbox.isRetryingPendingEvents)
 
         _ = await outbox.settleAcknowledgement(
+            binding: resumedBinding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: pending.eventId,
             throughSeq: pending.eventSeq,
@@ -350,24 +368,32 @@ struct EventOutboxRetryTests {
             replayRetryInitialDelay: .zero,
             replayRetryMaximumDelay: .zero
         )
+        let seedBinding = try await activeBinding(for: outbox)
         let first = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
         let second = try await outbox.sendActivate(
             nodeId: NodeId(8),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
         let resumedTransport = GatedTransport()
-        let generation = await outbox.beginResumeAttempt()
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
         let resumeTask = Task {
-            try await outbox.completeSameSessionResume(
+            try await resumeSameSession(
+                outbox,
                 id: "session-a",
                 lastProcessedEventSeq: 0,
                 generation: generation,
+                binding: resumedBinding,
                 via: resumedTransport,
                 enableNewEventsAfterReplay: true
             )
@@ -380,13 +406,17 @@ struct EventOutboxRetryTests {
         #expect(try await resumeTask.value)
         #expect(await outbox.isRetryingPendingEvents)
 
-        await outbox.applyLiveResyncFrontier(lastProcessedEventSeq: first.eventSeq)
+        await outbox.applyLiveResyncFrontier(
+            lastProcessedEventSeq: first.eventSeq,
+            binding: resumedBinding
+        )
 
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == first.eventSeq)
         #expect(await outbox.isRetryingPendingEvents)
 
         _ = await outbox.settleAcknowledgement(
+            binding: resumedBinding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: second.eventId,
             throughSeq: second.eventSeq,
@@ -411,19 +441,26 @@ struct EventOutboxRetryTests {
             replayRetryInitialDelay: .zero,
             replayRetryMaximumDelay: .zero
         )
+        let seedBinding = try await activeBinding(for: outbox)
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
         let resumedTransport = FailAfterFirstSendTransport()
         let (failures, failureContinuation) = AsyncStream<String>.makeStream()
-        let generation = await outbox.beginResumeAttempt()
-        let accepted = try await outbox.completeSameSessionResume(
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
+        let accepted = try await resumeSameSession(
+            outbox,
             id: "session-a",
             lastProcessedEventSeq: 0,
             generation: generation,
+            binding: resumedBinding,
             via: resumedTransport,
             enableNewEventsAfterReplay: true,
             onReplayFailure: { error in
@@ -451,26 +488,33 @@ struct EventOutboxRetryTests {
     func completedResumeReleasesHandshakeLatch() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = try await activeBinding(for: outbox)
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
         let (resumedClient, resumedServer) = await PipeTransport.createPair()
         let collector = OutboxWireCollector()
         await collector.start(draining: resumedServer)
-        let generation = await outbox.beginResumeAttempt()
-        let accepted = try await outbox.completeSameSessionResume(
+        let resumedBinding = await outbox.beginConnectionBinding()
+        let generation = try #require(
+            await outbox.beginResumeAttempt(binding: resumedBinding)
+        )
+        let accepted = try await resumeSameSession(
+            outbox,
             id: "session-a",
             lastProcessedEventSeq: 0,
             generation: generation,
+            binding: resumedBinding,
             via: resumedClient,
             enableNewEventsAfterReplay: true
         )
         #expect(accepted)
         #expect(await outbox.isRetryingPendingEvents)
-        #expect(await outbox.confirmFreshSession(id: "session-fresh"))
+        #expect(await outbox.confirmFreshSession(id: "session-fresh", binding: resumedBinding))
         #expect(await outbox.isRetryingPendingEvents == false)
 
         await collector.stop()
@@ -485,16 +529,19 @@ struct EventOutboxRetryTests {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
         let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let candidateBinding = await outbox.activeConnectionBindingForTesting
+        let binding = try #require(candidateBinding)
 
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
-
-        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
 
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
@@ -511,6 +558,7 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == event.eventSeq)
 
+        await controller.stop()
         await client.close()
         await server.close()
     }
@@ -523,21 +571,25 @@ struct EventOutboxRetryTests {
 
         let outbox = EventOutbox()
         let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let candidateBinding = await outbox.activeConnectionBindingForTesting
+        let binding = try #require(candidateBinding)
 
         let first = try await outbox.sendActivate(
             nodeId: NodeId(1),
             observedRevision: Revision(1),
+            binding: binding,
             via: client
         )
         let second = try await outbox.sendActivate(
             nodeId: NodeId(2),
             observedRevision: Revision(1),
+            binding: binding,
             via: client
         )
         #expect(await outbox.pendingCount == 2)
-        let sentBeforeAck = try events(in: await collector.wait(forAtLeast: 2)).count
-
-        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let sentBeforeAck = try events(in: await collector.wait(forAtLeast: 3)).count
 
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
@@ -553,10 +605,13 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == second.eventSeq)
 
-        try await outbox.resendPendingEvents(via: client)
-        let sentAfterAck = try events(in: await collector.wait(forAtLeast: sentBeforeAck, timeout: 0.5)).count
+        try await outbox.resendPendingEvents(binding: binding, via: client)
+        let sentAfterAck = try events(
+            in: await collector.wait(forAtLeast: sentBeforeAck + 1, timeout: 0.5)
+        ).count
         #expect(sentAfterAck == sentBeforeAck)
 
+        await controller.stop()
         await collector.stop()
         await client.close()
         await server.close()
@@ -571,18 +626,22 @@ struct EventOutboxRetryTests {
 
         let outbox = EventOutbox()
         let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let candidateBinding = await outbox.activeConnectionBindingForTesting
+        let binding = try #require(candidateBinding)
         let first = try await outbox.sendActivate(
             nodeId: NodeId(1),
             observedRevision: Revision(1),
+            binding: binding,
             via: client
         )
         let second = try await outbox.sendActivate(
             nodeId: NodeId(2),
             observedRevision: Revision(1),
+            binding: binding,
             via: client
         )
-
-        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
 
         var secondAck = SRUIServerEventAck()
         secondAck.clientInstanceID = outbox.clientInstanceId.bytes
@@ -597,8 +656,8 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
 
-        try await outbox.resendPendingEvents(via: client)
-        let replayedMessages = await collector.wait(forAtLeast: 3)
+        try await outbox.resendPendingEvents(binding: binding, via: client)
+        let replayedMessages = await collector.wait(forAtLeast: 4)
         let replayed = try #require(try events(in: replayedMessages).last)
         #expect(replayed.eventId == first.eventId)
 
@@ -615,6 +674,116 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == 2)
 
+        await controller.stop()
+        await collector.stop()
+        await client.close()
+        await server.close()
+    }
+
+    @Test("A bounded rejection marker settles its explicit out-of-order sequence (§18.2)")
+    func boundedRejectionMarkerSettlesExplicitSequence() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let binding = try #require(await outbox.activeConnectionBindingForTesting)
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: client
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(2),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: client
+        )
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        // A bounded marker is not a client identity and can collide with another valid ID. The
+        // explicit settled sequence must still retire `second`, never the ID-named `first`.
+        ack.eventID = first.eventId.bytes
+        ack.settledEventSeq = second.eventSeq
+        ack.lastProcessedEventSeq = 0
+        ack.status = .rejected
+        ack.rejectReason = "event_id exceeds 64 bytes"
+        ack.sessionID = "test-session"
+        var message = SRUIMessage()
+        message.serverEventAck = ack
+        await controller.handleIncomingMessage(message)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        try await outbox.resendPendingEvents(binding: binding, via: client)
+        let replayedMessages = await collector.wait(forAtLeast: 4)
+        let replayed = try #require(try events(in: replayedMessages).last)
+        #expect(replayed.eventId == first.eventId)
+
+        await controller.stop()
+        await collector.stop()
+        await client.close()
+        await server.close()
+    }
+
+    @Test("A replayed bounded rejection marker cannot retire the ID it collides with (§18.2)")
+    func replayedBoundedRejectionMarkerLeavesCollidingEventPending() async throws {
+        let (client, server) = await PipeTransport.createPair()
+        let collector = OutboxWireCollector()
+        await collector.start(draining: server)
+
+        let outbox = EventOutbox()
+        let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let binding = try #require(await outbox.activeConnectionBindingForTesting)
+        let first = try await outbox.sendActivate(
+            nodeId: NodeId(1),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: client
+        )
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(2),
+            observedRevision: Revision(1),
+            binding: binding,
+            via: client
+        )
+
+        var ack = SRUIServerEventAck()
+        ack.clientInstanceID = outbox.clientInstanceId.bytes
+        ack.eventID = first.eventId.bytes
+        ack.settledEventSeq = second.eventSeq
+        ack.lastProcessedEventSeq = 0
+        ack.status = .rejected
+        ack.rejectReason = "event_id exceeds 64 bytes"
+        ack.sessionID = "test-session"
+        var message = SRUIMessage()
+        message.serverEventAck = ack
+        await controller.handleIncomingMessage(message)
+
+        #expect(await outbox.pendingCount == 1)
+
+        // A duplicate or delayed copy names a slot that is already gone. Falling back to the marker
+        // would retire the unrelated `first` and selectively acknowledge its sequence, so the
+        // missing slot must read as already settled instead.
+        await controller.handleIncomingMessage(message)
+
+        #expect(await outbox.pendingCount == 1)
+        #expect(await outbox.lastAckedEventSeq == 0)
+
+        try await outbox.resendPendingEvents(binding: binding, via: client)
+        let replayedMessages = await collector.wait(forAtLeast: 4)
+        let replayed = try #require(try events(in: replayedMessages).last)
+        #expect(replayed.eventId == first.eventId)
+
+        await controller.stop()
         await collector.stop()
         await client.close()
         await server.close()
@@ -628,14 +797,17 @@ struct EventOutboxRetryTests {
 
         let outbox = EventOutbox()
         let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let candidateBinding = await outbox.activeConnectionBindingForTesting
+        let binding = try #require(candidateBinding)
 
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
-
-        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
 
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = outbox.clientInstanceId.bytes
@@ -652,11 +824,12 @@ struct EventOutboxRetryTests {
         // Left pending, the rejected event would be replayed on every resume and refused every
         // time — an unbounded loop the ack exists to break.
         #expect(await outbox.pendingCount == 0)
-        try await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(binding: binding, via: client)
 
-        let messages = await collector.wait(forAtLeast: 1)
+        let messages = await collector.wait(forAtLeast: 2)
         #expect(try events(in: messages).count == 1)
 
+        await controller.stop()
         await collector.stop()
         await client.close()
         await server.close()
@@ -670,15 +843,18 @@ struct EventOutboxRetryTests {
 
         let outbox = EventOutbox()
         let controller = SessionController(transport: client, outbox: outbox, sessionId: "session-9")
-        #expect(await outbox.confirmFreshSession(id: "session-9"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-9", binding: binding))
 
         for node in 1...3 {
             let event = try await outbox.sendActivate(
                 nodeId: NodeId(UInt64(node)),
                 observedRevision: Revision(1),
+                binding: binding,
                 via: client
             )
             _ = await outbox.settleAcknowledgement(
+                binding: binding,
                 clientInstanceId: outbox.clientInstanceId,
                 eventId: event.eventId,
                 throughSeq: event.eventSeq,
@@ -709,9 +885,11 @@ struct EventOutboxRetryTests {
     func pendingEventsWaitForSameSessionConfirmation() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = try await activeBinding(for: outbox)
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -755,9 +933,11 @@ struct EventOutboxRetryTests {
     func supersededResumeResponseIsIgnored() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = try await activeBinding(for: outbox)
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -813,9 +993,11 @@ struct EventOutboxRetryTests {
     func replacementSessionAbandonsPendingEvents() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let seedBinding = try await activeBinding(for: outbox)
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
 
@@ -851,11 +1033,13 @@ struct EventOutboxRetryTests {
     func staleHighWaterMarkDoesNotRetireUnackedEvents() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-stale"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-stale", binding: binding))
 
         _ = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
         #expect(await outbox.pendingCount == 1)
@@ -866,11 +1050,12 @@ struct EventOutboxRetryTests {
         // The identity binds — this is the live session and this client instance — so the refusal
         // below is about the content of the acknowledgement, not about who sent it.
         #expect(await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: EventId(string: "event-from-a-prior-incarnation"),
             throughSeq: 5_000,
             sessionId: "session-stale"
-        ))
+        ).bound)
 
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
@@ -883,12 +1068,14 @@ struct EventOutboxRetryTests {
     func acknowledgementDuringSendDoesNotRequeueSettledEvent() async throws {
         let transport = GatedTransport()
         let outbox = EventOutbox()
-        let controller = SessionController(transport: transport, outbox: outbox)
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "test-session", binding: binding))
 
         let sendTask = Task {
             try await outbox.sendActivate(
                 nodeId: NodeId(7),
                 observedRevision: Revision(3),
+                binding: binding,
                 via: transport
             )
         }
@@ -898,17 +1085,13 @@ struct EventOutboxRetryTests {
         let message = try decodeFramedMessage(from: frame)
         let event = try #require(try events(in: [message]).first)
 
-        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
-
-        var ack = SRUIServerEventAck()
-        ack.clientInstanceID = outbox.clientInstanceId.bytes
-        ack.eventID = event.eventId.bytes
-        ack.lastProcessedEventSeq = event.eventSeq
-        ack.status = .processed
-        ack.sessionID = "test-session"
-        var ackMessage = SRUIMessage()
-        ackMessage.serverEventAck = ack
-        await controller.handleIncomingMessage(ackMessage)
+        _ = await outbox.settleAcknowledgement(
+            binding: binding,
+            clientInstanceId: outbox.clientInstanceId,
+            eventId: event.eventId,
+            throughSeq: event.eventSeq,
+            sessionId: "test-session"
+        )
 
         #expect(await outbox.pendingCount == 0)
         await transport.releaseNextSend()
@@ -922,20 +1105,23 @@ struct EventOutboxRetryTests {
     func replaySerializesConcurrentFreshSend() async throws {
         let (seedClient, seedServer) = await PipeTransport.createPair()
         let outbox = EventOutbox()
+        let binding = try await activeBinding(for: outbox)
         let first = try await outbox.sendActivate(
             nodeId: NodeId(1),
             observedRevision: Revision(3),
+            binding: binding,
             via: seedClient
         )
         let second = try await outbox.sendActivate(
             nodeId: NodeId(2),
             observedRevision: Revision(3),
+            binding: binding,
             via: seedClient
         )
 
         let transport = GatedTransport()
         let replayTask = Task {
-            try await outbox.resendPendingEvents(via: transport)
+            try await outbox.resendPendingEvents(binding: binding, via: transport)
         }
         await transport.waitForSendCount(1)
 
@@ -943,6 +1129,7 @@ struct EventOutboxRetryTests {
             try await outbox.sendActivate(
                 nodeId: NodeId(3),
                 observedRevision: Revision(3),
+                binding: binding,
                 via: transport
             )
         }
@@ -984,13 +1171,16 @@ struct EventOutboxRetryTests {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox(clientInstanceId: ClientInstanceId(string: "client-a"))
         let controller = SessionController(transport: client, outbox: outbox)
+        try await controller.start()
+        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
+        let candidateBinding = await outbox.activeConnectionBindingForTesting
+        let binding = try #require(candidateBinding)
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
-
-        await controller.handleIncomingMessage(HandshakeFixtures.welcomeMessage())
 
         var ack = SRUIServerEventAck()
         ack.clientInstanceID = ClientInstanceId(string: "client-b").bytes
@@ -1005,6 +1195,7 @@ struct EventOutboxRetryTests {
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
 
+        await controller.stop()
         await client.close()
         await server.close()
     }
@@ -1016,18 +1207,21 @@ struct EventOutboxRetryTests {
         await collector.start(draining: server)
 
         let outbox = EventOutbox()
-        #expect(await outbox.confirmFreshSession(id: "session-7"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-7", binding: binding))
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
         #expect(await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: event.eventId,
             throughSeq: 0,
             sessionId: "session-7"
-        ))
+        ).bound)
 
         let controller = SessionController(
             transport: client,
@@ -1054,45 +1248,51 @@ struct EventOutboxRetryTests {
     func acknowledgementIdentityMustBindBeforeAnyMutation() async throws {
         let (client, server) = await PipeTransport.createPair()
         let outbox = EventOutbox(clientInstanceId: ClientInstanceId(string: "client-a"))
-        #expect(await outbox.confirmFreshSession(id: "session-live"))
+        let binding = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "session-live", binding: binding))
 
         let event = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
 
         // An expired incarnation draining its socket must not retire an intent the live session
         // still owns.
         #expect(await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: "session-expired"
-        ) == false)
+        ) == .unbound)
         // An empty session_id proves nothing about which incarnation settled the event.
         #expect(await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: ""
-        ) == false)
+        ) == .unbound)
         #expect(await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: ClientInstanceId(string: "client-b"),
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: "session-live"
-        ) == false)
+        ) == .unbound)
 
         #expect(await outbox.pendingCount == 1)
         #expect(await outbox.lastAckedEventSeq == 0)
 
         #expect(await outbox.settleAcknowledgement(
+            binding: binding,
             clientInstanceId: outbox.clientInstanceId,
             eventId: event.eventId,
             throughSeq: event.eventSeq,
             sessionId: "session-live"
-        ))
+        ).bound)
         #expect(await outbox.pendingCount == 0)
         #expect(await outbox.lastAckedEventSeq == event.eventSeq)
 
@@ -1107,9 +1307,11 @@ struct EventOutboxRetryTests {
         await collector.start(draining: server)
 
         let outbox = EventOutbox()
+        let binding = try await activeBinding(for: outbox)
         let original = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: binding,
             via: client
         )
 
@@ -1122,7 +1324,7 @@ struct EventOutboxRetryTests {
             nodeId: original.nodeId
         ).withClientInstanceId(outbox.clientInstanceId)
         await #expect(throws: EventOutboxError.pendingEventIdentityConflict(eventId: original.eventId)) {
-            try await outbox.sendEvent(resequenced, via: client)
+            try await outbox.sendEvent(resequenced, binding: binding, via: client)
         }
 
         let repayloaded = Event.activate(
@@ -1132,13 +1334,13 @@ struct EventOutboxRetryTests {
             nodeId: NodeId(8)
         ).withClientInstanceId(outbox.clientInstanceId)
         await #expect(throws: EventOutboxError.pendingEventIdentityConflict(eventId: original.eventId)) {
-            try await outbox.sendEvent(repayloaded, via: client)
+            try await outbox.sendEvent(repayloaded, binding: binding, via: client)
         }
 
         #expect(await outbox.pendingCount == 1)
 
         // The retained intent is still the original, byte for byte.
-        try await outbox.resendPendingEvents(via: client)
+        try await outbox.resendPendingEvents(binding: binding, via: client)
         let messages = await collector.wait(forAtLeast: 2)
         let decoded = try events(in: messages)
         #expect(decoded.count == 2)

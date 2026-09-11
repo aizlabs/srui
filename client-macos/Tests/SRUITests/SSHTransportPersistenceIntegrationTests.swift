@@ -33,6 +33,10 @@ struct SSHTransportPersistenceIntegrationTests {
 
         let tempDir = URL(fileURLWithPath: "/tmp/srui-persist-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempDir.path
+        )
         defer {
             try? FileManager.default.removeItem(at: tempDir)
         }
@@ -44,19 +48,8 @@ struct SSHTransportPersistenceIntegrationTests {
         let knownHostsPath = tempDir.appendingPathComponent("known_hosts").path
         let sshdConfigPath = tempDir.appendingPathComponent("sshd_config").path
 
-        // Generate SSH host key
-        let genHostKey = Process()
-        genHostKey.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
-        genHostKey.arguments = ["-t", "ed25519", "-N", "", "-f", hostKeyPath]
-        try genHostKey.run()
-        genHostKey.waitUntilExit()
-
-        // Generate SSH user key
-        let genUserKey = Process()
-        genUserKey.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
-        genUserKey.arguments = ["-t", "ed25519", "-N", "", "-f", userKeyPath]
-        try genUserKey.run()
-        genUserKey.waitUntilExit()
+        try SSHTestSupport.generateEd25519Key(at: hostKeyPath)
+        try SSHTestSupport.generateEd25519Key(at: userKeyPath)
 
         // Install user public key in authorized_keys
         let userPubData = try Data(contentsOf: URL(fileURLWithPath: "\(userKeyPath).pub"))
@@ -99,21 +92,11 @@ struct SSHTransportPersistenceIntegrationTests {
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 5)
 
         // 2. Launch ephemeral sshd daemon
-        let sshd = Process()
-        sshd.executableURL = URL(fileURLWithPath: "/usr/sbin/sshd")
-        sshd.arguments = [
-            "-f", sshdConfigPath,
-            "-h", hostKeyPath,
-            "-D",
-            "-p", String(port)
-        ]
-        try sshd.run()
-        defer {
-            if sshd.isRunning {
-                sshd.terminate()
-            }
-            sshd.waitUntilExit()
-        }
+        let sshd = try SSHTestSupport.launchSSHD(
+            configPath: sshdConfigPath,
+            hostKeyPath: hostKeyPath,
+            port: port)
+        defer { SSHTestSupport.terminate(sshd) }
 
         try await SSHTestSupport.waitForPort(port: port, timeoutSeconds: 5)
 
@@ -142,6 +125,7 @@ struct SSHTransportPersistenceIntegrationTests {
         try await controllerA.start()
         try await AsyncTestSupport.eventually(description: "connection A initial revision over SSH") {
             applierA.lastAppliedRevision == Revision(1)
+                && controllerA.isEventDispatchEnabled
         }
 
         let buttonID = NodeId(4)
@@ -185,7 +169,8 @@ struct SSHTransportPersistenceIntegrationTests {
 
         try await controllerB.start()
         try await AsyncTestSupport.eventually(description: "connection B receives preserved state over SSH") {
-            guard applierB.lastAppliedRevision == Revision(4) else {
+            guard applierB.lastAppliedRevision == Revision(4),
+                  controllerB.isEventDispatchEnabled else {
                 return false
             }
             guard let textHandle = rendererB.registry.handle(for: textID),
@@ -232,6 +217,10 @@ struct SSHTransportPersistenceIntegrationTests {
 
         let tempDir = URL(fileURLWithPath: "/tmp/srui-restarts-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: tempDir.path
+        )
         defer {
             try? FileManager.default.removeItem(at: tempDir)
         }

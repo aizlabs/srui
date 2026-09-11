@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "SRUI protocol registry validation tooling"
 requires-python = ">=3.11"
 dependencies = [
+    "jsonschema>=4.23",
     "pyyaml>=6.0",
 ]
 
@@ -14,4 +15,4 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["protocol"]
-testpaths = ["protocol/tests"]
+testpaths = ["protocol/tests", "benchmarks/tests"]

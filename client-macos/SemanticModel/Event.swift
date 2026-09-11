@@ -2,10 +2,10 @@
 // Event.swift
 // SemanticModel
 //
-// Client-originated semantic events and validation helpers (§6.1, §7.6, §7.7, §16, §18.2, §27).
+// Client-originated semantic events and validation helpers (§6.1, §7.6, §7.7, §16, §18.2, §18.3, §22.6, §27).
 // Platform-neutral: NEVER import AppKit or Cocoa in this file.
 //
-// Architecture & Protocol Invariants (§4, §6.1, §7.6, §7.7, §18.2, §27):
+// Architecture & Protocol Invariants (§4, §6.1, §7.6, §7.7, §18.2, §18.3, §22.6, §27):
 // - §6.1 Core Objects: An `Event` represents a client-originated semantic user action.
 // - §7.6 Standard Events: Controls emit high-level semantic events (`ACTIVATE`, `VALUE_CHANGED`,
 //   `SELECTION_CHANGED`, `EXPANSION_CHANGED`, `TEXT_EDIT`, `VIEWPORT_CHANGED`) rather than raw pointer coordinates.
@@ -14,6 +14,8 @@
 //   event-specific arguments.
 // - §18.2 Retry Safety & Deduplication: Every event that can cause side effects contains a stable
 //   `eventId` unique within session lifetime, enabling retry-safe delivery across network disconnects.
+// - §18.3 / §22.6 Native text editing: `TEXT_EDIT` carries a positive per-editor `editSeq` and a
+//   whole-value `TEXT` snapshot; other event types omit `editSeq`.
 // - §27 Server Validation: The server validates every client event against the current graph
 //   (verifying node existence, interactive/enabled status, and revision freshness) before dispatching to handlers.
 //
@@ -146,6 +148,35 @@ public struct ClientInstanceId: Hashable, Equatable, Comparable, Sendable, Custo
     }
 }
 
+// MARK: - Editor Sequence (§18.3, §22.6)
+
+/// Positive per-editor sequence for `TEXT_EDIT` events (§18.3, §22.6).
+///
+/// Zero is unrepresentable: the wire treats `edit_seq == 0` as absent.
+public struct EditSeq: Hashable, Equatable, Comparable, Sendable, CustomStringConvertible {
+    public let rawValue: UInt64
+
+    public init?(_ value: UInt64) {
+        guard value > 0 else { return nil }
+        self.rawValue = value
+    }
+
+    /// Checked increment that never wraps (§18.3).
+    public func incremented() -> EditSeq? {
+        let next = rawValue &+ 1
+        guard next > rawValue else { return nil }
+        return EditSeq(next)
+    }
+
+    public var description: String {
+        String(rawValue)
+    }
+
+    public static func < (lhs: EditSeq, rhs: EditSeq) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
 // MARK: - Semantic Event (§6.1, §7.6, §7.7, §16)
 
 /// Client-originated semantic event representing a user interaction (§6.1, §7.6, §7.7, §16).
@@ -164,6 +195,8 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
     public var eventType: TypeRef
     /// Event payload arguments mapped by property reference (§7.6, §7.7, §16).
     public var arguments: [PropertyRef: Value]
+    /// Positive editor sequence required on `TEXT_EDIT` and absent (`nil`) on every other type (§18.3).
+    public var editSeq: EditSeq?
 
     /// Constructs a generic semantic event.
     public init(
@@ -173,7 +206,8 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
         observedRevision: Revision,
         nodeId: NodeId,
         eventType: TypeRef,
-        arguments: [PropertyRef: Value] = [:]
+        arguments: [PropertyRef: Value] = [:],
+        editSeq: EditSeq? = nil
     ) {
         self.clientInstanceId = clientInstanceId
         self.eventSeq = eventSeq
@@ -182,6 +216,7 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
         self.nodeId = nodeId
         self.eventType = eventType
         self.arguments = arguments
+        self.editSeq = editSeq
     }
 
     /// Constructs a generic semantic event with property-value array arguments.
@@ -192,7 +227,8 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
         observedRevision: Revision,
         nodeId: NodeId,
         eventType: TypeRef,
-        arguments: [(PropertyRef, Value)]
+        arguments: [(PropertyRef, Value)],
+        editSeq: EditSeq? = nil
     ) {
         self.clientInstanceId = clientInstanceId
         self.eventSeq = eventSeq
@@ -206,6 +242,7 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
             dict[k] = v
         }
         self.arguments = dict
+        self.editSeq = editSeq
     }
 
     // MARK: - Convenience Constructors (§7.6)
@@ -268,7 +305,8 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
         eventId: EventId,
         observedRevision: Revision,
         nodeId: NodeId,
-        text: String
+        text: String,
+        editSeq: EditSeq
     ) -> Event {
         Event(
             eventSeq: eventSeq,
@@ -276,7 +314,8 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
             observedRevision: observedRevision,
             nodeId: nodeId,
             eventType: TypeRef.EVENT_TEXT_EDIT,
-            arguments: [PropertyRef.TEXT: .string(text)]
+            arguments: [PropertyRef.TEXT: .string(text)],
+            editSeq: editSeq
         )
     }
 
@@ -324,6 +363,12 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
         return copy
     }
 
+    public func withEditSeq(_ seq: EditSeq?) -> Event {
+        var copy = self
+        copy.editSeq = seq
+        return copy
+    }
+
     public func withArgument(property: PropertyRef, value: Value) -> Event {
         var copy = self
         copy.arguments[property] = value
@@ -360,7 +405,7 @@ public struct Event: Equatable, Sendable, CustomStringConvertible {
 
     public var description: String {
         let typeLabel = standardName ?? "\(eventType)"
-        return "Event(seq: \(eventSeq), id: \(eventId), node: \(nodeId), type: \(typeLabel), rev: \(observedRevision), args: \(arguments.count))"
+        return "Event(seq: \(eventSeq), id: \(eventId), node: \(nodeId), type: \(typeLabel), rev: \(observedRevision), editSeq: \(editSeq.map { String($0.rawValue) } ?? "nil"), args: \(arguments.count))"
     }
 
     // MARK: - Validation Against Store (§7.7, §27)

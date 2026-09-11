@@ -58,6 +58,11 @@ Tests in **Rust** (`server-rust/protocol/tests/conformance_test.rs`), **Swift** 
 2. **Encode Conformance**: Messages constructed from scratch in Rust and Swift serialize to bit-for-bit identical binary bytes matching `expected.json["hex"]`.
 3. **Roundtrip Re-encode**: Decoded messages re-encode to the exact golden fixture bytes.
 
+The event vectors include a canonical whole-value `TEXT_EDIT` and two protobuf-valid envelopes
+that semantic conversion must reject: `TEXT_EDIT` with `edit_seq == 0`, and a non-text event
+with `edit_seq != 0`. This distinguishes framing/protobuf conformance from the §18.3 event
+invariant.
+
 ---
 
 ## Standard Registry & Operation Wire Tags
@@ -94,6 +99,62 @@ separate field there would be redundant state a peer could contradict. Both resp
 
 ---
 
+## Native text editing (§18.3, §22.6)
+
+`TEXT_EDIT` travels on the existing `Event` transport. Immediate glyph, caret, selection, IME,
+clipboard, and spellcheck feedback stay in the platform text system; SRUI does not add a
+spellcheck protocol.
+
+**Whole-value encoding.** Each committed local edit carries the current string in
+`arguments[TEXT]`. There is no delta encoding in v0.1.
+
+**`edit_seq`.** A positive `Event.edit_seq` is required on `TEXT_EDIT` and MUST be zero on every
+other event type. The sequence is monotonic per `(session_id, client_instance_id, node_id)`. The
+client increments it for every committed local edit; coalescing may skip values. Global
+`event_seq` is allocated only when a coalesced edit enters the outbox, so `event_seq` stays
+contiguous even when `edit_seq` has gaps. `edit_seq == 0` is absent on the wire.
+
+**Resume.** `ClientResume.pending_text_edits` lists every assigned, unacknowledged `TEXT_EDIT`
+(`event_id`, `event_seq`, `node_id`, `edit_seq`). `SERVER RESUME_OK` ignores that list: the client
+replays assigned events byte-for-byte, then promotes the newest coalesced unsent draft.
+
+**Forced same-session resync.** Before capturing the snapshot, the server settles each declared
+text-event identity in the event-deduplication window (so removing them cannot open a global
+`event_seq` gap), records discard watermarks, and echoes the exact refs in
+`ServerResyncRequired.discarded_text_edits`. The client verifies the echo, selectively removes
+those text events, marks their global sequences settled, discards unsent drafts, replays only
+ordinary pending events, then applies the snapshot. A missing or mismatched echo fails closed.
+Replacement resync (`SESSION_CONTINUITY_REPLACED`) abandons every old event and text-edit
+sequence; both sequence spaces restart with the new incarnation.
+
+---
+
+## Terminal compatibility profile (§21, §21.2)
+
+`org.srui.terminal/1` is a negotiated extension profile, not a Namespace 0 widget.
+Local type ID `1` inside the session-assigned namespace is `Terminal`. The stream
+ID equals that node's `NodeId`. Clients MUST read the numeric namespace from
+`ServerWelcome.extension_namespaces` and MUST NOT assume it is `1`.
+
+| Envelope | Direction | Notes |
+|---|---|---|
+| `TerminalData` | Server → client | `byte_offset` is the absolute offset of `data[0]`. The resumable next offset is `byte_offset + data.size()` with checked `uint64` arithmetic. Empty frames are forbidden. |
+| `TerminalInput` | Client → server | Raw PTY bytes. Bounded by 65536 bytes. |
+| `TerminalResize` | Client → server | `columns`/`rows` in `[1, 512]`; pixel dimensions in `[0, 16384]`. |
+| `TerminalResyncRequired` | Server → client | `resume_at_offset` is where subsequent live data begins. Reasons distinguish retention loss, an offset ahead of the server, and a connected subscriber falling behind. |
+
+`ClientResume.terminal_stream_offsets` is independent of `pending_text_edits` and
+is capped at 256 entries. `TerminalResyncRequired` must not enter the semantic
+`ServerResyncRequired` path. Wrong-direction terminal messages are protocol
+errors. Terminal envelopes are legal only after successful terminal-profile
+negotiation.
+
+A session that emits a Terminal node marks `org.srui.terminal/1` required because
+v1 has no semantic fallback. Direct PTYs survive SRUI network detachment, but
+there is no automatic `tmux` redraw after the replay ring is lost.
+
+---
+
 ## Event Settlement (§18.2)
 
 `ServerEventAck.session_id` is **required and non-empty** on every acknowledgement. It names the
@@ -102,3 +163,9 @@ incarnation or by a connection that is still draining. An ack that omits it can 
 intent, so the event would stay pending forever — replayed on every retry, answered `DUPLICATE`,
 never settled — until the contiguous send window is exhausted. A client that receives one fails the
 session explicitly rather than degrading silently (§4 inv. 13).
+
+`ServerEventAck.settled_event_seq` identifies the exact positive sequence slot settled by an ack;
+`last_processed_event_seq` remains only the contiguous cumulative frontier. This distinction lets a
+`REJECTED` ack carry a bounded marker instead of reflecting an oversized `event_id` while still
+removing an out-of-order event from the retry set. Zero is accepted only as the legacy omitted
+value, in which case settlement requires an exact `event_id` match.

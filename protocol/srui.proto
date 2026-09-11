@@ -458,6 +458,18 @@ message Event {
   uint64 node_id = 5;
   TypeRef event_type = 6;
   repeated Property arguments = 7;
+  // Positive per-(session_id, client_instance_id, node_id) editor sequence for TEXT_EDIT (§18.3, §22.6).
+  // Zero is absent: TEXT_EDIT requires a positive value; every other event type MUST send zero.
+  uint64 edit_seq = 8;
+}
+
+// Assigned, unacknowledged TEXT_EDIT identity declared on resume and echoed on same-session
+// forced resync so those events can be settled without opening a global event_seq gap (§18.3).
+message PendingTextEditRef {
+  bytes event_id = 1;
+  uint64 event_seq = 2;
+  uint64 node_id = 3;
+  uint64 edit_seq = 4;
 }
 
 // Settlement status of a single client event (§18.2, Appendix B).
@@ -471,16 +483,19 @@ enum EventAckStatus {
 // Server acknowledgement settling exactly one client event (§18, §18.2, §19.2).
 //
 // The dedupe cache keyed on (client_instance_id, event_id) is the *idempotency*
-// mechanism; this ack selectively settles event_id. The client raises
+// mechanism; this ack selectively settles settled_event_seq. The client raises
 // `ClientResume.last_acked_event_seq` only across a contiguous settled prefix.
 message ServerEventAck {
   bytes client_instance_id = 1;
-  bytes event_id = 2; // The event this ack settles (§18.2)
+  // Normally echoes the event ID. A rejection of an oversized ID carries a bounded marker instead.
+  bytes event_id = 2;
   uint64 last_processed_event_seq = 3; // Highest contiguous settled event_seq (§18.2)
   EventAckStatus status = 4;
   uint64 revision_after_effect = 5; // Store revision after side effects (Appendix B)
   string reject_reason = 6; // Diagnostic only, bounded by max_string_length (§26)
   string session_id = 7; // Non-empty; incarnation that produced this acknowledgement (§18, §18.2)
+  // Exact positive sequence slot settled by this ack. Zero means a legacy sender omitted the field.
+  uint64 settled_event_seq = 8;
 }
 
 // -----------------------------------------------------------------------------
@@ -543,6 +558,9 @@ message ClientResume {
   ClientLimits limits = 6;
   // Verified committed CAS entries the server need not transfer again (§14, §18).
   repeated bytes known_resource_hashes = 7;
+  // Assigned, unacknowledged TEXT_EDIT events. Ignored on RESUME_OK; settled and echoed
+  // on same-session RESYNC_REQUIRED so canceling them cannot open an event_seq gap (§18.3).
+  repeated PendingTextEditRef pending_text_edits = 8;
 }
 
 // Machine-readable session identity continuity for a full snapshot response.
@@ -569,6 +587,9 @@ message ServerResyncRequired {
   SessionContinuity continuity = 4;
   // Highest contiguous settled event sequence for this client in session_id.
   uint64 last_processed_event_seq = 5;
+  // Confirmed discarded TEXT_EDIT identities for a same-session forced resync (§18.3).
+  // MUST echo the client's declared pending_text_edits; a mismatch fails closed.
+  repeated PendingTextEditRef discarded_text_edits = 6;
 }
 
 // -----------------------------------------------------------------------------
@@ -606,6 +627,87 @@ message ResourceChunk {
 }
 
 // -----------------------------------------------------------------------------
+// Terminal compatibility profile (§21, §21.2)
+// -----------------------------------------------------------------------------
+//
+// These envelopes are legal only after successful negotiation of
+// `org.srui.terminal/1`. Wrong-direction use is a protocol error:
+// TerminalData and TerminalResyncRequired are server → client;
+// TerminalInput and TerminalResize are client → server.
+//
+// Offset contract:
+//   - TerminalData.byte_offset is the absolute offset of data[0].
+//   - The client's resumable next offset is byte_offset + data.size()
+//     using checked uint64 arithmetic (overflow is a protocol error).
+//   - Empty TerminalData frames are forbidden.
+//   - TerminalResyncRequired.resume_at_offset is where subsequent live
+//     data begins after the abandoned gap.
+//
+// Limits (enforced by both peers; §21, §26):
+//   - TerminalInput.data                    ≤ 65536 bytes
+//   - TerminalData.data                     ≤ 16384 bytes and non-empty
+//   - ClientResume.terminal_stream_offsets  ≤ 256 entries
+//   - TerminalResize.columns / rows         in [1, 512]
+//   - TerminalResize.pixel_width / height   in [0, 16384]
+//
+// Local type ID 1 within the negotiated `org.srui.terminal/1` namespace
+// is Terminal. Clients MUST use the session-assigned namespace_id from
+// ServerWelcome.extension_namespaces and MUST NOT assume it is 1.
+
+enum TerminalResyncReason {
+  TERMINAL_RESYNC_REASON_UNSPECIFIED = 0;
+  // The requested next offset is older than the ring's retained start.
+  TERMINAL_RESYNC_REASON_RETENTION_LOSS = 1;
+  // The client advertised a next offset ahead of the server's next_offset.
+  TERMINAL_RESYNC_REASON_OFFSET_AHEAD = 2;
+  // A connected subscriber's cursor fell behind ring eviction.
+  TERMINAL_RESYNC_REASON_SUBSCRIBER_FALLBEHIND = 3;
+}
+
+message TerminalData {
+  uint64 stream_id = 1;
+  uint64 byte_offset = 2;
+  bytes data = 3;
+}
+
+message TerminalInput {
+  uint64 stream_id = 1;
+  bytes data = 2;
+}
+
+message TerminalResize {
+  uint64 stream_id = 1;
+  uint32 columns = 2;
+  uint32 rows = 3;
+  uint32 pixel_width = 4;
+  uint32 pixel_height = 5;
+}
+
+message TerminalResyncRequired {
+  uint64 stream_id = 1;
+  uint64 requested_offset = 2;
+  uint64 retained_from_offset = 3;
+  uint64 resume_at_offset = 4;
+  TerminalResyncReason reason = 5;
+}
+
+// -----------------------------------------------------------------------------
+// Collection range request (§8, §22.7)
+// -----------------------------------------------------------------------------
+
+// Client → server request for a missing cached window of a sparse collection
+// model. Idempotent and replaceable: not journaled, not replayed, and not an
+// Event. The server answers with an authoritative Transaction containing
+// MODEL_RESET_RANGE (§12.1). Viewport geometry remains EVENT_VIEWPORT_CHANGED.
+message ClientModelRangeRequest {
+  uint64 node_id = 1;
+  uint64 model_id = 2;
+  uint64 start_index = 3;
+  uint64 count = 4;
+  uint64 observed_revision = 5;
+}
+
+// -----------------------------------------------------------------------------
 // Top-Level Message Envelope
 // -----------------------------------------------------------------------------
 
@@ -621,5 +723,10 @@ message SruiMessage {
     ServerEventAck server_event_ack = 8;
     ResourceMetadata resource_metadata = 9;
     ResourceChunk resource_chunk = 10;
+    ClientModelRangeRequest client_model_range_request = 11;
+    TerminalData terminal_data = 12;
+    TerminalInput terminal_input = 13;
+    TerminalResize terminal_resize = 14;
+    TerminalResyncRequired terminal_resync_required = 15;
   }
 }

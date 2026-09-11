@@ -61,7 +61,9 @@ public actor PipeTransport: Transport {
         continuation
     }
 
-    public func send(data: Data) async throws {
+    /// Accepts a logical class for API parity; this transport has no queued byte sink.
+    public func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        _ = logicalClass
         guard !isClosed else {
             throw TransportError.closed
         }

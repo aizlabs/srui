@@ -2,6 +2,23 @@ import AppKit
 import SemanticModel
 import Testing
 @testable import RendererAppKit
+@testable import Collections
+
+@MainActor
+private func controlFactoryBitmapSignature(_ view: NSView) -> Data? {
+    view.layoutSubtreeIfNeeded()
+    let rect = view.bounds.integral
+    guard rect.width > 0, rect.height > 0,
+          let representation = view.bitmapImageRepForCachingDisplay(in: rect) else {
+        return nil
+    }
+    view.cacheDisplay(in: rect, to: representation)
+    guard let bytes = representation.bitmapData else { return nil }
+    return Data(
+        bytes: bytes,
+        count: representation.bytesPerRow * representation.pixelsHigh
+    )
+}
 
 private let controlFactoryRequiredTierTypes: [TypeRef] = [
     .surface, .row, .column, .grid, .spacer, .separator, .scroll,
@@ -11,11 +28,67 @@ private let controlFactoryRequiredTierTypes: [TypeRef] = [
 
 private let controlFactoryUnsupportedTypes: [TypeRef] = [
     .dialog, .select, .choiceGroup, .slider, .numberInput,
-    .tabs, .split, .menu, .toolbar,
+    .tabs, .split, .toolbar,
 ]
 
 @MainActor
 struct ControlFactoryTests {
+    @Test
+    func buttonHoverFeedbackChangesAndRestoresRaster() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+        let button = try #require(handle.view as? HoverFeedbackButton)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 180, height: 44),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = button
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+        button.updateTrackingAreas()
+        #expect(button.trackingAreas.isEmpty == false)
+
+        let location = NSPoint(x: button.bounds.midX, y: button.bounds.midY)
+        let entered = try #require(NSEvent.enterExitEvent(
+            with: .mouseEntered,
+            location: location,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            trackingNumber: 1,
+            userData: nil
+        ))
+        let exited = try #require(NSEvent.enterExitEvent(
+            with: .mouseExited,
+            location: location,
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 2,
+            trackingNumber: 1,
+            userData: nil
+        ))
+        let initial = try #require(controlFactoryBitmapSignature(button))
+
+        button.mouseEntered(with: entered)
+        let hovered = try #require(controlFactoryBitmapSignature(button))
+        #expect(button.isPointerInside)
+        #expect(hovered != initial)
+
+        button.mouseExited(with: exited)
+        let restored = try #require(controlFactoryBitmapSignature(button))
+        #expect(button.isPointerInside == false)
+        #expect(restored == initial)
+    }
+
     @Test(arguments: controlFactoryRequiredTierTypes)
     func requiredTierCreatesExpectedViewAndDefaults(nodeType: TypeRef) throws {
         let factory = ControlFactory()
@@ -35,7 +108,14 @@ struct ControlFactoryTests {
             #expect(stack.edgeInsets.left == 20)
             #expect(stack.edgeInsets.bottom == 20)
             #expect(stack.edgeInsets.right == 20)
-            #expect(handle.window != nil)
+            let window = try #require(handle.window)
+            #expect(window.contentView !== stack)
+            #expect(stack.superview === window.contentView)
+            #expect(window.contentView?.autoresizingMask.contains(.width) == true)
+            #expect(window.contentView?.autoresizingMask.contains(.height) == true)
+            #expect(window.styleMask.contains(.resizable))
+            #expect(window.contentMaxSize.width == 10_000)
+            #expect(window.maxSize.width == 10_000)
             #expect(handle.modelAdapter == nil)
             #expect(handle.actionTrampoline == nil)
 
@@ -92,15 +172,23 @@ struct ControlFactoryTests {
             #expect(label.lineBreakMode == .byWordWrapping)
 
         case .richText:
-            let textView = try #require(handle.view as? NSTextView)
+            let scroll = try #require(handle.view as? NSScrollView)
+            #expect(scroll.hasVerticalScroller)
+            #expect(scroll.hasHorizontalScroller == false)
+            #expect(scroll.drawsBackground == false)
+            let textView = try #require(scroll.documentView as? NSTextView)
             #expect(textView.isEditable == false)
             #expect(textView.isSelectable)
             #expect(textView.drawsBackground == false)
+            #expect(textView.isVerticallyResizable)
+            #expect(textView.isHorizontallyResizable == false)
+            #expect(textView.textContainer?.widthTracksTextView == true)
 
         case .button:
-            let button = try #require(handle.view as? NSButton)
+            let button = try #require(handle.view as? HoverFeedbackButton)
             #expect(button.bezelStyle == .rounded)
             #expect(button.title == "Button")
+            #expect(button.isPointerInside == false)
             #expect(handle.actionTrampoline is ActionTrampoline)
 
         case .toggle:
@@ -113,6 +201,7 @@ struct ControlFactoryTests {
             let field = try #require(handle.view as? NSTextField)
             #expect(field.isEditable)
             #expect(field.isBezeled)
+            #expect(handle.textAdapter != nil)
 
         case .textArea:
             let scroll = try #require(handle.view as? NSScrollView)
@@ -120,6 +209,7 @@ struct ControlFactoryTests {
             let textView = try #require(scroll.documentView as? NSTextView)
             #expect(textView.isEditable)
             #expect(textView.isRichText == false)
+            #expect(handle.textAdapter != nil)
 
         case .progress:
             let progress = try #require(handle.view as? NSProgressIndicator)
@@ -223,6 +313,41 @@ struct ControlFactoryTests {
     }
 
     @Test
+    func semanticMenuCreatesAndUpdatesRendererOwnedPopup() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(
+            for: Node(
+                id: 21,
+                nodeType: .menu,
+                properties: [
+                    .label: .string("Actions"),
+                    .items: .list([
+                        .string("One"),
+                        .string("Two"),
+                        .string("Three"),
+                    ]),
+                ]
+            )
+        )
+        let popUp = try #require(handle.view as? NSPopUpButton)
+
+        #expect(handle.nodeType == .menu)
+        #expect(handle.accessibilityMetadata.label == "Actions")
+        #expect(popUp.itemTitles == ["One", "Two", "Three"])
+        #expect(popUp.menu?.items.map(\.title) == ["One", "Two", "Three"])
+
+        factory.apply(
+            property: .items,
+            value: .list([.string("Updated")]),
+            to: handle
+        )
+        #expect(popUp.itemTitles == ["Updated"])
+
+        factory.apply(property: .items, value: nil, to: handle)
+        #expect(popUp.numberOfItems == 0)
+    }
+
+    @Test
     func buttonAndToggleEmitSemanticInteractions() throws {
         let factory = ControlFactory()
         var receivedInteractions: [SemanticInteraction] = []
@@ -311,29 +436,46 @@ struct ControlFactoryTests {
     }
 
     @Test
-    func modelRefPresentWithAbsentOrUncachedModelRendersEmptyRowsWithoutInlineFallback() throws {
+    func modelRefPresentWithAbsentOrUncachedModelDoesNotFallBackToInlineItems() throws {
         var store = SemanticStore()
         let absentModelID = ModelId(999)
         let uncachedModelID = ModelId(998)
         try store.createModel(id: uncachedModelID, modelType: .table, itemCount: 2)
 
         let factory = ControlFactory()
-        for modelID in [absentModelID, uncachedModelID] {
-            let node = Node(
-                id: 1,
-                nodeType: .table,
-                properties: [
-                    .modelRef: .unsignedInt(modelID.value),
-                    .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
-                ]
-            )
+        let absentNode = Node(
+            id: 1,
+            nodeType: .table,
+            properties: [
+                .modelRef: .unsignedInt(absentModelID.value),
+                .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
+            ]
+        )
+        let absentHandle = try factory.makeHandle(for: absentNode, store: store)
+        let absentAdapter = try #require(absentHandle.modelAdapter as? TableCollectionAdapter)
+        let absentTable = try #require((absentHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        #expect(absentAdapter.rows.isEmpty)
+        #expect(absentAdapter.numberOfRows(in: absentTable) == 0)
 
-            let handle = try factory.makeHandle(for: node, store: store)
-            let adapter = try #require(handle.modelAdapter as? TableCollectionAdapter)
-
-            // A present MODEL_REF is authoritative even when the model is absent or uncached.
-            #expect(adapter.rows.isEmpty)
-        }
+        let uncachedNode = Node(
+            id: 2,
+            nodeType: .table,
+            properties: [
+                .modelRef: .unsignedInt(uncachedModelID.value),
+                .items: .list([.string("Fallback Item A"), .string("Fallback Item B")]),
+            ]
+        )
+        let uncachedHandle = try factory.makeHandle(for: uncachedNode, store: store)
+        let uncachedAdapter = try #require(uncachedHandle.modelAdapter as? TableCollectionAdapter)
+        let uncachedTable = try #require((uncachedHandle.view as? NSScrollView)?.documentView as? NSTableView)
+        TableCollectionAdapter.reconcileColumns(in: uncachedTable, columns: nil, fallbackTitle: "Table")
+        #expect(uncachedAdapter.rows.isEmpty)
+        #expect(uncachedAdapter.numberOfRows(in: uncachedTable) == 2)
+        let loading = try #require(
+            uncachedAdapter.tableView(uncachedTable, viewFor: uncachedTable.tableColumns[0], row: 1) as? NSTextField
+        )
+        #expect(loading.stringValue == CollectionCells.loadingPlaceholder)
+        #expect(uncachedAdapter.tableView(uncachedTable, shouldSelectRow: 1) == false)
     }
 
     @Test
@@ -537,6 +679,24 @@ struct ControlFactoryTests {
         #expect(throws: ControlFactoryError.unsupportedNodeType(nodeType)) {
             try ControlFactory().makeHandle(for: Node(id: 1, nodeType: nodeType))
         }
+    }
+
+    @Test
+    func unsupportedExtensionWithoutFallbackIsRejected() {
+        let typeRef = TypeRef(namespaceID: 4, localID: 1)
+        #expect(throws: ExtensionMountError.unsupportedExtensionWithoutFallback(typeRef)) {
+            try ControlFactory().makeHandle(for: Node(id: 30, nodeType: typeRef))
+        }
+    }
+
+    @Test
+    func registeredTerminalTypeCreatesTerminalView() throws {
+        let factory = ControlFactory()
+        let typeRef = TypeRef(namespaceID: 2, localID: 1)
+        try factory.registerExtension(typeRef: typeRef, kind: .terminal)
+        let handle = try factory.makeHandle(for: Node(id: 30, nodeType: typeRef))
+        #expect(handle.view is TerminalView)
+        #expect((handle.view as? TerminalView)?.nodeID == NodeId(30))
     }
 
     @Test

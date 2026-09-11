@@ -1050,6 +1050,8 @@ message ServerEventAck {
   uint64 revision_after_effect = 5;
   string reject_reason = 6;
   string session_id = 7;
+  // Exact positive sequence slot settled by this ack; zero means a legacy sender omitted it.
+  uint64 settled_event_seq = 8;
 }
 ```
 
@@ -1122,6 +1124,7 @@ SERVER EVENT_ACK
   session_id = abc
   client_instance_id = c17
   event_id = e123
+  settled_event_seq = 593
   last_processed_event_seq = 593
   status = PROCESSED
   revision_after_effect = 1843
@@ -1275,9 +1278,14 @@ Rules:
   be answered with exactly one `SERVER EVENT_ACK` on the connection that carried that delivery.
   Acks are control-class traffic (§19.2) and are never coalesced or dropped behind lower-priority
   traffic.
-- Each terminal ack is a selective acknowledgement for its `event_id`. The client removes that
-  event from its retry set even when an earlier sequence remains pending, but it MUST NOT advance
-  `last_acked_event_seq` across the gap.
+- Each terminal ack is a selective acknowledgement for its positive `settled_event_seq`. The
+  client removes the event occupying that exact sequence slot from its retry set even when an
+  earlier sequence remains pending, but it MUST NOT advance `last_acked_event_seq` across the gap.
+  A legacy ack that omits this field may still settle by an exactly matching `event_id`.
+- A valid `event_id` is echoed unchanged. If a peer sends an oversized identifier, its `REJECTED`
+  ack MUST use a bounded marker instead of reflecting the peer-controlled bytes and MUST retain the
+  original slot in `settled_event_seq`, allowing selective settlement without retaining the invalid
+  key. An ID/sequence contradiction on a non-rejected ack settles neither event.
 - `last_processed_event_seq` is the highest **contiguous** settled sequence, analogous to a TCP
   cumulative ACK; it is never merely the largest sequence observed. If sequence 2 settles while
   sequence 1 is pending, an ack for sequence 2 reports frontier 0. When sequence 1 later settles,
@@ -1285,8 +1293,8 @@ Rules:
 - A server that settles events out of order tracks the bounded set beyond the contiguous frontier.
   A client likewise tracks selectively acknowledged sequences beyond `last_acked_event_seq`.
   Either side advances its frontier only while the next sequence is known settled.
-- The ack carries the session incarnation, bound `client_instance_id`, settled `event_id`,
-  contiguous `last_processed_event_seq`, status, and `revision_after_effect` recorded in the
+- The ack carries the session incarnation, bound `client_instance_id`, settled `event_id`, exact
+  `settled_event_seq`, contiguous `last_processed_event_seq`, status, and `revision_after_effect` recorded in the
   result cache (Appendix B). A client MUST ignore an ack whose session or `client_instance_id`
   does not match its active outbox; this prevents a draining old connection from settling events
   allocated after a replacement session reset.
@@ -1297,7 +1305,7 @@ Rules:
 - `REJECTED` — refused by event validation (unknown node, disabled node, future
   `observed_revision`). This is a terminal rejection of that event, not a protocol violation.
 - An event without a stable non-empty `event_id` is a protocol error and MUST be rejected before allocating persistent per-client dedupe state.
-- Acks are optional to consume: an unknown optional status still settles its `event_id`, but never
+- Acks are optional to consume: an unknown optional status still settles its named event, but never
   authorizes the client to cross a sequence gap.
 ### 18.3 Pending text edits
 
@@ -1915,6 +1923,24 @@ maximum pending unacknowledged events
 maximum terminal escape payload lengths
 ```
 
+`maximum update rate` is enforced per session with a token bucket: 120 semantic transactions per
+second sustained, with a 240-transaction burst capacity. These are the default limits and MAY be
+locally configurable, but implementations MUST enforce finite bounds. When the bucket is
+exhausted, the reference client pauses transaction ingress and withholds transport acknowledgement,
+propagating backpressure without discarding live traffic or a legitimate journal replay. This
+default is high enough for ordinary semantic UI traffic and admits short
+legitimate bursts, while preserving the invariant that protocol traffic does not scale with
+display refresh rate (§12.2, §31.3). It should be revised only if benchmarks demonstrate that
+legitimate workloads exceed it.
+
+`event_id` values are opaque retry/deduplication keys with a protocol-wide maximum encoded length
+of 64 bytes in the reference implementation. Every wire-to-domain conversion MUST enforce the same
+bound. An oversized identifier is settled as a rejected event and acknowledged so it cannot create
+a reconnect/retry loop; only a bounded internal rejection identity may enter deduplication state.
+Sixty-four bytes
+comfortably holds UUIDs and comparable cryptographic identifiers while preventing attacker-chosen
+keys from turning the bounded event window into disproportionate memory retention.
+
 `maximum pending unacknowledged events` bounds the client's retry set, which is drained by
 `SERVER EVENT_ACK` (§18.2). Reaching the bound means events are being discarded before they were
 known to be processed, so an eviction there MUST be reported rather than silently dropped.
@@ -1949,6 +1975,14 @@ The macOS client SHOULD use Hardened Runtime and SHOULD isolate the VT parser/re
 - Resource and journal memory is bounded.
 - Application-specific authorization remains the application's responsibility, exactly as it would for a command executed in the user's SSH shell.
 
+The reference deployment uses one daemon, runtime directory, and socket per OS account. Both
+`srui-sessiond` and `srui-ssh-bridge` refuse effective UID 0; require the runtime directory and
+socket to be owned by their effective UID with no group/other access; and require the kernel-reported
+Unix-socket peer UID to match. These checks prevent one local account from crossing into another
+account's SRUI session without trusting path names or environment variables. Mapping the
+SSH-authenticated account to that effective UID remains an OpenSSH/service-manager deployment
+responsibility, because only that layer possesses the authenticated SSH identity.
+
 ---
 
 # Part V — Reference implementation and conformance
@@ -1982,6 +2016,7 @@ srui/
 ├── server-rust/
 │   ├── ssh-bridge/
 │   ├── sessiond/
+│   ├── unix-security/          # shared Unix socket ownership, mode, and peer checks
 │   ├── semantic-tree/
 │   ├── journal/
 │   ├── event-dedupe/
@@ -2096,6 +2131,14 @@ peak memory
 ```
 
 This answers renderer/representation cost only.
+
+> **Implementation status (non-normative, 2026-09-10):** Task 34 reports signed
+> `malloc_zone_statistics` net-live block/byte endpoint deltas, footprint growth, and peak
+> footprint. Those endpoint deltas do not count allocations created and freed wholly inside the
+> interval and therefore do not complete the cumulative allocation-event evidence intended by
+> “allocations” above. The bounded Darwin allocation-counter follow-up is
+> [issue #48](https://github.com/aizlabs/srui/issues/48); until it lands, reports must preserve the
+> narrower metric names and state this limitation explicitly.
 
 ### 31.2 Serialization benchmark
 

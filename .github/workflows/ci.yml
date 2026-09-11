@@ -2,10 +2,9 @@ name: CI
 
 # Runs immediately before merge, not on every push.
 #
-# The check set is unchanged — the same four jobs run the same commands. What changed is how often
-# GitHub pays for them. `synchronize` (every push to an open PR) and `push` (every merge to main,
-# re-validating a tree the PR already validated) were the two high-frequency triggers, and neither
-# adds signal that `.githooks/pre-push` does not already produce locally on every push.
+# Merge-gate jobs (review-gate, registry, rust, fuzz, swift) still skip drafts. Linux Swift
+# parse and portable-scheduler jobs live in `swift-linux.yml` so they also run on draft and
+# stacked PRs; `ci.yml` only triggers for PRs into main.
 #
 # Review comes first, then CI. The intended order is:
 #
@@ -162,8 +161,8 @@ jobs:
         run: uv sync --extra dev
       - name: Validate protocol/registry.yaml
         run: uv run python protocol/validate_registry.py
-      - name: Run registry validator tests
-        run: uv run pytest protocol/tests
+      - name: Run Python unit tests
+        run: uv run --frozen pytest
 
   # The server workspace is built and tested on Linux only. It was previously also built on
   # macOS, but that job ran an identical command set at ~10x the per-minute price, and the one
@@ -183,14 +182,14 @@ jobs:
           cargo test --workspace --all-targets
           cargo clippy --workspace --all-targets -- -D warnings
         working-directory: server-rust
-      # The pidfd termination path is cfg(target_os = "linux") and is the safety-critical remote
-      # kill path on the expected server platform, so it must be compiled, linted and tested here.
       - name: Build and test examples
         run: |
           cargo test --manifest-path ../examples/process-monitor/Cargo.toml
           cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path ../examples/ui-gallery/Cargo.toml
           cargo clippy --manifest-path ../examples/ui-gallery/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path ../examples/coding-agent-demo/Cargo.toml
+          cargo clippy --manifest-path ../examples/coding-agent-demo/Cargo.toml --all-targets -- -D warnings
         working-directory: server-rust
 
   # libFuzzer and its sanitizers are best supported on Linux, and nothing in the decoders is
@@ -249,6 +248,9 @@ jobs:
             cargo fuzz run "$target" "corpus/$target" -- -max_total_time=15
           done
 
+  # Phase 3: macOS integration. Socket writers, SSH/TCP/Unix transports, backpressure,
+  # and the full client graph. Linux Swift jobs in `swift-linux.yml` supplement this;
+  # they do not replace it.
   swift:
     name: Swift Build
     needs: review-gate
@@ -267,17 +269,29 @@ jobs:
       - name: Type-check the non-Linux process-monitor fallback
         run: cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
       - name: Build example servers for integration tests
-        run: cargo build --manifest-path examples/counter/Cargo.toml
-      - name: Verify SemanticModel does not import AppKit or Cocoa (§1)
         run: |
-          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then
-            echo "Error: SemanticModel must never import AppKit or Cocoa"
+          cargo build --manifest-path examples/counter/Cargo.toml
+          cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
+      # `Text` owns TextEditingSession, the toolkit-free half of native text editing (§18.3,
+      # §22.6); NativeTextEditorAdapter in RendererAppKit is the only AppKit-touching half.
+      # `Terminal` owns the VT parser and grid; TerminalView in RendererAppKit is the only
+      # AppKit-touching half of the terminal island (§21).
+      - name: Verify toolkit-free targets do not import AppKit or Cocoa (§1, §21)
+        run: |
+          if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel client-macos/Text client-macos/Terminal; then
+            echo "Error: SemanticModel, Text, and Terminal must never import AppKit or Cocoa"
             exit 1
           fi
+      - name: Test portable LogicalChannelScheduling module
+        run: swift test --package-path client-macos/LogicalChannelScheduling
       - name: Build and test client-macos
         run: swift test
         working-directory: client-macos
-      - name: Verify committed Swift protobuf and registry output is fresh
+      - name: Verify committed generated protocol outputs are fresh
         run: |
           ./protocol/generate_proto.sh
-          git diff --exit-code client-macos/Protocol/srui.pb.swift client-macos/SemanticModel/RegistryTables.swift
+          git diff --exit-code \
+            client-macos/Protocol/srui.pb.swift \
+            client-macos/SemanticModel/RegistryTables.swift \
+            client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
+            server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs

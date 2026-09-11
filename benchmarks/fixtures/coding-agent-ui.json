@@ -1,0 +1,29 @@
+{
+  "name": "coding-agent",
+  "description": "Representative §30 coding-agent UI shared by server serialization and macOS rendering benchmarks; extension islands use their standard-profile fallbacks here and are measured directly in §31.6.",
+  "extension_islands": ["org.srui.terminal/1", "org.example.diff/1"],
+  "first_paint_node_count": 5,
+  "nodes": [
+    {"id": 1, "type": "Surface", "properties": {"label": "Remote coding session"}},
+    {"id": 2, "type": "Column", "parent": 1},
+    {"id": 3, "type": "Row", "parent": 2},
+    {"id": 4, "type": "Text", "parent": 3, "properties": {"text": "Remote coding session"}},
+    {"id": 5, "type": "Progress", "parent": 3, "properties": {"value": 0.62, "value_description": "62%"}},
+    {"id": 6, "type": "Row", "parent": 2},
+    {"id": 7, "type": "Tree", "parent": 6, "properties": {"label": "Files"}},
+    {"id": 8, "type": "Column", "parent": 6},
+    {"id": 9, "type": "RichText", "parent": 8, "properties": {"text": "Agent: I implemented token validation in src/auth.rs."}},
+    {"id": 10, "type": "Column", "parent": 8, "properties": {"label": "Diff fallback"}},
+    {"id": 11, "type": "Text", "parent": 10, "properties": {"text": "@@ -10,6 +10,15 @@"}},
+    {"id": 12, "type": "RichText", "parent": 10, "properties": {"text": "+pub fn validate_token(token: &str) -> bool { ... }"}},
+    {"id": 13, "type": "Text", "parent": 8, "properties": {"text": "Terminal output is benchmarked as a local extension island."}},
+    {"id": 14, "type": "TextArea", "parent": 8, "properties": {"value": "Review the changes and run tests."}},
+    {"id": 15, "type": "Row", "parent": 8},
+    {"id": 16, "type": "Button", "parent": 15, "properties": {"label": "Approve", "enabled": true}},
+    {"id": 17, "type": "Button", "parent": 15, "properties": {"label": "Reject", "enabled": true}},
+    {"id": 21, "type": "Menu", "parent": 15, "properties": {"label": "Actions", "items": ["One", "Two", "Three"]}},
+    {"id": 18, "type": "Separator", "parent": 2, "properties": {}},
+    {"id": 19, "type": "Text", "parent": 2, "properties": {"text": "Activity"}},
+    {"id": 20, "type": "Text", "parent": 2, "properties": {"text": "27 tests passed"}}
+  ]
+}

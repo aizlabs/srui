@@ -32,8 +32,10 @@ pub use capability::{
     PROFILE_TERMINAL, PROFILE_VECTOR_SCENE,
 };
 
-pub use event::{ClientInstanceId, Event, EventId, EventValidationError};
-
+pub use event::{
+    ClientInstanceId, EditSeq, Event, EventId, EventIdLengthError, EventValidationError,
+    MAX_EVENT_ID_BYTES,
+};
 pub use ids::{
     lookup_standard_enum, lookup_standard_enum_value, lookup_standard_event,
     lookup_standard_node_type, lookup_standard_operation, lookup_standard_property,

@@ -1,0 +1,3557 @@
+{
+  "driver_artifacts": {
+    "macos": {
+      "canonical_transaction_bytes": 981,
+      "canonical_transaction_sha256": "3c0273c2eeb792e0cc99a9159c1a1b1fb7fc6cf9f947ec5ad5f33396fc9d8f50",
+      "renderer_process_attribution": [
+        {
+          "candidate": "srui",
+          "driver_pid": 23204,
+          "ended_unix_ns": 1789089956199379000,
+          "helper_pid_source": "native candidate has no renderer helper processes",
+          "helper_pids": [],
+          "host_pid": 24192,
+          "measurement_intervals": [
+            {
+              "ended_unix_ns": 1789089944460194000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089944411401000
+            },
+            {
+              "ended_unix_ns": 1789089945207760000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089945162462000
+            },
+            {
+              "ended_unix_ns": 1789089945792739000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089945747845000
+            },
+            {
+              "ended_unix_ns": 1789089946415621000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089946372711000
+            },
+            {
+              "ended_unix_ns": 1789089947047040000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089947004354000
+            },
+            {
+              "ended_unix_ns": 1789089947637068000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089947596759000
+            },
+            {
+              "ended_unix_ns": 1789089948231459000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089948186602000
+            },
+            {
+              "ended_unix_ns": 1789089948807399000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089948765067000
+            },
+            {
+              "ended_unix_ns": 1789089949430869000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089949386821000
+            },
+            {
+              "ended_unix_ns": 1789089950072873000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089950029316000
+            },
+            {
+              "ended_unix_ns": 1789089950664858000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089950621314000
+            },
+            {
+              "ended_unix_ns": 1789089951246223000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089951203266000
+            },
+            {
+              "ended_unix_ns": 1789089951841393000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089951798895000
+            },
+            {
+              "ended_unix_ns": 1789089952455794000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089952414625000
+            },
+            {
+              "ended_unix_ns": 1789089953073018000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089953028712000
+            },
+            {
+              "ended_unix_ns": 1789089953657267000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089953613098000
+            },
+            {
+              "ended_unix_ns": 1789089954281122000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089954237752000
+            },
+            {
+              "ended_unix_ns": 1789089954898252000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089954853027000
+            },
+            {
+              "ended_unix_ns": 1789089955488805000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089955443702000
+            },
+            {
+              "ended_unix_ns": 1789089956106033000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089956063670000
+            }
+          ],
+          "process_identities": [
+            {
+              "birth_unix_ns": 1789089943016090000,
+              "observed_alive_through_unix_ns": 1789089956199379000,
+              "pid": 24192
+            }
+          ],
+          "started_unix_ns": 1789089943120905000
+        },
+        {
+          "candidate": "webkit",
+          "driver_pid": 23204,
+          "ended_unix_ns": 1789089972966788000,
+          "helper_pid_source": "required WebContent PID from benchmark-only _webProcessIdentifier; optional _networkProcessIdentifier/_gpuProcessIdentifier values included when available; every exact PID-role mapping must remain unchanged through the separate resource and peak-footprint passes",
+          "helper_pids": [
+            24656,
+            24657,
+            24658,
+            24715,
+            24716,
+            24774,
+            24775,
+            24820,
+            24821,
+            24849,
+            24850,
+            24877,
+            24878,
+            24904,
+            24905,
+            24932,
+            24933,
+            24959,
+            24960,
+            24987,
+            24988,
+            25016,
+            25017,
+            25048,
+            25049,
+            25066,
+            25076,
+            25078,
+            25079,
+            25105,
+            25106,
+            25133,
+            25134,
+            25160,
+            25161,
+            25187,
+            25188,
+            25214,
+            25215,
+            25242,
+            25243
+          ],
+          "host_pid": 24615,
+          "measurement_intervals": [
+            {
+              "ended_unix_ns": 1789089958017383000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089958008981000
+            },
+            {
+              "ended_unix_ns": 1789089958625793000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089958615811000
+            },
+            {
+              "ended_unix_ns": 1789089959410638000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089959401468000
+            },
+            {
+              "ended_unix_ns": 1789089960183799000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089960174359000
+            },
+            {
+              "ended_unix_ns": 1789089961001142000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089960990883000
+            },
+            {
+              "ended_unix_ns": 1789089961809489000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089961802677000
+            },
+            {
+              "ended_unix_ns": 1789089962625933000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089962615866000
+            },
+            {
+              "ended_unix_ns": 1789089963451072000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089963441156000
+            },
+            {
+              "ended_unix_ns": 1789089964209447000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089964199687000
+            },
+            {
+              "ended_unix_ns": 1789089965109785000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089965103099000
+            },
+            {
+              "ended_unix_ns": 1789089965708524000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089965698916000
+            },
+            {
+              "ended_unix_ns": 1789089966492823000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089966483436000
+            },
+            {
+              "ended_unix_ns": 1789089967300992000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089967294390000
+            },
+            {
+              "ended_unix_ns": 1789089968092159000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089968083552000
+            },
+            {
+              "ended_unix_ns": 1789089968863138000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089968856635000
+            },
+            {
+              "ended_unix_ns": 1789089969567424000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089969557123000
+            },
+            {
+              "ended_unix_ns": 1789089970358531000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089970348667000
+            },
+            {
+              "ended_unix_ns": 1789089971176063000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089971168961000
+            },
+            {
+              "ended_unix_ns": 1789089972084372000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089972076901000
+            },
+            {
+              "ended_unix_ns": 1789089972883210000,
+              "required_allocation_pids": [],
+              "started_unix_ns": 1789089972873567000
+            }
+          ],
+          "process_identities": [
+            {
+              "birth_unix_ns": 1789089956226100000,
+              "observed_alive_through_unix_ns": 1789089972908694000,
+              "pid": 24615
+            },
+            {
+              "birth_unix_ns": 1789089956598565000,
+              "observed_alive_through_unix_ns": 1789089972908692000,
+              "pid": 24656
+            },
+            {
+              "birth_unix_ns": 1789089956688936000,
+              "observed_alive_through_unix_ns": 1789089958042071000,
+              "pid": 24657
+            },
+            {
+              "birth_unix_ns": 1789089956756899000,
+              "observed_alive_through_unix_ns": 1789089958042074000,
+              "pid": 24658
+            },
+            {
+              "birth_unix_ns": 1789089958110930000,
+              "observed_alive_through_unix_ns": 1789089958650981000,
+              "pid": 24715
+            },
+            {
+              "birth_unix_ns": 1789089958141171000,
+              "observed_alive_through_unix_ns": 1789089958650980000,
+              "pid": 24716
+            },
+            {
+              "birth_unix_ns": 1789089958717799000,
+              "observed_alive_through_unix_ns": 1789089959443783000,
+              "pid": 24774
+            },
+            {
+              "birth_unix_ns": 1789089958745495000,
+              "observed_alive_through_unix_ns": 1789089959443780000,
+              "pid": 24775
+            },
+            {
+              "birth_unix_ns": 1789089959513083000,
+              "observed_alive_through_unix_ns": 1789089960208953000,
+              "pid": 24820
+            },
+            {
+              "birth_unix_ns": 1789089959545510000,
+              "observed_alive_through_unix_ns": 1789089960208957000,
+              "pid": 24821
+            },
+            {
+              "birth_unix_ns": 1789089960275344000,
+              "observed_alive_through_unix_ns": 1789089961029645000,
+              "pid": 24849
+            },
+            {
+              "birth_unix_ns": 1789089960302975000,
+              "observed_alive_through_unix_ns": 1789089961029638000,
+              "pid": 24850
+            },
+            {
+              "birth_unix_ns": 1789089961096568000,
+              "observed_alive_through_unix_ns": 1789089961834739000,
+              "pid": 24877
+            },
+            {
+              "birth_unix_ns": 1789089961127326000,
+              "observed_alive_through_unix_ns": 1789089961834741000,
+              "pid": 24878
+            },
+            {
+              "birth_unix_ns": 1789089961904444000,
+              "observed_alive_through_unix_ns": 1789089962651672000,
+              "pid": 24904
+            },
+            {
+              "birth_unix_ns": 1789089961936366000,
+              "observed_alive_through_unix_ns": 1789089962651670000,
+              "pid": 24905
+            },
+            {
+              "birth_unix_ns": 1789089962726426000,
+              "observed_alive_through_unix_ns": 1789089963476189000,
+              "pid": 24932
+            },
+            {
+              "birth_unix_ns": 1789089962771614000,
+              "observed_alive_through_unix_ns": 1789089963476194000,
+              "pid": 24933
+            },
+            {
+              "birth_unix_ns": 1789089963545921000,
+              "observed_alive_through_unix_ns": 1789089964242961000,
+              "pid": 24959
+            },
+            {
+              "birth_unix_ns": 1789089963574846000,
+              "observed_alive_through_unix_ns": 1789089964242966000,
+              "pid": 24960
+            },
+            {
+              "birth_unix_ns": 1789089964317623000,
+              "observed_alive_through_unix_ns": 1789089965134119000,
+              "pid": 24987
+            },
+            {
+              "birth_unix_ns": 1789089964345143000,
+              "observed_alive_through_unix_ns": 1789089965134121000,
+              "pid": 24988
+            },
+            {
+              "birth_unix_ns": 1789089965200315000,
+              "observed_alive_through_unix_ns": 1789089965733707000,
+              "pid": 25016
+            },
+            {
+              "birth_unix_ns": 1789089965228805000,
+              "observed_alive_through_unix_ns": 1789089965733709000,
+              "pid": 25017
+            },
+            {
+              "birth_unix_ns": 1789089965800420000,
+              "observed_alive_through_unix_ns": 1789089966526074000,
+              "pid": 25048
+            },
+            {
+              "birth_unix_ns": 1789089965828405000,
+              "observed_alive_through_unix_ns": 1789089966526079000,
+              "pid": 25049
+            },
+            {
+              "birth_unix_ns": 1789089966600845000,
+              "observed_alive_through_unix_ns": 1789089967325300000,
+              "pid": 25066
+            },
+            {
+              "birth_unix_ns": 1789089966631211000,
+              "observed_alive_through_unix_ns": 1789089967325296000,
+              "pid": 25076
+            },
+            {
+              "birth_unix_ns": 1789089967392522000,
+              "observed_alive_through_unix_ns": 1789089968121401000,
+              "pid": 25078
+            },
+            {
+              "birth_unix_ns": 1789089967419979000,
+              "observed_alive_through_unix_ns": 1789089968121403000,
+              "pid": 25079
+            },
+            {
+              "birth_unix_ns": 1789089968188011000,
+              "observed_alive_through_unix_ns": 1789089968888069000,
+              "pid": 25105
+            },
+            {
+              "birth_unix_ns": 1789089968237378000,
+              "observed_alive_through_unix_ns": 1789089968888064000,
+              "pid": 25106
+            },
+            {
+              "birth_unix_ns": 1789089968954249000,
+              "observed_alive_through_unix_ns": 1789089969591870000,
+              "pid": 25133
+            },
+            {
+              "birth_unix_ns": 1789089968983904000,
+              "observed_alive_through_unix_ns": 1789089969591872000,
+              "pid": 25134
+            },
+            {
+              "birth_unix_ns": 1789089969658243000,
+              "observed_alive_through_unix_ns": 1789089970383572000,
+              "pid": 25160
+            },
+            {
+              "birth_unix_ns": 1789089969687132000,
+              "observed_alive_through_unix_ns": 1789089970383576000,
+              "pid": 25161
+            },
+            {
+              "birth_unix_ns": 1789089970450219000,
+              "observed_alive_through_unix_ns": 1789089971204823000,
+              "pid": 25187
+            },
+            {
+              "birth_unix_ns": 1789089970478179000,
+              "observed_alive_through_unix_ns": 1789089971204819000,
+              "pid": 25188
+            },
+            {
+              "birth_unix_ns": 1789089971271875000,
+              "observed_alive_through_unix_ns": 1789089972108614000,
+              "pid": 25214
+            },
+            {
+              "birth_unix_ns": 1789089971303372000,
+              "observed_alive_through_unix_ns": 1789089972108618000,
+              "pid": 25215
+            },
+            {
+              "birth_unix_ns": 1789089972175417000,
+              "observed_alive_through_unix_ns": 1789089972908688000,
+              "pid": 25242
+            },
+            {
+              "birth_unix_ns": 1789089972205258000,
+              "observed_alive_through_unix_ns": 1789089972908691000,
+              "pid": 25243
+            }
+          ],
+          "started_unix_ns": 1789089956509701000
+        }
+      ]
+    },
+    "rust": {
+      "canonical_transaction_bytes": 981,
+      "canonical_transaction_sha256": "3c0273c2eeb792e0cc99a9159c1a1b1fb7fc6cf9f947ec5ad5f33396fc9d8f50"
+    }
+  },
+  "environment": {
+    "chip": "Apple M2 Max",
+    "git_commit": "c21925e6a59512c9d0ff390f764d3375e90d3269",
+    "git_dirty": false,
+    "machine": "arm64",
+    "physical_ram_bytes": 34359738368,
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.13.7",
+    "rust": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "swift": "Apple Swift version 6.2.3 (swiftlang-6.2.3.3.21 clang-1700.6.3.2)\nTarget: arm64-apple-macosx26.0\nswift-driver version: 1.127.14.1",
+    "xcode": "Xcode 26.2\nBuild version 17C52"
+  },
+  "fixture": "benchmarks/fixtures/coding-agent-ui.json",
+  "generated_at": "2026-09-11T01:36:28.092414+00:00",
+  "profile": "full",
+  "schema_version": 1,
+  "sections": [
+    {
+      "assertions": [
+        {
+          "detail": "21 nodes split 5 + 16 across revisions 0\u21921\u21922 and encoded into 981 framed bytes",
+          "id": "fixture_protobuf_valid",
+          "name": "shared fixture produced SRUI protobuf",
+          "passed": true
+        },
+        {
+          "detail": "3c0273c2eeb792e0cc99a9159c1a1b1fb7fc6cf9f947ec5ad5f33396fc9d8f50 / 981 exact canonical progressive sequence bytes",
+          "id": "canonical_transaction_parity",
+          "name": "canonical progressive transaction sequence bytes match",
+          "passed": true
+        }
+      ],
+      "id": "31.2",
+      "metrics": [
+        {
+          "id": "abstract_state_generation_ms",
+          "name": "abstract state generation",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.003625
+        },
+        {
+          "id": "abstract_state_generation_ms",
+          "name": "abstract state generation",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.006084
+        },
+        {
+          "id": "abstract_state_generation_ms",
+          "name": "abstract state generation",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.013333
+        },
+        {
+          "id": "protobuf_serialization_ms",
+          "name": "protobuf serialization",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.008833
+        },
+        {
+          "id": "protobuf_serialization_ms",
+          "name": "protobuf serialization",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.013583
+        },
+        {
+          "id": "protobuf_serialization_ms",
+          "name": "protobuf serialization",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.039708
+        },
+        {
+          "id": "serialized_transaction_bytes",
+          "name": "serialized transaction size",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 981.0
+        }
+      ],
+      "name": "Serialization",
+      "notes": [
+        "Generation constructs the same progressive two-transaction abstract UI plan used by the renderer benchmark.",
+        "Serialization timing covers only the two production Transaction::to_wire_bytes calls. Deterministic u64 big-endian artifact framing/copying happens after the timer; PTY spawn and renderer work are excluded."
+      ],
+      "sample_counts": {
+        "rust.generation": 500,
+        "rust.serialization": 500
+      }
+    },
+    {
+      "assertions": [
+        {
+          "detail": "32805-byte CAS object interrupted after one real chunk and reconstructed exactly",
+          "id": "mid_resource_exact_restart",
+          "name": "mid-resource reconnect restarts production transfer at offset zero",
+          "passed": true
+        },
+        {
+          "detail": "50 capacity-one handle_connection streams decoded no partial frame, left the replica at revision 0, then replayed exactly one atomic revision",
+          "id": "mid_transaction_wire_atomic",
+          "name": "mid-transaction wire disconnect exposes no partial state",
+          "passed": true
+        },
+        {
+          "detail": "50 pre-receipt and capacity-one partial-frame handle_connection reconnects each dispatched zero events on the interrupted connection, then decoded one Processed acknowledgement and one resulting transaction",
+          "id": "partial_event_wire_once",
+          "name": "pre-receipt and partial EVENT disconnects are inert before one processed replay",
+          "passed": true
+        },
+        {
+          "detail": "50 duplex reconnects decoded ServerEventAck::Duplicate with cached revision 2; handler count and state stayed at one effect",
+          "id": "lost_ack_wire_duplicate_once",
+          "name": "lost ACK wire replay is DUPLICATE without a second side effect",
+          "passed": true
+        },
+        {
+          "detail": "revision 6 replayed 6\u21928; revision 0 produced SAME_SESSION snapshot at 8",
+          "id": "journal_retention_boundary",
+          "name": "journal retention boundary selects replay versus same-session resync",
+          "passed": true
+        },
+        {
+          "detail": "event_allocated_before_disconnect=true, first_transport_delivered_zero_event_bytes=true, outbox_drained_after_ack=true, outbox_retained_before_disconnect=true, outbox_retained_until_exact_slot_ack=true, replacement_replayed_identical_event_once=true",
+          "id": "pre_receipt_pending_replay",
+          "name": "event retained before server receipt replays with identical identity exactly once",
+          "passed": true
+        },
+        {
+          "detail": "SessionController framing and ownership retired invisible partials; replacement replayed metadata and contiguous chunks from offset zero",
+          "id": "mid_resource_recovery",
+          "name": "mid-resource disconnect discards partial bytes and retransmission commits",
+          "passed": true
+        },
+        {
+          "detail": "new_action_identity_and_order_preserved=true, new_failure_not_called_by_old_response=true, new_lifecycle_unaffected_by_old_stop=true, new_response_replays_original_event=true, new_semantic_state_unchanged_by_old_response=true, new_wire_unchanged_by_old_response=true, old_lifecycle_closed=true, old_lifecycle_dispatch_blocked=true, old_lifecycle_diverged=true, old_lifecycle_handshake_failed=true, old_lifecycle_reports_superseded=true, old_replay_is_empty=true, old_response_sent_only_to_old_transport=true, pending_unchanged_by_old_response=true; old_failures=[\"superseded by a newer reconnect attempt: SERVER RESUME_OK answered a superseded resume attempt\"]",
+          "id": "superseded_response_inert",
+          "name": "superseded response affects only the expected old lifecycle teardown",
+          "passed": true
+        },
+        {
+          "detail": "exit 0; SRUI \u00a732 conformance \u2014 both\n==============================================================================\n #  suite                    result  notes\n------------------------------------------------------------------------------\n 8  reconnect                PASS    9 runner(s)\n==============================================================================\n1 passed, 0 failed, 0 documented gap(s), 0 not applicable",
+          "id": "production_reconnect_suite",
+          "name": "production reconnect boundary suite",
+          "passed": true
+        }
+      ],
+      "id": "31.5",
+      "metrics": [
+        {
+          "id": "disconnect_before_event_receipt_ms",
+          "name": "disconnect immediately before event receipt",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 6.883165999999999
+        },
+        {
+          "id": "disconnect_before_event_receipt_ms",
+          "name": "disconnect immediately before event receipt",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 7.078167
+        },
+        {
+          "id": "disconnect_before_event_receipt_ms",
+          "name": "disconnect immediately before event receipt",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 19.396084000000002
+        },
+        {
+          "id": "event_to_settled_side_effect_ms",
+          "name": "event receipt through settled side effect",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.000542
+        },
+        {
+          "id": "event_to_settled_side_effect_ms",
+          "name": "event receipt through settled side effect",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.002
+        },
+        {
+          "id": "event_to_settled_side_effect_ms",
+          "name": "event receipt through settled side effect",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.0043749999999999995
+        },
+        {
+          "id": "cached_duplicate_response_ms",
+          "name": "in-process cached DUPLICATE response",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.00020800000000000001
+        },
+        {
+          "id": "cached_duplicate_response_ms",
+          "name": "in-process cached DUPLICATE response",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.0005
+        },
+        {
+          "id": "cached_duplicate_response_ms",
+          "name": "in-process cached DUPLICATE response",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.0006659999999999999
+        },
+        {
+          "id": "lost_ack_wire_duplicate_ms",
+          "name": "lost ACK wire reconnect through DUPLICATE acknowledgement",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.109125
+        },
+        {
+          "id": "lost_ack_wire_duplicate_ms",
+          "name": "lost ACK wire reconnect through DUPLICATE acknowledgement",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.257291
+        },
+        {
+          "id": "lost_ack_wire_duplicate_ms",
+          "name": "lost ACK wire reconnect through DUPLICATE acknowledgement",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.427542
+        },
+        {
+          "id": "mid_resource_reconnect_ms",
+          "name": "mid-resource reconnect and exact replay",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.003792
+        },
+        {
+          "id": "mid_resource_reconnect_ms",
+          "name": "mid-resource reconnect and exact replay",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.021333
+        },
+        {
+          "id": "mid_resource_reconnect_ms",
+          "name": "mid-resource reconnect and exact replay",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.026208000000000002
+        },
+        {
+          "id": "mid_transaction_codec_replay_ms",
+          "name": "mid-transaction frame discard and atomic replay",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.000875
+        },
+        {
+          "id": "mid_transaction_codec_replay_ms",
+          "name": "mid-transaction frame discard and atomic replay",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.003125
+        },
+        {
+          "id": "mid_transaction_codec_replay_ms",
+          "name": "mid-transaction frame discard and atomic replay",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.008875000000000001
+        },
+        {
+          "id": "mid_transaction_wire_replay_ms",
+          "name": "mid-transaction wire disconnect and exact atomic replay",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 6.893541000000001
+        },
+        {
+          "id": "mid_transaction_wire_replay_ms",
+          "name": "mid-transaction wire disconnect and exact atomic replay",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 7.129875
+        },
+        {
+          "id": "mid_transaction_wire_replay_ms",
+          "name": "mid-transaction wire disconnect and exact atomic replay",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 7.370917
+        },
+        {
+          "id": "partial_event_wire_replay_ms",
+          "name": "partial EVENT disconnect and one processed replay",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 7.449208
+        },
+        {
+          "id": "partial_event_wire_replay_ms",
+          "name": "partial EVENT disconnect and one processed replay",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 8.687167
+        },
+        {
+          "id": "partial_event_wire_replay_ms",
+          "name": "partial EVENT disconnect and one processed replay",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 10.600874999999998
+        },
+        {
+          "id": "resume_beyond_retention_ms",
+          "name": "resume beyond journal retention",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.0007080000000000001
+        },
+        {
+          "id": "resume_beyond_retention_ms",
+          "name": "resume beyond journal retention",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.001958
+        },
+        {
+          "id": "resume_beyond_retention_ms",
+          "name": "resume beyond journal retention",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.0029170000000000003
+        },
+        {
+          "id": "resume_within_retention_ms",
+          "name": "resume within journal retention",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.000625
+        },
+        {
+          "id": "resume_within_retention_ms",
+          "name": "resume within journal retention",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.001709
+        },
+        {
+          "id": "resume_within_retention_ms",
+          "name": "resume within journal retention",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.0028339999999999997
+        },
+        {
+          "id": "pre_receipt_event_replay",
+          "name": "pre-receipt retained-event replay",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 23.897
+        },
+        {
+          "id": "pre_receipt_event_replay",
+          "name": "pre-receipt retained-event replay",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 37.196542
+        },
+        {
+          "id": "mid_resource_recovery",
+          "name": "mid-resource reconnect recovery",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.817042
+        },
+        {
+          "id": "mid_resource_recovery",
+          "name": "mid-resource reconnect recovery",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 1.743042
+        },
+        {
+          "id": "superseded_response",
+          "name": "superseded resume response handling",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.111875
+        },
+        {
+          "id": "superseded_response",
+          "name": "superseded resume response handling",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.129166
+        },
+        {
+          "id": "active_response",
+          "name": "active resume response handling",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.21725
+        },
+        {
+          "id": "active_response",
+          "name": "active resume response handling",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.333125
+        },
+        {
+          "id": "production_reconnect_suite_ms",
+          "name": "production reconnect boundary suite",
+          "statistic": "wall",
+          "unit": "ms",
+          "value": 29437.497249804437
+        }
+      ],
+      "name": "Reconnect",
+      "notes": [
+        "Superseded resume-attempt inertness is measured against the Task 23 client generation guard in the macOS driver.",
+        "The pre-receipt sample allocates the production EventOutbox identity before a deterministic transport loss delivers zero EVENT frames; a replacement SessionController then replays the exact retained id/sequence/revision and drains it only after an exact-slot acknowledgement.",
+        "The old resume response is inert with respect to active/new wire, event/action identity, semantic state, and lifecycle. Task 23 intentionally reports .superseded, marks the old controller diverged, and closes only its transport; those expected old-lifecycle effects are measured explicitly."
+      ],
+      "sample_counts": {
+        "macos.active_response": 5,
+        "macos.mid_resource": 5,
+        "macos.pre_receipt": 5,
+        "macos.superseded_response": 5,
+        "runner.production_conformance": 9,
+        "rust.cached_duplicate": 500,
+        "rust.event_side_effect": 500,
+        "rust.lost_ack_wire": 50,
+        "rust.mid_resource": 500,
+        "rust.mid_transaction_codec": 500,
+        "rust.mid_transaction_wire": 50,
+        "rust.partial_event_wire": 50,
+        "rust.pre_receipt_wire": 50,
+        "rust.resume_beyond_retention": 500,
+        "rust.resume_within_retention": 500
+      }
+    },
+    {
+      "assertions": [
+        {
+          "detail": "both paths compared all 6912 payload bytes",
+          "id": "pty_payload_identical",
+          "name": "standalone and embedded PTYs emit the identical ANSI byte stream",
+          "passed": true
+        },
+        {
+          "detail": "20 child exit statuses checked",
+          "id": "standalone_pty_exit_success",
+          "name": "standalone terminal command exits successfully",
+          "passed": true
+        },
+        {
+          "detail": "20 production PTY exit statuses checked after the final exact offset",
+          "id": "embedded_pty_eof_exact",
+          "name": "embedded terminal reaches natural successful EOF with no trailing bytes",
+          "passed": true
+        },
+        {
+          "detail": "20 samples aggregated; p50 1 frames, each at most 16384 bytes",
+          "id": "embedded_terminal_frame_bounds",
+          "name": "embedded terminal frames preserve exact offsets and bounds",
+          "passed": true
+        },
+        {
+          "detail": "PTYManager::subscribe returned Resync and catch_up emitted TerminalResyncRequired",
+          "id": "terminal_ring_retention_loss",
+          "name": "reconnect ring-buffer exhaustion maps to RETENTION_LOSS",
+          "passed": true
+        },
+        {
+          "detail": "every active SessionController delivery decoded one framed SRUITerminalData carrying exactly 6912 payload bytes at offset zero; the renderer-owned TerminalSession ended at 6912; framed envelope byte counts: [6922]",
+          "id": "terminal_offsets_exact",
+          "name": "framed embedded terminal payload and offsets remain exact",
+          "passed": true
+        },
+        {
+          "detail": "every direct production TerminalSession delivery consumed exactly 6912 payload bytes at offset zero and ended at offset 6912",
+          "id": "standalone_terminal_offsets_exact",
+          "name": "standalone terminal payload and offsets remain exact",
+          "passed": true
+        },
+        {
+          "detail": "20/20 embedded and 20/20 standalone TerminalView completions crossed the configured draw-visible boundary and produced content-distinct bitmaps; full mode additionally required nonblank, nonuniform client-only composited captures; embedded visibility provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; standalone visibility provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; embedded composited fingerprints: [\"4fa708a5da1d635c15ad19010349023e3064a3d9407b73b317beb149e64cd8c1\"]; standalone composited fingerprints: [\"12b12e48b07e6c24a820f342eb502fd874855c3e8d4609cdc06292cd54c9e016\", \"28f12e79bc64c59b5fb18c3121f4c8bc4e40e3245cb7c0d1968ad2fd75e93dbe\", \"2fe3ae5122549135ac918ebb23c6f878322cde23454549ceba76c3547f058b2e\", \"5141d4a957f992073bb98c0cc49ef15c7d5c68e87c1e4f84d21623ce3996ad2a\", \"664f8ce4b2b7e7de2f5167fb2b8fd7bd7792b812ad2153bc49e39a6784cff805\", \"77bc8876723fdc2239e955971e6dcfc923aa9ae3d5ab4deb5091532c0f6dd82f\", \"862a83f16208e85a3439664d96ca2c1336b9657b805bd2b3f0f175fe807445a2\", \"96165413fe372f11d697dbd5d4cc67c0b983fb74dd9da2387207efbbd4830a39\", \"978ae248382719a20268bcb32a52506fa06acd3be9551f07129068b54208adc5\", \"99dd133b137136c03c3b7123f1cc2869f4a21225c43b095c8a11d077ed0f322f\", \"a21edb6dbe47256facd053d7912001e13b6c60a9ccce9306e43dc39eb0b6fce5\", \"a9a615464ccc0daf27ffcc147929d06abf0828cd8e4ee1334742d24eb6bacbc9\", \"ac7948e1eaddad5b6dd776c8742f7f5acf502ba3ae07b9feface42f46e67868d\", \"ad48ebcae6fec79569e8e90a3949f8fe552f6f39953ec172e7f9a65ce5d48baf\", \"b50a0710a9e8fb8b0500240f36122f4b2de2ee1a688c52751f6fd0b00406ffbb\", \"cacaa40ed3dc94d6b65a9dab9296bfe9f59e1a182df7eb4c9b3634ba81481869\", \"d0cda6b6c3bd620eb225faecbdbdc7d8998728d86eb9461b38c29aafb82cf28c\", \"e3efd89a87a17515df86bb03df0ba7d0d5f6c273790f0ee941b4e1b73be7069f\"]",
+          "id": "terminal_display_draw_completion",
+          "name": "standalone and embedded terminal visible completions are actual draws",
+          "passed": true
+        },
+        {
+          "detail": "both paths consumed payload SHA-256 e4461bba73f99c7bc70ba6041b859c3e59446d6c80d1549c25de7bcaf933a910, decoded exact 256-line content SHA-256 e1e85bdbda198ce2b94b317765b18ec90b981d25c0ef567ff83d102f6817fe8d, and produced byte-identical TerminalView rasters; embedded content digests: [\"e1e85bdbda198ce2b94b317765b18ec90b981d25c0ef567ff83d102f6817fe8d\"]; standalone content digests: [\"e1e85bdbda198ce2b94b317765b18ec90b981d25c0ef567ff83d102f6817fe8d\"]; embedded bitmap digests: [\"e440b40246b19d42137da63cb2cc233d9e18702986ff6269b4f6ac33337dbab5\"]; standalone bitmap digests: [\"e440b40246b19d42137da63cb2cc233d9e18702986ff6269b4f6ac33337dbab5\"]",
+          "id": "terminal_display_equivalent",
+          "name": "standalone and embedded terminal displays render the identical ANSI payload",
+          "passed": true
+        },
+        {
+          "detail": "embedded samples negotiate org.srui.terminal/1, register namespace 31, and mount through a framed transaction; standalone samples instantiate fresh production TerminalSession and TerminalView pairs; both reproduce exact content SHA-256 e1e85bdbda198ce2b94b317765b18ec90b981d25c0ef567ff83d102f6817fe8d",
+          "id": "terminal_fresh_state",
+          "name": "standalone and production terminal samples begin from fresh parser and view state",
+          "passed": true
+        }
+      ],
+      "id": "31.6",
+      "metrics": [
+        {
+          "id": "embedded_pty_interaction_ms",
+          "name": "embedded SRUI PTY exact ANSI capture and framing",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 11.146916999999998
+        },
+        {
+          "id": "embedded_pty_interaction_ms",
+          "name": "embedded SRUI PTY exact ANSI capture and framing",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 12.440334
+        },
+        {
+          "id": "embedded_pty_interaction_ms",
+          "name": "embedded SRUI PTY exact ANSI capture and framing",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 13.708083
+        },
+        {
+          "id": "standalone_pty_interaction_ms",
+          "name": "standalone PTY exact ANSI interaction",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 9.58675
+        },
+        {
+          "id": "standalone_pty_interaction_ms",
+          "name": "standalone PTY exact ANSI interaction",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 15.313291999999999
+        },
+        {
+          "id": "standalone_pty_interaction_ms",
+          "name": "standalone PTY exact ANSI interaction",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 25.872709
+        },
+        {
+          "id": "terminal_retention_loss_ms",
+          "name": "terminal reconnect retention-loss decision",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 0.001
+        },
+        {
+          "id": "terminal_payload_bytes",
+          "name": "terminal payload",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 6912.0
+        },
+        {
+          "id": "embedded_terminal_frame_count",
+          "name": "embedded terminal frame count",
+          "statistic": "p50",
+          "unit": "messages",
+          "value": 1.0
+        },
+        {
+          "id": "embedded_terminal_frame_count",
+          "name": "embedded terminal frame count",
+          "statistic": "p95",
+          "unit": "messages",
+          "value": 1.0
+        },
+        {
+          "id": "embedded_terminal_frame_count",
+          "name": "embedded terminal frame count",
+          "statistic": "p99",
+          "unit": "messages",
+          "value": 1.0
+        },
+        {
+          "id": "client_terminal.decode_visible",
+          "name": "embedded SRUI Terminal decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 19.918166666666668
+        },
+        {
+          "id": "client_terminal.decode_visible",
+          "name": "embedded SRUI Terminal decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 22.00525
+        },
+        {
+          "id": "client_terminal.decode_visible",
+          "name": "embedded SRUI Terminal decode-to-visible",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 24.429
+        },
+        {
+          "id": "client_terminal.draw_only",
+          "name": "embedded SRUI Terminal draw-only",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 14.96025
+        },
+        {
+          "id": "client_terminal.draw_only",
+          "name": "embedded SRUI Terminal draw-only",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 20.351791666666667
+        },
+        {
+          "id": "client_terminal.draw_only",
+          "name": "embedded SRUI Terminal draw-only",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 23.237166666666667
+        },
+        {
+          "id": "standalone_terminal.decode_visible",
+          "name": "standalone TerminalSession and TerminalView decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 20.496875
+        },
+        {
+          "id": "standalone_terminal.decode_visible",
+          "name": "standalone TerminalSession and TerminalView decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 25.26654166666667
+        },
+        {
+          "id": "standalone_terminal.decode_visible",
+          "name": "standalone TerminalSession and TerminalView decode-to-visible",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 25.4255
+        },
+        {
+          "id": "standalone_terminal.draw_only",
+          "name": "standalone TerminalView draw-only",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 17.512708333333332
+        },
+        {
+          "id": "standalone_terminal.draw_only",
+          "name": "standalone TerminalView draw-only",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 24.374791666666667
+        },
+        {
+          "id": "standalone_terminal.draw_only",
+          "name": "standalone TerminalView draw-only",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 24.52925
+        },
+        {
+          "id": "terminal_display.embedded_to_standalone_decode_ratio",
+          "name": "embedded-to-standalone terminal decode-to-visible",
+          "statistic": "p50",
+          "unit": "ratio",
+          "value": 0.9717660212430758
+        },
+        {
+          "id": "terminal_display.embedded_to_standalone_draw_ratio",
+          "name": "embedded-to-standalone terminal draw-only",
+          "statistic": "p50",
+          "unit": "ratio",
+          "value": 0.8542510795731671
+        },
+        {
+          "id": "client_terminal.frame_bytes",
+          "name": "client terminal framed envelope",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 6922
+        },
+        {
+          "id": "client_terminal.raster_completions",
+          "name": "embedded terminal draw completions",
+          "statistic": "exact",
+          "unit": "frames",
+          "value": 20
+        },
+        {
+          "id": "standalone_terminal.raster_completions",
+          "name": "standalone terminal draw completions",
+          "statistic": "exact",
+          "unit": "frames",
+          "value": 20
+        }
+      ],
+      "name": "Terminal",
+      "notes": [
+        "Standalone and embedded samples both include production PTY spawn, identical shell execution, EOF, and exact ANSI output; embedded additionally captures and frames the bytes. The embedded EOF boundary is event-driven and does not poll process state.",
+        "Embedded decode-to-visible starts before a framed 6,912-byte SRUITerminalData enters BenchmarkTransport, then crosses SessionController, the renderer-owned TerminalSession, the renderer-created TerminalView snapshot subscription, and the configured presentation boundary.",
+        "The standalone display baseline feeds the identical Data value at offset zero through fresh production TerminalSession and TerminalView instances, using the embedded view's exact grid and bounds. The reported ratios compare p50 display completion on like-for-like content and geometry.",
+        "Full mode starts an exact TerminalView-ROI ScreenCaptureKit stream and verifies a nonblank, nonuniform baseline before timing. After the production payload action completes, it accepts only a later complete compositor sample whose same-frame ROI fingerprint changed; the reported latency is action-start mach time to that sample's ScreenCaptureKit display time. Exact WindowServer identity, display, client/ROI geometry, and absence of every intersecting visible nonzero-alpha window are checked before and after acceptance. Callback receipt remains metadata rather than the latency clock. Observed embedded provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]; standalone provenance: [\"screencapturekit_same_complete_frame_target_roi_after_action_screencapturekit_composited_baseline_status_level_25_appkit_occlusion_8192\"]. Smoke uses an explicitly named offscreen bitmap draw and is not presentation evidence.",
+        "The Rust section separately compares exact standalone-versus-embedded PTY byte transport and exercises reconnect ring-buffer exhaustion; this Swift section compares terminal emulator and display completion."
+      ],
+      "sample_counts": {
+        "macos.embedded_display": 20,
+        "macos.standalone_display": 20,
+        "rust.embedded_pty": 20,
+        "rust.ring_exhaustion": 1,
+        "rust.standalone_pty": 20
+      }
+    },
+    {
+      "assertions": [
+        {
+          "detail": "expected=21, native=21 semantic=true controls=true, WebKit=21 semantic=true elements-and-properties=true",
+          "id": "semantic_representation_parity",
+          "name": "representative fixture preserves exact parent, type, and property semantics",
+          "passed": true
+        },
+        {
+          "detail": "native presentations=40/40, pixels=40, authorized=true, content=20/20 samples passed; sample 19: full composited client-content proof: first=b5035007cea49854 complete=5322788e1ad2b066 dimensions=958x718/958x718 unmasked=687844/687844 quantized-colors=100/113 non-dominant=12845/63782 nonblank-and-nonuniform=true material-pixels=68991/8 max-channel-delta=219/255 tolerance=2/255 materially-distinct=true same-geometry-and-normalization=true provenance=screencapturekit_first_complete_target_frame_status_level_25_appkit_active/screencapturekit_first_complete_target_frame_status_level_25_appkit_active; WebKit presentations=40/40, pixels=40, authorized=true, content=20/20 samples passed; sample 19: full composited client-content proof: first=b52ca9ee70e20959 complete=e91a297af7e9d8b1 dimensions=958x718/958x718 unmasked=687844/687844 quantized-colors=33/33 non-dominant=2661/19242 nonblank-and-nonuniform=true material-pixels=17400/8 max-channel-delta=255/255 tolerance=2/255 materially-distinct=true same-geometry-and-normalization=true provenance=screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive/screencapturekit_first_complete_target_frame_status_level_25_appkit_inactive; four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before production protobuf decode/apply/render and ends at the accepted ScreenCaptureKit frame displayTime; CPU/host-net-live-allocation/footprint-growth use a separate production decode/apply/display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only production decode/apply/display-submission pass; four disjoint passes per sample: hidden/offscreen warm and reset precede first-state and complete-sequence visual passes; each visual interval begins immediately before the corresponding hidden WebKit load sequence and ends at the accepted ScreenCaptureKit frame displayTime; CPU/host-net-live-allocation/footprint-growth use a separate hidden-load plus display-submission interval with no ScreenCaptureKit; peak footprint uses a sampler-only hidden-load plus display-submission pass",
+          "id": "paint_completion_observed",
+          "name": "candidate production state reaches a verified composited target-pixel frame",
+          "passed": true
+        },
+        {
+          "detail": "host 24615, helpers [24656, 24657, 24658, 24715, 24716, 24774, 24775, 24820, 24821, 24849, 24850, 24877, 24878, 24904, 24905, 24932, 24933, 24959, 24960, 24987, 24988, 25016, 25017, 25048, 25049, 25066, 25076, 25078, 25079, 25105, 25106, 25133, 25134, 25160, 25161, 25187, 25188, 25214, 25215, 25242, 25243]; no process-name matching",
+          "id": "webkit_helpers_attributed",
+          "name": "WebKit helper resources use exact measured process attribution",
+          "passed": true
+        },
+        {
+          "detail": "SRUI blocks=20, bytes=20, scope=default malloc zone in the SRUI renderer host process only; signed after-minus-before net live state, not cumulative allocation events; WebKit control blocks=20, bytes=20, scope=default malloc zone in the WebKit comparison host process only; excludes WebContent, Network, and GPU helper processes; signed after-minus-before net live state, not cumulative allocation events",
+          "id": "host_net_live_allocation_scope",
+          "name": "signed net live allocation samples have exact host-process scope",
+          "passed": true
+        },
+        {
+          "detail": "window isolation self-test passed: dock=20 status=25 ahead=26 popup=101 target=449985 occluder=449986",
+          "id": "window_isolation_fail_closed",
+          "name": "WindowServer isolation rejects an exact synthetic occluder",
+          "passed": true
+        },
+        {
+          "detail": "forced candidate identity failure terminated the exact candidate process group and proved both the child and a real descendant gone; a forced descendant-identity publication failure and a forced internal candidate failure also proved both exact identities gone before the benchmark driver returned",
+          "id": "candidate_failure_cleanup",
+          "name": "renderer candidate launch failures cannot leak a child process",
+          "passed": true
+        }
+      ],
+      "id": "31.1",
+      "metrics": [
+        {
+          "id": "srui.first_paint",
+          "name": "SRUI first on-screen paint crossing display refresh",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 50.31104166666666
+        },
+        {
+          "id": "srui.first_paint",
+          "name": "SRUI first on-screen paint crossing display refresh",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 53.47083333333334
+        },
+        {
+          "id": "srui.complete_paint",
+          "name": "SRUI complete on-screen paint crossing display refresh",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 62.855958333333334
+        },
+        {
+          "id": "srui.complete_paint",
+          "name": "SRUI complete on-screen paint crossing display refresh",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 68.96808333333333
+        },
+        {
+          "id": "srui.complete_paint",
+          "name": "SRUI complete on-screen paint crossing display refresh",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 183.83133333333333
+        },
+        {
+          "id": "srui.cpu",
+          "name": "SRUI candidate process CPU time",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 1.0212700000000012
+        },
+        {
+          "id": "srui.cpu",
+          "name": "SRUI candidate process CPU time",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 1.0466710000000035
+        },
+        {
+          "id": "srui.host_net_live_allocation_blocks",
+          "name": "SRUI host-process net live allocation block delta",
+          "statistic": "p50",
+          "unit": "blocks",
+          "value": 22022
+        },
+        {
+          "id": "srui.host_net_live_allocation_blocks",
+          "name": "SRUI host-process net live allocation block delta",
+          "statistic": "p95",
+          "unit": "blocks",
+          "value": 22334
+        },
+        {
+          "id": "srui.host_net_live_allocation_blocks",
+          "name": "SRUI host-process net live allocation block delta",
+          "statistic": "p99",
+          "unit": "blocks",
+          "value": 22428
+        },
+        {
+          "id": "srui.host_net_live_allocation_bytes",
+          "name": "SRUI host-process net live allocation byte delta",
+          "statistic": "p50",
+          "unit": "bytes",
+          "value": 2173072
+        },
+        {
+          "id": "srui.host_net_live_allocation_bytes",
+          "name": "SRUI host-process net live allocation byte delta",
+          "statistic": "p95",
+          "unit": "bytes",
+          "value": 2189808
+        },
+        {
+          "id": "srui.host_net_live_allocation_bytes",
+          "name": "SRUI host-process net live allocation byte delta",
+          "statistic": "p99",
+          "unit": "bytes",
+          "value": 2247408
+        },
+        {
+          "id": "srui.process_footprint_growth",
+          "name": "SRUI host allocated footprint growth",
+          "statistic": "p50",
+          "unit": "MiB",
+          "value": 0.984375
+        },
+        {
+          "id": "srui.process_footprint_peak",
+          "name": "SRUI maximum concurrently sampled process footprint",
+          "statistic": "max",
+          "unit": "MiB",
+          "value": 50.235267639160156
+        },
+        {
+          "id": "webkit.first_paint",
+          "name": "WKWebView first on-screen paint crossing display refresh",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 34.50595833333334
+        },
+        {
+          "id": "webkit.first_paint",
+          "name": "WKWebView first on-screen paint crossing display refresh",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 99.88525
+        },
+        {
+          "id": "webkit.complete_paint",
+          "name": "WKWebView complete on-screen paint crossing display refresh",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 125.862375
+        },
+        {
+          "id": "webkit.complete_paint",
+          "name": "WKWebView complete on-screen paint crossing display refresh",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 137.29141666666666
+        },
+        {
+          "id": "webkit.cpu",
+          "name": "WKWebView host plus attributed helper CPU time",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.27313499999999635
+        },
+        {
+          "id": "webkit.host_net_live_allocation_blocks",
+          "name": "WKWebView comparison host-process net live allocation block delta",
+          "statistic": "p50",
+          "unit": "blocks",
+          "value": 302
+        },
+        {
+          "id": "webkit.host_net_live_allocation_blocks",
+          "name": "WKWebView comparison host-process net live allocation block delta",
+          "statistic": "p95",
+          "unit": "blocks",
+          "value": 381
+        },
+        {
+          "id": "webkit.host_net_live_allocation_blocks",
+          "name": "WKWebView comparison host-process net live allocation block delta",
+          "statistic": "p99",
+          "unit": "blocks",
+          "value": 399
+        },
+        {
+          "id": "webkit.host_net_live_allocation_bytes",
+          "name": "WKWebView comparison host-process net live allocation byte delta",
+          "statistic": "p50",
+          "unit": "bytes",
+          "value": 44864
+        },
+        {
+          "id": "webkit.host_net_live_allocation_bytes",
+          "name": "WKWebView comparison host-process net live allocation byte delta",
+          "statistic": "p95",
+          "unit": "bytes",
+          "value": 50368
+        },
+        {
+          "id": "webkit.host_net_live_allocation_bytes",
+          "name": "WKWebView comparison host-process net live allocation byte delta",
+          "statistic": "p99",
+          "unit": "bytes",
+          "value": 50992
+        },
+        {
+          "id": "webkit.process_footprint_growth",
+          "name": "WKWebView host plus helpers allocated footprint growth",
+          "statistic": "p50",
+          "unit": "MiB",
+          "value": 0.640625
+        },
+        {
+          "id": "webkit.process_footprint_peak",
+          "name": "WKWebView maximum concurrently sampled host-plus-helper footprint",
+          "statistic": "max",
+          "unit": "MiB",
+          "value": 163.09674835205078
+        },
+        {
+          "id": "representation.srui_bytes",
+          "name": "SRUI representation",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 981
+        },
+        {
+          "id": "representation.html_bytes",
+          "name": "HTML representation",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 4652
+        },
+        {
+          "id": "paint.capture_authorization",
+          "name": "screen capture authorization",
+          "statistic": "exact",
+          "unit": "boolean",
+          "value": 1
+        }
+      ],
+      "name": "Local renderer",
+      "notes": [
+        "Every accepted full-paint state requires an exact visible CGWindow, exact client/target geometry, unobscured z-order, and authorized nonblank/nonuniform ScreenCaptureKit pixels from one complete frame. Latency is action-start Mach time through that accepted frame's SCStream displayTime; callback receipt and pixel hashing are verifier metadata, not the presentation timestamp. The two reported timed states per logical sample produced native=40 and WebKit=40 verified captures; capture_authorization=true. Warm/resource/peak passes are not counted in that metric. No permission request is issued.",
+        "Each native logical sample uses four separately warmed/reset renderer instances: first-state visual latency, complete two-transaction visual latency, CPU/host-net-live-allocation/footprint-growth through production display submission, and sampler-only peak footprint. Each WebKit sample resets one warmed view between the same four disjoint workloads while preserving exact helper PID identities. Neither resource pass creates ScreenCaptureKit buffers, and the footprint sampler never runs in the CPU/allocation pass.",
+        "Native first timing decodes and applies revision 0\u21921 through production initial attach. Native complete timing decodes/applies 0\u21921 and then applies 1\u21922 through production incremental apply. WebKit uses structurally equivalent first and complete DOM states. The measured instance is checked immediately after each accepted presentation for exact semantic/control or DOM state. Full mode additionally requires nonblank, nonuniform, equal-geometry client-content fingerprints that differ between first and complete states.",
+        "Each candidate process group is birth-identity verified. WebKit CPU, footprint growth, and peak footprint aggregate the host with exact benchmark-only WebContent/network/GPU diagnostic PIDs. Allocation samples are signed default-zone malloc_zone_statistics after-minus-before deltas: blocks_in_use and size_in_use describe net live state, not cumulative allocation traffic. Allocation scope: default malloc zone in the SRUI renderer host process only; signed after-minus-before net live state, not cumulative allocation events. Control scope: default malloc zone in the WebKit comparison host process only; excludes WebContent, Network, and GPU helper processes; signed after-minus-before net live state, not cumulative allocation events. Peak footprint is the maximum simultaneous current-footprint sample at 1 ms cadence strictly inside its separate representative pass, not a sum of per-process lifetime maxima.",
+        "Task 34 deliberately defers cumulative allocation-call and requested-byte counts. The supported malloc_history all-events export was rejected after the first real pre-workload SRUI snapshot expanded to 1,902,439,272 bytes; no value from that attempt entered this report. GitHub issue aizlabs/srui#48 tracks a benchmark-only Darwin allocator-interposition counter.",
+        "The warmed WKWebView candidate and its host-only allocator deltas are comparison controls only; they are not the production SRUI renderer, do not cover WebKit helper-process allocations, and do not describe SRUI's native AppKit rendering path."
+      ],
+      "sample_counts": {
+        "macos.srui.render": 20,
+        "macos.webkit.render": 20
+      }
+    },
+    {
+      "assertions": [
+        {
+          "detail": "every framed production SessionController sample matched isolated semantic state and changed the exact visible client-content fingerprint without benchmark-forced invalidation; every cadence stream ended in its expected native value with passive composited evidence",
+          "id": "mutation_raster_completion",
+          "name": "decode-to-visible samples reach an unforced composited content change",
+          "passed": true
+        },
+        {
+          "detail": "1000ms after all production EVENT ACKs drained for every count/cadence; byte deltas [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], message deltas [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]. This does not claim natural AppKit idle invalidation behavior: the synthetic cadence gate suppresses unchanged-state draws by construction.",
+          "id": "idle_zero_traffic",
+          "name": "settled idle UI emits zero SRUI traffic",
+          "passed": true
+        },
+        {
+          "detail": "the same prebuilt 1/100/1000 inbound TRANSACTION frame sequences were reused at 60/120/144/240Hz; every outbound transport delta is exactly the three decoded production EVENT frames with no extra, dropped, or interrupted attempts; total, inbound, and outbound bytes/messages are reported separately and compared across cadences; ACKs are injected only after these counters and the presentation timestamp are frozen",
+          "id": "cadence_wire_invariant",
+          "name": "complete bidirectional wire bytes and message count are cadence independent",
+          "passed": true
+        },
+        {
+          "detail": "1@60Hz=1, 1@120Hz=1, 1@144Hz=1, 1@240Hz=1, 100@60Hz=13, 100@120Hz=24, 100@144Hz=27, 100@240Hz=48, 1000@60Hz=243, 1000@120Hz=367, 1000@144Hz=386, 1000@240Hz=495. This diagnostic measures configured coalescing opportunities; it is not evidence of AppKit's natural invalidation count.",
+          "id": "cadence_repaint_independent",
+          "name": "synthetic native-change-gated repaint count varies independently",
+          "passed": true
+        },
+        {
+          "detail": "ACTIVATE, VALUE_CHANGED, and SELECTION_CHANGED were emitted through SessionController/EventOutbox at deterministic early/mid/final applied revisions before those revisions entered the cadence paint gate. Every returned ID/sequence/observed-revision/type/node/argument set exactly matched its captured framed EVENT in emission order, and the typed order signature matched across 60/120/144/240Hz for each update count: 1@60Hz=3 EVENT frames/294B signature=6bec77ea34786e58, 1@120Hz=3 EVENT frames/294B signature=6bec77ea34786e58, 1@144Hz=3 EVENT frames/294B signature=6bec77ea34786e58, 1@240Hz=3 EVENT frames/294B signature=6bec77ea34786e58, 100@60Hz=3 EVENT frames/294B signature=d050587895c53065, 100@120Hz=3 EVENT frames/294B signature=d050587895c53065, 100@144Hz=3 EVENT frames/294B signature=d050587895c53065, 100@240Hz=3 EVENT frames/294B signature=d050587895c53065, 1000@60Hz=3 EVENT frames/297B signature=55ccc044e33c3be5, 1000@120Hz=3 EVENT frames/297B signature=55ccc044e33c3be5, 1000@144Hz=3 EVENT frames/297B signature=55ccc044e33c3be5, 1000@240Hz=3 EVENT frames/297B signature=55ccc044e33c3be5",
+          "id": "cadence_state_event_order",
+          "name": "committed state and production EVENT order are cadence independent",
+          "passed": true
+        }
+      ],
+      "id": "31.3",
+      "metrics": [
+        {
+          "id": "updates.1.semantic",
+          "name": "1 updates semantic decode/apply",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.016
+        },
+        {
+          "id": "updates.1.semantic",
+          "name": "1 updates semantic decode/apply",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.018458
+        },
+        {
+          "id": "updates.1.semantic",
+          "name": "1 updates semantic decode/apply",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.145667
+        },
+        {
+          "id": "updates.1.visible",
+          "name": "1 updates decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 13.133791666666665
+        },
+        {
+          "id": "updates.1.visible",
+          "name": "1 updates decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 17.873708333333333
+        },
+        {
+          "id": "updates.1.visible",
+          "name": "1 updates decode-to-visible",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 17.974083333333333
+        },
+        {
+          "id": "updates.1.bytes",
+          "name": "1 updates wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 28
+        },
+        {
+          "id": "updates.1.messages",
+          "name": "1 updates message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "updates.100.semantic",
+          "name": "100 updates semantic decode/apply",
+          "statistic": "p50",
+          "target": 1,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.103792
+        },
+        {
+          "id": "updates.100.semantic",
+          "name": "100 updates semantic decode/apply",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.11
+        },
+        {
+          "id": "updates.100.semantic",
+          "name": "100 updates semantic decode/apply",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.190167
+        },
+        {
+          "id": "updates.100.visible",
+          "name": "100 updates decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 12.12925
+        },
+        {
+          "id": "updates.100.visible",
+          "name": "100 updates decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 17.830625
+        },
+        {
+          "id": "updates.100.visible",
+          "name": "100 updates decode-to-visible",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 18.268583333333332
+        },
+        {
+          "id": "updates.100.bytes",
+          "name": "100 updates wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 2109
+        },
+        {
+          "id": "updates.100.messages",
+          "name": "100 updates message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "updates.1000.semantic",
+          "name": "1000 updates semantic decode/apply",
+          "statistic": "p50",
+          "target": 5,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 0.849458
+        },
+        {
+          "id": "updates.1000.semantic",
+          "name": "1000 updates semantic decode/apply",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 0.882791
+        },
+        {
+          "id": "updates.1000.semantic",
+          "name": "1000 updates semantic decode/apply",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 0.968708
+        },
+        {
+          "id": "updates.1000.visible",
+          "name": "1000 updates decode-to-visible",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 19.35354166666667
+        },
+        {
+          "id": "updates.1000.visible",
+          "name": "1000 updates decode-to-visible",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 20.415791666666667
+        },
+        {
+          "id": "updates.1000.visible",
+          "name": "1000 updates decode-to-visible",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 20.639958333333333
+        },
+        {
+          "id": "updates.1000.bytes",
+          "name": "1000 updates wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 21011
+        },
+        {
+          "id": "updates.1000.messages",
+          "name": "1000 updates message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.60.visible",
+          "name": "1 updates at 60Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 37.262375
+        },
+        {
+          "id": "cadence.1.60.bytes",
+          "name": "1 updates at 60Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 322
+        },
+        {
+          "id": "cadence.1.60.messages",
+          "name": "1 updates at 60Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 4
+        },
+        {
+          "id": "cadence.1.60.inbound_bytes",
+          "name": "1 updates at 60Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 28
+        },
+        {
+          "id": "cadence.1.60.inbound_messages",
+          "name": "1 updates at 60Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.60.outbound_bytes",
+          "name": "1 updates at 60Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.1.60.outbound_messages",
+          "name": "1 updates at 60Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1.60.repaints",
+          "name": "1 updates at 60Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.120.visible",
+          "name": "1 updates at 120Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 29.25691666666667
+        },
+        {
+          "id": "cadence.1.120.bytes",
+          "name": "1 updates at 120Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 322
+        },
+        {
+          "id": "cadence.1.120.messages",
+          "name": "1 updates at 120Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 4
+        },
+        {
+          "id": "cadence.1.120.inbound_bytes",
+          "name": "1 updates at 120Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 28
+        },
+        {
+          "id": "cadence.1.120.inbound_messages",
+          "name": "1 updates at 120Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.120.outbound_bytes",
+          "name": "1 updates at 120Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.1.120.outbound_messages",
+          "name": "1 updates at 120Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1.120.repaints",
+          "name": "1 updates at 120Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.144.visible",
+          "name": "1 updates at 144Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 24.9345
+        },
+        {
+          "id": "cadence.1.144.bytes",
+          "name": "1 updates at 144Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 322
+        },
+        {
+          "id": "cadence.1.144.messages",
+          "name": "1 updates at 144Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 4
+        },
+        {
+          "id": "cadence.1.144.inbound_bytes",
+          "name": "1 updates at 144Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 28
+        },
+        {
+          "id": "cadence.1.144.inbound_messages",
+          "name": "1 updates at 144Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.144.outbound_bytes",
+          "name": "1 updates at 144Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.1.144.outbound_messages",
+          "name": "1 updates at 144Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1.144.repaints",
+          "name": "1 updates at 144Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.240.visible",
+          "name": "1 updates at 240Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 19.283458333333332
+        },
+        {
+          "id": "cadence.1.240.bytes",
+          "name": "1 updates at 240Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 322
+        },
+        {
+          "id": "cadence.1.240.messages",
+          "name": "1 updates at 240Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 4
+        },
+        {
+          "id": "cadence.1.240.inbound_bytes",
+          "name": "1 updates at 240Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 28
+        },
+        {
+          "id": "cadence.1.240.inbound_messages",
+          "name": "1 updates at 240Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "cadence.1.240.outbound_bytes",
+          "name": "1 updates at 240Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.1.240.outbound_messages",
+          "name": "1 updates at 240Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1.240.repaints",
+          "name": "1 updates at 240Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 1
+        },
+        {
+          "id": "cadence.100.60.visible",
+          "name": "100 updates at 60Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 336.9655
+        },
+        {
+          "id": "cadence.100.60.bytes",
+          "name": "100 updates at 60Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 3094
+        },
+        {
+          "id": "cadence.100.60.messages",
+          "name": "100 updates at 60Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 103
+        },
+        {
+          "id": "cadence.100.60.inbound_bytes",
+          "name": "100 updates at 60Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 2800
+        },
+        {
+          "id": "cadence.100.60.inbound_messages",
+          "name": "100 updates at 60Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 100
+        },
+        {
+          "id": "cadence.100.60.outbound_bytes",
+          "name": "100 updates at 60Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.100.60.outbound_messages",
+          "name": "100 updates at 60Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.100.60.repaints",
+          "name": "100 updates at 60Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 13
+        },
+        {
+          "id": "cadence.100.120.visible",
+          "name": "100 updates at 120Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 420.952625
+        },
+        {
+          "id": "cadence.100.120.bytes",
+          "name": "100 updates at 120Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 3094
+        },
+        {
+          "id": "cadence.100.120.messages",
+          "name": "100 updates at 120Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 103
+        },
+        {
+          "id": "cadence.100.120.inbound_bytes",
+          "name": "100 updates at 120Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 2800
+        },
+        {
+          "id": "cadence.100.120.inbound_messages",
+          "name": "100 updates at 120Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 100
+        },
+        {
+          "id": "cadence.100.120.outbound_bytes",
+          "name": "100 updates at 120Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.100.120.outbound_messages",
+          "name": "100 updates at 120Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.100.120.repaints",
+          "name": "100 updates at 120Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 24
+        },
+        {
+          "id": "cadence.100.144.visible",
+          "name": "100 updates at 144Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 445.4906666666667
+        },
+        {
+          "id": "cadence.100.144.bytes",
+          "name": "100 updates at 144Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 3094
+        },
+        {
+          "id": "cadence.100.144.messages",
+          "name": "100 updates at 144Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 103
+        },
+        {
+          "id": "cadence.100.144.inbound_bytes",
+          "name": "100 updates at 144Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 2800
+        },
+        {
+          "id": "cadence.100.144.inbound_messages",
+          "name": "100 updates at 144Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 100
+        },
+        {
+          "id": "cadence.100.144.outbound_bytes",
+          "name": "100 updates at 144Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.100.144.outbound_messages",
+          "name": "100 updates at 144Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.100.144.repaints",
+          "name": "100 updates at 144Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 27
+        },
+        {
+          "id": "cadence.100.240.visible",
+          "name": "100 updates at 240Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 624.8140416666666
+        },
+        {
+          "id": "cadence.100.240.bytes",
+          "name": "100 updates at 240Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 3094
+        },
+        {
+          "id": "cadence.100.240.messages",
+          "name": "100 updates at 240Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 103
+        },
+        {
+          "id": "cadence.100.240.inbound_bytes",
+          "name": "100 updates at 240Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 2800
+        },
+        {
+          "id": "cadence.100.240.inbound_messages",
+          "name": "100 updates at 240Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 100
+        },
+        {
+          "id": "cadence.100.240.outbound_bytes",
+          "name": "100 updates at 240Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 294
+        },
+        {
+          "id": "cadence.100.240.outbound_messages",
+          "name": "100 updates at 240Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.100.240.repaints",
+          "name": "100 updates at 240Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 48
+        },
+        {
+          "id": "cadence.1000.60.visible",
+          "name": "1000 updates at 60Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 6366.78125
+        },
+        {
+          "id": "cadence.1000.60.bytes",
+          "name": "1000 updates at 60Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 30044
+        },
+        {
+          "id": "cadence.1000.60.messages",
+          "name": "1000 updates at 60Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1003
+        },
+        {
+          "id": "cadence.1000.60.inbound_bytes",
+          "name": "1000 updates at 60Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 29747
+        },
+        {
+          "id": "cadence.1000.60.inbound_messages",
+          "name": "1000 updates at 60Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1000
+        },
+        {
+          "id": "cadence.1000.60.outbound_bytes",
+          "name": "1000 updates at 60Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 297
+        },
+        {
+          "id": "cadence.1000.60.outbound_messages",
+          "name": "1000 updates at 60Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1000.60.repaints",
+          "name": "1000 updates at 60Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 243
+        },
+        {
+          "id": "cadence.1000.120.visible",
+          "name": "1000 updates at 120Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 6362.558541666667
+        },
+        {
+          "id": "cadence.1000.120.bytes",
+          "name": "1000 updates at 120Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 30044
+        },
+        {
+          "id": "cadence.1000.120.messages",
+          "name": "1000 updates at 120Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1003
+        },
+        {
+          "id": "cadence.1000.120.inbound_bytes",
+          "name": "1000 updates at 120Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 29747
+        },
+        {
+          "id": "cadence.1000.120.inbound_messages",
+          "name": "1000 updates at 120Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1000
+        },
+        {
+          "id": "cadence.1000.120.outbound_bytes",
+          "name": "1000 updates at 120Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 297
+        },
+        {
+          "id": "cadence.1000.120.outbound_messages",
+          "name": "1000 updates at 120Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1000.120.repaints",
+          "name": "1000 updates at 120Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 367
+        },
+        {
+          "id": "cadence.1000.144.visible",
+          "name": "1000 updates at 144Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 6361.722666666667
+        },
+        {
+          "id": "cadence.1000.144.bytes",
+          "name": "1000 updates at 144Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 30044
+        },
+        {
+          "id": "cadence.1000.144.messages",
+          "name": "1000 updates at 144Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1003
+        },
+        {
+          "id": "cadence.1000.144.inbound_bytes",
+          "name": "1000 updates at 144Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 29747
+        },
+        {
+          "id": "cadence.1000.144.inbound_messages",
+          "name": "1000 updates at 144Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1000
+        },
+        {
+          "id": "cadence.1000.144.outbound_bytes",
+          "name": "1000 updates at 144Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 297
+        },
+        {
+          "id": "cadence.1000.144.outbound_messages",
+          "name": "1000 updates at 144Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1000.144.repaints",
+          "name": "1000 updates at 144Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 386
+        },
+        {
+          "id": "cadence.1000.240.visible",
+          "name": "1000 updates at 240Hz decode-to-visible",
+          "statistic": "sample",
+          "unit": "ms",
+          "value": 6362.467208333333
+        },
+        {
+          "id": "cadence.1000.240.bytes",
+          "name": "1000 updates at 240Hz total SRUI wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 30044
+        },
+        {
+          "id": "cadence.1000.240.messages",
+          "name": "1000 updates at 240Hz total SRUI message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1003
+        },
+        {
+          "id": "cadence.1000.240.inbound_bytes",
+          "name": "1000 updates at 240Hz inbound TRANSACTION bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 29747
+        },
+        {
+          "id": "cadence.1000.240.inbound_messages",
+          "name": "1000 updates at 240Hz inbound TRANSACTION message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1000
+        },
+        {
+          "id": "cadence.1000.240.outbound_bytes",
+          "name": "1000 updates at 240Hz outbound EVENT bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 297
+        },
+        {
+          "id": "cadence.1000.240.outbound_messages",
+          "name": "1000 updates at 240Hz outbound EVENT message count",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 3
+        },
+        {
+          "id": "cadence.1000.240.repaints",
+          "name": "1000 updates at 240Hz synthetic change-gated repaint count",
+          "statistic": "exact",
+          "unit": "repaints",
+          "value": 495
+        },
+        {
+          "id": "idle.bytes",
+          "name": "settled idle SRUI wire bytes",
+          "statistic": "observed max",
+          "unit": "bytes",
+          "value": 0
+        },
+        {
+          "id": "idle.messages",
+          "name": "settled idle SRUI message count",
+          "statistic": "observed max",
+          "unit": "messages",
+          "value": 0
+        }
+      ],
+      "name": "Mutation and frame independence",
+      "notes": [
+        "The updates.*.semantic trial times ProtocolDecoder plus TransactionApplier only. A byte-identical framed aggregate trial traverses BenchmarkTransport and SessionController into the pre-presented warm AppKitRenderer for updates.*.visible; final revision/value parity and exact inbound TRANSACTION bytes/messages are asserted.",
+        "Full decode-to-visible measurements establish a visible baseline before timing and await a passive WindowServer framebuffer/content-fingerprint change after production mutation; the timed path does not set needsDisplay or call the forced presentation observer. Smoke remains an explicitly offscreen AppKit raster fallback.",
+        "For each update count, one pre-encoded TRANSACTION sequence is reused unchanged at 60/120/144/240Hz. Three distinct production client events are interleaved at deterministic applied revisions before the corresponding native state is exposed to the synthetic cadence gate. The complete transport delta is frozen before ACK: inbound, outbound, and total bytes/messages are reported separately; exact outbound EVENT frames cover every outbound index, are decoded, and are compared field-for-field with returned events, proving no unreported frames. ACKs drain outside decode-to-visible timing.",
+        "The cadence repaint number is a synthetic change-gated coalescing diagnostic. Because that task intentionally skips unchanged pending state, it cannot establish natural renderer idle invalidation. The settled 1000ms assertion is limited to zero SRUI byte/message deltas after EVENT settlement."
+      ],
+      "sample_counts": {
+        "macos.cadence.1.120": 1,
+        "macos.cadence.1.144": 1,
+        "macos.cadence.1.240": 1,
+        "macos.cadence.1.60": 1,
+        "macos.cadence.100.120": 1,
+        "macos.cadence.100.144": 1,
+        "macos.cadence.100.240": 1,
+        "macos.cadence.100.60": 1,
+        "macos.cadence.1000.120": 1,
+        "macos.cadence.1000.144": 1,
+        "macos.cadence.1000.240": 1,
+        "macos.cadence.1000.60": 1,
+        "macos.cadence.events.1.120": 3,
+        "macos.cadence.events.1.144": 3,
+        "macos.cadence.events.1.240": 3,
+        "macos.cadence.events.1.60": 3,
+        "macos.cadence.events.100.120": 3,
+        "macos.cadence.events.100.144": 3,
+        "macos.cadence.events.100.240": 3,
+        "macos.cadence.events.100.60": 3,
+        "macos.cadence.events.1000.120": 3,
+        "macos.cadence.events.1000.144": 3,
+        "macos.cadence.events.1000.240": 3,
+        "macos.cadence.events.1000.60": 3,
+        "macos.mutation.1": 20,
+        "macos.mutation.100": 20,
+        "macos.mutation.1000": 20
+      }
+    },
+    {
+      "assertions": [
+        {
+          "detail": "largest p50 increase 5.1883 ms versus the measured local frame budget of 8.3333 ms; full compositor mode applies this numeric correctness gate; paired injected transaction remained blocked through local visible completion in 640/640 probes=true; configured delay state was verified at the exact action boundary in 640/640 probes=true, with a nonzero transport delay still active in 480/480 nonzero-RTT probes; local_state_checks=truepaired p95/p99 deltas were 9.5023/12.5107 ms; production renderer callbacks=240",
+          "id": "local_latency_independent",
+          "name": "mounted local interactions do not acquire one RTT",
+          "passed": true
+        },
+        {
+          "detail": "RTT 0ms: node=14 final_text=\"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9view the changes and run tests.xxxxxxxxxxxxxxxxxxxx\" edit_seq=40 observed_revision=81 matching_framed_events=1 exact_slot_ack=true stable_empty_tail=true; RTT 100ms: node=14 final_text=\"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9view the changes and run tests.xxxxxxxxxxxxxxxxxxxx\" edit_seq=40 observed_revision=81 matching_framed_events=1 exact_slot_ack=true stable_empty_tail=true; RTT 300ms: node=14 final_text=\"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9view the changes and run tests.xxxxxxxxxxxxxxxxxxxx\" edit_seq=40 observed_revision=80 matching_framed_events=1 exact_slot_ack=true stable_empty_tail=true; RTT 600ms: node=14 final_text=\"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9view the changes and run tests.xxxxxxxxxxxxxxxxxxxx\" edit_seq=40 observed_revision=80 matching_framed_events=1 exact_slot_ack=true stable_empty_tail=true",
+          "id": "production_text_edit_framed",
+          "name": "native text entry emits and settles one exact production TEXT_EDIT",
+          "passed": true
+        },
+        {
+          "detail": "SessionController EventOutbox sends and framed transaction responses tracked 100/300/600ms RTT",
+          "id": "server_latency_tracks_rtt",
+          "name": "injected transport RTT affects production server-dependent feedback",
+          "passed": true
+        },
+        {
+          "detail": "Each local action began only after its exact compositor baseline was ready and while its configured BenchmarkTransport delay state was verified; 480/480 nonzero-RTT actions began during an active delay. Every paired production transaction remained blocked through visible completion; the gate was released only afterward. Separately, production server-dependent feedback tracked 100/300/600ms RTT.",
+          "id": "no_sync_rtt",
+          "name": "local visible completion does not await an injected transport response",
+          "passed": true
+        },
+        {
+          "detail": "sample 1: 16493 framed bytes / 1 message: measured 17.5221 ms >= theoretical 15.7290 ms; exact_event=true; sample 2: 16493 framed bytes / 1 message: measured 17.0053 ms >= theoretical 15.7290 ms; exact_event=true; sample 3: 16493 framed bytes / 1 message: measured 16.9598 ms >= theoretical 15.7290 ms; exact_event=true; 49479 total bandwidth bytes; lost and interrupted events remained in EventOutbox and replayed through replacement SessionControllers",
+          "id": "impairments_use_session",
+          "name": "bandwidth delay, loss, and interruption exercise session recovery",
+          "passed": true
+        }
+      ],
+      "id": "31.4",
+      "metrics": [
+        {
+          "id": "display.frame_budget",
+          "name": "local display frame budget",
+          "statistic": "exact",
+          "unit": "ms",
+          "value": 8.333333333333334
+        },
+        {
+          "id": "interaction.caret_movement.rtt.0",
+          "name": "caret movement at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 13.537333333333335
+        },
+        {
+          "id": "interaction.caret_movement.rtt.0",
+          "name": "caret movement at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.060958333333332
+        },
+        {
+          "id": "interaction.caret_movement.rtt.0",
+          "name": "caret movement at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.925208333333334
+        },
+        {
+          "id": "interaction.hover.rtt.0",
+          "name": "hover at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.519333333333332
+        },
+        {
+          "id": "interaction.hover.rtt.0",
+          "name": "hover at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 24.5905
+        },
+        {
+          "id": "interaction.hover.rtt.0",
+          "name": "hover at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 25.23229166666667
+        },
+        {
+          "id": "interaction.ime_composition.rtt.0",
+          "name": "ime composition at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.371958333333335
+        },
+        {
+          "id": "interaction.ime_composition.rtt.0",
+          "name": "ime composition at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.499333333333333
+        },
+        {
+          "id": "interaction.ime_composition.rtt.0",
+          "name": "ime composition at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.61145833333333
+        },
+        {
+          "id": "interaction.menu_opening.rtt.0",
+          "name": "menu opening at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 32.937916666666666
+        },
+        {
+          "id": "interaction.menu_opening.rtt.0",
+          "name": "menu opening at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 35.94954166666666
+        },
+        {
+          "id": "interaction.menu_opening.rtt.0",
+          "name": "menu opening at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 63.644
+        },
+        {
+          "id": "interaction.pressed.rtt.0",
+          "name": "pressed at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 18.747666666666667
+        },
+        {
+          "id": "interaction.pressed.rtt.0",
+          "name": "pressed at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.641875
+        },
+        {
+          "id": "interaction.pressed.rtt.0",
+          "name": "pressed at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 24.65725
+        },
+        {
+          "id": "interaction.scrolling.rtt.0",
+          "name": "scrolling at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.528583333333334
+        },
+        {
+          "id": "interaction.scrolling.rtt.0",
+          "name": "scrolling at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.22958333333333
+        },
+        {
+          "id": "interaction.scrolling.rtt.0",
+          "name": "scrolling at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.445125
+        },
+        {
+          "id": "interaction.text_entry.rtt.0",
+          "name": "text entry at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 13.4375
+        },
+        {
+          "id": "interaction.text_entry.rtt.0",
+          "name": "text entry at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.331208333333333
+        },
+        {
+          "id": "interaction.text_entry.rtt.0",
+          "name": "text entry at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.561791666666668
+        },
+        {
+          "id": "interaction.text_selection.rtt.0",
+          "name": "text selection at 0ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 13.210083333333333
+        },
+        {
+          "id": "interaction.text_selection.rtt.0",
+          "name": "text selection at 0ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.843666666666667
+        },
+        {
+          "id": "interaction.text_selection.rtt.0",
+          "name": "text selection at 0ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 24.92670833333333
+        },
+        {
+          "id": "server_feedback.rtt.0",
+          "name": "server-dependent input-to-visible at 0ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 10.518541666666666
+        },
+        {
+          "id": "server_feedback.rtt.0",
+          "name": "server-dependent input-to-visible at 0ms RTT",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 16.729708333333335
+        },
+        {
+          "id": "server_feedback.rtt.0",
+          "name": "server-dependent input-to-visible at 0ms RTT",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 16.729708333333335
+        },
+        {
+          "id": "interaction.caret_movement.rtt.100",
+          "name": "caret movement at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.83366666666667
+        },
+        {
+          "id": "interaction.caret_movement.rtt.100",
+          "name": "caret movement at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.331125
+        },
+        {
+          "id": "interaction.caret_movement.rtt.100",
+          "name": "caret movement at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 22.17729166666667
+        },
+        {
+          "id": "interaction.hover.rtt.100",
+          "name": "hover at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 15.463125
+        },
+        {
+          "id": "interaction.hover.rtt.100",
+          "name": "hover at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 18.38595833333333
+        },
+        {
+          "id": "interaction.hover.rtt.100",
+          "name": "hover at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 18.42366666666667
+        },
+        {
+          "id": "interaction.ime_composition.rtt.100",
+          "name": "ime composition at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.47475
+        },
+        {
+          "id": "interaction.ime_composition.rtt.100",
+          "name": "ime composition at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.03879166666667
+        },
+        {
+          "id": "interaction.ime_composition.rtt.100",
+          "name": "ime composition at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 26.001416666666668
+        },
+        {
+          "id": "interaction.menu_opening.rtt.100",
+          "name": "menu opening at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 33.90004166666667
+        },
+        {
+          "id": "interaction.menu_opening.rtt.100",
+          "name": "menu opening at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 36.49279166666666
+        },
+        {
+          "id": "interaction.menu_opening.rtt.100",
+          "name": "menu opening at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 37.078916666666665
+        },
+        {
+          "id": "interaction.pressed.rtt.100",
+          "name": "pressed at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 18.710708333333333
+        },
+        {
+          "id": "interaction.pressed.rtt.100",
+          "name": "pressed at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 25.074375
+        },
+        {
+          "id": "interaction.pressed.rtt.100",
+          "name": "pressed at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 25.19141666666667
+        },
+        {
+          "id": "interaction.scrolling.rtt.100",
+          "name": "scrolling at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.91025
+        },
+        {
+          "id": "interaction.scrolling.rtt.100",
+          "name": "scrolling at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.99220833333333
+        },
+        {
+          "id": "interaction.scrolling.rtt.100",
+          "name": "scrolling at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 18.547375
+        },
+        {
+          "id": "interaction.text_entry.rtt.100",
+          "name": "text entry at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.327833333333334
+        },
+        {
+          "id": "interaction.text_entry.rtt.100",
+          "name": "text entry at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.111666666666668
+        },
+        {
+          "id": "interaction.text_entry.rtt.100",
+          "name": "text entry at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.688875
+        },
+        {
+          "id": "interaction.text_selection.rtt.100",
+          "name": "text selection at 100ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.832708333333333
+        },
+        {
+          "id": "interaction.text_selection.rtt.100",
+          "name": "text selection at 100ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 18.54433333333333
+        },
+        {
+          "id": "interaction.text_selection.rtt.100",
+          "name": "text selection at 100ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.522125
+        },
+        {
+          "id": "server_feedback.rtt.100",
+          "name": "server-dependent input-to-visible at 100ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 121.12608333333333
+        },
+        {
+          "id": "server_feedback.rtt.100",
+          "name": "server-dependent input-to-visible at 100ms RTT",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 121.53725
+        },
+        {
+          "id": "server_feedback.rtt.100",
+          "name": "server-dependent input-to-visible at 100ms RTT",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 121.53725
+        },
+        {
+          "id": "interaction.caret_movement.rtt.300",
+          "name": "caret movement at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.88825
+        },
+        {
+          "id": "interaction.caret_movement.rtt.300",
+          "name": "caret movement at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.538708333333332
+        },
+        {
+          "id": "interaction.caret_movement.rtt.300",
+          "name": "caret movement at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.01083333333333
+        },
+        {
+          "id": "interaction.hover.rtt.300",
+          "name": "hover at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 15.096083333333334
+        },
+        {
+          "id": "interaction.hover.rtt.300",
+          "name": "hover at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.982875
+        },
+        {
+          "id": "interaction.hover.rtt.300",
+          "name": "hover at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.56804166666667
+        },
+        {
+          "id": "interaction.ime_composition.rtt.300",
+          "name": "ime composition at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.468625
+        },
+        {
+          "id": "interaction.ime_composition.rtt.300",
+          "name": "ime composition at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.28516666666667
+        },
+        {
+          "id": "interaction.ime_composition.rtt.300",
+          "name": "ime composition at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.453875
+        },
+        {
+          "id": "interaction.menu_opening.rtt.300",
+          "name": "menu opening at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 34.129625
+        },
+        {
+          "id": "interaction.menu_opening.rtt.300",
+          "name": "menu opening at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 36.625625
+        },
+        {
+          "id": "interaction.menu_opening.rtt.300",
+          "name": "menu opening at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 38.142875
+        },
+        {
+          "id": "interaction.pressed.rtt.300",
+          "name": "pressed at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 13.370208333333334
+        },
+        {
+          "id": "interaction.pressed.rtt.300",
+          "name": "pressed at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 18.36929166666667
+        },
+        {
+          "id": "interaction.pressed.rtt.300",
+          "name": "pressed at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.53
+        },
+        {
+          "id": "interaction.scrolling.rtt.300",
+          "name": "scrolling at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.264208333333332
+        },
+        {
+          "id": "interaction.scrolling.rtt.300",
+          "name": "scrolling at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 25.387958333333334
+        },
+        {
+          "id": "interaction.scrolling.rtt.300",
+          "name": "scrolling at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 25.69675
+        },
+        {
+          "id": "interaction.text_entry.rtt.300",
+          "name": "text entry at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.227041666666665
+        },
+        {
+          "id": "interaction.text_entry.rtt.300",
+          "name": "text entry at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 19.53954166666667
+        },
+        {
+          "id": "interaction.text_entry.rtt.300",
+          "name": "text entry at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.063041666666667
+        },
+        {
+          "id": "interaction.text_selection.rtt.300",
+          "name": "text selection at 300ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 14.090708333333334
+        },
+        {
+          "id": "interaction.text_selection.rtt.300",
+          "name": "text selection at 300ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.691041666666667
+        },
+        {
+          "id": "interaction.text_selection.rtt.300",
+          "name": "text selection at 300ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.6975
+        },
+        {
+          "id": "server_feedback.rtt.300",
+          "name": "server-dependent input-to-visible at 300ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 329.42175
+        },
+        {
+          "id": "server_feedback.rtt.300",
+          "name": "server-dependent input-to-visible at 300ms RTT",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 333.977625
+        },
+        {
+          "id": "server_feedback.rtt.300",
+          "name": "server-dependent input-to-visible at 300ms RTT",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 333.977625
+        },
+        {
+          "id": "interaction.caret_movement.rtt.600",
+          "name": "caret movement at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.363458333333334
+        },
+        {
+          "id": "interaction.caret_movement.rtt.600",
+          "name": "caret movement at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.115166666666667
+        },
+        {
+          "id": "interaction.caret_movement.rtt.600",
+          "name": "caret movement at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.77404166666667
+        },
+        {
+          "id": "interaction.hover.rtt.600",
+          "name": "hover at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.40083333333333
+        },
+        {
+          "id": "interaction.hover.rtt.600",
+          "name": "hover at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.659958333333332
+        },
+        {
+          "id": "interaction.hover.rtt.600",
+          "name": "hover at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 20.863166666666668
+        },
+        {
+          "id": "interaction.ime_composition.rtt.600",
+          "name": "ime composition at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.606
+        },
+        {
+          "id": "interaction.ime_composition.rtt.600",
+          "name": "ime composition at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.452791666666666
+        },
+        {
+          "id": "interaction.ime_composition.rtt.600",
+          "name": "ime composition at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.570416666666667
+        },
+        {
+          "id": "interaction.menu_opening.rtt.600",
+          "name": "menu opening at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 33.459
+        },
+        {
+          "id": "interaction.menu_opening.rtt.600",
+          "name": "menu opening at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 40.152375
+        },
+        {
+          "id": "interaction.menu_opening.rtt.600",
+          "name": "menu opening at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 41.15475
+        },
+        {
+          "id": "interaction.pressed.rtt.600",
+          "name": "pressed at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.862625
+        },
+        {
+          "id": "interaction.pressed.rtt.600",
+          "name": "pressed at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.434875
+        },
+        {
+          "id": "interaction.pressed.rtt.600",
+          "name": "pressed at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.49729166666667
+        },
+        {
+          "id": "interaction.scrolling.rtt.600",
+          "name": "scrolling at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.309708333333333
+        },
+        {
+          "id": "interaction.scrolling.rtt.600",
+          "name": "scrolling at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 25.154625
+        },
+        {
+          "id": "interaction.scrolling.rtt.600",
+          "name": "scrolling at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 25.20554166666667
+        },
+        {
+          "id": "interaction.text_entry.rtt.600",
+          "name": "text entry at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 16.852625
+        },
+        {
+          "id": "interaction.text_entry.rtt.600",
+          "name": "text entry at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.071125
+        },
+        {
+          "id": "interaction.text_entry.rtt.600",
+          "name": "text entry at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.1345
+        },
+        {
+          "id": "interaction.text_selection.rtt.600",
+          "name": "text selection at 600ms RTT",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 17.31533333333333
+        },
+        {
+          "id": "interaction.text_selection.rtt.600",
+          "name": "text selection at 600ms RTT",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.010291666666667
+        },
+        {
+          "id": "interaction.text_selection.rtt.600",
+          "name": "text selection at 600ms RTT",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 21.120875
+        },
+        {
+          "id": "server_feedback.rtt.600",
+          "name": "server-dependent input-to-visible at 600ms RTT",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 637.8675833333334
+        },
+        {
+          "id": "server_feedback.rtt.600",
+          "name": "server-dependent input-to-visible at 600ms RTT",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 653.0959166666667
+        },
+        {
+          "id": "server_feedback.rtt.600",
+          "name": "server-dependent input-to-visible at 600ms RTT",
+          "statistic": "p99",
+          "unit": "ms",
+          "value": 653.0959166666667
+        },
+        {
+          "id": "impairment.bandwidth_transfer",
+          "name": "1MiB/s bandwidth-limited production event",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 17.00525
+        },
+        {
+          "id": "impairment.bandwidth_transfer",
+          "name": "1MiB/s bandwidth-limited production event",
+          "statistic": "p95",
+          "unit": "ms",
+          "value": 17.522125
+        },
+        {
+          "id": "impairment.bandwidth_delivered_bytes",
+          "name": "bandwidth-limited delivered bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 49479
+        },
+        {
+          "id": "impairment.loss_attempts",
+          "name": "deterministic production loss attempts",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 2
+        },
+        {
+          "id": "impairment.loss_delivered_messages",
+          "name": "deterministic production loss delivered messages",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1
+        },
+        {
+          "id": "impairment.interruption_detection",
+          "name": "controlled production interruption detection",
+          "statistic": "p50",
+          "unit": "ms",
+          "value": 0.957333
+        },
+        {
+          "id": "session_wire.bytes",
+          "name": "measured production session wire bytes",
+          "statistic": "exact",
+          "unit": "bytes",
+          "value": 142145
+        },
+        {
+          "id": "session_wire.messages",
+          "name": "measured production session wire messages",
+          "statistic": "exact",
+          "unit": "messages",
+          "value": 1240
+        },
+        {
+          "id": "local_rtt_delta",
+          "name": "maximum RTT-induced local latency delta",
+          "statistic": "p50",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 5.188333333333333
+        },
+        {
+          "id": "local_rtt_delta",
+          "name": "maximum RTT-induced local latency delta",
+          "statistic": "p95",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 9.50233333333333
+        },
+        {
+          "id": "local_rtt_delta",
+          "name": "maximum RTT-induced local latency delta",
+          "statistic": "p99",
+          "target": 8.333333333333334,
+          "target_direction": "max",
+          "unit": "ms",
+          "value": 12.510708333333335
+        }
+      ],
+      "name": "Network and local interaction",
+      "notes": [
+        "Controls are mounted renderer TextArea, ScrollView, and Button. renderer-produced NSButton context menu was proven as a new exact owned menu-level WindowServer surface in the same ScreenCaptureKit frame used for its presentation timestamp.",
+        "Pressed state is observed between real NSWindow-dispatched mouseDown/mouseUp events and triggers the production ActionTrampoline. renderer-produced NSButton changed at least 1590 target-ROI pixels above the explicit 2/255 per-channel SCStream tolerance on the local AppKit hover path in 20/20 samples; mouseExited then restored every unmasked screenshot pixel within the explicit 5/255 same-API tolerance, with maximum observed channel delta 4/255; renderer-produced NSButton changed at least 1590 target-ROI pixels above the explicit 2/255 per-channel SCStream tolerance on the local AppKit hover path in 20/20 samples; mouseExited then restored every unmasked screenshot pixel within the explicit 5/255 same-API tolerance, with maximum observed channel delta 5/255. Permission-free hover invokes the renderer-produced NSButton's own AppKit entry/exit path and does not claim WindowServer pointer latency.",
+        "Local frame budget 8.333333 ms came from CGDisplayMode.refreshRate for the benchmark NSScreen.",
+        "All impairment traffic traverses SessionController, EventOutbox, SRUIFraming, and replacement-session resume/replay; no benchmark calls Transport.send directly.",
+        "For each 1 MiB/s sample, the proof takes the exact outbound framed-byte delta around one awaited SessionController.sendValueChanged call, requires exactly one matching event frame, and requires elapsed wall time >= framed bytes / 1,048,576 bytes/s. Encoding and outbox overhead are inside the measured interval and can only increase that elapsed time.",
+        "In full compositor mode, the RTT-independence correctness gate requires the worst p50 delta to stay within the measured local display-frame budget. Smoke mode reports the offscreen raster delta diagnostically because unrelated remote invalidation can be charged to a later whole-host raster. Both profiles require every one of the 640 exact held-response probes. That probe proves non-dependence on delivery of its exact paired transaction; it does not claim the configured one-way-delay interval remained active throughout the action. Paired p95/p99 delta tails carry the \u00a723 target for follow-up reporting but are not assertion gates."
+      ],
+      "sample_counts": {
+        "macos.bandwidth": 3,
+        "macos.interaction.caret_movement.rtt.0": 20,
+        "macos.interaction.caret_movement.rtt.100": 20,
+        "macos.interaction.caret_movement.rtt.300": 20,
+        "macos.interaction.caret_movement.rtt.600": 20,
+        "macos.interaction.hover.rtt.0": 20,
+        "macos.interaction.hover.rtt.100": 20,
+        "macos.interaction.hover.rtt.300": 20,
+        "macos.interaction.hover.rtt.600": 20,
+        "macos.interaction.ime_composition.rtt.0": 20,
+        "macos.interaction.ime_composition.rtt.100": 20,
+        "macos.interaction.ime_composition.rtt.300": 20,
+        "macos.interaction.ime_composition.rtt.600": 20,
+        "macos.interaction.menu_opening.rtt.0": 20,
+        "macos.interaction.menu_opening.rtt.100": 20,
+        "macos.interaction.menu_opening.rtt.300": 20,
+        "macos.interaction.menu_opening.rtt.600": 20,
+        "macos.interaction.pressed.rtt.0": 20,
+        "macos.interaction.pressed.rtt.100": 20,
+        "macos.interaction.pressed.rtt.300": 20,
+        "macos.interaction.pressed.rtt.600": 20,
+        "macos.interaction.scrolling.rtt.0": 20,
+        "macos.interaction.scrolling.rtt.100": 20,
+        "macos.interaction.scrolling.rtt.300": 20,
+        "macos.interaction.scrolling.rtt.600": 20,
+        "macos.interaction.text_entry.rtt.0": 20,
+        "macos.interaction.text_entry.rtt.100": 20,
+        "macos.interaction.text_entry.rtt.300": 20,
+        "macos.interaction.text_entry.rtt.600": 20,
+        "macos.interaction.text_selection.rtt.0": 20,
+        "macos.interaction.text_selection.rtt.100": 20,
+        "macos.interaction.text_selection.rtt.300": 20,
+        "macos.interaction.text_selection.rtt.600": 20,
+        "macos.interruption": 1,
+        "macos.local_held_response": 640,
+        "macos.loss": 1,
+        "macos.server_feedback.rtt.0": 7,
+        "macos.server_feedback.rtt.100": 7,
+        "macos.server_feedback.rtt.300": 7,
+        "macos.server_feedback.rtt.600": 7
+      }
+    }
+  ]
+}

@@ -131,7 +131,7 @@ private actor ScriptedReplayTransport: Transport {
         }
     }
 
-    func send(data: Data) async throws {
+    func send(data: Data, logicalClass _: LogicalChannelClass) async throws {
         let index = sentFrames.count
         sentFrames.append(data)
         let verdict = index < script.count ? script[index] : .fail("unscripted send #\(index)")
@@ -172,9 +172,12 @@ struct SessionControllerReplayFailureTests {
             replayRetryInitialDelay: .zero,
             replayRetryMaximumDelay: .zero
         )
+        let seedBinding = await outbox.beginConnectionBinding()
+        #expect(await outbox.allowNewEvents(binding: seedBinding))
         let pending = try await outbox.sendActivate(
             nodeId: NodeId(7),
             observedRevision: Revision(3),
+            binding: seedBinding,
             via: seedClient
         )
         await seedClient.close()

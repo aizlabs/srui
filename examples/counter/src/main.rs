@@ -6,16 +6,24 @@
 //! - Server: `--port <port>` binds a TCP loopback socket and hosts the counter application.
 //! - Opt-in: `--image-fixture` publishes a deterministic 1×1 PNG and mounts an Image node
 //!   referencing its `ResourceHash` for cross-language resource integration tests (§14).
+//! - Opt-in: `--terminal-fixture` adds a required Terminal extension node and spawns a
+//!   trusted PTY (`/bin/sh -i` by default). There is no automatic tmux redraw after the
+//!   output ring is lost.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, UnixListener};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use srui_example_counter::CounterApp;
 use srui_sdk::*;
-use srui_sessiond::{handle_connection, Session};
+use srui_semantic_tree::{ItemId, ModelId, ModelItem, Operation, TypeRef, Value};
+use srui_sessiond::{handle_connection, ModelRangeProvider, Session, TerminalSpec};
+use srui_unix_security::{
+    effective_uid, prepare_private_socket_parent, require_unprivileged_uid, validate_peer,
+};
 
 /// Deterministic valid 1×1 RGB PNG (69 bytes); shared with Swift ResourceCacheTests.
 fn fixture_png() -> Vec<u8> {
@@ -43,16 +51,68 @@ fn wants_image_fixture(args: &[String]) -> bool {
     args.iter().any(|a| a == "--image-fixture")
 }
 
+fn wants_large_collection_fixture(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--large-collection-fixture")
+}
+
+fn wants_terminal_fixture(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--terminal-fixture")
+}
+
+fn terminal_ring_capacity(args: &[String]) -> usize {
+    args.iter()
+        .position(|a| a == "--terminal-ring-bytes")
+        .and_then(|pos| args.get(pos + 1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1024 * 1024)
+}
+
+fn terminal_command(args: &[String]) -> TerminalSpec {
+    let mut spec = TerminalSpec::interactive_shell();
+    spec.ring_capacity = terminal_ring_capacity(args);
+    if let Some(pos) = args.iter().position(|a| a == "--terminal-command") {
+        if let Some(command) = args.get(pos + 1) {
+            spec.executable = command.into();
+            spec.args = args
+                .iter()
+                .skip(pos + 2)
+                .take_while(|arg| !arg.starts_with("--"))
+                .cloned()
+                .collect();
+        }
+    }
+    spec
+}
+
+fn collection_provider_delay() -> Duration {
+    std::env::var("SRUI_COLLECTION_PROVIDER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let capabilities = parse_server_capabilities(&args);
     let image_fixture = wants_image_fixture(&args);
+    let large_collection = wants_large_collection_fixture(&args);
+    let terminal_fixture = wants_terminal_fixture(&args);
+    let terminal_spec = terminal_command(&args);
 
     if let Some(pos) = args.iter().position(|a| a == "--socket") {
         if let Some(socket_path_str) = args.get(pos + 1) {
             let socket_path = PathBuf::from(socket_path_str);
-            run_unix_server(socket_path, capabilities, image_fixture).await?;
+            run_unix_server(
+                socket_path,
+                capabilities,
+                image_fixture,
+                large_collection,
+                terminal_fixture,
+                terminal_spec,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -60,7 +120,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(pos) = args.iter().position(|a| a == "--port") {
         if let Some(port_str) = args.get(pos + 1) {
             let port: u16 = port_str.parse().expect("valid port number");
-            run_tcp_server(port, capabilities, image_fixture).await?;
+            run_tcp_server(
+                port,
+                capabilities,
+                image_fixture,
+                large_collection,
+                terminal_fixture,
+                terminal_spec,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -176,10 +244,81 @@ fn initialize_counter_session(
     (surface_id, text_id, progress_id, button_id)
 }
 
+fn initialize_terminal_fixture(session: &Arc<Session>, spec: TerminalSpec) {
+    let terminal_id = NodeId::new(30);
+    session
+        .create_terminal_node(terminal_id, NodeId::new(1), spec.clone())
+        .expect("initialize terminal fixture");
+    info!(
+        "Terminal fixture ready: node={} command={} ring_bytes={} (v1 has no redraw backend / tmux integration)",
+        terminal_id.get(),
+        spec.executable.display(),
+        spec.ring_capacity
+    );
+}
+
+async fn initialize_large_collection_fixture(session: &Arc<Session>) {
+    let table_id = NodeId::new(10);
+    let model_id = ModelId::new(1);
+    const ITEM_COUNT: u64 = 500_000;
+    const PRELOAD: u64 = 64;
+
+    session
+        .transaction(|ui| {
+            ui.apply_op(&Operation::create_model(
+                model_id,
+                TypeRef::TABLE,
+                ITEM_COUNT,
+            ))?;
+            Table::builder(table_id)
+                .parent(NodeId::new(1))
+                .label("Large Collection")
+                .model_ref(model_id)
+                .columns(["Index", "Label"])
+                .create(ui)?;
+            Ok(())
+        })
+        .expect("initialize large collection");
+
+    let delay = collection_provider_delay();
+    let provider: ModelRangeProvider = Arc::new(move |query| {
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            Ok((0..query.count)
+                .map(|offset| {
+                    let index = query.start_index + offset;
+                    ModelItem::with_value(
+                        ItemId::new(index + 1),
+                        Value::List(vec![
+                            Value::String(index.to_string()),
+                            Value::String(format!("Row {index}")),
+                        ]),
+                    )
+                })
+                .collect())
+        })
+    });
+    session.register_model_range_provider(model_id, provider);
+    session
+        .push_visible_model_range(table_id, model_id, 0, PRELOAD)
+        .await
+        .expect("proactive visible range");
+    info!(
+        "Large collection fixture ready: model={} items={} preloaded={}",
+        model_id.get(),
+        ITEM_COUNT,
+        PRELOAD
+    );
+}
 async fn run_unix_server(
     socket_path: PathBuf,
     capabilities: ServerCapabilities,
     image_fixture: bool,
+    large_collection: bool,
+    terminal_fixture: bool,
+    terminal_spec: TerminalSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -190,14 +329,17 @@ async fn run_unix_server(
 
     info!("Starting SRUI Counter Unix Socket Server...");
 
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
-    }
-    if let Some(parent) = socket_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let uid = effective_uid();
+    require_unprivileged_uid(uid, "counter")?;
+    let socket_parent = prepare_private_socket_parent(&socket_path, uid)?;
+    if socket_parent.socket_identity()?.is_some() {
+        socket_parent.remove_socket()?;
     }
 
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = UnixListener::from_std(socket_parent.bind()?)?;
+    let bound_identity = socket_parent
+        .socket_identity()?
+        .ok_or("counter socket vanished immediately after bind")?;
     info!("Listening on Unix domain socket: {:?}", socket_path);
 
     let session = Arc::new(Session::with_capabilities(
@@ -205,6 +347,12 @@ async fn run_unix_server(
         capabilities,
     ));
     let _ = initialize_counter_session(&session, image_fixture);
+    if large_collection {
+        initialize_large_collection_fixture(&session).await;
+    }
+    if terminal_fixture {
+        initialize_terminal_fixture(&session, terminal_spec);
+    }
 
     let shutdown = CancellationToken::new();
 
@@ -213,6 +361,13 @@ async fn run_unix_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
+                        if let Err(error) = validate_peer(&stream, uid) {
+                            warn!(
+                                error = %error,
+                                "rejecting Unix socket peer outside the authenticated user boundary"
+                            );
+                            continue;
+                        }
                         let session_clone = session.clone();
                         let shutdown_child = shutdown.child_token();
                         tokio::spawn(async move {
@@ -233,7 +388,9 @@ async fn run_unix_server(
         }
     }
 
-    let _ = std::fs::remove_file(&socket_path);
+    if socket_parent.socket_identity()? == Some(bound_identity) {
+        socket_parent.remove_socket()?;
+    }
     Ok(())
 }
 
@@ -241,6 +398,9 @@ async fn run_tcp_server(
     port: u16,
     capabilities: ServerCapabilities,
     image_fixture: bool,
+    large_collection: bool,
+    terminal_fixture: bool,
+    terminal_spec: TerminalSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -258,6 +418,12 @@ async fn run_tcp_server(
         capabilities,
     ));
     let _ = initialize_counter_session(&session, image_fixture);
+    if large_collection {
+        initialize_large_collection_fixture(&session).await;
+    }
+    if terminal_fixture {
+        initialize_terminal_fixture(&session, terminal_spec);
+    }
 
     let shutdown = CancellationToken::new();
 

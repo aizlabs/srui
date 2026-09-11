@@ -18,13 +18,18 @@ let package = Package(
         .library(name: "Resources", targets: ["Resources"]),
         .library(name: "Accessibility", targets: ["Accessibility"]),
         .executable(name: "RendererDemoApp", targets: ["RendererDemoApp"]),
+        .executable(name: "BenchmarkDriver", targets: ["BenchmarkDriver"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.2"),
+        .package(path: "LogicalChannelScheduling"),
     ],
     targets: [
         .target(
             name: "TransportSSH",
+            dependencies: [
+                .product(name: "LogicalChannelScheduling", package: "LogicalChannelScheduling"),
+            ],
             path: "TransportSSH"
         ),
         .target(
@@ -51,6 +56,9 @@ let package = Package(
             dependencies: [
                 "SemanticModel",
                 "Resources",
+                "Collections",
+                "Text",
+                "Terminal",
             ],
             path: "RendererAppKit"
         ),
@@ -62,6 +70,9 @@ let package = Package(
                 "SemanticModel",
                 "RendererAppKit",
                 "Resources",
+                "Collections",
+                "Text",
+                "Terminal",
             ],
             path: "Session"
         ),
@@ -77,16 +88,39 @@ let package = Package(
             ],
             path: "RendererDemoApp"
         ),
+        .executableTarget(
+            name: "BenchmarkDriver",
+            dependencies: [
+                "Protocol",
+                "SemanticModel",
+                "Session",
+                "TransportSSH",
+                "RendererAppKit",
+                "Resources",
+                "Terminal",
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ],
+            path: "Benchmarks"
+        ),
         .target(
             name: "Collections",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "Collections"
         ),
         .target(
             name: "Text",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "Text"
         ),
         .target(
             name: "Terminal",
+            dependencies: [
+                "SemanticModel",
+            ],
             path: "Terminal"
         ),
         .target(
@@ -107,8 +141,27 @@ let package = Package(
                 "RendererAppKit",
                 "SemanticModel",
                 "Resources",
+                "Collections",
+                "Text",
+                "Terminal",
             ],
             path: "Tests/RendererAppKitTests"
+        ),
+        .testTarget(
+            name: "TerminalTests",
+            dependencies: [
+                "Terminal",
+                "SemanticModel",
+            ],
+            path: "Tests/TerminalTests"
+        ),
+        .testTarget(
+            name: "TextTests",
+            dependencies: [
+                "Text",
+                "SemanticModel",
+            ],
+            path: "Tests/TextTests"
         ),
         .testTarget(
             name: "ResourcesTests",

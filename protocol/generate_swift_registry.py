@@ -145,11 +145,15 @@ def generate_swift_registry(registry_path: Path, output_path: Path) -> None:
         "",
         "// MARK: - Registry Tables",
         "",
-        "public let standardNodeTypesTable: [(id: UInt32, name: String)] = [",
+        "public let standardNodeTypesTable: [(id: UInt32, name: String, tier: String)] = [",
     ]
 
+    # `tier` travels with the table so conformance suites can branch on the registry rather than
+    # on a hand-written list. A hardcoded tier set silently inverts when a node is promoted:
+    # the newly-required widget falls into the "must be refused" branch and the suite passes for
+    # the wrong reason.
     for item in node_types:
-        lines.append(f'    ({item["id"]}, "{item["name"]}"),')
+        lines.append(f'    ({item["id"]}, "{item["name"]}", "{item["tier"]}"),')
     lines.append("]")
     lines.append("")
 
@@ -158,6 +162,51 @@ def generate_swift_registry(registry_path: Path, output_path: Path) -> None:
         lines.append(f'    ({item["id"]}, "{item["name"]}"),')
     lines.append("]")
     lines.append("")
+
+    value_type_cases = {
+        "bool": "bool",
+        "enum": "enumToken",
+        "float64": "float64",
+        "list": "list",
+        "resource_hash": "resourceHash",
+        "size": "size",
+        "string": "string",
+        "uint64": "unsignedInt",
+        "value": "any",
+    }
+    lines.extend(
+        [
+            "/// Runtime value kinds declared by the standard property registry.",
+            "public enum StandardPropertyValueType: String, Sendable {",
+            '    case any = "value"',
+            "    case bool",
+            '    case enumToken = "enum"',
+            "    case float64",
+            "    case list",
+            '    case resourceHash = "resource_hash"',
+            "    case size",
+            "    case string",
+            '    case unsignedInt = "uint64"',
+            "}",
+            "",
+            "/// Returns the canonical runtime value kind for a standard property.",
+            "public func standardPropertyValueType(_ property: PropertyRef) -> StandardPropertyValueType? {",
+            "    guard property.isStandard else { return nil }",
+            "    switch property.localID {",
+        ]
+    )
+    for item in properties:
+        value_type = item["value_type"]
+        swift_case = value_type_cases[value_type]
+        lines.append(f"    case {item['id']}: return .{swift_case}")
+    lines.extend(
+        [
+            "    default: return nil",
+            "    }",
+            "}",
+            "",
+        ]
+    )
 
     lines.append("public let standardEventsTable: [(id: UInt32, name: String)] = [")
     for item in events:

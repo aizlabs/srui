@@ -44,13 +44,13 @@ struct HandshakeNegotiationTests {
         }
 
         let hello = try #require(receivedHello)
-        #expect(hello.coreVersion == "0.4.0")
+        #expect(hello.coreVersion == SRUICoreVersion)
         #expect(hello.profiles.contains("org.srui.standard-widgets/1"))
         #expect(hello.profiles.contains("org.srui.terminal/1"))
 
         // 2. Server sends ServerWelcome with required and optional profiles
         var welcome = SRUIServerWelcome()
-        welcome.coreVersion = "0.4.0"
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "handshake-session-1"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         welcome.optionalProfiles = ["org.srui.terminal/1"]
@@ -79,7 +79,7 @@ struct HandshakeNegotiationTests {
     /// (§4 inv. 13), so it must fail closed alongside an explicitly incompatible version.
     @Test(
         "Incompatible or absent SERVER WELCOME core_version fails the handshake",
-        arguments: ["", "1.0.0", "0.5.0", "garbage", "0"]
+        arguments: ["", "1.0.0", "0.4.0", "garbage", "0"]
     )
     func incompatibleCoreVersionFailsHandshake(advertised: String) async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
@@ -133,7 +133,7 @@ struct HandshakeNegotiationTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
-        welcome.coreVersion = "0.4.99"
+        welcome.coreVersion = "0.5.99"
         welcome.sessionID = "core-version-patch"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         welcome.initialRevision = 0
@@ -178,7 +178,7 @@ struct HandshakeNegotiationTests {
 
         // 2. Server sends ServerWelcome with required profile that client does not offer
         var welcome = SRUIServerWelcome()
-        welcome.coreVersion = "0.4.0"
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "mismatch-session"
         welcome.requiredProfiles = ["org.srui.unsupported-feature/1"]
         welcome.optionalProfiles = []
@@ -265,7 +265,7 @@ struct HandshakeNegotiationTests {
 
         // 1. Send first valid welcome
         var welcome = SRUIServerWelcome()
-        welcome.coreVersion = "0.4.0"
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "session-1"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         var msg1 = SRUIMessage()
@@ -317,7 +317,7 @@ struct HandshakeNegotiationTests {
 
         // 2. Server sends ServerWelcome that ONLY provides standard-widgets (not terminal)
         var welcome = SRUIServerWelcome()
-        welcome.coreVersion = "0.4.0"
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "server-missing-client-req"
         welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
         welcome.optionalProfiles = []
@@ -397,6 +397,60 @@ struct HandshakeNegotiationTests {
         await serverTransport.close()
     }
 
+    @Test("Client-originated model range request received from server is rejected as protocol violation")
+    func clientModelRangeRequestFromServerIsRejected() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let controller = SessionController(
+            transport: clientTransport,
+            clientCapabilities: [Profile.standardWidgetsV1]
+        )
+
+        let failurePromise = ManagedAtomic<SessionFailure?>(nil)
+        controller.onFailure = { failure in
+            failurePromise.store(failure)
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "range-direction-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 0
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        try await AsyncTestSupport.eventually(description: "handshake completion") {
+            controller.isHandshakeComplete
+        }
+
+        var request = SRUIClientModelRangeRequest()
+        request.nodeID = 2
+        request.modelID = 7
+        request.startIndex = 0
+        request.count = 8
+        request.observedRevision = 0
+        var requestMsg = SRUIMessage()
+        requestMsg.clientModelRangeRequest = request
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(requestMsg))
+
+        try await AsyncTestSupport.eventually(description: "rejection of client range request from server") {
+            controller.isDiverged && failurePromise.load() != nil
+        }
+
+        if let failure = failurePromise.load() {
+            if case .protocolViolation(let msg) = failure {
+                #expect(msg.contains("model range request"))
+            } else {
+                Issue.record("Expected protocolViolation, got \(failure)")
+            }
+        }
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     @Test("Unsolicited SERVER RESUME_OK without CLIENT RESUME is a protocol violation")
     func unsolicitedResumeOkIsRejected() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
@@ -452,7 +506,7 @@ struct HandshakeNegotiationTests {
         try await controller.start()
 
         var welcome = SRUIServerWelcome()
-        welcome.coreVersion = "0.4.0"
+        welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = "bad-required"
         welcome.requiredProfiles = ["not-a-profile"]
         var welcomeMsg = SRUIMessage()

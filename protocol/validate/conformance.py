@@ -64,11 +64,21 @@ def _derive_oracle_from_registry(registry_path: Path = REGISTRY_PATH) -> dict[st
 
     events = reg.get("events", [])
     event_names = {ev["name"] for ev in events}
+    semantic_events = {ev["name"] for ev in events if ev.get("kind") == "semantic"}
+    coordinate_events = {ev["name"] for ev in events if ev.get("kind") == "coordinate"}
+
+    # §7.6/§32.5: which standard node types may originate which semantic events. Coordinate
+    # events (§7.7) are never listed here — they are reserved for subscribed custom scenes,
+    # so an empty intersection with `coordinate_events` is itself a conformance assertion.
+    node_emits = {n["name"]: list(n.get("emits", [])) for n in node_types}
 
     operations = reg.get("operations", [])
     op_names = {op["name"] for op in operations}
 
     return {
+        "SEMANTIC_EVENTS": semantic_events,
+        "COORDINATE_EVENTS": coordinate_events,
+        "NODE_EMITTED_EVENTS": node_emits,
         "REQUIRED_NODE_TYPES": required_nodes,
         "SHOULD_NODE_TYPES": should_nodes,
         "OTHER_STANDARD_NODE_TYPES": other_nodes,
@@ -100,6 +110,11 @@ REQUIRED_ENUM_VALUES: dict[str, set[str]] = _DERIVED.get("REQUIRED_ENUM_VALUES",
 REQUIRED_EVENTS: set[str] = _DERIVED.get("REQUIRED_EVENTS", set())
 REQUIRED_OPERATIONS: set[str] = _DERIVED.get("REQUIRED_OPERATIONS", set())
 PROPERTY_ENUM_REFERENCES: dict[str, set[str]] = _DERIVED.get("PROPERTY_ENUM_REFERENCES", {})
+
+# §7.6 / §7.7 event partition and the per-node emission matrix backing §32 suites 2, 5 and 12.
+SEMANTIC_EVENTS: set[str] = _DERIVED.get("SEMANTIC_EVENTS", set())
+COORDINATE_EVENTS: set[str] = _DERIVED.get("COORDINATE_EVENTS", set())
+NODE_EMITTED_EVENTS: dict[str, list[str]] = _DERIVED.get("NODE_EMITTED_EVENTS", {})
 
 REQUIRED_TIER_NODE_COUNT = len(REQUIRED_NODE_TYPES)
 SHOULD_TIER_NODE_COUNT = len(SHOULD_NODE_TYPES)

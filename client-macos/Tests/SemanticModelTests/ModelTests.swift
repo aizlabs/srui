@@ -549,6 +549,42 @@ final class ModelTests: XCTestCase {
         }
     }
 
+    func testModelResetRangeEvictsFarthestCachedItemsToStayInBudget() throws {
+        let limits = StoreLimits().withMaxCachedItemsPerModel(3)
+        var store = SemanticStore(limits: limits)
+        let listType = try XCTUnwrap(resolveStandardNodeType("List").get())
+        let modelID = ModelId(1)
+
+        try store.createModel(id: modelID, modelType: listType, itemCount: 10_000)
+        try store.modelResetRange(
+            id: modelID,
+            startIndex: 0,
+            items: [
+                ModelItem(itemID: ItemId(1), value: .string("a")),
+                ModelItem(itemID: ItemId(2), value: .string("b")),
+                ModelItem(itemID: ItemId(3), value: .string("c"))
+            ],
+            totalCount: nil
+        )
+        try store.modelResetRange(
+            id: modelID,
+            startIndex: 100,
+            items: [
+                ModelItem(itemID: ItemId(10), value: .string("far-0")),
+                ModelItem(itemID: ItemId(11), value: .string("far-1"))
+            ],
+            totalCount: nil
+        )
+
+        let model = try XCTUnwrap(store.getModel(modelID))
+        XCTAssertEqual(model.cachedItemCount, 3)
+        XCTAssertNotNil(model.getItemByIndex(100))
+        XCTAssertNotNil(model.getItemByIndex(101))
+        XCTAssertNil(model.getItemByIndex(0))
+        XCTAssertNil(model.getItemByIndex(1))
+        XCTAssertNotNil(model.getItemByIndex(2))
+    }
+
     func testModelDeleteCombinedIdentityAndRangePreservesItemCount() throws {
         var store = SemanticStore()
         let listType = try XCTUnwrap(resolveStandardNodeType("List").get())

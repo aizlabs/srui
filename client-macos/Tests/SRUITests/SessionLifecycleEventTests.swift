@@ -1106,6 +1106,131 @@ struct SessionLifecycleEventTests {
     }
 
     @Test(
+        "an older overlapping activation cannot tear down the newer binding",
+        .timeLimit(.minutes(1))
+    )
+    func overlappingBindingActivationKeepsNewestState() async throws {
+        let outbox = EventOutbox()
+        let transport = LifecycleEventTransport()
+        let activationGate = AsyncGate()
+        let older = Task {
+            try await outbox.beginConnectionBindingUnlessCancelled { _, _ in
+                await activationGate.pause()
+            }
+        }
+        await activationGate.waitUntilPaused()
+
+        let newest = await outbox.beginConnectionBinding()
+        #expect(await outbox.confirmFreshSession(id: "activation-c", binding: newest))
+        _ = try await outbox.sendActivate(
+            nodeId: NodeId(30),
+            observedRevision: Revision(1),
+            binding: newest,
+            via: transport
+        )
+
+        await activationGate.release()
+        _ = try await older.value
+
+        #expect(await outbox.activeConnectionBindingForTesting == newest)
+        #expect(await outbox.pendingCount == 1)
+        let second = try await outbox.sendActivate(
+            nodeId: NodeId(31),
+            observedRevision: Revision(1),
+            binding: newest,
+            via: transport
+        )
+        #expect(second.eventSeq == 2)
+    }
+
+    @Test(
+        "hard snapshots rebind Terminal and collection callbacks",
+        arguments: [
+            Srui_Protocol_SessionContinuity.sameSession,
+            Srui_Protocol_SessionContinuity.replaced,
+        ]
+    )
+    @MainActor
+    func hardSnapshotRebindsRendererCallbacks(
+        continuity: Srui_Protocol_SessionContinuity
+    ) async throws {
+        let transport = LifecycleEventTransport()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: transport,
+            renderer: renderer,
+            clientCapabilities: [.standardWidgetsV1, .terminalV1]
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        await controller.handleIncomingMessage(
+            welcome(
+                sessionID: "callback-old",
+                requiredProfiles: ["org.srui.standard-widgets/1", terminalProfileURI],
+                extensionNamespaces: [mapping]
+            )
+        )
+        let staleTerminal = try #require(renderer.onTerminalInput)
+        let staleCollection = try #require(renderer.onCollectionRangeRequest)
+        let nextSessionID = continuity == .replaced ? "callback-new" : "callback-old"
+        await controller.handleIncomingMessage(
+            resync(
+                sessionID: nextSessionID,
+                continuity: continuity,
+                snapshotRevision: 1,
+                requiredProfiles: ["org.srui.standard-widgets/1", terminalProfileURI],
+                extensionNamespaces: [mapping]
+            )
+        )
+        await controller.handleIncomingMessage(snapshot(revision: 1, text: "ready"))
+        #expect(controller.isEventDispatchEnabled)
+
+        let request = CollectionRangeRequest(
+            nodeID: NodeId(20),
+            modelID: ModelId(7),
+            startIndex: 4,
+            count: 6
+        )
+        staleTerminal(NodeId(30), Data([0x73]))
+        staleCollection(request)
+        await controller.waitForInteractionDispatchForTesting()
+        await controller.waitForTerminalCommandDrainForTesting()
+        #expect(transport.sentFrame(at: 1) == nil)
+
+        let completion = LifecycleCompletionSignal()
+        controller.collectionRangeDispatchDidFinishForTesting = {
+            completion.signal()
+        }
+        renderer.onTerminalInput?(NodeId(30), Data([0x6e]))
+        await controller.waitForInteractionDispatchForTesting()
+        await controller.waitForTerminalCommandDrainForTesting()
+        renderer.onCollectionRangeRequest?(request)
+        await completion.wait()
+
+        let terminalFrame = try #require(transport.sentFrame(at: 1))
+        var decoder = SRUIMessageStreamDecoder()
+        let terminalMessage = try #require(
+            try decoder.appendAndExtract(incoming: terminalFrame).first
+        )
+        #expect(terminalMessage.terminalInput.streamID == 30)
+        #expect(terminalMessage.terminalInput.data == Data([0x6e]))
+
+        let collectionFrame = try #require(transport.sentFrame(at: 2))
+        decoder = SRUIMessageStreamDecoder()
+        let collectionMessage = try #require(
+            try decoder.appendAndExtract(incoming: collectionFrame).first
+        )
+        #expect(collectionMessage.clientModelRangeRequest.nodeID == 20)
+        #expect(collectionMessage.clientModelRangeRequest.modelID == 7)
+
+        await controller.stop()
+    }
+
+    @Test(
         "canceled queued binding acquisition cannot supersede the active binding",
         .timeLimit(.minutes(1))
     )
@@ -1154,12 +1279,15 @@ struct SessionLifecycleEventTests {
 
     private func welcome(
         sessionID: String,
-        initialRevision: UInt64 = 0
+        initialRevision: UInt64 = 0,
+        requiredProfiles: [String] = ["org.srui.standard-widgets/1"],
+        extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping] = []
     ) -> SRUIMessage {
         var welcome = SRUIServerWelcome()
         welcome.coreVersion = SRUICoreVersion
         welcome.sessionID = sessionID
-        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.requiredProfiles = requiredProfiles
+        welcome.extensionNamespaces = extensionNamespaces
         welcome.initialRevision = initialRevision
         var message = SRUIMessage()
         message.serverWelcome = welcome

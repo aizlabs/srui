@@ -562,6 +562,83 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
+    @Test("A native-assigned edit survives rebinding before authorization")
+    @MainActor
+    func assignedEditSurvivesBindingReplacementBeforeAuthorization() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let (oldClient, oldServer) = await PipeTransport.createPair()
+        let old = SessionController(
+            transport: oldClient,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            continuityContext: continuityContext
+        )
+        old.attachRenderer(renderer)
+        try await old.start()
+        try await handshakeAndMount(
+            controller: old,
+            server: oldServer,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "assigned-before-rebind"
+        )
+
+        let authorizationGate = TextLifecycleGate()
+        old.textEditWillAuthorizeForTesting = {
+            await authorizationGate.pause()
+        }
+        renderer.textEditingSession.noteLocalValue(
+            "must replay",
+            nodeID: editorID,
+            composing: false,
+            flushImmediately: true
+        )
+        await authorizationGate.waitUntilPaused()
+        let prepared = try #require(await outbox.assignedTextEditEvents().first)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
+
+        let (newClient, newServer) = await PipeTransport.createPair()
+        let replacement = SessionController(
+            transport: newClient,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "assigned-before-rebind",
+            continuityContext: continuityContext
+        )
+        replacement.attachRenderer(renderer)
+        let collector = EventCollector()
+        await collector.start(draining: newServer)
+        try await replacement.start()
+
+        var resume = SRUIServerResumeOk()
+        resume.sessionID = "assigned-before-rebind"
+        var resumeMessage = SRUIMessage()
+        resumeMessage.serverResumeOk = resume
+        await replacement.handleIncomingMessage(resumeMessage)
+
+        let replayed = try await waitForTextEvent(collector)
+        #expect(replayed.eventId == prepared.eventId)
+        #expect(replayed.textArg == "must replay")
+
+        old.textEditWillAuthorizeForTesting = nil
+        await authorizationGate.release()
+        await old.waitForInteractionDispatchForTesting()
+        #expect(await outbox.assignedTextEditEvents().contains { $0.eventId == prepared.eventId })
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
+
+        await old.stop()
+        await replacement.stop()
+        await collector.stop()
+        await oldServer.close()
+        await newServer.close()
+    }
+
     @Test("Stopping wakes an action blocked behind a text draft without allocating it")
     @MainActor
     func stopCancelsActionWaitingForTextDraft() async throws {
@@ -1945,7 +2022,7 @@ struct TextEditingIntegrationTests {
             newRevision: Revision(2),
             operations: [
                 .createNode(
-                    id: NodeId(99),
+                    id: NodeId(101),
                     nodeType: .text,
                     parentID: surfaceID,
                     properties: [Property(property: .text, value: .string("structural"))]
@@ -1955,7 +2032,7 @@ struct TextEditingIntegrationTests {
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(intervening))
         try await AsyncTestSupport.eventually(description: "intervening structural revision remounted") {
             applier.lastAppliedRevision == Revision(2)
-                && renderer.registry.handle(for: NodeId(99)) != nil
+                && renderer.registry.handle(for: NodeId(101)) != nil
         }
         let remountedHandle = try #require(renderer.registry.handle(for: editorID))
         let remountedField = try #require(remountedHandle.view as? NSTextField)
@@ -2057,6 +2134,7 @@ struct TextEditingIntegrationTests {
                         Property(property: .value, value: .string("authoritative")),
                     ]
                 ),
+                .createNode(id: NodeId(100), nodeType: .button, parentID: surfaceID),
             ]
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
@@ -2180,6 +2258,7 @@ struct TextEditingIntegrationTests {
                         Property(property: .value, value: .string("authoritative")),
                     ]
                 ),
+                .createNode(id: NodeId(100), nodeType: .button, parentID: surfaceID),
             ]
         ).toWire()
         await controller.handleIncomingMessage(snapshotMessage)
@@ -2317,6 +2396,8 @@ struct TextEditingIntegrationTests {
                         Property(property: .value, value: .string("")),
                     ]
                 ),
+                .createNode(id: NodeId(99), nodeType: .button, parentID: surfaceID),
+                .createNode(id: NodeId(100), nodeType: .button, parentID: surfaceID),
             ]
         )
         var mountMsg = SRUIMessage()

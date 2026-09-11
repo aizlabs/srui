@@ -338,11 +338,19 @@ private final class TextLifecycleFence: @unchecked Sendable {
 private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
     private let lock = NSLock()
     private var preparedEventIds: Set<EventId> = []
+    private var assignedEventIds: Set<EventId> = []
     private var revokedEventIds: Set<EventId> = []
 
     func register(_ eventId: EventId) {
         lock.withLock {
             _ = preparedEventIds.insert(eventId)
+        }
+    }
+
+    func markAssigned(_ eventId: EventId) {
+        lock.withLock {
+            guard preparedEventIds.contains(eventId) else { return }
+            assignedEventIds.insert(eventId)
         }
     }
 
@@ -353,11 +361,28 @@ private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
         }
     }
 
+    /// Promotes a native-assigned envelope across binding teardown. A prepared identity which
+    /// never reached TextEditingSession, or was synchronously revoked by a correction, remains
+    /// rollback-safe and is not advertised by the replacement connection.
+    func consumeAssignedForLifecycle(_ eventId: EventId) -> Bool {
+        lock.lock()
+        defer {
+            preparedEventIds.remove(eventId)
+            assignedEventIds.remove(eventId)
+            revokedEventIds.remove(eventId)
+            lock.unlock()
+        }
+        return preparedEventIds.contains(eventId)
+            && assignedEventIds.contains(eventId)
+            && !revokedEventIds.contains(eventId)
+    }
+
     /// Consults and retires one authorization record atomically with the caller's decision.
     func resolve<T>(_ eventId: EventId, _ body: (Bool) -> T) -> T {
         lock.lock()
         defer {
             preparedEventIds.remove(eventId)
+            assignedEventIds.remove(eventId)
             revokedEventIds.remove(eventId)
             lock.unlock()
         }
@@ -367,6 +392,7 @@ private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
     func retire(_ eventId: EventId) {
         lock.withLock {
             preparedEventIds.remove(eventId)
+            assignedEventIds.remove(eventId)
             revokedEventIds.remove(eventId)
         }
     }
@@ -374,6 +400,7 @@ private final class PreparedTextEditAuthorizationFence: @unchecked Sendable {
     func reset() {
         lock.withLock {
             preparedEventIds.removeAll(keepingCapacity: false)
+            assignedEventIds.removeAll(keepingCapacity: false)
             revokedEventIds.removeAll(keepingCapacity: false)
         }
     }
@@ -799,6 +826,12 @@ public actor EventOutbox {
             let version = textLaneStateVersion
             try await waitForTextLaneStateChange(binding: binding, after: version)
         }
+    }
+
+    /// Records that the exact prepared identity now owns native text state. Binding teardown
+    /// uses this nonisolated fence to distinguish replayable assignments from rollback-safe slots.
+    nonisolated func notePreparedTextEditAssigned(eventId: EventId) {
+        preparedTextEditAuthorizationFence.markAssigned(eventId)
     }
 
     /// Marks a native assignment as retracted. `authorizePreparedTextEdit` consults this fence
@@ -1314,6 +1347,14 @@ public actor EventOutbox {
         activeConnectionBinding = binding
         activeSessionIncarnation = sessionIncarnation
         await onActivated(binding, sessionIncarnation)
+        // onActivated may suspend while a later B/C acquisition publishes a newer owner. The
+        // earlier continuation must not cancel that owner's replay, prepared writes, or render
+        // state when it resumes.
+        guard resyncBoundaryTransitionEpoch == transitionEpoch,
+              activeConnectionBinding == binding,
+              activeSessionIncarnation == sessionIncarnation else {
+            return binding
+        }
         activeResumeGeneration = nil
         pendingResumeFinalizationGeneration = nil
         acceptsNewEvents = false
@@ -2741,17 +2782,23 @@ public actor EventOutbox {
             guard pendingEvents[retained.event.eventId] == retained.event else { continue }
             if retainUnauthorizedPreparedTextEdits {
                 lifecycleSuspendedPreparedTextEdits[token] = retained.event
+            } else if preparedTextEditAuthorizationFence.consumeAssignedForLifecycle(
+                retained.event.eventId
+            ) {
+                lifecycleAuthorizedPreparedTextEdits[token] = retained.event
             } else {
-                preparedTextEditAuthorizationFence.retire(retained.event.eventId)
                 unauthorizedEventsToRollback.append(retained.event)
             }
         }
         preparedTextEditSends.removeAll(keepingCapacity: true)
 
         if !retainUnauthorizedPreparedTextEdits {
-            for event in lifecycleSuspendedPreparedTextEdits.values {
-                preparedTextEditAuthorizationFence.retire(event.eventId)
-                unauthorizedEventsToRollback.append(event)
+            for (token, event) in lifecycleSuspendedPreparedTextEdits {
+                if preparedTextEditAuthorizationFence.consumeAssignedForLifecycle(event.eventId) {
+                    lifecycleAuthorizedPreparedTextEdits[token] = event
+                } else {
+                    unauthorizedEventsToRollback.append(event)
+                }
             }
             lifecycleSuspendedPreparedTextEdits.removeAll(keepingCapacity: true)
             for event in unauthorizedEventsToRollback.sorted(

@@ -536,7 +536,6 @@ public final class SessionController: @unchecked Sendable {
     private var currentSessionId: String?
     /// Identifies this controller/transport attempt inside the shared outbox.
     private var outboxConnectionBinding: EventOutboxConnectionBinding?
-    private var actionHandlerWired = false
     /// Serializes native callbacks so a synchronous text flush is admitted before the action
     /// which caused editing to end (§18.2, §22.6).
     @MainActor private var interactionDispatchTail: Task<Void, Never>?
@@ -983,8 +982,6 @@ public final class SessionController: @unchecked Sendable {
         for renderer: AppKitRenderer,
         ownership: SemanticActionOwnership
     ) {
-        guard !actionHandlerWired else { return }
-        actionHandlerWired = true
         interactionRenderer = renderer
 
         renderer.textEditingSession.onAssignedIdentityRevoked = { [weak self] eventId in
@@ -1559,10 +1556,16 @@ public final class SessionController: @unchecked Sendable {
                               }) else {
                             return false
                         }
-                        return self.renderer?.textEditingSession.noteAssigned(
+                        let didAssign = self.renderer?.textEditingSession.noteAssigned(
                             retained.event,
                             matching: edit
                         ) == true
+                        if didAssign {
+                            self.outbox.notePreparedTextEditAssigned(
+                                eventId: retained.event.eventId
+                            )
+                        }
+                        return didAssign
                     } ?? false
                 if !assigned {
                     let rejected = await outbox.rejectPreparedTextEdit(retained)
@@ -1620,6 +1623,43 @@ public final class SessionController: @unchecked Sendable {
         interactionIncarnation += 1
         interactionDispatchTail?.cancel()
         interactionDispatchTail = nil
+    }
+
+    /// Rebinds renderer callbacks and the Terminal writer to a committed hard-snapshot
+    /// incarnation. Previously captured closures retain their old immutable ownership and remain
+    /// unable to cross the boundary.
+    private func reinstallInteractionOwnership(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        guard let lease = continuityContext.acquireMutation(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return false
+        }
+        defer { continuityContext.releaseMutation(lease) }
+
+        await terminalPump.attach(
+            sendIfAuthorized: terminalCommandSender(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        )
+        await MainActor.run {
+            guard let renderer = self.interactionRenderer ?? self.renderer else { return }
+            self.wireActionHandler(
+                for: renderer,
+                ownership: SemanticActionOwnership(
+                    binding: binding,
+                    sessionIncarnation: sessionIncarnation
+                )
+            )
+        }
+        return continuityContext.isActive(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
     }
 
     @MainActor
@@ -4949,6 +4989,19 @@ public final class SessionController: @unchecked Sendable {
             ))
             return
         }
+        guard await reinstallInteractionOwnership(
+            binding: connectionBinding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            let context = "resync snapshot lost callback ownership before finalization"
+            if let generation {
+                await failRefusedResumeDecision(generation, context)
+            } else {
+                await reportFailure(.superseded(context))
+            }
+            return
+        }
+
         let released: Bool
         if let generation {
             released = await outbox.finishResync(generation: generation)

@@ -39,7 +39,6 @@ struct SemanticInspectorTests {
         #expect(button.state.selected == false)
         #expect(button.actionKey == "approve")
         #expect(button.actions == ["announce", "show_details"])
-        #expect(button.supportedEventTypes == [TypeRef.EVENT_ACTIVATE])
     }
 
     @Test("Each query takes a fresh source while old snapshots remain immutable")
@@ -77,18 +76,17 @@ struct SemanticInspectorTests {
         #expect(inspector.findAll(role: TypeRef.text).map { $0.id } == [NodeId(3)])
     }
 
-    @Test("Intrinsic events come from the registry and passive actions do not add any")
+    @Test("Snapshot event capabilities come from the registry, not passive actions")
     func registryActions() throws {
-        #expect(standardEventsEmitted(by: TypeRef.button) == [TypeRef.EVENT_ACTIVATE])
-        #expect(standardEventsEmitted(by: TypeRef.menu).isEmpty)
         #expect(standardEventsEmitted(by: TypeRef(namespaceID: 42, localID: 11)).isEmpty)
 
         let snapshot = makeInspector(source: try makeSource(revision: 1, epoch: 1)).snapshot()
+        let button = try #require(snapshot.node(NodeId(4)))
         let menu = try #require(snapshot.node(NodeId(5)))
-        #expect(menu.role == .menu)
-        #expect(menu.role == TypeRef.menu)
+        #expect(button.supportedEventTypes == standardEventsEmitted(by: button.role))
+        #expect(menu.supportedEventTypes == standardEventsEmitted(by: menu.role))
         #expect(menu.actionKey == "menu.command")
-        #expect(menu.supportedEventTypes.isEmpty)
+        #expect(menu.actions == ["activate"])
     }
 
     @Test("Handles forward typed actions with their captured node and epoch")

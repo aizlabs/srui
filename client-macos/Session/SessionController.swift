@@ -206,6 +206,8 @@ private struct SemanticAutomationSessionState: Sendable {
     var isActive: Bool
     var ownership: SemanticActionOwnership?
 }
+
+/// Central coordinator managing client session lifecycle, message decoding, store application,
 /// outbox event dispatch, resource assembly, and UI rendering (§22, §22.2).
 public final class SessionController: @unchecked Sendable {
     public let transport: any Transport
@@ -301,6 +303,13 @@ public final class SessionController: @unchecked Sendable {
     var semanticActionWillRegisterCancellationForTesting: (@Sendable () -> Void)? {
         get { withStateLock { _semanticActionWillRegisterCancellationForTesting } }
         set { withStateLock { _semanticActionWillRegisterCancellationForTesting = newValue } }
+    }
+    private var _nativeSemanticActionErrorReportedForTesting:
+        (@Sendable (SemanticAutomationError) -> Void)?
+    var nativeSemanticActionErrorReportedForTesting:
+        (@Sendable (SemanticAutomationError) -> Void)? {
+        get { withStateLock { _nativeSemanticActionErrorReportedForTesting } }
+        set { withStateLock { _nativeSemanticActionErrorReportedForTesting = newValue } }
     }
     private var _textEditWillAuthorizeForTesting: (@Sendable () async -> Void)?
     var textEditWillAuthorizeForTesting: (@Sendable () async -> Void)? {
@@ -515,15 +524,20 @@ public final class SessionController: @unchecked Sendable {
 
     /// Creates an in-process, toolkit-independent view of the retained semantic tree.
     ///
-    /// Every query captures a fresh immutable transaction snapshot. Action handles re-enter the
-    /// same admission queue as native controls and never expose or invoke AppKit objects.
+    /// Every query captures a fresh immutable transaction snapshot while this controller is alive.
+    /// If the controller is released, the inspector retains only its creation snapshot and its
+    /// action handles fail as inactive. No inspector or handle retains the controller graph.
     public func makeSemanticInspector() -> SemanticInspector {
-        SemanticInspector(
-            snapshotProvider: { [self] in
-                semanticInspectionSourceSnapshot()
+        let detachedSnapshot = semanticInspectionSourceSnapshot()
+        return SemanticInspector(
+            snapshotProvider: { [weak self] in
+                self?.semanticInspectionSourceSnapshot() ?? detachedSnapshot
             },
-            actionHandler: { [self] request in
-                try await performSemanticAction(request)
+            actionHandler: { [weak self] request in
+                guard let self else {
+                    throw SemanticAutomationError.sessionInactive
+                }
+                return try await self.performSemanticAction(request)
             }
         )
     }
@@ -620,12 +634,38 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    static func shouldReportNativeSemanticActionError(
+        _ error: SemanticAutomationError
+    ) -> Bool {
+        switch error {
+        case .staleHandle, .nodeDisabled, .sessionInactive:
+            return false
+        case .nodeNotFound, .unsupportedAction, .capabilityNotNegotiated:
+            return true
+        }
+    }
+
+    private func reportNativeSemanticActionError(_ error: SemanticAutomationError) {
+        guard Self.shouldReportNativeSemanticActionError(error) else { return }
+        SessionDiagnostics.error("Interaction dispatch failed: \(error)")
+        nativeSemanticActionErrorReportedForTesting?(error)
+    }
+
     @MainActor
     private func enqueueNativeSemanticAction(
         nodeID: NodeId,
         action: SemanticAction,
         renderer: AppKitRenderer
     ) {
+        let state = semanticAutomationSessionState()
+        guard state.isActive else { return }
+        guard state.ownership != nil else {
+            SessionDiagnostics.error(
+                "Interaction dispatch skipped without outbox session ownership"
+            )
+            return
+        }
+
         let source = semanticInspectionSourceSnapshot()
         let request = SemanticActionRequest(
             nodeID: nodeID,
@@ -636,11 +676,11 @@ public final class SessionController: @unchecked Sendable {
             _ = try enqueueSemanticAction(
                 request,
                 observedSnapshot: source.transaction,
-                renderer: renderer
+                renderer: renderer,
+                reportNativeSemanticErrors: true
             )
-        } catch is SemanticAutomationError {
-            // A native control can race a disabling/replacement transaction. Fail closed quietly;
-            // the server remains the final authorization boundary for an already-admitted event.
+        } catch let error as SemanticAutomationError {
+            reportNativeSemanticActionError(error)
         } catch {
             SessionDiagnostics.error("Interaction dispatch failed: \(error)")
         }
@@ -785,11 +825,12 @@ public final class SessionController: @unchecked Sendable {
         _ request: SemanticActionRequest,
         observedSnapshot: TransactionSnapshot,
         renderer: AppKitRenderer?,
-        cancellationState: SemanticActionCancellationState? = nil
+        cancellationState: SemanticActionCancellationState? = nil,
+        reportNativeSemanticErrors: Bool = false
     ) throws -> Task<Event, Error> {
         let ownership = try validateSemanticAction(request, in: observedSnapshot)
 
-        // A native action can end editing before its debounce fires. Flush synchronously so each
+        // An action can end editing before its debounce fires. Flush synchronously so each
         // recursive text callback appends itself to this same tail before the action captures it.
         renderer?.textEditingSession.flushAllPending()
         let drainCutoff = renderer?.textEditingSession.currentFlushGeneration ?? 0
@@ -863,14 +904,20 @@ public final class SessionController: @unchecked Sendable {
         }
         cancellationState?.register(operation)
 
-        let tail = Task { @MainActor in
+        let tail = Task { @MainActor [weak self] in
             let result = await withTaskCancellationHandler(
                 operation: { await operation.result },
                 onCancel: { operation.cancel() }
             )
-            if case .failure(let error) = result,
-               !(error is CancellationError),
-               !(error is SemanticAutomationError) {
+            guard case .failure(let error) = result,
+                  !(error is CancellationError) else {
+                return
+            }
+            if let semanticError = error as? SemanticAutomationError {
+                if reportNativeSemanticErrors {
+                    self?.reportNativeSemanticActionError(semanticError)
+                }
+            } else {
                 SessionDiagnostics.error("Interaction dispatch failed: \(error)")
             }
         }

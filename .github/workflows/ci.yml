@@ -283,11 +283,11 @@ jobs:
           fi
       - name: Test portable LogicalChannelScheduling module
         run: swift test --package-path client-macos/LogicalChannelScheduling
+      - name: Verify Accessibility API boundary (§22.9, §32.11)
+        run: scripts/check-accessibility-api-boundary.sh
       - name: Build and test client-macos
         run: swift test
         working-directory: client-macos
-      - name: Verify Accessibility API boundary (§22.9, §32.11)
-        run: scripts/check-accessibility-api-boundary.sh
       - name: Verify committed generated protocol outputs are fresh
         run: |
           ./protocol/generate_proto.sh

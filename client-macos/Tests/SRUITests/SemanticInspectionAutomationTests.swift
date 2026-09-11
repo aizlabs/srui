@@ -380,6 +380,113 @@ struct SemanticInspectionAutomationTests {
         }
     }
 
+    @Test("Native semantic diagnostics distinguish races from contract failures")
+    func nativeSemanticErrorTaxonomy() {
+        let nodeID = SemanticInspectionFixture.approveID
+        let eventType = TypeRef.EVENT_ACTIVATE
+
+        #expect(
+            SessionController.shouldReportNativeSemanticActionError(.nodeNotFound(nodeID))
+        )
+        #expect(
+            SessionController.shouldReportNativeSemanticActionError(
+                .unsupportedAction(nodeID: nodeID, eventType: eventType)
+            )
+        )
+        #expect(
+            SessionController.shouldReportNativeSemanticActionError(
+                .capabilityNotNegotiated(eventType)
+            )
+        )
+        #expect(
+            SessionController.shouldReportNativeSemanticActionError(
+                .staleHandle(expected: 1, actual: 2)
+            ) == false
+        )
+        #expect(
+            SessionController.shouldReportNativeSemanticActionError(.nodeDisabled(nodeID))
+                == false
+        )
+        #expect(
+            SessionController.shouldReportNativeSemanticActionError(.sessionInactive) == false
+        )
+    }
+
+    @Test("Queued native contract failures emit diagnostics")
+    @MainActor
+    func queuedNativeContractFailureIsReported() async throws {
+        try await withHarness { harness in
+            let recorder = SemanticInspectionErrorRecorder()
+            harness.controller.nativeSemanticActionErrorReportedForTesting = { error in
+                recorder.record(error)
+            }
+            let gate = SemanticInspectionActionGate()
+            harness.controller.interactionWillEnterOutboxForTesting = {
+                await gate.suspend()
+            }
+            let button = try #require(
+                harness.renderer.registry.view(for: SemanticInspectionFixture.approveID)
+                    as? NSButton
+            )
+
+            button.performClick(nil)
+            await gate.waitUntilEntered()
+            do {
+                try await harness.deleteApproveButton()
+            } catch {
+                harness.controller.interactionWillEnterOutboxForTesting = nil
+                await gate.release()
+                throw error
+            }
+            harness.controller.interactionWillEnterOutboxForTesting = nil
+            await gate.release()
+
+            try await AsyncTestSupport.eventually(
+                description: "native node-not-found diagnostic"
+            ) {
+                recorder.errors() == [
+                    SemanticAutomationError.nodeNotFound(SemanticInspectionFixture.approveID),
+                ]
+            }
+            harness.controller.nativeSemanticActionErrorReportedForTesting = nil
+            #expect(await harness.transport.recordedEvents().isEmpty)
+        }
+    }
+
+    @Test("Retained inspection values do not keep a stopped session alive")
+    @MainActor
+    func retainedInspectionValuesReleaseStoppedController() async throws {
+        var retainedInspector: SemanticInspector?
+        var retainedHandle: SemanticNodeHandle?
+        weak var stoppedController: SessionController?
+
+        try await withHarness { harness in
+            let inspector = harness.controller.makeSemanticInspector()
+            stoppedController = harness.controller
+            retainedInspector = inspector
+            retainedHandle = try #require(
+                inspector.find(role: .button, label: SemanticInspectionFixture.approveLabel)
+            )
+        }
+
+        #expect(stoppedController == nil)
+        let inspector = try #require(retainedInspector)
+        let handle = try #require(retainedHandle)
+        #expect(
+            inspector.snapshot().node(SemanticInspectionFixture.approveID)?.label
+                == SemanticInspectionFixture.approveLabel
+        )
+
+        do {
+            _ = try await handle.activate()
+            Issue.record("Expected a retained handle to reject action after session release")
+        } catch SemanticAutomationError.sessionInactive {
+            // Expected.
+        } catch {
+            Issue.record("Expected sessionInactive, got \(error)")
+        }
+    }
+
     @MainActor
     private func withHarness(
         _ body: @MainActor (SemanticInspectionHarness) async throws -> Void
@@ -392,6 +499,23 @@ struct SemanticInspectionAutomationTests {
             throw error
         }
         await harness.stop()
+    }
+}
+
+private final class SemanticInspectionErrorRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedErrors: [SemanticAutomationError] = []
+
+    func record(_ error: SemanticAutomationError) {
+        lock.lock()
+        recordedErrors.append(error)
+        lock.unlock()
+    }
+
+    func errors() -> [SemanticAutomationError] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedErrors
     }
 }
 
@@ -561,6 +685,23 @@ private final class SemanticInspectionHarness {
         #expect(renderer.textEditingSession.localValue(
             for: SemanticInspectionFixture.editorID
         ) == text)
+    }
+
+    func deleteApproveButton() async throws {
+        var message = SRUIMessage()
+        message.transaction = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .deleteNode(id: SemanticInspectionFixture.approveID),
+            ]
+        ).toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(message))
+
+        try await AsyncTestSupport.eventually(description: "Approve button deleted") {
+            applier.lastAppliedRevision == Revision(2)
+                && renderer.registry.handle(for: SemanticInspectionFixture.approveID) == nil
+        }
     }
 
     func disableApproveButton() async throws {

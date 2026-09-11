@@ -100,10 +100,17 @@ PY
 )
 
 mkdir -p "$symbol_dir"
+swift build \
+    --package-path "$package_root" \
+    --target Accessibility
 bin_path=$(swift build \
     --package-path "$package_root" \
-    --target Accessibility \
     --show-bin-path)
+module_path="$bin_path/Modules/Accessibility.swiftmodule"
+if [[ ! -e "$module_path" ]]; then
+    echo "error: Swift build did not produce package module $module_path" >&2
+    exit 1
+fi
 sdk_path=$(xcrun --sdk macosx --show-sdk-path)
 
 swift symbolgraph-extract \
@@ -114,12 +121,15 @@ swift symbolgraph-extract \
     -minimum-access-level public \
     -output-dir "$symbol_dir"
 
-python3 - "$symbol_dir" <<'PY'
+python3 - "$symbol_dir" "$package_root" <<'PY'
 import json
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 symbol_dir = Path(sys.argv[1])
+package_root = Path(sys.argv[2]).resolve()
+source_root = (package_root / "Accessibility").resolve()
 graphs = sorted(symbol_dir.glob("Accessibility*.symbols.json"))
 if not graphs:
     raise SystemExit("error: symbol extraction produced no Accessibility symbol graph")
@@ -140,6 +150,7 @@ def without_prose(value):
     return value
 
 
+package_symbol_count = 0
 for graph_path in graphs:
     graph = json.loads(graph_path.read_text(encoding="utf-8"))
     if graph.get("module", {}).get("name") != "Accessibility":
@@ -149,6 +160,14 @@ for graph_path in graphs:
         )
 
     for symbol in graph.get("symbols", []):
+        location_uri = symbol.get("location", {}).get("uri")
+        if isinstance(location_uri, str):
+            parsed_location = urlparse(location_uri)
+            if parsed_location.scheme == "file":
+                location_path = Path(unquote(parsed_location.path)).resolve()
+                if location_path == source_root or source_root in location_path.parents:
+                    package_symbol_count += 1
+
         public_shape = json.dumps(without_prose(symbol), sort_keys=True)
         hits = sorted({name for name in forbidden if name in public_shape})
         if hits:
@@ -164,6 +183,11 @@ for graph_path in graphs:
             source = relationship.get("source", "<unknown>")
             target = relationship.get("target", "<unknown>")
             violations.append(f"relationship {source} -> {target}: {', '.join(hits)}")
+
+if package_symbol_count == 0:
+    raise SystemExit(
+        "error: symbol extraction did not inspect the package Accessibility sources"
+    )
 
 if violations:
     raise SystemExit(

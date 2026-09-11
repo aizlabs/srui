@@ -215,14 +215,45 @@ struct ConnectionManagerTests {
         return attempt
     }
 
-    @Test("connect control is disabled while an attempt is in flight")
-    func connectControlAvailabilityTracksAttemptState() {
-        #expect(ConnectionStatus.unknown.acceptsConnectRequest)
-        #expect(!ConnectionStatus.connecting.acceptsConnectRequest)
-        #expect(!ConnectionStatus.resynchronizing.acceptsConnectRequest)
-        #expect(!ConnectionStatus.connected.acceptsConnectRequest)
-        #expect(ConnectionStatus.disconnected(resumeAvailable: true).acceptsConnectRequest)
-        #expect(ConnectionStatus.disconnected(resumeAvailable: false).acceptsConnectRequest)
+    @Test("connection status selects the correct primary action")
+    func connectionStatusSelectsPrimaryAction() {
+        #expect(ConnectionStatus.unknown.primaryAction == .connect)
+        #expect(ConnectionStatus.connecting.primaryAction == .unavailable)
+        #expect(ConnectionStatus.resynchronizing.primaryAction == .unavailable)
+        #expect(ConnectionStatus.connected.primaryAction == .open)
+        #expect(ConnectionStatus.disconnected(resumeAvailable: true).primaryAction == .connect)
+        #expect(ConnectionStatus.disconnected(resumeAvailable: false).primaryAction == .connect)
+    }
+
+    @Test("opening a connected renderer does not start another attempt")
+    func openingConnectedRendererDoesNotReconnect() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(
+            label: "Open Existing",
+            host: "open.example",
+            user: "alice"
+        )
+        try await temporary.store.save([saved])
+
+        let harness = ConnectionAttemptHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+
+        #expect(manager.open(id: saved.id) == false)
+        manager.connect(id: saved.id)
+        let attempt = try #require(harness.attempts.first)
+        await attempt.emit(.ready(sessionID: "open-session", revision: 1))
+        try await AsyncTestSupport.eventually(description: "connection ready for open") {
+            manager.status(for: saved.id) == .connected
+        }
+
+        #expect(manager.open(id: saved.id))
+        #expect(harness.attempts.count == 1)
+        await manager.shutdown()
     }
 
     @Test("saved connections replace the JSON file atomically")

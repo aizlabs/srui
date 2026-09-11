@@ -113,6 +113,25 @@ public struct ConnectDraft: Identifiable, Equatable, Sendable {
     }
 }
 
+enum ConnectionPrimaryAction: Equatable, Sendable {
+    case connect
+    case open
+    case unavailable
+
+    var title: String {
+        switch self {
+        case .connect, .unavailable:
+            return "Connect"
+        case .open:
+            return "Open"
+        }
+    }
+
+    var isEnabled: Bool {
+        self != .unavailable
+    }
+}
+
 public enum ConnectionStatus: Equatable, Sendable {
     case unknown
     case connecting
@@ -120,12 +139,14 @@ public enum ConnectionStatus: Equatable, Sendable {
     case connected
     case disconnected(resumeAvailable: Bool)
 
-    var acceptsConnectRequest: Bool {
+    var primaryAction: ConnectionPrimaryAction {
         switch self {
-        case .connecting, .resynchronizing, .connected:
-            return false
         case .unknown, .disconnected:
-            return true
+            return .connect
+        case .connected:
+            return .open
+        case .connecting, .resynchronizing:
+            return .unavailable
         }
     }
 
@@ -482,6 +503,18 @@ public final class ConnectionManager {
             return
         }
         beginAttempt(for: connection)
+    }
+
+    @discardableResult
+    public func open(id connectionID: SavedConnection.ID) -> Bool {
+        guard isShuttingDown == false,
+              statuses[connectionID] == .connected,
+              let context = contexts[connectionID] else {
+            return false
+        }
+
+        context.renderer.showWindows()
+        return true
     }
 
     public func remove(id connectionID: SavedConnection.ID) {

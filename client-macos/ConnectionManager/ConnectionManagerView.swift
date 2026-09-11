@@ -38,6 +38,7 @@ public struct ConnectionManagerView: View {
                             entry: entry,
                             status: manager.status(for: entry.id),
                             onConnect: { manager.connect(id: entry.id) },
+                            onOpen: { manager.open(id: entry.id) },
                             onRemove: { manager.remove(id: entry.id) }
                         )
                     }
@@ -75,6 +76,7 @@ private struct SavedConnectionRow: View {
     let entry: SavedConnection
     let status: ConnectionStatus
     let onConnect: () -> Void
+    let onOpen: () -> Void
     let onRemove: () -> Void
 
     var body: some View {
@@ -107,13 +109,24 @@ private struct SavedConnectionRow: View {
                 .multilineTextAlignment(.trailing)
                 .accessibilityLabel("\(entry.label) status: \(status.displayText)")
 
-            Button("Connect", action: onConnect)
-                .disabled(!status.acceptsConnectRequest)
-                .accessibilityLabel("Connect \(entry.label)")
+            Button(status.primaryAction.title, action: performPrimaryAction)
+                .disabled(status.primaryAction.isEnabled == false)
+                .accessibilityLabel("\(status.primaryAction.title) \(entry.label)")
             Button("Remove", role: .destructive, action: onRemove)
                 .accessibilityLabel("Remove \(entry.label)")
         }
         .padding(.vertical, 5)
+    }
+
+    private func performPrimaryAction() {
+        switch status.primaryAction {
+        case .connect:
+            onConnect()
+        case .open:
+            onOpen()
+        case .unavailable:
+            break
+        }
     }
 
     private var endpoint: String {

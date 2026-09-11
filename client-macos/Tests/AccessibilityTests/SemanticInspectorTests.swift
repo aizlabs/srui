@@ -89,45 +89,68 @@ struct SemanticInspectorTests {
         #expect(menu.actions == ["activate"])
     }
 
-    @Test("Handles forward typed actions with their captured node and epoch")
+    @Test("Handles forward typed actions with their captured node, epoch, and revision")
     func handleForwardsRequests() async throws {
-        let source = try makeSource(revision: 11, epoch: 27)
+        let firstSource = try makeSource(revision: 11, epoch: 27)
+        let secondSource = try makeSource(
+            buttonLabel: "Approve updated",
+            revision: 12,
+            epoch: 27
+        )
+        let sequence = LockedSnapshotSequence([firstSource, secondSource])
         let recorder = ActionRequestRecorder()
         let inspector = SemanticInspector(
-            snapshotProvider: { source },
+            snapshotProvider: { sequence.next() },
             actionHandler: { request in
                 await recorder.receive(request)
             }
         )
         let handle = try #require(inspector.find(role: TypeRef.button, label: "Approve"))
+        let freshHandle = try #require(
+            inspector.find(role: TypeRef.button, label: "Approve updated")
+        )
+        #expect(handle.observedRevision == Revision(11))
+        #expect(freshHandle.observedRevision == Revision(12))
 
         let activateEvent = try await handle.activate()
         let valueEvent = try await handle.setValue(.bool(true))
         let selectionEvent = try await handle.select(ItemId(88))
+        let freshEvent = try await freshHandle.activate()
         let requests = await recorder.requests()
 
         #expect(requests == [
             SemanticActionRequest(
                 nodeID: NodeId(4),
                 expectedEpoch: SemanticInspectionEpoch(27),
+                observedRevision: Revision(11),
                 action: .activate
             ),
             SemanticActionRequest(
                 nodeID: NodeId(4),
                 expectedEpoch: SemanticInspectionEpoch(27),
+                observedRevision: Revision(11),
                 action: .valueChanged(.bool(true))
             ),
             SemanticActionRequest(
                 nodeID: NodeId(4),
                 expectedEpoch: SemanticInspectionEpoch(27),
+                observedRevision: Revision(11),
                 action: .selectionChanged(ItemId(88))
+            ),
+            SemanticActionRequest(
+                nodeID: NodeId(4),
+                expectedEpoch: SemanticInspectionEpoch(27),
+                observedRevision: Revision(12),
+                action: .activate
             ),
         ])
         #expect(activateEvent.eventType == TypeRef.EVENT_ACTIVATE)
+        #expect(activateEvent.observedRevision == Revision(11))
         #expect(valueEvent.eventType == TypeRef.EVENT_VALUE_CHANGED)
         #expect(valueEvent.arguments[PropertyRef.VALUE] == Value.bool(true))
         #expect(selectionEvent.eventType == TypeRef.EVENT_SELECTION_CHANGED)
         #expect(selectionEvent.arguments[PropertyRef.VALUE] == Value.itemID(ItemId(88)))
+        #expect(freshEvent.observedRevision == Revision(12))
     }
 }
 
@@ -234,7 +257,7 @@ private actor ActionRequestRecorder {
         return Event(
             eventSeq: UInt64(recorded.count),
             eventId: EventId(string: "semantic-test-\(recorded.count)"),
-            observedRevision: Revision(11),
+            observedRevision: request.observedRevision,
             nodeId: request.nodeID,
             eventType: request.action.eventType,
             arguments: arguments

@@ -670,12 +670,13 @@ public final class SessionController: @unchecked Sendable {
         let request = SemanticActionRequest(
             nodeID: nodeID,
             expectedEpoch: source.epoch,
+            observedRevision: source.transaction.revision,
             action: action
         )
         do {
             _ = try enqueueSemanticAction(
                 request,
-                observedSnapshot: source.transaction,
+                validationSnapshot: source.transaction,
                 renderer: renderer,
                 reportNativeSemanticErrors: true
             )
@@ -823,12 +824,12 @@ public final class SessionController: @unchecked Sendable {
     @MainActor
     private func enqueueSemanticAction(
         _ request: SemanticActionRequest,
-        observedSnapshot: TransactionSnapshot,
+        validationSnapshot: TransactionSnapshot,
         renderer: AppKitRenderer?,
         cancellationState: SemanticActionCancellationState? = nil,
         reportNativeSemanticErrors: Bool = false
     ) throws -> Task<Event, Error> {
-        let ownership = try validateSemanticAction(request, in: observedSnapshot)
+        let ownership = try validateSemanticAction(request, in: validationSnapshot)
 
         // An action can end editing before its debounce fires. Flush synchronously so each
         // recursive text callback appends itself to this same tail before the action captures it.
@@ -864,7 +865,7 @@ public final class SessionController: @unchecked Sendable {
                 case .activate:
                     return try await self.sendActivate(
                         nodeId: request.nodeID,
-                        observedRevision: observedSnapshot.revision,
+                        observedRevision: request.observedRevision,
                         binding: ownership.binding,
                         sessionIncarnation: ownership.sessionIncarnation,
                         maxFlushGeneration: drainCutoff,
@@ -873,7 +874,7 @@ public final class SessionController: @unchecked Sendable {
                 case .valueChanged(let value):
                     return try await self.sendValueChanged(
                         nodeId: request.nodeID,
-                        observedRevision: observedSnapshot.revision,
+                        observedRevision: request.observedRevision,
                         value: value,
                         binding: ownership.binding,
                         sessionIncarnation: ownership.sessionIncarnation,
@@ -883,7 +884,7 @@ public final class SessionController: @unchecked Sendable {
                 case .selectionChanged(let itemID):
                     return try await self.sendSelectionChanged(
                         nodeId: request.nodeID,
-                        observedRevision: observedSnapshot.revision,
+                        observedRevision: request.observedRevision,
                         itemId: itemID,
                         binding: ownership.binding,
                         sessionIncarnation: ownership.sessionIncarnation,
@@ -929,14 +930,14 @@ public final class SessionController: @unchecked Sendable {
         return try await withTaskCancellationHandler(
             operation: {
                 try Task.checkCancellation()
-                // Capture one immutable transaction before the first suspension. That revision
-                // describes what automation observed even if later validation sees updates.
+                // Capture current state before the first suspension for initial authorization.
+                // The request separately retains the revision represented by its immutable handle.
                 let source = semanticInspectionSourceSnapshot()
                 let operation = try await MainActor.run {
                     try Task.checkCancellation()
                     return try self.enqueueSemanticAction(
                         request,
-                        observedSnapshot: source.transaction,
+                        validationSnapshot: source.transaction,
                         renderer: self.interactionRenderer ?? self.renderer,
                         cancellationState: cancellationState
                     )

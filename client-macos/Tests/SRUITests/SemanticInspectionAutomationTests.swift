@@ -52,6 +52,39 @@ struct SemanticInspectionAutomationTests {
         }
     }
 
+    @Test("A retained handle reports the revision represented by its immutable snapshot")
+    @MainActor
+    func retainedHandlePreservesObservedRevision() async throws {
+        try await withHarness { harness in
+            let inspector = harness.controller.makeSemanticInspector()
+            let retained = try #require(
+                inspector.find(role: .button, label: SemanticInspectionFixture.approveLabel)
+            )
+            #expect(retained.observedRevision == Revision(1))
+
+            let updatedLabel = "Approve updated"
+            try await harness.relabelApproveButton(to: updatedLabel)
+            let current = inspector.snapshot()
+            let fresh = try #require(inspector.find(role: .button, label: updatedLabel))
+            #expect(current.revision == Revision(2))
+            #expect(current.node(SemanticInspectionFixture.approveID)?.label == updatedLabel)
+            #expect(retained.label == SemanticInspectionFixture.approveLabel)
+            #expect(fresh.observedRevision == Revision(2))
+
+            let retainedEvent = try await retained.activate()
+            let freshEvent = try await fresh.activate()
+
+            let captured = await harness.transport.recordedEvents()
+            #expect(captured.map(\.event.observedRevision) == [Revision(1), Revision(2)])
+            #expect(captured.map(\.event.nodeId) == [
+                SemanticInspectionFixture.approveID,
+                SemanticInspectionFixture.approveID,
+            ])
+            #expect(retainedEvent == captured.first?.event)
+            #expect(freshEvent == captured.last?.event)
+        }
+    }
+
     @Test("A handle rechecks enabled state and emits no event after disablement")
     @MainActor
     func disabledHandleIsRejectedWithoutAnOutboundEvent() async throws {
@@ -685,6 +718,28 @@ private final class SemanticInspectionHarness {
         #expect(renderer.textEditingSession.localValue(
             for: SemanticInspectionFixture.editorID
         ) == text)
+    }
+
+    func relabelApproveButton(to label: String) async throws {
+        var message = SRUIMessage()
+        message.transaction = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(
+                    id: SemanticInspectionFixture.approveID,
+                    property: .label,
+                    value: .string(label)
+                ),
+            ]
+        ).toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(message))
+
+        try await AsyncTestSupport.eventually(description: "Approve button relabeled") {
+            applier.lastAppliedRevision == Revision(2)
+                && (renderer.registry.view(for: SemanticInspectionFixture.approveID) as? NSButton)?
+                    .title == label
+        }
     }
 
     func deleteApproveButton() async throws {

@@ -60,19 +60,22 @@ public enum SemanticAction: Equatable, Sendable {
     }
 }
 
-/// An action request retaining the semantic identity captured with its handle.
+/// An action request retaining the semantic identity and tree revision captured with its handle.
 public struct SemanticActionRequest: Equatable, Sendable {
     public let nodeID: NodeId
     public let expectedEpoch: SemanticInspectionEpoch
+    public let observedRevision: Revision
     public let action: SemanticAction
 
     public init(
         nodeID: NodeId,
         expectedEpoch: SemanticInspectionEpoch,
+        observedRevision: Revision,
         action: SemanticAction
     ) {
         self.nodeID = nodeID
         self.expectedEpoch = expectedEpoch
+        self.observedRevision = observedRevision
         self.action = action
     }
 }
@@ -234,20 +237,24 @@ public struct SemanticTreeSnapshot: Equatable, Sendable {
     }
 }
 
-/// Stable reference to a node from a particular semantic inspection epoch.
+/// Stable reference to a node from a particular semantic tree snapshot.
 public struct SemanticNodeHandle: Sendable {
     public let node: SemanticNodeSnapshot
     public let expectedEpoch: SemanticInspectionEpoch
+    /// Authoritative tree revision represented by this handle's immutable node snapshot.
+    public let observedRevision: Revision
 
     private let actionHandler: @Sendable (SemanticActionRequest) async throws -> Event
 
     init(
         node: SemanticNodeSnapshot,
         expectedEpoch: SemanticInspectionEpoch,
+        observedRevision: Revision,
         actionHandler: @escaping @Sendable (SemanticActionRequest) async throws -> Event
     ) {
         self.node = node
         self.expectedEpoch = expectedEpoch
+        self.observedRevision = observedRevision
         self.actionHandler = actionHandler
     }
 
@@ -262,6 +269,7 @@ public struct SemanticNodeHandle: Sendable {
             SemanticActionRequest(
                 nodeID: node.id,
                 expectedEpoch: expectedEpoch,
+                observedRevision: observedRevision,
                 action: action
             )
         )
@@ -310,7 +318,7 @@ public struct SemanticInspector: Sendable {
     public func node(id: NodeId) -> SemanticNodeHandle? {
         let tree = snapshot()
         guard let node = tree.node(id) else { return nil }
-        return makeHandle(node: node, epoch: tree.epoch)
+        return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
     }
 
     /// Finds the first exact role/label match in deterministic tree order using one fresh snapshot.
@@ -321,7 +329,7 @@ public struct SemanticInspector: Sendable {
         }) else {
             return nil
         }
-        return makeHandle(node: node, epoch: tree.epoch)
+        return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
     }
 
     /// Finds all exact role/label matches in deterministic tree order using one fresh snapshot.
@@ -332,17 +340,19 @@ public struct SemanticInspector: Sendable {
                   (label == nil || node.label == label) else {
                 return nil
             }
-            return makeHandle(node: node, epoch: tree.epoch)
+            return makeHandle(node: node, epoch: tree.epoch, revision: tree.revision)
         }
     }
 
     private func makeHandle(
         node: SemanticNodeSnapshot,
-        epoch: SemanticInspectionEpoch
+        epoch: SemanticInspectionEpoch,
+        revision: Revision
     ) -> SemanticNodeHandle {
         SemanticNodeHandle(
             node: node,
             expectedEpoch: epoch,
+            observedRevision: revision,
             actionHandler: actionHandler
         )
     }

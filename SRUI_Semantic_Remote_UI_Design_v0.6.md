@@ -1110,7 +1110,28 @@ client_instance_id
 last_applied_revision
 last_acked_event_seq
 per-terminal received stream offsets
+negotiated capabilities and extension/Terminal namespace/type mappings
 ```
+
+The values above form one continuity checkpoint; they are not independent reconnect hints. A
+process-local ("warm") reconnect retains the same `session_id` and `client_instance_id`, the
+actual committed semantic replica at `last_applied_revision`, the event outbox and its contiguous
+acknowledgement frontier, pending text edits, per-terminal received offsets, applicable
+resource-continuity state, and the negotiated capability result plus extension/Terminal namespace
+and type mappings.
+
+After a cold application relaunch, a client without an atomic durable continuity checkpoint MUST
+NOT claim a persisted last-known revision and MUST NOT reuse the former `client_instance_id`. It
+MAY still send `CLIENT RESUME` for the persisted `session_id` with a fresh `client_instance_id`,
+`last_applied_revision = 0`, `last_acked_event_seq = 0`, and empty terminal/text/event continuity
+state. The server can then replay from revision 1 when retained history permits or return
+`RESYNC_REQUIRED` so a snapshot rebuilds the replica. A persisted last-known revision in a saved
+connection record is presentation metadata only; it is not resume authority.
+
+Literal revision-N cold resume is valid only when the client atomically checkpoints and restores
+the semantic replica together with its outbox, pending event and text state, terminal offsets,
+resource-continuity state, negotiated capability result, and extension/Terminal namespace and type
+mappings from the same durable boundary.
 
 In steady state each client event is settled by an acknowledgement:
 

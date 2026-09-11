@@ -1822,12 +1822,13 @@ if present) and the EventOutbox (Task 24, if present) before starting.
 Read: §17 (session states — ATTACHED/DETACHED/TERMINATING/EXPIRED, so the UI can show a
 meaningful status rather than a raw boolean — plus the incarnation-token paragraph, since a saved
 entry's `session_id` may simply no longer exist by the time the user reconnects), §18 (reconnect
-— what the client must remember: session_id, client_instance_id, last_applied_revision; the
-continuity decision the server returns; and the generation-bound resume-attempt rule, which this
-UI can trigger directly if the user clicks Connect twice), §19.1 (recommended SSH posture —
-host-key verification behavior must stay visible to the user, not silently bypassed), §6.3's state
-ownership table (this task's saved-connection list is purely local "presentation state," owned by
-the client, never synchronized to the server — the server has no concept of it).
+— the complete process-local continuity checkpoint; the cold-relaunch rule requiring a fresh
+`client_instance_id` and revision 0 when no durable checkpoint exists; the continuity decision the
+server returns; and the generation-bound resume-attempt rule, which this UI can trigger directly
+if the user clicks Connect twice), §19.1 (recommended SSH posture — host-key verification behavior
+must stay visible to the user, not silently bypassed), §6.3's state ownership table (this task's
+saved-connection list is purely local "presentation state," owned by the client, never
+synchronized to the server — the server has no concept of it).
 
 Build, as a new small app-level module in client-macos/ (e.g. `ConnectionManager/`) sitting above
 Session/TransportSSH, not inside SemanticModel/Protocol:
@@ -1837,10 +1838,16 @@ Session/TransportSSH, not inside SemanticModel/Protocol:
   credential store).
 - A local, client-only saved-connections list (e.g. a JSON/plist file under Application
   Support): for each entry, at least a human label, host, user, and — once a session has been
-  established — its `session_id` and `last_applied_revision`, so a later reconnect can attempt
-  Task 23's `CLIENT RESUME` instead of always starting fresh. This list is never sent to the
-  server and has no protocol meaning; it is exactly the kind of local presentation state §6.3
-  says the client owns unilaterally.
+  established — its `session_id` and last-known revision. The revision is presentation metadata,
+  not cold-resume authority. While the application remains running, retain the entry's actual
+  semantic replica, `client_instance_id`, event frontier/outbox, pending text state, terminal
+  offsets, resource continuity, negotiated capabilities, and extension/Terminal namespace and type
+  mappings in memory so a warm reconnect can resume from those exact values. After a cold
+  relaunch without a durable continuity checkpoint, attempt `CLIENT RESUME`
+  for the saved `session_id` from revision 0 with a fresh `client_instance_id` and empty event,
+  text, and terminal continuity state; never advertise the persisted last-known revision. This
+  list is never sent to the server and has no protocol meaning; it is exactly the kind of local
+  presentation state §6.3 says the client owns unilaterally.
 - A session list window showing saved entries with a status derived from the last known
   transport/session state (e.g. "connected," "disconnected — will resume," "unknown"), letting
   the user pick one to (re)connect or remove. Removing an entry only forgets it locally — it has
@@ -1863,15 +1870,25 @@ Out of scope: no keychain-integrated secret storage beyond what the user's own s
 known_hosts already provide; no simultaneous-multi-session window management beyond whatever
 falls out naturally (one window per active connection is fine); no syncing the saved-connection
 list across machines; no new protocol messages or server-side changes of any kind — this task
-only adds a UI layer over transport/session APIs that already exist.
+only adds a UI layer over transport/session APIs that already exist. A literal revision-N cold
+resume is also out of scope: it requires one atomic durable checkpoint of the semantic replica,
+outbox, pending event and text state, terminal offsets, resource-continuity state, negotiated
+capabilities, and extension/Terminal namespace and type mappings, and MUST NOT be approximated
+from saved-list presentation metadata.
 
 Verification:
 - connect to a fresh host/user with no prior saved session: a new session is established and an
   entry is added to the saved list afterward with its session_id recorded;
-- quit and relaunch the client, reconnect via the saved entry: confirm (via a log/test hook) that
-  it attempts Task 23's `CLIENT RESUME` with the remembered session_id/last_applied_revision
-  rather than performing a plain fresh handshake, and that the resulting UI reflects the
-  session's actual current state;
+- disconnect and reconnect without quitting: confirm `CLIENT RESUME` uses the same `session_id`
+  and `client_instance_id`, the actual committed replica revision and event frontier, retained
+  terminal offsets, negotiated capabilities, and extension/Terminal namespace and type mappings
+  from the process-local continuity state. Exercise an extension-bearing or Terminal session and
+  confirm a recreated controller does not fall back to fresh negotiation;
+- quit and relaunch the client, then reconnect via the saved entry without a durable checkpoint:
+  confirm (via a log/test hook) that it attempts Task 23's `CLIENT RESUME` with the remembered
+  `session_id`, a fresh `client_instance_id`, revision 0, event frontier 0, and empty terminal/text
+  continuity state — never the saved last-known revision — and that replay or
+  `RESYNC_REQUIRED` rebuilds the UI to the session's actual current state;
 - restart the remote sessiond (or otherwise force a `REPLACED` continuity outcome) and then
   reconnect via a saved entry: confirm the UI clearly communicates that the session was replaced
   rather than presenting it as a normal resume, and that the saved entry is updated to the new

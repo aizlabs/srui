@@ -138,6 +138,71 @@ struct ControlFactoryTests {
         )
     }
 
+    @Test
+    func buttonHoverFeedbackYieldsToOcclusionAndToThePressedState() throws {
+        let factory = ControlFactory()
+        let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
+        let button = try #require(handle.view as? HoverFeedbackButton)
+        let pointerContext = TestPointerContext()
+        button.screenPointerLocationProvider = { pointerContext.location }
+        button.applicationActiveProvider = { pointerContext.applicationIsActive }
+        button.windowVisibilityProvider = { _ in pointerContext.windowIsVisible }
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 180, height: 44))
+        button.frame = container.bounds
+        container.addSubview(button)
+        let window = NSWindow(
+            contentRect: container.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = container
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        let centerInScreen = window.convertPoint(
+            toScreen: button.convert(
+                NSPoint(x: button.bounds.midX, y: button.bounds.midY),
+                to: nil
+            )
+        )
+        let awayFromButton = NSPoint(
+            x: centerInScreen.x + button.bounds.width + 100,
+            y: centerInScreen.y
+        )
+        pointerContext.location = centerInScreen
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+
+        // Pressed: AppKit already draws its own highlight, so hover must contribute no pixels on
+        // top of it. Same press, pointer on and off the control, must raster identically.
+        button.isHighlighted = true
+        pointerContext.location = awayFromButton
+        button.reconcilePointerState()
+        let pressedWithoutPointer = try #require(controlFactoryBitmapSignature(button))
+        pointerContext.location = centerInScreen
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+        let pressedWithPointer = try #require(controlFactoryBitmapSignature(button))
+        #expect(pressedWithPointer == pressedWithoutPointer)
+        button.isHighlighted = false
+
+        // A sibling drawn over the control owns the pixels under the pointer, so the hover
+        // belongs to it and not to us -- `bounds.contains` alone cannot see that.
+        let overlay = NSView(frame: container.bounds)
+        container.addSubview(overlay, positioned: .above, relativeTo: button)
+        button.reconcilePointerState()
+        #expect(button.isPointerInside == false)
+
+        overlay.removeFromSuperview()
+        button.reconcilePointerState()
+        #expect(button.isPointerInside)
+    }
+
     @Test(arguments: controlFactoryRequiredTierTypes)
     func requiredTierCreatesExpectedViewAndDefaults(nodeType: TypeRef) throws {
         let factory = ControlFactory()

@@ -302,6 +302,12 @@ impl TerminalSubscription {
     }
 
     /// Waits until the ring advances past `cursor`, then drains.
+    ///
+    /// An **empty vector means end of stream**, not a spurious wake: the reader thread owns the
+    /// only sender, so the channel closes exactly once the PTY has reached natural EOF and the
+    /// final ring bytes have been drained. Callers must treat an empty result as terminal and
+    /// stop polling -- looping on it without that check spins, because every later call returns
+    /// empty immediately. A non-empty result always carries at least one event.
     pub async fn recv(&mut self) -> Vec<TerminalEvent> {
         loop {
             let drained = self.try_drain();
@@ -601,6 +607,48 @@ mod tests {
             started.elapsed()
         );
         assert!(manager.live_stream_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recv_drains_then_reports_end_of_stream_after_natural_eof() {
+        let manager = PTYManager::default();
+        let id = NodeId::new(24);
+        manager
+            .spawn(id, echo_spec("printf 'SRUI_EOF_OK'; exit 0", 4_096))
+            .unwrap();
+        let SubscribeOutcome {
+            mut subscription, ..
+        } = manager.subscribe(id, 0).unwrap();
+
+        let mut received = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let events = subscription.recv().await;
+                if events.is_empty() {
+                    // Channel closure, not a spurious wake: the reader has exited.
+                    return true;
+                }
+                for event in events {
+                    if let TerminalEvent::Data(data) = event {
+                        received.extend_from_slice(&data.data);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("recv must report end of stream after natural EOF");
+
+        assert!(ended);
+        assert!(
+            received
+                .windows(b"SRUI_EOF_OK".len())
+                .any(|window| window == b"SRUI_EOF_OK"),
+            "end of stream arrived before the retained bytes: {:?}",
+            String::from_utf8_lossy(&received)
+        );
+        // Terminal, and stays terminal: a caller that ignored the empty result would spin here.
+        assert!(subscription.recv().await.is_empty());
+        manager.shutdown();
     }
 
     #[test]

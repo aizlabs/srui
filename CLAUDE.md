@@ -14,8 +14,12 @@ Three toolchains, three roots. CI (`.github/workflows/ci.yml`) runs all of them;
 
 ```bash
 # Rust workspace (server) — from server-rust/
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings   # CI gates on clean lint
+# `--all-targets` without `--workspace` builds the default members, which are the production
+# crates. `benchmark-driver` is a workspace member but not a default member, so CI tests it
+# separately; keep both commands green.
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings                # CI gates on clean lint
+cargo test -p srui-benchmark-driver                      # the §31 driver, excluded above
 cargo test -p srui-semantic-tree --test store_test      # one integration test file
 cargo test -p srui-semantic-tree apply_transaction       # one test by name substring
 cargo fmt -p srui-sessiond                              # format only the crate you changed
@@ -36,11 +40,16 @@ bash scripts/check-logical-channel-scheduling-imports.sh
 bash scripts/check-test-process-stdio.sh                 # no test may leak the binary's stdio
 bash scripts/run-swift-tests.sh                          # `swift test` under a wedge watchdog
 
+# §31 benchmark drivers — the Swift package is nested and resolved on its own
+swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release
+
 # Python registry tooling — from repo root (uv, per uv.lock)
 uv sync --extra dev
 uv run python protocol/validate_registry.py
-uv run pytest protocol/tests
+uv run pytest protocol/tests                             # `pytest` alone also runs benchmarks/tests
 uv run pytest protocol/tests/test_validate_registry.py::test_name
+uv run python benchmarks/generate_metric_contract.py --check   # generated metric descriptors
+uv run pytest benchmarks/tests
 ```
 
 ## Protocol changes: the codegen contract

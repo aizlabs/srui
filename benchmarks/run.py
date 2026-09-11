@@ -47,7 +47,7 @@ from benchmarks.contract import (
     expected_report_sample_counts as expected_report_sample_counts,
     percentile as percentile,
 )
-from benchmarks.errors import BenchmarkError
+from benchmarks.errors import BenchmarkError, CandidateCleanupAssertionError
 from benchmarks.process_control import (
     ManagedCommandError,
     ManagedCommandTimeout,
@@ -403,7 +403,7 @@ def run_candidate_cleanup_probe(
             ) from error
         combined = (result.stdout + "\n" + result.stderr).strip()
         if result.returncode == 0:
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "candidate cleanup probe unexpectedly succeeded"
             )
         if (
@@ -411,7 +411,7 @@ def run_candidate_cleanup_probe(
             not in combined
             or "candidate cleanup failed" in combined
         ):
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "candidate cleanup probe did not exercise the expected "
                 f"successful cleanup path: {combined[-2000:]}"
             )
@@ -425,16 +425,16 @@ def run_candidate_cleanup_probe(
                 pid = identity["pid"]
                 birth = identity["birth_unix_ns"]
                 if not _positive_integer(pid) or not _positive_integer(birth):
-                    raise BenchmarkError(
+                    raise CandidateCleanupAssertionError(
                         f"candidate cleanup probe {label} identity has invalid values"
                     )
                 identities.append((pid, birth))
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "candidate cleanup probe did not record both valid identities"
             ) from error
         if len({pid for pid, _birth in identities}) != 2:
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "candidate cleanup probe identities do not name distinct processes"
             )
         try:
@@ -443,7 +443,7 @@ def run_candidate_cleanup_probe(
                 label="forced-identity-failure renderer candidate group",
             )
         except ManagedCommandError as error:
-            raise BenchmarkError(str(error)) from error
+            raise CandidateCleanupAssertionError(str(error)) from error
 
         publication_candidate_path = probe_directory / "publication-candidate.json"
         publication_observer_path = probe_directory / "publication-descendant.json"
@@ -493,7 +493,7 @@ def run_candidate_cleanup_probe(
             or "renderer candidate srui exited with status" not in publication_detail
             or "candidate cleanup failed" in publication_detail
         ):
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "candidate descendant-publication probe did not exercise the "
                 f"expected cleanup path: {publication_detail[-2000:]}"
             )
@@ -504,16 +504,16 @@ def run_candidate_cleanup_probe(
                 pid = identity["pid"]
                 birth = identity["birth_unix_ns"]
                 if not _positive_integer(pid) or not _positive_integer(birth):
-                    raise BenchmarkError(
+                    raise CandidateCleanupAssertionError(
                         "descendant-publication probe identity has invalid values"
                     )
                 publication_identities.append((pid, birth))
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "descendant-publication probe did not record both identities"
             ) from error
         if len({pid for pid, _birth in publication_identities}) != 2:
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "descendant-publication probe identities are not distinct"
             )
         try:
@@ -522,7 +522,7 @@ def run_candidate_cleanup_probe(
                 label="descendant-publication-failure renderer candidate group",
             )
         except ManagedCommandError as error:
-            raise BenchmarkError(str(error)) from error
+            raise CandidateCleanupAssertionError(str(error)) from error
 
         internal_candidate_path = probe_directory / "internal-candidate.json"
         internal_descendant_path = probe_directory / "internal-descendant.json"
@@ -570,7 +570,7 @@ def run_candidate_cleanup_probe(
             )
             or "candidate cleanup failed" in internal_detail
         ):
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "candidate internal-failure probe did not exercise the "
                 f"expected cleanup path: {internal_detail[-2000:]}"
             )
@@ -581,16 +581,16 @@ def run_candidate_cleanup_probe(
                 pid = identity["pid"]
                 birth = identity["birth_unix_ns"]
                 if not _positive_integer(pid) or not _positive_integer(birth):
-                    raise BenchmarkError(
+                    raise CandidateCleanupAssertionError(
                         "internal-failure probe identity has invalid values"
                     )
                 internal_identities.append((pid, birth))
         except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "internal-failure probe did not record both identities"
             ) from error
         if len({pid for pid, _birth in internal_identities}) != 2:
-            raise BenchmarkError(
+            raise CandidateCleanupAssertionError(
                 "internal-failure probe identities are not distinct"
             )
         try:
@@ -599,7 +599,7 @@ def run_candidate_cleanup_probe(
                 label="internal-failure renderer candidate group",
             )
         except ManagedCommandError as error:
-            raise BenchmarkError(str(error)) from error
+            raise CandidateCleanupAssertionError(str(error)) from error
     return (
         "forced candidate identity failure terminated the exact candidate "
         "process group and proved both the child and a real descendant gone; "
@@ -721,15 +721,23 @@ def main(argv: list[str] | None = None) -> int:
 
     append_parity_assertion(sections, driver_artifacts)
 
-    candidate_cleanup_detail = run_candidate_cleanup_probe(
-        fixture,
-        driver_timeout,
-    )
+    # A probe outcome is an assertion result, not a reason to abandon the run:
+    # a leaked child has to reach the report as `passed=false` so the exit code,
+    # `failed_assertions`, and `ensure_baseline_recordable` all see it.
+    try:
+        candidate_cleanup_detail = run_candidate_cleanup_probe(
+            fixture,
+            driver_timeout,
+        )
+        candidate_cleanup_passed = True
+    except CandidateCleanupAssertionError as error:
+        candidate_cleanup_detail = str(error)
+        candidate_cleanup_passed = False
     sections["31.1"]["assertions"].append(
         {
             "id": "candidate_failure_cleanup",
             "name": "renderer candidate launch failures cannot leak a child process",
-            "passed": True,
+            "passed": candidate_cleanup_passed,
             "detail": candidate_cleanup_detail,
         }
     )
@@ -739,8 +747,15 @@ def main(argv: list[str] | None = None) -> int:
             verification, driver_timeout
         )
         if conformance_count is None:
+            # A suite that ran and failed still prints its runner count, so it
+            # lands below as `passed=false`. Reaching here means the suite never
+            # produced one -- it crashed, timed out, or changed its summary
+            # format -- and the contract pins `runner.production_conformance` to
+            # an exact constant, so no honest sample count exists to record.
+            # Abort, but carry the diagnostic instead of discarding it.
             raise BenchmarkError(
-                f"{verification['name']} did not emit an exact runner count"
+                f"{verification['name']} did not emit an exact runner count: "
+                f"{detail}"
             )
         section = sections[verification["section"]]
         section["metrics"].append(

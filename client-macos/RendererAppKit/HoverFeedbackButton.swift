@@ -82,7 +82,10 @@ public final class HoverFeedbackButton: NSButton {
     public override func draw(_ dirtyRect: NSRect) {
         reconcilePointerState(scheduleDisplay: false)
         super.draw(dirtyRect)
-        guard isPointerInside, isEnabled else { return }
+        // A pressed button already has AppKit's own highlight; tinting on top of it reads as a
+        // third state that the semantic tree never described. The inset keeps the overlay inside
+        // the bezel so it cannot wash out the focus ring drawn around it.
+        guard isPointerInside, isEnabled, isHighlighted == false else { return }
         let overlayRect = bounds.insetBy(dx: 1, dy: 1)
         guard overlayRect.isEmpty == false else { return }
         NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
@@ -114,7 +117,17 @@ public final class HoverFeedbackButton: NSButton {
             return false
         }
         let pointInWindow = window.convertPoint(fromScreen: screenPointerLocationProvider())
-        return bounds.contains(convert(pointInWindow, from: nil))
+        // `visibleRect` rather than `bounds`: an ancestor clip (a scroll view) can leave the
+        // pointer inside our own coordinate space while the pixels under it belong to something
+        // else. The hit test then settles overlap the other way, when a sibling is drawn on top
+        // of us at that point and owns the hover.
+        guard visibleRect.contains(convert(pointInWindow, from: nil)) else {
+            return false
+        }
+        guard let hit = window.contentView?.hitTest(pointInWindow) else {
+            return false
+        }
+        return hit === self || hit.isDescendant(of: self)
     }
 
     private func installApplicationStateObserversIfNeeded() {

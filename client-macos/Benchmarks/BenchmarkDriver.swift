@@ -99,14 +99,15 @@ struct BenchmarkDriver {
             cleanupCandidateLifetime()
         }
         // Candidate process-group ownership and parent-birth supervision are established above,
-        // synchronously, before this first AppKit access. Full renderer candidates must become
-        // the foreground application because they provide ScreenCaptureKit presentation evidence.
-        let requiresForegroundPresentation = arguments.requiresCompositedPresentation
+        // synchronously, before this first AppKit access. Benchmark executables are unbundled
+        // command-line processes; a regular inactive application can be associated with a
+        // non-active Space, and activation is only a request. Accessory policy still supports the
+        // mounted AppKit controls, key/first-responder setup, menus, and exact compositor checks
+        // exercised below without treating foreground activation as presentation evidence.
         let application = NSApplication.shared
         let applicationDelegate = BenchmarkApplicationDelegate()
         application.delegate = applicationDelegate
-        let requestedActivationPolicy: NSApplication.ActivationPolicy =
-            requiresForegroundPresentation ? .regular : .accessory
+        let requestedActivationPolicy: NSApplication.ActivationPolicy = .accessory
         _ = application.setActivationPolicy(requestedActivationPolicy)
         guard application.activationPolicy() == requestedActivationPolicy else {
             cleanupCandidateLifetime()
@@ -118,10 +119,6 @@ struct BenchmarkDriver {
             Darwin.exit(EXIT_FAILURE)
         }
         application.finishLaunching()
-        if requiresForegroundPresentation {
-            application.activate()
-        }
-
         var failure: (any Error)?
         Task { @MainActor in
             do {

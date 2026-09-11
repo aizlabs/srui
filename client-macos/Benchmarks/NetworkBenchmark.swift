@@ -815,6 +815,7 @@ func networkAndLocalInteraction(
         ],
         notes: [
             "Controls are mounted renderer TextArea, ScrollView, and Button. \(menuModes.sorted().joined(separator: "; ")).",
+            "The unbundled full benchmark runs with AppKit accessory activation policy so benchmark-only hosts can join the active Space/application set without pretending that foreground activation succeeded. The mounted NSTextView must still become the window first responder with a live input context, and every timed visual transition still requires exact WindowServer and ScreenCaptureKit evidence.",
             "Pressed feedback uses performClick on the mounted renderer button, accepts its transient action-time composited frame, and triggers the production ActionTrampoline. \(hoverModes.sorted().joined(separator: "; ")). Hover injects a deterministic pointer context through benchmark SPI into the production HoverFeedbackButton reconciliation path. These two trials measure SRUI local state-to-visible latency and explicitly exclude OS hardware-event routing latency.",
             "Local frame budget \(String(format: "%.6f", frameBudget.milliseconds)) ms came from \(frameBudget.source).",
             "All impairment traffic traverses SessionController, EventOutbox, SRUIFraming, and replacement-session resume/replay; no benchmark calls Transport.send directly.",

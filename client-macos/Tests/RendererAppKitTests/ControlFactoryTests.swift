@@ -148,7 +148,7 @@ struct ControlFactoryTests {
     }
 
     @Test
-    func buttonHoverFeedbackYieldsToOcclusionAndToThePressedState() throws {
+    func buttonHoverFeedbackYieldsToSameWindowSiblingOverlapAndPressedState() throws {
         let factory = ControlFactory()
         let handle = try factory.makeHandle(for: Node(id: 1, nodeType: .button))
         let button = try #require(handle.view as? HoverFeedbackButton)

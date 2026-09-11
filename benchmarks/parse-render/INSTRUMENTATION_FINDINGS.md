@@ -161,38 +161,71 @@ A full run on the tested macOS/Xcode 26 host exposed a separate failure mode: Sc
 supplying complete display frames, `NSWindow.isVisible` was true, and
 `CGWindowListCopyWindowInfo(.optionAll, ...)` contained the exact candidate window at layer 25,
 alpha 1, and the expected 960×752 frame. The same window was absent from the
-`.optionOnScreenOnly` inventory, so every one of 144–587 post-cutoff frames was correctly rejected
-as `exact WindowServer target identity was unavailable`. A standalone AppKit control window at the
-same level and geometry appeared in both inventories. This distinguishes Space association from
-Screen Recording authorization, missing frames, geometry, or level selection.
+`.optionOnScreenOnly` inventory, so every one of 144–1,264 post-cutoff frames was correctly
+rejected as `exact WindowServer target identity was unavailable`. The final diagnostic now also
+records `NSWindow.isOnActiveSpace`, the collection-behavior mask, and the application activation
+policy. This distinguishes Space/application-set association from Screen Recording authorization,
+missing frames, geometry, or level selection.
 
-The reason cannot be repaired by treating `NSApplication.activate()` as a synchronous proof.
-Apple documents that the method only requests activation and does not guarantee it. The former
-`activateIgnoringOtherApps` option is deprecated on macOS 14 and later and the tested SDK states
-that it has no effect. Waiting for `NSApplication.isActive` therefore converted the symptom into a
-clear failure but could not make the command-line process foreground; that experiment was removed.
-`moveToActiveSpace` was likewise ineffective when activation was not granted.
+Activation is not a valid repair or proof. Apple documents `NSApplication.activate()` as a request
+whose success is not guaranteed. The former `activateIgnoringOtherApps` option is deprecated on
+macOS 14 and later and the tested SDK states that it has no effect. `orderFrontRegardless()`
+orders a window at the front of its level while the app is inactive, but does not promise to move
+the window between Spaces. `.moveToActiveSpace` is mutually exclusive with
+`.canJoinAllSpaces` and acts when the window becomes active, so it cannot make an unattended
+activation request deterministic.
 
-The retained solution is narrower: immediately before ordering, the short-lived benchmark host
-window inserts `.canJoinAllSpaces`. The same setting is applied during untimed preparation of
-§31.4's benchmark-only host. It is not a production renderer default and is not evidence by itself.
-The window must still appear in `.optionOnScreenOnly`, match exact PID/window/layer/display/geometry,
-have clear z-order, and produce accepted ScreenCaptureKit pixels before a sample exists. With this setting present, two consecutive full-profile §31.1 focused runs completed after the
-failure was reproduced; the second reused the already-built executable. The consolidated full run remains the authoritative confirmation.
+A reduced AppKit control reproduced the exact state without SRUI rendering. Under the failing
+desktop state, a regular command-line application with a ScreenCaptureKit stream reported
+`isVisible=true`, `isOnActiveSpace=false`, presence in `.optionAll`, and absence from
+`.optionOnScreenOnly`; adding both `.canJoinAllSpaces` and `.canJoinAllApplications` did not
+change that result. The otherwise identical accessory application reported
+`isOnActiveSpace=true` and appeared in both inventories, with the capture stream running.
+This experiment isolates the reliable policy-level difference but does not claim knowledge of
+WindowServer's private Space-assignment algorithm.
 
+A suspected process-supervisor cause was also disproved. The sentinel's
+`start_new_session=True` predates the previous successful baseline. The current exact driver
+failed identically when launched directly, through the sentinel, in a new POSIX session, and in a
+new process group within the caller's session. POSIX session identity is not macOS Aqua login or
+Space identity; changing it did not move the window.
+
+The retained benchmark-only arrangement is therefore:
+
+- all unbundled benchmark-driver processes use AppKit's `.accessory` activation policy and do not
+  claim or require foreground activation;
+- benchmark host windows opt into `.canJoinAllSpaces` and
+  `.canJoinAllApplications` before ordering;
+- §31.4 still requires the mounted production editor to become the window's first responder with
+  an input context, and exercises production controls, menu presentation, and compositor evidence;
+- no policy, first-responder value, or collection-behavior value is accepted as presentation
+  evidence.
+
+Every measured target must still appear in `.optionOnScreenOnly`, match the exact
+PID/window/layer/display/geometry, have clear z-order, and produce accepted ScreenCaptureKit pixels.
+Supervised full-profile focused runs for §31.1 and §31.4 completed with this arrangement after the
+failure was reproduced using the same already-built driver path. The §31.4 run completed all 640
+held-response local interaction probes across 0/100/300/600 ms RTT with no failed assertion. The
+consolidated full run remains the authoritative confirmation.
 Operationally, if `.optionAll` contains the exact expected window but `.optionOnScreenOnly` does
-not, inspect active-Space association before changing capture permissions or weakening identity
-checks. If neither inventory contains the window, investigate ordering/lifetime instead. If the
-on-screen inventory contains it with different fields, preserve the exact mismatch as the failure.
+not, inspect `isOnActiveSpace`, activation policy, and collection behavior before changing capture
+permissions or weakening identity checks. If neither inventory contains the window, investigate
+ordering/lifetime instead. If the on-screen inventory contains it with different fields, preserve
+the exact mismatch as the failure.
 
 Apple references:
 
 - [`NSApplication.activate()`](https://developer.apple.com/documentation/appkit/nsapplication/activate())
   — an activation request, not a guarantee;
-- [`NSRunningApplication.activate(options:)`](https://developer.apple.com/documentation/appkit/nsrunningapplication/activate(options:))
-  — returns whether activation succeeded;
-- [`activateIgnoringOtherApps`](https://developer.apple.com/documentation/appkit/nsapplication/activationoptions/activateignoringotherapps)
-  — deprecated as ineffective on macOS 14 and later.
+- [`NSWindow.orderFrontRegardless()`](https://developer.apple.com/documentation/appkit/nswindow/orderfrontregardless())
+  — front-of-level ordering while inactive, not a Space move;
+- [`NSWindow.isOnActiveSpace`](https://developer.apple.com/documentation/appkit/nswindow/isonactivespace)
+  — predicts active-Space placement even while hidden;
+- [`canJoinAllSpaces`](https://developer.apple.com/documentation/appkit/nswindow/collectionbehavior-swift.struct/canjoinallspaces)
+  and [`canJoinAllApplications`](https://developer.apple.com/documentation/appkit/nswindow/collectionbehavior-swift.struct/canjoinallapplications)
+  — the public ordinary-Space and eligible application-set behaviors;
+- [Apple's window collection-behavior guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/WinPanel/Articles/SettingWindowCollectionBehavior.html)
+  — documents the mutually exclusive Spaces-behavior group.
 
 ### 2.4 Window levels and z-order
 

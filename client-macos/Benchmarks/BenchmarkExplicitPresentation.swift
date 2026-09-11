@@ -95,11 +95,16 @@ func benchmarkMeasureExplicitCompositedPaint(
         }
 
         let application = NSApplication.shared
-        // Repeated CLI candidates can inherit an inactive Space association. This dedicated
-        // short-lived benchmark host joins every Space before ordering; exact WindowServer
-        // visibility, z-order, and captured pixels remain fail-closed below.
-        target.window.collectionBehavior.insert(.canJoinAllSpaces)
-        application.activate()
+        // The benchmark-only host joins ordinary Spaces and eligible Stage Manager/full-screen
+        // application sets before ordering. Exact WindowServer visibility, z-order, and captured
+        // pixels remain fail-closed below.
+        target.window.collectionBehavior.formUnion([
+            .canJoinAllSpaces,
+            .canJoinAllApplications,
+        ])
+        if application.activationPolicy() == .regular {
+            application.activate()
+        }
         let usesAppKitVisiblePath = application.isActive
         let isolatedHostLevel = try benchmarkIsolatedHostWindowLevel()
         target.window.animationBehavior = .none
@@ -220,7 +225,6 @@ func benchmarkMeasureExplicitCompositedPaint(
             )
             break candidateLoop
         }
-
         guard let acceptedCandidate else {
             throw BenchmarkFailure.message(
                 "explicit composited presentation timed out or ended after "
@@ -230,12 +234,14 @@ func benchmarkMeasureExplicitCompositedPaint(
                     + "; final target state: window_number="
                     + "\(target.window.windowNumber) visible=\(target.window.isVisible) "
                     + "miniaturized=\(target.window.isMiniaturized) "
+                    + "active_space=\(target.window.isOnActiveSpace) "
+                    + "collection_behavior=\(target.window.collectionBehavior.rawValue) "
+                    + "activation_policy=\(application.activationPolicy().rawValue) "
                     + "app_active=\(application.isActive) "
                     + "app_hidden=\(application.isHidden) "
                     + benchmarkWindowServerEntryDiagnostic(for: target.window)
             )
         }
-
         let visibilityProvenance = usesAppKitVisiblePath
             ? "screencapturekit_first_complete_target_frame_status_level_"
                 + "\(isolatedHostLevel.rawValue)_appkit_active"
@@ -320,17 +326,19 @@ func benchmarkPrepareExactVisibleWindow(
             y: floor(availableFrame.midY - windowFrame.height / 2)
         )
     )
-
-    // The long-lived CLI driver can retain an inactive Space association just like a candidate
-    // subprocess. This window is benchmark-only; joining Spaces does not relax any visibility,
-    // z-order, geometry, or pixel acceptance rule below.
-    window.collectionBehavior.insert(.canJoinAllSpaces)
+    // This benchmark-only host joins ordinary Spaces and eligible Stage Manager/full-screen
+    // application sets. Exact visibility, z-order, geometry, and pixel acceptance remain
+    window.collectionBehavior.formUnion([
+        .canJoinAllSpaces,
+        .canJoinAllApplications,
+    ])
     let isolatedHostLevel = try benchmarkIsolatedHostWindowLevel()
     window.animationBehavior = .none
     window.level = isolatedHostLevel
-
     func submitUntimedWindow() {
-        NSApplication.shared.activate()
+        if NSApplication.shared.activationPolicy() == .regular {
+            NSApplication.shared.activate()
+        }
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
         window.contentView?.layoutSubtreeIfNeeded()

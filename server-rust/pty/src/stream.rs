@@ -154,9 +154,9 @@ impl TerminalStream {
         });
 
         let reader_ring = Arc::clone(&ring);
-        // The reader owns the only sender. When the PTY reaches natural
-        // EOF and the reader exits, every subscription observes channel
-        // closure after draining the final ring bytes.
+        // The reader owns the only sender. Whenever it exits -- after PTY EOF, a terminal read
+        // error, or a ring-append error -- every subscription observes channel closure after
+        // draining the bytes successfully retained before that failure.
         let reader_watch = next_offset_watch_tx;
         let reader_child = Arc::clone(&child);
         let reader_child_pid = Arc::clone(&child_pid);
@@ -367,8 +367,8 @@ fn read_loop(
         let _ = child.wait();
         *child_pid.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
-    // Natural exit: close the command worker so it does not sit on blocking_recv
-    // for the rest of the session.
+    // Any reader termination closes the command worker so it does not sit on blocking_recv for
+    // the rest of the session.
     drop(command_tx.lock().unwrap_or_else(|e| e.into_inner()).take());
 }
 

@@ -303,11 +303,13 @@ impl TerminalSubscription {
 
     /// Waits until the ring advances past `cursor`, then drains.
     ///
-    /// An **empty vector means end of stream**, not a spurious wake: the reader thread owns the
-    /// only sender, so the channel closes exactly once the PTY has reached natural EOF and the
-    /// final ring bytes have been drained. Callers must treat an empty result as terminal and
-    /// stop polling -- looping on it without that check spins, because every later call returns
-    /// empty immediately. A non-empty result always carries at least one event.
+    /// An **empty vector means the subscription producer has stopped and all retained bytes have
+    /// been drained**, not a spurious wake. The reader thread owns the only sender, so channel
+    /// closure is sticky after that thread exits -- whether because the PTY returned EOF, a
+    /// terminal read failed, or output could not be appended to the ring. `recv` does not
+    /// distinguish those causes. Callers must treat an empty result as terminal and stop polling:
+    /// every later call also returns empty immediately. A non-empty result always carries at
+    /// least one event.
     pub async fn recv(&mut self) -> Vec<TerminalEvent> {
         loop {
             let drained = self.try_drain();

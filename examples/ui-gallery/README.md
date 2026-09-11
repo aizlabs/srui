@@ -80,7 +80,7 @@ build if one ever appears.
 
 | Path | Status | Why |
 | --- | --- | --- |
-| Text editing (`TextInput`, `TextArea`) | **native-local only** | The renderer does not emit `TEXT_EDIT`. Keystrokes never reach the server and are discarded by the next server-driven `SET_PROPERTY`. |
+| Text editing (`TextInput`, `TextArea`) | **authoritative** | Native editor commits emit `TEXT_EDIT`; `Session` validates and deduplicates the edit, then commits the accepted string to the node's `value`. |
 | Tree interaction | **presentation-only** | The outline is built from a flat inline `items` list. There is no hierarchical model type and no `EXPANSION_CHANGED` event, so expanding a row changes nothing on the server. |
 | Menu interaction | **presentation-only** | `Menu` is an explicitly rendered deferred-tier node, but the standard registry declares no events for it. |
 | Round-trip latency | **not measured** | The server never sees the client's clock, and `EVENT_ACK` is emitted below the `Session` API. The connection panel reports server-side handling time only. |

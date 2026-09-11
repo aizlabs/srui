@@ -587,7 +587,6 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         .read_only(true)
         .validation_state(ValidationState::Valid)
         .create(ui)?;
-
     TextInput::builder(ids::INPUT_INVALID)
         .parent(ids::CTRL_INPUT_GRID)
         .label("Validated")
@@ -603,7 +602,7 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
         .label("Notes")
         .value(concat!(
             "TextArea content is authoritative server state.\n",
-            "Typing here changes the local NSTextView only."
+            "Typing here emits validated TEXT_EDIT commits."
         ))
         .placeholder("Multi-line notes")
         .read_only(false)
@@ -612,13 +611,11 @@ fn build_controls(ui: &mut UiTransaction) -> Result<(), StoreError> {
     Text::builder(ids::TEXT_AREA_NOTE)
         .parent(ids::CTRL_COLUMN)
         .text(concat!(
-            "Honest limitation: text editing is native-local. The renderer does not emit ",
-            "TEXT_EDIT yet, so keystrokes never reach the server and are discarded on the next ",
-            "server-driven SET_PROPERTY."
+            "Text edits are authoritative: native editor commits emit TEXT_EDIT, Session validates ",
+            "and deduplicates them, and the accepted string is committed to this node's value."
         ))
         .role(TextRole::Caption)
         .create(ui)?;
-
     Row::builder(ids::CTRL_PROGRESS_ROW)
         .parent(ids::CTRL_COLUMN)
         .spacing_role(SpacingRole::Normal)

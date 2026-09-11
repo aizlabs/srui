@@ -76,6 +76,24 @@ impl Client {
             item,
         ))
     }
+
+    fn text_edit(
+        &mut self,
+        session: &Session,
+        node: NodeId,
+        text: &str,
+        edit_seq: u64,
+    ) -> WireEvent {
+        let seq = self.next_seq();
+        self.wire(SemanticEvent::text_edit(
+            seq,
+            format!("text-{seq}"),
+            session.current_revision(),
+            node,
+            text,
+            EditSeq::new(edit_seq).expect("edit sequence is positive"),
+        ))
+    }
 }
 
 fn dispatch(session: &Session, event: &WireEvent) -> EventOutcome {
@@ -522,6 +540,32 @@ fn autoplay_toggle_drives_server_state() {
 }
 
 #[test]
+fn text_edit_commits_the_authoritative_editor_value() {
+    let app = app();
+    let mut client = Client::new();
+    let before = app.session().current_revision();
+    let event = client.text_edit(app.session(), ids::INPUT_PLAIN, "edited by client", 1);
+
+    assert!(
+        matches!(
+            dispatch(app.session(), &event),
+            EventOutcome::Processed { .. }
+        ),
+        "a valid text edit must be accepted by the default Session policy"
+    );
+    assert_eq!(app.session().current_revision(), before.saturating_add(1));
+    let input = app
+        .session()
+        .get_node(ids::INPUT_PLAIN)
+        .expect("text input exists");
+    assert_eq!(
+        input.get_property(VALUE).and_then(Value::as_string),
+        Some("edited by client"),
+        "accepted TEXT_EDIT must update authoritative node state"
+    );
+}
+
+#[test]
 fn scene_buttons_advance_and_reset_the_tour() {
     let app = app();
     let mut client = Client::new();
@@ -791,6 +835,58 @@ fn a_full_scene_cycle_and_reset_restore_the_baseline() {
     assert_eq!(
         after, baseline_nodes,
         "reset is a revert, not a rebuild: node identity survives"
+    );
+}
+
+#[test]
+fn concurrent_relative_scene_actions_each_advance_the_tour() {
+    const ACTIONS: usize = 16;
+
+    let app = app();
+    let barrier = Arc::new(Barrier::new(ACTIONS.saturating_add(1)));
+    let mut handles = Vec::new();
+    for _ in 0..ACTIONS {
+        let app = app.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            app.next_scene()
+        }));
+    }
+    barrier.wait();
+
+    for handle in handles {
+        handle
+            .join()
+            .expect("scene action thread does not panic")
+            .expect("scene action commits");
+    }
+
+    assert_eq!(
+        app.scene(),
+        Scene::from_index(ACTIONS),
+        "each accepted relative action must derive its target from serialized gallery state"
+    );
+}
+
+#[test]
+fn connection_telemetry_refreshes_after_attach_and_detach() {
+    let app = app();
+    let attachment = app.session().attach().expect("session accepts attachment");
+
+    app.refresh_connection_telemetry()
+        .expect("attach telemetry commits");
+    assert_eq!(
+        text_of(app.session(), ids::CONN_CLIENTS),
+        "Attached clients: 1"
+    );
+
+    drop(attachment);
+    app.refresh_connection_telemetry()
+        .expect("detach telemetry commits");
+    assert_eq!(
+        text_of(app.session(), ids::CONN_CLIENTS),
+        "Attached clients: 0"
     );
 }
 

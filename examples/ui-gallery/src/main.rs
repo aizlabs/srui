@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -200,6 +200,36 @@ impl Drop for UmaskGuard {
     }
 }
 
+async fn serve_gallery_connection(
+    stream: UnixStream,
+    session: Arc<Session>,
+    app: Arc<GalleryApp>,
+    shutdown: CancellationToken,
+) {
+    let mut connection = Box::pin(handle_connection(stream, session, shutdown));
+
+    // handle_connection attaches synchronously on its first poll and then waits for the handshake.
+    // Poll it before the yield branch so the telemetry commit observes this exact attachment.
+    let result = tokio::select! {
+        biased;
+        result = &mut connection => result,
+        _ = tokio::task::yield_now() => {
+            if let Err(error) = app.refresh_connection_telemetry() {
+                warn!("failed to refresh telemetry after client attach: {error}");
+            }
+            connection.await
+        }
+    };
+
+    // The connection future has completed and its AttachmentGuard has detached on every exit path.
+    if let Err(error) = app.refresh_connection_telemetry() {
+        warn!("failed to refresh telemetry after client detach: {error}");
+    }
+    if let Err(error) = result {
+        warn!("client connection ended: {error}");
+    }
+}
+
 async fn bind_owned_socket(path: &Path) -> std::io::Result<(UnixListener, OwnedSocket)> {
     let lock = acquire_socket_lock(path)?;
 
@@ -301,12 +331,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match accept_result {
                     Ok((stream, _peer)) => {
                         let session = session.clone();
+                        let app = app.clone();
                         let child = shutdown.child_token();
-                        tasks.spawn(async move {
-                            if let Err(error) = handle_connection(stream, session, child).await {
-                                warn!("client connection ended: {error}");
-                            }
-                        });
+                        tasks.spawn(serve_gallery_connection(stream, session, app, child));
                     }
                     Err(error) => error!("accept failed: {error}"),
                 }
@@ -386,5 +413,49 @@ mod tests {
         owned.remove();
         std::fs::remove_file(socket_lock_path(&path)).expect("lock file is removed");
         std::fs::remove_dir(directory).expect("temporary socket directory is removed");
+    }
+
+    fn attached_clients_text(session: &Session) -> String {
+        let node = session
+            .get_node(srui_example_ui_gallery::ids::CONN_CLIENTS)
+            .expect("connection telemetry node exists");
+        srui_sdk::Text::text_of(&node)
+            .expect("connection telemetry is text")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn connection_lifecycle_publishes_attach_and_detach_counts() {
+        let session = Arc::new(Session::mint());
+        let app = GalleryApp::start(session.clone()).expect("gallery starts");
+        let (client, server) = UnixStream::pair().expect("socket pair opens");
+        let shutdown = CancellationToken::new();
+
+        let connection = tokio::spawn(serve_gallery_connection(
+            server,
+            session.clone(),
+            app,
+            shutdown,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attached_clients_text(&session) != "Attached clients: 1" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attach telemetry is published");
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), connection)
+            .await
+            .expect("connection exits after peer disconnects")
+            .expect("connection task does not panic");
+
+        assert_eq!(
+            attached_clients_text(&session),
+            "Attached clients: 0",
+            "the transaction after AttachmentGuard drops must publish the detached count"
+        );
     }
 }

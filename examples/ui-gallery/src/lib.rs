@@ -247,26 +247,53 @@ impl GalleryApp {
         started: Option<Instant>,
     ) -> Result<Vec<Operation>, SessionError> {
         self.commit(trigger, Vec::new(), started, move |ui, state| {
-            if state.scene == target {
-                return Ok(());
-            }
-            state.scene.revert(ui, &mut state.scenes)?;
-            target.apply(ui, &mut state.scenes)?;
-            state.scene = target;
-            Text::set_text_for(ui, ids::SCENE_LABEL, target.label())?;
-            Text::set_text_for(ui, ids::INSPECT_SCENE, target.label())?;
-            Ok(())
+            Self::stage_scene(ui, state, target)
         })
+    }
+
+    fn step_scene_traced(
+        &self,
+        step: fn(Scene) -> Scene,
+        trigger: Trigger,
+        started: Option<Instant>,
+    ) -> Result<Vec<Operation>, SessionError> {
+        self.commit(trigger, Vec::new(), started, move |ui, state| {
+            // Derive a relative target only after commit has acquired the state lock. Concurrent
+            // Next/Previous actions must each advance from the state committed before them.
+            let target = step(state.scene);
+            Self::stage_scene(ui, state, target)
+        })
+    }
+
+    fn stage_scene(
+        ui: &mut UiTransaction,
+        state: &mut GalleryState,
+        target: Scene,
+    ) -> Result<(), StoreError> {
+        if state.scene == target {
+            return Ok(());
+        }
+        state.scene.revert(ui, &mut state.scenes)?;
+        target.apply(ui, &mut state.scenes)?;
+        state.scene = target;
+        Text::set_text_for(ui, ids::SCENE_LABEL, target.label())?;
+        Text::set_text_for(ui, ids::INSPECT_SCENE, target.label())?;
+        Ok(())
     }
 
     /// Advances one scene, wrapping back to the baseline.
     pub fn next_scene(&self) -> Result<Vec<Operation>, SessionError> {
-        self.goto_scene(self.scene().next())
+        self.step_scene_traced(Scene::next, Trigger::server("next scene"), None)
     }
 
     /// Steps back one scene, wrapping to the last scene.
     pub fn previous_scene(&self) -> Result<Vec<Operation>, SessionError> {
-        self.goto_scene(self.scene().previous())
+        self.step_scene_traced(Scene::previous, Trigger::server("previous scene"), None)
+    }
+
+    /// Refreshes session-derived connection telemetry after an attach or detach transition.
+    pub fn refresh_connection_telemetry(&self) -> Result<Vec<Operation>, SessionError> {
+        self.mutate("connection lifecycle changed", |_, _| Ok(()))
     }
 
     /// Reverts the applied scene and restores every baseline value the gallery owns.
@@ -383,11 +410,9 @@ impl GalleryApp {
         let started = Instant::now();
         let trigger = event_trigger(event, action.detail());
         let result = match action {
-            SceneAction::Next => {
-                self.goto_scene_traced(self.scene().next(), trigger, Some(started))
-            }
+            SceneAction::Next => self.step_scene_traced(Scene::next, trigger, Some(started)),
             SceneAction::Previous => {
-                self.goto_scene_traced(self.scene().previous(), trigger, Some(started))
+                self.step_scene_traced(Scene::previous, trigger, Some(started))
             }
             SceneAction::Reset => {
                 self.commit(trigger, Vec::new(), Some(started), Self::restore_baseline)

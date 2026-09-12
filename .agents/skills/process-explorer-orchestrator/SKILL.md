@@ -16,7 +16,7 @@ Read these files from the candidate base revision before scheduling work:
 - `apps/srtop/srui-process-explorer-plan/BASELINE.md`
 - `apps/srtop/srui-process-explorer-plan/STANDING_AGENT_CONTRACT.md`
 
-Use `task-index.json.execution_order` and each ticket's `depends_on`; ticket numbers alone do not define scheduling. Treat the plan as specification and keep execution state in a separate run directory such as `.codex/process-explorer-run/`.
+Use `task-index.json.execution_order` and each ticket's `depends_on`; ticket numbers alone do not define scheduling. Treat the plan as specification and keep execution state outside every repository checkout by default. Require an absolute external run directory (for example, `${CODEX_HOME}/process-explorer-run/<run-id>/` or `/tmp/process-explorer-run/<run-id>/`); never resolve a relative path from the launcher checkout. If external storage is unavailable, create a dedicated non-main orchestration worktree and record its absolute path.
 
 ## Scheduling loop
 

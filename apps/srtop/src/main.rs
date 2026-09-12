@@ -1,5 +1,7 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
-use srui_process_explorer::{initialize, update_title, FIXTURE_TITLE};
+use srui_process_explorer::{
+    initialize, initialize_from_source, source::FakeProcessSource, update_title, FIXTURE_TITLE,
+};
 use srui_sessiond::{handle_connection, Session};
 use srui_unix_security::{
     effective_uid, prepare_private_socket_parent, require_unprivileged_uid, validate_peer,
@@ -12,16 +14,17 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--socket")) {
-        return Err("usage: srtop --socket PATH [--smoke-fixture]".into());
+        return Err("usage: srtop --socket PATH [--smoke-fixture] [--fake-source]".into());
     }
     let socket_path = PathBuf::from(args.next().ok_or("missing --socket PATH")?);
-    let fixture = match args.next() {
-        None => false,
-        Some(value) if value == "--smoke-fixture" => true,
-        Some(_) => return Err("unknown option".into()),
-    };
-    if args.next().is_some() {
-        return Err("unexpected argument".into());
+    let mut fixture = false;
+    let mut fake_source = false;
+    for value in args {
+        match value.to_str() {
+            Some("--smoke-fixture") if !fixture => fixture = true,
+            Some("--fake-source") if !fake_source => fake_source = true,
+            _ => return Err("unknown or repeated option".into()),
+        }
     }
     let uid = effective_uid();
     require_unprivileged_uid(uid, "srtop")?;
@@ -36,7 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .socket_identity()?
         .ok_or("socket vanished after bind")?;
     let session = Arc::new(Session::mint());
-    initialize(&session)?;
+    if fake_source {
+        initialize_from_source(&session, &mut FakeProcessSource)?;
+    } else {
+        initialize(&session)?;
+    }
     let shutdown = CancellationToken::new();
     let mut connections = JoinSet::new();
     // Only the explicitly requested fixture installs this local test trigger.

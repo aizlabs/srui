@@ -1,4 +1,4 @@
-// PX-001: real non-PTY SSH launch through the unchanged generic client (§§8, 12, 22, 29).
+// PX-001/PX-002: real non-PTY SSH launch through the unchanged generic client (§§8, 12, 22, 29).
 import Testing
 import Foundation
 import AppKit
@@ -10,9 +10,9 @@ import TransportSSH
 import RendererAppKit
 
 struct ProcessExplorerShellTests {
-    @Test(.timeLimit(.minutes(1)))
+    @Test(.serialized, .timeLimit(.minutes(1)), arguments: [false, true])
     @MainActor
-    func emptyShellOverSSHRetainsNativeHandlesAfterTitleFixture() async throws {
+    func shellOverSSHRetainsNativeHandlesAfterTitleFixture(fakeSource: Bool) async throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
@@ -50,7 +50,7 @@ struct ProcessExplorerShellTests {
 
         let server = Process()
         server.executableURL = appBinary
-        server.arguments = ["--socket", socket, "--smoke-fixture"]
+        server.arguments = ["--socket", socket, "--smoke-fixture"] + (fakeSource ? ["--fake-source"] : [])
         server.standardOutput = FileHandle.nullDevice
         server.standardError = FileHandle.nullDevice
         try server.run()
@@ -95,13 +95,22 @@ struct ProcessExplorerShellTests {
         #expect(window.isVisible)
         #expect(window.title == "Process Explorer")
         #expect(heading.stringValue == "Process Explorer")
-        #expect(status.stringValue == "Read-only · Process collection not started")
+        #expect(status.stringValue == (fakeSource ? "Read-only · Fake process snapshot" : "Read-only · Process collection not started"))
         #expect(status.isEditable == false)
-        #expect(table.numberOfRows == 0)
+        #expect(table.numberOfRows == (fakeSource ? 3 : 0))
         #expect(table.tableColumns.map(\.title) == ["PID", "Name"])
         #expect(tableHandle.actionTrampoline == nil)
+        if fakeSource {
+            let expected = [["4101", "worker"], ["4102", "worker"], ["Unavailable", "helper"]]
+            for row in 0..<3 {
+                for column in 0..<2 {
+                    let cell = try #require(table.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTextField)
+                    #expect(cell.stringValue == expected[row][column])
+                }
+            }
+        }
         let windowNumber = window.windowNumber
-        try await Self.capture(window: window, name: "initial")
+        try await Self.capture(window: window, name: fakeSource ? "fake-initial" : "initial")
 
         #expect(kill(server.processIdentifier, SIGUSR1) == 0)
         try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "title mutation over SSH") {
@@ -115,15 +124,15 @@ struct ProcessExplorerShellTests {
         #expect(renderer.registry.handle(for: NodeId(1))?.window === window)
         #expect(window.windowNumber == windowNumber)
         #expect(window.isVisible)
-        #expect(table.numberOfRows == 0)
-        try await Self.capture(window: window, name: "updated")
-        print("PX-001 native SSH evidence: revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading and Table handles retained; PID/Name columns; zero rows.")
+        #expect(table.numberOfRows == (fakeSource ? 3 : 0))
+        try await Self.capture(window: window, name: fakeSource ? "fake-updated" : "updated")
+        print("PX-001/PX-002 native SSH evidence: fakeSource=\(fakeSource); revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading and Table handles retained; PID/Name columns; rows=\(table.numberOfRows).")
         await controller.stop()
     }
 
     @MainActor
     private static func capture(window: NSWindow, name: String) async throws {
-        guard let directory = ProcessInfo.processInfo.environment["PX001_EVIDENCE_DIR"] else { return }
+        guard let directory = (ProcessInfo.processInfo.environment["PX002_EVIDENCE_DIR"] ?? ProcessInfo.processInfo.environment["PX001_EVIDENCE_DIR"]) else { return }
         // Let AppKit finish its display cycle before capturing the retained native view.
         try await Task.sleep(for: .milliseconds(100))
         let output = URL(fileURLWithPath: directory)

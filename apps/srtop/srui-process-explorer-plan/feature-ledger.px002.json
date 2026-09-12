@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-002",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Deterministic fake process rows on generic native macOS client; no live collector or htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX002-001",
+      "feature": "Three deterministic model rows with distinct duplicate names, opaque session ItemIds and explicit missing data",
+      "scope": "PX-002/macOS/localhost SSH/fake-source/read-only",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-002",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-002.md"
+      ]
+    }
+  ]
+}

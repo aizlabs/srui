@@ -850,6 +850,7 @@ name = "srui-process-explorer"
 version = "0.1.0"
 dependencies = [
  "srui-sdk",
+ "srui-semantic-tree",
  "srui-sessiond",
  "srui-unix-security",
  "tokio",

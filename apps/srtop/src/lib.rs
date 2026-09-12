@@ -1,5 +1,8 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
-//! (design §§6–8, 12, 29; PX-001). No process source or action handlers are installed.
+//! (design §§6–8, 12, 29; PX-001/PX-002). No action handlers are installed.
+
+mod projection;
+pub mod source;
 
 use srui_sdk::*;
 use srui_sessiond::{Session, SessionError};
@@ -16,8 +19,31 @@ pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
 
 /// Creates the complete empty shell in one authoritative commit.
 pub fn initialize(session: &Session) -> Result<(), SessionError> {
+    initialize_rows(session, vec![], STATUS_TEXT)
+}
+
+/// Samples only the injected source and publishes its model rows atomically with the shell.
+/// No periodic collection or process actions are installed.
+pub fn initialize_from_source(
+    session: &Session,
+    source: &mut impl source::ProcessSource,
+) -> Result<source::ProcessSnapshot, Box<dyn std::error::Error>> {
+    let snapshot = source.snapshot();
+    let items = projection::SessionItemIds::default().project(&snapshot)?;
+    initialize_rows(session, items, "Read-only · Fake process snapshot")?;
+    Ok(snapshot)
+}
+
+fn initialize_rows(
+    session: &Session,
+    items: Vec<srui_semantic_tree::ModelItem>,
+    status: &str,
+) -> Result<(), SessionError> {
     session.transaction(|ui| {
         ui.apply_op(&Operation::create_model(MODEL, TypeRef::TABLE, 0))?;
+        if !items.is_empty() {
+            ui.apply_op(&Operation::model_insert(MODEL, 0, items.clone()))?;
+        }
         Surface::builder(SURFACE).label(TITLE).create(ui)?;
         Column::builder(COLUMN)
             .parent(SURFACE)
@@ -32,7 +58,7 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
             .create(ui)?;
         Text::builder(STATUS)
             .parent(COLUMN)
-            .text(STATUS_TEXT)
+            .text(status)
             .role(TextRole::Status)
             .create(ui)?;
         ui.set(STATUS, READ_ONLY, true)?;

@@ -44,9 +44,26 @@ class Plan:
     notes: list[str]
 
 
+# Git exports these repository-local variables to hooks. They must not leak
+# into checks that create their own repositories (or into an explicit cwd).
+LOCAL_GIT_ENV = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
+    "GIT_SHALLOW_FILE", "GIT_COMMON_DIR",
+}
+
+
+def check_environment() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items()
+            if key not in LOCAL_GIT_ENV
+            and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+
+
 def git(repo: Path, *args: str) -> str:
     result = subprocess.run(
-        ["git", *args], cwd=repo, stdin=subprocess.DEVNULL,
+        ["git", *args], cwd=repo, stdin=subprocess.DEVNULL, env=check_environment(),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     if result.returncode:
@@ -205,7 +222,7 @@ def run_plan(repo: Path, plan: Plan) -> int:
     require_candidate(repo, plan.targets)
     for check in plan.checks:
         print(f"\n== {check.name}: {shlex.join(check.argv)}", flush=True)
-        result = subprocess.run(check.argv, cwd=repo, stdin=subprocess.DEVNULL)
+        result = subprocess.run(check.argv, cwd=repo, stdin=subprocess.DEVNULL, env=check_environment())
         if result.returncode:
             print(f"FAILED: {check.name} (exit {result.returncode}); push aborted.", file=sys.stderr)
             return 1

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("pre_push_checks", ROOT / "scripts/pre_push_checks.py")
@@ -229,6 +230,31 @@ class GitFixture(unittest.TestCase):
             self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
             self.write("README.md", chr(96) * 3 + "\nunfinished\n")
             self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
+
+    def test_inherited_git_context_cannot_redirect_fixture_operations(self):
+        foreign = self.root / "foreign"
+        foreign.mkdir()
+        checks.git(foreign, "init", "-q")
+        before = (foreign / ".git/config").read_bytes()
+        inherited = {
+            "GIT_DIR": str(foreign / ".git"),
+            "GIT_COMMON_DIR": str(foreign / ".git"),
+            "GIT_WORK_TREE": str(foreign),
+            "GIT_INDEX_FILE": str(foreign / ".git/index"),
+            "GIT_IMPLICIT_WORK_TREE": "0",
+        }
+        with patch.dict(os.environ, inherited):
+            self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+            self.git("config", "test.isolation", "yes")
+            plan = checks.Plan([self.base], [], [], {}, [
+                checks.Check("environment", [sys.executable, "-c",
+                    "import os; assert not any(k in os.environ for k in "
+                    "('GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_IMPLICIT_WORK_TREE'))"]),
+            ], [])
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(checks.run_plan(self.repo, plan), 0)
+        self.assertEqual((foreign / ".git/config").read_bytes(), before)
+        self.assertFalse((foreign / ".git/index").exists())
 
     def test_real_git_push_invokes_focused_hook(self):
         # Install the production wrapper/selector and exact app test entrypoint

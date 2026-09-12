@@ -45,6 +45,8 @@ changes. To avoid certifying the wrong code, execution requires a clean checkout
 at the pushed commit; pushes of different commits must use their respective
 worktrees. A generator/test that changes tracked source also blocks the push.
 Ignored build artifacts are allowed. Selected checks stop at their first failure.
+Repository-specific Git environment variables are cleared before child checks,
+so temporary-repository tests cannot modify the repository being pushed.
 
 The previous full hook is retained for conservative fallback and explicit use:
 

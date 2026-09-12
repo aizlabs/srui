@@ -171,6 +171,13 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
             # This entrypoint already tests Rust and builds the app and bridge.
             checks.append(Check("Process Explorer Rust and native SSH tests", ["bash", "apps/srtop/test.sh"]))
         else:
+            if NATIVE_TEST in paths:
+                # Parse exactly the selected test. The shared range-based script
+                # could select unrelated Swift files; deleted tests need no parse.
+                checks.append(Check("Process Explorer Swift syntax (no type checking)", [
+                    "bash", "-c", 'if [ -f "$1" ]; then swiftc -frontend -parse "$1"; fi',
+                    "parse-native-test", NATIVE_TEST,
+                ]))
             checks.append(Check("Process Explorer Rust tests", ["cargo", "test", *manifest]))
     return checks
 
@@ -251,6 +258,34 @@ def print_plan(plan: Plan) -> None:
     sys.stdout.flush()
 
 
+def markdown_link_targets(text: str):
+    """Read inline destinations separately from optional Markdown link titles."""
+    for match in re.finditer(r"\[[^\]]*\]\(\s*", text):
+        index = match.end()
+        angled = text[index:index + 1] == "<"
+        index += int(angled)
+        target, depth = [], 0
+        while index < len(text):
+            char = text[index]
+            if char == "\\" and index + 1 < len(text):
+                target.append(text[index + 1])
+                index += 2
+                continue
+            if angled:
+                if char == ">":
+                    break
+            else:
+                if char.isspace() or (char == ")" and depth == 0):
+                    break
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+            target.append(char)
+            index += 1
+        yield "".join(target)
+
+
 def check_docs(repo: Path, paths: list[str]) -> int:
     errors = []
     for name in paths:
@@ -283,8 +318,7 @@ def check_docs(repo: Path, paths: list[str]) -> int:
                 visible.append(line)
         if fence is not None:
             errors.append(f"{name}: unclosed Markdown fence")
-        for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", "\n".join(visible)):
-            target = target.strip("<>")
+        for target in markdown_link_targets("\n".join(visible)):
             url = urlsplit(target)
             if url.scheme or url.netloc or not url.path:
                 continue

@@ -18,8 +18,9 @@ and builds the app/bridge; those steps are not duplicated either. Unchanged
 infrastructure is still compiled when the app needs it, without running all its
 dedicated suites.
 
-On Linux the app profile runs Rust checks and explicitly reports native
-SSH/AppKit as unavailable locally. This is not native acceptance evidence; the
+On Linux the app profile runs Rust checks and parses the native Swift test when
+that file changes. Parsing checks syntax only; native SSH/AppKit execution remains
+unavailable locally. This is not native acceptance evidence; the
 ticket's required macOS verification and CI gate still apply.
 
 Preview the current branch without executing checks:

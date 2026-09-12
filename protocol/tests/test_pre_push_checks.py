@@ -98,6 +98,17 @@ class SelectionTests(unittest.TestCase):
                       [item.argv for item in commands])
         self.assertNotIn(["bash", "apps/srtop/test.sh"], [item.argv for item in commands])
 
+    def test_linux_native_changes_select_syntax_check_only_when_needed(self):
+        paths = [checks.NATIVE_TEST]
+        commands = checks.commands(checks.classify(paths), paths, [], [], "Linux")
+        parsers = [item for item in commands if item.argv[-1] == checks.NATIVE_TEST]
+        self.assertEqual(len(parsers), 1)
+        self.assertIn("swiftc -frontend -parse", parsers[0].argv[2])
+        for system, paths in (("Darwin", [checks.NATIVE_TEST]),
+                              ("Linux", ["apps/srtop/src/main.rs"])):
+            commands = checks.commands(checks.classify(paths), paths, [], [], system)
+            self.assertFalse(any("swiftc" in " ".join(item.argv) for item in commands))
+
     def test_malformed_hook_input_is_rejected(self):
         for text in ["\n", "one two", f"ref $(touch) ref {ZERO}", f"ref {'a'*39} ref {ZERO}"]:
             with self.subTest(text=text):
@@ -251,6 +262,42 @@ class GitFixture(unittest.TestCase):
             self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
             self.write("README.md", chr(96) * 3 + "\nunfinished\n")
             self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
+
+    def test_markdown_link_titles_are_not_part_of_the_destination(self):
+        for destination in ("guide.md", "<guide with spaces.md>",
+                            "guide%20with%20spaces.md", "guide(appendix).md",
+                            r"guide\(appendix\).md"):
+            for title in ('"Guide title"', "'Guide title'", "(Guide title)",
+                          '"Title with ) parentheses"'):
+                with self.subTest(destination=destination, title=title):
+                    self.write("guide.md", "# Guide\n")
+                    self.write("guide with spaces.md", "# Guide\n")
+                    self.write("guide(appendix).md", "# Appendix\n")
+                    self.write("README.md", f"[guide]({destination} {title})\n")
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 0)
+        self.write("README.md", '[missing](absent.md "Title")\n')
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
+
+    def test_linux_native_syntax_failure_blocks_push_and_deleted_file_is_skipped(self):
+        self.write(checks.NATIVE_TEST, "func broken( {\n")
+        head = self.save()
+        plan = self.plan(head, system="Linux")
+        parser = next(item for item in plan.checks if item.argv[-1] == checks.NATIVE_TEST)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        swiftc = bin_dir / "swiftc"
+        swiftc.write_text('#!/bin/sh\n[ "$1" = "-frontend" ] && [ "$2" = "-parse" ] || exit 99\nexit 7\n')
+        swiftc.chmod(0o755)
+        parser_plan = checks.Plan([head], [], [], {}, [parser], [])
+        with patch.dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ["PATH"]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(checks.run_plan(self.repo, parser_plan), 1)
+                self.git("rm", checks.NATIVE_TEST)
+                deleted = self.save()
+                parser_plan.targets = [deleted]
+                self.assertEqual(checks.run_plan(self.repo, parser_plan), 0)
 
     def test_inherited_git_context_cannot_redirect_fixture_operations(self):
         foreign = self.root / "foreign"

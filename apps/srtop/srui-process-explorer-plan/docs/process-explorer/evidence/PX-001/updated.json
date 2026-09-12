@@ -1,0 +1,7 @@
+{
+  "fixture" : "updated",
+  "title" : "Process Explorer — title fixture",
+  "transport" : "real localhost SSH subsystem",
+  "visible" : true,
+  "window_number" : 479962
+}

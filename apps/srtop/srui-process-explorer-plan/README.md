@@ -6,7 +6,7 @@ Updated 12 September 2026 • Edition 1.2
 
 Read [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md), [BASELINE.md](BASELINE.md), and [EXECUTION_TIMELINE.md](EXECUTION_TIMELINE.md). Use [TASK_INDEX.md](TASK_INDEX.md) or `task-index.json.execution_order` to choose a ticket. IDs are stable and no longer express execution order. Give one standalone ticket to an implementation session with the authoritative repository design.
 
-The product lives under `apps/srtop`; preserve the runnable `examples/process-monitor` example and reuse verified components. PX-000 refreshes the partial baseline before implementation. All 146 tickets remain planned; the passing example tests do not close any product gate.
+The product lives under `apps/srtop`; preserve the runnable `examples/process-monitor` example and reuse verified components. PX-000 records the revision-specific baseline. The PX-001 shell now has implementation test evidence in [its completion record](docs/process-explorer/completions/PX-001.md), including real localhost SSH and retained native handles. Independent verification is still required; ticket-index statuses and broader release gates are not advanced by this implementation evidence.
 
 ## Delivery priorities
 
@@ -30,6 +30,7 @@ PX-035-G01 resolves advanced-action feasibility before enabling those operations
 - `tickets/`: 140 original IDs plus six suffixed tickets, each self-contained.
 - `feature-ledger.seed.json`: 48 planning families with zero verified parity claims.
 - `feature-ledger.px000.json`: ten individually scoped htop 3.5.3 entries for R0/R1 and safe termination; all remain planned until evidence is attached.
+- `feature-ledger.px001.json`: individually scoped empty-shell implementation evidence against the SRUI design; no htop parity claim.
 - `validate_feature_ledger.py`: schema, duplicate-ID, upstream-reference, owner, status, and evidence checks for the PX-000 ledger.
 - `STANDING_AGENT_CONTRACT.md`: shared implementation rules.
 - `SOURCES.md`: design and upstream reference provenance.

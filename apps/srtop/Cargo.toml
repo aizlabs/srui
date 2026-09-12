@@ -1,0 +1,16 @@
+[package]
+name = "srui-process-explorer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = "0.7"
+srui-sdk = { path = "../../server-rust/sdk" }
+srui-sessiond = { path = "../../server-rust/sessiond" }
+srui-unix-security = { path = "../../server-rust/unix-security" }
+
+[[bin]]
+name = "srtop"
+path = "src/main.rs"

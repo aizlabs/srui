@@ -13,6 +13,8 @@ Start from the candidate implementation commit in a fresh worktree or clean chec
 
 Before any write, confirm the verifier worktree is non-main. Product source, tests, generated code, and plan specifications are read-only for this skill. Write only an external or explicitly designated verification report; never patch failures during verification.
 
+Before testing, use the orchestrator's [worktree setup and recovery](../process-explorer-orchestrator/references/worktree-setup.md) for this fresh checkout. Installing locked development dependencies, producing ignored build/index artifacts, and pinning a child tool session to this workspace are environment preparation; product files remain read-only. If the assigned role mandates graph evidence, confirm a query resolves candidate-local symbols before the main verification run. A missing index or wrong workspace binding needs diagnosis, not an immediate claim that the required tool is unavailable.
+
 ## Review procedure
 
 Check, in order:
@@ -30,6 +32,8 @@ Classify the result as:
 - `pass`: all acceptance criteria and required evidence are satisfied.
 - `fail`: the implementation can be corrected within the ticket; list exact findings and commands.
 - `blocked`: required OS, device, toolchain, reviewer, or external evidence is unavailable; do not convert absence into success.
+
+Tie every failure to an explicit acceptance criterion or mandatory reviewer requirement. An incomplete optional screenshot is a warning unless it leaves required visual behavior unverified; passing object-identity assertions alone do not prove pixels, and missing pixels in a capture alone do not prove a renderer defect. Report what each source of evidence actually establishes.
 
 ## Result format
 

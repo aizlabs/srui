@@ -18,6 +18,12 @@ Read these files from the candidate base revision before scheduling work:
 
 Use `task-index.json.execution_order` and each ticket's `depends_on`; ticket numbers alone do not define scheduling. Treat the plan as specification and keep execution state outside every repository checkout by default. Require an absolute external run directory (for example, `${CODEX_HOME}/process-explorer-run/<run-id>/` or `/tmp/process-explorer-run/<run-id>/`); never resolve a relative path from the launcher checkout. If external storage is unavailable, create a dedicated non-main orchestration worktree and record its absolute path.
 
+## Worktree preflight
+
+Before dispatching either agent, read [Worktree setup and recovery](references/worktree-setup.md). Initialize the declared development dependencies in each new worktree, check the actual test interpreter, and establish required native/SSH and reviewer-tool access early. A successful check in another checkout does not establish this worktree's environment.
+
+Choose an agent context whose requirements fit the ticket. A specialized reviewer can impose additional mandatory tooling checks; discover and preflight those before dispatch. Do not invent graph requirements when none apply, or silently discard a mandatory requirement after selecting that role.
+
 ## Scheduling loop
 
 For each ticket:
@@ -25,10 +31,10 @@ For each ticket:
 1. Confirm the candidate base commit, branch, and worktree. Never write in a checkout on `main`. Create a new `codex/<ticket-id>-<short-name>` worktree from the intended base.
 2. Mark the ticket `implementing` in external run state with the commit, branch, worktree, and timestamp.
 3. Start one implementer context with only the ticket, required design sections, baseline, dependency completion notes, and worktree path.
-4. Wait for its bounded result. It must commit only its ticket and report changed files, commands, evidence, and blockers.
-5. Start a fresh verifier context from the implementation commit. Do not pass the implementer's conclusions as trusted evidence.
+4. Wait for its bounded result. It must report changed files, commands, evidence, and blockers and normally commit only its ticket. If the user requires the final task commit after verification, preserve an immutable candidate snapshot for the clean verifier, then confirm the final commit has the same tree. Do not pass unstaged implementation state to the verifier.
+5. Start a fresh verifier context from the candidate commit. Do not pass the implementer's conclusions as trusted evidence.
 6. Accept the ticket only when the verifier returns `pass`; record the verifier commit, commands, evidence, and report path.
-7. On `fail`, preserve the implementation commit and send only the verifier findings back for a bounded correction. Re-verify from a fresh context. On `blocked`, record the missing environment or prerequisite and stop dependent scheduling.
+7. Honor an explicit stop-on-fail/blocked instruction when an agent returns that terminal result. Otherwise, on `fail`, preserve the candidate and send only the verifier findings back for a bounded correction; re-verify from a fresh context. On `blocked`, record the missing prerequisite and stop dependent scheduling. Ordinary implementation debugging and bounded setup recovery happen before a terminal verdict, unless the user explicitly requests stopping on the first unsuccessful command.
 8. Schedule the next ready ticket only after dependencies are verified. Do not implement follow-on tickets opportunistically.
 
 Keep state transitions explicit: `planned → ready → implementing → implementation_complete → verifying → verified`, with terminal `blocked`, `failed_verification`, and `cancelled`.
@@ -47,6 +53,8 @@ The run state must be resumable and separate from the plan:
 
 Each result records the ticket ID, base and implementation commit, branch/worktree, exact commands, exit status, evidence paths, limitations, and timestamp. Never mark a ticket verified solely from a passing fake test when the ticket requires Linux, macOS, hardware, native UI, or live SSH evidence.
 
+Record implementation, independent verification, and delivery separately. A pre-push environment failure leaves an existing verification pass intact: record `delivery: blocked` with the exact failed command, log, and recovery attempt. Preserve prior reports when resuming. If only environment/index configuration changes and the candidate tree is unchanged, rerun the affected check; do not repeat unrelated passing tests without a new reason. Product changes require fresh verification.
+
 ## Verification profiles
 
 Select checks from the ticket and repository guidance:
@@ -58,7 +66,7 @@ Select checks from the ticket and repository guidance:
 - live process work: deterministic fixtures plus bounded disposable owned workers
 - release gates: clean install, reconnect, compatibility, privacy, accessibility, and measured evidence
 
-Do not run a repository-wide hook merely because a ticket changes documentation. Use the narrow profile first; run broader checks when the ticket or release gate requires them. A hook failure is evidence to classify, not permission to weaken acceptance criteria.
+Do not run a repository-wide hook merely because a ticket changes documentation. Use the narrow profile first; run broader checks when the ticket or release gate requires them. A hook failure is evidence to classify, not permission to weaken acceptance criteria. Prepare required delivery dependencies before pushing, and let configured hooks run. Diagnose and repair bounded local setup problems using the recovery reference; never bypass a required hook or change dependency pins merely to get a green result.
 
 ## External actions
 

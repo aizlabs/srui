@@ -1,0 +1,753 @@
+{
+  "schema_version": 1,
+  "htop_baseline": "3.5.3",
+  "verified_feature_count": 0,
+  "warning": "Family-level planning seed. Expand individual upstream entries; never infer parity from family counts.",
+  "families": [
+    {
+      "family_id": "B01",
+      "feature_family": "Basic process list and live incremental sampling",
+      "scope": "core",
+      "tickets": [
+        "PX-003",
+        "PX-004",
+        "PX-008",
+        "PX-010-G01"
+      ],
+      "source": "H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B02",
+      "feature_family": "Process-instance identity and stale target handling",
+      "scope": "core",
+      "tickets": [
+        "PX-003",
+        "PX-029",
+        "PX-086"
+      ],
+      "source": "D1 §§6.2,27; K1–K3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B03",
+      "feature_family": "CPU/RSS summary and field conventions",
+      "scope": "core",
+      "tickets": [
+        "PX-005",
+        "PX-006",
+        "PX-007"
+      ],
+      "source": "H3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B04",
+      "feature_family": "Typed sorting and sort reversal",
+      "scope": "core",
+      "tickets": [
+        "PX-009",
+        "PX-068"
+      ],
+      "source": "H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B05",
+      "feature_family": "Incremental filter and search navigation",
+      "scope": "core",
+      "tickets": [
+        "PX-010",
+        "PX-011"
+      ],
+      "source": "H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B06",
+      "feature_family": "User/PID filters",
+      "scope": "core",
+      "tickets": [
+        "PX-012",
+        "PX-075"
+      ],
+      "source": "H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B07",
+      "feature_family": "Command line, executable and merged presentation",
+      "scope": "core",
+      "tickets": [
+        "PX-014",
+        "PX-050"
+      ],
+      "source": "H3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B08",
+      "feature_family": "Pause, refresh and configurable interval",
+      "scope": "core",
+      "tickets": [
+        "PX-015",
+        "PX-075"
+      ],
+      "source": "H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B09",
+      "feature_family": "Keyboard, mouse, scrolling and help workflows",
+      "scope": "core",
+      "tickets": [
+        "PX-016",
+        "PX-074",
+        "PX-075"
+      ],
+      "source": "H2,H5,H6",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B10",
+      "feature_family": "Follow and stable table/tree navigation",
+      "scope": "core",
+      "tickets": [
+        "PX-017",
+        "PX-018",
+        "PX-074"
+      ],
+      "source": "H5,H6",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B11",
+      "feature_family": "Process tree and collapse/expand",
+      "scope": "core",
+      "tickets": [
+        "PX-018"
+      ],
+      "source": "H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B12",
+      "feature_family": "User threads, kernel threads and counts",
+      "scope": "core",
+      "tickets": [
+        "PX-019",
+        "PX-043"
+      ],
+      "source": "H3,H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B13",
+      "feature_family": "Tagging, clear tags, descendants and bulk targets",
+      "scope": "core",
+      "tickets": [
+        "PX-020",
+        "PX-035"
+      ],
+      "source": "H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B14",
+      "feature_family": "Readonly enforcement and signal controls",
+      "scope": "core",
+      "tickets": [
+        "PX-028",
+        "PX-030",
+        "PX-032",
+        "PX-033",
+        "PX-034"
+      ],
+      "source": "H4,H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B15",
+      "feature_family": "Nice, affinity, I/O priority and scheduler controls",
+      "scope": "conditional/privilege",
+      "tickets": [
+        "PX-036",
+        "PX-037",
+        "PX-038",
+        "PX-039",
+        "PX-035-G01"
+      ],
+      "source": "H4,H5,H7",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B16",
+      "feature_family": "Autogroup fields and control",
+      "scope": "conditional/privilege",
+      "tickets": [
+        "PX-040"
+      ],
+      "source": "H3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B17",
+      "feature_family": "Identity, scheduling, time, fault and context fields",
+      "scope": "core",
+      "tickets": [
+        "PX-043",
+        "PX-044"
+      ],
+      "source": "H3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B18",
+      "feature_family": "Memory field families including PSS/EPSS",
+      "scope": "core/conditional",
+      "tickets": [
+        "PX-045",
+        "PX-046"
+      ],
+      "source": "H3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B19",
+      "feature_family": "Per-process I/O accounting and rates",
+      "scope": "core/conditional",
+      "tickets": [
+        "PX-047"
+      ],
+      "source": "H3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B20",
+      "feature_family": "Cgroups, namespaces and container visibility",
+      "scope": "conditional",
+      "tickets": [
+        "PX-048"
+      ],
+      "source": "H3,H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B21",
+      "feature_family": "OOM, privilege state and replaced executable/library warnings",
+      "scope": "conditional",
+      "tickets": [
+        "PX-049",
+        "PX-050"
+      ],
+      "source": "H3",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B22",
+      "feature_family": "Delay accounting",
+      "scope": "optional-build/privilege",
+      "tickets": [
+        "PX-051",
+        "PX-098",
+        "PX-100"
+      ],
+      "source": "H3,H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B23",
+      "feature_family": "Per-CPU classes, topology, SMT and hotplug",
+      "scope": "core/conditional",
+      "tickets": [
+        "PX-052"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B24",
+      "feature_family": "Frequency and temperature",
+      "scope": "hardware",
+      "tickets": [
+        "PX-053"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B25",
+      "feature_family": "Host memory, swap, huge pages",
+      "scope": "core/conditional",
+      "tickets": [
+        "PX-054"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B26",
+      "feature_family": "Disk and network meters",
+      "scope": "core/conditional",
+      "tickets": [
+        "PX-055",
+        "PX-056"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B27",
+      "feature_family": "Pressure, descriptors, task counts, host/clock/uptime variants",
+      "scope": "core/conditional",
+      "tickets": [
+        "PX-057",
+        "PX-058"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B28",
+      "feature_family": "Battery and power source",
+      "scope": "hardware",
+      "tickets": [
+        "PX-059"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B29",
+      "feature_family": "Host and process GPU fields/meters",
+      "scope": "hardware",
+      "tickets": [
+        "PX-060",
+        "PX-061"
+      ],
+      "source": "H3,H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B30",
+      "feature_family": "zram, zswap and ZFS ARC variants",
+      "scope": "optional-build",
+      "tickets": [
+        "PX-062",
+        "PX-063",
+        "PX-064"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B31",
+      "feature_family": "systemd, OpenRC and SELinux meters",
+      "scope": "optional-build",
+      "tickets": [
+        "PX-065",
+        "PX-066",
+        "PX-067"
+      ],
+      "source": "H4",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B32",
+      "feature_family": "Selectable/reordered columns and named screens",
+      "scope": "core",
+      "tickets": [
+        "PX-068",
+        "PX-069"
+      ],
+      "source": "H5,H6",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B33",
+      "feature_family": "Meter placement, hide/show and text/bar/graph/indicator modes",
+      "scope": "core",
+      "tickets": [
+        "PX-070",
+        "PX-071",
+        "PX-072",
+        "PX-073"
+      ],
+      "source": "H4,H6",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B34",
+      "feature_family": "Appearance, highlights, labels and layout preferences",
+      "scope": "core/native-adaptation",
+      "tickets": [
+        "PX-074"
+      ],
+      "source": "H6",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B35",
+      "feature_family": "Startup flags, environment/config behavior and import",
+      "scope": "core/native-adaptation",
+      "tickets": [
+        "PX-075"
+      ],
+      "source": "H2,H6",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B36",
+      "feature_family": "Open files and descriptor information",
+      "scope": "tool/permission",
+      "tickets": [
+        "PX-076",
+        "PX-077"
+      ],
+      "source": "H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B37",
+      "feature_family": "File locks and environment inspection",
+      "scope": "permission",
+      "tickets": [
+        "PX-078",
+        "PX-079"
+      ],
+      "source": "H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B38",
+      "feature_family": "System-call tracing and bounded output",
+      "scope": "tool/permission",
+      "tickets": [
+        "PX-081",
+        "PX-082"
+      ],
+      "source": "H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B39",
+      "feature_family": "Backtrace support",
+      "scope": "optional-build/permission",
+      "tickets": [
+        "PX-083"
+      ],
+      "source": "H5",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B40",
+      "feature_family": "PCP metric instances and declarative dynamic views",
+      "scope": "separate-PCP-scope",
+      "tickets": [
+        "PX-101",
+        "PX-102",
+        "PX-103"
+      ],
+      "source": "H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B41",
+      "feature_family": "Additional monitored-host operating systems",
+      "scope": "platform-scope",
+      "tickets": [
+        "PX-104",
+        "PX-108",
+        "PX-112",
+        "PX-116",
+        "PX-120",
+        "PX-124",
+        "PX-128",
+        "PX-132"
+      ],
+      "source": "H1",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B42",
+      "feature_family": "No-GUI/terminal-only deployment and flags",
+      "scope": "deployment-scope",
+      "tickets": [
+        "PX-133",
+        "PX-134",
+        "PX-135",
+        "PX-136"
+      ],
+      "source": "H1,H2",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "B43",
+      "feature_family": "Administrative workflows requiring additional privileges",
+      "scope": "privilege-scope",
+      "tickets": [
+        "PX-098",
+        "PX-099",
+        "PX-100"
+      ],
+      "source": "H4,H5,H7",
+      "status": "planned",
+      "upstream_version": "3.5.3",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "X01",
+      "feature_family": "Semantic interaction and transparent reconnect",
+      "scope": "SRUI-advantage",
+      "tickets": [
+        "PX-022",
+        "PX-024",
+        "PX-025",
+        "PX-026",
+        "PX-086",
+        "PX-026-G01"
+      ],
+      "source": "D1 §§18,22.9,31",
+      "status": "planned",
+      "upstream_version": null,
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "X02",
+      "feature_family": "Last observed state, sampled history and comparisons",
+      "scope": "beyond-baseline",
+      "tickets": [
+        "PX-021",
+        "PX-090",
+        "PX-091",
+        "PX-092"
+      ],
+      "source": "proposed product feature",
+      "status": "planned",
+      "upstream_version": null,
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "X03",
+      "feature_family": "Threshold observations, export and multiple hosts",
+      "scope": "beyond-baseline",
+      "tickets": [
+        "PX-093",
+        "PX-094",
+        "PX-095"
+      ],
+      "source": "proposed product feature",
+      "status": "planned",
+      "upstream_version": null,
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "X04",
+      "feature_family": "Trusted external semantic automation",
+      "scope": "beyond-baseline/review",
+      "tickets": [
+        "PX-137",
+        "PX-138",
+        "PX-139"
+      ],
+      "source": "D1 §22.9 future work",
+      "status": "planned",
+      "upstream_version": null,
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Expand initial-release entries at PX-000; defer other individual inventory to PX-088 or its owning branch gate. Family counts are not parity evidence."
+    },
+    {
+      "family_id": "X05",
+      "feature_family": "Btop-inspired native host dashboard and sampled process-history inspection",
+      "scope": "beyond-baseline/no-btop-parity",
+      "tickets": [
+        "PX-070-G01",
+        "PX-073-G01",
+        "PX-073-G02"
+      ],
+      "source": "BT1",
+      "status": "planned",
+      "upstream_version": "Reference tag/commit to be pinned at PX-070-G01; no btop parity target",
+      "individual_entries": [],
+      "evidence": [],
+      "notes": "Selected workflow inspiration only; core CPU/memory/disk/network panels, optional GPU/per-CPU additions, measured native UX and overhead. htop remains the separate process-management baseline."
+    }
+  ]
+}

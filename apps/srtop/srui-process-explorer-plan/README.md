@@ -29,6 +29,8 @@ PX-035-G01 resolves advanced-action feasibility before enabling those operations
 - `task-index.json`: structured specification, dependency graph, and execution order.
 - `tickets/`: 140 original IDs plus six suffixed tickets, each self-contained.
 - `feature-ledger.seed.json`: 48 planning families with zero verified parity claims.
+- `feature-ledger.px000.json`: ten individually scoped htop 3.5.3 entries for R0/R1 and safe termination; all remain planned until evidence is attached.
+- `validate_feature_ledger.py`: schema, duplicate-ID, upstream-reference, owner, status, and evidence checks for the PX-000 ledger.
 - `STANDING_AGENT_CONTRACT.md`: shared implementation rules.
 - `SOURCES.md`: design and upstream reference provenance.
 - `validate_plan.py`: consistency, dependency, and link checks.

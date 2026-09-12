@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-000",
+  "upstream": {
+    "project": "htop",
+    "version": "3.5.3",
+    "tag": "3.5.3",
+    "commit": "20882b8ef8271fb49ea0eb74bbfd484e9b0a11d8",
+    "scope": "Linux htop feature inventory, with platform/build/permission scope recorded per entry",
+    "references": {
+      "H1": "https://htop.dev/",
+      "H2": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/htop.1.in",
+      "H3": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/linux/LinuxProcess.c",
+      "H4": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/linux/Platform.c",
+      "H5": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/Action.c",
+      "H6": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/DisplayOptionsPanel.c",
+      "H7": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/Scheduling.c",
+      "H8": "https://raw.githubusercontent.com/htop-dev/htop/3.5.3/ChangeLog"
+    }
+  },
+  "entries": [
+    {"feature_id":"HTOP-R0-001","feature":"Live process enumeration and refresh","scope":"R0/core/Linux","source_refs":["H2","H3"],"owner":"PX-003/PX-004","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R0-002","feature":"Process identity fields and PID/start handling","scope":"R0/core/Linux","source_refs":["H3"],"owner":"PX-003","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R0-003","feature":"CPU percentage and host summary conventions","scope":"R0/core/Linux","source_refs":["H3","H4"],"owner":"PX-006/PX-007","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R0-004","feature":"Resident memory and display units","scope":"R0/core/Linux","source_refs":["H3","H4"],"owner":"PX-005","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R0-005","feature":"Server-side user/PID filtering","scope":"R0/core/Linux","source_refs":["H2","H3"],"owner":"PX-010/PX-012","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R0-006","feature":"Typed column sorting and reversal","scope":"R0/core","source_refs":["H2","H5"],"owner":"PX-009/PX-068","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R0-007","feature":"Tree navigation and collapse/expand workflow","scope":"R0/core/Linux","source_refs":["H2","H5"],"owner":"PX-018","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R1-001","feature":"Safe process selection and termination workflow","scope":"R1/permission/Linux","source_refs":["H2","H5","H7"],"owner":"PX-028/PX-031","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R1-002","feature":"Meters, layout, and display preferences","scope":"R1/native adaptation","source_refs":["H4","H6"],"owner":"PX-070/PX-074","status":"planned","evidence":[]},
+    {"feature_id":"HTOP-R1-003","feature":"Startup flags, configuration, and platform scope","scope":"R1/native adaptation","source_refs":["H1","H2","H6","H8"],"owner":"PX-075/PX-088","status":"planned","evidence":[]}
+  ]
+}

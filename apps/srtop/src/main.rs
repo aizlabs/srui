@@ -25,6 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let uid = effective_uid();
     require_unprivileged_uid(uid, "srtop")?;
+    // Install both handlers before publishing the socket so a ready instance
+    // always routes normal stop signals through owned-socket cleanup.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let parent = prepare_private_socket_parent(&socket_path, uid)?;
     // Never replace another instance's socket, including a stale socket.
     let listener = UnixListener::from_std(parent.bind()?)?;
@@ -73,7 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break Err(error.into());
                 }
             }
-            stopped = tokio::signal::ctrl_c() => break stopped.map_err(Into::into),
+            _ = sigint.recv() => break Ok(()),
+            _ = sigterm.recv() => break Ok(()),
         }
     };
     shutdown.cancel();

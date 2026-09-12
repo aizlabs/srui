@@ -2,7 +2,7 @@
 //! (§18.3, §22.6, §26, §27).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use srui_protocol::{ClientResume, Event as WireEvent};
@@ -100,6 +100,84 @@ fn duplicate_gap_and_stale_edit_sequences() {
         other => panic!("expected stale rejection, got {other:?}"),
     }
     assert_eq!(editor_value(&session), "three");
+}
+
+#[test]
+fn committed_text_edit_handler_receives_the_exact_authoritative_transaction() {
+    let session = Session::new("text-transaction-observer");
+    seed_editor(&session);
+    let observed = Arc::new(Mutex::new(None));
+
+    session.on_result_with_transaction(NodeId::new(EDITOR), TEXT_EDIT, {
+        let observed = Arc::clone(&observed);
+        move |_, _, transaction| {
+            *observed.lock().expect("observer lock") = transaction.cloned();
+            Ok(())
+        }
+    });
+
+    let outcome = session
+        .process_event(&text_edit(1, "observed", "published", 1))
+        .expect("text edit is processable");
+    assert!(matches!(outcome, EventOutcome::Processed { .. }));
+
+    let transaction = observed
+        .lock()
+        .expect("observer lock")
+        .clone()
+        .expect("accepted text edit supplies its committed transaction");
+    assert_eq!(transaction.base_revision, 1);
+    assert_eq!(transaction.new_revision, 2);
+    assert_eq!(
+        transaction.operations.len(),
+        2,
+        "the observer sees the actual value and validation operations"
+    );
+    assert_eq!(session.current_revision(), 2);
+}
+
+#[test]
+fn transaction_result_revisions_follow_a_concurrent_built_in_text_edit() {
+    let session = Session::new("text-transaction-concurrency");
+    seed_editor(&session);
+    let handler_entered = Arc::new(Barrier::new(2));
+    let release_handler = Arc::new(Barrier::new(2));
+
+    session.on(NodeId::new(EDITOR), TEXT_EDIT, {
+        let handler_entered = Arc::clone(&handler_entered);
+        let release_handler = Arc::clone(&release_handler);
+        move |_, _| {
+            handler_entered.wait();
+            release_handler.wait();
+        }
+    });
+
+    let edit_session = session.clone();
+    let edit = thread::spawn(move || {
+        edit_session.process_event(&text_edit(1, "concurrent", "committed", 1))
+    });
+    handler_entered.wait();
+
+    let result = session
+        .transaction_with_result(|_, revisions| Ok(revisions))
+        .expect("transaction commits while the text-edit handler is in flight");
+    assert_eq!(result.value.base_revision, 2);
+    assert_eq!(result.value.committed_revision, 3);
+    assert_eq!(result.transaction.base_revision, 2);
+    assert_eq!(result.transaction.new_revision, 3);
+
+    release_handler.wait();
+    let outcome = edit
+        .join()
+        .expect("text-edit thread does not panic")
+        .expect("text edit remains processable");
+    assert!(matches!(
+        outcome,
+        EventOutcome::Processed {
+            revision_after_effect: 3,
+            ..
+        }
+    ));
 }
 
 #[test]

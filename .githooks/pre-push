@@ -46,6 +46,10 @@ run "benchmarks: Rust driver tests" \
 	cargo test --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver
 run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
 run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+run "rust: ui-gallery test" cargo test --manifest-path examples/ui-gallery/Cargo.toml
+run "rust: ui-gallery clippy" cargo clippy --manifest-path examples/ui-gallery/Cargo.toml --all-targets -- -D warnings
+run "rust: coding-agent-demo test" cargo test --manifest-path examples/coding-agent-demo/Cargo.toml
+run "rust: coding-agent-demo clippy" cargo clippy --manifest-path examples/coding-agent-demo/Cargo.toml --all-targets -- -D warnings
 
 # --- Swift (Linux: `swift-linux.yml`; macOS: `ci.yml` job `swift`) ------------
 printf '\n\033[1m== swift: SemanticModel must not import AppKit or Cocoa (§1)\033[0m\n'
@@ -89,6 +93,7 @@ if [ "$(uname -s)" = Darwin ]; then
 	# exactly as CI does.
 	run "swift: build server binaries" cargo build --manifest-path server-rust/Cargo.toml
 	run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
+	run "swift: build coding-agent demo" cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
 	run "swift: swift test" swift test --package-path client-macos
 	run "benchmarks: isolated Swift driver tests" \
 		swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release

@@ -186,6 +186,8 @@ jobs:
         run: |
           cargo test --manifest-path ../examples/process-monitor/Cargo.toml
           cargo clippy --manifest-path ../examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path ../examples/ui-gallery/Cargo.toml
+          cargo clippy --manifest-path ../examples/ui-gallery/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path ../examples/coding-agent-demo/Cargo.toml
           cargo clippy --manifest-path ../examples/coding-agent-demo/Cargo.toml --all-targets -- -D warnings
         working-directory: server-rust

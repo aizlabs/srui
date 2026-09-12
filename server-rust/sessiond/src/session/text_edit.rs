@@ -465,10 +465,11 @@ impl Session {
             decision,
         )? {
             TextEditCommit::Settled(outcome) => Ok(outcome),
-            TextEditCommit::DispatchAccepted => self.dispatch_admitted_event(
+            TextEditCommit::DispatchAccepted(transaction) => self.dispatch_admitted_event(
                 event,
                 &prepared.handlers,
                 HandlerDispatchKind::CommittedTextEdit,
+                Some(&transaction),
             ),
         }
     }
@@ -645,7 +646,7 @@ impl Session {
 
         // Keep the admitted identity in flight until registered handlers finish. The shared
         // dispatch path samples the post-handler revision and always removes this marker.
-        Ok(TextEditCommit::DispatchAccepted)
+        Ok(TextEditCommit::DispatchAccepted(tx_wire))
     }
 
     pub(crate) fn validate_pending_text_edit_refs(
@@ -794,7 +795,7 @@ struct PreparedTextEdit {
 
 enum TextEditCommit {
     Settled(EventOutcome),
-    DispatchAccepted,
+    DispatchAccepted(srui_protocol::Transaction),
 }
 
 #[derive(Debug)]

@@ -116,21 +116,48 @@ pub type HandlerFn = Arc<dyn Fn(&Session, &Event) + Send + Sync + 'static>;
 
 type FallibleHandlerFn =
     Arc<dyn Fn(&Session, &Event) -> Result<(), SessionError> + Send + Sync + 'static>;
+type TransactionAwareHandlerFn = Arc<
+    dyn Fn(&Session, &Event, Option<&Transaction>) -> Result<(), SessionError>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Revisions assigned atomically to a transaction while the Session commit lock is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionRevisions {
+    pub base_revision: u64,
+    pub committed_revision: u64,
+}
+
+/// A successful Session transaction together with the exact wire transaction it published.
+#[derive(Debug)]
+pub struct TransactionResult<T> {
+    pub value: T,
+    pub transaction: Transaction,
+}
 
 #[derive(Clone)]
 pub(crate) enum RegisteredHandler {
     Infallible(HandlerFn),
     Fallible(FallibleHandlerFn),
+    TransactionAware(TransactionAwareHandlerFn),
 }
 
 impl RegisteredHandler {
-    fn call(&self, session: &Session, event: &Event) -> Result<(), SessionError> {
+    fn call(
+        &self,
+        session: &Session,
+        event: &Event,
+        committed: Option<&Transaction>,
+    ) -> Result<(), SessionError> {
         match self {
             Self::Infallible(handler) => {
                 handler(session, event);
                 Ok(())
             }
             Self::Fallible(handler) => handler(session, event),
+            Self::TransactionAware(handler) => handler(session, event, committed),
         }
     }
 }
@@ -807,6 +834,30 @@ impl Session {
         );
     }
 
+    /// Registers a fallible handler that can inspect a transaction committed before dispatch.
+    ///
+    /// The transaction is Some for an accepted authoritative TEXT_EDIT, whose value and
+    /// validation mutations are committed before notification (§22.6), and None for ordinary
+    /// events. The borrowed record is the exact transaction published to the journal and clients;
+    /// callers must not infer its revisions from a later Session snapshot.
+    pub fn on_result_with_transaction<F>(
+        &self,
+        node: impl Into<NodeId>,
+        event_type: TypeRef,
+        handler: F,
+    ) where
+        F: Fn(&Session, &Event, Option<&Transaction>) -> Result<(), SessionError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.register_handler(
+            node.into(),
+            event_type,
+            RegisteredHandler::TransactionAware(Arc::new(handler)),
+        );
+    }
+
     fn register_handler(&self, node: NodeId, event_type: TypeRef, handler: RegisteredHandler) {
         let mut guard = lock_or_recover(&self.inner);
         guard
@@ -832,81 +883,89 @@ impl Session {
         guard.handlers.clear();
     }
 
-    /// Opens an atomic semantic transaction advancing the graph from revision `N` to `N + 1` (§12.1, §29).
+    /// Opens an atomic semantic transaction advancing the graph from revision N to N + 1 (§12.1, §29).
     ///
-    /// Applies mutations speculatively on [`UiTransaction`], commits atomically to [`SemanticStore`],
-    /// logs the transaction in [`TransactionJournal`], and broadcasts the resulting [`Transaction`]
+    /// Applies mutations speculatively on UiTransaction, commits atomically to SemanticStore,
+    /// logs the transaction in TransactionJournal, and broadcasts the resulting Transaction
     /// to all attached client connections.
     pub fn transaction<T, F>(&self, f: F) -> Result<T, SessionError>
     where
         F: FnOnce(&mut UiTransaction) -> Result<T, StoreError>,
     {
-        let val = {
-            let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
-            let base_revision = guard.store.revision();
-            let max_ops = guard.store.limits().max_transaction_operations;
-            let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
-
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut ui)));
-
-            match result {
-                Ok(Ok(val)) => {
-                    let (staged, ops) = ui.into_staged_and_ops();
-                    let deletes_nodes = ops
-                        .iter()
-                        .any(|op| matches!(op, Operation::DeleteNode { .. }));
-                    let commit = AuthoritativeCommit::new(base_revision, ops);
-
-                    // Journal admission is decided before the store mutates: `append` below cannot
-                    // fail, so the store and the journal advance together or neither does
-                    // (§12.1, §18.1).
-                    let permit = guard.journal.prepare(&commit)?;
-                    let tx_wire = permit.transaction().clone();
-                    guard.store.commit_staging(staged, commit.new_revision());
-                    guard.journal.append(permit);
-                    if deletes_nodes {
-                        let SessionInner {
-                            store,
-                            text_edit_tracker,
-                            ..
-                        } = &mut *guard;
-                        text_edit_tracker.reclaim_missing_nodes(store);
-                    }
-                    // Published under `inner` so delivery order equals commit order (§12.1);
-                    // see `publish_committed` for why this is not an `async-no-lock-await`
-                    // violation.
-                    self.publish_committed(&tx_wire);
-                    let missing_terminals = if deletes_nodes {
-                        self.pty
-                            .live_stream_ids()
-                            .into_iter()
-                            .filter(|id| guard.store.get_node(*id).is_none())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    drop(guard);
-                    self.close_terminals_for_deleted_nodes(&missing_terminals);
-                    val
-                }
-                Ok(Err(store_err)) => return Err(SessionError::Store(store_err)),
-                Err(panic_payload) => {
-                    let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
-                    };
-                    return Err(SessionError::Panicked(panic_msg));
-                }
-            }
-        };
-
-        Ok(val)
+        self.transaction_with_result(|ui, _| f(ui))
+            .map(|result| result.value)
     }
 
-    /// Publishes one committed transaction to every attached connection (§12.1, §20.2).
+    /// Commits atomically and returns the exact revisions and wire transaction chosen under lock.
+    ///
+    /// The closure receives revisions from the same critical section that stages and publishes the
+    /// commit. This closes the stale-snapshot window for callers that need to render the revision
+    /// carried by their own transaction while preserving the no-lock-across-await rule.
+    pub fn transaction_with_result<T, F>(&self, f: F) -> Result<TransactionResult<T>, SessionError>
+    where
+        F: FnOnce(&mut UiTransaction, TransactionRevisions) -> Result<T, StoreError>,
+    {
+        let mut guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+        let base_revision = guard.store.revision();
+        let committed_revision = base_revision
+            .checked_next()
+            .ok_or(SessionError::Transaction(TxnError::RevisionExhausted {
+                base: base_revision,
+            }))?;
+        let revisions = TransactionRevisions {
+            base_revision: base_revision.get(),
+            committed_revision: committed_revision.get(),
+        };
+        let max_ops = guard.store.limits().max_transaction_operations;
+        let mut ui = UiTransaction::new(guard.store.clone_staging(), max_ops);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut ui, revisions)));
+
+        match result {
+            Ok(Ok(value)) => {
+                let (staged, ops) = ui.into_staged_and_ops();
+                let deletes_nodes = ops
+                    .iter()
+                    .any(|op| matches!(op, Operation::DeleteNode { .. }));
+                let commit = AuthoritativeCommit::new(base_revision, ops);
+
+                // Journal admission is decided before the store mutates: append below cannot
+                // fail, so the store and the journal advance together or neither does.
+                let permit = guard.journal.prepare(&commit)?;
+                let transaction = permit.transaction().clone();
+                guard.store.commit_staging(staged, commit.new_revision());
+                guard.journal.append(permit);
+                if deletes_nodes {
+                    let SessionInner {
+                        store,
+                        text_edit_tracker,
+                        ..
+                    } = &mut *guard;
+                    text_edit_tracker.reclaim_missing_nodes(store);
+                }
+                self.publish_committed(&transaction);
+                let missing_terminals = if deletes_nodes {
+                    self.pty
+                        .live_stream_ids()
+                        .into_iter()
+                        .filter(|id| guard.store.get_node(*id).is_none())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                drop(guard);
+                self.close_terminals_for_deleted_nodes(&missing_terminals);
+                Ok(TransactionResult { value, transaction })
+            }
+            Ok(Err(store_err)) => Err(SessionError::Store(store_err)),
+            Err(panic_payload) => Err(SessionError::Panicked(panic_payload_message(
+                panic_payload.as_ref(),
+            ))),
+        }
+    }
+
+    /// Publishes one committed transaction while preserving commit order.
     ///
     /// # Locking
     ///
@@ -1038,7 +1097,12 @@ impl Session {
             .unwrap_or_default();
         drop(guard);
 
-        self.dispatch_admitted_event(event, &matching_handlers, HandlerDispatchKind::Ordinary)
+        self.dispatch_admitted_event(
+            event,
+            &matching_handlers,
+            HandlerDispatchKind::Ordinary,
+            None,
+        )
     }
 
     fn admit_event(
@@ -1086,15 +1150,17 @@ impl Session {
             last_processed_event_seq,
         }
     }
+
     pub(crate) fn dispatch_admitted_event(
         &self,
         event: &Event,
         handlers: &[RegisteredHandler],
         kind: HandlerDispatchKind,
+        committed: Option<&Transaction>,
     ) -> Result<EventOutcome, SessionError> {
         let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for handler in handlers {
-                handler.call(self, event)?;
+                handler.call(self, event, committed)?;
             }
             Ok(())
         }));
@@ -1254,6 +1320,59 @@ mod tests {
             let surface = Surface::from_store(store, NodeId::new(1)).expect("surface exists");
             assert_eq!(surface.label(store), Some("Counter Application"));
         });
+    }
+
+    #[test]
+    fn transaction_result_uses_revisions_chosen_after_a_concurrent_commit() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let session = Session::new("transaction-result-race");
+        let first_entered = Arc::new(Barrier::new(2));
+        let release_first = Arc::new(Barrier::new(2));
+
+        let first_session = session.clone();
+        let first_entered_worker = Arc::clone(&first_entered);
+        let release_first_worker = Arc::clone(&release_first);
+        let first = thread::spawn(move || {
+            first_session.transaction(|_| {
+                first_entered_worker.wait();
+                release_first_worker.wait();
+                Ok(())
+            })
+        });
+        first_entered.wait();
+
+        let second_started = Arc::new(Barrier::new(2));
+        let second_session = session.clone();
+        let second_started_worker = Arc::clone(&second_started);
+        let second = thread::spawn(move || {
+            second_started_worker.wait();
+            second_session.transaction_with_result(|_, revisions| Ok(revisions))
+        });
+        second_started.wait();
+        release_first.wait();
+
+        first
+            .join()
+            .expect("first transaction thread does not panic")
+            .expect("first transaction commits");
+        let result = second
+            .join()
+            .expect("second transaction thread does not panic")
+            .expect("second transaction commits after waiting");
+
+        assert_eq!(
+            result.value,
+            TransactionRevisions {
+                base_revision: 1,
+                committed_revision: 2,
+            },
+            "the waiting transaction must receive revisions selected after the first commit"
+        );
+        assert_eq!(result.transaction.base_revision, 1);
+        assert_eq!(result.transaction.new_revision, 2);
+        assert_eq!(session.current_revision(), 2);
     }
 
     #[test]

@@ -62,7 +62,7 @@ Do not run a repository-wide hook merely because a ticket changes documentation.
 
 ## External actions
 
-Creating branches, commits, and worktrees is part of this workflow. Pushing or opening a pull request requires the user's authorization for the current run; merging to `main` is never performed by this skill. Do not send messages or deploy artifacts unless separately authorized.
+Creating branches, commits, and worktrees is part of this workflow. For an ordinary implementation or supervision request, the delivery step after a passing verification is to push the task branch and open or update its pull request; the initiating implementation request authorizes that delivery. An explicit local-only or canary request suppresses push and pull-request creation. If the request does not establish either mode, mark delivery `pending_authorization` and ask before pushing. Merging to `main` is never performed by this skill. Do not send messages or deploy artifacts unless separately authorized.
 
 ## Stop conditions
 

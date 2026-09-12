@@ -7,9 +7,17 @@ description: Independently verify one completed SRUI Process Explorer ticket fro
 
 Use this skill after an implementer reports a completed ticket.
 
+## Scoped verification policy
+
+Follow the orchestrator's [scoped verification policy](../process-explorer-orchestrator/SKILL.md#scoped-verification-policy). Independently compare the proposed check profile with the candidate diff and ticket acceptance criteria; the implementer's passing results are not verification evidence.
+
+Rerun the selected ticket acceptance checks from the clean candidate, including required native/wire/Linux/live evidence. App-only changes do not require all unchanged runtime, SDK, renderer, example or benchmark suites. Documentation-only changes need whitespace, required skill frontmatter and relevant plan/schema consistency checks. Do not add general Markdown link/fence validation unless the ticket explicitly requires it. Reuse recorded baseline evidence only after checking that the relevant source, dependency pins, test configuration and environment remain applicable; cite its revision and results separately from your own runs.
+
+Add checks for an affected shared component, an explicit acceptance/release requirement or a concrete regression, and state the reason. Baseline and setup-reference command examples are not a mandatory full-repository checklist. An unrelated check excluded from the profile is not an acceptance gap. Once review and selected checks finish, return the concise verdict without optional extra audits; only relevant changes or unresolved failures justify reruns. Configured delivery hooks remain the orchestrator's separate responsibility.
+
 ## Independence
 
-Start from the candidate implementation commit in a fresh worktree or clean checkout. Do not reuse the implementer's conversation, unstaged state, build assumptions, or conclusions. Read only the assigned ticket, the authoritative SRUI design sections it cites, the revision-specific baseline, verified dependency evidence, and the candidate diff.
+Start from the candidate implementation commit in a fresh worktree or clean checkout. Do not reuse the implementer's conversation, unstaged state, build assumptions, or conclusions. Read only the assigned ticket, scoped verification profile, authoritative SRUI design sections it cites, revision-specific baseline, verified dependency evidence, and candidate diff.
 
 Before any write, confirm the verifier worktree is non-main. Product source, tests, generated code, and plan specifications are read-only for this skill. Write only an external or explicitly designated verification report; never patch failures during verification.
 

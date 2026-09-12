@@ -34,7 +34,7 @@ PX-035-G01 resolves advanced-action feasibility before enabling those operations
 - `validate_feature_ledger.py`: schema, duplicate-ID, upstream-reference, owner, status, and evidence checks for the PX-000 ledger.
 - `STANDING_AGENT_CONTRACT.md`: shared implementation rules.
 - `SOURCES.md`: design and upstream reference provenance.
-- `validate_plan.py`: consistency, dependency, and link checks.
+- `validate_plan.py`: ticket, dependency, execution-order, shared-contract, and feature-ownership consistency checks; excludes general Markdown link/fence linting.
 - `VALIDATION_REPORT.md`: planning validation and its limits.
 
 The htop baseline remains 3.5.3; no fresh upstream release check was performed for edition 1.1. Rebaseline explicitly for newer releases. The adjacent `../IMPLEMENTATION_PLAN.md` points to this canonical planning pack.

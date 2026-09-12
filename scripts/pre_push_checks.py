@@ -105,7 +105,7 @@ def classify(paths: list[str]) -> dict[str, list[str]]:
         suffix = Path(path).suffix.lower()
         if path in HOOK_FILES:
             profile = "hook"
-        elif path.startswith(PLAN + "/") and suffix in {".md", ".json", ".png"}:
+        elif path.startswith(PLAN + "/") and suffix in {".md", ".json", ".png", ".py"}:
             profile = "plan"
         elif suffix in {".md", ".rst"} or (suffix == ".txt" and path.startswith("docs/")):
             profile = "docs"
@@ -139,6 +139,10 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
             Check("Process Explorer plan", ["python3", f"{PLAN}/validate_plan.py"]),
             Check("Process Explorer ledgers", ["python3", SCRIPT, "--check-ledgers"]),
         ])
+        if any(Path(path).suffix.lower() == ".py" for path in profiles["plan"]):
+            checks.append(Check("Process Explorer plan tooling regression tests", [
+                "python3", "-m", "unittest", "discover", "-s", PLAN, "-p", "test_*.py",
+            ]))
     if "hook" in profiles:
         checks.extend([
             Check("hook syntax", ["sh", "-n", ".githooks/pre-push"]),

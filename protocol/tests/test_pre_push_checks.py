@@ -50,6 +50,27 @@ class SelectionTests(unittest.TestCase):
         commands = checks.commands(checks.classify(paths), paths, [], [], "Darwin")
         self.assertEqual([item.name for item in commands], ["documentation"])
 
+    def test_plan_python_changes_run_validators_and_regressions_without_app_builds(self):
+        for name in ("validate_plan.py", "validate_feature_ledger.py",
+                     "test_validate_feature_ledger.py"):
+            for system in ("Darwin", "Linux"):
+                with self.subTest(name=name, system=system):
+                    paths = [checks.PLAN + "/" + name]
+                    commands = checks.commands(checks.classify(paths), paths, [], [], system)
+                    self.assertEqual([item.argv for item in commands], [
+                        ["python3", checks.PLAN + "/validate_plan.py"],
+                        ["python3", checks.SCRIPT, "--check-ledgers"],
+                        ["python3", "-m", "unittest", "discover", "-s", checks.PLAN,
+                         "-p", "test_*.py"],
+                    ])
+
+    def test_plan_data_changes_only_run_validators(self):
+        paths = [checks.PLAN + "/feature-ledger.px002.json"]
+        commands = checks.commands(checks.classify(paths), paths, [], [], "Darwin")
+        self.assertEqual([item.name for item in commands], [
+            "Process Explorer plan", "Process Explorer ledgers",
+        ])
+
     def test_shared_dependencies_and_unknown_code_fall_back_to_full(self):
         for path in ["server-rust/sdk/src/lib.rs", "protocol/srui.proto",
                      "client-macos/RendererAppKit/AppKitRenderer.swift",

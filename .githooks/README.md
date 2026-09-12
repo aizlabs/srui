@@ -8,6 +8,7 @@ the merge gate; its jobs and coverage are unchanged.
 | Process Explorer source, tests, app dependencies, launcher, or its native Swift test | App formatting, Clippy, Rust tests, and native SSH integration on macOS |
 | Markdown/reStructuredText, text files under docs/, and skills | Whitespace plus changed Markdown links/fences and skill frontmatter |
 | Process Explorer plan Markdown/JSON/evidence | Plan and individual-ledger validators, plus applicable documentation checks |
+| Python tooling under the Process Explorer plan | Plan and individual-ledger validators, plus planning-tool regression tests |
 | Hook, selector, or selector tests | Shell syntax and selector regression tests |
 | Shared runtime/SDK/protocol/client, shared dependencies/configuration, other or unknown executable paths | Existing full checks |
 

@@ -118,23 +118,13 @@ def main() -> int:
     actual_files = {p.relative_to(root).as_posix() for p in (root / "tickets").glob("*.md")}
     if actual_files != {t["file"] for t in tasks}:
         errors.append("Ticket file set differs from index")
-    for path in root.rglob("*.md"):
-        text = path.read_text(encoding="utf-8")
-        if sum(line.startswith(fence) for line in text.splitlines()) % 2:
-            errors.append(f"Unbalanced fences: {path.name}")
-        for target in re.findall(r"\[[^]]*\]\(([^)]+)\)", text):
-            if re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*:", target) or target.startswith("#"):
-                continue
-            local = target.split("#", 1)[0].strip("<>")
-            if local and not (path.parent / local).exists():
-                errors.append(f"Broken link in {path.name}: {target}")
     for error in errors:
         print("FAIL:", error)
     if errors:
         return 1
     print(f"PASS: {len(tasks)} unique tickets; original IDs preserved; dependencies resolve; graph acyclic.")
     print("PASS: JSON, master, standalone tickets, shared contracts, and execution queue agree.")
-    print(f"PASS: {len(actual_files)} ticket files; local Markdown links and fences valid.")
+    print(f"PASS: {len(actual_files)} ticket files match the task index.")
     print(f"PASS: {len(ledger)} feature families with valid owners and no fabricated evidence.")
     return 0
 

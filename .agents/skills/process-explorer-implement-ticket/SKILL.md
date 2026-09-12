@@ -9,7 +9,7 @@ Use this skill only when an orchestrator or user assigns one concrete ticket fro
 
 ## Scoped verification policy
 
-Follow the orchestrator's [scoped verification policy](../process-explorer-orchestrator/SKILL.md#scoped-verification-policy). Use its recorded profile, or select and record one from the ticket and affected components if none was supplied. App-only work needs app checks and the required native/wire/Linux evidence, not every unchanged infrastructure, example or benchmark suite. Documentation-only work needs relevant validators.
+Follow the orchestrator's [scoped verification policy](../process-explorer-orchestrator/SKILL.md#scoped-verification-policy). Use its recorded profile, or select and record one from the ticket and affected components if none was supplied. App-only work needs app checks and the required native/wire/Linux evidence, not every unchanged infrastructure, example or benchmark suite. Documentation-only work needs whitespace, required skill frontmatter and relevant plan/schema consistency checks. Do not add general Markdown link/fence validation unless the ticket explicitly requires it.
 
 Treat historical baseline/setup command lists as a menu. Reuse applicable baseline evidence for unchanged components, recording the revision and why it still applies; it cannot replace tests of new behavior. Add checks only for newly affected code, an explicit acceptance/release requirement, or a concrete regression, and record the reason.
 

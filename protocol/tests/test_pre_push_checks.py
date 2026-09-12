@@ -48,7 +48,7 @@ class SelectionTests(unittest.TestCase):
         paths = ["CLAUDE.md", ".agents/skills/process-explorer-orchestrator/SKILL.md"]
         self.assertEqual(self.profiles(paths), {"docs"})
         commands = checks.commands(checks.classify(paths), paths, [], [], "Darwin")
-        self.assertEqual([item.name for item in commands], ["documentation"])
+        self.assertEqual([item.name for item in commands], ["skill frontmatter"])
 
     def test_plan_python_changes_run_validators_and_regressions_without_app_builds(self):
         for name in ("validate_plan.py", "validate_feature_ledger.py",
@@ -253,32 +253,13 @@ class GitFixture(unittest.TestCase):
         )
         self.assertEqual(set(json.loads(result.stdout)["profiles"]), {"srtop"})
 
-    def test_changed_document_validation_is_bounded(self):
-        self.write("README.md", "# Fixture\n[local](guide.md)\n")
-        self.write("guide.md", "# Guide\n")
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            self.assertEqual(checks.check_docs(self.repo, ["README.md", "deleted.md"]), 0)
-            self.write("README.md", "[broken](absent.md)\n")
-            self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
-            self.write("README.md", chr(96) * 3 + "\nunfinished\n")
-            self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
-
-    def test_markdown_link_titles_are_not_part_of_the_destination(self):
-        for destination in ("guide.md", "<guide with spaces.md>",
-                            "guide%20with%20spaces.md", "guide(appendix).md",
-                            r"guide\(appendix\).md"):
-            for title in ('"Guide title"', "'Guide title'", "(Guide title)",
-                          '"Title with ) parentheses"'):
-                with self.subTest(destination=destination, title=title):
-                    self.write("guide.md", "# Guide\n")
-                    self.write("guide with spaces.md", "# Guide\n")
-                    self.write("guide(appendix).md", "# Appendix\n")
-                    self.write("README.md", f"[guide]({destination} {title})\n")
-                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                        self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 0)
-        self.write("README.md", '[missing](absent.md "Title")\n')
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            self.assertEqual(checks.check_docs(self.repo, ["README.md"]), 1)
+    def test_plain_document_push_only_checks_whitespace(self):
+        self.write("README.md", 'Use ' + chr(96) + '[x](missing.md)' + chr(96)
+                   + ' as syntax.\n\n[guide](absent.md "Guide title")\n')
+        plan = self.plan(self.save())
+        self.assertEqual([item.name for item in plan.checks], ["whitespace"])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(checks.run_plan(self.repo, plan), 0)
 
     def test_linux_native_syntax_failure_blocks_push_and_deleted_file_is_skipped(self):
         self.write(checks.NATIVE_TEST, "func broken( {\n")

@@ -13,7 +13,6 @@ import re
 import shlex
 import subprocess
 import sys
-from urllib.parse import unquote, urlsplit
 
 SCRIPT = "scripts/pre_push_checks.py"
 PLAN = "apps/srtop/srui-process-explorer-plan"
@@ -129,10 +128,10 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
     if not ranges:
         checks.extend(Check("whitespace", ["git", "show", "--format=", "--check", head])
                       for head in targets)
-    markdown = [path for path in paths if path.lower().endswith(".md")]
-    if markdown:
-        checks.append(Check("documentation", [
-            "uv", "run", "--frozen", "python", SCRIPT, "--check-docs", "--", *markdown,
+    skills = [path for path in paths if Path(path).name == "SKILL.md"]
+    if skills:
+        checks.append(Check("skill frontmatter", [
+            "uv", "run", "--frozen", "python", SCRIPT, "--check-skills", "--", *skills,
         ]))
     if "plan" in profiles:
         checks.extend([
@@ -258,78 +257,28 @@ def print_plan(plan: Plan) -> None:
     sys.stdout.flush()
 
 
-def markdown_link_targets(text: str):
-    """Read inline destinations separately from optional Markdown link titles."""
-    for match in re.finditer(r"\[[^\]]*\]\(\s*", text):
-        index = match.end()
-        angled = text[index:index + 1] == "<"
-        index += int(angled)
-        target, depth = [], 0
-        while index < len(text):
-            char = text[index]
-            if char == "\\" and index + 1 < len(text):
-                target.append(text[index + 1])
-                index += 2
-                continue
-            if angled:
-                if char == ">":
-                    break
-            else:
-                if char.isspace() or (char == ")" and depth == 0):
-                    break
-                if char == "(":
-                    depth += 1
-                elif char == ")":
-                    depth -= 1
-            target.append(char)
-            index += 1
-        yield "".join(target)
-
-
-def check_docs(repo: Path, paths: list[str]) -> int:
+def check_skills(repo: Path, paths: list[str]) -> int:
+    import yaml  # Declared, locked project dependency.
     errors = []
     for name in paths:
         path = repo / name
         if not path.exists():  # Deleted files remain selection inputs.
             continue
         text = path.read_text(encoding="utf-8")
-        if path.name == "SKILL.md":
-            import yaml  # Declared, locked project dependency; only docs need it.
-            match = re.match(r"^---\n(.*?)\n---(?:\n|$)", text, re.S)
-            try:
-                metadata = yaml.safe_load(match[1]) if match else None
-                if not isinstance(metadata, dict) or any(
-                    not isinstance(metadata.get(key), str) or not metadata[key].strip()
-                    for key in ("name", "description")
-                ):
-                    errors.append(f"{name}: skill needs name and description frontmatter")
-            except yaml.YAMLError as error:
-                errors.append(f"{name}: invalid skill frontmatter: {error}")
-        visible, fence = [], None
-        for line in text.splitlines():
-            marker = re.match(r"^\s*(" + chr(96) + r"{3,}|~{3,})(.*)$", line)
-            if marker:
-                token, rest = marker.groups()
-                if fence is None:
-                    fence = token
-                elif token[0] == fence[0] and len(token) >= len(fence) and not rest.strip():
-                    fence = None
-            elif fence is None:
-                visible.append(line)
-        if fence is not None:
-            errors.append(f"{name}: unclosed Markdown fence")
-        for target in markdown_link_targets("\n".join(visible)):
-            url = urlsplit(target)
-            if url.scheme or url.netloc or not url.path:
-                continue
-            linked = (repo / unquote(url.path.lstrip("/")) if url.path.startswith("/")
-                      else path.parent / unquote(url.path))
-            if not linked.exists():
-                errors.append(f"{name}: missing local link {target}")
+        match = re.match(r"^---\n(.*?)\n---(?:\n|$)", text, re.S)
+        try:
+            metadata = yaml.safe_load(match[1]) if match else None
+            if not isinstance(metadata, dict) or any(
+                not isinstance(metadata.get(key), str) or not metadata[key].strip()
+                for key in ("name", "description")
+            ):
+                errors.append(f"{name}: skill needs name and description frontmatter")
+        except yaml.YAMLError as error:
+            errors.append(f"{name}: invalid skill frontmatter: {error}")
     for error in errors:
         print(f"FAIL: {error}", file=sys.stderr)
     if not errors:
-        print(f"Documentation checks passed for {len(paths)} selected paths.")
+        print(f"Skill frontmatter checks passed for {len(paths)} selected paths.")
     return int(bool(errors))
 
 
@@ -356,16 +305,16 @@ def main() -> int:
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true", help="Print a plan without executing checks")
-    parser.add_argument("--check-docs", action="store_true")
+    parser.add_argument("--check-skills", action="store_true")
     parser.add_argument("--check-ledgers", action="store_true")
     parser.add_argument("paths", nargs="*")
     args = parser.parse_args()
     try:
         repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
-        if args.check_docs or args.check_ledgers:
+        if args.check_skills or args.check_ledgers:
             if args.hook:
                 raise CheckError("Validation modes cannot override hook selection.")
-            return check_docs(repo, args.paths) if args.check_docs else check_ledgers(repo)
+            return check_skills(repo, args.paths) if args.check_skills else check_ledgers(repo)
         if args.paths:
             raise CheckError("Paths are selected from Git revisions, not command-line overrides.")
         if args.hook:

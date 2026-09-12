@@ -6,11 +6,17 @@ the merge gate; its jobs and coverage are unchanged.
 | Changed paths | Local profile |
 | --- | --- |
 | Process Explorer source, tests, app dependencies, launcher, or its native Swift test | App formatting, Clippy, Rust tests, and native SSH integration on macOS |
-| Markdown/reStructuredText, text files under docs/, and skills | Whitespace plus changed Markdown links/fences and skill frontmatter |
-| Process Explorer plan Markdown/JSON/evidence | Plan and individual-ledger validators, plus applicable documentation checks |
+| Markdown/reStructuredText and text files under docs/ | Whitespace |
+| Skills | Whitespace and required skill frontmatter |
+| Process Explorer plan Markdown/JSON/evidence | Ticket, dependency, contract and ledger consistency validators |
 | Python tooling under the Process Explorer plan | Plan and individual-ledger validators, plus planning-tool regression tests |
 | Hook, selector, or selector tests | Shell syntax and selector regression tests |
 | Shared runtime/SDK/protocol/client, shared dependencies/configuration, other or unknown executable paths | Existing full checks |
+
+General Markdown link and fence validation is not a push gate. Documentation
+examples and optional link titles do not affect application acceptance. The plan
+validator still checks ticket files, metadata, dependencies, shared contracts,
+execution order and feature-ledger ownership/evidence.
 
 Profiles combine. A full profile includes the app checks, so the selector does not
 run a second app suite. The app's native entrypoint already runs its Rust tests

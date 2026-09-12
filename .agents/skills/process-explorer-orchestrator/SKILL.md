@@ -13,7 +13,7 @@ Select checks from the ticket's acceptance criteria and affected components befo
 
 - **App-only changes:** run the app's tests, formatting/linting, and native, wire, Linux or live-process checks required by the ticket or changed behavior. Add conformance for the semantics affected. Using an unchanged SDK/runtime/renderer does not by itself require its entire test suite, unrelated examples, or benchmark packages.
 - **Shared infrastructure changes:** add focused tests for the changed SDK, runtime, protocol, renderer or dependency and its affected consumers. Broaden to full suites when the affected surface or a concrete regression warrants it.
-- **Documentation/skills:** use the relevant document, skill, schema, link/fence and whitespace validators; do not build product packages.
+- **Documentation/skills:** check whitespace, required skill frontmatter and relevant plan/schema consistency; do not build product packages. General Markdown link/fence validation is not a mandatory check unless the ticket explicitly requires it.
 - **Release gates:** run the broader checks explicitly required by that gate. A scoped profile never substitutes fake tests for required native, Linux, hardware or live evidence.
 
 Treat baseline command lists and setup-reference examples as a check-selection menu, not an instruction to rerun every historical command on every ticket. Reuse baseline evidence only after confirming its relevant source, dependency pins, test configuration and environment remain applicable; record its revision and results. Reused evidence does not verify new behavior.

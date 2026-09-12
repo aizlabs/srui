@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import re
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +21,40 @@ REQUIRED_ENTRY_FIELDS = {
 ALLOWED_STATUS = {"planned", "in_progress", "verified", "deferred"}
 
 
-def validate_ledger(document: dict[str, Any]) -> list[str]:
+def valid_evidence(item: Any) -> bool:
+    """Evidence is a URL/file reference, or a record with a reference field.
+
+    This checks reference structure, not whether the cited artifact proves parity.
+    """
+    reference = item.get("reference") if isinstance(item, dict) else item
+    if not isinstance(reference, str) or not reference.strip():
+        return False
+    reference = reference.strip()
+    if any(character.isspace() for character in reference):
+        return False
+    try:
+        url = urlsplit(reference)
+    except ValueError:
+        return False
+    if url.scheme:
+        return url.scheme in {"http", "https"} and bool(url.hostname)
+    # Local artifact references need a filename extension; bare claims and
+    # placeholders such as "TODO", "pending", and "N/A" are not evidence.
+    return bool(re.fullmatch(r"[^?#]+\.[A-Za-z0-9]+(?:#[^\s]+)?", reference))
+
+
+def validate_ledger(
+    document: dict[str, Any], ticket_ids: set[str] | None = None
+) -> list[str]:
     errors: list[str] = []
+    if ticket_ids is None:
+        try:
+            index = json.loads(
+                Path(__file__).with_name("task-index.json").read_text(encoding="utf-8")
+            )
+            ticket_ids = {task["id"] for task in index["tasks"]}
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+            return [f"cannot read ticket index: {error}"]
     if document.get("schema_version") != 1:
         errors.append("schema_version must be 1")
     upstream = document.get("upstream")
@@ -65,11 +99,20 @@ def validate_ledger(document: dict[str, Any]) -> list[str]:
         evidence = entry.get("evidence")
         if not isinstance(evidence, list):
             errors.append(f"{prefix} evidence must be an array")
-        elif status == "verified" and not evidence:
-            errors.append(f"{prefix} verified entry has no evidence")
+        else:
+            if status == "verified" and not evidence:
+                errors.append(f"{prefix} verified entry has no evidence")
+            for item in evidence:
+                if not valid_evidence(item):
+                    errors.append(f"{prefix} has invalid evidence reference: {item!r}")
         owner = entry.get("owner")
-        if not isinstance(owner, str) or not owner:
+        if not isinstance(owner, str) or not owner.strip():
             errors.append(f"{prefix} must have an owner")
+        else:
+            for ticket_id in owner.split("/"):
+                ticket_id = ticket_id.strip()
+                if ticket_id not in ticket_ids:
+                    errors.append(f"{prefix} has unknown owner: {ticket_id!r}")
 
     return errors
 

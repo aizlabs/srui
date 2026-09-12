@@ -72,7 +72,7 @@ pub struct ResumeClientBootstrap {
     pub outcome: ResumeOutcome,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
-    /// Whether this client may send terminal input/resize (prior negotiation or required profile).
+    /// Whether this resume re-advertised and negotiated `org.srui.terminal/1`.
     pub terminal_negotiated: bool,
     /// Terminal catch-up captured before resume so live bytes cannot fall through (§21.2).
     pub terminal: TerminalAttach,
@@ -93,6 +93,160 @@ pub enum ResumeOutcome {
     },
 }
 
+fn negotiate_client(
+    inner: &super::SessionInner,
+    core_version: &str,
+    profiles: &[String],
+) -> Result<CapabilitySet, SessionError> {
+    // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
+    // version would let two peers that disagree about required semantics reach the data plane
+    // (§4 inv. 13).
+    if !core_version_is_compatible(core_version) {
+        return Err(SessionError::UnsupportedCoreVersion {
+            requested: core_version.to_string(),
+            supported: CORE_VERSION.to_string(),
+        });
+    }
+
+    let mut client_caps = CapabilitySet::new();
+    for profile in profiles {
+        if let Ok(profile) = Profile::parse(profile) {
+            client_caps.insert(profile);
+        }
+    }
+    let negotiated = inner.capabilities.negotiate(&client_caps)?;
+    validate_extension_namespace_contract(inner)?;
+    Ok(negotiated)
+}
+
+/// Validates the complete server-advertised namespace contract while `SessionInner` is locked.
+///
+/// Handshake responses carry the server's required and optional profile lists. An advertised
+/// optional extension without a mapping would therefore become negotiated for any client that
+/// offers it. Reject that configuration before snapshot export, subscription, or terminal attach
+/// instead of sending a response whose numeric type references cannot be decoded (§6.4, §15).
+fn validate_extension_namespace_contract(inner: &super::SessionInner) -> Result<(), SessionError> {
+    let standard_widgets = Profile::standard_widgets_v1();
+    let standard_uri = standard_widgets.name();
+    let mut standard_mappings = inner
+        .extension_namespaces
+        .iter()
+        .filter(|mapping| mapping.extension_uri == standard_uri);
+    let Some(standard_mapping) = standard_mappings.next() else {
+        return Err(SessionError::InvalidConfiguration(
+            "the reserved standard widget namespace mapping is missing".to_string(),
+        ));
+    };
+    if standard_mapping.namespace_id != 0 {
+        return Err(SessionError::InvalidConfiguration(
+            "the reserved standard widget namespace must use namespace_id 0".to_string(),
+        ));
+    }
+    if standard_mappings.next().is_some() {
+        return Err(SessionError::InvalidConfiguration(
+            "the reserved standard widget namespace has more than one mapping".to_string(),
+        ));
+    }
+
+    for profile in inner
+        .capabilities
+        .required
+        .iter()
+        .chain(inner.capabilities.optional.iter())
+    {
+        if profile.name() == standard_uri {
+            if profile != &standard_widgets {
+                return Err(SessionError::InvalidConfiguration(format!(
+                    "unsupported standard widget profile {profile}; namespace_id 0 is reserved for org.srui.standard-widgets/1"
+                )));
+            }
+            continue;
+        }
+
+        let extension_uri = profile.to_string();
+        let mut mappings = inner
+            .extension_namespaces
+            .iter()
+            .filter(|mapping| mapping.extension_uri == extension_uri);
+        let Some(mapping) = mappings.next() else {
+            return Err(SessionError::InvalidConfiguration(format!(
+                "advertised profile {profile} has no extension namespace mapping"
+            )));
+        };
+        if mapping.namespace_id == 0 {
+            return Err(SessionError::InvalidConfiguration(format!(
+                "advertised profile {profile} must use a nonzero extension namespace"
+            )));
+        }
+        if mappings.next().is_some() {
+            return Err(SessionError::InvalidConfiguration(format!(
+                "advertised profile {profile} has more than one extension namespace mapping"
+            )));
+        }
+    }
+
+    let mut seen_ids = HashSet::new();
+    let mut seen_uris = HashSet::new();
+    for mapping in &inner.extension_namespaces {
+        if mapping.extension_uri == standard_uri {
+            if mapping.namespace_id != 0 {
+                return Err(SessionError::InvalidConfiguration(
+                    "the reserved standard widget namespace must use namespace_id 0".to_string(),
+                ));
+            }
+        } else {
+            if mapping.namespace_id == 0 {
+                return Err(SessionError::InvalidConfiguration(format!(
+                    "extension namespace {:?} must use a nonzero namespace_id",
+                    mapping.extension_uri
+                )));
+            }
+            let mapped_profile = Profile::parse(&mapping.extension_uri).map_err(|error| {
+                SessionError::InvalidConfiguration(format!(
+                    "extension namespace URI {:?} is not a versioned profile: {error}",
+                    mapping.extension_uri
+                ))
+            })?;
+            if mapped_profile.to_string() != mapping.extension_uri {
+                return Err(SessionError::InvalidConfiguration(format!(
+                    "extension namespace URI {:?} is not canonical; expected {:?}",
+                    mapping.extension_uri,
+                    mapped_profile.to_string()
+                )));
+            }
+            if mapped_profile.name() == standard_uri {
+                return Err(SessionError::InvalidConfiguration(
+                    "standard widget profiles cannot have nonzero extension namespace aliases"
+                        .to_string(),
+                ));
+            }
+            if !inner.capabilities.required.contains(&mapped_profile)
+                && !inner.capabilities.optional.contains(&mapped_profile)
+            {
+                return Err(SessionError::InvalidConfiguration(format!(
+                    "extension namespace URI {:?} is not advertised as a required or optional profile",
+                    mapping.extension_uri
+                )));
+            }
+        }
+
+        if !seen_ids.insert(mapping.namespace_id) {
+            return Err(SessionError::InvalidConfiguration(format!(
+                "duplicate extension namespace_id {}",
+                mapping.namespace_id
+            )));
+        }
+        if !seen_uris.insert(mapping.extension_uri.as_str()) {
+            return Err(SessionError::InvalidConfiguration(format!(
+                "duplicate extension_uri {:?} in extension namespace table",
+                mapping.extension_uri
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn negotiate_hello(
     inner: &super::SessionInner,
     hello: &ClientHello,
@@ -100,24 +254,7 @@ fn negotiate_hello(
     // Refuse an unretainable identity before any per-client table copies it (§15, §26).
     validate_client_instance_id(&hello.client_instance_id)?;
 
-    // §15: `core_version` is part of the handshake, not decoration. Accepting an unknown core
-    // version would let two peers that disagree about required semantics reach the data plane
-    // (§4 inv. 13).
-    if !core_version_is_compatible(&hello.core_version) {
-        return Err(SessionError::UnsupportedCoreVersion {
-            requested: hello.core_version.clone(),
-            supported: CORE_VERSION.to_string(),
-        });
-    }
-
-    let mut client_caps = CapabilitySet::new();
-    for p_str in &hello.profiles {
-        if let Ok(p) = Profile::parse(p_str) {
-            client_caps.insert(p);
-        }
-    }
-
-    let negotiated = inner.capabilities.negotiate(&client_caps)?;
+    let negotiated = negotiate_client(inner, &hello.core_version, &hello.profiles)?;
     let terminal_negotiated = negotiated.contains(&Profile::terminal_v1());
 
     let initial_revision = inner.store.revision().get();
@@ -404,10 +541,11 @@ impl Session {
 
     /// Atomically prepares a client resume and subscribes it to transactions (§18, §18.1, §20.2).
     ///
-    /// Replaced session incarnations are evaluated first (§18.1). If the session incarnation matches
-    /// but the client detached due to outbound queue overflow (§20.2), full state resync is forced.
-    /// If neither applies and `last_applied_revision` is within the retained journal window,
-    /// a replay is prepared; otherwise, same-session snapshot resync is returned.
+    /// Core/profile compatibility is validated before selecting or exporting any catch-up.
+    /// Replaced session incarnations are evaluated first (§18.1). If the session incarnation
+    /// matches but the client detached due to outbound queue overflow (§20.2), full state resync
+    /// is forced. If neither applies and `last_applied_revision` is within the retained journal
+    /// window, a replay is prepared; otherwise, same-session snapshot resync is returned.
     pub fn bootstrap_resume(
         &self,
         resume: &ClientResume,
@@ -452,6 +590,9 @@ impl Session {
                 reason: String,
                 last_processed_event_seq: u64,
                 discarded_text_edits: Vec<srui_protocol::PendingTextEditRef>,
+                required_profiles: Vec<String>,
+                optional_profiles: Vec<String>,
+                extension_namespaces: Vec<srui_protocol::ExtensionNamespaceMapping>,
                 pending_text_edit_cancellation:
                     Option<super::text_edit::PendingTextEditCancellation>,
             },
@@ -488,8 +629,11 @@ impl Session {
 
         let mut before_subscribe = Some(before_subscribe);
         let mut optimistic_attempts = 0usize;
-        let (mut inner_guard, mut plan) = loop {
+        let (mut inner_guard, mut plan, terminal_negotiated) = loop {
             let inner_guard = self.inner.lock().map_err(|_| SessionError::LockPoisoned)?;
+            let negotiated =
+                negotiate_client(&inner_guard, &resume.core_version, &resume.profiles)?;
+            let terminal_negotiated = negotiated.contains(&Profile::terminal_v1());
             let Some(cause) = determine_resync_cause(&inner_guard) else {
                 let last_processed_event_seq = inner_guard
                     .dedupe
@@ -503,10 +647,13 @@ impl Session {
                         session_id: inner_guard.session_id.clone(),
                         replay_from_revision: resume.last_applied_revision,
                         last_processed_event_seq,
+                        required_profiles: inner_guard.capabilities.required.to_string_vec(),
+                        optional_profiles: inner_guard.capabilities.optional.to_string_vec(),
+                        extension_namespaces: inner_guard.extension_namespaces.clone(),
                     },
                     replayed: iter.cloned().collect(),
                 };
-                break (inner_guard, plan);
+                break (inner_guard, plan, terminal_negotiated);
             };
 
             let snapshot_revision = inner_guard.store.revision().get();
@@ -581,43 +728,13 @@ impl Session {
                 reason: cause.reason().to_string(),
                 last_processed_event_seq,
                 discarded_text_edits,
+                required_profiles: inner_guard.capabilities.required.to_string_vec(),
+                optional_profiles: inner_guard.capabilities.optional.to_string_vec(),
+                extension_namespaces: inner_guard.extension_namespaces.clone(),
                 pending_text_edit_cancellation,
             };
-            break (inner_guard, plan);
+            break (inner_guard, plan, terminal_negotiated);
         };
-
-        // A replaced incarnation was never negotiated with this client: CLIENT_RESUME carries no
-        // profile list, so the server cannot know whether the peer implements the extension
-        // profiles this incarnation requires. Inferring support from server state would push a
-        // Terminal node and terminal frames at a client that cannot mount them. Fail explicitly
-        // and make the client re-handshake instead of degrading silently (§11.1, §15, §4 inv. 13).
-        //
-        // The standard-widgets baseline is exempt: no peer can reach the data plane without it,
-        // so a resume already proves it was negotiated.
-        if matches!(
-            &plan,
-            ResumePlan::Resync {
-                continuity: SessionContinuity::Replaced,
-                ..
-            }
-        ) {
-            let unproven: Vec<String> = inner_guard
-                .capabilities
-                .required
-                .iter()
-                .filter(|profile| **profile != Profile::standard_widgets_v1())
-                .map(ToString::to_string)
-                .collect();
-            if !unproven.is_empty() {
-                let unproven = unproven.join(", ");
-                drop(inner_guard);
-                return Err(SessionError::InvalidInput(format!(
-                    "CLIENT_RESUME names a replaced incarnation, but this session requires \
-                     [{unproven}], which this client never negotiated here. Reconnect with \
-                     CLIENT_HELLO (§11.1, §15)"
-                )));
-            }
-        }
 
         before_subscribe
             .take()
@@ -658,14 +775,6 @@ impl Session {
                 ..
             }
         );
-        let terminal_negotiated = inner_guard
-            .capabilities
-            .required
-            .contains(&Profile::terminal_v1())
-            || inner_guard
-                .extension_namespaces
-                .iter()
-                .any(|mapping| mapping.extension_uri == srui_protocol::TERMINAL_PROFILE_URI);
         drop(inner_guard);
 
         let terminal = self.attach_terminals(&resume.terminal_stream_offsets, replaced)?;
@@ -686,6 +795,9 @@ impl Session {
                 reason,
                 last_processed_event_seq,
                 discarded_text_edits,
+                required_profiles,
+                optional_profiles,
+                extension_namespaces,
                 pending_text_edit_cancellation: _,
             } => ResumeOutcome::Resync {
                 resync_msg: ServerResyncRequired {
@@ -695,6 +807,9 @@ impl Session {
                     continuity: continuity as i32,
                     last_processed_event_seq,
                     discarded_text_edits,
+                    required_profiles,
+                    optional_profiles,
+                    extension_namespaces,
                 },
                 snapshot_transaction,
             },
@@ -712,7 +827,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use srui_semantic_tree::{NodeId, Revision, StoreLimits, TypeRef};
+    use srui_semantic_tree::{NodeId, Revision, ServerCapabilities, StoreLimits, TypeRef};
     use std::cell::Cell;
     use std::sync::{Arc, Barrier, TryLockError};
     use std::thread;
@@ -726,6 +841,356 @@ mod tests {
             client_metadata: Default::default(),
             known_resource_hashes: vec![],
         }
+    }
+
+    const UNMAPPED_PROFILE: &str = "org.example.unmapped/1";
+
+    fn session_with_unmapped_optional_profile(session_id: &str) -> Session {
+        let required =
+            CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1"]).expect("required");
+        let optional = CapabilitySet::from_str_slice(&[UNMAPPED_PROFILE]).expect("optional");
+        Session::with_capabilities(session_id, ServerCapabilities::new(required, optional))
+    }
+
+    fn session_with_unmapped_required_profile(session_id: &str) -> Session {
+        let required =
+            CapabilitySet::from_str_slice(&["org.srui.standard-widgets/1", UNMAPPED_PROFILE])
+                .expect("required");
+        Session::with_capabilities(
+            session_id,
+            ServerCapabilities::new(required, CapabilitySet::new()),
+        )
+    }
+
+    fn hello_offering_unmapped_profile() -> ClientHello {
+        let mut hello = sample_hello();
+        hello.profiles.push(UNMAPPED_PROFILE.to_string());
+        hello
+    }
+
+    fn resume_offering_unmapped_profile(session_id: String) -> ClientResume {
+        ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: hello_offering_unmapped_profile().profiles,
+            session_id,
+            client_instance_id: vec![7, 7],
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: Default::default(),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![],
+        }
+    }
+
+    fn assert_unmapped_profile_rejected<T>(result: Result<T, SessionError>) {
+        match result {
+            Err(SessionError::InvalidConfiguration(reason)) => assert_eq!(
+                reason,
+                format!("advertised profile {UNMAPPED_PROFILE} has no extension namespace mapping")
+            ),
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("unmapped advertised extension must be rejected"),
+        }
+    }
+
+    #[test]
+    fn default_standard_session_does_not_negotiate_terminal_without_a_terminal_node() {
+        let session = Session::new("standard-only");
+        let mut hello = sample_hello();
+        hello.profiles.push(Profile::terminal_v1().to_string());
+
+        let bootstrap = session
+            .bootstrap_fresh_client(&hello)
+            .expect("standard-only handshake");
+
+        assert_eq!(
+            bootstrap.welcome.required_profiles,
+            vec!["org.srui.standard-widgets/1"]
+        );
+        assert!(bootstrap.welcome.optional_profiles.is_empty());
+        assert!(!bootstrap.terminal_negotiated);
+        assert!(bootstrap
+            .welcome
+            .extension_namespaces
+            .iter()
+            .all(|mapping| mapping.extension_uri != Profile::terminal_v1().to_string()));
+    }
+
+    #[test]
+    fn fresh_handshake_rejects_unoffered_optional_extension_without_a_namespace() {
+        let session = session_with_unmapped_optional_profile("invalid-fresh-optional");
+
+        assert_unmapped_profile_rejected(session.bootstrap_fresh_client(&sample_hello()));
+        assert!(!session.inner.lock().expect("session lock").has_negotiated);
+    }
+
+    #[test]
+    fn fresh_handshake_rejects_required_extension_without_a_namespace() {
+        let session = session_with_unmapped_required_profile("invalid-fresh-required");
+
+        assert_unmapped_profile_rejected(
+            session.bootstrap_fresh_client(&hello_offering_unmapped_profile()),
+        );
+        assert!(!session.inner.lock().expect("session lock").has_negotiated);
+    }
+
+    #[test]
+    fn replay_resume_rejects_advertised_extension_without_a_namespace() {
+        let session = session_with_unmapped_optional_profile("invalid-replay");
+        let resume = resume_offering_unmapped_profile(session.session_id());
+
+        assert_unmapped_profile_rejected(session.bootstrap_resume(&resume));
+        assert!(!session.inner.lock().expect("session lock").has_negotiated);
+    }
+
+    #[test]
+    fn resync_resume_rejects_advertised_extension_without_a_namespace() {
+        let session = session_with_unmapped_optional_profile("invalid-resync");
+        let resume = resume_offering_unmapped_profile("replaced-session".to_string());
+
+        assert_unmapped_profile_rejected(session.bootstrap_resume(&resume));
+        assert!(!session.inner.lock().expect("session lock").has_negotiated);
+    }
+
+    #[test]
+    fn namespace_contract_rejects_malformed_mapping_tables() {
+        let missing_standard = Session::new("missing-standard-namespace");
+        missing_standard
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .clear();
+        let missing_reason = {
+            let inner = missing_standard.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("missing standard namespace must be rejected");
+            };
+            reason
+        };
+        assert!(missing_reason.contains("standard widget namespace mapping is missing"));
+
+        let wrong_standard_id = Session::new("wrong-standard-namespace-id");
+        wrong_standard_id
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces[0]
+            .namespace_id = 1;
+        let wrong_standard_id_reason = {
+            let inner = wrong_standard_id.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("wrong standard namespace ID must be rejected");
+            };
+            reason
+        };
+        assert!(wrong_standard_id_reason.contains("must use namespace_id 0"));
+
+        let duplicate_standard = Session::new("duplicate-standard-namespace");
+        duplicate_standard
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .push(srui_protocol::ExtensionNamespaceMapping {
+                extension_uri: "org.srui.standard-widgets".to_string(),
+                namespace_id: 1,
+            });
+        let duplicate_standard_reason = {
+            let inner = duplicate_standard.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("duplicate standard namespace must be rejected");
+            };
+            reason
+        };
+        assert!(duplicate_standard_reason.contains("has more than one mapping"));
+
+        let standard_v2_alias = Session::new("standard-v2-extension-alias");
+        standard_v2_alias
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .push(srui_protocol::ExtensionNamespaceMapping {
+                extension_uri: "org.srui.standard-widgets/2".to_string(),
+                namespace_id: 1,
+            });
+        let standard_v2_alias_reason = {
+            let inner = standard_v2_alias.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("standard v2 extension alias must be rejected");
+            };
+            reason
+        };
+        assert!(standard_v2_alias_reason
+            .contains("standard widget profiles cannot have nonzero extension namespace aliases"));
+
+        let malformed_uri = Session::new("malformed-extension-uri");
+        malformed_uri
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .push(srui_protocol::ExtensionNamespaceMapping {
+                extension_uri: "org.example.unversioned".to_string(),
+                namespace_id: 1,
+            });
+        let malformed_reason = {
+            let inner = malformed_uri.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("unversioned extension namespace must be rejected");
+            };
+            reason
+        };
+        assert!(malformed_reason.contains("is not a versioned profile"));
+
+        let noncanonical_uri = Session::new("noncanonical-extension-uri");
+        noncanonical_uri
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .push(srui_protocol::ExtensionNamespaceMapping {
+                extension_uri: " org.example.noncanonical/1 ".to_string(),
+                namespace_id: 1,
+            });
+        let noncanonical_reason = {
+            let inner = noncanonical_uri.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("noncanonical extension namespace must be rejected");
+            };
+            reason
+        };
+        assert!(noncanonical_reason.contains("is not canonical"));
+
+        let orphan = Session::new("orphan-extension-namespace");
+        orphan
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .push(srui_protocol::ExtensionNamespaceMapping {
+                extension_uri: "org.example.orphan/1".to_string(),
+                namespace_id: 1,
+            });
+        let orphan_reason = {
+            let inner = orphan.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("orphan extension namespace must be rejected");
+            };
+            reason
+        };
+        assert!(orphan_reason.contains("is not advertised as a required or optional profile"));
+
+        let duplicate_id = Session::new("duplicate-namespace-id");
+        let shared_namespace = duplicate_id
+            .register_optional_extension_profile(
+                Profile::parse("org.example.one/1").expect("first profile"),
+            )
+            .expect("first extension namespace");
+        duplicate_id
+            .register_optional_extension_profile(
+                Profile::parse("org.example.two/1").expect("second profile"),
+            )
+            .expect("second extension namespace");
+        duplicate_id
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .iter_mut()
+            .find(|mapping| mapping.extension_uri == "org.example.two/1")
+            .expect("second mapping")
+            .namespace_id = shared_namespace;
+        let duplicate_id_reason = {
+            let inner = duplicate_id.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("duplicate extension namespace IDs must be rejected");
+            };
+            reason
+        };
+        assert!(duplicate_id_reason.contains("duplicate extension namespace_id 1"));
+
+        let standard_alias = Session::new("standard-extension-alias");
+        standard_alias
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .push(srui_protocol::ExtensionNamespaceMapping {
+                extension_uri: Profile::standard_widgets_v1().to_string(),
+                namespace_id: 1,
+            });
+        let standard_alias_reason = {
+            let inner = standard_alias.inner.lock().expect("session lock");
+            let Err(SessionError::InvalidConfiguration(reason)) =
+                validate_extension_namespace_contract(&inner)
+            else {
+                panic!("standard profile extension alias must be rejected");
+            };
+            reason
+        };
+        assert!(standard_alias_reason
+            .contains("standard widget profiles cannot have nonzero extension namespace aliases"));
+    }
+
+    #[test]
+    fn namespace_contract_rejects_zero_and_duplicate_extension_mappings() {
+        let zero = session_with_unmapped_optional_profile("zero-namespace");
+        zero.inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .push(srui_protocol::ExtensionNamespaceMapping {
+                extension_uri: UNMAPPED_PROFILE.to_string(),
+                namespace_id: 0,
+            });
+        let Err(SessionError::InvalidConfiguration(zero_reason)) =
+            zero.bootstrap_fresh_client(&hello_offering_unmapped_profile())
+        else {
+            panic!("zero extension namespace must be rejected");
+        };
+        assert!(zero_reason.contains("must use a nonzero extension namespace"));
+
+        let duplicate = session_with_unmapped_optional_profile("duplicate-namespace");
+        duplicate
+            .inner
+            .lock()
+            .expect("session lock")
+            .extension_namespaces
+            .extend([
+                srui_protocol::ExtensionNamespaceMapping {
+                    extension_uri: UNMAPPED_PROFILE.to_string(),
+                    namespace_id: 1,
+                },
+                srui_protocol::ExtensionNamespaceMapping {
+                    extension_uri: UNMAPPED_PROFILE.to_string(),
+                    namespace_id: 2,
+                },
+            ]);
+        let Err(SessionError::InvalidConfiguration(duplicate_reason)) =
+            duplicate.bootstrap_fresh_client(&hello_offering_unmapped_profile())
+        else {
+            panic!("duplicate extension mappings must be rejected");
+        };
+        assert!(duplicate_reason.contains("more than one extension namespace mapping"));
     }
 
     fn empty_tx(base: u64, new_rev: u64) -> Transaction {
@@ -768,6 +1233,8 @@ mod tests {
         let mut invalid_ref = pending_text_edit_ref();
         invalid_ref.event_id.clear();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: vec![8, 1],
             last_applied_revision: 0,
@@ -788,6 +1255,8 @@ mod tests {
     fn replaced_resume_validates_pending_text_edit_ref_bound() {
         let session = Session::new("replacement-pending-validation");
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "replaced-session".into(),
             client_instance_id: vec![8, 2],
             last_applied_revision: 0,
@@ -825,6 +1294,8 @@ mod tests {
 
         let pending = pending_text_edit_ref();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 2,
@@ -888,6 +1359,8 @@ mod tests {
         conflicting.event_seq = 1;
         conflicting.event_id = b"conflicting-text-edit".to_vec();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 2,
@@ -954,6 +1427,8 @@ mod tests {
             .expect("existing subscriber");
         install_unrepresentable_snapshot(&session);
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "replaced-session".into(),
             client_instance_id: client,
             last_applied_revision: 0,
@@ -1009,6 +1484,8 @@ mod tests {
         let session = Session::new("known-resume");
         let published = session.publish_resource(b"already-cached").unwrap();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: vec![3, 4],
             last_applied_revision: 0,
@@ -1032,6 +1509,8 @@ mod tests {
         let session = Session::new("limited-resume");
         session.publish_resource(b"larger-than-eight").unwrap();
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: vec![5, 6],
             last_applied_revision: 0,
@@ -1070,6 +1549,8 @@ mod tests {
         assert!(session.outbound_hub().is_client_stale(&client));
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "old-incarnation".to_string(),
             client_instance_id: client,
             last_applied_revision: 0,
@@ -1109,6 +1590,8 @@ mod tests {
         assert!(session.outbound_hub().is_client_stale(&client));
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 0,
@@ -1173,6 +1656,8 @@ mod tests {
         assert_eq!(snapshot.new_revision, 1);
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "test-session".to_string(),
             client_instance_id: vec![1, 2],
             last_applied_revision: 0,
@@ -1217,6 +1702,8 @@ mod tests {
         assert_eq!(session.current_revision(), 1025);
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "resync-test".to_string(),
             client_instance_id: vec![1],
             last_applied_revision: 0,
@@ -1383,6 +1870,8 @@ mod tests {
         seed_revision_one(&session);
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "test-resume-no-gap".to_string(),
             client_instance_id: vec![7, 8],
             last_applied_revision: 0,
@@ -1552,6 +2041,8 @@ mod tests {
         let session = Session::new("resume-export-outside-lock");
         seed_revision_one(&session);
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: "replaced-incarnation".to_string(),
             client_instance_id: vec![4, 5],
             last_applied_revision: 0,
@@ -1620,6 +2111,8 @@ mod tests {
         assert!(session.outbound_hub.is_client_stale(&client));
 
         let resume = ClientResume {
+            core_version: CORE_VERSION.to_string(),
+            profiles: sample_hello().profiles,
             session_id: session.session_id(),
             client_instance_id: client.clone(),
             last_applied_revision: 3,

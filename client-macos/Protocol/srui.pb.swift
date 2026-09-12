@@ -2391,6 +2391,12 @@ public nonisolated struct Srui_Protocol_ClientResume: Sendable {
   /// on same-session RESYNC_REQUIRED so canceling them cannot open an event_seq gap (§18.3).
   public var pendingTextEdits: [Srui_Protocol_PendingTextEditRef] = []
 
+  /// Re-advertised on every resume so the server can fail closed before replay or resync
+  /// when this client does not implement the session's core/profile semantics (§15, §18).
+  public var coreVersion: String = String()
+
+  public var profiles: [String] = []
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2410,6 +2416,14 @@ public nonisolated struct Srui_Protocol_ServerResumeOk: Sendable {
 
   /// Highest contiguous settled event sequence for this client in this session.
   public var lastProcessedEventSeq: UInt64 = 0
+
+  /// Re-advertised so a fresh client process can validate the session's required semantics
+  /// and restore session-assigned TypeRefs before applying replay (§15, §18).
+  public var requiredProfiles: [String] = []
+
+  public var optionalProfiles: [String] = []
+
+  public var extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping] = []
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2435,6 +2449,13 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
   /// Confirmed discarded TEXT_EDIT identities for a same-session forced resync (§18.3).
   /// MUST echo the client's declared pending_text_edits; a mismatch fails closed.
   public var discardedTextEdits: [Srui_Protocol_PendingTextEditRef] = []
+
+  /// Re-advertised before the replacement snapshot for cold-process resume (§15, §18).
+  public var requiredProfiles: [String] = []
+
+  public var optionalProfiles: [String] = []
+
+  public var extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping] = []
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -4856,7 +4877,7 @@ nonisolated extension Srui_Protocol_ServerWelcome: SwiftProtobuf.Message, SwiftP
 
 nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ClientResume"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}client_instance_id\0\u{3}last_applied_revision\0\u{3}last_acked_event_seq\0\u{3}terminal_stream_offsets\0\u{1}limits\0\u{3}known_resource_hashes\0\u{3}pending_text_edits\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}client_instance_id\0\u{3}last_applied_revision\0\u{3}last_acked_event_seq\0\u{3}terminal_stream_offsets\0\u{1}limits\0\u{3}known_resource_hashes\0\u{3}pending_text_edits\0\u{3}core_version\0\u{1}profiles\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4872,6 +4893,8 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
       case 6: try { try decoder.decodeSingularMessageField(value: &self._limits) }()
       case 7: try { try decoder.decodeRepeatedBytesField(value: &self.knownResourceHashes) }()
       case 8: try { try decoder.decodeRepeatedMessageField(value: &self.pendingTextEdits) }()
+      case 9: try { try decoder.decodeSingularStringField(value: &self.coreVersion) }()
+      case 10: try { try decoder.decodeRepeatedStringField(value: &self.profiles) }()
       default: break
       }
     }
@@ -4906,6 +4929,12 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
     if !self.pendingTextEdits.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.pendingTextEdits, fieldNumber: 8)
     }
+    if !self.coreVersion.isEmpty {
+      try visitor.visitSingularStringField(value: self.coreVersion, fieldNumber: 9)
+    }
+    if !self.profiles.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.profiles, fieldNumber: 10)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4918,6 +4947,8 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
     if lhs._limits != rhs._limits {return false}
     if lhs.knownResourceHashes != rhs.knownResourceHashes {return false}
     if lhs.pendingTextEdits != rhs.pendingTextEdits {return false}
+    if lhs.coreVersion != rhs.coreVersion {return false}
+    if lhs.profiles != rhs.profiles {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4925,7 +4956,7 @@ nonisolated extension Srui_Protocol_ClientResume: SwiftProtobuf.Message, SwiftPr
 
 nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerResumeOk"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}replay_from_revision\0\u{3}last_processed_event_seq\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}replay_from_revision\0\u{3}last_processed_event_seq\0\u{3}required_profiles\0\u{3}optional_profiles\0\u{3}extension_namespaces\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4936,6 +4967,9 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
       case 1: try { try decoder.decodeSingularStringField(value: &self.sessionID) }()
       case 2: try { try decoder.decodeSingularUInt64Field(value: &self.replayFromRevision) }()
       case 3: try { try decoder.decodeSingularUInt64Field(value: &self.lastProcessedEventSeq) }()
+      case 4: try { try decoder.decodeRepeatedStringField(value: &self.requiredProfiles) }()
+      case 5: try { try decoder.decodeRepeatedStringField(value: &self.optionalProfiles) }()
+      case 6: try { try decoder.decodeRepeatedMessageField(value: &self.extensionNamespaces) }()
       default: break
       }
     }
@@ -4951,6 +4985,15 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
     if self.lastProcessedEventSeq != 0 {
       try visitor.visitSingularUInt64Field(value: self.lastProcessedEventSeq, fieldNumber: 3)
     }
+    if !self.requiredProfiles.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.requiredProfiles, fieldNumber: 4)
+    }
+    if !self.optionalProfiles.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.optionalProfiles, fieldNumber: 5)
+    }
+    if !self.extensionNamespaces.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.extensionNamespaces, fieldNumber: 6)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4958,6 +5001,9 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
     if lhs.sessionID != rhs.sessionID {return false}
     if lhs.replayFromRevision != rhs.replayFromRevision {return false}
     if lhs.lastProcessedEventSeq != rhs.lastProcessedEventSeq {return false}
+    if lhs.requiredProfiles != rhs.requiredProfiles {return false}
+    if lhs.optionalProfiles != rhs.optionalProfiles {return false}
+    if lhs.extensionNamespaces != rhs.extensionNamespaces {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4965,7 +5011,7 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
 
 nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerResyncRequired"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0\u{1}continuity\0\u{3}last_processed_event_seq\0\u{3}discarded_text_edits\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0\u{1}continuity\0\u{3}last_processed_event_seq\0\u{3}discarded_text_edits\0\u{3}required_profiles\0\u{3}optional_profiles\0\u{3}extension_namespaces\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4979,6 +5025,9 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
       case 4: try { try decoder.decodeSingularEnumField(value: &self.continuity) }()
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.lastProcessedEventSeq) }()
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.discardedTextEdits) }()
+      case 7: try { try decoder.decodeRepeatedStringField(value: &self.requiredProfiles) }()
+      case 8: try { try decoder.decodeRepeatedStringField(value: &self.optionalProfiles) }()
+      case 9: try { try decoder.decodeRepeatedMessageField(value: &self.extensionNamespaces) }()
       default: break
       }
     }
@@ -5003,6 +5052,15 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if !self.discardedTextEdits.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.discardedTextEdits, fieldNumber: 6)
     }
+    if !self.requiredProfiles.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.requiredProfiles, fieldNumber: 7)
+    }
+    if !self.optionalProfiles.isEmpty {
+      try visitor.visitRepeatedStringField(value: self.optionalProfiles, fieldNumber: 8)
+    }
+    if !self.extensionNamespaces.isEmpty {
+      try visitor.visitRepeatedMessageField(value: self.extensionNamespaces, fieldNumber: 9)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -5013,6 +5071,9 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if lhs.continuity != rhs.continuity {return false}
     if lhs.lastProcessedEventSeq != rhs.lastProcessedEventSeq {return false}
     if lhs.discardedTextEdits != rhs.discardedTextEdits {return false}
+    if lhs.requiredProfiles != rhs.requiredProfiles {return false}
+    if lhs.optionalProfiles != rhs.optionalProfiles {return false}
+    if lhs.extensionNamespaces != rhs.extensionNamespaces {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

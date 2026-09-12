@@ -290,6 +290,8 @@ pub fn client_resume_with_pending_edits(
 pub fn client_resume(session_id: &str, last_applied: u64) -> SruiMessage {
     SruiMessage {
         msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: session_id.to_string(),
             client_instance_id: vec![1, 2, 3],
             last_applied_revision: last_applied,

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use srui_protocol::{
-    srui_message, ClientHello, ClientResume, TerminalInput, TerminalResize, TERMINAL_LOCAL_TYPE_ID,
-    TERMINAL_PROFILE_URI,
+    srui_message, ClientHello, ClientResume, SessionContinuity, TerminalInput, TerminalResize,
+    TERMINAL_LOCAL_TYPE_ID, TERMINAL_PROFILE_URI,
 };
 use srui_sdk::*;
 use srui_sessiond::{handle_connection, Session, SessionError, TerminalSpec};
@@ -135,6 +135,22 @@ fn terminal_profiles() -> Vec<String> {
         "org.srui.standard-widgets/1".to_string(),
         "org.srui.terminal/1".to_string(),
     ]
+}
+
+fn assert_terminal_negotiation_readvertised(
+    required_profiles: &[String],
+    optional_profiles: &[String],
+    extension_namespaces: &[srui_protocol::ExtensionNamespaceMapping],
+) {
+    assert!(required_profiles
+        .iter()
+        .any(|profile| profile == TERMINAL_PROFILE_URI));
+    assert!(optional_profiles.is_empty());
+    let terminal_mapping = extension_namespaces
+        .iter()
+        .find(|mapping| mapping.extension_uri == TERMINAL_PROFILE_URI)
+        .expect("resume response must re-advertise the terminal namespace");
+    assert_ne!(terminal_mapping.namespace_id, 0);
 }
 
 #[tokio::test]
@@ -267,7 +283,7 @@ async fn resize_reaches_tiocswinsz() {
 }
 
 #[tokio::test]
-async fn reconnect_within_retention_replays_without_duplicate_gap() {
+async fn cold_revision_zero_resume_readvertises_terminal_negotiation_before_replay() {
     let (session, _, term) = terminal_session();
     session
         .pty()
@@ -281,9 +297,11 @@ async fn reconnect_within_retention_replays_without_duplicate_gap() {
         session,
         terminal_profiles(),
         Some(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: terminal_profiles(),
             session_id: "terminal-session".to_string(),
             client_instance_id: CLIENT.to_vec(),
-            last_applied_revision: 1,
+            last_applied_revision: 0,
             last_acked_event_seq: 0,
             terminal_stream_offsets: HashMap::from([(term.get(), 0)]),
             limits: None,
@@ -294,7 +312,14 @@ async fn reconnect_within_retention_replays_without_duplicate_gap() {
     .await;
     let first = recv(&mut read).await;
     match first.msg {
-        Some(srui_message::Msg::ServerResumeOk(_)) => {}
+        Some(srui_message::Msg::ServerResumeOk(resume_ok)) => {
+            assert_eq!(resume_ok.replay_from_revision, 0);
+            assert_terminal_negotiation_readvertised(
+                &resume_ok.required_profiles,
+                &resume_ok.optional_profiles,
+                &resume_ok.extension_namespaces,
+            );
+        }
         other => panic!("expected resume ok, got {other:?}"),
     }
     let mut replayed = Vec::new();
@@ -361,6 +386,8 @@ async fn reconnect_beyond_retention_sends_terminal_resync_with_resume_ok() {
         session,
         terminal_profiles(),
         Some(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: terminal_profiles(),
             session_id: "tiny-ring".to_string(),
             client_instance_id: CLIENT.to_vec(),
             last_applied_revision: 1,
@@ -520,13 +547,14 @@ fn create_terminal_after_attach_is_rejected() {
     );
 }
 
-/// CLIENT_RESUME carries no profile list. When the requested incarnation is gone, the server has
-/// never negotiated with this client, so it must not infer Terminal support from its own state and
-/// push a snapshot plus terminal frames the peer may not implement (§11.1, §15, §4 inv. 13).
+/// A resume must prove compatibility again before a replaced Terminal incarnation can export its
+/// extension snapshot or subscribe the client (§11.1, §15, §4 inv. 13).
 #[test]
-fn replaced_incarnation_resume_is_rejected_when_terminal_is_required() {
+fn replaced_incarnation_resume_rejects_missing_terminal_profile() {
     let (session, _surface, _term) = terminal_session();
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: "a-different-incarnation".to_string(),
         client_instance_id: CLIENT.to_vec(),
         last_applied_revision: 0,
@@ -536,16 +564,113 @@ fn replaced_incarnation_resume_is_rejected_when_terminal_is_required() {
         known_resource_hashes: vec![],
         pending_text_edits: vec![],
     };
+
     let err = session.bootstrap_resume(&resume).unwrap_err();
     match err {
-        SessionError::InvalidInput(message) => {
+        SessionError::Negotiation(error) => {
             assert!(
-                message.contains(TERMINAL_PROFILE_URI) && message.contains("CLIENT_HELLO"),
-                "replacement resume must name the unproven profile, got {message}"
+                error.to_string().contains(TERMINAL_PROFILE_URI),
+                "profile rejection must name Terminal, got {error}"
             );
         }
-        other => panic!("expected InvalidInput, got {other:?}"),
+        other => panic!("expected Negotiation, got {other:?}"),
     }
+}
+
+#[test]
+fn replaced_incarnation_resume_rejects_incompatible_core_version() {
+    let (session, _surface, _term) = terminal_session();
+    let resume = ClientResume {
+        core_version: "0.4.9".to_string(),
+        profiles: terminal_profiles(),
+        session_id: "a-different-incarnation".to_string(),
+        client_instance_id: CLIENT.to_vec(),
+        last_applied_revision: 0,
+        last_acked_event_seq: 0,
+        terminal_stream_offsets: HashMap::new(),
+        limits: None,
+        known_resource_hashes: vec![],
+        pending_text_edits: vec![],
+    };
+
+    let err = session.bootstrap_resume(&resume).unwrap_err();
+    match err {
+        SessionError::UnsupportedCoreVersion {
+            requested,
+            supported,
+        } => {
+            assert_eq!(requested, "0.4.9");
+            assert_eq!(supported, "0.5.0");
+        }
+        other => panic!("expected UnsupportedCoreVersion, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn replaced_incarnation_terminal_resume_sends_negotiation_before_snapshot() {
+    let (session, _surface, term) = terminal_session();
+    let expected_session_id = session.session_id();
+    let (mut read, _write, _task) = connect(
+        session,
+        Vec::new(),
+        Some(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: terminal_profiles(),
+            session_id: "a-different-incarnation".to_string(),
+            client_instance_id: CLIENT.to_vec(),
+            last_applied_revision: 0,
+            last_acked_event_seq: 0,
+            terminal_stream_offsets: HashMap::new(),
+            limits: None,
+            known_resource_hashes: vec![],
+            pending_text_edits: vec![],
+        }),
+    )
+    .await;
+
+    let resync = match recv(&mut read).await.msg {
+        Some(srui_message::Msg::ServerResyncRequired(resync)) => resync,
+        other => panic!("expected negotiation-bearing resync first, got {other:?}"),
+    };
+    assert_eq!(resync.session_id, expected_session_id);
+    assert_eq!(
+        SessionContinuity::try_from(resync.continuity),
+        Ok(SessionContinuity::Replaced)
+    );
+    assert_terminal_negotiation_readvertised(
+        &resync.required_profiles,
+        &resync.optional_profiles,
+        &resync.extension_namespaces,
+    );
+    let terminal_namespace = resync
+        .extension_namespaces
+        .iter()
+        .find(|mapping| mapping.extension_uri == TERMINAL_PROFILE_URI)
+        .expect("terminal namespace")
+        .namespace_id;
+
+    let snapshot = match recv(&mut read).await.msg {
+        Some(srui_message::Msg::Transaction(snapshot)) => snapshot,
+        other => panic!("expected snapshot after negotiation metadata, got {other:?}"),
+    };
+    assert_eq!(snapshot.new_revision, resync.snapshot_revision);
+    let terminal_node = snapshot
+        .operations
+        .iter()
+        .find_map(|operation| match &operation.op {
+            Some(srui_protocol::operation::Op::CreateNode(create)) => create
+                .node
+                .as_ref()
+                .filter(|node| node.node_id == term.get()),
+            _ => None,
+        });
+    let terminal_type = terminal_node
+        .expect("replacement snapshot contains Terminal node")
+        .r#type
+        .as_ref()
+        .expect("Terminal type");
+    assert_eq!(terminal_type.namespace_id, terminal_namespace);
+    assert_eq!(terminal_type.local_id, TERMINAL_LOCAL_TYPE_ID);
 }
 
 /// Detaching returns the session to `Detached`, but a client that already handshook can resume
@@ -679,6 +804,8 @@ async fn semantic_journal_gap_still_replays_retained_terminal() {
         session,
         terminal_profiles(),
         Some(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: terminal_profiles(),
             session_id: "journal-gap".to_string(),
             client_instance_id: CLIENT.to_vec(),
             last_applied_revision: 0,
@@ -706,7 +833,18 @@ async fn semantic_journal_gap_still_replays_retained_terminal() {
             continue;
         };
         match msg.msg {
-            Some(srui_message::Msg::ServerResyncRequired(_)) => saw_semantic_resync = true,
+            Some(srui_message::Msg::ServerResyncRequired(resync)) => {
+                assert_eq!(
+                    SessionContinuity::try_from(resync.continuity),
+                    Ok(SessionContinuity::SameSession)
+                );
+                assert_terminal_negotiation_readvertised(
+                    &resync.required_profiles,
+                    &resync.optional_profiles,
+                    &resync.extension_namespaces,
+                );
+                saw_semantic_resync = true;
+            }
             Some(srui_message::Msg::TerminalData(data)) => replayed.extend_from_slice(&data.data),
             _ => {}
         }
@@ -761,6 +899,8 @@ async fn journal_gap_and_terminal_eviction_are_independent() {
         session,
         terminal_profiles(),
         Some(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: terminal_profiles(),
             session_id: "both-gaps".to_string(),
             client_instance_id: CLIENT.to_vec(),
             last_applied_revision: 0,
@@ -952,6 +1092,8 @@ async fn live_terminal_generation_during_catch_up_does_not_trigger_fallbehind() 
         session,
         terminal_profiles(),
         Some(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: terminal_profiles(),
             session_id: "catchup-drain".to_string(),
             client_instance_id: CLIENT.to_vec(),
             last_applied_revision: 1,

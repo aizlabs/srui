@@ -279,6 +279,8 @@ async fn test_structural_saturation_causes_detachment_and_forces_resync() {
     // Client attempts to resume from revision 0 (which is within journal retention!)
     let resume = SruiMessage {
         msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
             session_id: session.session_id(),
             client_instance_id: client_instance.clone(),
             last_applied_revision: 0,

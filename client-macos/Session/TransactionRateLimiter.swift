@@ -138,11 +138,13 @@ public actor TransactionIngressGate {
         limiter.availableTokens
     }
 
+    func admissionAttempt() -> TransactionAdmission {
+        limiter.admission(atUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds)
+    }
+
     func waitForAdmission() async throws {
         while true {
-            switch limiter.admission(
-                atUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
-            ) {
+            switch admissionAttempt() {
             case .admitted:
                 return
             case .wait(let nanoseconds):

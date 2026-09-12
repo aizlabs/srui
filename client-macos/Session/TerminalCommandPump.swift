@@ -14,6 +14,11 @@ import Terminal
 import TransportSSH
 
 actor TerminalCommandPump {
+    typealias SendIfAuthorized = @Sendable (
+        Data,
+        LogicalChannelClass
+    ) async throws -> Bool
+
     private enum Item {
         case input(NodeId, Data)
         case resize(NodeId, UInt32, UInt32, UInt32, UInt32)
@@ -23,10 +28,17 @@ actor TerminalCommandPump {
     private var drainTask: Task<Void, Never>?
     private var latestSize: [NodeId: (UInt32, UInt32, UInt32, UInt32)] = [:]
     private var connected = false
-    private var transport: (any Transport)?
+    private var sendIfAuthorized: SendIfAuthorized?
 
     func attach(transport: any Transport) {
-        self.transport = transport
+        attach { data, logicalClass in
+            try await transport.send(data: data, logicalClass: logicalClass)
+            return true
+        }
+    }
+
+    func attach(sendIfAuthorized: @escaping SendIfAuthorized) {
+        self.sendIfAuthorized = sendIfAuthorized
         connected = true
         for (id, size) in latestSize {
             queue.removeAll { item in
@@ -40,10 +52,27 @@ actor TerminalCommandPump {
 
     func disconnect() {
         connected = false
+        sendIfAuthorized = nil
         queue.removeAll { item in
             if case .input = item { return true }
             return false
         }
+    }
+
+    func resetForReplacementSession(
+        sendIfAuthorized: @escaping SendIfAuthorized
+    ) {
+        queue.removeAll(keepingCapacity: true)
+        latestSize.removeAll(keepingCapacity: true)
+        self.sendIfAuthorized = sendIfAuthorized
+    }
+
+    var retainedResizeCountForTesting: Int {
+        latestSize.count
+    }
+
+    func waitUntilIdleForTesting() async {
+        await drainTask?.value
     }
 
     func prune(retainedStreamIDs: Set<NodeId>) {
@@ -117,7 +146,7 @@ actor TerminalCommandPump {
         defer { drainTask = nil }
         while connected, !queue.isEmpty {
             let item = queue.removeFirst()
-            guard let transport else { continue }
+            guard let sendIfAuthorized else { continue }
             do {
                 switch item {
                 case .input(let id, let data):
@@ -126,9 +155,9 @@ actor TerminalCommandPump {
                     input.data = data
                     var envelope = SRUIMessage()
                     envelope.terminalInput = input
-                    try await transport.send(
-                        data: SRUIFraming.encodeFramed(envelope),
-                        logicalClass: .terminalHigh
+                    _ = try await sendIfAuthorized(
+                        SRUIFraming.encodeFramed(envelope),
+                        .terminalHigh
                     )
                 case .resize(let id, let cols, let rows, let width, let height):
                     var resize = SRUITerminalResize()
@@ -139,9 +168,9 @@ actor TerminalCommandPump {
                     resize.pixelHeight = height
                     var envelope = SRUIMessage()
                     envelope.terminalResize = resize
-                    try await transport.send(
-                        data: SRUIFraming.encodeFramed(envelope),
-                        logicalClass: .terminalHigh
+                    _ = try await sendIfAuthorized(
+                        SRUIFraming.encodeFramed(envelope),
+                        .terminalHigh
                     )
                 }
             } catch {

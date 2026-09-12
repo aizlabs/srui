@@ -832,7 +832,6 @@ authoritative design document is attached: `SRUI_Semantic_Remote_UI_Design_v0.6.
 read-only and authoritative — do not edit it. This is Task 20 of a sequential implementation plan
 (Tasks 0–38). Task 19 made the transport real SSH; Task 7 already built the Rust-side
 CapabilitySet negotiation logic (in-process only, no wire I/O). Inspect both before starting.
-
 Read: §15 (capability negotiation) in full, §4 invariant 13 (unknown required semantics fail
 explicitly; optional semantics are negotiated or have documented fallbacks).
 
@@ -842,10 +841,17 @@ Build:
   negotiation logic (port equivalent matching logic to Swift if it doesn't exist yet). The
   handshake must complete, successfully or not, before any Transaction/Event traffic is
   permitted on the connection.
+- Treat the server's profile declaration and extension namespace table as one contract. Every
+  advertised non-standard required or optional profile has exactly one stable, non-zero mapping;
+  mapping URIs and IDs are unique; exactly one bare `org.srui.standard-widgets` sentinel maps
+  to namespace 0, which no other mapping may use. Validate the complete contract before snapshot export, subscription, or data-plane traffic. A standard-only
+  session advertises no dormant Terminal, RichText, or other extension profiles merely because
+  their implementations are compiled into the server.
 - Concrete failure path: if the server's required profile list isn't satisfied by the client's
-  offered profiles (or vice versa, if you want symmetry), the connection is cleanly closed with
-  a clear error surfaced to whichever side is easiest to test against — no partial/undefined
-  protocol traffic should be attempted afterward.
+  offered profiles (or vice versa, if you want symmetry), or if its advertised profile/namespace
+  contract is inconsistent, the connection is cleanly closed with a clear error surfaced to
+  whichever side is easiest to test against — no partial/undefined protocol traffic should be
+  attempted afterward.
 
 Out of scope: no extension-profile fallback subtree logic yet (that's exercised in Task 30), no
 reconnect/session-resume handshake yet (Task 22, though it shares this task's message framing
@@ -854,6 +860,9 @@ patterns).
 Verification:
 - end-to-end test: successful handshake with matching required profile (`org.srui.standard-
   widgets/1`), followed by the Task 18/19 counter demo working exactly as before;
+- connect a Terminal-capable client to a standard-only server and confirm only Standard Widgets
+  are negotiated; separately confirm that a missing, duplicate, zero, malformed, or orphaned
+  extension mapping fails before a snapshot or subscription side effect;
 - a mismatched-required-profile test (temporarily configure the server to require a profile the
   test client doesn't offer) confirms the connection fails cleanly at handshake time rather than
   failing confusingly later or being silently accepted;
@@ -1822,12 +1831,14 @@ if present) and the EventOutbox (Task 24, if present) before starting.
 Read: §17 (session states — ATTACHED/DETACHED/TERMINATING/EXPIRED, so the UI can show a
 meaningful status rather than a raw boolean — plus the incarnation-token paragraph, since a saved
 entry's `session_id` may simply no longer exist by the time the user reconnects), §18 (reconnect
-— what the client must remember: session_id, client_instance_id, last_applied_revision; the
-continuity decision the server returns; and the generation-bound resume-attempt rule, which this
-UI can trigger directly if the user clicks Connect twice), §19.1 (recommended SSH posture —
-host-key verification behavior must stay visible to the user, not silently bypassed), §6.3's state
-ownership table (this task's saved-connection list is purely local "presentation state," owned by
-the client, never synchronized to the server — the server has no concept of it).
+— the complete process-local continuity checkpoint; the cold-relaunch rule requiring a fresh
+`client_instance_id` and revision 0 when no durable checkpoint exists; resume-time core/profile and
+extension-namespace re-advertisement; the continuity decision the server returns; and the
+generation-bound resume-attempt rule, which this UI can trigger directly if the user clicks Connect
+twice), §19.1 (recommended SSH posture — host-key verification behavior
+must stay visible to the user, not silently bypassed), §6.3's state ownership table (this task's
+saved-connection list is purely local "presentation state," owned by the client, never
+synchronized to the server — the server has no concept of it).
 
 Build, as a new small app-level module in client-macos/ (e.g. `ConnectionManager/`) sitting above
 Session/TransportSSH, not inside SemanticModel/Protocol:
@@ -1837,10 +1848,21 @@ Session/TransportSSH, not inside SemanticModel/Protocol:
   credential store).
 - A local, client-only saved-connections list (e.g. a JSON/plist file under Application
   Support): for each entry, at least a human label, host, user, and — once a session has been
-  established — its `session_id` and `last_applied_revision`, so a later reconnect can attempt
-  Task 23's `CLIENT RESUME` instead of always starting fresh. This list is never sent to the
-  server and has no protocol meaning; it is exactly the kind of local presentation state §6.3
-  says the client owns unilaterally.
+  established — its `session_id` and last-known revision. The revision is presentation metadata,
+  not cold-resume authority. While the application remains running, retain the entry's actual
+  semantic replica, `client_instance_id`, event frontier/outbox, pending text state, terminal
+  offsets, resource continuity, negotiated capabilities, and extension/Terminal namespace and type
+  mappings in memory so a warm reconnect can resume from those exact values. After a cold
+  relaunch without a durable continuity checkpoint, attempt `CLIENT RESUME`
+  for the saved `session_id` from revision 0 with a fresh `client_instance_id` and empty event,
+  text, and terminal continuity state; never advertise the persisted last-known revision. Every
+  resume also re-advertises the current client's `core_version` and supported `profiles`. Before
+  replay or snapshot traffic enters the data plane, validate the server-authoritative
+  `required_profiles`, `optional_profiles`, and `extension_namespaces` carried by
+  `SERVER_RESUME_OK` or `SERVER_RESYNC_REQUIRED`, then install the negotiated capability result
+  and session-assigned namespace/type mappings. This list is never sent to the server and has no
+  protocol meaning; it is exactly the kind of local presentation state §6.3 says the client owns
+  unilaterally.
 - A session list window showing saved entries with a status derived from the last known
   transport/session state (e.g. "connected," "disconnected — will resume," "unknown"), letting
   the user pick one to (re)connect or remove. Removing an entry only forgets it locally — it has
@@ -1862,20 +1884,46 @@ Session/TransportSSH, not inside SemanticModel/Protocol:
 Out of scope: no keychain-integrated secret storage beyond what the user's own ssh-agent/
 known_hosts already provide; no simultaneous-multi-session window management beyond whatever
 falls out naturally (one window per active connection is fine); no syncing the saved-connection
-list across machines; no new protocol messages or server-side changes of any kind — this task
-only adds a UI layer over transport/session APIs that already exist.
+list across machines; no new protocol message kinds or unrelated server-side behavior. The one
+allowed prerequisite is the minimal additive, wire-compatible resume-negotiation extension to the
+existing messages: `CLIENT_RESUME.core_version`/`profiles`, and
+`SERVER_RESUME_OK`/`SERVER_RESYNC_REQUIRED.required_profiles`, `optional_profiles`, and
+`extension_namespaces`, with fail-closed validation before subscription or data-plane traffic.
+Every non-standard profile advertised as required or optional in these responses must have exactly
+one stable, non-zero namespace mapping; duplicate, malformed, zero, orphaned, or missing mappings
+fail before snapshot export, replay collection, subscription, or any data-plane traffic. A
+standard-only session must not advertise dormant extensions merely because their implementations
+are available in the server binary. All other work remains a UI layer over existing
+transport/session APIs. A literal revision-N cold resume is also out of scope: it requires one
+atomic durable checkpoint of the semantic replica, outbox, pending event and text state, terminal
+offsets, resource-continuity state, negotiated capabilities, and extension/Terminal namespace and
+type mappings, and MUST NOT be approximated from saved-list presentation metadata.
 
 Verification:
+- connect the default Terminal-capable client to the standard-only Task 21 process monitor and
+  confirm the server advertises and negotiates only Standard Widgets and delivers the complete
+  snapshot;
 - connect to a fresh host/user with no prior saved session: a new session is established and an
   entry is added to the saved list afterward with its session_id recorded;
-- quit and relaunch the client, reconnect via the saved entry: confirm (via a log/test hook) that
-  it attempts Task 23's `CLIENT RESUME` with the remembered session_id/last_applied_revision
-  rather than performing a plain fresh handshake, and that the resulting UI reflects the
-  session's actual current state;
+- disconnect and reconnect without quitting: confirm `CLIENT RESUME` uses the same `session_id`
+  and `client_instance_id`, the actual committed replica revision and event frontier, retained
+  terminal offsets, negotiated capabilities, and extension/Terminal namespace and type mappings
+  from the process-local continuity state. Exercise an extension-bearing or Terminal session and
+  confirm a recreated controller does not fall back to fresh negotiation;
+- quit and relaunch the client, then reconnect via the saved entry without a durable checkpoint:
+  confirm (via a log/test hook) that it attempts Task 23's `CLIENT RESUME` with the remembered
+  `session_id`, a fresh `client_instance_id`, revision 0, event frontier 0, empty terminal/text
+  continuity state, and the current `core_version`/supported `profiles` — never the saved last-known
+  revision. Exercise a Terminal session and both journal replay and same-session snapshot resync:
+  confirm each resume response re-advertises the authoritative profile sets and Terminal namespace,
+  the client validates and installs that mapping before replay/snapshot/Terminal data, and the UI is
+  rebuilt to the session's actual current state;
 - restart the remote sessiond (or otherwise force a `REPLACED` continuity outcome) and then
-  reconnect via a saved entry: confirm the UI clearly communicates that the session was replaced
-  rather than presenting it as a normal resume, and that the saved entry is updated to the new
-  session_id;
+  reconnect via a saved Terminal entry: confirm `SERVER_RESYNC_REQUIRED{continuity=REPLACED}`
+  carries the replacement's required/optional profiles and extension namespaces, the client
+  validates and installs the replacement Terminal mapping before its snapshot/data plane, the UI
+  clearly communicates that the session was replaced rather than presenting it as a normal resume,
+  and the saved entry is updated to the new `session_id`;
 - double-click Connect on the same saved entry in quick succession: confirm only the newer resume
   attempt's outcome is reflected in the UI and no duplicate side effects or duplicated windows
   result from the superseded attempt;

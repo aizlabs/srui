@@ -62,6 +62,7 @@ struct SessionResumeContinuityTests {
         resync.continuity = continuity
         resync.lastProcessedEventSeq = lastProcessedEventSeq
         resync.discardedTextEdits = discardedTextEdits
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
         var message = SRUIMessage()
         message.serverResyncRequired = resync
         return message
@@ -988,11 +989,11 @@ struct SessionResumeContinuityTests {
         await server.close()
     }
 
-    /// A server that refuses a replaced incarnation — because CLIENT_RESUME cannot prove the peer
-    /// negotiated the profiles it requires — answers with nothing at all (§11.1, §15). Retaining
-    /// the session id would make every reconnect re-send the same doomed resume forever.
-    @Test("A failure with CLIENT_RESUME unanswered invalidates the resume identity")
-    func unansweredResumeFailureForcesFreshHello() async throws {
+    /// A failed transport or protocol exchange before the server answers CLIENT_RESUME is not an
+    /// authoritative continuity decision. Keep the checkpoint so the next transport can retry and
+    /// let RESUME_OK or RESYNC_REQUIRED decide whether the session survived (§18).
+    @Test("A failure with CLIENT_RESUME unanswered preserves the resume identity")
+    func unansweredResumeFailurePreservesResumeIdentity() async throws {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
         let controller = SessionController(
             transport: clientTransport,
@@ -1009,9 +1010,10 @@ struct SessionResumeContinuityTests {
         helloMessage.clientHello = hello
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(helloMessage))
 
-        try await AsyncTestSupport.eventually(description: "resume identity invalidated") {
-            controller.isDiverged && controller.sessionId == nil
+        try await AsyncTestSupport.eventually(description: "unanswered resume failure") {
+            controller.isDiverged
         }
+        #expect(controller.sessionId == "replaced-incarnation")
 
         await controller.stop()
         await serverTransport.close()

@@ -808,6 +808,8 @@ fn committed_edit_survives_editor_reclamation_and_resume_until_handler_finishes(
         event_id: b"resume-cancel-race".to_vec(),
     };
     let make_resume = |pending_text_edits| ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: session.session_id(),
         client_instance_id: CLIENT.to_vec(),
         last_applied_revision: 0,

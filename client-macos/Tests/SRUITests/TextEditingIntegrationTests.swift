@@ -562,6 +562,83 @@ struct TextEditingIntegrationTests {
         await serverTransport.close()
     }
 
+    @Test("A native-assigned edit survives rebinding before authorization")
+    @MainActor
+    func assignedEditSurvivesBindingReplacementBeforeAuthorization() async throws {
+        let continuityContext = SessionContinuityContext()
+        let outbox = EventOutbox()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        renderer.textEditingSession.debounceNanoseconds = 0
+        let (oldClient, oldServer) = await PipeTransport.createPair()
+        let old = SessionController(
+            transport: oldClient,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            continuityContext: continuityContext
+        )
+        old.attachRenderer(renderer)
+        try await old.start()
+        try await handshakeAndMount(
+            controller: old,
+            server: oldServer,
+            applier: applier,
+            renderer: renderer,
+            sessionId: "assigned-before-rebind"
+        )
+
+        let authorizationGate = TextLifecycleGate()
+        old.textEditWillAuthorizeForTesting = {
+            await authorizationGate.pause()
+        }
+        renderer.textEditingSession.noteLocalValue(
+            "must replay",
+            nodeID: editorID,
+            composing: false,
+            flushImmediately: true
+        )
+        await authorizationGate.waitUntilPaused()
+        let prepared = try #require(await outbox.assignedTextEditEvents().first)
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
+
+        let (newClient, newServer) = await PipeTransport.createPair()
+        let replacement = SessionController(
+            transport: newClient,
+            applier: applier,
+            outbox: outbox,
+            renderer: renderer,
+            sessionId: "assigned-before-rebind",
+            continuityContext: continuityContext
+        )
+        replacement.attachRenderer(renderer)
+        let collector = EventCollector()
+        await collector.start(draining: newServer)
+        try await replacement.start()
+
+        var resume = SRUIServerResumeOk()
+        resume.sessionID = "assigned-before-rebind"
+        var resumeMessage = SRUIMessage()
+        resumeMessage.serverResumeOk = resume
+        await replacement.handleIncomingMessage(resumeMessage)
+
+        let replayed = try await waitForTextEvent(collector)
+        #expect(replayed.eventId == prepared.eventId)
+        #expect(replayed.textArg == "must replay")
+
+        old.textEditWillAuthorizeForTesting = nil
+        await authorizationGate.release()
+        await old.waitForInteractionDispatchForTesting()
+        #expect(await outbox.assignedTextEditEvents().contains { $0.eventId == prepared.eventId })
+        #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
+
+        await old.stop()
+        await replacement.stop()
+        await collector.stop()
+        await oldServer.close()
+        await newServer.close()
+    }
+
     @Test("Stopping wakes an action blocked behind a text draft without allocating it")
     @MainActor
     func stopCancelsActionWaitingForTextDraft() async throws {
@@ -588,7 +665,7 @@ struct TextEditingIntegrationTests {
 
         // Use a real interactive node: native semantic admission now rejects nonexistent nodes
         // synchronously, while this test needs a valid action queued behind the pending draft.
-        let actionID = NodeId(99)
+        let actionID = NodeId(101)
         var actionMount = SRUIMessage()
         actionMount.transaction = Transaction(
             baseRevision: Revision(1),
@@ -703,6 +780,7 @@ struct TextEditingIntegrationTests {
     @Test("Stopping flushes a native debounce draft for same-session resume")
     @MainActor
     func stopFlushesDebouncedDraftForResume() async throws {
+        let continuityContext = SessionContinuityContext()
         let outbox = EventOutbox()
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
@@ -712,7 +790,8 @@ struct TextEditingIntegrationTests {
             transport: client,
             applier: applier,
             outbox: outbox,
-            renderer: renderer
+            renderer: renderer,
+            continuityContext: continuityContext
         )
         controller.attachRenderer(renderer)
         try await controller.start()
@@ -738,7 +817,8 @@ struct TextEditingIntegrationTests {
             applier: applier,
             outbox: outbox,
             renderer: renderer,
-            sessionId: "debounce-stop-resume"
+            sessionId: "debounce-stop-resume",
+            continuityContext: continuityContext
         )
         resumed.attachRenderer(renderer)
         let collector = EventCollector()
@@ -767,6 +847,7 @@ struct TextEditingIntegrationTests {
     @Test("An edit committed while disconnected replays when the same session resumes")
     @MainActor
     func disconnectedEditReplaysAfterResume() async throws {
+        let continuityContext = SessionContinuityContext()
         let outbox = EventOutbox()
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
@@ -776,7 +857,8 @@ struct TextEditingIntegrationTests {
             transport: client,
             applier: applier,
             outbox: outbox,
-            renderer: renderer
+            renderer: renderer,
+            continuityContext: continuityContext
         )
         controller.attachRenderer(renderer)
         try await controller.start()
@@ -805,7 +887,8 @@ struct TextEditingIntegrationTests {
             applier: applier,
             outbox: outbox,
             renderer: renderer,
-            sessionId: "offline-edit-resume"
+            sessionId: "offline-edit-resume",
+            continuityContext: continuityContext
         )
         resumed.attachRenderer(renderer)
         let collector = EventCollector()
@@ -818,6 +901,10 @@ struct TextEditingIntegrationTests {
             var resumeMessage = SRUIMessage()
             resumeMessage.serverResumeOk = resumeOK
             await resumed.handleIncomingMessage(resumeMessage)
+            await resumed.waitForInteractionDispatchForTesting()
+            #expect(resumed.isEventDispatchEnabled)
+            #expect(renderer.textEditingSession.hasUnsentSuccessorDraft(for: editorID) == false)
+            #expect(await outbox.pendingCount == 1)
 
             let edit = try await waitForTextEvent(
                 collector,
@@ -844,6 +931,7 @@ struct TextEditingIntegrationTests {
     @Test("A replacement snapshot discards an edit committed while disconnected")
     @MainActor
     func replacementDiscardsDisconnectedDraft() async throws {
+        let continuityContext = SessionContinuityContext()
         let outbox = EventOutbox()
         let applier = TransactionApplier()
         let renderer = AppKitRenderer()
@@ -853,7 +941,8 @@ struct TextEditingIntegrationTests {
             transport: client,
             applier: applier,
             outbox: outbox,
-            renderer: renderer
+            renderer: renderer,
+            continuityContext: continuityContext
         )
         controller.attachRenderer(renderer)
         try await controller.start()
@@ -880,7 +969,8 @@ struct TextEditingIntegrationTests {
             applier: applier,
             outbox: outbox,
             renderer: renderer,
-            sessionId: "debounce-stop-replaced"
+            sessionId: "debounce-stop-replaced",
+            continuityContext: continuityContext
         )
         resumed.attachRenderer(renderer)
         let collector = EventCollector()
@@ -892,6 +982,7 @@ struct TextEditingIntegrationTests {
         resync.snapshotRevision = 2
         resync.reason = "replacement"
         resync.continuity = .replaced
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
         var resyncMessage = SRUIMessage()
         resyncMessage.serverResyncRequired = resync
         await resumed.handleIncomingMessage(resyncMessage)
@@ -1931,7 +2022,7 @@ struct TextEditingIntegrationTests {
             newRevision: Revision(2),
             operations: [
                 .createNode(
-                    id: NodeId(99),
+                    id: NodeId(101),
                     nodeType: .text,
                     parentID: surfaceID,
                     properties: [Property(property: .text, value: .string("structural"))]
@@ -1941,7 +2032,7 @@ struct TextEditingIntegrationTests {
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(intervening))
         try await AsyncTestSupport.eventually(description: "intervening structural revision remounted") {
             applier.lastAppliedRevision == Revision(2)
-                && renderer.registry.handle(for: NodeId(99)) != nil
+                && renderer.registry.handle(for: NodeId(101)) != nil
         }
         let remountedHandle = try #require(renderer.registry.handle(for: editorID))
         let remountedField = try #require(remountedHandle.view as? NSTextField)
@@ -2043,6 +2134,7 @@ struct TextEditingIntegrationTests {
                         Property(property: .value, value: .string("authoritative")),
                     ]
                 ),
+                .createNode(id: NodeId(100), nodeType: .button, parentID: surfaceID),
             ]
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
@@ -2146,6 +2238,7 @@ struct TextEditingIntegrationTests {
         resync.reason = "replaced"
         resync.continuity = .replaced
         resync.lastProcessedEventSeq = 0
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
         var resyncMessage = SRUIMessage()
         resyncMessage.serverResyncRequired = resync
         await controller.handleIncomingMessage(resyncMessage)
@@ -2165,6 +2258,7 @@ struct TextEditingIntegrationTests {
                         Property(property: .value, value: .string("authoritative")),
                     ]
                 ),
+                .createNode(id: NodeId(100), nodeType: .button, parentID: surfaceID),
             ]
         ).toWire()
         await controller.handleIncomingMessage(snapshotMessage)
@@ -2248,6 +2342,7 @@ struct TextEditingIntegrationTests {
         resync.reason = "replaced"
         resync.continuity = .replaced
         resync.lastProcessedEventSeq = 0
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
         var message = SRUIMessage()
         message.serverResyncRequired = resync
         await controller.handleIncomingMessage(message)
@@ -2301,6 +2396,8 @@ struct TextEditingIntegrationTests {
                         Property(property: .value, value: .string("")),
                     ]
                 ),
+                .createNode(id: NodeId(99), nodeType: .button, parentID: surfaceID),
+                .createNode(id: NodeId(100), nodeType: .button, parentID: surfaceID),
             ]
         )
         var mountMsg = SRUIMessage()

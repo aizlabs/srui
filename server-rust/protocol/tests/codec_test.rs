@@ -2,7 +2,8 @@ use bytes::BytesMut;
 use futures::{SinkExt, StreamExt};
 use prost::Message;
 use srui_protocol::{
-    srui_message, ClientHello, ClientLimits, FramingError, SruiCodec, SruiMessage, Transaction,
+    srui_message, ClientHello, ClientLimits, ClientResume, FramingError, SruiCodec, SruiMessage,
+    Transaction,
 };
 use tokio::io::{duplex, AsyncWriteExt};
 use tokio_util::codec::{Decoder, FramedRead, FramedWrite};
@@ -69,6 +70,26 @@ fn test_decode_chunked_large_frame_without_upfront_allocation() {
     }
 
     panic!("frame should have decoded after all chunks were fed");
+}
+
+#[test]
+fn client_resume_negotiation_advertisement_round_trips() {
+    let expected = SruiMessage {
+        msg: Some(srui_message::Msg::ClientResume(ClientResume {
+            session_id: "opaque-session".to_string(),
+            client_instance_id: vec![1, 2, 3],
+            core_version: "0.5.7".to_string(),
+            profiles: vec![
+                "org.srui.standard-widgets/1".to_string(),
+                "org.srui.terminal/1".to_string(),
+            ],
+            ..ClientResume::default()
+        })),
+    };
+
+    let encoded = srui_protocol::encode_framed(&expected).expect("encode resume");
+    let decoded: SruiMessage = srui_protocol::decode_framed(&encoded).expect("decode resume");
+    assert_eq!(decoded, expected);
 }
 
 #[test]

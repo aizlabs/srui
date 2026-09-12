@@ -296,6 +296,8 @@ async fn test_process_restart_replaced_continuity_on_old_session_id_resume() {
 
     // Client attempts to resume with old_session_id against the new sessiond process
     let resume = ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: old_session_id.clone(),
         client_instance_id: vec![5, 5, 5],
         last_applied_revision: 2,

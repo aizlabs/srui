@@ -1015,6 +1015,7 @@ struct EventOutboxRetryTests {
         resync.reason = "requested session expired"
         resync.continuity = .replaced
         resync.lastProcessedEventSeq = 4
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
         var response = SRUIMessage()
         response.serverResyncRequired = resync
         await controller.handleIncomingMessage(response)

@@ -275,13 +275,7 @@ async fn server_welcome_contains_session_metadata() {
                 w.required_profiles,
                 vec!["org.srui.standard-widgets/1".to_string()]
             );
-            assert_eq!(
-                w.optional_profiles,
-                vec![
-                    "org.srui.richtext/1".to_string(),
-                    "org.srui.terminal/1".to_string(),
-                ]
-            );
+            assert!(w.optional_profiles.is_empty());
             assert_eq!(w.extension_namespaces.len(), 1);
             assert_eq!(
                 w.extension_namespaces[0].extension_uri,

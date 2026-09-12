@@ -19,6 +19,26 @@ struct LayoutRendererTests {
     }
 
     @Test
+    func showWindowsReopensClosedSurfaceWindow() throws {
+        let store = try makeStore([
+            .createNode(id: 1, nodeType: .surface),
+        ])
+        let renderer = AppKitRenderer()
+
+        try renderer.attach(store: store)
+        renderer.showWindows()
+        let window = try #require(renderer.registry.surfaceHandles.first?.window)
+        #expect(window.isVisible)
+
+        window.close()
+        #expect(window.isVisible == false)
+
+        renderer.showWindows()
+        #expect(window.isVisible)
+        window.close()
+    }
+
+    @Test
     func structuralRemountKeepsSurfaceWindowsVisible() throws {
         let base: [SemanticModel.Operation] = [
             .createNode(id: 1, nodeType: .surface),

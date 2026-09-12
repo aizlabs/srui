@@ -66,6 +66,8 @@ fn hello(client_instance_id: Vec<u8>) -> ClientHello {
 
 fn resume(session_id: &str, client_instance_id: Vec<u8>) -> ClientResume {
     ClientResume {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
         session_id: session_id.to_string(),
         client_instance_id,
         last_applied_revision: 0,

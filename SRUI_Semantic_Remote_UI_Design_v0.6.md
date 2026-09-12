@@ -274,7 +274,13 @@ org.srui.vector-scene/1
 org.example.coding/2
 ```
 
-During capability negotiation, both sides assign an extension a compact session-local namespace number. Wire references are then encoded as:
+Before capability negotiation completes, the server assigns each advertised non-standard profile
+one stable, non-zero session-local namespace and carries the authoritative URI-to-number mapping in
+the handshake. The client uses and validates the mappings required by profiles and types it
+implements; clients do not independently choose namespace numbers. Mapping URIs and IDs are unique,
+namespace `0` remains reserved for standard
+widgets, and an inconsistent advertised profile/mapping contract fails before snapshot, replay, or
+data-plane traffic. Wire references are then encoded as:
 
 ```text
 (namespace_id, local_id)
@@ -969,8 +975,29 @@ SERVER WELCOME
   core_version = 1.0
   required_profiles = [org.srui.standard-widgets/1]
   optional_profiles = [org.srui.terminal/1]
+  extension_namespaces = [
+    { extension_uri = org.srui.standard-widgets, namespace_id = 0 },
+    { extension_uri = org.srui.terminal/1, namespace_id = 1 }
+  ]
   session = ...
 ```
+
+The active negotiated set is the server's required profiles plus the intersection of the server's
+optional profiles and the client's offered profiles. An optional profile is therefore active when
+the client offers it; it is not a dormant declaration. Every non-standard profile advertised as
+required or optional MUST have exactly one stable, non-zero entry in `extension_namespaces`.
+Mappings MUST have unique canonical URIs and unique namespace IDs. The table MUST contain
+exactly one bare `org.srui.standard-widgets` sentinel mapped to namespace `0`; no other mapping
+may use namespace `0`. The server validates this complete advertised contract before
+sending `SERVER WELCOME`, `SERVER RESUME_OK`, or `SERVER RESYNC_REQUIRED`, and before exporting a
+snapshot, collecting replay, subscribing the client, or entering the data plane. The client
+independently validates mapping-table uniqueness and the mappings needed by profiles and types it
+implements, installs those server-authoritative mappings, and fails closed when required semantics
+cannot be resolved.
+
+A standard-only session advertises only `org.srui.standard-widgets/1`; support compiled into the
+server does not by itself activate Terminal, RichText, or another extension for that session.
+Registering an extension allocates its namespace before the profile may be advertised.
 
 A client is never required to announce `macos-appkit`; renderer identity is diagnostic only.
 
@@ -1110,7 +1137,29 @@ client_instance_id
 last_applied_revision
 last_acked_event_seq
 per-terminal received stream offsets
+negotiated capabilities and extension/Terminal namespace/type mappings
 ```
+
+The values above form one continuity checkpoint; they are not independent reconnect hints. A
+process-local ("warm") reconnect retains the same `session_id` and `client_instance_id`, the
+actual committed semantic replica at `last_applied_revision`, the event outbox and its contiguous
+acknowledgement frontier, pending text edits, per-terminal received offsets, applicable
+resource-continuity state, and the negotiated capability result plus extension/Terminal namespace
+and type mappings.
+
+After a cold application relaunch, a client without an atomic durable continuity checkpoint MUST
+NOT claim a persisted last-known revision and MUST NOT reuse the former `client_instance_id`. It
+MAY still send `CLIENT RESUME` for the persisted `session_id` with a fresh `client_instance_id`,
+`last_applied_revision = 0`, `last_acked_event_seq = 0`, and empty terminal/text/event continuity
+state. The server can then replay from revision 1 when retained history permits or return
+`RESYNC_REQUIRED` so a snapshot rebuilds the replica. A persisted last-known revision in a saved
+connection record is presentation metadata only; it is not resume authority.
+
+Literal revision-N cold resume is valid only when the client atomically checkpoints and restores
+the semantic replica together with its outbox, pending event and text state, terminal offsets,
+resource-continuity state, negotiated capability result, and extension/Terminal namespace and type
+mappings from the same durable boundary. Resume-time negotiation re-advertisement does not turn a
+persisted last-known revision into resume authority or replace that atomic checkpoint.
 
 In steady state each client event is settled by an acknowledgement:
 
@@ -1138,7 +1187,16 @@ CLIENT RESUME
   client_instance_id = c17
   last_applied_revision = 1842
   last_acked_event_seq = 593
+  core_version = 0.5.0
+  profiles = [org.srui.standard-widgets/1, org.srui.terminal/1]
 ```
+
+Every `CLIENT_RESUME` MUST re-advertise the client's `core_version` and supported `profiles`.
+The server validates the core version and negotiates the offered profiles against the current
+session before it subscribes the connection or emits replay, snapshot, resource, or Terminal data.
+These are additive protobuf fields, so an older server can ignore them. A newer server MUST fail
+closed when the core version is absent/incompatible or the offer does not satisfy the session's
+required profiles; proto3 default values are not evidence of compatible semantics.
 
 The client MUST retain pending events but MUST NOT replay them or generate new semantic events until
 the server provides a machine-readable continuity decision. UI-state similarity is not a valid
@@ -1151,11 +1209,15 @@ SERVER RESUME_OK
   session_id = abc
   replay_from_revision = 1843
   last_processed_event_seq = 593
+  required_profiles = [org.srui.standard-widgets/1]
+  optional_profiles = [org.srui.terminal/1]
+  extension_namespaces = [{extension_uri: org.srui.terminal/1, namespace_id: 3}]
 ```
 
-`SERVER RESUME_OK.session_id` MUST exactly equal the requested ID. The client first applies the
-reported contiguous event frontier, then replays the remaining pending events with their original
-`event_id` and `event_seq`. The complete replay batch is serialized before newly generated events.
+`SERVER RESUME_OK.session_id` MUST exactly equal the requested ID. After validating and installing
+the response's negotiation result, the client first applies the reported contiguous event frontier,
+then replays the remaining pending events with their original `event_id` and `event_seq`. The
+complete replay batch is serialized before newly generated events.
 
 If the same incarnation survived but its transaction journal no longer covers the gap:
 
@@ -1165,11 +1227,14 @@ SERVER RESYNC_REQUIRED
   continuity = SAME_SESSION
   snapshot_revision = 2210
   last_processed_event_seq = 593
+  required_profiles = [org.srui.standard-widgets/1]
+  optional_profiles = [org.srui.terminal/1]
+  extension_namespaces = [{extension_uri: org.srui.terminal/1, namespace_id: 3}]
 ```
 
-The client applies the event frontier, may replay remaining old events, discards its semantic
-replica, and applies the consistent snapshot. New user events remain disabled until that snapshot
-commits.
+After validating and installing the response's negotiation result, the client applies the event
+frontier, may replay remaining old events, discards its semantic replica, and applies the consistent
+snapshot. New user events remain disabled until that snapshot commits.
 
 If the requested incarnation expired, crashed without durable restoration, or was otherwise
 replaced:
@@ -1180,14 +1245,28 @@ SERVER RESYNC_REQUIRED
   continuity = REPLACED
   snapshot_revision = 17
   last_processed_event_seq = 0
+  required_profiles = [org.srui.standard-widgets/1, org.srui.terminal/1]
+  optional_profiles = []
+  extension_namespaces = [{extension_uri: org.srui.terminal/1, namespace_id: 1}]
 ```
 
-The client MUST abandon every unresolved event and text edit belonging to the expired incarnation.
-It resets its event outbox to the replacement session's reported frontier, discards the old semantic
-replica, and applies the fresh authoritative snapshot. It MUST NOT replay an old event merely
-because the server reports a lower frontier. This deliberately chooses possible loss of an
-unacknowledged user intent across application/session failure over applying stale intent twice or
-against unrelated state.
+After validating and installing the replacement session's negotiation result, the client MUST
+abandon every unresolved event and text edit belonging to the expired incarnation. It resets its
+event outbox to the replacement session's reported frontier, discards the old semantic replica,
+and applies the fresh authoritative snapshot. It MUST NOT replay an old event merely because the
+server reports a lower frontier. This deliberately chooses possible loss of an unacknowledged user
+intent across application/session failure over applying stale intent twice or against unrelated
+state.
+
+`SERVER_RESUME_OK` and `SERVER_RESYNC_REQUIRED` MUST both carry the authoritative
+`required_profiles`, `optional_profiles`, and `extension_namespaces` for their `session_id`. The
+client validates that result against its offer and installs the session-assigned namespace/type
+mappings before it applies an event frontier, replay, or snapshot or enables any data plane. For
+`continuity = REPLACED`, the mappings belong to the replacement incarnation, never the requested
+one. A client interoperating with an older server response that omits these additive fields MAY use
+an exact process-local negotiation retained for the same session. Without that warm state it MAY
+fall back to the fixed standard-widget namespace only when it requires no server profile and its
+committed replica has no extension nodes; a cold extension-bearing resume MUST fail closed.
 
 The server, not the client, decides continuity. The client MUST NOT infer replacement from a
 snapshot looking “far away” from its prior state. An unknown or omitted continuity value is a

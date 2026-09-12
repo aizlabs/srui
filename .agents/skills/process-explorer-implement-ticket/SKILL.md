@@ -7,6 +7,14 @@ description: Implement exactly one SRUI Process Explorer plan ticket in its assi
 
 Use this skill only when an orchestrator or user assigns one concrete ticket from the SRUI Process Explorer plan.
 
+## Scoped verification policy
+
+Follow the orchestrator's [scoped verification policy](../process-explorer-orchestrator/SKILL.md#scoped-verification-policy). Use its recorded profile, or select and record one from the ticket and affected components if none was supplied. App-only work needs app checks and the required native/wire/Linux evidence, not every unchanged infrastructure, example or benchmark suite. Documentation-only work needs relevant validators.
+
+Treat historical baseline/setup command lists as a menu. Reuse applicable baseline evidence for unchanged components, recording the revision and why it still applies; it cannot replace tests of new behavior. Add checks only for newly affected code, an explicit acceptance/release requirement, or a concrete regression, and record the reason.
+
+After the selected checks pass on the final relevant code, finish the completion record and handoff without optional extra audits or unrelated reruns. Report selected commands, results, reused evidence and blockers concisely. Existing configured delivery hooks remain separate and must not be bypassed.
+
 ## Required context
 
 Read the assigned ticket completely, then read the relevant sections of:
@@ -29,7 +37,7 @@ Keep process enumeration, metric interpretation, filtering, identity, authorizat
 
 ## Implementation loop
 
-1. Establish the ticket's current acceptance criteria and applicable verification profile.
+1. Establish the ticket's acceptance criteria and scoped verification profile; update the profile if the actual diff affects additional components.
 2. Inspect the smallest relevant code surface and existing tests.
 3. Implement the bounded change with deterministic positive and negative tests.
 4. Add or update the ticket completion note with exact commands, results, native/live evidence, and limitations.

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-001",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Empty read-only Process Explorer shell on the generic macOS client; no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX001-001",
+      "feature": "Empty PID/Name table over authenticated SSH with retained native window handles after a title mutation",
+      "scope": "PX-001/macOS/localhost SSH/read-only",
+      "source_refs": ["D1", "D2"],
+      "owner": "PX-001",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-001.md",
+        "docs/process-explorer/evidence/PX-001/initial.png",
+        "docs/process-explorer/evidence/PX-001/updated.png",
+        "docs/process-explorer/evidence/PX-001/initial.json",
+        "docs/process-explorer/evidence/PX-001/updated.json"
+      ]
+    }
+  ]
+}

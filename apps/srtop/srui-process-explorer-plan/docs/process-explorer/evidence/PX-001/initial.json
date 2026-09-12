@@ -1,0 +1,7 @@
+{
+  "fixture" : "initial",
+  "title" : "Process Explorer",
+  "transport" : "real localhost SSH subsystem",
+  "visible" : true,
+  "window_number" : 479962
+}

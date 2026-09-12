@@ -44,6 +44,8 @@ run "rust: cargo test" cargo test --manifest-path server-rust/Cargo.toml --all-t
 run "rust: cargo clippy" cargo clippy --manifest-path server-rust/Cargo.toml --all-targets -- -D warnings
 run "benchmarks: Rust driver tests" \
 	cargo test --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver
+run "rust: Process Explorer test" cargo test --locked --manifest-path apps/srtop/Cargo.toml
+run "rust: Process Explorer clippy" cargo clippy --locked --manifest-path apps/srtop/Cargo.toml --all-targets -- -D warnings
 run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
 run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
 run "rust: ui-gallery test" cargo test --manifest-path examples/ui-gallery/Cargo.toml
@@ -94,6 +96,7 @@ if [ "$(uname -s)" = Darwin ]; then
 	run "swift: build server binaries" cargo build --manifest-path server-rust/Cargo.toml
 	run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
 	run "swift: build coding-agent demo" cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
+	run "swift: build Process Explorer" cargo build --locked --manifest-path apps/srtop/Cargo.toml
 	run "swift: swift test" swift test --package-path client-macos
 	run "benchmarks: isolated Swift driver tests" \
 		swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release

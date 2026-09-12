@@ -15,8 +15,8 @@ use tracing::{error, info, warn};
 use srui_example_ui_gallery::GalleryApp;
 use srui_sessiond::{handle_connection, Session};
 use srui_unix_security::{
-    default_named_socket_path, effective_uid, prepare_private_socket_parent, validate_peer,
-    PrivateSocketParent, SocketIdentity,
+    default_named_socket_path, effective_uid, prepare_private_socket_parent,
+    require_unprivileged_uid, validate_peer, PrivateSocketParent, SocketIdentity,
 };
 
 const DEFAULT_AUTOPLAY_INTERVAL: Duration = Duration::from_secs(4);
@@ -229,6 +229,24 @@ async fn serve_gallery_connection(
     }
 }
 
+enum ServerActivity {
+    Accepted(std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)>),
+    TaskFinished(Result<(), tokio::task::JoinError>),
+}
+
+async fn next_server_activity(listener: &UnixListener, tasks: &mut JoinSet<()>) -> ServerActivity {
+    tokio::select! {
+        Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+            ServerActivity::TaskFinished(result)
+        }
+        accept_result = listener.accept() => ServerActivity::Accepted(accept_result),
+    }
+}
+
+fn require_gallery_uid(uid: u32) -> std::io::Result<()> {
+    require_unprivileged_uid(uid, "ui-gallery")
+}
+
 async fn bind_owned_socket(path: &Path, uid: u32) -> std::io::Result<(UnixListener, OwnedSocket)> {
     let parent = prepare_private_socket_parent(path, uid)?;
     let lock = acquire_socket_lock(path)?;
@@ -343,6 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let uid = effective_uid();
+    require_gallery_uid(uid)?;
     let (listener, owned_socket) = bind_owned_socket(&options.socket_path, uid).await?;
     info!("ui gallery listening on {}", options.socket_path.display());
 
@@ -370,9 +389,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         tokio::select! {
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, _peer)) => {
+            activity = next_server_activity(&listener, &mut tasks) => {
+                match activity {
+                    ServerActivity::Accepted(Ok((stream, _peer))) => {
                         if let Err(error) = validate_peer(&stream, uid) {
                             warn!(
                                 error = %error,
@@ -388,7 +407,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             child,
                         ));
                     }
-                    Err(error) => error!("accept failed: {error}"),
+                    ServerActivity::Accepted(Err(error)) => error!("accept failed: {error}"),
+                    ServerActivity::TaskFinished(Err(error)) => {
+                        warn!("task ended abnormally: {error}");
+                    }
+                    ServerActivity::TaskFinished(Ok(())) => {}
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -438,6 +461,41 @@ mod tests {
             let parsed = parse_options(&[flag.to_string()]).expect("help parses");
             assert!(matches!(parsed, ParseOutcome::Help));
         }
+    }
+
+    #[test]
+    fn root_uid_is_refused_before_socket_binding() {
+        let error = require_gallery_uid(0).expect_err("root must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("ui-gallery refuses to run as root"));
+    }
+
+    #[tokio::test]
+    async fn completed_tasks_are_reaped_while_accept_is_idle() {
+        let (directory, path) = temporary_socket_path("task-reaping");
+        let (listener, owned) = bind_owned_socket(&path, effective_uid())
+            .await
+            .expect("socket binds");
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async {});
+
+        let activity = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_server_activity(&listener, &mut tasks),
+        )
+        .await
+        .expect("completed task is reaped without an incoming connection");
+        assert!(matches!(activity, ServerActivity::TaskFinished(Ok(()))));
+        assert!(
+            tasks.is_empty(),
+            "completed task is removed from the JoinSet"
+        );
+
+        drop(listener);
+        drop(owned);
+        std::fs::remove_dir(directory).expect("temporary socket directory is removed");
     }
 
     #[tokio::test]

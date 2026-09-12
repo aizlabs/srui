@@ -37,10 +37,11 @@ Server flags:
 | `--autoplay-interval SECONDS` | `4` | Autoplay cadence |
 
 All diagnostics go to stderr, so the binary is safe to bridge over an SSH subsystem where stdout
-is the protocol stream (§19.1, §20.1). The shared `srui-unix-security` boundary creates a private
-0700 parent, binds the socket at 0600, validates each peer's effective UID, and retains an advisory
-lock across stale-socket cleanup and binding. Orderly shutdown removes only the socket and lock
-inodes this process owns.
+is the protocol stream (§19.1, §20.1). The shared `srui-unix-security` boundary refuses UID 0,
+creates a private 0700 parent, binds the socket at 0600, validates each peer's effective UID, and
+retains an advisory lock across stale-socket cleanup and binding. Completed connection tasks are
+reaped while the listener remains active. Orderly shutdown removes only the socket and lock inodes
+this process owns.
 
 ### What you should see
 

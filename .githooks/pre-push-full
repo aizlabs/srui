@@ -1,0 +1,123 @@
+#!/bin/sh
+# Pre-push gate: registry + rust match `.github/workflows/ci.yml`; Swift matches that file's
+# macOS job on Darwin and `.github/workflows/swift-linux.yml` on Linux.
+#
+# Enable with:
+#     git config core.hooksPath .githooks
+#
+# Bypass a single push with `git push --no-verify` — appropriate for a WIP branch, not for a
+# branch you intend to open a PR from.
+#
+# Deliberately NOT a full CI replacement. Two things this cannot check on a Mac:
+#   * the `pidfd` termination path in examples/process-monitor is cfg(target_os = "linux") and is
+#     only ever compiled by the Linux CI job;
+#   * a from-scratch build. Cargo and SwiftPM reuse incremental artifacts here, and this repo has
+#     already produced phantom failures from stale rlibs after mtime-preserving edits (AGENTS.md).
+set -eu
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+fail=0
+run() {
+	label=$1
+	shift
+	printf '\n\033[1m== %s\033[0m\n' "$label"
+	if "$@"; then
+		return 0
+	fi
+	printf '\033[31mFAILED: %s\033[0m\n' "$label"
+	fail=1
+}
+
+# --- Registry Validation (CI: job `registry`) --------------------------------
+run "registry: validate_registry.py" uv run python protocol/validate_registry.py
+run "python: protocol pytest" uv run --frozen pytest -q protocol/tests
+run "benchmarks: generated metric contract" \
+	uv run --frozen python benchmarks/generate_metric_contract.py --check
+run "benchmarks: Python harness" uv run --frozen pytest -q benchmarks/tests
+
+# --- Rust Build (CI: job `rust`) ---------------------------------------------
+# `--all-targets` compiles tests, benches and examples, so CI's separate `cargo check` adds
+# nothing beyond what these two already build.
+run "rust: cargo test" cargo test --manifest-path server-rust/Cargo.toml --all-targets
+run "rust: cargo clippy" cargo clippy --manifest-path server-rust/Cargo.toml --all-targets -- -D warnings
+run "benchmarks: Rust driver tests" \
+	cargo test --locked --manifest-path server-rust/Cargo.toml -p srui-benchmark-driver
+run "rust: Process Explorer test" cargo test --locked --manifest-path apps/srtop/Cargo.toml
+run "rust: Process Explorer clippy" cargo clippy --locked --manifest-path apps/srtop/Cargo.toml --all-targets -- -D warnings
+run "rust: examples test" cargo test --manifest-path examples/process-monitor/Cargo.toml
+run "rust: examples clippy" cargo clippy --manifest-path examples/process-monitor/Cargo.toml --all-targets -- -D warnings
+run "rust: ui-gallery test" cargo test --manifest-path examples/ui-gallery/Cargo.toml
+run "rust: ui-gallery clippy" cargo clippy --manifest-path examples/ui-gallery/Cargo.toml --all-targets -- -D warnings
+run "rust: coding-agent-demo test" cargo test --manifest-path examples/coding-agent-demo/Cargo.toml
+run "rust: coding-agent-demo clippy" cargo clippy --manifest-path examples/coding-agent-demo/Cargo.toml --all-targets -- -D warnings
+
+# --- Swift (Linux: `swift-linux.yml`; macOS: `ci.yml` job `swift`) ------------
+printf '\n\033[1m== swift: SemanticModel must not import AppKit or Cocoa (§1)\033[0m\n'
+if grep -rnE "^[^/]*import (AppKit|Cocoa)" client-macos/SemanticModel; then
+	printf '\033[31mFAILED: SemanticModel must never import AppKit or Cocoa\033[0m\n'
+	fail=1
+fi
+
+# Pure grep, no Swift toolchain required, so it runs on every platform.
+run "swift: LogicalChannelScheduling imports" bash scripts/check-logical-channel-scheduling-imports.sh
+run "swift: test process stdio" bash scripts/check-test-process-stdio.sh
+
+if command -v swiftc >/dev/null 2>&1; then
+	run "swift: parse changed sources (syntax-only)" bash scripts/parse-changed-swift.sh
+else
+	printf '\nskipping Swift parse gate (swiftc not on PATH)\n'
+fi
+
+if command -v swift >/dev/null 2>&1; then
+	run "swift: LogicalChannelScheduling tests" \
+		swift test --package-path client-macos/LogicalChannelScheduling
+else
+	printf '\nskipping LogicalChannelScheduling tests (swift not on PATH)\n'
+fi
+
+# Policy and registry codegen are pure Python and run everywhere. Only the protobuf half needs
+# protoc-gen-swift (macOS CI).
+run "protocol: regenerate logical-channel policy" \
+	uv run python protocol/generate_logical_channel_policy.py
+run "protocol: regenerate Swift registry tables" \
+	uv run python protocol/generate_swift_registry.py
+run "protocol: committed scheduling policy is fresh" git diff --exit-code \
+	client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
+	server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs
+run "protocol: committed registry tables are fresh" git diff --exit-code \
+	client-macos/SemanticModel/RegistryTables.swift
+
+# Full client + proto regeneration need AppKit and protoc-gen-swift (macOS CI).
+if [ "$(uname -s)" = Darwin ]; then
+	# The integration tests drive a real sessiond and counter server, so both must be built first,
+	# exactly as CI does.
+	run "swift: build server binaries" cargo build --manifest-path server-rust/Cargo.toml
+	run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
+	run "swift: build coding-agent demo" cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
+	run "swift: build Process Explorer" cargo build --locked --manifest-path apps/srtop/Cargo.toml
+	run "swift: swift test" swift test --package-path client-macos
+	run "benchmarks: isolated Swift driver tests" \
+		swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release
+
+	# --- Generated-file freshness (CI: job `swift`, final step) -------------------
+	# The committed protobuf, registry, and scheduling bindings are generated output; CI fails on
+	# any diff after regeneration. Checked last because it rewrites files in the working tree.
+	run "protocol: regenerate bindings" ./protocol/generate_proto.sh
+	run "protocol: committed bindings are fresh" git diff --exit-code \
+		client-macos/Protocol/srui.pb.swift \
+		client-macos/SemanticModel/RegistryTables.swift \
+		client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
+		server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs
+else
+	printf '\nskipping macOS client tests and proto regen on %s\n' "$(uname -s)"
+fi
+
+if [ "$fail" -ne 0 ]; then
+	printf '\n\033[31mpre-push checks failed; push aborted.\033[0m\n'
+	printf 'Re-run an individual check above, or bypass with: git push --no-verify\n'
+	exit 1
+fi
+
+printf '\n\033[32mAll pre-push checks passed.\033[0m\n'

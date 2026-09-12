@@ -9,7 +9,7 @@ Use this skill when the user asks to automate, resume, or supervise implementati
 
 ## Scoped verification policy
 
-Select checks from the ticket's acceptance criteria and affected components before implementation. Do not rerun unrelated repository suites merely because they exist. Record the affected components, exact selected commands, reasons, and reusable baseline evidence in external run state; pass this profile to both agents.
+Select checks from the ticket's acceptance criteria and affected components before implementation. Do not rerun unrelated repository suites merely because they exist. Record the affected components, exact selected commands, reasons, and reusable baseline evidence in external run state; pass this profile to both agents. Preview the actual diff with `python3 scripts/pre_push_checks.py --base origin/main --head HEAD --json` and use its shared delivery profile as a starting point; add the ticket's required evidence where it goes beyond path-based checks.
 
 - **App-only changes:** run the app's tests, formatting/linting, and native, wire, Linux or live-process checks required by the ticket or changed behavior. Add conformance for the semantics affected. Using an unchanged SDK/runtime/renderer does not by itself require its entire test suite, unrelated examples, or benchmark packages.
 - **Shared infrastructure changes:** add focused tests for the changed SDK, runtime, protocol, renderer or dependency and its affected consumers. Broaden to full suites when the affected surface or a concrete regression warrants it.

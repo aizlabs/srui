@@ -20,7 +20,7 @@ SRUI (Semantic Remote UI) replicates application UI *meaning* and authoritative 
 
 ## Build, test, lint
 
-Three toolchains, three roots. CI (`.github/workflows/ci.yml`) runs all of them; match it locally before pushing.
+Three toolchains, three roots. CI (`.github/workflows/ci.yml`) keeps the full merge gate. Local pre-push checks are selected from the pushed diff; see [.githooks/README.md](.githooks/README.md). Run the affected component checks and required ticket-specific evidence locally; the commands below are a menu, not a requirement to rerun every unchanged package.
 
 ```bash
 # Rust workspace (server) — from server-rust/

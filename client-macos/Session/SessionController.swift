@@ -988,8 +988,26 @@ public final class SessionController: @unchecked Sendable {
             self?.outbox.revokeUnauthorizedPreparedTextEdit(eventId: eventId)
         }
 
-        renderer.onInteraction = { [weak self, weak renderer] interaction in
-            guard let self, let renderer else { return }
+        renderer.onInteraction = {
+            [weak self, weak renderer, applier, continuityContext] interaction in
+            guard let renderer else { return }
+            guard let self else {
+                // The retained renderer can receive edits after its stopped controller is gone.
+                // Preserve their observed revision without retaining the transport/controller,
+                // and fence this fallback against activation of the next connection.
+                if case .textEdit(let nodeID, let text, let editSeq, let laneEpoch) = interaction {
+                    _ = continuityContext.performIfNoConnectionIsActive {
+                        renderer.textEditingSession.recordObservedRevision(
+                            nodeID: nodeID,
+                            text: text,
+                            editSeq: editSeq,
+                            laneEpoch: laneEpoch,
+                            observedRevision: applier.currentSnapshot.revision
+                        )
+                    }
+                }
+                return
+            }
 
             switch interaction {
             case .activate(let nodeID):
@@ -3973,6 +3991,10 @@ public final class SessionController: @unchecked Sendable {
             return false
         }
         defer { continuityContext.releaseMutation(lease) }
+        // The replacement identity must never inherit the abandoned replica's revision (§18).
+        // Reset before publishing that identity, even if its snapshot never reaches this transport.
+        applier.resetReplica()
+        let emptyStore = applier.currentSnapshot.store
         await terminalPump.resetForReplacementSession(
             sendIfAuthorized: terminalCommandSender(
                 binding: binding,
@@ -3981,9 +4003,12 @@ public final class SessionController: @unchecked Sendable {
         )
         if let renderer {
             await renderer.terminalSession.resetForReplacementSession()
-            await MainActor.run {
-                renderer.resetExtensionRegistry()
-            }
+        }
+        await MainActor.run {
+            self.renderer?.resetExtensionRegistry()
+            try? self.renderer?.attach(store: emptyStore)
+            self.hasMountedInitialTree = false
+            self.withStateLock { self.lastRenderedRevision = 0 }
         }
         return true
     }

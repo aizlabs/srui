@@ -665,7 +665,7 @@ struct TextEditingIntegrationTests {
 
         // Use a real interactive node: native semantic admission now rejects nonexistent nodes
         // synchronously, while this test needs a valid action queued behind the pending draft.
-        let actionID = NodeId(99)
+        let actionID = NodeId(101)
         var actionMount = SRUIMessage()
         actionMount.transaction = Transaction(
             baseRevision: Revision(1),

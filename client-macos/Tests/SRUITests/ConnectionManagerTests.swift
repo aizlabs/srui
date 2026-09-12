@@ -9,6 +9,7 @@ import Foundation
 @testable import ConnectionManager
 import Protocol
 import SemanticModel
+import Session
 import Testing
 import TransportSSH
 
@@ -134,6 +135,23 @@ private actor ConnectionManagerCaptureTransport: Transport {
     func frame(at index: Int) -> Data? {
         guard frames.indices.contains(index) else { return nil }
         return frames[index]
+    }
+
+    func receive(_ message: SRUIMessage) throws {
+        continuation.yield(try SRUIFraming.encodeFramed(message))
+    }
+}
+
+@MainActor
+private final class ConnectionControllerHarness {
+    private(set) var requests: [ConnectionAttemptRequest] = []
+    private(set) var transports: [ConnectionManagerCaptureTransport] = []
+
+    func makeAttempt(_ request: ConnectionAttemptRequest) -> any ConnectionAttempt {
+        let transport = ConnectionManagerCaptureTransport()
+        requests.append(request)
+        transports.append(transport)
+        return ConnectionManager.makeSessionControllerAttempt(request: request, transport: transport)
     }
 }
 
@@ -337,6 +355,191 @@ struct ConnectionManagerTests {
         #expect(request.resumeRevision == 0)
 
         await attempt.stop()
+    }
+
+    private func mountOriginalSession(
+        manager: ConnectionManager,
+        harness: ConnectionControllerHarness,
+        connectionID: SavedConnection.ID
+    ) async throws {
+        manager.connect(id: connectionID)
+        let transport = try #require(harness.transports.last)
+        _ = try await waitForFrame(0, from: transport)
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "original-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 1
+        var message = SRUIMessage()
+        message.serverWelcome = welcome
+        try await transport.receive(message)
+        try await transport.receive(textSnapshot(value: "original value"))
+        try await AsyncTestSupport.eventually(description: "original session mounted") {
+            manager.status(for: connectionID) == .connected
+                && harness.requests.last?.context.renderer.textEditingSession
+                    .lastKnownAuthoritative(for: NodeId(2)) == "original value"
+        }
+    }
+
+    private func textSnapshot(value: String) -> SRUIMessage {
+        var message = SRUIMessage()
+        message.transaction = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: NodeId(1), nodeType: .surface),
+                .createNode(
+                    id: NodeId(2),
+                    nodeType: .textInput,
+                    parentID: NodeId(1),
+                    properties: [Property(property: .value, value: .string(value))]
+                ),
+            ]
+        ).toWire()
+        return message
+    }
+
+    private func waitForFrame(
+        _ index: Int,
+        from transport: ConnectionManagerCaptureTransport
+    ) async throws -> SRUIMessage {
+        try await AsyncTestSupport.eventuallyAsync(description: "outbound frame \(index)") {
+            await transport.frame(at: index) != nil
+        }
+        return try decodeFramedMessage(from: #require(await transport.frame(at: index)))
+    }
+
+    @Test(
+        "interrupted replacement resumes the new session from an empty replica",
+        arguments: [false, true]
+    )
+    func interruptedReplacementResumesFromEmptyReplica(duringResume: Bool) async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Replacement", host: "replacement.example", user: "alice")
+        try await temporary.store.save([saved])
+        let harness = ConnectionControllerHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        try await mountOriginalSession(manager: manager, harness: harness, connectionID: saved.id)
+        let context = try #require(harness.requests.first?.context)
+
+        if duringResume {
+            await harness.transports.last?.close()
+            try await AsyncTestSupport.eventually(description: "original attempt released") {
+                !manager.hasActiveAttemptForTesting(saved.id)
+            }
+            manager.connect(id: saved.id)
+            _ = try await waitForFrame(0, from: #require(harness.transports.last))
+        }
+
+        let replacedTransport = try #require(harness.transports.last)
+        var replacement = SRUIServerResyncRequired()
+        replacement.sessionID = "replacement-session"
+        replacement.continuity = .replaced
+        replacement.snapshotRevision = 1
+        replacement.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var message = SRUIMessage()
+        message.serverResyncRequired = replacement
+        try await replacedTransport.receive(message)
+        try await AsyncTestSupport.eventually(description: "replacement accepted before snapshot") {
+            manager.entries.first?.sessionID == "replacement-session"
+                && manager.status(for: saved.id) == .resynchronizing
+        }
+        #expect(context.applier.lastAppliedRevision == .initial)
+        #expect(context.applier.currentSnapshot.store.rootIDs.isEmpty)
+        #expect(context.renderer.registry.handle(for: NodeId(2)) == nil)
+
+        // Lose the transport after REPLACED, before the replacement snapshot can arrive.
+        await replacedTransport.close()
+        try await AsyncTestSupport.eventually(description: "replacement attempt released") {
+            !manager.hasActiveAttemptForTesting(saved.id)
+        }
+        manager.connect(id: saved.id)
+        let resumedTransport = try #require(harness.transports.last)
+        let resumeMessage = try await waitForFrame(0, from: resumedTransport)
+        guard case .clientResume(let resume) = resumeMessage.msg else {
+            Issue.record("replacement reconnect did not send CLIENT_RESUME")
+            await manager.shutdown()
+            return
+        }
+        #expect(resume.sessionID == "replacement-session")
+        #expect(resume.lastAppliedRevision == 0)
+        #expect(resume.pendingTextEdits.isEmpty)
+        #expect(resume.terminalStreamOffsets.isEmpty)
+
+        // Both sessions use revision 1. A correct revision-zero request makes the server replay
+        // the new session's first transaction instead of accepting the old replica as current.
+        var resumed = SRUIServerResumeOk()
+        resumed.sessionID = "replacement-session"
+        resumed.replayFromRevision = 1
+        resumed.requiredProfiles = ["org.srui.standard-widgets/1"]
+        message.serverResumeOk = resumed
+        try await resumedTransport.receive(message)
+        try await resumedTransport.receive(textSnapshot(value: "replacement value"))
+        try await AsyncTestSupport.eventually(description: "replacement replay mounted") {
+            manager.status(for: saved.id) == .connected
+                && context.renderer.textEditingSession.lastKnownAuthoritative(for: NodeId(2))
+                    == "replacement value"
+        }
+        #expect(context.applier.lastAppliedRevision == Revision(1))
+        await manager.shutdown()
+    }
+
+    @Test("offline text is sent after the manager releases the stopped attempt")
+    func offlineTextSurvivesReleasedAttempt() async throws {
+        let temporary = TemporaryConnectionStore()
+        defer { temporary.cleanUp() }
+        let saved = SavedConnection(label: "Offline", host: "offline.example", user: "alice")
+        try await temporary.store.save([saved])
+        let harness = ConnectionControllerHarness()
+        let manager = ConnectionManager(
+            store: temporary.store,
+            attemptFactory: { harness.makeAttempt($0) }
+        )
+        await manager.load()
+        try await mountOriginalSession(manager: manager, harness: harness, connectionID: saved.id)
+        let context = try #require(harness.requests.first?.context)
+        await harness.transports.last?.close()
+        try await AsyncTestSupport.eventually(description: "stopped attempt released") {
+            !manager.hasActiveAttemptForTesting(saved.id)
+        }
+
+        context.renderer.textEditingSession.noteLocalValue(
+            "offline edit",
+            nodeID: NodeId(2),
+            composing: false,
+            flushImmediately: true
+        )
+        #expect(context.renderer.textEditingSession.nextUnassignedEditNode() == NodeId(2))
+        #expect(await context.outbox.pendingCount == 0)
+
+        manager.connect(id: saved.id)
+        let transport = try #require(harness.transports.last)
+        let resumeMessage = try await waitForFrame(0, from: transport)
+        #expect(resumeMessage.clientResume.lastAppliedRevision == 1)
+        #expect(await transport.frame(at: 1) == nil)
+
+        var resumed = SRUIServerResumeOk()
+        resumed.sessionID = "original-session"
+        resumed.replayFromRevision = 2
+        resumed.requiredProfiles = ["org.srui.standard-widgets/1"]
+        var message = SRUIMessage()
+        message.serverResumeOk = resumed
+        try await transport.receive(message)
+        let eventMessage = try await waitForFrame(1, from: transport)
+        let event = try ProtocolDecoder().validateAndConvertEvent(wire: eventMessage.event)
+        #expect(event.eventType == .EVENT_TEXT_EDIT)
+        #expect(event.nodeId == NodeId(2))
+        #expect(event.textArg == "offline edit")
+        #expect(event.observedRevision == Revision(1))
+        #expect(event.eventSeq == 1)
+        #expect(context.renderer.textEditingSession.localValue(for: NodeId(2)) == "offline edit")
+        await manager.shutdown()
     }
 
     @Test("cold failure preserves last-known revision metadata until ready")

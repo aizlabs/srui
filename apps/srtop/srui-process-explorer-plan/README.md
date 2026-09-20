@@ -8,6 +8,8 @@ Read [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md), [BASELINE.md](BASELINE.md
 
 The product lives under `apps/srtop`; preserve the runnable `examples/process-monitor` example and reuse verified components. PX-000 records the revision-specific baseline. The PX-001 shell now has implementation test evidence in [its completion record](docs/process-explorer/completions/PX-001.md), including real localhost SSH and retained native handles. Independent verification is still required; ticket-index statuses and broader release gates are not advanced by this implementation evidence.
 
+PX-002 now has deterministic fake-source implementation evidence in [its completion record](docs/process-explorer/completions/PX-002.md): three model-backed rows over native localhost SSH, distinct duplicate names and explicit missing values. Its individual ledger remains `in_progress` until independent verification; broader release gates and task-index statuses are unchanged.
+
 ## Delivery priorities
 
 1. PX-000–PX-008: real read-only monitor.
@@ -31,6 +33,7 @@ PX-035-G01 resolves advanced-action feasibility before enabling those operations
 - `feature-ledger.seed.json`: 48 planning families with zero verified parity claims.
 - `feature-ledger.px000.json`: ten individually scoped htop 3.5.3 entries for R0/R1 and safe termination; all remain planned until evidence is attached.
 - `feature-ledger.px001.json`: individually scoped empty-shell implementation evidence against the SRUI design; no htop parity claim.
+- `feature-ledger.px002.json`: individually scoped deterministic fake-source implementation evidence; no live collection or htop parity claim.
 - `validate_feature_ledger.py`: schema, duplicate-ID, upstream-reference, owner, status, and evidence checks for the PX-000 ledger.
 - `STANDING_AGENT_CONTRACT.md`: shared implementation rules.
 - `SOURCES.md`: design and upstream reference provenance.

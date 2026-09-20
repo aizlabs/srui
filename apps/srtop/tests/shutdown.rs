@@ -4,6 +4,7 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -17,7 +18,13 @@ impl SocketDirectory {
             .unwrap()
             .as_nanos();
         // Keep AF_UNIX paths short even when macOS TMPDIR is deeply nested.
-        let path = PathBuf::from(format!("/tmp/srtop-{}-{nonce}", std::process::id()));
+        // The clock can return the same timestamp to parallel test threads.
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(format!(
+            "/tmp/srtop-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         Self(path)

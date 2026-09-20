@@ -22,15 +22,17 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
     initialize_rows(session, vec![], STATUS_TEXT)
 }
 
-/// Samples only the injected source and publishes its model rows atomically with the shell.
-/// No periodic collection or process actions are installed.
+/// Samples only the injected source and publishes its model rows atomically with the shell,
+/// labeling the status with the source's own truthful description rather than a fixed
+/// fixture string. No periodic collection or process actions are installed.
 pub fn initialize_from_source(
     session: &Session,
     source: &mut impl source::ProcessSource,
 ) -> Result<source::ProcessSnapshot, Box<dyn std::error::Error>> {
+    let status = source.status_text().to_string();
     let snapshot = source.snapshot();
     let items = projection::SessionItemIds::default().project(&snapshot)?;
-    initialize_rows(session, items, "Read-only · Fake process snapshot")?;
+    initialize_rows(session, items, &status)?;
     Ok(snapshot)
 }
 

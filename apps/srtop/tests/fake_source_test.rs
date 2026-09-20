@@ -1,6 +1,6 @@
 //! PX-002 acceptance: injected deterministic domain records become collection rows (§§8, 12, 29).
-use srui_process_explorer::{initialize_from_source, source::*, MODEL, TABLE};
-use srui_sdk::{Value, ACTIONS, ACTION_KEY};
+use srui_process_explorer::{initialize_from_source, source::*, MODEL, STATUS, TABLE};
+use srui_sdk::{Value, ACTIONS, ACTION_KEY, TEXT};
 use srui_sessiond::Session;
 use std::time::{Duration, SystemTime};
 
@@ -29,6 +29,10 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
         calls: usize,
     }
     impl ProcessSource for CountingSource {
+        fn status_text(&self) -> &str {
+            FAKE_STATUS_TEXT
+        }
+
         fn snapshot(&mut self) -> ProcessSnapshot {
             self.calls += 1;
             assert_eq!(
@@ -86,9 +90,39 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
 }
 
 #[test]
+fn status_is_the_injected_source_description_not_a_fixed_fixture_label() {
+    struct LabeledSource(&'static str);
+    impl ProcessSource for LabeledSource {
+        fn status_text(&self) -> &str {
+            self.0
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            FakeProcessSource.snapshot()
+        }
+    }
+
+    for label in ["Read-only · Live process snapshot", FAKE_STATUS_TEXT] {
+        let session = Session::mint();
+        initialize_from_source(&session, &mut LabeledSource(label)).unwrap();
+        session.with_store(|store| {
+            assert_eq!(
+                store.get_node(STATUS).unwrap().get_property(TEXT),
+                Some(&Value::String(label.into())),
+                "non-fixture data must never be labeled as synthetic"
+            );
+        });
+    }
+}
+
+#[test]
 fn invalid_source_identity_does_not_publish_partial_ui() {
     struct DuplicateSource;
     impl ProcessSource for DuplicateSource {
+        fn status_text(&self) -> &str {
+            FAKE_STATUS_TEXT
+        }
+
         fn snapshot(&mut self) -> ProcessSnapshot {
             let mut snapshot = FakeProcessSource.snapshot();
             snapshot.records[1].id = snapshot.records[0].id.clone();

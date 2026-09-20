@@ -41,7 +41,15 @@ pub struct ProcessSnapshot {
     pub records: Vec<ProcessRecord>,
 }
 
+/// Status label of the deterministic fixture source. Real sources state their own.
+pub const FAKE_STATUS_TEXT: &str = "Read-only · Fake process snapshot";
+
 pub trait ProcessSource {
+    /// Truthful, source-owned description of this source's provenance, shown as the shell
+    /// status. There is no default: a source must state what its data is, so injected
+    /// non-fixture data can never be mislabeled as synthetic.
+    fn status_text(&self) -> &str;
+
     fn snapshot(&mut self) -> ProcessSnapshot;
 }
 
@@ -49,6 +57,10 @@ pub trait ProcessSource {
 pub struct FakeProcessSource;
 
 impl ProcessSource for FakeProcessSource {
+    fn status_text(&self) -> &str {
+        FAKE_STATUS_TEXT
+    }
+
     fn snapshot(&mut self) -> ProcessSnapshot {
         ProcessSnapshot {
             source: SourceId("fake-processes-v1".into()),

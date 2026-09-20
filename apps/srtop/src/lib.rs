@@ -1,6 +1,8 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
-//! (design §§6–8, 12, 29; PX-001/PX-002). No action handlers are installed.
+//! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003). No action handlers are
+//! installed and no process is ever opened for control.
 
+pub mod procfs;
 mod projection;
 pub mod source;
 
@@ -32,8 +34,34 @@ pub fn initialize_from_source(
     let status = source.status_text().to_string();
     let snapshot = source.snapshot();
     let items = projection::SessionItemIds::default().project(&snapshot)?;
-    initialize_rows(session, items, &status)?;
+    initialize_rows(session, items, &published_status(&status, &snapshot))?;
     Ok(snapshot)
+}
+
+/// The published status line: the source's own truthful description, plus an
+/// explicit clause whenever the scan could not observe every process. A complete
+/// snapshot is labeled exactly as the source describes itself, so an
+/// authoritative empty result and a degraded scan are never the same text and a
+/// partial list is never presented as the whole picture (§22.1).
+pub fn published_status(source_status: &str, snapshot: &source::ProcessSnapshot) -> String {
+    match &snapshot.completeness {
+        source::Completeness::Complete => source_status.to_string(),
+        source::Completeness::Incomplete { skipped, .. } => {
+            let listed = snapshot.records.len();
+            format!(
+                "{source_status} · incomplete scan · {listed} {} listed · {skipped} unreadable",
+                plural(listed)
+            )
+        }
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 {
+        "process"
+    } else {
+        "processes"
+    }
 }
 
 fn initialize_rows(
@@ -90,6 +118,59 @@ pub fn update_title(session: &Session, title: &str) -> Result<(), SessionError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use source::{Completeness, EnumerationIssue, IssueScope, MissingReason, ProcessSource};
+
+    fn empty_snapshot(completeness: Completeness) -> source::ProcessSnapshot {
+        let mut snapshot = source::FakeProcessSource.snapshot();
+        snapshot.records.clear();
+        snapshot.completeness = completeness;
+        snapshot
+    }
+
+    #[test]
+    fn authoritative_empty_and_incomplete_scans_are_distinct_states() {
+        let label = source::FAKE_STATUS_TEXT;
+        // A complete scan is labeled exactly as the source describes itself.
+        assert_eq!(
+            published_status(label, &empty_snapshot(Completeness::Complete)),
+            label
+        );
+        assert_eq!(
+            published_status(label, &source::FakeProcessSource.snapshot()),
+            label
+        );
+        let degraded = Completeness::from_scan(
+            4,
+            vec![EnumerationIssue {
+                scope: IssueScope::Root,
+                reason: MissingReason::Denied,
+                detail: "denied".into(),
+            }],
+        );
+        // An empty degraded scan never reads like an authoritative empty result.
+        let empty_but_degraded = published_status(label, &empty_snapshot(degraded.clone()));
+        assert_eq!(
+            empty_but_degraded,
+            format!("{label} · incomplete scan · 0 processes listed · 4 unreadable")
+        );
+        assert_ne!(
+            empty_but_degraded,
+            published_status(label, &empty_snapshot(Completeness::Complete))
+        );
+        let mut partial = source::FakeProcessSource.snapshot();
+        partial.completeness = degraded;
+        assert_eq!(
+            published_status(label, &partial),
+            format!("{label} · incomplete scan · 3 processes listed · 4 unreadable")
+        );
+        let mut single = empty_snapshot(Completeness::from_scan(1, vec![]));
+        single.records = source::FakeProcessSource.snapshot().records;
+        single.records.truncate(1);
+        assert_eq!(
+            published_status(label, &single),
+            format!("{label} · incomplete scan · 1 process listed · 1 unreadable")
+        );
+    }
 
     #[test]
     fn empty_shell_has_exact_structure_and_no_action_or_terminal_nodes() {

@@ -16,11 +16,14 @@ fn fake_snapshot_is_fixed_without_sampling_the_host_or_clock() {
     );
     assert_eq!(first.records.len(), 3);
     assert_eq!(first.records[0].display_name, first.records[1].display_name);
-    assert_ne!(first.records[0].id, first.records[1].id);
+    assert_ne!(first.records[0].key, first.records[1].key);
+    assert_ne!(first.records[0].key.creation, first.records[1].key.creation);
     assert_eq!(
-        first.records[2].pid,
+        first.records[2].key.pid,
         Observed::Missing(MissingReason::Unavailable)
     );
+    // A fixed fake set is authoritative: it is complete, not a degraded scan.
+    assert_eq!(first.completeness, Completeness::Complete);
 }
 
 #[test]
@@ -125,7 +128,7 @@ fn invalid_source_identity_does_not_publish_partial_ui() {
 
         fn snapshot(&mut self) -> ProcessSnapshot {
             let mut snapshot = FakeProcessSource.snapshot();
-            snapshot.records[1].id = snapshot.records[0].id.clone();
+            snapshot.records[1].key = snapshot.records[0].key.clone();
             snapshot
         }
     }

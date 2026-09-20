@@ -1,6 +1,7 @@
 //! Existing sessiond runtime/SSH bridge host for the PX-001 shell (§§12, 20, 27, 29).
 use srui_process_explorer::{
-    initialize, initialize_from_source, source::FakeProcessSource, update_title, FIXTURE_TITLE,
+    initialize, initialize_from_source, procfs::ProcFsSource, source::FakeProcessSource,
+    update_title, FIXTURE_TITLE,
 };
 use srui_sessiond::{handle_connection, Session};
 use srui_unix_security::{
@@ -14,17 +15,24 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--socket")) {
-        return Err("usage: srtop --socket PATH [--smoke-fixture] [--fake-source]".into());
+        return Err(
+            "usage: srtop --socket PATH [--smoke-fixture] [--fake-source | --live-source]".into(),
+        );
     }
     let socket_path = PathBuf::from(args.next().ok_or("missing --socket PATH")?);
     let mut fixture = false;
     let mut fake_source = false;
+    let mut live_source = false;
     for value in args {
         match value.to_str() {
             Some("--smoke-fixture") if !fixture => fixture = true,
             Some("--fake-source") if !fake_source => fake_source = true,
+            Some("--live-source") if !live_source => live_source = true,
             _ => return Err("unknown or repeated option".into()),
         }
+    }
+    if fake_source && live_source {
+        return Err("choose either --fake-source or --live-source".into());
     }
     let uid = effective_uid();
     require_unprivileged_uid(uid, "srtop")?;
@@ -41,6 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session = Arc::new(Session::mint());
     if fake_source {
         initialize_from_source(&session, &mut FakeProcessSource)?;
+    } else if live_source {
+        // One read-only snapshot of the host's process filesystem; no polling
+        // and no process controls are installed.
+        initialize_from_source(&session, &mut ProcFsSource::live())?;
     } else {
         initialize(&session)?;
     }

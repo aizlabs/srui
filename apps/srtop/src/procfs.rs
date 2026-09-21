@@ -8,9 +8,9 @@
 //! exists on Linux; on other systems it honestly reports an incomplete scan
 //! instead of an authoritative empty result.
 use crate::source::{
-    BootId, Completeness, CreationToken, DisplayName, EnumerationIssue, HostId, IssueScope,
-    MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord, ProcessSnapshot,
-    ProcessSource, SnapshotTime, SourceId,
+    record_issue, BootId, Completeness, CreationToken, DisplayName, EnumerationIssue, HostId,
+    IssueScope, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+    ProcessSnapshot, ProcessSource, SnapshotTime, SourceId,
 };
 use std::fs::File;
 use std::io::{self, Read};
@@ -79,7 +79,7 @@ impl ProcFsSource {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes).trim().to_string();
                 if text.is_empty() {
-                    issues.push(EnumerationIssue {
+                    record_issue(issues, || EnumerationIssue {
                         scope,
                         reason: MissingReason::Unavailable,
                         detail: format!("{relative} is empty"),
@@ -91,7 +91,7 @@ impl ProcFsSource {
             }
             Err(error) => {
                 let reason = reason_for(&error);
-                issues.push(EnumerationIssue {
+                record_issue(issues, || EnumerationIssue {
                     scope,
                     reason,
                     detail: format!("{relative}: {error}"),
@@ -107,7 +107,7 @@ impl ProcFsSource {
             Ok(target) => match parse_namespace(&target.to_string_lossy()) {
                 Some(inode) => Observed::Known(PidNamespaceId(inode)),
                 None => {
-                    issues.push(EnumerationIssue {
+                    record_issue(issues, || EnumerationIssue {
                         scope: IssueScope::PidNamespace,
                         reason: MissingReason::Unavailable,
                         detail: "self/ns/pid is not a pid:[inode] link".into(),
@@ -117,7 +117,7 @@ impl ProcFsSource {
             },
             Err(error) => {
                 let reason = reason_for(&error);
-                issues.push(EnumerationIssue {
+                record_issue(issues, || EnumerationIssue {
                     scope: IssueScope::PidNamespace,
                     reason,
                     detail: format!("self/ns/pid: {error}"),
@@ -156,7 +156,7 @@ impl ProcessSource for ProcFsSource {
             Err(error) => {
                 // The whole scan failed: an empty list here is explicitly not
                 // an authoritative "no processes" answer.
-                issues.push(EnumerationIssue {
+                record_issue(&mut issues, || EnumerationIssue {
                     scope: IssueScope::Root,
                     reason: reason_for(&error),
                     detail: format!("{}: {error}", self.root.display()),
@@ -174,7 +174,7 @@ impl ProcessSource for ProcFsSource {
                 Ok(entry) => entry,
                 Err(error) => {
                     skipped += 1;
-                    issues.push(EnumerationIssue {
+                    record_issue(&mut issues, || EnumerationIssue {
                         scope: IssueScope::Root,
                         reason: reason_for(&error),
                         detail: format!("directory entry: {error}"),
@@ -190,13 +190,11 @@ impl ProcessSource for ProcFsSource {
             };
             if records.len() >= MAX_RECORDS {
                 skipped += 1;
-                if issues.len() < crate::source::MAX_RECORDED_ISSUES {
-                    issues.push(EnumerationIssue {
-                        scope: IssueScope::Root,
-                        reason: MissingReason::Unavailable,
-                        detail: format!("record limit {MAX_RECORDS} reached"),
-                    });
-                }
+                record_issue(&mut issues, || EnumerationIssue {
+                    scope: IssueScope::Root,
+                    reason: MissingReason::Unavailable,
+                    detail: format!("record limit {MAX_RECORDS} reached"),
+                });
                 continue;
             }
             match read_bounded(&self.root.join(&name).join("stat")) {
@@ -204,7 +202,7 @@ impl ProcessSource for ProcFsSource {
                 // the snapshot (PX-003).
                 Err(error) => {
                     skipped += 1;
-                    issues.push(EnumerationIssue {
+                    record_issue(&mut issues, || EnumerationIssue {
                         scope: IssueScope::Process(pid),
                         reason: reason_for(&error),
                         detail: format!("{pid}/stat: {error}"),
@@ -213,7 +211,7 @@ impl ProcessSource for ProcFsSource {
                 Ok(bytes) => match parse_stat(pid, &bytes) {
                     None => {
                         skipped += 1;
-                        issues.push(EnumerationIssue {
+                        record_issue(&mut issues, || EnumerationIssue {
                             scope: IssueScope::Process(pid),
                             reason: MissingReason::Unavailable,
                             detail: format!("{pid}/stat is not parsable for this PID"),

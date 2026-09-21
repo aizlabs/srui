@@ -158,6 +158,21 @@ pub struct EnumerationIssue {
 /// Bound on retained issue descriptions; `skipped` still counts every record.
 pub const MAX_RECORDED_ISSUES: usize = 32;
 
+/// Records an explanation only while the bound has room. The description is built
+/// lazily, so a host whose records are all unreadable cannot make a scan allocate
+/// one detail string per process before a later truncation throws them away: the
+/// bound holds during collection, not just in the result. `skipped` is counted by
+/// the caller and is never bounded — a degraded scan still reports how much it
+/// could not see.
+pub fn record_issue(
+    issues: &mut Vec<EnumerationIssue>,
+    describe: impl FnOnce() -> EnumerationIssue,
+) {
+    if issues.len() < MAX_RECORDED_ISSUES {
+        issues.push(describe());
+    }
+}
+
 /// Whether the record list is authoritative. An empty `Complete` snapshot means
 /// "no processes are visible"; an `Incomplete` snapshot never means that, however
 /// many records it carries.
@@ -271,6 +286,32 @@ impl ProcessSource for FakeProcessSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_recording_stops_allocating_once_the_bound_is_reached() {
+        let mut issues = Vec::new();
+        let mut described = 0usize;
+        let flood = MAX_RECORDED_ISSUES + 500;
+        for pid in 0..flood as u32 {
+            record_issue(&mut issues, || {
+                described += 1;
+                EnumerationIssue {
+                    scope: IssueScope::Process(pid),
+                    reason: MissingReason::Denied,
+                    detail: format!("{pid}/stat: denied"),
+                }
+            });
+            assert!(
+                issues.len() <= MAX_RECORDED_ISSUES,
+                "the buffer must stay bounded during collection, not only after truncation"
+            );
+        }
+        assert_eq!(issues.len(), MAX_RECORDED_ISSUES);
+        assert_eq!(
+            described, MAX_RECORDED_ISSUES,
+            "no explanation may be built once the bound is reached"
+        );
+    }
 
     #[test]
     fn hostile_names_are_sanitized_without_losing_literal_text() {

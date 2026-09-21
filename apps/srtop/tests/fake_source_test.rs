@@ -119,6 +119,52 @@ fn status_is_the_injected_source_description_not_a_fixed_fixture_label() {
 }
 
 #[test]
+fn a_snapshot_larger_than_one_model_batch_is_published_whole() {
+    // A live host can hold more processes than §26 allows in a single model
+    // mutation batch. Publishing must split into bounded batches rather than
+    // abort initialization and leave the operator with no window at all.
+    struct CrowdedSource(usize);
+    impl ProcessSource for CrowdedSource {
+        fn status_text(&self) -> &str {
+            "Read-only · Crowded fixture snapshot"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let mut snapshot = FakeProcessSource.snapshot();
+            let template = snapshot.records[0].key.clone();
+            snapshot.records = (0..self.0)
+                .map(|index| ProcessRecord {
+                    key: ProcessKey {
+                        pid: Observed::Known(index as u32 + 1),
+                        creation: CreationToken::Opaque(format!("crowded-{index}")),
+                        ..template.clone()
+                    },
+                    display_name: DisplayName::sanitize(b"worker"),
+                })
+                .collect();
+            snapshot
+        }
+    }
+
+    let session = Session::mint();
+    let limit = session.with_store(|store| store.limits().max_items_per_model_operation);
+    let crowded = limit * 2 + 1;
+    let snapshot = initialize_from_source(&session, &mut CrowdedSource(crowded)).unwrap();
+    assert_eq!(snapshot.records.len(), crowded);
+    assert_eq!(
+        session.current_revision(),
+        1,
+        "every batch belongs to the one transaction that publishes the shell"
+    );
+    session.with_store(|store| {
+        let model = store.get_model(MODEL).unwrap();
+        assert_eq!(model.item_count, crowded as u64);
+        assert_eq!(model.id_to_index.len(), crowded, "no row is dropped");
+        assert_eq!(store.node_count(), 5, "rows never become view nodes");
+    });
+}
+
+#[test]
 fn invalid_source_identity_does_not_publish_partial_ui() {
     struct DuplicateSource;
     impl ProcessSource for DuplicateSource {

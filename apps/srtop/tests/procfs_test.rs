@@ -11,7 +11,7 @@ use srui_process_explorer::procfs::{
 };
 use srui_process_explorer::source::{
     Completeness, CreationToken, IssueScope, MissingReason, Observed, ProcessSource, SourceId,
-    FAKE_STATUS_TEXT,
+    FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -207,6 +207,32 @@ fn one_inaccessible_record_is_skipped_with_a_reason_without_failing_the_scan() {
             Some(MissingReason::Unavailable)
         );
     }
+}
+
+#[test]
+fn a_wholly_unreadable_root_keeps_issue_memory_bounded_while_counting_every_record() {
+    let fixture = ProcFixture::new();
+    fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
+    let denied = MAX_RECORDED_ISSUES + 200;
+    for pid in 0..denied as u32 {
+        fixture.denied(pid + 1);
+    }
+    let snapshot = fixture.source().snapshot();
+    assert!(snapshot.records.is_empty());
+    assert!(
+        !snapshot.completeness.is_complete(),
+        "a host whose records are all unreadable is never an authoritative empty result"
+    );
+    assert_eq!(
+        snapshot.completeness.skipped(),
+        denied,
+        "the count of what could not be read is never bounded"
+    );
+    assert_eq!(
+        snapshot.completeness.issues().len(),
+        MAX_RECORDED_ISSUES,
+        "retained explanations stay at the bound"
+    );
 }
 
 #[test]

@@ -69,10 +69,23 @@ fn initialize_rows(
     items: Vec<srui_semantic_tree::ModelItem>,
     status: &str,
 ) -> Result<(), SessionError> {
+    // §26 bounds the items in a single model mutation batch, and a live host can
+    // hold more processes than that bound. The rows are therefore published as
+    // consecutive bounded batches inside the one transaction that creates the
+    // shell, so a large snapshot still arrives atomically instead of aborting
+    // initialization. The limit is read before the transaction opens: the session
+    // lock is held for the closure's duration.
+    let batch = session
+        .with_store(|store| store.limits().max_items_per_model_operation)
+        .max(1);
     session.transaction(|ui| {
         ui.apply_op(&Operation::create_model(MODEL, TypeRef::TABLE, 0))?;
-        if !items.is_empty() {
-            ui.apply_op(&Operation::model_insert(MODEL, 0, items.clone()))?;
+        for (batch_index, chunk) in items.chunks(batch).enumerate() {
+            ui.apply_op(&Operation::model_insert(
+                MODEL,
+                (batch_index * batch) as u64,
+                chunk.to_vec(),
+            ))?;
         }
         Surface::builder(SURFACE).label(TITLE).create(ui)?;
         Column::builder(COLUMN)

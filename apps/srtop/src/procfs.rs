@@ -22,7 +22,8 @@ pub const DEFAULT_PROC_ROOT: &str = "/proc";
 /// Source-owned status label: this data is a live read of a real process
 /// filesystem and is never described as a fixture.
 pub const LIVE_STATUS_TEXT: &str = "Read-only · Live process snapshot";
-/// Bound on records published from one scan; the remainder is reported skipped.
+/// Default bound on records published from one scan; entries beyond it are
+/// counted as capped, never as unreadable.
 pub const MAX_RECORDS: usize = 65_536;
 /// Bound on every single file this scan reads.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
@@ -35,6 +36,7 @@ pub struct ProcFsSource {
     root: PathBuf,
     source: SourceId,
     status: String,
+    record_limit: usize,
 }
 
 impl ProcFsSource {
@@ -61,7 +63,15 @@ impl ProcFsSource {
             root,
             source,
             status,
+            record_limit: MAX_RECORDS,
         }
+    }
+
+    /// Bounds how many records one scan publishes. Entries beyond the bound are
+    /// reported as capped rather than unreadable, and the scan is not complete.
+    pub fn with_record_limit(mut self, limit: usize) -> Self {
+        self.record_limit = limit;
+        self
     }
 
     pub fn source_id(&self) -> &SourceId {
@@ -138,6 +148,7 @@ impl ProcessSource for ProcFsSource {
         let mut issues = Vec::new();
         let mut skipped = 0usize;
         let mut vanished = 0usize;
+        let mut capped = 0usize;
         let host = self.identity(
             "sys/kernel/hostname",
             IssueScope::HostIdentity,
@@ -167,6 +178,7 @@ impl ProcessSource for ProcFsSource {
                     sampled_at,
                     records,
                     vanished,
+                    capped,
                     completeness: Completeness::from_scan(skipped, issues),
                 };
             }
@@ -190,13 +202,19 @@ impl ProcessSource for ProcFsSource {
             let Some(pid) = parse_pid(name.as_encoded_bytes()) else {
                 continue;
             };
-            if records.len() >= MAX_RECORDS {
-                skipped += 1;
-                record_issue(&mut issues, || EnumerationIssue {
-                    scope: IssueScope::Entry,
-                    reason: MissingReason::Unavailable,
-                    detail: format!("record limit {MAX_RECORDS} reached"),
-                });
+            if records.len() >= self.record_limit {
+                // This entry was never read: it is omitted by the collector's own
+                // bound, not because anything denied or hid it. Counting it as
+                // skipped would publish a read failure that never happened.
+                capped += 1;
+                if capped == 1 {
+                    let limit = self.record_limit;
+                    record_issue(&mut issues, || EnumerationIssue {
+                        scope: IssueScope::Limit,
+                        reason: MissingReason::Unavailable,
+                        detail: format!("record limit {limit} reached"),
+                    });
+                }
                 continue;
             }
             match read_bounded(&self.root.join(&name).join("stat")) {
@@ -250,6 +268,7 @@ impl ProcessSource for ProcFsSource {
             sampled_at,
             records,
             vanished,
+            capped,
             completeness: Completeness::from_scan(skipped, issues),
         }
     }

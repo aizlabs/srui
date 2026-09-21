@@ -278,6 +278,37 @@ fn a_wholly_unreadable_root_keeps_issue_memory_bounded_while_counting_every_reco
 }
 
 #[test]
+fn records_beyond_the_collector_limit_are_never_reported_as_unreadable() {
+    let fixture = ProcFixture::new();
+    fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
+    for pid in 1..=5u32 {
+        fixture.process(pid, b"worker", 100 + u64::from(pid));
+    }
+    let snapshot = fixture.source().with_record_limit(2).snapshot();
+    assert_eq!(snapshot.records.len(), 2);
+    // The omitted entries were never opened: nothing denied or hid them.
+    assert_eq!(snapshot.capped, 3);
+    assert_eq!(snapshot.completeness.skipped(), 0);
+    let issues = snapshot.completeness.issues();
+    assert_eq!(
+        issues.len(),
+        1,
+        "the bound is explained once, not per entry"
+    );
+    assert_eq!(issues[0].scope, IssueScope::Limit);
+    // The list is still not authoritative, but it is not a read failure either.
+    assert!(!snapshot.completeness.is_complete());
+    let published = published_status(LIVE_STATUS_TEXT, &snapshot);
+    assert_eq!(
+        published,
+        format!(
+            "{LIVE_STATUS_TEXT} · incomplete scan · 2 processes listed · 3 beyond the record limit"
+        )
+    );
+    assert!(!published.contains("unreadable"), "{published}");
+}
+
+#[test]
 fn missing_identity_files_degrade_explicitly_instead_of_aliasing_silently() {
     let fixture = ProcFixture::new();
     fixture.process(1, b"systemd", 7);

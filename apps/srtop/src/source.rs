@@ -191,6 +191,10 @@ pub enum IssueScope {
     Root,
     /// One entry of an otherwise readable root could not be examined.
     Entry,
+    /// The scan reached its own record bound. Nothing was inaccessible: the
+    /// remaining entries were never read, so they are never reported as denied
+    /// or unreadable.
+    Limit,
     HostIdentity,
     BootIdentity,
     PidNamespace,
@@ -280,6 +284,12 @@ pub struct ProcessSnapshot {
     /// "incomplete scan" and make a genuinely denied record indistinguishable
     /// from ordinary churn.
     pub vanished: usize,
+    /// Records the scan saw but never read, because it had already published as
+    /// many as its own bound allows. They exist and may be perfectly readable,
+    /// so counting them as `skipped` would publish a read failure or permission
+    /// problem that never happened. The list is still not authoritative, which
+    /// [`Completeness`] reports through the recorded [`IssueScope::Limit`].
+    pub capped: usize,
     pub completeness: Completeness,
 }
 
@@ -337,6 +347,7 @@ impl ProcessSource for FakeProcessSource {
                 },
             ],
             vanished: 0,
+            capped: 0,
             completeness: Completeness::Complete,
         }
     }

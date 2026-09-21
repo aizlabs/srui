@@ -69,6 +69,12 @@ pub fn published_status(source_status: &str, snapshot: &source::ProcessSnapshot)
             clauses.push(format!("{skipped} unreadable"));
         }
     }
+    // Records omitted by the collector's own bound were never read: publishing
+    // them as unreadable would claim a read failure or a permission problem that
+    // never happened.
+    if snapshot.capped > 0 {
+        clauses.push(format!("{} beyond the record limit", snapshot.capped));
+    }
     if issues.iter().any(|issue| {
         matches!(
             issue.scope,

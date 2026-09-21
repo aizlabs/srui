@@ -71,6 +71,14 @@ impl ProcFixture {
         self
     }
 
+    /// The namespace init of the scanned mount: the task it numbers 1, with the
+    /// `ns/pid` link that names the namespace its records are numbered in.
+    fn namespace_init(&self, namespace: &str) -> &Self {
+        fs::create_dir_all(self.0.join("1/ns")).unwrap();
+        std::os::unix::fs::symlink(namespace, self.0.join("1/ns/pid")).unwrap();
+        self
+    }
+
     /// Shapes the root like a real procfs mount whose `self` symlink names this
     /// process as *that mount* numbers it, with its own `ns/pid` link beneath.
     fn self_numbered(&self, named: u32, namespace: &str) -> &Self {
@@ -324,6 +332,26 @@ fn a_mount_numbering_pids_in_another_namespace_never_stamps_this_one() {
         snapshot.records[0].key.pid_namespace,
         Observed::Missing(MissingReason::Unavailable)
     );
+
+    // When the mount's own namespace init is readable it answers directly, and
+    // outranks the reader's link: these records are numbered in the mount's
+    // namespace, not in whichever one this process happens to be in.
+    let readable_init = ProcFixture::new();
+    readable_init
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(1, b"systemd", 7)
+        .namespace_init("pid:[4026599999]")
+        .self_numbered(u32::MAX - 1, "pid:[4026531836]");
+    let snapshot = readable_init.source().snapshot();
+    assert_eq!(
+        snapshot.records[0].key.pid_namespace,
+        Observed::Known(srui_process_explorer::source::PidNamespaceId(4_026_599_999))
+    );
+    assert!(snapshot
+        .completeness
+        .issues()
+        .iter()
+        .all(|issue| issue.scope != IssueScope::PidNamespace));
 
     // A fixture tree is not a procfs mount — it has no `self` symlink — so its
     // own identity files still answer for it, and the live `/proc` case, where

@@ -121,34 +121,55 @@ impl ProcFsSource {
     /// the link resolves to the container's, so every key would be stamped with
     /// a namespace its PIDs do not belong to.
     ///
-    /// So the link is trusted only when the scanned mount *is* the procfs this
-    /// process runs under. A procfs superblock belongs to exactly one PID
-    /// namespace, so comparing the task directory `<root>/self` resolves to with
-    /// the one this process's own `/proc/self` resolves to — same device, same
-    /// inode — proves that, where matching PID *numbers* would not: two
-    /// namespaces can number this process identically by coincidence. Anything
-    /// else reports the namespace unavailable rather than guessing it: an
-    /// unknown identity component fails explicitly instead of degrading
-    /// silently. A fixture tree has no `self` symlink and is not a procfs mount,
-    /// so its own identity files answer for it.
+    /// The mount's own namespace init answers it directly when this scan may
+    /// read it: `<root>/1` is the task *that mount* numbers 1, so its `ns/pid`
+    /// link names the namespace the enumerated PIDs are numbered in, whatever
+    /// namespace the reader is in. Reading another task's `ns/` link needs
+    /// ptrace access, so an unprivileged scan of a host `/proc` normally cannot,
+    /// and falls back to the reader's own link — but only with both proofs that
+    /// it describes these records:
+    ///
+    /// * `<root>/self` names *this* process's own PID. A nested PID namespace
+    ///   that inherited an outer `/proc` (`unshare --pid --fork` with no
+    ///   remount) fails here: the mount still numbers this process by its outer
+    ///   PID while `self/ns/pid` names the inner namespace.
+    /// * `<root>/self` and `/proc/self` are the same device and inode, so the
+    ///   mount is the procfs this process runs under. A procfs superblock
+    ///   belongs to exactly one PID namespace; a bind-mounted host `/proc`
+    ///   fails here even when the two numberings happen to agree.
+    ///
+    /// Failing either, the namespace is reported unavailable rather than
+    /// guessed: an unknown identity component fails explicitly instead of
+    /// degrading silently. A fixture tree has no `self` symlink and is not a
+    /// procfs mount, so its own identity files answer for it.
     fn pid_namespace(&self, issues: &mut Vec<EnumerationIssue>) -> Observed<PidNamespaceId> {
+        if let Some(inode) = std::fs::read_link(self.root.join("1/ns/pid"))
+            .ok()
+            .and_then(|target| parse_namespace(&target.to_string_lossy()))
+        {
+            return Observed::Known(PidNamespaceId(inode));
+        }
         let scanned_self = self.root.join("self");
         if scanned_self.is_symlink() {
             let own_self = Path::new(DEFAULT_PROC_ROOT).join("self");
-            let same_procfs = match (
+            let numbers_this_process = std::fs::read_link(&scanned_self)
+                .ok()
+                .and_then(|target| parse_pid(target.as_os_str().as_encoded_bytes()))
+                == Some(std::process::id());
+            let own_procfs = match (
                 std::fs::metadata(&scanned_self),
                 std::fs::metadata(&own_self),
             ) {
                 (Ok(scanned), Ok(own)) => scanned.dev() == own.dev() && scanned.ino() == own.ino(),
                 _ => false,
             };
-            if !same_procfs {
+            if !readers_namespace_describes(numbers_this_process, own_procfs) {
                 record_issue(issues, || {
                     EnumerationIssue {
                     scope: IssueScope::PidNamespace,
                     reason: MissingReason::Unavailable,
                     detail: format!(
-                        "{} is not this process's own procfs: its records are numbered in another PID namespace",
+                        "{} numbers its records in a PID namespace this scan cannot prove is its own",
                         self.root.display()
                     ),
                 }
@@ -318,6 +339,17 @@ impl ProcessSource for ProcFsSource {
     }
 }
 
+/// Whether `self/ns/pid` — always the *reader's* active namespace — describes
+/// the records of the scanned mount. Both proofs are required, and each rules
+/// out a different real configuration: a mount that does not number this process
+/// by its own PID is numbering its records elsewhere (a nested namespace that
+/// inherited an outer `/proc`), and a mount that is not the procfs this process
+/// runs under belongs to another namespace even when the two numberings happen
+/// to agree (a bind-mounted host `/proc`).
+fn readers_namespace_describes(numbers_this_process: bool, is_own_procfs: bool) -> bool {
+    numbers_this_process && is_own_procfs
+}
+
 fn reason_for(error: &io::Error) -> MissingReason {
     match error.kind() {
         io::ErrorKind::PermissionDenied => MissingReason::Denied,
@@ -386,4 +418,23 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
         .rposition(|byte| !byte.is_ascii_whitespace())
         .map_or(start, |index| index + 1);
     &bytes[start..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_readers_namespace_describes_records_only_under_both_proofs() {
+        // The mount this process runs under and is numbered by.
+        assert!(readers_namespace_describes(true, true));
+        // A nested PID namespace that inherited an outer `/proc`: the same
+        // mount, so the same superblock, but it still numbers this process by
+        // its outer PID while the link names the inner namespace.
+        assert!(!readers_namespace_describes(false, true));
+        // A bind-mounted host `/proc` whose numbering happens to agree: PIDs
+        // coincide across namespaces, so agreement proves nothing on its own.
+        assert!(!readers_namespace_describes(true, false));
+        assert!(!readers_namespace_describes(false, false));
+    }
 }

@@ -47,14 +47,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .socket_identity()?
         .ok_or("socket vanished after bind")?;
     let session = Arc::new(Session::mint());
-    if fake_source {
-        initialize_from_source(&session, &mut FakeProcessSource)?;
+    let initialized: Result<(), Box<dyn std::error::Error>> = if fake_source {
+        initialize_from_source(&session, &mut FakeProcessSource).map(|_| ())
     } else if live_source {
         // One read-only snapshot of the host's process filesystem; no polling
         // and no process controls are installed.
-        initialize_from_source(&session, &mut ProcFsSource::live())?;
+        initialize_from_source(&session, &mut ProcFsSource::live()).map(|_| ())
     } else {
-        initialize(&session)?;
+        initialize(&session).map_err(Into::into)
+    };
+    // The socket is already published. Sampling a real host can fail where the
+    // constant fixture cannot, and leaving the socket behind would make the next
+    // start refuse it as another instance's: this instance owns it and removes
+    // it on the failure path too.
+    if let Err(error) = initialized {
+        if parent.socket_identity()? == Some(identity) {
+            parent.remove_socket()?;
+        }
+        return Err(error);
     }
     let shutdown = CancellationToken::new();
     let mut connections = JoinSet::new();

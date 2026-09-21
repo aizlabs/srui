@@ -169,7 +169,19 @@ fn a_process_filesystem_source_never_describes_itself_as_a_fixture_source() {
     let scoped = fixture.source();
     assert_ne!(scoped.status_text(), LIVE_STATUS_TEXT);
     assert_ne!(scoped.status_text(), FAKE_STATUS_TEXT);
-    assert!(scoped.status_text().contains("fixture"));
+    assert!(scoped
+        .status_text()
+        .contains(&fixture.0.display().to_string()));
+    // A scoped root states what it read and from where. It claims neither
+    // liveness nor synthesis, because the path cannot tell them apart: a bind
+    // mount of the host's real `/proc` is live data, and labeling those rows a
+    // fixture would describe live processes as synthetic.
+    for source in [scoped, ProcFsSource::with_root("/host/proc")] {
+        let status = source.status_text().to_lowercase();
+        assert!(!status.contains("fixture"), "{status}");
+        assert!(!status.contains("fake"), "{status}");
+        assert!(!status.contains("live"), "{status}");
+    }
 }
 
 #[test]
@@ -529,16 +541,56 @@ fn hostile_names_cannot_shift_fields_or_reach_the_ui_as_live_content() {
 fn oversized_records_are_bounded_rather_than_read_without_limit() {
     let fixture = ProcFixture::new();
     fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
-    let mut padded = stat_line(900, b"padded", 31);
-    padded.pop();
-    padded.extend(std::iter::repeat_n(b' ', MAX_FILE_BYTES as usize));
-    padded.extend_from_slice(b"\n");
-    fixture.raw(900, &padded);
+    // Exactly at the bound: read whole and parsed.
+    let mut snug = stat_line(900, b"padded", 31);
+    snug.pop();
+    snug.extend(std::iter::repeat_n(
+        b' ',
+        MAX_FILE_BYTES as usize - snug.len() - 1,
+    ));
+    snug.push(b'\n');
+    assert_eq!(snug.len() as u64, MAX_FILE_BYTES);
+    fixture.raw(900, &snug);
+
+    // Past the bound, with the creation token straddling it. Cutting at the
+    // bound leaves a line that still parses — first `(`, last `)`, twenty fields
+    // — whose twentieth field is `9070`, the digits of `907081358` that happened
+    // to fit. That is a stable but false process identity, so the record must be
+    // skipped with a reason instead.
+    let mut straddling = b"901 (padded) S".to_vec();
+    for filler in 1..=18 {
+        straddling.extend_from_slice(format!(" {filler}").as_bytes());
+    }
+    straddling.extend(std::iter::repeat_n(
+        b' ',
+        MAX_FILE_BYTES as usize - straddling.len() - 4,
+    ));
+    straddling.extend_from_slice(b"907081358 4096 0 18446744073709551615\n");
+    assert!(straddling.len() as u64 > MAX_FILE_BYTES);
+    assert_eq!(
+        parse_stat(901, &straddling[..MAX_FILE_BYTES as usize]).map(|(_, ticks)| ticks),
+        Some(9070),
+        "a silent cut would mint this wrong creation token"
+    );
+    fixture.raw(901, &straddling);
+
     let snapshot = fixture.source().snapshot();
     assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.records[0].key.pid, Observed::Known(900));
     assert_eq!(
         snapshot.records[0].key.creation,
         CreationToken::LinuxBootTicks(31)
+    );
+    assert_eq!(snapshot.completeness.skipped(), 1);
+    assert_eq!(
+        snapshot
+            .completeness
+            .issues()
+            .iter()
+            .find(|issue| issue.scope == IssueScope::Process(901))
+            .map(|issue| issue.reason),
+        Some(MissingReason::Unavailable),
+        "an oversized record is skipped with a reason, never silently shortened"
     );
 }
 

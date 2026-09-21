@@ -41,25 +41,34 @@ pub struct ProcFsSource {
 }
 
 impl ProcFsSource {
-    /// Reads the host's real process filesystem.
+    /// Reads the host's real process filesystem. Only this constructor may
+    /// describe its data as live.
     pub fn live() -> Self {
-        Self::with_root(DEFAULT_PROC_ROOT)
+        Self::rooted(
+            PathBuf::from(DEFAULT_PROC_ROOT),
+            LIVE_STATUS_TEXT.to_string(),
+        )
     }
 
     /// Reads a `/proc`-shaped tree. The root is part of the source identity, so
     /// records from different roots can never alias.
+    ///
+    /// The status describes what was read and from where, and claims neither
+    /// liveness nor synthesis. A path cannot tell the two apart: `/host/proc` is
+    /// a bind mount of a real process filesystem, and calling its rows a fixture
+    /// would label live host processes as synthetic — the same defect as the
+    /// reverse, in the other direction.
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
+        let status = format!(
+            "Read-only · Process filesystem snapshot: {}",
+            root.display()
+        );
+        Self::rooted(root, status)
+    }
+
+    fn rooted(root: PathBuf, status: String) -> Self {
         let source = SourceId(format!("procfs:{}", root.display()));
-        // Only the real process filesystem may be described as live data.
-        let status = if root == Path::new(DEFAULT_PROC_ROOT) {
-            LIVE_STATUS_TEXT.to_string()
-        } else {
-            format!(
-                "Read-only · Process filesystem fixture snapshot: {}",
-                root.display()
-            )
-        };
         Self {
             root,
             source,
@@ -150,7 +159,16 @@ impl ProcFsSource {
             return Observed::Known(PidNamespaceId(inode));
         }
         let scanned_self = self.root.join("self");
-        if scanned_self.is_symlink() {
+        // A real procfs mount always has `self` as a symlink; a tree that does
+        // not is not a procfs mount and answers from its own identity files.
+        // `Path::is_symlink` would fold "cannot tell" into that second case, so
+        // the file type is read explicitly and an error counts as unproven.
+        let scanned_self_kind =
+            std::fs::symlink_metadata(&scanned_self).map(|data| data.file_type());
+        if scanned_self_kind
+            .as_ref()
+            .map_or(true, |kind| kind.is_symlink())
+        {
             let own_self = Path::new(DEFAULT_PROC_ROOT).join("self");
             let numbers_this_process = std::fs::read_link(&scanned_self)
                 .ok()
@@ -359,10 +377,22 @@ fn reason_for(error: &io::Error) -> MissingReason {
 
 fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
     // `/proc` files report size 0, so read through a hard byte bound instead.
+    // Reading one byte past the bound is what separates "exactly this long" from
+    // "cut here": a stat line cut mid-field still parses — first `(`, last `)`,
+    // twenty whitespace fields — and would mint a *wrong* creation token, a
+    // stable but false process identity, from the digits that happened to fit.
+    // An oversized file is therefore an error, skipped with a reason, never a
+    // silently shortened record.
     let mut bytes = Vec::new();
     File::open(path)?
-        .take(MAX_FILE_BYTES)
+        .take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("exceeds the {MAX_FILE_BYTES} byte read bound"),
+        ));
+    }
     Ok(bytes)
 }
 

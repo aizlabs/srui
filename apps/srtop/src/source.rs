@@ -100,10 +100,13 @@ impl DisplayName {
                 truncated = true;
                 break;
             }
-            name.push(if Self::is_unsafe(character) {
-                REPLACEMENT
-            } else {
-                character
+            name.push(match character {
+                // A space separator is legible and cannot fake a glyph, but a
+                // non-ASCII one can fake alignment and width, so it is narrowed
+                // to a plain space instead of being destroyed.
+                _ if Self::is_space_separator(character) => ' ',
+                _ if Self::is_unsafe(character) => REPLACEMENT,
+                _ => character,
             });
         }
         if truncated {
@@ -132,12 +135,13 @@ impl DisplayName {
     /// public so tests assert against the same rule the sanitizer applies.
     ///
     /// The last group cannot be expressed as a Unicode property: U+3164 is Lo,
-    /// U+2800 is So, U+13441 is Lo and U+13440 is Mn — ordinary categories whose
-    /// glyph is blank, or which silently re-render the glyph beside them.
-    /// "Renders as nothing" is a property of the glyph, not of the character
-    /// class, so those code points are enumerated deliberately, by whole block
-    /// where a block is entirely invisible, and the list grows when a new blank
-    /// glyph is assigned.
+    /// U+2800 is So, U+1D159 is So, U+13441 is Lo and U+13440 is Mn — ordinary
+    /// categories whose glyph is blank, or which silently re-render the glyph
+    /// beside them. "Renders as nothing" is a property of the glyph, not of the
+    /// character class, so no categorical rule can stand in for the list: it is
+    /// the published set of invisible and blank-glyph code points, closed by
+    /// whole block wherever a block is entirely invisible, and it grows when a
+    /// new blank glyph is assigned.
     pub fn is_unsafe(character: char) -> bool {
         character.is_control()
             || matches!(character,
@@ -158,6 +162,7 @@ impl DisplayName {
                 | '\u{13430}'..='\u{1343f}'
                 | '\u{1bca0}'..='\u{1bca3}'
                 | '\u{1d173}'..='\u{1d17a}'
+                | '\u{1d159}'
                 // The whole tag plane, assigned or not: the language tag, the
                 // tag characters and the variation selectors supplement all
                 // render as nothing, and no code point here belongs in a name.
@@ -182,6 +187,18 @@ impl DisplayName {
                 // whole rather than one code point at a time.
                 | '\u{13440}'..='\u{13446}'
                 | '\u{16fe4}')
+    }
+
+    /// Unicode space separators other than U+0020. They are visible as blank
+    /// width, so they are not destroyed, but a non-breaking or ideographic space
+    /// can fake the width and wrapping of a name, so the sanitizer narrows every
+    /// one of them to a plain space.
+    pub fn is_space_separator(character: char) -> bool {
+        matches!(
+            character,
+            '\u{00a0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+        )
     }
 
     pub fn as_str(&self) -> &str {
@@ -450,6 +467,7 @@ mod tests {
             '\u{e0100}',
             '\u{1107f}',
             '\u{16fe4}',
+            '\u{1d159}',
             // Blank glyphs and invisible marks in ordinary categories: `Lo`
             // letters whose rendering is empty space, and an `Mn` mark that
             // silently re-renders its neighbour. No Unicode property
@@ -475,6 +493,27 @@ mod tests {
         for kept in ["sshd", "ЖУК", "my app (2)", "$(reboot)", "日本語"] {
             assert_eq!(DisplayName::sanitize(kept.as_bytes()).as_str(), kept);
         }
+    }
+
+    #[test]
+    fn exotic_spaces_are_narrowed_to_a_plain_space_rather_than_destroyed() {
+        // These are visible as blank width, so replacing them would mangle a
+        // legible name; keeping them would let a row fake width and wrapping.
+        for space in [
+            '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2009}', '\u{202f}', '\u{205f}', '\u{3000}',
+        ] {
+            assert!(DisplayName::is_space_separator(space), "{space:?}");
+            assert!(!DisplayName::is_unsafe(space), "{space:?}");
+            assert_eq!(
+                DisplayName::sanitize(format!("a{space}sshd").as_bytes()).as_str(),
+                "a sshd"
+            );
+        }
+        // A name made only of exotic spaces is still never empty.
+        assert_eq!(
+            DisplayName::sanitize("\u{3000}\u{00a0}".as_bytes()).as_str(),
+            UNNAMED_PROCESS
+        );
     }
 
     #[test]

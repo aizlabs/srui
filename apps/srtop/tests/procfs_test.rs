@@ -518,13 +518,17 @@ mod live {
         assert!(matches!(record.key.boot, Observed::Known(_)));
         assert!(matches!(record.key.host, Observed::Known(_)));
         assert!(matches!(record.key.pid_namespace, Observed::Known(_)));
-        let init = snapshot
+        // Any other visible record proves the same thing as PID 1 here, and PID
+        // 1 is legitimately invisible to an unprivileged scan under `hidepid=2`
+        // or in a restricted container — where the collector is working exactly
+        // as intended.
+        let other = snapshot
             .records
             .iter()
-            .find(|record| record.key.pid == Observed::Known(1))
-            .expect("PID 1 must be visible");
-        assert_ne!(record.key, init.key);
-        assert_eq!(record.key.boot, init.key.boot);
+            .find(|candidate| candidate.key.pid != Observed::Known(pid))
+            .expect("a live host shows more than this test's own worker");
+        assert_ne!(record.key, other.key);
+        assert_eq!(record.key.boot, other.key.boot);
         println!(
             "PX-003 live evidence: source={:?} host={:?} boot={:?} ns={:?} worker_pid={pid} \
              creation_ticks={ticks} records={} completeness_skipped={} status={:?}",

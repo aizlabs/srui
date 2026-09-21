@@ -123,25 +123,32 @@ impl DisplayName {
         }
     }
 
-    /// True for every character that must never reach a rendered row: Unicode
-    /// control characters (Cc), format characters (Cf — soft hyphen, the bidi
-    /// marks and overrides, the zero-width joiners, the tag characters), the
-    /// line and paragraph separators, and the code points outside those
-    /// categories that render as nothing at all.
+    /// True for every character that must never reach a rendered row:
+    ///
+    /// * Unicode control characters (Cc), through [`char::is_control`].
+    /// * The complete `Default_Ignorable_Code_Point` set, transcribed below as
+    ///   ranges, including its *reserved* members (U+2065, U+FFF0–U+FFF8 and the
+    ///   unassigned parts of the tag plane): a code point the standard says to
+    ///   ignore renders as nothing today and must not survive as a name.
+    /// * The format characters (Cf) outside that set — the Arabic and Kaithi
+    ///   number signs, the interlinear annotation marks, the Egyptian format
+    ///   controls — which are not ignorable but still invisible.
+    /// * The line and paragraph separators (Zl, Zp).
+    /// * Blank glyphs in ordinary categories, which no property describes.
     ///
     /// `char::is_control` covers only Cc, so a `comm` of `a\u{2028}sshd` or
     /// `a\u{3164}sshd` would otherwise reach the table as a line break or an
     /// invisible gap and let one row impersonate another. This predicate is
     /// public so tests assert against the same rule the sanitizer applies.
     ///
-    /// The last group cannot be expressed as a Unicode property: U+3164 is Lo,
-    /// U+2800 is So, U+1D159 is So, U+13441 is Lo and U+13440 is Mn — ordinary
-    /// categories whose glyph is blank, or which silently re-render the glyph
-    /// beside them. "Renders as nothing" is a property of the glyph, not of the
-    /// character class, so no categorical rule can stand in for the list: it is
-    /// the published set of invisible and blank-glyph code points, closed by
-    /// whole block wherever a block is entirely invisible, and it grows when a
-    /// new blank glyph is assigned.
+    /// Only the last group is open-ended: U+3164 is Lo, U+2800 and U+1D159 are
+    /// So, U+13441 is Lo and U+13440 is Mn — ordinary categories whose glyph is
+    /// blank, or which silently re-render the glyph beside them. "Renders as
+    /// nothing" is a property of the glyph, not of the character class, and
+    /// `Default_Ignorable_Code_Point` does not include any of them, so they are
+    /// enumerated deliberately and the list grows when a new blank glyph is
+    /// assigned. The ignorable set above, by contrast, is complete, and
+    /// `every_default_ignorable_code_point_is_unsafe` walks all of it.
     pub fn is_unsafe(character: char) -> bool {
         character.is_control()
             || matches!(character,
@@ -157,7 +164,7 @@ impl DisplayName {
                 | '\u{202a}'..='\u{202e}'
                 | '\u{2060}'..='\u{206f}'
                 | '\u{feff}'
-                | '\u{fff9}'..='\u{fffb}'
+                | '\u{fff0}'..='\u{fffb}'
                 | '\u{110bd}' | '\u{110cd}'
                 | '\u{13430}'..='\u{1343f}'
                 | '\u{1bca0}'..='\u{1bca3}'
@@ -493,6 +500,49 @@ mod tests {
         for kept in ["sshd", "ЖУК", "my app (2)", "$(reboot)", "日本語"] {
             assert_eq!(DisplayName::sanitize(kept.as_bytes()).as_str(), kept);
         }
+    }
+
+    /// `Default_Ignorable_Code_Point`, Unicode 15.1, in full — including the
+    /// reserved ranges, which is where every "adjacent gap" in a hand-written
+    /// list comes from.
+    const DEFAULT_IGNORABLE: &[(char, char)] = &[
+        ('\u{00ad}', '\u{00ad}'),
+        ('\u{034f}', '\u{034f}'),
+        ('\u{061c}', '\u{061c}'),
+        ('\u{115f}', '\u{1160}'),
+        ('\u{17b4}', '\u{17b5}'),
+        ('\u{180b}', '\u{180f}'),
+        ('\u{200b}', '\u{200f}'),
+        ('\u{202a}', '\u{202e}'),
+        ('\u{2060}', '\u{206f}'),
+        ('\u{3164}', '\u{3164}'),
+        ('\u{fe00}', '\u{fe0f}'),
+        ('\u{feff}', '\u{feff}'),
+        ('\u{ffa0}', '\u{ffa0}'),
+        ('\u{fff0}', '\u{fff8}'),
+        ('\u{1bca0}', '\u{1bca3}'),
+        ('\u{1d173}', '\u{1d17a}'),
+        ('\u{e0000}', '\u{e0fff}'),
+    ];
+
+    #[test]
+    fn every_default_ignorable_code_point_is_unsafe() {
+        // Walked exhaustively rather than sampled: the findings this closes were
+        // all one code point beside a range end.
+        let mut checked = 0usize;
+        for (first, last) in DEFAULT_IGNORABLE {
+            for point in u32::from(*first)..=u32::from(*last) {
+                let Some(character) = char::from_u32(point) else {
+                    continue;
+                };
+                assert!(
+                    DisplayName::is_unsafe(character),
+                    "U+{point:04X} is default-ignorable and must never reach a row"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 4_000, "the table must cover the tag plane too");
     }
 
     #[test]

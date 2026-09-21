@@ -71,6 +71,17 @@ impl ProcFixture {
         self
     }
 
+    /// Shapes the root like a real procfs mount whose `self` symlink names this
+    /// process as *that mount* numbers it, with its own `ns/pid` link beneath.
+    fn self_numbered(&self, named: u32, namespace: &str) -> &Self {
+        let _ = fs::remove_dir_all(self.0.join("self"));
+        let _ = fs::remove_file(self.0.join("self"));
+        fs::create_dir_all(self.0.join(format!("{named}/ns"))).unwrap();
+        std::os::unix::fs::symlink(namespace, self.0.join(format!("{named}/ns/pid"))).unwrap();
+        std::os::unix::fs::symlink(named.to_string(), self.0.join("self")).unwrap();
+        self
+    }
+
     /// A record that disappeared between listing the directory and reading it.
     fn vanished(&self, pid: u32) -> &Self {
         fs::create_dir_all(self.0.join(pid.to_string())).unwrap();
@@ -275,6 +286,46 @@ fn a_wholly_unreadable_root_keeps_issue_memory_bounded_while_counting_every_reco
         MAX_RECORDED_ISSUES,
         "retained explanations stay at the bound"
     );
+}
+
+#[test]
+fn a_mount_numbering_pids_in_another_namespace_never_stamps_this_one() {
+    let foreign = ProcFixture::new();
+    foreign
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(1, b"systemd", 7)
+        // A host `/proc` seen from a container: the mount names this process by
+        // a number that is not its PID here, and its `ns/pid` link is the
+        // reader's own namespace, not the one those PIDs are numbered in.
+        .self_numbered(u32::MAX - 1, "pid:[4026531836]");
+    let snapshot = foreign.source().snapshot();
+    assert_eq!(
+        snapshot.records[0].key.pid_namespace,
+        Observed::Missing(MissingReason::Unavailable),
+        "a namespace that cannot be proven is never guessed from the caller's"
+    );
+    assert!(snapshot
+        .completeness
+        .issues()
+        .iter()
+        .any(|issue| issue.scope == IssueScope::PidNamespace));
+    assert!(!snapshot.completeness.is_complete());
+
+    // The same mount read by the process it numbers: the namespace is known.
+    let own = ProcFixture::new();
+    own.identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(1, b"systemd", 7)
+        .self_numbered(std::process::id(), "pid:[4026531999]");
+    let snapshot = own.source().snapshot();
+    assert_eq!(
+        snapshot.records[0].key.pid_namespace,
+        Observed::Known(srui_process_explorer::source::PidNamespaceId(4_026_531_999))
+    );
+    assert!(snapshot
+        .completeness
+        .issues()
+        .iter()
+        .all(|issue| issue.scope != IssueScope::PidNamespace));
 }
 
 #[test]

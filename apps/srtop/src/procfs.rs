@@ -111,7 +111,38 @@ impl ProcFsSource {
         }
     }
 
+    /// The PID namespace the scanned records are numbered in.
+    ///
+    /// `self/ns/pid` always names the *reader's* active namespace, which is the
+    /// right answer only when the mount numbers PIDs the way this process is
+    /// numbered. A host `/proc` bind-mounted into a container breaks exactly
+    /// that: the numeric directories are scoped to the mount's namespace while
+    /// the link resolves to the container's, so every key would be stamped with
+    /// a namespace its PIDs do not belong to.
+    ///
+    /// `<root>/self` is the cross-check: a real procfs mount resolves it to this
+    /// process's PID *as that mount numbers it*. When that number is not this
+    /// process's own PID, the mount belongs to another namespace and the
+    /// namespace is reported unavailable rather than guessed — an unknown
+    /// identity component fails explicitly instead of degrading silently. A
+    /// fixture tree has no `self` symlink and is not cross-checked.
     fn pid_namespace(&self, issues: &mut Vec<EnumerationIssue>) -> Observed<PidNamespaceId> {
+        if let Ok(target) = std::fs::read_link(self.root.join("self")) {
+            let numbered_here = std::process::id();
+            if parse_pid(target.as_os_str().as_encoded_bytes()) != Some(numbered_here) {
+                record_issue(issues, || {
+                    EnumerationIssue {
+                    scope: IssueScope::PidNamespace,
+                    reason: MissingReason::Unavailable,
+                    detail: format!(
+                        "self names {}, not this process ({numbered_here}): the mount numbers PIDs in another namespace",
+                        target.display()
+                    ),
+                }
+                });
+                return Observed::Missing(MissingReason::Unavailable);
+            }
+        }
         let path = self.root.join("self/ns/pid");
         match std::fs::read_link(&path) {
             Ok(target) => match parse_namespace(&target.to_string_lossy()) {

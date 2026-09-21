@@ -311,21 +311,33 @@ fn a_mount_numbering_pids_in_another_namespace_never_stamps_this_one() {
         .any(|issue| issue.scope == IssueScope::PidNamespace));
     assert!(!snapshot.completeness.is_complete());
 
-    // The same mount read by the process it numbers: the namespace is known.
-    let own = ProcFixture::new();
-    own.identity("fixture-host", "boot-a", "pid:[4026531836]")
+    // A foreign mount that happens to number this process with the same value
+    // it has here is still foreign: PIDs coincide across namespaces, so numeric
+    // equality proves nothing and must not unlock the reader's namespace.
+    let coincidence = ProcFixture::new();
+    coincidence
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
         .process(1, b"systemd", 7)
-        .self_numbered(std::process::id(), "pid:[4026531999]");
-    let snapshot = own.source().snapshot();
+        .self_numbered(std::process::id(), "pid:[4026531836]");
+    let snapshot = coincidence.source().snapshot();
+    assert_eq!(
+        snapshot.records[0].key.pid_namespace,
+        Observed::Missing(MissingReason::Unavailable)
+    );
+
+    // A fixture tree is not a procfs mount — it has no `self` symlink — so its
+    // own identity files still answer for it, and the live `/proc` case, where
+    // the mount *is* this process's procfs, is covered by
+    // `live_snapshot_locates_the_test_owned_sleeping_worker`.
+    let tree = ProcFixture::new();
+    tree.identity("fixture-host", "boot-a", "pid:[4026531999]")
+        .process(1, b"systemd", 7);
+    let snapshot = tree.source().snapshot();
     assert_eq!(
         snapshot.records[0].key.pid_namespace,
         Observed::Known(srui_process_explorer::source::PidNamespaceId(4_026_531_999))
     );
-    assert!(snapshot
-        .completeness
-        .issues()
-        .iter()
-        .all(|issue| issue.scope != IssueScope::PidNamespace));
+    assert_eq!(snapshot.completeness, Completeness::Complete);
 }
 
 #[test]

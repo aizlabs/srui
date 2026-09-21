@@ -14,6 +14,7 @@ use crate::source::{
 };
 use std::fs::File;
 use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -120,23 +121,35 @@ impl ProcFsSource {
     /// the link resolves to the container's, so every key would be stamped with
     /// a namespace its PIDs do not belong to.
     ///
-    /// `<root>/self` is the cross-check: a real procfs mount resolves it to this
-    /// process's PID *as that mount numbers it*. When that number is not this
-    /// process's own PID, the mount belongs to another namespace and the
-    /// namespace is reported unavailable rather than guessed — an unknown
-    /// identity component fails explicitly instead of degrading silently. A
-    /// fixture tree has no `self` symlink and is not cross-checked.
+    /// So the link is trusted only when the scanned mount *is* the procfs this
+    /// process runs under. A procfs superblock belongs to exactly one PID
+    /// namespace, so comparing the task directory `<root>/self` resolves to with
+    /// the one this process's own `/proc/self` resolves to — same device, same
+    /// inode — proves that, where matching PID *numbers* would not: two
+    /// namespaces can number this process identically by coincidence. Anything
+    /// else reports the namespace unavailable rather than guessing it: an
+    /// unknown identity component fails explicitly instead of degrading
+    /// silently. A fixture tree has no `self` symlink and is not a procfs mount,
+    /// so its own identity files answer for it.
     fn pid_namespace(&self, issues: &mut Vec<EnumerationIssue>) -> Observed<PidNamespaceId> {
-        if let Ok(target) = std::fs::read_link(self.root.join("self")) {
-            let numbered_here = std::process::id();
-            if parse_pid(target.as_os_str().as_encoded_bytes()) != Some(numbered_here) {
+        let scanned_self = self.root.join("self");
+        if scanned_self.is_symlink() {
+            let own_self = Path::new(DEFAULT_PROC_ROOT).join("self");
+            let same_procfs = match (
+                std::fs::metadata(&scanned_self),
+                std::fs::metadata(&own_self),
+            ) {
+                (Ok(scanned), Ok(own)) => scanned.dev() == own.dev() && scanned.ino() == own.ino(),
+                _ => false,
+            };
+            if !same_procfs {
                 record_issue(issues, || {
                     EnumerationIssue {
                     scope: IssueScope::PidNamespace,
                     reason: MissingReason::Unavailable,
                     detail: format!(
-                        "self names {}, not this process ({numbered_here}): the mount numbers PIDs in another namespace",
-                        target.display()
+                        "{} is not this process's own procfs: its records are numbered in another PID namespace",
+                        self.root.display()
                     ),
                 }
                 });

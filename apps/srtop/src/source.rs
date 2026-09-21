@@ -130,6 +130,12 @@ impl DisplayName {
     /// `a\u{3164}sshd` would otherwise reach the table as a line break or an
     /// invisible gap and let one row impersonate another. This predicate is
     /// public so tests assert against the same rule the sanitizer applies.
+    ///
+    /// The last group cannot be expressed as a Unicode property: U+3164 is Lo,
+    /// U+2800 is So and U+13441 is Lo, all ordinary categories whose glyph is
+    /// blank. "Renders as nothing" is a property of the glyph, not of the
+    /// character class, so those code points are enumerated deliberately and
+    /// the list grows when a new blank glyph is assigned.
     pub fn is_unsafe(character: char) -> bool {
         character.is_control()
             || matches!(character,
@@ -163,6 +169,10 @@ impl DisplayName {
                 | '\u{3164}'
                 | '\u{fe00}'..='\u{fe0f}'
                 | '\u{ffa0}'
+                | '\u{fffc}'
+                // Egyptian hieroglyph blanks and lost signs: category Lo, but
+                // every one of them renders as empty space.
+                | '\u{13441}'..='\u{13446}'
                 | '\u{e0100}'..='\u{e01ef}')
     }
 
@@ -426,7 +436,17 @@ mod tests {
             '\u{3164}',
             '\u{fe0f}',
             '\u{ffa0}',
+            '\u{fffc}',
             '\u{e0001}',
+            // Blank glyphs in ordinary categories: `Lo` letters whose rendering
+            // is empty space, which no Unicode property distinguishes from a
+            // visible letter.
+            '\u{13441}',
+            '\u{13442}',
+            '\u{13443}',
+            '\u{13444}',
+            '\u{13445}',
+            '\u{13446}',
         ] {
             assert!(
                 !spoof.is_control(),

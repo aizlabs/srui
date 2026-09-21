@@ -132,10 +132,12 @@ impl DisplayName {
     /// public so tests assert against the same rule the sanitizer applies.
     ///
     /// The last group cannot be expressed as a Unicode property: U+3164 is Lo,
-    /// U+2800 is So and U+13441 is Lo, all ordinary categories whose glyph is
-    /// blank. "Renders as nothing" is a property of the glyph, not of the
-    /// character class, so those code points are enumerated deliberately and
-    /// the list grows when a new blank glyph is assigned.
+    /// U+2800 is So, U+13441 is Lo and U+13440 is Mn — ordinary categories whose
+    /// glyph is blank, or which silently re-render the glyph beside them.
+    /// "Renders as nothing" is a property of the glyph, not of the character
+    /// class, so those code points are enumerated deliberately, by whole block
+    /// where a block is entirely invisible, and the list grows when a new blank
+    /// glyph is assigned.
     pub fn is_unsafe(character: char) -> bool {
         character.is_control()
             || matches!(character,
@@ -156,8 +158,10 @@ impl DisplayName {
                 | '\u{13430}'..='\u{1343f}'
                 | '\u{1bca0}'..='\u{1bca3}'
                 | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0001}'
-                | '\u{e0020}'..='\u{e007f}'
+                // The whole tag plane, assigned or not: the language tag, the
+                // tag characters and the variation selectors supplement all
+                // render as nothing, and no code point here belongs in a name.
+                | '\u{e0000}'..='\u{e0fff}'
                 // Zl and Zp — line and paragraph separators.
                 | '\u{2028}' | '\u{2029}'
                 // Invisible or blank code points outside Cc and Cf.
@@ -170,10 +174,14 @@ impl DisplayName {
                 | '\u{fe00}'..='\u{fe0f}'
                 | '\u{ffa0}'
                 | '\u{fffc}'
-                // Egyptian hieroglyph blanks and lost signs: category Lo, but
-                // every one of them renders as empty space.
-                | '\u{13441}'..='\u{13446}'
-                | '\u{e0100}'..='\u{e01ef}')
+                | '\u{1107f}'
+                // Egyptian hieroglyph controls, blanks and lost signs. U+13440
+                // is an invisible `Mn` mark that changes how the glyph beside it
+                // renders; U+13441–U+13446 are `Lo` letters whose own glyph is
+                // empty space. Neither category says so, so the block is closed
+                // whole rather than one code point at a time.
+                | '\u{13440}'..='\u{13446}'
+                | '\u{16fe4}')
     }
 
     pub fn as_str(&self) -> &str {
@@ -438,9 +446,15 @@ mod tests {
             '\u{ffa0}',
             '\u{fffc}',
             '\u{e0001}',
-            // Blank glyphs in ordinary categories: `Lo` letters whose rendering
-            // is empty space, which no Unicode property distinguishes from a
-            // visible letter.
+            '\u{e0020}',
+            '\u{e0100}',
+            '\u{1107f}',
+            '\u{16fe4}',
+            // Blank glyphs and invisible marks in ordinary categories: `Lo`
+            // letters whose rendering is empty space, and an `Mn` mark that
+            // silently re-renders its neighbour. No Unicode property
+            // distinguishes either from a visible letter or an ordinary accent.
+            '\u{13440}',
             '\u{13441}',
             '\u{13442}',
             '\u{13443}',

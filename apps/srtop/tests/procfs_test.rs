@@ -542,14 +542,18 @@ mod live {
         );
 
         // The worker is bounded and disposable: once this test reaps it, the
-        // next live snapshot no longer lists it.
+        // next live snapshot no longer lists that process instance. The absent
+        // thing is the full identity, not the PID: the kernel may hand the same
+        // number to a new process before the second scan, and that record is a
+        // different instance the collector is right to list.
+        let reaped = record.key.clone();
         worker.0.kill().unwrap();
         worker.0.wait().unwrap();
         let after = ProcFsSource::live().snapshot();
-        assert!(after
-            .records
-            .iter()
-            .all(|record| record.key.pid != Observed::Known(pid)));
+        assert!(
+            after.records.iter().all(|listed| listed.key != reaped),
+            "the reaped worker's process identity must be gone from a later snapshot"
+        );
     }
 
     #[test]

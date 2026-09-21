@@ -176,6 +176,6 @@ mod tests {
         let Value::String(name) = &cells[1] else {
             panic!("expected a plain string cell")
         };
-        assert!(!name.chars().any(char::is_control));
+        assert!(!name.chars().any(crate::source::DisplayName::is_unsafe));
     }
 }

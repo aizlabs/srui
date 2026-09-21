@@ -56,6 +56,17 @@ pub enum MissingReason {
     Denied,
 }
 
+impl MissingReason {
+    /// Short, publishable wording for a status line. The reason a scan could not
+    /// see something is part of the honest answer, not diagnostic-only detail.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Denied => "permission denied",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Observed<T> {
     Known(T),
@@ -109,14 +120,50 @@ impl DisplayName {
         }
     }
 
-    fn is_unsafe(character: char) -> bool {
+    /// True for every character that must never reach a rendered row: Unicode
+    /// control characters (Cc), format characters (Cf — soft hyphen, the bidi
+    /// marks and overrides, the zero-width joiners, the tag characters), the
+    /// line and paragraph separators, and the code points outside those
+    /// categories that render as nothing at all.
+    ///
+    /// `char::is_control` covers only Cc, so a `comm` of `a\u{2028}sshd` or
+    /// `a\u{3164}sshd` would otherwise reach the table as a line break or an
+    /// invisible gap and let one row impersonate another. This predicate is
+    /// public so tests assert against the same rule the sanitizer applies.
+    pub fn is_unsafe(character: char) -> bool {
         character.is_control()
             || matches!(character,
-                '\u{200b}'..='\u{200f}'
+                // Cf — format characters.
+                '\u{00ad}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}' | '\u{0891}'
+                | '\u{08e2}'
+                | '\u{200b}'..='\u{200f}'
                 | '\u{202a}'..='\u{202e}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{feff}')
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}' | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+                // Zl and Zp — line and paragraph separators.
+                | '\u{2028}' | '\u{2029}'
+                // Invisible or blank code points outside Cc and Cf.
+                | '\u{034f}'
+                | '\u{115f}' | '\u{1160}'
+                | '\u{17b4}' | '\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{ffa0}'
+                | '\u{e0100}'..='\u{e01ef}')
     }
 
     pub fn as_str(&self) -> &str {
@@ -139,8 +186,11 @@ pub struct ProcessRecord {
 /// What part of the scan could not be observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueScope {
-    /// The enumeration root itself.
+    /// The enumeration root itself could not be listed, so the record list is
+    /// not a partial answer: there is no answer at all.
     Root,
+    /// One entry of an otherwise readable root could not be examined.
+    Entry,
     HostIdentity,
     BootIdentity,
     PidNamespace,
@@ -222,6 +272,14 @@ pub struct ProcessSnapshot {
     pub sampled_at: SnapshotTime,
     /// Authoritative display order, supplied by the server-side source.
     pub records: Vec<ProcessRecord>,
+    /// Records that no longer existed when the scan reached them. A process that
+    /// exits between listing and reading was not *unreadable* — it simply does
+    /// not exist at sample time — so it is counted here and never degrades
+    /// [`Completeness`]. On a busy host this happens on nearly every scan, and
+    /// folding it into `skipped` would leave the shell permanently labeled
+    /// "incomplete scan" and make a genuinely denied record indistinguishable
+    /// from ordinary churn.
+    pub vanished: usize,
     pub completeness: Completeness,
 }
 
@@ -278,6 +336,7 @@ impl ProcessSource for FakeProcessSource {
                     display_name: "helper".into(),
                 },
             ],
+            vanished: 0,
             completeness: Completeness::Complete,
         }
     }
@@ -317,7 +376,7 @@ mod tests {
     fn hostile_names_are_sanitized_without_losing_literal_text() {
         let name = DisplayName::sanitize(b"we\x1b[31mird ) na\xffme (x");
         assert_eq!(name.as_str(), "we\u{fffd}[31mird ) na\u{fffd}me (x");
-        assert!(!name.as_str().chars().any(char::is_control));
+        assert!(!name.as_str().chars().any(DisplayName::is_unsafe));
         // Shell metacharacters stay literal data; nothing here is ever evaluated.
         assert_eq!(
             DisplayName::sanitize(b"$(reboot); rm -rf /").as_str(),
@@ -337,6 +396,40 @@ mod tests {
         let long = DisplayName::sanitize(&b"n".repeat(MAX_DISPLAY_NAME_CHARS + 50));
         assert_eq!(long.as_str().chars().count(), MAX_DISPLAY_NAME_CHARS + 1);
         assert!(long.as_str().ends_with('…'));
+    }
+
+    #[test]
+    fn invisible_and_format_characters_outside_cc_are_replaced_too() {
+        // Every one of these fits in TASK_COMM_LEN and is invisible or breaks the
+        // line when rendered, so each would let a row impersonate another.
+        // `char::is_control` matches none of them.
+        for spoof in [
+            '\u{2028}',
+            '\u{2029}',
+            '\u{00ad}',
+            '\u{034f}',
+            '\u{061c}',
+            '\u{180e}',
+            '\u{2060}',
+            '\u{2800}',
+            '\u{3164}',
+            '\u{fe0f}',
+            '\u{ffa0}',
+            '\u{e0001}',
+        ] {
+            assert!(
+                !spoof.is_control(),
+                "{spoof:?} is the Cc case already covered"
+            );
+            assert!(DisplayName::is_unsafe(spoof), "{spoof:?} must be replaced");
+            let name = DisplayName::sanitize(format!("a{spoof}sshd").as_bytes());
+            assert_eq!(name.as_str(), format!("a{REPLACEMENT}sshd"));
+            assert!(!name.as_str().chars().any(DisplayName::is_unsafe));
+        }
+        // Ordinary text, including non-ASCII and shell metacharacters, survives.
+        for kept in ["sshd", "ЖУК", "my app (2)", "$(reboot)", "日本語"] {
+            assert_eq!(DisplayName::sanitize(kept.as_bytes()).as_str(), kept);
+        }
     }
 
     #[test]

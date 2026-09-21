@@ -9,9 +9,10 @@
 use srui_process_explorer::procfs::{
     parse_pid, parse_stat, ProcFsSource, LIVE_STATUS_TEXT, MAX_FILE_BYTES,
 };
+use srui_process_explorer::published_status;
 use srui_process_explorer::source::{
-    Completeness, CreationToken, IssueScope, MissingReason, Observed, ProcessSource, SourceId,
-    FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
+    Completeness, CreationToken, DisplayName, IssueScope, MissingReason, Observed, ProcessSource,
+    SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -172,6 +173,18 @@ fn an_unreadable_root_is_incomplete_and_never_an_empty_result() {
         .issues()
         .iter()
         .any(|issue| issue.scope == IssueScope::Root));
+    // Nothing was reached, so the published line must not claim that every
+    // record was readable beside an empty table.
+    // An absent root also has no identity files, and both facts are published.
+    let published = published_status(LIVE_STATUS_TEXT, &snapshot);
+    assert_eq!(
+        published,
+        format!(
+            "{LIVE_STATUS_TEXT} · incomplete scan · process list unavailable: unavailable · \
+             host identity incomplete"
+        )
+    );
+    assert!(!published.contains("unreadable"), "{published}");
 }
 
 #[test]
@@ -181,15 +194,14 @@ fn one_inaccessible_record_is_skipped_with_a_reason_without_failing_the_scan() {
         .identity("fixture-host", "boot-a", "pid:[4026531836]")
         .process(1, b"systemd", 7)
         .denied(4242)
-        .vanished(4343)
         .raw(4444, b"garbage without fields\n")
         .raw(4545, &stat_line(9999, b"mismatched", 12));
     let snapshot = fixture.source().snapshot();
     assert_eq!(snapshot.records.len(), 1, "the readable record survives");
     assert_eq!(snapshot.records[0].display_name.as_str(), "systemd");
-    assert_eq!(snapshot.completeness.skipped(), 4);
+    assert_eq!(snapshot.completeness.skipped(), 3);
     let issues = snapshot.completeness.issues();
-    assert_eq!(issues.len(), 4);
+    assert_eq!(issues.len(), 3);
     assert_eq!(
         issues
             .iter()
@@ -198,7 +210,7 @@ fn one_inaccessible_record_is_skipped_with_a_reason_without_failing_the_scan() {
         Some(MissingReason::Denied),
         "a denied record keeps its reason and never becomes zero or empty"
     );
-    for pid in [4343, 4444, 4545] {
+    for pid in [4444, 4545] {
         assert_eq!(
             issues
                 .iter()
@@ -207,6 +219,36 @@ fn one_inaccessible_record_is_skipped_with_a_reason_without_failing_the_scan() {
             Some(MissingReason::Unavailable)
         );
     }
+}
+
+#[test]
+fn a_process_that_exits_during_the_scan_is_not_a_degradation() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(1, b"systemd", 7)
+        .vanished(4343)
+        .vanished(4344);
+    let snapshot = fixture.source().snapshot();
+    // Ordinary churn: the record no longer existed when the scan reached it.
+    // Every readable process is listed, so the answer is still authoritative and
+    // the shell is not labeled "incomplete scan" on every busy-host sample.
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.vanished, 2);
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    assert_eq!(snapshot.completeness.skipped(), 0);
+    assert!(snapshot.completeness.issues().is_empty());
+    assert_eq!(
+        published_status(LIVE_STATUS_TEXT, &snapshot),
+        LIVE_STATUS_TEXT
+    );
+    // A record that exists but cannot be read is still a degradation, and stays
+    // distinguishable from one that exited.
+    fixture.denied(4242);
+    let degraded = fixture.source().snapshot();
+    assert_eq!(degraded.vanished, 2);
+    assert_eq!(degraded.completeness.skipped(), 1);
+    assert!(!degraded.completeness.is_complete());
 }
 
 #[test]
@@ -262,6 +304,16 @@ fn missing_identity_files_degrade_explicitly_instead_of_aliasing_silently() {
     let key = &snapshot.records[0].key;
     assert_eq!(key.boot, Observed::Missing(MissingReason::Unavailable));
     assert_eq!(key.host, Observed::Missing(MissingReason::Unavailable));
+    // Every process that exists was listed: the degradation is the identity, and
+    // saying "0 unreadable" would contradict that.
+    let published = published_status(LIVE_STATUS_TEXT, &snapshot);
+    assert_eq!(
+        published,
+        format!(
+            "{LIVE_STATUS_TEXT} · incomplete scan · 1 process listed · host identity incomplete"
+        )
+    );
+    assert!(!published.contains("unreadable"), "{published}");
 }
 
 #[test]
@@ -301,10 +353,14 @@ fn hostile_names_cannot_shift_fields_or_reach_the_ui_as_live_content() {
         .process(808, hostile, 4_242_424)
         .process(809, b"$(reboot); rm -rf /", 9)
         .process(810, b"  spaced name  ", 10)
-        .process(811, b"", 11);
+        .process(811, b"", 11)
+        // Invisible and line-breaking characters outside Cc: a name that would
+        // otherwise impersonate another row in the table.
+        .process(812, "a\u{2028}sshd".as_bytes(), 12)
+        .process(813, "a\u{3164}sshd".as_bytes(), 13);
     let snapshot = fixture.source().snapshot();
     assert_eq!(snapshot.completeness, Completeness::Complete);
-    assert_eq!(snapshot.records.len(), 4);
+    assert_eq!(snapshot.records.len(), 6);
     // Parsing is unaffected: the creation token still comes from field 22.
     assert_eq!(
         snapshot.records[0].key.creation,
@@ -322,10 +378,12 @@ fn hostile_names_cannot_shift_fields_or_reach_the_ui_as_live_content() {
             "$(reboot); rm -rf /",
             "spaced name",
             "(unnamed)",
+            "a\u{fffd}sshd",
+            "a\u{fffd}sshd",
         ]
     );
     for name in names {
-        assert!(!name.chars().any(char::is_control));
+        assert!(!name.chars().any(DisplayName::is_unsafe), "{name:?}");
     }
     // Direct parser checks, independent of the directory scan.
     assert_eq!(
@@ -505,7 +563,19 @@ mod live {
                 panic!("expected table cells")
             };
             assert_eq!(cells[1], Value::String("sleep".into()));
-            assert!(worker_row.item_id.get() != u64::from(worker.pid()));
+            // Item IDs are session-allocated and opaque: the allocator hands out
+            // 1..=count in projection order, whatever the PID values are.
+            // Asserting that set keeps this meaningful in a PID namespace with
+            // contiguous low PIDs, where `item_id != pid` would hold only by
+            // coincidence.
+            let mut ids: Vec<u64> = model
+                .items
+                .values()
+                .map(|item| item.item_id.get())
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(ids, (1..=ids.len() as u64).collect::<Vec<u64>>());
+            assert!(ids.contains(&worker_row.item_id.get()));
             for item in model.items.values() {
                 let Value::List(cells) = &item.value else {
                     panic!("expected table cells")
@@ -514,8 +584,8 @@ mod live {
                     panic!("a live process name must be a plain string")
                 };
                 assert!(
-                    !name.chars().any(char::is_control),
-                    "live name {name:?} reached the UI with control characters"
+                    !name.chars().any(DisplayName::is_unsafe),
+                    "live name {name:?} reached the UI with invisible characters"
                 );
             }
         });

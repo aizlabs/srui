@@ -137,6 +137,7 @@ impl ProcessSource for ProcFsSource {
         let sampled_at = SnapshotTime(SystemTime::now());
         let mut issues = Vec::new();
         let mut skipped = 0usize;
+        let mut vanished = 0usize;
         let host = self.identity(
             "sys/kernel/hostname",
             IssueScope::HostIdentity,
@@ -165,6 +166,7 @@ impl ProcessSource for ProcFsSource {
                     source: self.source.clone(),
                     sampled_at,
                     records,
+                    vanished,
                     completeness: Completeness::from_scan(skipped, issues),
                 };
             }
@@ -175,7 +177,7 @@ impl ProcessSource for ProcFsSource {
                 Err(error) => {
                     skipped += 1;
                     record_issue(&mut issues, || EnumerationIssue {
-                        scope: IssueScope::Root,
+                        scope: IssueScope::Entry,
                         reason: reason_for(&error),
                         detail: format!("directory entry: {error}"),
                     });
@@ -191,13 +193,20 @@ impl ProcessSource for ProcFsSource {
             if records.len() >= MAX_RECORDS {
                 skipped += 1;
                 record_issue(&mut issues, || EnumerationIssue {
-                    scope: IssueScope::Root,
+                    scope: IssueScope::Entry,
                     reason: MissingReason::Unavailable,
                     detail: format!("record limit {MAX_RECORDS} reached"),
                 });
                 continue;
             }
             match read_bounded(&self.root.join(&name).join("stat")) {
+                // The process exited between listing the root and reading it.
+                // Nothing was inaccessible: the record no longer exists at sample
+                // time, which is ordinary churn on any busy host, so it is
+                // counted apart and does not degrade the scan.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    vanished += 1;
+                }
                 // One unreadable record is skipped with a reason; it never fails
                 // the snapshot (PX-003).
                 Err(error) => {
@@ -240,6 +249,7 @@ impl ProcessSource for ProcFsSource {
             source: self.source.clone(),
             sampled_at,
             records,
+            vanished,
             completeness: Completeness::from_scan(skipped, issues),
         }
     }

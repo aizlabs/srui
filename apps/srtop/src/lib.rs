@@ -39,21 +39,47 @@ pub fn initialize_from_source(
 }
 
 /// The published status line: the source's own truthful description, plus an
-/// explicit clause whenever the scan could not observe every process. A complete
-/// snapshot is labeled exactly as the source describes itself, so an
-/// authoritative empty result and a degraded scan are never the same text and a
-/// partial list is never presented as the whole picture (§22.1).
+/// explicit clause for each way the scan fell short. A complete snapshot is
+/// labeled exactly as the source describes itself, so an authoritative empty
+/// result and a degraded scan are never the same text and a partial list is
+/// never presented as the whole picture (§22.1).
+///
+/// Each degradation states what actually happened rather than one fixed clause.
+/// A root that could not be listed publishes its reason and no record count,
+/// because "0 unreadable" there would claim the opposite of the truth: nothing
+/// was readable. A scan degraded only in its identity files says that, instead
+/// of reporting an unreadable count of zero.
 pub fn published_status(source_status: &str, snapshot: &source::ProcessSnapshot) -> String {
-    match &snapshot.completeness {
-        source::Completeness::Complete => source_status.to_string(),
-        source::Completeness::Incomplete { skipped, .. } => {
-            let listed = snapshot.records.len();
-            format!(
-                "{source_status} · incomplete scan · {listed} {} listed · {skipped} unreadable",
-                plural(listed)
-            )
+    let source::Completeness::Incomplete { skipped, issues } = &snapshot.completeness else {
+        return source_status.to_string();
+    };
+    let mut clauses = vec!["incomplete scan".to_string()];
+    let root = issues
+        .iter()
+        .find(|issue| issue.scope == source::IssueScope::Root);
+    if let Some(root) = root {
+        clauses.push(format!(
+            "process list unavailable: {}",
+            root.reason.describe()
+        ));
+    } else {
+        let listed = snapshot.records.len();
+        clauses.push(format!("{listed} {} listed", plural(listed)));
+        if *skipped > 0 {
+            clauses.push(format!("{skipped} unreadable"));
         }
     }
+    if issues.iter().any(|issue| {
+        matches!(
+            issue.scope,
+            source::IssueScope::HostIdentity
+                | source::IssueScope::BootIdentity
+                | source::IssueScope::PidNamespace
+        )
+    }) {
+        clauses.push("host identity incomplete".to_string());
+    }
+    format!("{source_status} · {}", clauses.join(" · "))
 }
 
 fn plural(count: usize) -> &'static str {
@@ -155,7 +181,7 @@ mod tests {
         let degraded = Completeness::from_scan(
             4,
             vec![EnumerationIssue {
-                scope: IssueScope::Root,
+                scope: IssueScope::Process(7),
                 reason: MissingReason::Denied,
                 detail: "denied".into(),
             }],
@@ -183,6 +209,57 @@ mod tests {
             published_status(label, &single),
             format!("{label} · incomplete scan · 1 process listed · 1 unreadable")
         );
+    }
+
+    #[test]
+    fn a_scan_that_read_nothing_never_publishes_a_count_of_zero_unreadable() {
+        let label = source::FAKE_STATUS_TEXT;
+        // The root itself could not be listed: no record was even reached, so
+        // `skipped` is legitimately 0 and "0 unreadable" would read as "every
+        // process was readable" beside an empty table.
+        let unlistable = empty_snapshot(Completeness::from_scan(
+            0,
+            vec![EnumerationIssue {
+                scope: IssueScope::Root,
+                reason: MissingReason::Unavailable,
+                detail: "/proc: No such file or directory (os error 2)".into(),
+            }],
+        ));
+        let published = published_status(label, &unlistable);
+        assert_eq!(
+            published,
+            format!("{label} · incomplete scan · process list unavailable: unavailable")
+        );
+        assert!(!published.contains("unreadable"), "{published}");
+        let denied_root = empty_snapshot(Completeness::from_scan(
+            0,
+            vec![EnumerationIssue {
+                scope: IssueScope::Root,
+                reason: MissingReason::Denied,
+                detail: "/proc: Permission denied (os error 13)".into(),
+            }],
+        ));
+        assert_eq!(
+            published_status(label, &denied_root),
+            format!("{label} · incomplete scan · process list unavailable: permission denied")
+        );
+        // Only the identity files were unreadable: every listed record is real,
+        // and nothing was skipped, so no unreadable count is published either.
+        let mut identity_only = source::FakeProcessSource.snapshot();
+        identity_only.completeness = Completeness::from_scan(
+            0,
+            vec![EnumerationIssue {
+                scope: IssueScope::BootIdentity,
+                reason: MissingReason::Unavailable,
+                detail: "sys/kernel/random/boot_id: unavailable".into(),
+            }],
+        );
+        let published = published_status(label, &identity_only);
+        assert_eq!(
+            published,
+            format!("{label} · incomplete scan · 3 processes listed · host identity incomplete")
+        );
+        assert!(!published.contains("unreadable"), "{published}");
     }
 
     #[test]

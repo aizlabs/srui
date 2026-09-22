@@ -75,7 +75,19 @@ impl ProcFsSource {
     /// would label live host processes as synthetic — the same defect as the
     /// reverse, in the other direction.
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        // A relative root is anchored here, not at scan time. The scan happens
+        // later and the process may have changed directory in between, which
+        // would silently point the same source — same `SourceId`, same status
+        // line — at a different tree, and make records from two trees compare
+        // as one. Anchoring is textual on purpose: it does not resolve symlinks
+        // or require the root to exist, because a missing root must still scan
+        // and report itself unreadable rather than fail construction.
         let root = root.into();
+        let root = if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir().map_or_else(|_| root.clone(), |working| working.join(&root))
+        };
         let status = format!(
             "Read-only · Process filesystem snapshot: {}",
             root.display()
@@ -531,6 +543,27 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn a_relative_root_is_anchored_so_a_later_chdir_cannot_move_the_scan() {
+        let source = ProcFsSource::with_root("srtop-relative-root");
+        let anchored = std::env::current_dir()
+            .expect("a test process has a working directory")
+            .join("srtop-relative-root");
+        assert_eq!(
+            source.source_id(),
+            &SourceId(format!("procfs:{}", anchored.display())),
+            "the identity names the tree that will actually be scanned"
+        );
+        assert!(source
+            .status_text()
+            .contains(&anchored.display().to_string()));
+        // An absolute root is untouched.
+        assert_eq!(
+            ProcFsSource::with_root(DEFAULT_PROC_ROOT).source_id(),
+            &SourceId("procfs:/proc".into())
+        );
+    }
 
     #[test]
     fn roots_differing_only_in_invalid_utf8_never_share_a_source_identity() {

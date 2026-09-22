@@ -54,6 +54,9 @@ pub struct ProcFsSource {
     source: SourceId,
     status: String,
     record_limit: usize,
+    /// Whether the root names one fixed tree for the life of this source. A
+    /// relative root that could not be anchored does not, and is never scanned.
+    anchored: bool,
 }
 
 impl ProcFsSource {
@@ -82,11 +85,23 @@ impl ProcFsSource {
         // as one. Anchoring is textual on purpose: it does not resolve symlinks
         // or require the root to exist, because a missing root must still scan
         // and report itself unreadable rather than fail construction.
-        let root = root.into();
-        let root = if root.is_absolute() {
-            root
-        } else {
-            std::env::current_dir().map_or_else(|_| root.clone(), |working| working.join(&root))
+        let given = root.into();
+        let Some(root) = anchor_root(&given, std::env::current_dir().ok().as_deref()) else {
+            // The working directory is gone, so a relative root names no fixed
+            // tree: it would follow the next `chdir` while keeping one identity.
+            // The source is constructed — callers get a source, not a panic — but
+            // it scans nothing and says why, rather than emitting records whose
+            // identity it cannot stand behind.
+            return Self {
+                root: given.clone(),
+                source: SourceId(format!("procfs-unanchored:{}", given.display())),
+                status: format!(
+                    "Read-only · Process filesystem snapshot unavailable: {} cannot be anchored to a working directory",
+                    given.display()
+                ),
+                record_limit: MAX_RECORDS,
+                anchored: false,
+            };
         };
         let status = format!(
             "Read-only · Process filesystem snapshot: {}",
@@ -102,6 +117,7 @@ impl ProcFsSource {
             source,
             status,
             record_limit: MAX_RECORDS,
+            anchored: true,
         }
     }
 
@@ -271,6 +287,27 @@ impl ProcessSource for ProcFsSource {
     fn snapshot(&mut self) -> ProcessSnapshot {
         let sampled_at = SnapshotTime(SystemTime::now());
         let mut issues = Vec::new();
+        if !self.anchored {
+            // No fixed tree to scan: an empty list here is explicitly not an
+            // authoritative "no processes", and no record is emitted under an
+            // identity that could name a different tree a moment later.
+            issues.push(EnumerationIssue {
+                scope: IssueScope::Root,
+                reason: MissingReason::Unavailable,
+                detail: format!(
+                    "{} is relative and could not be anchored to a working directory",
+                    self.root.display()
+                ),
+            });
+            return ProcessSnapshot {
+                source: self.source.clone(),
+                sampled_at,
+                records: Vec::new(),
+                vanished: 0,
+                capped: 0,
+                completeness: Completeness::from_scan(0, issues),
+            };
+        }
         let mut skipped = 0usize;
         let mut vanished = 0usize;
         let mut capped = 0usize;
@@ -433,6 +470,25 @@ fn readers_namespace_describes(numbers_this_process: bool, is_own_procfs: bool) 
     numbers_this_process && is_own_procfs
 }
 
+/// Resolves a root to the one tree this source will scan for its whole life.
+///
+/// An absolute root already names it. A relative root is joined to the working
+/// directory *once*, because the scan happens later and a `chdir` in between
+/// would otherwise point the same source — same identity, same status line — at
+/// a different tree. With no working directory to join to (it was deleted),
+/// there is no such tree: the answer is `None`, not the movable original.
+///
+/// The join is textual on purpose. `canonicalize` would require the root to
+/// exist, when a missing root must still scan and report itself unreadable, and
+/// it would resolve symlinks, collapsing two deliberately distinct roots into
+/// one identity — the opposite of what this field is for.
+fn anchor_root(root: &Path, working_directory: Option<&Path>) -> Option<PathBuf> {
+    if root.is_absolute() {
+        return Some(root.to_path_buf());
+    }
+    working_directory.map(|working| working.join(root))
+}
+
 /// The source identity of a root, lossless in that root's bytes.
 ///
 /// `Path::display` replaces invalid UTF-8 with U+FFFD, so two roots differing
@@ -543,6 +599,48 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn a_relative_root_with_no_working_directory_is_never_scanned() {
+        // `current_dir` fails when the working directory has been deleted. The
+        // relative root then names no fixed tree, so keeping it would recreate
+        // exactly the aliasing anchoring exists to prevent.
+        assert_eq!(anchor_root(Path::new("proc"), None), None);
+        assert_eq!(
+            anchor_root(Path::new("proc"), Some(Path::new("/var/empty"))),
+            Some(PathBuf::from("/var/empty/proc"))
+        );
+        assert_eq!(
+            anchor_root(Path::new(DEFAULT_PROC_ROOT), None),
+            Some(PathBuf::from(DEFAULT_PROC_ROOT)),
+            "an absolute root needs no working directory"
+        );
+
+        let mut unanchored = ProcFsSource {
+            root: PathBuf::from("proc"),
+            source: SourceId("procfs-unanchored:proc".into()),
+            status: "unanchored".into(),
+            record_limit: MAX_RECORDS,
+            anchored: false,
+        };
+        let snapshot = unanchored.snapshot();
+        assert!(snapshot.records.is_empty());
+        assert!(
+            !snapshot.completeness.is_complete(),
+            "an unscannable source is never an authoritative empty result"
+        );
+        assert_eq!(
+            snapshot
+                .completeness
+                .issues()
+                .iter()
+                .map(|issue| issue.scope)
+                .collect::<Vec<_>>(),
+            vec![IssueScope::Root]
+        );
+        // Its identity cannot collide with an anchored source's.
+        assert_ne!(unanchored.source_id(), &source_id_for(Path::new("proc")));
+    }
 
     #[test]
     fn a_relative_root_is_anchored_so_a_later_chdir_cannot_move_the_scan() {

@@ -482,6 +482,10 @@ struct CollectionAdaptersTests {
     }
 }
 
+// `NSView.subviews` is main-actor isolated in the macOS 15+ SDKs, and every call
+// site is inside the `@MainActor` suite above, so the helper is isolated too
+// rather than reaching into AppKit from a nonisolated context.
+@MainActor
 private func exactViewCount<T: NSView>(_ type: T.Type, in root: NSView) -> Int {
     var count = 0
     if ObjectIdentifier(Swift.type(of: root)) == ObjectIdentifier(type) {

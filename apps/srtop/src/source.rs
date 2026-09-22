@@ -166,7 +166,14 @@ impl DisplayName {
                 | '\u{feff}'
                 | '\u{fff0}'..='\u{fffb}'
                 | '\u{110bd}' | '\u{110cd}'
-                | '\u{13430}'..='\u{1343f}'
+                // The Egyptian Hieroglyph Format Controls block entire —
+                // U+13430–U+1345F — rather than its assigned prefix. Every code
+                // point in it is a control, a blank, a lost sign or a damage
+                // modifier: invisible on its own and defined to alter the glyph
+                // beside it. Unicode 16 assigned U+13447–U+13455 inside what was
+                // reserved, so closing the block also closes the next such
+                // assignment before it ships.
+                | '\u{13430}'..='\u{1345f}'
                 | '\u{1bca0}'..='\u{1bca3}'
                 | '\u{1d173}'..='\u{1d17a}'
                 | '\u{1d159}'
@@ -187,12 +194,6 @@ impl DisplayName {
                 | '\u{ffa0}'
                 | '\u{fffc}'
                 | '\u{1107f}'
-                // Egyptian hieroglyph controls, blanks and lost signs. U+13440
-                // is an invisible `Mn` mark that changes how the glyph beside it
-                // renders; U+13441–U+13446 are `Lo` letters whose own glyph is
-                // empty space. Neither category says so, so the block is closed
-                // whole rather than one code point at a time.
-                | '\u{13440}'..='\u{13446}'
                 | '\u{16fe4}')
     }
 
@@ -481,11 +482,9 @@ mod tests {
             // distinguishes either from a visible letter or an ordinary accent.
             '\u{13440}',
             '\u{13441}',
-            '\u{13442}',
-            '\u{13443}',
-            '\u{13444}',
-            '\u{13445}',
             '\u{13446}',
+            '\u{13447}',
+            '\u{13455}',
         ] {
             assert!(
                 !spoof.is_control(),
@@ -524,6 +523,26 @@ mod tests {
         ('\u{1d173}', '\u{1d17a}'),
         ('\u{e0000}', '\u{e0fff}'),
     ];
+
+    #[test]
+    fn the_egyptian_format_controls_block_is_closed_whole() {
+        // U+13430–U+1345F is controls, blanks, lost signs and damage modifiers:
+        // nothing in it is visible on its own. Unicode 16 assigned U+13447–
+        // U+13455 inside what this block previously left reserved, which is how
+        // a prefix-shaped rule falls behind the standard.
+        for point in 0x1_3430..=0x1_345f_u32 {
+            let character = char::from_u32(point).expect("the block is valid scalar values");
+            assert!(
+                DisplayName::is_unsafe(character),
+                "U+{point:04X} must never reach a row"
+            );
+        }
+        // The hieroglyphs themselves are ordinary letters and stay legible.
+        assert_eq!(
+            DisplayName::sanitize("\u{13000}\u{1342f}".as_bytes()).as_str(),
+            "\u{13000}\u{1342f}"
+        );
+    }
 
     #[test]
     fn every_default_ignorable_code_point_is_unsafe() {

@@ -330,11 +330,23 @@ impl ProcessSource for ProcFsSource {
             });
             Observed::Missing(MissingReason::Unavailable)
         } else {
+            // Even on this process's own procfs, the hostname is whatever the
+            // *reader's* UTS namespace says: `unshare --uts` without unsharing
+            // PIDs leaves the records identical and the hostname different. The
+            // identity therefore carries the namespace it was read from, so two
+            // readers in different UTS namespaces produce visibly different host
+            // components instead of two conflicting names for one machine, and
+            // a reader that cannot name its namespace says so.
+            let uts = uts_namespace_tag();
             self.identity(
                 "sys/kernel/hostname",
                 IssueScope::HostIdentity,
                 &mut issues,
-                HostId,
+                |text| match (&uts, mount) {
+                    (_, MountKind::Tree) => HostId(text),
+                    (Some(tag), _) => HostId(format!("{text}@{tag}")),
+                    (None, _) => HostId(format!("{text}@uts:unknown")),
+                },
             )
         };
         // The boot identity is not gated the same way: `random/boot_id` is one
@@ -470,6 +482,20 @@ fn readers_namespace_describes(numbers_this_process: bool, is_own_procfs: bool) 
     numbers_this_process && is_own_procfs
 }
 
+/// The reader's UTS namespace, as a tag to qualify a hostname with.
+///
+/// `sys/kernel/hostname` is answered from the reading process's UTS namespace
+/// whatever mount it is read through, so the name alone is not an identity of
+/// the listed processes — only of the namespace it was read in. Naming that
+/// namespace makes the value self-describing: two readers that disagree about
+/// the hostname now disagree visibly, instead of both claiming to have named
+/// the same machine.
+fn uts_namespace_tag() -> Option<String> {
+    let link = std::fs::read_link(Path::new(DEFAULT_PROC_ROOT).join("self/ns/uts")).ok()?;
+    let inode = parse_namespace_of_kind(&link.to_string_lossy(), "uts")?;
+    Some(format!("uts:[{inode}]"))
+}
+
 /// Resolves a root to the one tree this source will scan for its whole life.
 ///
 /// An absolute root already names it. A relative root is joined to the working
@@ -552,7 +578,14 @@ pub fn parse_pid(name: &[u8]) -> Option<u32> {
 }
 
 fn parse_namespace(link: &str) -> Option<u64> {
-    let inner = link.strip_prefix("pid:[")?.strip_suffix(']')?;
+    parse_namespace_of_kind(link, "pid")
+}
+
+fn parse_namespace_of_kind(link: &str, kind: &str) -> Option<u64> {
+    let inner = link
+        .strip_prefix(kind)?
+        .strip_prefix(":[")?
+        .strip_suffix(']')?;
     inner.parse().ok()
 }
 
@@ -599,6 +632,33 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn a_hostname_names_the_namespace_it_was_read_in() {
+        assert_eq!(
+            parse_namespace_of_kind("uts:[4026531838]", "uts"),
+            Some(4_026_531_838)
+        );
+        assert_eq!(
+            parse_namespace_of_kind("pid:[4026531836]", "pid"),
+            Some(4_026_531_836)
+        );
+        // A namespace link of another kind is never mistaken for this one: a
+        // hostname qualified with a PID-namespace inode would compare equal
+        // across two UTS namespaces that share a PID namespace, which is the
+        // case this tag exists to separate.
+        assert_eq!(parse_namespace_of_kind("pid:[4026531836]", "uts"), None);
+        assert_eq!(parse_namespace_of_kind("uts:[4026531838]", "pid"), None);
+        assert_eq!(parse_namespace_of_kind("uts:[]", "uts"), None);
+        assert_eq!(parse_namespace_of_kind("uts:4026531838", "uts"), None);
+        // On a host with a readable `/proc/self/ns/uts` the tag is well formed;
+        // elsewhere it is absent and the hostname says so rather than implying
+        // a namespace it cannot name.
+        if let Some(tag) = uts_namespace_tag() {
+            assert!(tag.starts_with("uts:[") && tag.ends_with(']'), "{tag}");
+            assert!(parse_namespace_of_kind(&tag, "uts").is_some(), "{tag}");
+        }
+    }
 
     #[test]
     fn a_relative_root_with_no_working_directory_is_never_scanned() {

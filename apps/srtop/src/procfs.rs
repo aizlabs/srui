@@ -317,37 +317,27 @@ impl ProcessSource for ProcFsSource {
         // containers scanning one bind-mounted host `/proc` would otherwise
         // stamp the same processes with two different host identities, and one
         // of them with a hostname belonging to no process in the list.
-        let host = if mount == MountKind::Unproven {
-            record_issue(&mut issues, || {
-                EnumerationIssue {
-                scope: IssueScope::HostIdentity,
-                reason: MissingReason::Unavailable,
-                detail: format!(
-                    "{} is a procfs mount this scan cannot prove is its own: its hostname would be the reader's",
-                    self.root.display()
-                ),
-            }
-            });
-            Observed::Missing(MissingReason::Unavailable)
-        } else {
-            // Even on this process's own procfs, the hostname is whatever the
-            // *reader's* UTS namespace says: `unshare --uts` without unsharing
-            // PIDs leaves the records identical and the hostname different. The
-            // identity therefore carries the namespace it was read from, so two
-            // readers in different UTS namespaces produce visibly different host
-            // components instead of two conflicting names for one machine, and
-            // a reader that cannot name its namespace says so.
-            let uts = uts_namespace_tag();
-            self.identity(
+        let host = match host_label(mount, uts_namespace_tag()) {
+            HostLabel::Plain => self.identity(
                 "sys/kernel/hostname",
                 IssueScope::HostIdentity,
                 &mut issues,
-                |text| match (&uts, mount) {
-                    (_, MountKind::Tree) => HostId(text),
-                    (Some(tag), _) => HostId(format!("{text}@{tag}")),
-                    (None, _) => HostId(format!("{text}@uts:unknown")),
-                },
-            )
+                HostId,
+            ),
+            HostLabel::Qualified(tag) => self.identity(
+                "sys/kernel/hostname",
+                IssueScope::HostIdentity,
+                &mut issues,
+                |text| HostId(format!("{text}@{tag}")),
+            ),
+            HostLabel::Unidentifiable(why) => {
+                record_issue(&mut issues, || EnumerationIssue {
+                    scope: IssueScope::HostIdentity,
+                    reason: MissingReason::Unavailable,
+                    detail: format!("{}: {why}", self.root.display()),
+                });
+                Observed::Missing(MissingReason::Unavailable)
+            }
         };
         // The boot identity is not gated the same way: `random/boot_id` is one
         // value per running kernel, not per namespace, so every procfs mount on
@@ -480,6 +470,40 @@ impl ProcessSource for ProcFsSource {
 /// to agree (a bind-mounted host `/proc`).
 fn readers_namespace_describes(numbers_this_process: bool, is_own_procfs: bool) -> bool {
     numbers_this_process && is_own_procfs
+}
+
+/// How a hostname read under a given mount may be published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostLabel {
+    /// Not read through a procfs mount at all: the tree's own file answers for
+    /// it, with nothing to qualify.
+    Plain,
+    /// Published as `<hostname>@uts:[inode]`.
+    Qualified(String),
+    /// Not an identity, with the reason to publish.
+    Unidentifiable(&'static str),
+}
+
+/// Decides that, and is deliberately total.
+///
+/// A hostname is a property of the UTS namespace it was read in, never of the
+/// listed processes, so it may only be published when that namespace can be
+/// named. `"<hostname>@uts:unknown"` would be worse than withholding it: two
+/// readers in *different* namespaces that happen to share a hostname would
+/// receive byte-identical known host components, and their keys could alias —
+/// the failure the qualifier exists to prevent, reintroduced by its own
+/// fallback.
+fn host_label(mount: MountKind, uts: Option<String>) -> HostLabel {
+    match (mount, uts) {
+        (MountKind::Tree, _) => HostLabel::Plain,
+        (MountKind::Unproven, _) => HostLabel::Unidentifiable(
+            "a procfs mount this scan cannot prove is its own, so its hostname would be the reader's",
+        ),
+        (MountKind::Own, Some(tag)) => HostLabel::Qualified(tag),
+        (MountKind::Own, None) => HostLabel::Unidentifiable(
+            "the reader's UTS namespace could not be named, so its hostname identifies nothing",
+        ),
+    }
 }
 
 /// The reader's UTS namespace, as a tag to qualify a hostname with.
@@ -632,6 +656,37 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn an_unnameable_namespace_withholds_the_hostname_rather_than_labelling_it_unknown() {
+        let tag = "uts:[4026531838]".to_string();
+        assert_eq!(
+            host_label(MountKind::Own, Some(tag.clone())),
+            HostLabel::Qualified(tag)
+        );
+        assert_eq!(host_label(MountKind::Tree, None), HostLabel::Plain);
+        assert_eq!(
+            host_label(MountKind::Tree, Some("uts:[1]".into())),
+            HostLabel::Plain,
+            "a fixture tree's own file is not read through any namespace"
+        );
+        // The case this test exists for: an unnameable namespace is not a
+        // hostname with an "unknown" suffix. Two readers in different UTS
+        // namespaces that share a hostname would otherwise receive identical
+        // *known* host components and their keys could alias.
+        assert!(matches!(
+            host_label(MountKind::Own, None),
+            HostLabel::Unidentifiable(_)
+        ));
+        assert!(matches!(
+            host_label(MountKind::Unproven, Some("uts:[1]".into())),
+            HostLabel::Unidentifiable(_)
+        ));
+        assert!(matches!(
+            host_label(MountKind::Unproven, None),
+            HostLabel::Unidentifiable(_)
+        ));
+    }
 
     #[test]
     fn a_hostname_names_the_namespace_it_was_read_in() {

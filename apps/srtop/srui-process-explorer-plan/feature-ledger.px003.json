@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-003",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "One-shot live Linux /proc snapshot with process-instance identity; no refresh loop, no process controls, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX003-001",
+      "feature": "One-shot live Linux PID and process-name enumeration behind the injectable source seam",
+      "scope": "PX-003/Linux/procfs/read-only/one snapshot per session start",
+      "source_refs": [
+        "D1",
+        "D2",
+        "K1"
+      ],
+      "owner": "PX-003",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-003.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX003-002",
+      "feature": "ProcessKey instance identity over source, host, boot, PID namespace, PID and a boot-tick creation token, resolved to opaque session ItemIds that are never reused",
+      "scope": "PX-003/Linux/procfs and deterministic fixtures/read-only",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-003",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-003.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX003-003",
+      "feature": "Incomplete enumeration reported separately from an authoritative empty result, with individually skipped inaccessible records and sanitized hostile process names",
+      "scope": "PX-003/Linux/procfs and deterministic fixtures/read-only",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-003",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-003.md"
+      ]
+    }
+  ]
+}

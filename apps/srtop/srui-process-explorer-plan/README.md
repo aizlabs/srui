@@ -10,6 +10,8 @@ The product lives under `apps/srtop`; preserve the runnable `examples/process-mo
 
 PX-002 now has deterministic fake-source implementation evidence in [its completion record](docs/process-explorer/completions/PX-002.md): three model-backed rows over native localhost SSH, distinct duplicate names and explicit missing values. Its individual ledger remains `in_progress` until independent verification; broader release gates and task-index statuses are unchanged.
 
+PX-003 now has live Linux implementation evidence in [its completion record](docs/process-explorer/completions/PX-003.md): one real `/proc` snapshot on an Ubuntu-kernel host that locates a test-owned sleeping worker, `ProcessKey` instance identity including a boot-tick creation token, incomplete scans kept distinct from authoritative empty results, and sanitized hostile process names. Its individual ledger remains `in_progress` until independent verification; broader release gates and task-index statuses are unchanged.
+
 ## Delivery priorities
 
 1. PX-000–PX-008: real read-only monitor.
@@ -34,6 +36,7 @@ PX-035-G01 resolves advanced-action feasibility before enabling those operations
 - `feature-ledger.px000.json`: ten individually scoped htop 3.5.3 entries for R0/R1 and safe termination; all remain planned until evidence is attached.
 - `feature-ledger.px001.json`: individually scoped empty-shell implementation evidence against the SRUI design; no htop parity claim.
 - `feature-ledger.px002.json`: individually scoped deterministic fake-source implementation evidence; no live collection or htop parity claim.
+- `feature-ledger.px003.json`: individually scoped live Linux one-shot snapshot and process-instance identity evidence; no refresh loop, action or htop parity claim.
 - `validate_feature_ledger.py`: schema, duplicate-ID, upstream-reference, owner, status, and evidence checks for the PX-000 ledger.
 - `STANDING_AGENT_CONTRACT.md`: shared implementation rules.
 - `SOURCES.md`: design and upstream reference provenance.

@@ -16,11 +16,14 @@ fn fake_snapshot_is_fixed_without_sampling_the_host_or_clock() {
     );
     assert_eq!(first.records.len(), 3);
     assert_eq!(first.records[0].display_name, first.records[1].display_name);
-    assert_ne!(first.records[0].id, first.records[1].id);
+    assert_ne!(first.records[0].key, first.records[1].key);
+    assert_ne!(first.records[0].key.creation, first.records[1].key.creation);
     assert_eq!(
-        first.records[2].pid,
+        first.records[2].key.pid,
         Observed::Missing(MissingReason::Unavailable)
     );
+    // A fixed fake set is authoritative: it is complete, not a degraded scan.
+    assert_eq!(first.completeness, Completeness::Complete);
 }
 
 #[test]
@@ -116,6 +119,52 @@ fn status_is_the_injected_source_description_not_a_fixed_fixture_label() {
 }
 
 #[test]
+fn a_snapshot_larger_than_one_model_batch_is_published_whole() {
+    // A live host can hold more processes than §26 allows in a single model
+    // mutation batch. Publishing must split into bounded batches rather than
+    // abort initialization and leave the operator with no window at all.
+    struct CrowdedSource(usize);
+    impl ProcessSource for CrowdedSource {
+        fn status_text(&self) -> &str {
+            "Read-only · Crowded fixture snapshot"
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let mut snapshot = FakeProcessSource.snapshot();
+            let template = snapshot.records[0].key.clone();
+            snapshot.records = (0..self.0)
+                .map(|index| ProcessRecord {
+                    key: ProcessKey {
+                        pid: Observed::Known(index as u32 + 1),
+                        creation: CreationToken::Opaque(format!("crowded-{index}")),
+                        ..template.clone()
+                    },
+                    display_name: DisplayName::sanitize(b"worker"),
+                })
+                .collect();
+            snapshot
+        }
+    }
+
+    let session = Session::mint();
+    let limit = session.with_store(|store| store.limits().max_items_per_model_operation);
+    let crowded = limit * 2 + 1;
+    let snapshot = initialize_from_source(&session, &mut CrowdedSource(crowded)).unwrap();
+    assert_eq!(snapshot.records.len(), crowded);
+    assert_eq!(
+        session.current_revision(),
+        1,
+        "every batch belongs to the one transaction that publishes the shell"
+    );
+    session.with_store(|store| {
+        let model = store.get_model(MODEL).unwrap();
+        assert_eq!(model.item_count, crowded as u64);
+        assert_eq!(model.id_to_index.len(), crowded, "no row is dropped");
+        assert_eq!(store.node_count(), 5, "rows never become view nodes");
+    });
+}
+
+#[test]
 fn invalid_source_identity_does_not_publish_partial_ui() {
     struct DuplicateSource;
     impl ProcessSource for DuplicateSource {
@@ -125,7 +174,7 @@ fn invalid_source_identity_does_not_publish_partial_ui() {
 
         fn snapshot(&mut self) -> ProcessSnapshot {
             let mut snapshot = FakeProcessSource.snapshot();
-            snapshot.records[1].id = snapshot.records[0].id.clone();
+            snapshot.records[1].key = snapshot.records[0].key.clone();
             snapshot
         }
     }

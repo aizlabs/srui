@@ -12,6 +12,7 @@ use crate::source::{
     IssueScope, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
     ProcessSnapshot, ProcessSource, SnapshotTime, SourceId,
 };
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -30,6 +31,21 @@ pub const MAX_RECORDS: usize = 65_536;
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// `/proc/<pid>/stat` field 22 (start time) is the 20th field after `comm`.
 const STARTTIME_FIELD_AFTER_COMM: usize = 19;
+
+/// What a scanned root is, as far as an unprivileged scan can prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountKind {
+    /// Not a procfs mount: no `self` symlink. A fixture tree, whose own identity
+    /// files are the only thing that can answer for it.
+    Tree,
+    /// The procfs this process runs under, so the kernel interfaces read through
+    /// it describe the processes it lists.
+    Own,
+    /// A procfs mount this scan cannot prove is its own — or a root it cannot
+    /// even classify. Identity read through it belongs to the reader, not to the
+    /// records, and is reported unavailable rather than guessed.
+    Unproven,
+}
 
 /// One-shot reader over a `/proc`-shaped directory tree.
 #[derive(Debug, Clone)]
@@ -68,7 +84,7 @@ impl ProcFsSource {
     }
 
     fn rooted(root: PathBuf, status: String) -> Self {
-        let source = SourceId(format!("procfs:{}", root.display()));
+        let source = source_id_for(&root);
         Self {
             root,
             source,
@@ -151,49 +167,63 @@ impl ProcFsSource {
     /// guessed: an unknown identity component fails explicitly instead of
     /// degrading silently. A fixture tree has no `self` symlink and is not a
     /// procfs mount, so its own identity files answer for it.
-    fn pid_namespace(&self, issues: &mut Vec<EnumerationIssue>) -> Observed<PidNamespaceId> {
+    /// What the scanned root is, as far as this scan can prove. Every kernel
+    /// interface reached *through* a procfs mount — `self/ns/pid`,
+    /// `sys/kernel/hostname` — answers for the reader's namespaces, not the
+    /// mount's, so the answer is only this mount's identity when the mount is
+    /// the procfs this process runs under.
+    fn mount_kind(&self) -> MountKind {
+        let scanned_self = self.root.join("self");
+        // A real procfs mount always has `self` as a symlink; a tree that does
+        // not is not a procfs mount and answers from its own identity files.
+        // `Path::is_symlink` would fold "cannot tell" into that second case, so
+        // the file type is read explicitly and an error counts as unproven.
+        let Ok(kind) = std::fs::symlink_metadata(&scanned_self).map(|data| data.file_type()) else {
+            return MountKind::Unproven;
+        };
+        if !kind.is_symlink() {
+            return MountKind::Tree;
+        }
+        let own_self = Path::new(DEFAULT_PROC_ROOT).join("self");
+        let numbers_this_process = std::fs::read_link(&scanned_self)
+            .ok()
+            .and_then(|target| parse_pid(target.as_os_str().as_encoded_bytes()))
+            == Some(std::process::id());
+        let own_procfs = match (
+            std::fs::metadata(&scanned_self),
+            std::fs::metadata(&own_self),
+        ) {
+            (Ok(scanned), Ok(own)) => scanned.dev() == own.dev() && scanned.ino() == own.ino(),
+            _ => false,
+        };
+        if readers_namespace_describes(numbers_this_process, own_procfs) {
+            MountKind::Own
+        } else {
+            MountKind::Unproven
+        }
+    }
+
+    fn pid_namespace(
+        &self,
+        mount: MountKind,
+        issues: &mut Vec<EnumerationIssue>,
+    ) -> Observed<PidNamespaceId> {
         if let Some(inode) = std::fs::read_link(self.root.join("1/ns/pid"))
             .ok()
             .and_then(|target| parse_namespace(&target.to_string_lossy()))
         {
             return Observed::Known(PidNamespaceId(inode));
         }
-        let scanned_self = self.root.join("self");
-        // A real procfs mount always has `self` as a symlink; a tree that does
-        // not is not a procfs mount and answers from its own identity files.
-        // `Path::is_symlink` would fold "cannot tell" into that second case, so
-        // the file type is read explicitly and an error counts as unproven.
-        let scanned_self_kind =
-            std::fs::symlink_metadata(&scanned_self).map(|data| data.file_type());
-        if scanned_self_kind
-            .as_ref()
-            .map_or(true, |kind| kind.is_symlink())
-        {
-            let own_self = Path::new(DEFAULT_PROC_ROOT).join("self");
-            let numbers_this_process = std::fs::read_link(&scanned_self)
-                .ok()
-                .and_then(|target| parse_pid(target.as_os_str().as_encoded_bytes()))
-                == Some(std::process::id());
-            let own_procfs = match (
-                std::fs::metadata(&scanned_self),
-                std::fs::metadata(&own_self),
-            ) {
-                (Ok(scanned), Ok(own)) => scanned.dev() == own.dev() && scanned.ino() == own.ino(),
-                _ => false,
-            };
-            if !readers_namespace_describes(numbers_this_process, own_procfs) {
-                record_issue(issues, || {
-                    EnumerationIssue {
-                    scope: IssueScope::PidNamespace,
-                    reason: MissingReason::Unavailable,
-                    detail: format!(
-                        "{} numbers its records in a PID namespace this scan cannot prove is its own",
-                        self.root.display()
-                    ),
-                }
-                });
-                return Observed::Missing(MissingReason::Unavailable);
-            }
+        if mount == MountKind::Unproven {
+            record_issue(issues, || EnumerationIssue {
+                scope: IssueScope::PidNamespace,
+                reason: MissingReason::Unavailable,
+                detail: format!(
+                    "{} numbers its records in a PID namespace this scan cannot prove is its own",
+                    self.root.display()
+                ),
+            });
+            return Observed::Missing(MissingReason::Unavailable);
         }
         let path = self.root.join("self/ns/pid");
         match std::fs::read_link(&path) {
@@ -232,19 +262,42 @@ impl ProcessSource for ProcFsSource {
         let mut skipped = 0usize;
         let mut vanished = 0usize;
         let mut capped = 0usize;
-        let host = self.identity(
-            "sys/kernel/hostname",
-            IssueScope::HostIdentity,
-            &mut issues,
-            HostId,
-        );
+        let mount = self.mount_kind();
+        // `sys/kernel/hostname` is a sysctl: the kernel answers it from the
+        // *reader's* UTS namespace, whatever mount it is read through. Two
+        // containers scanning one bind-mounted host `/proc` would otherwise
+        // stamp the same processes with two different host identities, and one
+        // of them with a hostname belonging to no process in the list.
+        let host = if mount == MountKind::Unproven {
+            record_issue(&mut issues, || {
+                EnumerationIssue {
+                scope: IssueScope::HostIdentity,
+                reason: MissingReason::Unavailable,
+                detail: format!(
+                    "{} is a procfs mount this scan cannot prove is its own: its hostname would be the reader's",
+                    self.root.display()
+                ),
+            }
+            });
+            Observed::Missing(MissingReason::Unavailable)
+        } else {
+            self.identity(
+                "sys/kernel/hostname",
+                IssueScope::HostIdentity,
+                &mut issues,
+                HostId,
+            )
+        };
+        // The boot identity is not gated the same way: `random/boot_id` is one
+        // value per running kernel, not per namespace, so every procfs mount on
+        // this machine answers it identically.
         let boot = self.identity(
             "sys/kernel/random/boot_id",
             IssueScope::BootIdentity,
             &mut issues,
             BootId,
         );
-        let pid_namespace = self.pid_namespace(&mut issues);
+        let pid_namespace = self.pid_namespace(mount, &mut issues);
         let mut records = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
@@ -368,6 +421,29 @@ fn readers_namespace_describes(numbers_this_process: bool, is_own_procfs: bool) 
     numbers_this_process && is_own_procfs
 }
 
+/// The source identity of a root, lossless in that root's bytes.
+///
+/// `Path::display` replaces invalid UTF-8 with U+FFFD, so two roots differing
+/// only in those bytes would share one `SourceId`, and their records could then
+/// compare equal on every component — precisely the cross-root aliasing
+/// [`ProcFsSource::with_root`] promises cannot happen. A path that is valid
+/// UTF-8 keeps the readable form; anything else is hex-encoded under a distinct
+/// prefix, so no byte sequence can reach the same identity by two routes.
+fn source_id_for(root: &Path) -> SourceId {
+    match root.as_os_str().to_str() {
+        Some(text) => SourceId(format!("procfs:{text}")),
+        None => {
+            let bytes = root.as_os_str().as_encoded_bytes();
+            let mut id = String::with_capacity("procfs-bytes:".len() + bytes.len() * 2);
+            id.push_str("procfs-bytes:");
+            for byte in bytes {
+                let _ = write!(id, "{byte:02x}");
+            }
+            SourceId(id)
+        }
+    }
+}
+
 fn reason_for(error: &io::Error) -> MissingReason {
     match error.kind() {
         io::ErrorKind::PermissionDenied => MissingReason::Denied,
@@ -453,6 +529,30 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn roots_differing_only_in_invalid_utf8_never_share_a_source_identity() {
+        let first = Path::new(OsStr::from_bytes(b"/tmp/procfs-\xff"));
+        let second = Path::new(OsStr::from_bytes(b"/tmp/procfs-\xfe"));
+        // Both display as the same text, which is exactly why the identity
+        // cannot be built from `Path::display`.
+        assert_eq!(first.display().to_string(), second.display().to_string());
+        assert_ne!(source_id_for(first), source_id_for(second));
+        // A readable root keeps its readable identity.
+        assert_eq!(
+            source_id_for(Path::new(DEFAULT_PROC_ROOT)),
+            SourceId("procfs:/proc".into())
+        );
+        // The two encodings live in separate namespaces, so a path whose text
+        // looks like an encoded one cannot collide with it.
+        assert!(source_id_for(first).0.starts_with("procfs-bytes:"));
+        assert_ne!(
+            source_id_for(first),
+            source_id_for(Path::new(&source_id_for(first).0))
+        );
+    }
 
     #[test]
     fn the_readers_namespace_describes_records_only_under_both_proofs() {

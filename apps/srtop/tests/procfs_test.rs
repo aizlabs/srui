@@ -331,6 +331,24 @@ fn a_mount_numbering_pids_in_another_namespace_never_stamps_this_one() {
         .any(|issue| issue.scope == IssueScope::PidNamespace));
     assert!(!snapshot.completeness.is_complete());
 
+    // The host identity is withheld for the same reason. `sys/kernel/hostname`
+    // is a sysctl the kernel answers from the *reader's* UTS namespace, so a
+    // mount that cannot be proven this process's own would otherwise stamp its
+    // records with a hostname belonging to none of them.
+    assert_eq!(
+        snapshot.records[0].key.host,
+        Observed::Missing(MissingReason::Unavailable),
+        "the reader's hostname is never published as a foreign mount's identity"
+    );
+    assert!(snapshot
+        .completeness
+        .issues()
+        .iter()
+        .any(|issue| issue.scope == IssueScope::HostIdentity));
+    // The boot identity is one value per running kernel, not per namespace, so
+    // it is still read.
+    assert!(matches!(snapshot.records[0].key.boot, Observed::Known(_)));
+
     // A foreign mount that happens to number this process with the same value
     // it has here is still foreign: PIDs coincide across namespaces, so numeric
     // equality proves nothing and must not unlock the reader's namespace.
@@ -377,6 +395,7 @@ fn a_mount_numbering_pids_in_another_namespace_never_stamps_this_one() {
         snapshot.records[0].key.pid_namespace,
         Observed::Known(srui_process_explorer::source::PidNamespaceId(4_026_531_999))
     );
+    assert!(matches!(snapshot.records[0].key.host, Observed::Known(_)));
     assert_eq!(snapshot.completeness, Completeness::Complete);
 }
 

@@ -12,13 +12,17 @@
 //! * Rows are deleted only on the word of a scan that is entitled to say a
 //!   process is gone. A scan that could not list the process filesystem, or
 //!   whose records this app refuses to identify, is an error published over the
-//!   last-known rows, never a collection that emptied itself.
+//!   last-known rows, never a collection that emptied itself. Entitlement is
+//!   scoped to the absences a scan could not account for
+//!   ([`crate::source::Retention`]): a scan that named the records it skipped
+//!   still deletes the rows of processes that really ended, so one permanently
+//!   denied record cannot freeze the collection and let it grow without bound.
 //! * Every published change is recorded as it commits, so the view's idea of
 //!   what the client holds is exactly what the store holds even when a later
 //!   batch of one refresh fails.
 
 use crate::projection::{Row, SessionItemIds};
-use crate::source::{ProcessSnapshot, ProcessSource};
+use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::{initialize_rows, published_status, MODEL, STATUS};
 use srui_sdk::{ItemId, Operation, Value, TEXT};
 use srui_semantic_tree::DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION;
@@ -114,10 +118,16 @@ impl ProcessView {
             Ok(rows) => (rows, None),
             Err(error) => (Vec::new(), Some(error.to_string())),
         };
-        // Only a complete scan is entitled to say that an absent process ended.
-        let authoritative = rejected.is_none() && snapshot.completeness.is_complete();
+        // A scan says which absences it cannot account for, and only those rows
+        // survive not being confirmed. A rejected snapshot confirmed nothing at
+        // all, so no absence in it is evidence of anything.
+        let retention = if rejected.is_some() {
+            Retention::Unenumerable
+        } else {
+            snapshot.retention()
+        };
         let confirmed_count = confirmed.len();
-        let target = retain_unconfirmed(&self.rows, confirmed, authoritative);
+        let target = retain_unconfirmed(&self.rows, confirmed, &retention);
         let retained = target.len() - confirmed_count;
         let status = refresh_status(source_status, snapshot, retained, rejected.as_deref());
 
@@ -236,25 +246,25 @@ pub fn refresh_status(
     status
 }
 
-/// Keeps rows the scan did not confirm when the scan was not entitled to delete
-/// them, in the position they already hold relative to the rows it did confirm.
+/// Keeps rows the scan did not confirm and could not account for, in the
+/// position they already hold relative to the rows it did confirm.
 ///
-/// An unconfirmed row is anchored to the confirmed row that followed it, so a
+/// `retention` decides which unconfirmed rows those are: a scan that named the
+/// records it skipped keeps only those, so an unrelated process that really
+/// ended is still deleted while one denied record is unreadable. Only a scan
+/// whose uncertainty cannot be enumerated at all keeps every absent row.
+///
+/// A retained row is anchored to the confirmed row that followed it, so a
 /// scan that misses a record for one tick does not move that row to the end of
 /// the table and back again on the next.
-fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, authoritative: bool) -> Vec<Row> {
-    if authoritative {
-        return confirmed;
-    }
+fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retention) -> Vec<Row> {
     let position: HashMap<ItemId, usize> = confirmed
         .iter()
         .enumerate()
         .map(|(index, row)| (row.item_id, index))
         .collect();
-    if published
-        .iter()
-        .all(|row| position.contains_key(&row.item_id))
-    {
+    let uncertain = |row: &Row| !position.contains_key(&row.item_id) && retention.keeps(&row.key);
+    if !published.iter().any(uncertain) {
         return confirmed;
     }
     let mut before: HashMap<usize, Vec<Row>> = HashMap::new();
@@ -263,6 +273,9 @@ fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, authoritative: boo
     for row in published.iter().rev() {
         match position.get(&row.item_id) {
             Some(&index) => anchor = Some(index),
+            // An absent row this scan accounted for really ended: it is left out
+            // of the target, which deletes it.
+            None if !retention.keeps(&row.key) => {}
             None => match anchor {
                 Some(index) => before.entry(index).or_default().push(row.clone()),
                 None => tail.push(row.clone()),
@@ -525,8 +538,27 @@ pub async fn poll<S>(
 mod tests {
     use super::*;
     use crate::source::{
-        Completeness, EnumerationIssue, IssueScope, MissingReason, ProcessKey, ScriptedFakeSource,
+        Completeness, EnumerationIssue, IssueScope, MissingReason, Observed, ProcessKey,
+        ScriptedFakeSource,
     };
+    use std::collections::BTreeSet;
+
+    /// Retention that keeps every row a scan did not confirm.
+    fn everything() -> Retention {
+        Retention::Unenumerable
+    }
+
+    /// Retention that keeps exactly the rows of `rows`, matched by their PIDs.
+    fn only(rows: &[Row]) -> Retention {
+        Retention::Skipped(
+            rows.iter()
+                .filter_map(|row| match row.key.pid {
+                    Observed::Known(pid) => Some(pid),
+                    Observed::Missing(_) => None,
+                })
+                .collect::<BTreeSet<u32>>(),
+        )
+    }
 
     fn rows_of(view: &ProcessView) -> Vec<(u64, Value)> {
         view.rows
@@ -547,11 +579,14 @@ mod tests {
         assert_eq!(first.len(), 3);
         // The middle row is not confirmed by this scan.
         let confirmed = vec![first[0].clone(), first[2].clone()];
-        let merged = retain_unconfirmed(&first, confirmed, false);
+        let merged = retain_unconfirmed(&first, confirmed, &everything());
         assert_eq!(keyed(&merged), keyed(&first), "order must not churn");
-        // The same scan, believed, deletes it instead.
+        // A scan that named the record it skipped keeps exactly that row.
         let confirmed = vec![first[0].clone(), first[2].clone()];
-        let believed = retain_unconfirmed(&first, confirmed.clone(), true);
+        let scoped = retain_unconfirmed(&first, confirmed.clone(), &only(&first[1..2]));
+        assert_eq!(keyed(&scoped), keyed(&first));
+        // The same scan, having accounted for that absence, deletes it instead.
+        let believed = retain_unconfirmed(&first, confirmed.clone(), &only(&[]));
         assert_eq!(keyed(&believed), keyed(&confirmed));
     }
 
@@ -560,9 +595,9 @@ mod tests {
         let mut ids = SessionItemIds::default();
         let mut source = ScriptedFakeSource::default();
         let first = ids.project(&source.snapshot()).unwrap();
-        let merged = retain_unconfirmed(&first, vec![first[1].clone()], false);
+        let merged = retain_unconfirmed(&first, vec![first[1].clone()], &everything());
         assert_eq!(keyed(&merged), keyed(&first));
-        let merged = retain_unconfirmed(&first, Vec::new(), false);
+        let merged = retain_unconfirmed(&first, Vec::new(), &everything());
         assert_eq!(
             keyed(&merged),
             keyed(&first),

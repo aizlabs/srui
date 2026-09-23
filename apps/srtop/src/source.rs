@@ -2,6 +2,7 @@
 //! (design §§6.3, 8, 12, 22; PX-002 records, PX-003 identity and completeness).
 //! This module reads no process state: adapters live in their own modules and the
 //! fake adapter below uses constants only, with no OS enumeration or clock read.
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -313,6 +314,62 @@ impl Completeness {
     }
 }
 
+/// Which absent rows a scan is entitled to delete (PX-004).
+///
+/// A row the current scan did not confirm is deleted unless *that identity's*
+/// absence is genuinely uncertain. A single persistently denied record must not
+/// make every unrelated exit unobservable: a scan that named exactly which
+/// records it could not read has accounted for every other absence, and a row it
+/// did not account for really ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retention {
+    /// This scan enumerated the records it skipped, so only rows whose PID it
+    /// named are kept; every other absent row is deleted. An empty set is a scan
+    /// that accounted for everything, including a complete one.
+    Skipped(BTreeSet<u32>),
+    /// The uncertain identities cannot be enumerated — the root could not be
+    /// listed or entered, the scan stopped at its own record bound without
+    /// reading the remaining PIDs, or the bounded issue list dropped some of the
+    /// records it skipped — so every absent row is kept.
+    Unenumerable,
+}
+
+impl Retention {
+    /// Whether a published row this scan did not confirm must be kept rather than
+    /// deleted.
+    ///
+    /// A skipped record is matched by the PID its issue names, which is the only
+    /// identity component an unread record has. A row whose PID was never
+    /// observed can therefore never match, and a row carrying a PID from an
+    /// earlier boot or another namespace may match one that names the same
+    /// number: matching errs towards keeping a row, never towards deleting one
+    /// whose fate is unknown.
+    pub fn keeps(&self, key: &ProcessKey) -> bool {
+        match self {
+            Self::Unenumerable => true,
+            Self::Skipped(pids) => match key.pid {
+                Observed::Known(pid) => pids.contains(&pid),
+                Observed::Missing(_) => false,
+            },
+        }
+    }
+
+    /// True when this scan cannot say which identities are uncertain, so every
+    /// absent row is retained.
+    pub fn is_global(&self) -> bool {
+        matches!(self, Self::Unenumerable)
+    }
+
+    /// The PIDs whose absence this scan left uncertain, or `None` when it could
+    /// not enumerate them. Bounded by [`MAX_RECORDED_ISSUES`] when it is `Some`.
+    pub fn uncertain_pids(&self) -> Option<&BTreeSet<u32>> {
+        match self {
+            Self::Skipped(pids) => Some(pids),
+            Self::Unenumerable => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSnapshot {
     pub source: SourceId,
@@ -334,6 +391,60 @@ pub struct ProcessSnapshot {
     /// [`Completeness`] reports through the recorded [`IssueScope::Limit`].
     pub capped: usize,
     pub completeness: Completeness,
+}
+
+impl ProcessSnapshot {
+    /// Which absences this snapshot leaves uncertain (PX-004).
+    ///
+    /// A complete scan accounts for every process it can see, so nothing it did
+    /// not list is uncertain. An incomplete one is scoped to the records it
+    /// actually named, because a scan that could read all but three records has
+    /// still proven that the *other* processes are gone: keeping every absent
+    /// row while one record stays permanently denied — the steady state on any
+    /// shared host — would accumulate a stale row per exit forever, until the
+    /// model's own item bound refuses the next refresh.
+    ///
+    /// Retention stays whole only where the uncertainty really is whole:
+    ///
+    /// * the root could not be listed or one of its entries could not be
+    ///   examined, so the missing records have no known PID;
+    /// * the scan stopped at its own record bound, so the entries beyond it were
+    ///   never read and their PIDs are equally unknown;
+    /// * more records were skipped than the bounded issue list retained
+    ///   ([`MAX_RECORDED_ISSUES`]), so the uncertain set is not enumerable.
+    ///
+    /// A record that merely [vanished](Self::vanished) is not uncertain: it did
+    /// not exist at sample time, and its row is deleted like any other exit.
+    pub fn retention(&self) -> Retention {
+        let Completeness::Incomplete { skipped, issues } = &self.completeness else {
+            return Retention::Skipped(BTreeSet::new());
+        };
+        if self.capped > 0 {
+            return Retention::Unenumerable;
+        }
+        let mut uncertain = BTreeSet::new();
+        let mut named = 0usize;
+        for issue in issues {
+            match issue.scope {
+                IssueScope::Root | IssueScope::Entry | IssueScope::Limit => {
+                    return Retention::Unenumerable
+                }
+                IssueScope::Process(pid) => {
+                    named += 1;
+                    uncertain.insert(pid);
+                }
+                // An identity file this scan could not read degrades every
+                // record equally; it hides none of them.
+                IssueScope::HostIdentity | IssueScope::BootIdentity | IssueScope::PidNamespace => {}
+            }
+        }
+        if *skipped > named {
+            // Records were skipped whose explanation the bound threw away, so
+            // this list does not name everything that is uncertain.
+            return Retention::Unenumerable;
+        }
+        Retention::Skipped(uncertain)
+    }
 }
 
 /// Status label of the deterministic fixture source. Real sources state their own.

@@ -41,7 +41,7 @@
     },
     {
       "feature_id": "SRUI-PX004-003",
-      "feature": "A failed or incomplete scan keeps the last-known rows with their item identities and publishes an explanation instead of deleting them; recovery converges without moving a row",
+      "feature": "A scan deletes a row only when it accounted for that absence: an incomplete scan keeps the last-known rows whose absence it could not account for, with their item identities, and publishes an explanation instead of deleting them, while the processes it proved ended are still removed; recovery converges without moving a row",
       "scope": "PX-004/all sources/read-only",
       "source_refs": [
         "D1",

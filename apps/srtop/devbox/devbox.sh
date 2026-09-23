@@ -53,7 +53,9 @@ cmd_up() {
   ensure_key
   docker image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  docker run -d --name "$NAME" -p "$PORT:22" \
+  # Loopback only: Docker publishes to every interface when the host address is
+  # omitted, which would put a throwaway sshd on the LAN, Wi-Fi and any VPN.
+  docker run -d --name "$NAME" -p "127.0.0.1:$PORT:22" \
     -e SRTOP_ARGS="$SRTOP_ARGS" \
     -v "$STATE_DIR:/keys:ro" "$IMAGE" >/dev/null
 

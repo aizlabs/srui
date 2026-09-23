@@ -61,7 +61,7 @@ rm -rf "${SRTOP_DEVBOX_STATE:-$HOME/.codex/srtop-devbox}"
 | `SRTOP_DEVBOX_STATE` | `$HOME/.codex/srtop-devbox` | keypair, `known_hosts`, build context — outside every checkout |
 | `SRTOP_DEVBOX_NAME` | `srtop-devbox` | container name |
 | `SRTOP_DEVBOX_IMAGE` | `srtop-devbox:latest` | image tag |
-| `SRTOP_DEVBOX_PORT` | `2222` | host port forwarded to the container's sshd |
+| `SRTOP_DEVBOX_PORT` | `2222` | loopback-only host port forwarded to the container's sshd |
 | `SRTOP_DEVBOX_REV` | `HEAD` | revision exported into the build context; must be PX-004 or later |
 | `SRTOP_ARGS` | `--live-source --refresh-interval-ms 1000` | srtop flags |
 
@@ -72,7 +72,9 @@ rm -rf "${SRTOP_DEVBOX_STATE:-$HOME/.codex/srtop-devbox}"
 - `srtop` runs as the unprivileged `srui` account on a `0700` directory; it
   refuses a socket directory that is not private to a non-root user.
 - sshd accepts public keys only, for that one account, and exposes exactly one
-  subsystem: `srui` → `srui-ssh-bridge --socket /home/srui/run/srtop.sock`.
+  subsystem: `srui` → `srui-ssh-bridge --socket /home/srui/run/srtop.sock`. The
+  port is published as `127.0.0.1:$SRTOP_DEVBOX_PORT`, so the throwaway daemon is
+  never reachable from the LAN, Wi-Fi or a VPN interface.
 - The container has its own PID namespace, so the process list is the
   container's own — a short list dominated by `sshd`, `srtop` and whatever you
   spawn. For a busy host, point the client at a real Linux machine instead.

@@ -21,11 +21,21 @@
 //! each further record's detail is what the bound stops; listing it is not, and
 //! a listing entry is a PID, so those entries are named too and only a ledger
 //! asked to hold more than `MAX_UNCERTAIN_PIDS` identities is unenumerable.
+//!
+//! Round 5's defect: a scan that could not read one *global* identity file —
+//! `sys/kernel/hostname`, `sys/kernel/random/boot_id`, `1/ns/pid` — skips no PID,
+//! so retention keeps nothing, while every record's `ProcessKey` loses that
+//! component and becomes a new key. The whole table was therefore deleted and
+//! reinserted under fresh item IDs on the degraded tick, and again on the tick
+//! the file came back. The session now remembers the last value each global
+//! component was observed to hold and keys a scan that could not read one with
+//! it, while a component that comes back *different* is treated as what it is: a
+//! different source, whose records take new identities.
 use srui_process_explorer::procfs::{MAX_RECORDS, MAX_UNCERTAIN_PIDS};
 use srui_process_explorer::refresh::ProcessView;
 use srui_process_explorer::source::*;
 use srui_process_explorer::{start_from_source, MODEL, STATUS};
-use srui_sdk::{ItemId, Value, TEXT};
+use srui_sdk::{ItemId, Operation, Value, TEXT};
 use srui_sessiond::Session;
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -575,4 +585,244 @@ fn churn_under_a_permanently_denied_record_does_not_grow_the_published_rows() {
              1 row retained from an earlier scan"
         )
     );
+}
+
+/// One of the three global identity components a scan stamps every record with.
+/// They are facts about the source, not about a record: one hostname per UTS
+/// namespace, one boot ID per running kernel, one namespace per procfs mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Component {
+    Host,
+    Boot,
+    PidNamespace,
+}
+
+impl Component {
+    /// The scope a collector records when it cannot read this component.
+    fn scope(self) -> IssueScope {
+        match self {
+            Self::Host => IssueScope::HostIdentity,
+            Self::Boot => IssueScope::BootIdentity,
+            Self::PidNamespace => IssueScope::PidNamespace,
+        }
+    }
+
+    /// The identity file this component is read from, for the issue detail.
+    fn file(self) -> &'static str {
+        match self {
+            Self::Host => "sys/kernel/hostname",
+            Self::Boot => "sys/kernel/random/boot_id",
+            Self::PidNamespace => "1/ns/pid",
+        }
+    }
+
+    /// This scan could not read the component at all.
+    fn lost(self, key: &mut ProcessKey) {
+        let lost = MissingReason::Unavailable;
+        match self {
+            Self::Host => key.host = Observed::Missing(lost),
+            Self::Boot => key.boot = Observed::Missing(lost),
+            Self::PidNamespace => key.pid_namespace = Observed::Missing(lost),
+        }
+    }
+
+    /// This scan read the component and it is a different value: a different
+    /// host, a different boot, or a different PID namespace.
+    fn changed(self, key: &mut ProcessKey) {
+        match self {
+            Self::Host => key.host = Observed::Known(HostId("another-host".into())),
+            Self::Boot => key.boot = Observed::Known(BootId("fixture-boot-0002".into())),
+            Self::PidNamespace => {
+                key.pid_namespace = Observed::Known(PidNamespaceId(4_026_532_999))
+            }
+        }
+    }
+}
+
+const COMPONENTS: [Component; 3] = [Component::Host, Component::Boot, Component::PidNamespace];
+
+/// A scan that read every record it listed and could not read one global
+/// identity file. Nothing is skipped and no PID is uncertain — that is the whole
+/// point: an identity file degrades every record equally and hides none — so
+/// this snapshot's retention is empty and every row it fails to confirm would be
+/// deleted.
+fn identity_lost(pids: &[u32], component: Component) -> ProcessSnapshot {
+    let mut tick = scan(pids);
+    for record in &mut tick.records {
+        component.lost(&mut record.key);
+    }
+    tick.completeness = Completeness::from_scan(
+        SkippedRecords::none(),
+        vec![EnumerationIssue {
+            scope: component.scope(),
+            reason: MissingReason::Unavailable,
+            detail: format!(
+                "{}: No such file or directory (os error 2)",
+                component.file()
+            ),
+        }],
+    );
+    tick
+}
+
+/// A scan that read every record and every identity file, with one component
+/// answering a different value than the session has seen before.
+fn identity_changed(pids: &[u32], component: Component) -> ProcessSnapshot {
+    let mut tick = scan(pids);
+    for record in &mut tick.records {
+        component.changed(&mut record.key);
+    }
+    tick
+}
+
+/// Operations committed since `revision`, decoded from the wire form a client
+/// actually receives, flattened in commit order.
+fn operations_since(session: &Session, revision: u64) -> Vec<Operation> {
+    session
+        .collect_replayed_transactions(revision)
+        .expect("the journal holds this run")
+        .into_iter()
+        .flat_map(|transaction| transaction.operations)
+        .map(|op| Operation::try_from(op).expect("a committed operation decodes"))
+        .collect()
+}
+
+/// The round-5 regression. A global identity file that cannot be read for one
+/// tick and is readable again on the next must not re-key a single record: no
+/// row is deleted, none is inserted, and every row keeps the item ID the client
+/// already holds, on the degraded tick and on the recovering one alike.
+#[test]
+fn a_global_identity_lost_for_one_tick_and_recovered_churns_no_row() {
+    for component in COMPONENTS {
+        let (session, mut view) = started(&[4101, 4102, 4103]);
+        let before = published(&session);
+        let start = session.current_revision();
+
+        let degraded = view
+            .apply(
+                &session,
+                STATUS_TEXT,
+                &identity_lost(&[4101, 4102, 4103], component),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                degraded.inserted,
+                degraded.deleted,
+                degraded.updated,
+                degraded.retained
+            ),
+            (0, 0, 0, 0),
+            "{component:?}: a lost identity file re-keys nothing, so there is nothing \
+             to delete, insert or even retain"
+        );
+        assert_eq!(
+            published(&session),
+            before,
+            "{component:?}: every row keeps its identity, its place and its cells"
+        );
+        // The status is still built from counts and fixed wording, and it does
+        // say what happened: the degradation is published even though the keys
+        // held steady.
+        assert_eq!(
+            status_text(&session),
+            format!(
+                "{STATUS_TEXT} · incomplete scan · 3 processes listed · host identity incomplete"
+            ),
+            "{component:?}"
+        );
+
+        let recovered = view
+            .apply(&session, STATUS_TEXT, &scan(&[4101, 4102, 4103]))
+            .unwrap();
+        assert_eq!(
+            (
+                recovered.inserted,
+                recovered.deleted,
+                recovered.updated,
+                recovered.retained
+            ),
+            (0, 0, 0, 0),
+            "{component:?}: recovery is not a change either"
+        );
+        assert_eq!(
+            published(&session),
+            before,
+            "{component:?}: recovery moves no row"
+        );
+        assert_eq!(status_text(&session), STATUS_TEXT, "{component:?}");
+
+        // On the wire, across both ticks: the status text and nothing else.
+        let ops = operations_since(&session, start);
+        assert!(
+            ops.iter()
+                .all(|op| matches!(op, Operation::SetProperty { .. })),
+            "{component:?}: {ops:?}"
+        );
+    }
+}
+
+/// The honest exception. A component that comes back as a *different* value is
+/// not a degradation and is never smoothed over: a different host, boot or PID
+/// namespace is a different source, its records are different process instances,
+/// and they visibly take new identities. The new value is then what a later
+/// degraded scan anchors to.
+#[test]
+fn a_different_global_identity_is_a_different_source_and_takes_new_identities() {
+    for component in COMPONENTS {
+        let (session, mut view) = started(&[4101, 4102, 4103]);
+        let before = published(&session);
+        // Degrade first, so the session has a remembered value that *could* have
+        // been reused, and prove it is not reused when the answer disagrees.
+        view.apply(
+            &session,
+            STATUS_TEXT,
+            &identity_lost(&[4101, 4102, 4103], component),
+        )
+        .unwrap();
+
+        let outcome = view
+            .apply(
+                &session,
+                STATUS_TEXT,
+                &identity_changed(&[4101, 4102, 4103], component),
+            )
+            .unwrap();
+        assert_eq!(
+            (outcome.inserted, outcome.deleted, outcome.retained),
+            (3, 3, 0),
+            "{component:?}: the rows of the source that left are deleted and the new \
+             source's rows are inserted"
+        );
+        let after = published(&session);
+        assert_eq!(
+            pids(&after),
+            pids(&before),
+            "{component:?}: the same PID numbers, which is exactly why they must not \
+             be taken for the same instances"
+        );
+        assert!(
+            after
+                .iter()
+                .all(|(id, _)| before.iter().all(|(held, _)| held != id)),
+            "{component:?}: not one row is silently equal to the one it replaced"
+        );
+        assert_eq!(status_text(&session), STATUS_TEXT, "{component:?}");
+
+        // And the session now anchors to the source that is actually there: a
+        // later scan that loses the same file keeps the *new* identities.
+        let outcome = view
+            .apply(
+                &session,
+                STATUS_TEXT,
+                &identity_lost(&[4101, 4102, 4103], component),
+            )
+            .unwrap();
+        assert_eq!(
+            (outcome.inserted, outcome.deleted, outcome.retained),
+            (0, 0, 0),
+            "{component:?}: the remembered identity is the one last observed"
+        );
+        assert_eq!(published(&session), after, "{component:?}");
+    }
 }

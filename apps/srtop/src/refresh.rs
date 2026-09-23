@@ -539,7 +539,7 @@ mod tests {
     use super::*;
     use crate::source::{
         Completeness, EnumerationIssue, IssueScope, MissingReason, Observed, ProcessKey,
-        ScriptedFakeSource,
+        ScriptedFakeSource, SkippedRecords,
     };
     use std::collections::BTreeSet;
 
@@ -630,7 +630,7 @@ mod tests {
         let mut failed = snapshot.clone();
         failed.records.clear();
         failed.completeness = Completeness::from_scan(
-            0,
+            SkippedRecords::unenumerable(),
             vec![EnumerationIssue {
                 scope: IssueScope::Root,
                 reason: MissingReason::Denied,

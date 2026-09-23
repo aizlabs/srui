@@ -12,7 +12,7 @@ use srui_process_explorer::procfs::{
 use srui_process_explorer::published_status;
 use srui_process_explorer::source::{
     Completeness, CreationToken, DisplayName, IssueScope, MissingReason, Observed, ProcessSource,
-    SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
+    Retention, SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
 };
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -306,6 +306,52 @@ fn a_wholly_unreadable_root_keeps_issue_memory_bounded_while_counting_every_reco
         MAX_RECORDED_ISSUES,
         "retained explanations stay at the bound"
     );
+    // What the scan skipped is its own knowledge, not a reading of the
+    // explanations it kept: every one of those records is still named, so an
+    // absence this scan did not name is still a real exit.
+    let skipped = snapshot
+        .completeness
+        .skipped_records()
+        .expect("a degraded scan reports what it skipped");
+    assert_eq!(skipped.pids().len(), denied);
+    assert!(skipped.is_enumerable());
+    let Retention::Skipped(uncertain) = snapshot.retention() else {
+        panic!("a scan that named every record it skipped can enumerate them")
+    };
+    assert_eq!(uncertain.len(), denied);
+    assert!(
+        !uncertain.contains(&(denied as u32 + 1)),
+        "and no other PID"
+    );
+}
+
+#[test]
+fn a_scan_that_skips_more_records_than_its_bound_can_name_says_so_instead_of_growing() {
+    let fixture = ProcFixture::new();
+    fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
+    let bound = 2;
+    for pid in 1..=10u32 {
+        fixture.denied(pid);
+    }
+    let snapshot = fixture.source().with_record_limit(bound).snapshot();
+    assert!(snapshot.records.is_empty());
+    assert_eq!(
+        snapshot.completeness.skipped(),
+        10,
+        "the count is the truth"
+    );
+    let skipped = snapshot
+        .completeness
+        .skipped_records()
+        .expect("a degraded scan reports what it skipped");
+    assert_eq!(
+        skipped.pids().len(),
+        bound,
+        "the skipped identities never exceed the scan's own record bound"
+    );
+    assert!(!skipped.is_enumerable());
+    // Unable to name everything it skipped, the scan keeps every absent row.
+    assert_eq!(snapshot.retention(), Retention::Unenumerable);
 }
 
 #[test]

@@ -7,10 +7,16 @@
 //! on any platform. Only [`ProcFsSource::live`] reads the real `/proc`, which
 //! exists on Linux; on other systems it honestly reports an incomplete scan
 //! instead of an authoritative empty result.
+//!
+//! One scan's memory is bounded by [`MAX_RECORDS`] published records, by
+//! [`crate::source::MAX_RECORDED_ISSUES`] retained explanations, and by the same
+//! record bound for the skipped PIDs it names (PX-003, PX-004). A host with more
+//! unreadable records than it can name reports itself unenumerable rather than
+//! growing a set per scan.
 use crate::source::{
     record_issue, BootId, Completeness, CreationToken, DisplayName, EnumerationIssue, HostId,
     IssueScope, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
-    ProcessSnapshot, ProcessSource, SnapshotTime, SourceId,
+    ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime, SourceId,
 };
 use std::fmt::Write as _;
 use std::fs::File;
@@ -305,10 +311,14 @@ impl ProcessSource for ProcFsSource {
                 records: Vec::new(),
                 vanished: 0,
                 capped: 0,
-                completeness: Completeness::from_scan(0, issues),
+                // Nothing was enumerated at all: no absence can be attributed.
+                completeness: Completeness::from_scan(SkippedRecords::unenumerable(), issues),
             };
         }
-        let mut skipped = 0usize;
+        // The skipped records are named as they are skipped, bounded by the same
+        // record bound that limits how many records this scan reads, so the
+        // uncertain set never depends on how many explanations were retained.
+        let mut skipped = SkippedRecords::with_limit(self.record_limit);
         let mut vanished = 0usize;
         let mut capped = 0usize;
         let mount = self.mount_kind();
@@ -354,7 +364,9 @@ impl ProcessSource for ProcFsSource {
             Ok(entries) => entries,
             Err(error) => {
                 // The whole scan failed: an empty list here is explicitly not
-                // an authoritative "no processes" answer.
+                // an authoritative "no processes" answer, and the records it
+                // hides were never read, so none of them can be named.
+                skipped.mark_unenumerable();
                 record_issue(&mut issues, || EnumerationIssue {
                     scope: IssueScope::Root,
                     reason: reason_for(&error),
@@ -374,7 +386,9 @@ impl ProcessSource for ProcFsSource {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    skipped += 1;
+                    // The entry itself could not be examined, so this record has
+                    // no PID to name and its absence cannot be attributed.
+                    skipped.unnamed();
                     record_issue(&mut issues, || EnumerationIssue {
                         scope: IssueScope::Entry,
                         reason: reason_for(&error),
@@ -415,7 +429,7 @@ impl ProcessSource for ProcFsSource {
                 // One unreadable record is skipped with a reason; it never fails
                 // the snapshot (PX-003).
                 Err(error) => {
-                    skipped += 1;
+                    skipped.record(pid);
                     record_issue(&mut issues, || EnumerationIssue {
                         scope: IssueScope::Process(pid),
                         reason: reason_for(&error),
@@ -424,7 +438,7 @@ impl ProcessSource for ProcFsSource {
                 }
                 Ok(bytes) => match parse_stat(pid, &bytes) {
                     None => {
-                        skipped += 1;
+                        skipped.record(pid);
                         record_issue(&mut issues, || EnumerationIssue {
                             scope: IssueScope::Process(pid),
                             reason: MissingReason::Unavailable,

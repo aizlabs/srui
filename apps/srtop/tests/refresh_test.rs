@@ -1,6 +1,7 @@
 //! PX-004 acceptance: a polled collection that publishes only what changed,
 //! keeps unchanged rows, and never lets a failed scan empty the table
 //! (§§8, 12.1, 13, 23).
+use srui_process_explorer::procfs::MAX_RECORDS;
 use srui_process_explorer::refresh::refresh_status;
 use srui_process_explorer::source::*;
 use srui_process_explorer::{start_from_source, COLUMN, HEADING, MODEL, STATUS, SURFACE, TABLE};
@@ -317,8 +318,10 @@ fn a_partial_scan_adds_what_it_saw_and_deletes_nothing() {
             }
             // The middle record could not be read this time.
             snapshot.records.remove(self.keep);
+            let mut skipped = SkippedRecords::with_limit(MAX_RECORDS);
+            skipped.record(4102);
             snapshot.completeness = Completeness::from_scan(
-                1,
+                skipped,
                 vec![EnumerationIssue {
                     scope: IssueScope::Process(4102),
                     reason: MissingReason::Denied,

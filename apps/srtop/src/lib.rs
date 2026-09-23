@@ -61,6 +61,7 @@ pub fn published_status(source_status: &str, snapshot: &source::ProcessSnapshot)
     let source::Completeness::Incomplete { skipped, issues } = &snapshot.completeness else {
         return source_status.to_string();
     };
+    let skipped = skipped.count();
     let mut clauses = vec!["incomplete scan".to_string()];
     let root = issues
         .iter()
@@ -73,7 +74,7 @@ pub fn published_status(source_status: &str, snapshot: &source::ProcessSnapshot)
     } else {
         let listed = snapshot.records.len();
         clauses.push(format!("{listed} {} listed", plural(listed)));
-        if *skipped > 0 {
+        if skipped > 0 {
             clauses.push(format!("{skipped} unreadable"));
         }
     }
@@ -176,7 +177,25 @@ pub fn update_title(session: &Session, title: &str) -> Result<(), SessionError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use source::{Completeness, EnumerationIssue, IssueScope, MissingReason, ProcessSource};
+    use source::{
+        Completeness, EnumerationIssue, IssueScope, MissingReason, ProcessSource, SkippedRecords,
+    };
+
+    /// The completeness of a scan that could not read `pids`, naming each one,
+    /// exactly as a real scan records them.
+    fn denied(pids: &[u32]) -> Completeness {
+        let mut skipped = SkippedRecords::with_limit(pids.len());
+        let mut issues = Vec::new();
+        for pid in pids {
+            skipped.record(*pid);
+            issues.push(EnumerationIssue {
+                scope: IssueScope::Process(*pid),
+                reason: MissingReason::Denied,
+                detail: "denied".into(),
+            });
+        }
+        Completeness::from_scan(skipped, issues)
+    }
 
     fn empty_snapshot(completeness: Completeness) -> source::ProcessSnapshot {
         let mut snapshot = source::FakeProcessSource.snapshot();
@@ -197,14 +216,7 @@ mod tests {
             published_status(label, &source::FakeProcessSource.snapshot()),
             label
         );
-        let degraded = Completeness::from_scan(
-            4,
-            vec![EnumerationIssue {
-                scope: IssueScope::Process(7),
-                reason: MissingReason::Denied,
-                detail: "denied".into(),
-            }],
-        );
+        let degraded = denied(&[7, 8, 9, 10]);
         // An empty degraded scan never reads like an authoritative empty result.
         let empty_but_degraded = published_status(label, &empty_snapshot(degraded.clone()));
         assert_eq!(
@@ -221,7 +233,7 @@ mod tests {
             published_status(label, &partial),
             format!("{label} · incomplete scan · 3 processes listed · 4 unreadable")
         );
-        let mut single = empty_snapshot(Completeness::from_scan(1, vec![]));
+        let mut single = empty_snapshot(denied(&[7]));
         single.records = source::FakeProcessSource.snapshot().records;
         single.records.truncate(1);
         assert_eq!(
@@ -237,7 +249,7 @@ mod tests {
         // `skipped` is legitimately 0 and "0 unreadable" would read as "every
         // process was readable" beside an empty table.
         let unlistable = empty_snapshot(Completeness::from_scan(
-            0,
+            SkippedRecords::unenumerable(),
             vec![EnumerationIssue {
                 scope: IssueScope::Root,
                 reason: MissingReason::Unavailable,
@@ -251,7 +263,7 @@ mod tests {
         );
         assert!(!published.contains("unreadable"), "{published}");
         let denied_root = empty_snapshot(Completeness::from_scan(
-            0,
+            SkippedRecords::unenumerable(),
             vec![EnumerationIssue {
                 scope: IssueScope::Root,
                 reason: MissingReason::Denied,
@@ -266,7 +278,7 @@ mod tests {
         // and nothing was skipped, so no unreadable count is published either.
         let mut identity_only = source::FakeProcessSource.snapshot();
         identity_only.completeness = Completeness::from_scan(
-            0,
+            SkippedRecords::none(),
             vec![EnumerationIssue {
                 scope: IssueScope::BootIdentity,
                 reason: MissingReason::Unavailable,

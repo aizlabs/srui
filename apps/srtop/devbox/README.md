@@ -8,6 +8,11 @@ position survive a refresh, does a row appear when a process really starts.
 
 It is not part of any test suite and nothing in CI runs it.
 
+The box is only useful against a revision whose `srtop` polls its source, so this
+branch is stacked on PX-004 and `SRTOP_DEVBOX_REV` defaults to `HEAD`. Exporting
+an older revision produces a server that takes one snapshot and never refreshes:
+`up` refuses to pretend otherwise and reports srtop's own argument error.
+
 ## Turn it on
 
 ```sh
@@ -57,8 +62,8 @@ rm -rf "${SRTOP_DEVBOX_STATE:-$HOME/.codex/srtop-devbox}"
 | `SRTOP_DEVBOX_NAME` | `srtop-devbox` | container name |
 | `SRTOP_DEVBOX_IMAGE` | `srtop-devbox:latest` | image tag |
 | `SRTOP_DEVBOX_PORT` | `2222` | host port forwarded to the container's sshd |
-| `SRTOP_DEVBOX_REV` | `HEAD` | revision exported into the build context |
-| `SRTOP_ARGS` | `--live-source --refresh-interval-ms 1000` | srtop flags; use `--live-source` alone before PX-004 |
+| `SRTOP_DEVBOX_REV` | `HEAD` | revision exported into the build context; must be PX-004 or later |
+| `SRTOP_ARGS` | `--live-source --refresh-interval-ms 1000` | srtop flags |
 
 ## How it is wired
 

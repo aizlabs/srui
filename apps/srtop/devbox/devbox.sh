@@ -19,7 +19,9 @@ NAME=${SRTOP_DEVBOX_NAME:-srtop-devbox}
 IMAGE=${SRTOP_DEVBOX_IMAGE:-srtop-devbox:latest}
 PORT=${SRTOP_DEVBOX_PORT:-2222}
 REV=${SRTOP_DEVBOX_REV:-HEAD}
-# Pre-PX-004 revisions have no --refresh-interval-ms: use SRTOP_ARGS=--live-source.
+# The harness needs a revision whose srtop polls: PX-004 or later. An older
+# revision has no refresh loop at all, so a spawned process would never appear;
+# `up` fails with srtop's own message rather than serving a frozen list.
 SRTOP_ARGS=${SRTOP_ARGS:---live-source --refresh-interval-ms 1000}
 
 KEY="$STATE_DIR/id_ed25519"
@@ -60,7 +62,9 @@ cmd_up() {
     sleep 0.2
   done
   docker logs "$NAME" 2>&1 | grep -q 'Server listening on' \
-    || { docker logs "$NAME" >&2; die "container never started sshd"; }
+    || { docker logs "$NAME" >&2
+         die "container never started sshd; if srtop rejected its arguments above, \
+the exported revision ($REV) predates the flags in SRTOP_ARGS"; }
 
   # Fresh host keys every run, so the known_hosts file is rewritten every run.
   ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 2>/dev/null > "$KNOWN_HOSTS"

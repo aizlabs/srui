@@ -4,12 +4,14 @@
 //! This module reads no process state: adapters live in their own modules and the
 //! fake adapter below uses constants only, with no OS enumeration or clock read.
 //!
-//! What a degraded scan carries is bounded twice over, and the two bounds are
-//! independent: [`MAX_RECORDED_ISSUES`] bounds the human-readable explanations,
-//! and [`SkippedRecords`] bounds the skipped identities by the scan's own record
-//! bound. Neither is derived from the other — a scan that dropped explanations
-//! still names what it skipped — and only the skipped *count* is unbounded,
-//! because it is a number.
+//! What a degraded scan carries is bounded several times over, and the bounds
+//! are independent: [`MAX_RECORDED_ISSUES`] bounds the human-readable
+//! explanations, while two [`PidLedger`]s bound the identities the scan leaves
+//! uncertain — [`SkippedRecords`] for the records it read and could not use,
+//! [`CappedRecords`] for the entries it listed but never read. No bound is
+//! derived from another: a scan that dropped explanations still names both what
+//! it skipped and what it never reached, and only the *counts* are unbounded,
+//! because they are numbers.
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
@@ -283,32 +285,45 @@ pub fn record_issue(
     }
 }
 
-/// The records one scan could not read: how many there were, and — for each one
-/// whose PID the scan observed — which.
+/// A bounded ledger of the records one scan listed and did not publish: how
+/// many there were, and — for each one whose PID the scan observed — which.
 ///
-/// This set is what scopes retention (PX-004), and it is deliberately *not*
-/// derived from the bounded [`EnumerationIssue`] list. A skipped record's PID is
-/// known even when [`MAX_RECORDED_ISSUES`] threw its explanation away, so
-/// reading the uncertain identities out of the capped explanations would make
-/// every scan of a host with more than 32 unreadable records — routine on a
-/// shared machine — keep every absent row again, which is exactly the unbounded
-/// growth scoped retention exists to end.
+/// A scan keeps two of them, and their union is what scopes retention (PX-004):
+/// [`SkippedRecords`] for the records it read and could not use, and
+/// [`CappedRecords`] for the entries it listed but never read. Neither is
+/// derived from the bounded [`EnumerationIssue`] list. A record's PID is known
+/// even when [`MAX_RECORDED_ISSUES`] threw its explanation away, so reading the
+/// uncertain identities out of the capped explanations would make every scan of
+/// a host with more than 32 unreadable records — routine on a shared machine —
+/// keep every absent row again, which is exactly the unbounded growth scoped
+/// retention exists to end.
 ///
-/// Memory stays bounded by the scan's own record bound rather than by the host:
-/// the set holds at most `limit` PIDs — the same bound that limits how many
-/// records the scan reads — and a scan that skipped more records than it can
-/// name reports itself unenumerable instead of growing.
+/// Memory stays bounded by the scan rather than by the host: the set holds at
+/// most `limit` PIDs, and a ledger asked to name more than that reports itself
+/// unenumerable instead of growing. What the collector passes as `limit`, and
+/// why the published collection is bounded by it, is stated at
+/// [`crate::procfs::MAX_UNCERTAIN_PIDS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkippedRecords {
+pub struct PidLedger {
     limit: usize,
     named: BTreeSet<u32>,
     count: usize,
     enumerable: bool,
 }
 
-impl SkippedRecords {
-    /// A scan that has skipped nothing yet and may name up to `limit` PIDs,
-    /// which is the collector's own record bound.
+/// The records one scan read and could not use: denied, unreadable, or carrying
+/// no usable identity. Each one exists and was not published.
+pub type SkippedRecords = PidLedger;
+
+/// The entries one scan listed but never read, because it had already published
+/// as many records as its own bound allows. The listing named them — a `/proc`
+/// entry *is* a PID — so a capped record is a known identity whose details went
+/// unread, never an unknowable one.
+pub type CappedRecords = PidLedger;
+
+impl PidLedger {
+    /// An empty ledger that may name up to `limit` PIDs; the collector chooses
+    /// `limit` (see [`crate::procfs::MAX_UNCERTAIN_PIDS`]).
     pub fn with_limit(limit: usize) -> Self {
         Self {
             limit,
@@ -318,7 +333,7 @@ impl SkippedRecords {
         }
     }
 
-    /// A scan that skipped no record at all and accounted for everything it saw.
+    /// An empty ledger for a scan that accounted for everything it saw.
     pub fn none() -> Self {
         Self::with_limit(0)
     }
@@ -331,14 +346,14 @@ impl SkippedRecords {
         skipped
     }
 
-    /// One record that exists, could not be read, and whose PID this scan knows.
+    /// One record that exists, was not published, and whose PID this scan knows.
     pub fn record(&mut self, pid: u32) {
         self.count += 1;
         if self.named.len() < self.limit || self.named.contains(&pid) {
             self.named.insert(pid);
         } else {
-            // Naming this one would grow the set past the scan's record bound,
-            // so the scan reports that it cannot name everything it skipped.
+            // Naming this one would grow the set past this ledger's bound, so
+            // the scan reports that it cannot name everything it left out.
             self.enumerable = false;
         }
     }
@@ -355,19 +370,19 @@ impl SkippedRecords {
         self.enumerable = false;
     }
 
-    /// How many records existed but could not be read. Never bounded: a degraded
-    /// scan always reports how much it could not see.
+    /// How many records this ledger accounts for. Never bounded: a degraded scan
+    /// always reports how much it could not publish.
     pub fn count(&self) -> usize {
         self.count
     }
 
-    /// The PIDs of the skipped records, at most the scan's record bound of them.
+    /// The PIDs this ledger named, at most `limit` of them.
     pub fn pids(&self) -> &BTreeSet<u32> {
         &self.named
     }
 
-    /// Whether every absence this scan leaves is attributable: no record was
-    /// skipped without a PID, nothing overflowed the bound, and the record list
+    /// Whether every absence this ledger leaves is attributable: no record was
+    /// left out without a PID, nothing overflowed the bound, and the record list
     /// itself was read.
     pub fn is_enumerable(&self) -> bool {
         self.enumerable
@@ -437,16 +452,19 @@ impl Completeness {
 /// did not account for really ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Retention {
-    /// This scan enumerated the records it skipped, so only rows whose PID it
+    /// This scan enumerated the records it listed and did not publish — those it
+    /// could not read, and those it never reached — so only rows whose PID it
     /// named are kept; every other absent row is deleted. An empty set is a scan
     /// that accounted for everything, including a complete one.
     Skipped(BTreeSet<u32>),
     /// The uncertain identities cannot be enumerated — the root could not be
-    /// listed or entered, or the scan stopped at its own record bound without
-    /// reading the remaining PIDs — so every absent row is kept. This is about
-    /// records that were never read, never about explanations that were dropped:
-    /// a skipped record's PID is known whether or not its [`EnumerationIssue`]
-    /// survived [`MAX_RECORDED_ISSUES`].
+    /// listed or anchored, an entry could not be examined, or a ledger was asked
+    /// to name more PIDs than it may hold — so every absent row is kept. This is
+    /// about identities that were never observed, never about explanations that
+    /// were dropped: an unpublished record's PID is known whether or not its
+    /// [`EnumerationIssue`] survived [`MAX_RECORDED_ISSUES`], and reaching the
+    /// collector's record bound is not by itself one of these cases, because the
+    /// listing names every entry beyond it.
     Unenumerable,
 }
 
@@ -454,8 +472,8 @@ impl Retention {
     /// Whether a published row this scan did not confirm must be kept rather than
     /// deleted.
     ///
-    /// A skipped record is matched by the PID its issue names, which is the only
-    /// identity component an unread record has. A row whose PID was never
+    /// An unpublished record is matched by the PID the listing names, which is
+    /// the only identity component it has. A row whose PID was never
     /// observed can therefore never match, and a row carrying a PID from an
     /// earlier boot or another namespace may match one that names the same
     /// number: matching errs towards keeping a row, never towards deleting one
@@ -477,8 +495,9 @@ impl Retention {
     }
 
     /// The PIDs whose absence this scan left uncertain, or `None` when it could
-    /// not enumerate them. Bounded by the scan's own record bound when it is
-    /// `Some` (see [`SkippedRecords`]), never by the host.
+    /// not enumerate them. Bounded by the scan's own ledgers when it is `Some`
+    /// (see [`PidLedger`] and [`crate::procfs::MAX_UNCERTAIN_PIDS`]), never by
+    /// the host.
     pub fn uncertain_pids(&self) -> Option<&BTreeSet<u32>> {
         match self {
             Self::Skipped(pids) => Some(pids),
@@ -506,7 +525,13 @@ pub struct ProcessSnapshot {
     /// so counting them as `skipped` would publish a read failure or permission
     /// problem that never happened. The list is still not authoritative, which
     /// [`Completeness`] reports through the recorded [`IssueScope::Limit`].
-    pub capped: usize,
+    ///
+    /// Reading a record's detail is what the bound stops; *listing* it is not,
+    /// and a listing entry is a PID. So these records are named, one `u32` each,
+    /// and their absences stay attributable (see [`Self::retention`]) instead of
+    /// making every scan of a host larger than the record bound keep every
+    /// absent row forever.
+    pub capped: CappedRecords,
     pub completeness: Completeness,
 }
 
@@ -521,14 +546,24 @@ impl ProcessSnapshot {
     /// shared host — would accumulate a stale row per exit forever, until the
     /// model's own item bound refuses the next refresh.
     ///
+    /// Reaching the collector's own record bound is *not* one of those cases.
+    /// The bound stops the scan from reading each further record's detail; it
+    /// does not stop the root listing that produced the entry, and that listing
+    /// is exactly a PID. A capped record is therefore "identity known, detail
+    /// unread" — the scoped case — and is named in [`Self::capped`] beside the
+    /// records that were read and could not be used. Without that, every scan of
+    /// a host with more readable PIDs than the record bound would return global
+    /// retention on every tick, and ordinary churn could never delete anything:
+    /// the same unbounded growth as a permanently denied record, at a higher
+    /// threshold.
+    ///
     /// Retention stays whole only where the uncertainty really is whole — where
-    /// the records were never read, so their PIDs are genuinely unknown:
+    /// the identities themselves were never observed:
     ///
     /// * the root could not be listed or anchored, or one of its entries could
-    ///   not be examined ([`SkippedRecords::is_enumerable`] is then false);
-    /// * the scan stopped at its own record bound ([`Self::capped`], recorded as
-    ///   [`IssueScope::Limit`]), so the entries beyond it were never read;
-    /// * more records were skipped than that same bound lets the scan name.
+    ///   not be examined ([`PidLedger::is_enumerable`] is then false);
+    /// * more records were left unpublished than the ledger naming them may hold
+    ///   ([`crate::procfs::MAX_UNCERTAIN_PIDS`]), for either ledger.
     ///
     /// The bounded [`EnumerationIssue`] list decides none of this. It explains a
     /// degraded scan to a person, and a host with more than
@@ -540,13 +575,17 @@ impl ProcessSnapshot {
     /// identity file the scan could not read degrades every record equally and
     /// hides none, so it skips nothing and scopes nothing.
     pub fn retention(&self) -> Retention {
-        let Completeness::Incomplete { skipped, .. } = &self.completeness else {
-            return Retention::Skipped(BTreeSet::new());
-        };
-        if self.capped > 0 || !skipped.is_enumerable() {
+        if !self.capped.is_enumerable() {
             return Retention::Unenumerable;
         }
-        Retention::Skipped(skipped.pids().clone())
+        let mut uncertain = self.capped.pids().clone();
+        if let Completeness::Incomplete { skipped, .. } = &self.completeness {
+            if !skipped.is_enumerable() {
+                return Retention::Unenumerable;
+            }
+            uncertain.extend(skipped.pids().iter().copied());
+        }
+        Retention::Skipped(uncertain)
     }
 }
 
@@ -604,7 +643,7 @@ impl ProcessSource for FakeProcessSource {
                 },
             ],
             vanished: 0,
-            capped: 0,
+            capped: CappedRecords::none(),
             completeness: Completeness::Complete,
         }
     }
@@ -725,7 +764,7 @@ impl ProcessSource for ScriptedFakeSource {
             ),
             records,
             vanished: 0,
-            capped: 0,
+            capped: CappedRecords::none(),
             completeness,
         }
     }
@@ -1065,9 +1104,9 @@ mod tests {
         assert!(repeated.is_enumerable());
     }
 
-    /// Only records that were never read make retention global: a whole-scan
-    /// failure, an entry that could not be examined, or the collector's own
-    /// record bound.
+    /// Only identities that were never observed make retention global: a
+    /// whole-scan failure, an entry that could not be examined, or a ledger
+    /// asked to name more than it may hold.
     #[test]
     fn only_unread_records_make_retention_global() {
         let mut snapshot = FakeProcessSource.snapshot();
@@ -1089,9 +1128,62 @@ mod tests {
             snapshot.retention(),
             Retention::Skipped(BTreeSet::from([4101]))
         );
-        // The same scan that stopped at its own record bound cannot attribute
-        // anything, because the entries beyond it were never read.
-        snapshot.capped = 1;
+        // The same scan stopping at its own record bound attributes just as
+        // much: the listing named every entry beyond that bound, so those PIDs
+        // join the uncertain set instead of replacing it with "everything".
+        let mut capped = CappedRecords::with_limit(16);
+        capped.record(4102);
+        snapshot.capped = capped;
+        assert_eq!(
+            snapshot.retention(),
+            Retention::Skipped(BTreeSet::from([4101, 4102]))
+        );
+
+        // Only a ledger that cannot name what it left out is unknowable.
+        let mut overflowed = CappedRecords::with_limit(1);
+        overflowed.record(4102);
+        overflowed.record(4103);
+        assert!(!overflowed.is_enumerable());
+        snapshot.capped = overflowed;
         assert_eq!(snapshot.retention(), Retention::Unenumerable);
+    }
+
+    /// A scan that stopped at its own record bound still names the identities it
+    /// left uncertain: the bound stopped it from reading each record's detail,
+    /// not from listing it, and a listing entry is a PID.
+    #[test]
+    fn a_capped_scan_names_the_entries_it_listed_and_never_read() {
+        let mut capped = CappedRecords::with_limit(crate::procfs::MAX_UNCERTAIN_PIDS);
+        for pid in 0..1_000u32 {
+            capped.record(9000 + pid);
+        }
+        assert!(capped.is_enumerable());
+        assert_eq!(capped.count(), 1_000);
+        assert_eq!(capped.pids().len(), 1_000);
+
+        let mut snapshot = FakeProcessSource.snapshot();
+        snapshot.capped = capped;
+        snapshot.completeness = Completeness::from_scan(
+            SkippedRecords::none(),
+            vec![EnumerationIssue {
+                scope: IssueScope::Limit,
+                reason: MissingReason::Unavailable,
+                detail: "record limit 65536 reached".into(),
+            }],
+        );
+        assert!(
+            !snapshot.retention().is_global(),
+            "a host larger than the record bound is not an unknowable host"
+        );
+        let Retention::Skipped(uncertain) = snapshot.retention() else {
+            panic!("a capped scan enumerates the entries it never read")
+        };
+        assert_eq!(uncertain.len(), 1_000);
+        assert!(uncertain.contains(&9000));
+        assert!(uncertain.contains(&9999));
+        assert!(
+            !uncertain.contains(&8999),
+            "and no PID the listing did not name"
+        );
     }
 }

@@ -411,7 +411,7 @@ fn a_refresh_beyond_the_transaction_bound_is_published_whole() {
                 sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
                 records,
                 vanished: 0,
-                capped: 0,
+                capped: CappedRecords::none(),
                 completeness: Completeness::Complete,
             }
         }

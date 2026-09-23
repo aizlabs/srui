@@ -13,7 +13,15 @@
 //! scan, reinstating that same growth at a higher threshold. The skipped PIDs
 //! are now the scan's own knowledge, bounded by its record bound, and the issue
 //! list only explains.
-use srui_process_explorer::procfs::MAX_RECORDS;
+//!
+//! Round 3's defect: a scan that reached its own record bound was treated as
+//! unable to name anything, so a host with more readable PIDs than `MAX_RECORDS`
+//! returned global retention on *every* tick and the collection grew from the
+//! record bound until the model's item limit refused the next refresh. Reading
+//! each further record's detail is what the bound stops; listing it is not, and
+//! a listing entry is a PID, so those entries are named too and only a ledger
+//! asked to hold more than `MAX_UNCERTAIN_PIDS` identities is unenumerable.
+use srui_process_explorer::procfs::{MAX_RECORDS, MAX_UNCERTAIN_PIDS};
 use srui_process_explorer::refresh::ProcessView;
 use srui_process_explorer::source::*;
 use srui_process_explorer::{start_from_source, MODEL, STATUS};
@@ -51,9 +59,33 @@ fn scan(pids: &[u32]) -> ProcessSnapshot {
         sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
         records: pids.iter().copied().map(record).collect(),
         vanished: 0,
-        capped: 0,
+        capped: CappedRecords::none(),
         completeness: Completeness::Complete,
     }
+}
+
+/// The ledger a scan builds for the entries it listed past its record bound:
+/// every one of them named, up to `limit` of them, exactly as the collector
+/// records them while it walks the rest of the listing.
+fn capped_beyond(pids: &[u32], limit: usize) -> CappedRecords {
+    let mut capped = CappedRecords::with_limit(limit);
+    for pid in pids {
+        capped.record(*pid);
+    }
+    capped
+}
+
+/// The completeness of a scan that stopped at its own record bound: one
+/// explanation for the bound, and not one unreadable record.
+fn at_the_record_bound(limit: usize) -> Completeness {
+    Completeness::from_scan(
+        SkippedRecords::none(),
+        vec![EnumerationIssue {
+            scope: IssueScope::Limit,
+            reason: MissingReason::Unavailable,
+            detail: format!("record limit {limit} reached"),
+        }],
+    )
 }
 
 /// The completeness a real procfs scan records when exactly these records could
@@ -220,19 +252,14 @@ fn a_scan_that_cannot_enumerate_its_uncertainty_still_retains_every_row() {
         );
         tick
     };
-    let capped = || {
+    let capped_past_the_ledger_bound = || {
         let mut tick = scan(&[4101]);
-        // Entries beyond the collector's own bound were never read: their PIDs
-        // are unknown, so nothing absent can be attributed.
-        tick.capped = 2;
-        tick.completeness = Completeness::from_scan(
-            SkippedRecords::none(),
-            vec![EnumerationIssue {
-                scope: IssueScope::Limit,
-                reason: MissingReason::Unavailable,
-                detail: "record limit 1 reached".into(),
-            }],
-        );
+        // More entries were listed past the record bound than the ledger naming
+        // them may hold, so the scan says so instead of growing a set per scan —
+        // and none of the PIDs it did name is 4102 or 4103.
+        let beyond: Vec<u32> = (9000..9010).collect();
+        tick.capped = capped_beyond(&beyond, 2);
+        tick.completeness = at_the_record_bound(1);
         tick
     };
     let past_the_record_bound = || {
@@ -248,7 +275,10 @@ fn a_scan_that_cannot_enumerate_its_uncertainty_still_retains_every_row() {
     for (name, build) in [
         ("root", &unlistable_root as &dyn Fn() -> ProcessSnapshot),
         ("entry", &unreadable_entry),
-        ("capped", &capped),
+        (
+            "capped past the ledger bound",
+            &capped_past_the_ledger_bound,
+        ),
         ("past the record bound", &past_the_record_bound),
     ] {
         let tick = build();
@@ -297,6 +327,102 @@ fn a_scan_that_cannot_enumerate_its_uncertainty_still_retains_every_row() {
     let outcome = view.apply(&session, STATUS_TEXT, &accounted).unwrap();
     assert_eq!((outcome.deleted, outcome.retained), (2, 0));
     assert_eq!(pids(&published(&session)), vec![4101]);
+
+    // Nor is any of them reachable merely by being capped. Under the collector's
+    // real ledger bound the scan names every entry it listed past its record
+    // bound — a `/proc` entry is a PID, whatever the bound stopped it reading —
+    // and 4102 and 4103 are not among them, so their rows go.
+    let mut capped = scan(&[4101]);
+    let beyond: Vec<u32> = (9000..9000 + MAX_RECORDED_ISSUES as u32 + 8).collect();
+    capped.capped = capped_beyond(&beyond, MAX_UNCERTAIN_PIDS);
+    capped.completeness = at_the_record_bound(1);
+    assert_eq!(
+        capped.completeness.issues().len(),
+        1,
+        "the record bound is explained once, not per entry"
+    );
+    assert!(
+        !capped.retention().is_global(),
+        "a host larger than the record bound is not an unknowable host"
+    );
+    assert_eq!(
+        capped.retention().uncertain_pids().map(BTreeSet::len),
+        Some(beyond.len()),
+        "the uncertain set is every entry the listing named beyond the bound"
+    );
+    let (session, mut view) = started(&[4101, 4102, 4103]);
+    let outcome = view.apply(&session, STATUS_TEXT, &capped).unwrap();
+    assert_eq!((outcome.deleted, outcome.retained), (2, 0));
+    assert_eq!(pids(&published(&session)), vec![4101]);
+}
+
+/// The round-3 regression, over a long run. Every tick of a host with more
+/// readable PIDs than one scan publishes is capped, so this is the steady state,
+/// not an incident: the published collection must stay the size of the host's
+/// own listing — the records this scan confirmed plus one row per entry it named
+/// beyond its bound — however long the churn runs.
+#[test]
+fn churn_on_a_scan_capped_on_every_tick_holds_the_published_rows_at_the_listing() {
+    // This collector publishes two records per scan and lists two more it never
+    // reads, so the published collection is bounded at four rows: two confirmed,
+    // two named beyond the bound.
+    const RECORD_BOUND: usize = 2;
+    let beyond = [4201u32, 4202];
+    const BOUND: usize = RECORD_BOUND + 2;
+
+    let (session, mut view) = started(&[4101, 4201, 4202, 5000]);
+    let capped_rows: Vec<(ItemId, u64)> = published(&session)[1..=beyond.len()].to_vec();
+    assert_eq!(pids(&capped_rows), vec![4201, 4202]);
+
+    for tick in 1..=250u32 {
+        // Every tick: the same stable process, the same two entries past the
+        // record bound, and one short-lived process replacing the previous one.
+        let ephemeral = 5000 + tick;
+        let mut scanned = scan(&[4101, ephemeral]);
+        assert_eq!(scanned.records.len(), RECORD_BOUND);
+        scanned.vanished = 1;
+        scanned.capped = capped_beyond(&beyond, MAX_UNCERTAIN_PIDS);
+        scanned.completeness = at_the_record_bound(RECORD_BOUND);
+        view.apply(&session, STATUS_TEXT, &scanned).unwrap();
+
+        let rows = published(&session);
+        assert_eq!(
+            rows.len(),
+            BOUND,
+            "tick {tick}: two confirmed rows and two rows named beyond the bound"
+        );
+        assert!(
+            !scanned.retention().is_global(),
+            "tick {tick}: a capped scan still accounts for every other absence"
+        );
+        assert_eq!(view.row_count(), rows.len());
+        assert_eq!(
+            pids(&rows).into_iter().collect::<BTreeSet<u64>>(),
+            BTreeSet::from([4101, 4201, 4202, u64::from(ephemeral)]),
+            "tick {tick}: every process that ended has left the collection"
+        );
+        for row in &capped_rows {
+            assert!(
+                rows.contains(row),
+                "tick {tick}: each entry past the bound keeps its row and its identity"
+            );
+        }
+    }
+    // The status says what happened in counts and fixed wording: two records
+    // listed, two entries never read, two rows carried over. Nothing here claims
+    // a read failure, and nothing here is a process's own text.
+    assert_eq!(
+        status_text(&session),
+        format!(
+            "{STATUS_TEXT} · incomplete scan · 2 processes listed · 2 beyond the record limit · \
+             2 rows retained from an earlier scan"
+        )
+    );
+    assert!(
+        !status_text(&session).contains("unreadable"),
+        "{}",
+        status_text(&session)
+    );
 }
 
 /// The round-2 regression, directly. A scan that skips more records than the

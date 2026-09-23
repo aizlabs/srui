@@ -616,8 +616,11 @@ fn oversized_records_are_bounded_rather_than_read_without_limit() {
 #[cfg(target_os = "linux")]
 mod live {
     use super::*;
-    use srui_process_explorer::{initialize_from_source, published_status, MODEL};
-    use srui_sdk::Value;
+    use srui_process_explorer::refresh::DEFAULT_REFRESH_INTERVAL;
+    use srui_process_explorer::{
+        initialize_from_source, published_status, start_from_source, MODEL,
+    };
+    use srui_sdk::{ItemId, Value};
     use srui_sessiond::Session;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
@@ -790,5 +793,90 @@ mod live {
                 );
             }
         });
+    }
+
+    /// PX-004 acceptance on a real host: a process this test creates, and then
+    /// ends, reaches the published collection within two sampling intervals —
+    /// through the refresh path, not a fresh publication.
+    #[test]
+    fn a_test_owned_worker_appears_and_exits_within_two_sampling_intervals() {
+        let interval = DEFAULT_REFRESH_INTERVAL;
+        let session = Session::mint();
+        let mut source = ProcFsSource::live();
+        let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+        let before = session.current_revision();
+        assert_eq!(before, 1);
+
+        let mut worker = Worker::start();
+        let pid = worker.pid();
+        let started = Instant::now();
+        let mut appeared = None;
+        for tick in 1..=2 {
+            std::thread::sleep(interval);
+            view.refresh(&session, &mut source).unwrap();
+            if let Some(row) = row_for(&session, pid) {
+                appeared = Some((tick, started.elapsed(), row));
+                break;
+            }
+        }
+        let (appeared_tick, appeared_after, row) =
+            appeared.expect("an owned worker must reach the collection within two intervals");
+        let Value::List(cells) = &row.1 else {
+            panic!("expected table cells")
+        };
+        assert_eq!(cells[0], Value::UnsignedInt(u64::from(pid)));
+        assert_eq!(cells[1], Value::String("sleep".into()));
+        // The shell was built once and is refreshed in place.
+        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        assert!(session.current_revision() > before);
+
+        // A refresh that sees the same worker leaves its row identity alone.
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(
+            row_for(&session, pid).map(|(id, _)| id),
+            Some(row.0),
+            "a process that did not change must keep its row"
+        );
+
+        worker.0.kill().unwrap();
+        worker.0.wait().unwrap();
+        let ended = Instant::now();
+        let mut gone = None;
+        for tick in 1..=2 {
+            std::thread::sleep(interval);
+            view.refresh(&session, &mut source).unwrap();
+            if row_for(&session, pid).is_none() {
+                gone = Some((tick, ended.elapsed()));
+                break;
+            }
+        }
+        let (gone_tick, gone_after) =
+            gone.expect("an ended worker must leave the collection within two intervals");
+        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        println!(
+            "PX-004 live evidence: interval={interval:?} worker_pid={pid} item_id={} \
+             appeared_tick={appeared_tick} appeared_after={appeared_after:?} \
+             exited_tick={gone_tick} exited_after={gone_after:?} rows={} revision={} status={:?}",
+            row.0.get(),
+            view.row_count(),
+            session.current_revision(),
+            view.status(),
+        );
+    }
+
+    /// The published row of `pid`, if the collection currently holds one.
+    fn row_for(session: &Session, pid: u32) -> Option<(ItemId, Value)> {
+        session.with_store(|store| {
+            store
+                .get_model(MODEL)
+                .unwrap()
+                .items
+                .values()
+                .find(|item| {
+                    matches!(&item.value, Value::List(cells)
+                        if cells[0] == Value::UnsignedInt(u64::from(pid)))
+                })
+                .map(|item| (item.item_id, item.value.clone()))
+        })
     }
 }

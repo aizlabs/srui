@@ -1,16 +1,38 @@
 //! Server-side row projection and session-local item allocation
-//! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys).
+//! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh).
 use crate::source::{MissingReason, Observed, ProcessKey, ProcessSnapshot};
 use srui_sdk::{ItemId, Value};
 use srui_semantic_tree::ModelItem;
 use std::collections::{HashMap, HashSet};
 use std::io;
 
+/// One projected row: the process instance it was projected from, the opaque
+/// item ID that instance owns, and the exact value published to the model.
+///
+/// The key travels with the row because a refresh publishes rows the current
+/// scan did not confirm (PX-004): the allocator must be able to tell an identity
+/// that is still on screen from one that is not.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Row {
+    pub(crate) key: ProcessKey,
+    pub(crate) item_id: ItemId,
+    pub(crate) value: Value,
+}
+
+impl Row {
+    pub(crate) fn to_model_item(&self) -> ModelItem {
+        ModelItem::with_value(self.item_id, self.value.clone())
+    }
+}
+
 /// Resolves a full [`ProcessKey`] to an opaque item ID. Allocation is
 /// independent of PID alone, display name and row position: a reused PID with a
 /// different creation token is a different key and receives a different ID.
-/// Entries are never removed, so an item ID is never reused within this
-/// allocator's semantic session.
+///
+/// An item ID is never reused within this allocator's semantic session:
+/// [`Self::retain`] may forget a key that is no longer published, but the
+/// counter only ever moves forward, so a forgotten key that somehow returns is
+/// given a new ID rather than an old row's.
 #[derive(Default)]
 pub(crate) struct SessionItemIds {
     assigned: HashMap<ProcessKey, ItemId>,
@@ -18,7 +40,27 @@ pub(crate) struct SessionItemIds {
 }
 
 impl SessionItemIds {
-    pub(crate) fn project(&mut self, snapshot: &ProcessSnapshot) -> io::Result<Vec<ModelItem>> {
+    /// Forgets every identity that is not in `published`.
+    ///
+    /// A poll loop samples forever, so remembering every process that ever ran
+    /// would grow without bound on a host with ordinary churn. Only identities
+    /// that are still on screen — including rows a degraded scan failed to
+    /// confirm — need an assignment, because only those can be updated in place.
+    pub(crate) fn retain(&mut self, published: &[Row]) {
+        if self.assigned.len() == published.len() {
+            return;
+        }
+        let live: HashSet<&ProcessKey> = published.iter().map(|row| &row.key).collect();
+        self.assigned.retain(|key, _| live.contains(key));
+    }
+
+    /// Number of identities currently holding an assignment.
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.assigned.len()
+    }
+
+    pub(crate) fn project(&mut self, snapshot: &ProcessSnapshot) -> io::Result<Vec<Row>> {
         let mut seen = HashSet::with_capacity(snapshot.records.len());
         if snapshot
             .records
@@ -53,13 +95,14 @@ impl SessionItemIds {
                     }
                     Observed::Missing(MissingReason::Denied) => Value::String("Denied".into()),
                 };
-                Ok(ModelItem::with_value(
+                Ok(Row {
+                    key: record.key.clone(),
                     item_id,
-                    Value::List(vec![
+                    value: Value::List(vec![
                         pid,
                         Value::String(record.display_name.as_str().to_string()),
                     ]),
-                ))
+                })
             })
             .collect()
     }
@@ -158,6 +201,52 @@ mod tests {
             };
             assert_eq!(cells[0], expected);
         }
+    }
+
+    #[test]
+    fn forgetting_an_unpublished_identity_never_hands_its_id_back_out() {
+        let snapshot = FakeProcessSource.snapshot();
+        let mut ids = SessionItemIds::default();
+        let original = ids.project(&snapshot).unwrap();
+        assert_eq!(ids.tracked(), 3);
+        // Only the first row is still on screen: the other two identities are
+        // gone from the collection and must not be remembered forever.
+        ids.retain(&original[..1]);
+        assert_eq!(ids.tracked(), 1);
+        let again = ids.project(&snapshot).unwrap();
+        assert_eq!(
+            again[0].item_id, original[0].item_id,
+            "a published identity keeps its row"
+        );
+        // A forgotten identity is a new row, never a recycled ID.
+        assert_ne!(again[1].item_id, original[1].item_id);
+        assert_ne!(again[2].item_id, original[2].item_id);
+        assert!(again[1].item_id.get() > original[2].item_id.get());
+    }
+
+    #[test]
+    fn churn_does_not_grow_the_allocator_without_bound() {
+        let base = FakeProcessSource.snapshot();
+        let mut ids = SessionItemIds::default();
+        let mut highest = 0;
+        for tick in 0..200u32 {
+            let mut snapshot = base.clone();
+            // Every process is replaced on every tick: the worst case for an
+            // allocator that never forgets.
+            for (index, record) in snapshot.records.iter_mut().enumerate() {
+                record.key.creation = CreationToken::Opaque(format!("churn-{tick}-{index}"));
+            }
+            let rows = ids.project(&snapshot).unwrap();
+            ids.retain(&rows);
+            assert_eq!(ids.tracked(), rows.len());
+            let lowest = rows.iter().map(|row| row.item_id.get()).min().unwrap();
+            assert!(
+                lowest > highest,
+                "a replaced instance must never reuse an ID"
+            );
+            highest = rows.iter().map(|row| row.item_id.get()).max().unwrap();
+        }
+        assert_eq!(ids.tracked(), 3);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
-//! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003). No action handlers are
-//! installed and no process is ever opened for control.
+//! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004). No action handlers
+//! are installed and no process is ever opened for control.
 
 pub mod procfs;
 mod projection;
+pub mod refresh;
 pub mod source;
 
 use srui_sdk::*;
@@ -24,18 +25,25 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
     initialize_rows(session, vec![], STATUS_TEXT)
 }
 
-/// Samples only the injected source and publishes its model rows atomically with the shell,
+/// Samples the injected source once and publishes its model rows atomically with the shell,
 /// labeling the status with the source's own truthful description rather than a fixed
-/// fixture string. No periodic collection or process actions are installed.
+/// fixture string. No process actions are installed.
+///
+/// The returned view is what a later refresh diffs against; a caller that only
+/// wants the one-shot publication can use [`initialize_from_source`].
+pub fn start_from_source(
+    session: &Session,
+    source: &mut impl source::ProcessSource,
+) -> Result<(refresh::ProcessView, source::ProcessSnapshot), Box<dyn std::error::Error>> {
+    refresh::ProcessView::start(session, source)
+}
+
+/// Publishes one snapshot and discards the refresh state.
 pub fn initialize_from_source(
     session: &Session,
     source: &mut impl source::ProcessSource,
 ) -> Result<source::ProcessSnapshot, Box<dyn std::error::Error>> {
-    let status = source.status_text().to_string();
-    let snapshot = source.snapshot();
-    let items = projection::SessionItemIds::default().project(&snapshot)?;
-    initialize_rows(session, items, &published_status(&status, &snapshot))?;
-    Ok(snapshot)
+    start_from_source(session, source).map(|(_, snapshot)| snapshot)
 }
 
 /// The published status line: the source's own truthful description, plus an
@@ -96,7 +104,7 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
-fn initialize_rows(
+pub(crate) fn initialize_rows(
     session: &Session,
     items: Vec<srui_semantic_tree::ModelItem>,
     status: &str,

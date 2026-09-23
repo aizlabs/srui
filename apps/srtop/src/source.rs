@@ -396,9 +396,166 @@ impl ProcessSource for FakeProcessSource {
     }
 }
 
+/// Status label of the scripted fixture sequence. Like every source, it states
+/// what its data is: a script, never a host.
+pub const SEQUENCE_STATUS_TEXT: &str = "Read-only · Fake process sequence";
+
+/// A deterministic, cyclic script of fake snapshots covering every refresh case
+/// the collection has to survive (PX-004):
+///
+/// | step | snapshot |
+/// | ---- | -------- |
+/// | 0 | three processes: 4101 `worker`, 4102 `worker`, 4103 `helper` |
+/// | 1 | the same three processes, sampled one second later |
+/// | 2 | 4102 ended, 4103 renamed to `helper-tool`, 4104 `builder` appeared |
+/// | 3 | a failed scan: the process list could not be read at all |
+/// | 4 | the step 2 processes again |
+///
+/// The script then repeats from step 0, so a client that attaches at any moment
+/// observes every case within one cycle. Step 1 differs from step 0 only in its
+/// sample time, which is exactly the thing that must never reach the wire; step
+/// 3 must retain the step 2 rows rather than empty the table; and step 4 must
+/// converge back onto them without moving a row.
+///
+/// This is a fixture, not an observation: it reads no process, no clock and no
+/// file, and it names itself as synthetic in every published status.
+#[derive(Debug, Default)]
+pub struct ScriptedFakeSource {
+    step: usize,
+}
+
+impl ScriptedFakeSource {
+    pub const SOURCE: &'static str = "fake-process-sequence-v1";
+    pub const STATUS_TEXT: &'static str = SEQUENCE_STATUS_TEXT;
+    /// Length of one cycle of the script.
+    pub const STEPS: usize = 5;
+    /// Sample time of step 0 of the first cycle; each step is one second later.
+    pub const EPOCH_SECONDS: u64 = 1_800_000_000;
+
+    /// The step this source will publish next.
+    pub fn step(&self) -> usize {
+        self.step
+    }
+
+    fn key(token: &str, pid: u32) -> ProcessKey {
+        ProcessKey {
+            source: SourceId(Self::SOURCE.into()),
+            host: Observed::Known(HostId("fake-host".into())),
+            boot: Observed::Known(BootId("fake-boot-0001".into())),
+            pid_namespace: Observed::Known(PidNamespaceId(4_026_531_836)),
+            pid: Observed::Known(pid),
+            creation: CreationToken::Opaque(token.into()),
+        }
+    }
+
+    fn record(token: &str, pid: u32, name: &str) -> ProcessRecord {
+        ProcessRecord {
+            key: Self::key(token, pid),
+            display_name: name.into(),
+        }
+    }
+
+    /// The records and completeness of one step, independent of the sample time.
+    pub fn script(step: usize) -> (Vec<ProcessRecord>, Completeness) {
+        let settled = || {
+            vec![
+                Self::record("worker-a", 4101, "worker"),
+                Self::record("helper", 4103, "helper-tool"),
+                Self::record("builder", 4104, "builder"),
+            ]
+        };
+        match step % Self::STEPS {
+            0 | 1 => (
+                vec![
+                    Self::record("worker-a", 4101, "worker"),
+                    Self::record("worker-b", 4102, "worker"),
+                    Self::record("helper", 4103, "helper"),
+                ],
+                Completeness::Complete,
+            ),
+            2 | 4 => (settled(), Completeness::Complete),
+            // The process list itself could not be read: this is not a
+            // collection that emptied, and nothing here may be deleted.
+            _ => (
+                Vec::new(),
+                Completeness::from_scan(
+                    0,
+                    vec![EnumerationIssue {
+                        scope: IssueScope::Root,
+                        reason: MissingReason::Denied,
+                        detail: "scripted failed scan".into(),
+                    }],
+                ),
+            ),
+        }
+    }
+}
+
+impl ProcessSource for ScriptedFakeSource {
+    fn status_text(&self) -> &str {
+        Self::STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let step = self.step;
+        self.step += 1;
+        let (records, completeness) = Self::script(step);
+        ProcessSnapshot {
+            source: SourceId(Self::SOURCE.into()),
+            sampled_at: SnapshotTime(
+                // The sample time advances on every step, including the two
+                // steps whose records are identical. A tick must publish
+                // nothing at all for those, which it cannot do if the sample
+                // time reaches the UI.
+                SystemTime::UNIX_EPOCH + Duration::from_secs(Self::EPOCH_SECONDS + step as u64),
+            ),
+            records,
+            vanished: 0,
+            capped: 0,
+            completeness,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scripted_sequence_is_cyclic_and_only_its_sample_time_always_moves() {
+        let mut source = ScriptedFakeSource::default();
+        let cycle: Vec<ProcessSnapshot> = (0..ScriptedFakeSource::STEPS * 2)
+            .map(|_| source.snapshot())
+            .collect();
+        for step in 0..ScriptedFakeSource::STEPS {
+            let repeated = &cycle[step + ScriptedFakeSource::STEPS];
+            assert_eq!(cycle[step].records, repeated.records, "step {step}");
+            assert_eq!(
+                cycle[step].completeness, repeated.completeness,
+                "step {step}"
+            );
+            assert_ne!(cycle[step].sampled_at, repeated.sampled_at);
+        }
+        // Steps 0 and 1 are the same observation taken a second apart.
+        assert_eq!(cycle[0].records, cycle[1].records);
+        assert_ne!(cycle[0].sampled_at, cycle[1].sampled_at);
+        // One insertion, one deletion and one rename.
+        let before: Vec<_> = cycle[1].records.iter().map(|r| r.key.clone()).collect();
+        let after: Vec<_> = cycle[2].records.iter().map(|r| r.key.clone()).collect();
+        assert_eq!(after.iter().filter(|key| !before.contains(key)).count(), 1);
+        assert_eq!(before.iter().filter(|key| !after.contains(key)).count(), 1);
+        let renamed = cycle[2]
+            .records
+            .iter()
+            .find(|record| record.key == cycle[1].records[2].key)
+            .expect("the renamed process keeps its identity");
+        assert_eq!(cycle[1].records[2].display_name.as_str(), "helper");
+        assert_eq!(renamed.display_name.as_str(), "helper-tool");
+        // The failed step is never an authoritative empty result.
+        assert!(cycle[3].records.is_empty());
+        assert!(!cycle[3].completeness.is_complete());
+        assert_eq!(cycle[4].records, cycle[2].records);
+    }
 
     #[test]
     fn issue_recording_stops_allocating_once_the_bound_is_reached() {

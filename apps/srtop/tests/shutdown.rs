@@ -41,10 +41,15 @@ struct Server(Child);
 
 impl Server {
     fn start(socket: &Path) -> Self {
+        Self::start_with(socket, &[])
+    }
+
+    fn start_with(socket: &Path, options: &[&str]) -> Self {
         let mut server = Self(
             Command::new(env!("CARGO_BIN_EXE_srtop"))
                 .arg("--socket")
                 .arg(socket)
+                .args(options)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -105,6 +110,65 @@ fn assert_restart_after(signal: &str) {
 #[test]
 fn sigterm_cleans_socket_and_allows_restart() {
     assert_restart_after("-TERM");
+}
+
+/// A collecting instance keeps polling in the background; a normal stop must
+/// still shut it down and release the socket it owns.
+#[test]
+fn a_polling_instance_stops_and_releases_its_socket() {
+    let directory = SocketDirectory::new();
+    let socket = directory.0.join("s.sock");
+    let mut server =
+        Server::start_with(&socket, &["--fake-sequence", "--refresh-interval-ms", "50"]);
+    // Long enough for several ticks, including the script's failed scan.
+    thread::sleep(Duration::from_millis(400));
+    server.stop("-TERM");
+    assert!(!socket.exists(), "shutdown left its socket behind");
+}
+
+/// The sampling interval is configuration, and an unusable value is refused
+/// rather than quietly clamped into something else.
+#[test]
+fn an_out_of_range_refresh_interval_is_refused_without_publishing_a_socket() {
+    let directory = SocketDirectory::new();
+    let socket = directory.0.join("s.sock");
+    for interval in ["0", "1", "600000", "not-a-number"] {
+        let exit = Command::new(env!("CARGO_BIN_EXE_srtop"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(["--live-source", "--refresh-interval-ms", interval])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!exit.success(), "interval {interval} must be refused");
+        assert!(!socket.exists(), "a refused start must publish no socket");
+    }
+}
+
+/// Two sources are a contradiction, not a preference order.
+#[test]
+fn two_sources_are_refused() {
+    let directory = SocketDirectory::new();
+    let socket = directory.0.join("s.sock");
+    for pair in [
+        ["--fake-source", "--live-source"],
+        ["--fake-source", "--fake-sequence"],
+        ["--fake-sequence", "--fake-sequence"],
+    ] {
+        let exit = Command::new(env!("CARGO_BIN_EXE_srtop"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(pair)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!exit.success(), "{pair:?} must be refused");
+        assert!(!socket.exists());
+    }
 }
 
 #[test]

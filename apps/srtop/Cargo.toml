@@ -7,6 +7,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
 tokio-util = "0.7"
+srui-protocol = { path = "../../server-rust/protocol" }
 srui-sdk = { path = "../../server-rust/sdk" }
 srui-semantic-tree = { path = "../../server-rust/semantic-tree" }
 srui-sessiond = { path = "../../server-rust/sessiond" }

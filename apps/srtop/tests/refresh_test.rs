@@ -5,6 +5,7 @@ use srui_process_explorer::procfs::MAX_RECORDS;
 use srui_process_explorer::refresh::refresh_status;
 use srui_process_explorer::source::*;
 use srui_process_explorer::{start_from_source, COLUMN, HEADING, MODEL, STATUS, SURFACE, TABLE};
+use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, Operation, Value, TEXT};
 use srui_semantic_tree::Model;
 use srui_sessiond::Session;
@@ -378,6 +379,203 @@ fn a_partial_scan_adds_what_it_saw_and_deletes_nothing() {
     for (id, _) in &rows {
         assert!(after.iter().any(|(after_id, _)| after_id == id));
     }
+}
+
+/// A source that publishes `rows` processes, each carrying the widest display
+/// name this app can ever publish: [`MAX_DISPLAY_NAME_CHARS`] characters of four
+/// UTF-8 bytes each. A scan of a busy host really can look like this, and it is
+/// the shape that makes a handful of operations overflow a 16 MiB frame.
+struct Widest {
+    rows: u32,
+    first_pid: u32,
+}
+
+impl Widest {
+    /// The name every row carries. Sanitizing keeps it whole — no character of
+    /// it is control, ignorable, blank or trimmed — so it reaches the model at
+    /// four bytes a character.
+    fn name() -> DisplayName {
+        let name = DisplayName::from("\u{20000}".repeat(MAX_DISPLAY_NAME_CHARS).as_str());
+        assert_eq!(name.as_str().chars().count(), MAX_DISPLAY_NAME_CHARS);
+        assert_eq!(name.as_str().len(), MAX_DISPLAY_NAME_CHARS * 4);
+        name
+    }
+}
+
+impl ProcessSource for Widest {
+    fn status_text(&self) -> &str {
+        FAKE_STATUS_TEXT
+    }
+
+    fn snapshot(&mut self) -> ProcessSnapshot {
+        let template = FakeProcessSource.snapshot().records[0].key.clone();
+        let name = Self::name();
+        let records = (0..self.rows)
+            .map(|index| {
+                let pid = self.first_pid + index;
+                ProcessRecord {
+                    key: ProcessKey {
+                        pid: Observed::Known(pid),
+                        creation: CreationToken::Opaque(format!("widest-{pid}")),
+                        ..template.clone()
+                    },
+                    display_name: name.clone(),
+                }
+            })
+            .collect();
+        ProcessSnapshot {
+            source: SourceId(FakeProcessSource::SOURCE.into()),
+            sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            records,
+            vanished: 0,
+            capped: CappedRecords::none(),
+            completeness: Completeness::Complete,
+        }
+    }
+}
+
+/// The bytes each transaction committed since `revision` occupies, measured by
+/// the protocol's own encoder — exactly the quantity `SruiCodec` compares
+/// against the frame limit before writing a frame (§26).
+fn frames_since(session: &Session, revision: u64) -> Vec<usize> {
+    session
+        .collect_replayed_transactions(revision)
+        .expect("the journal holds this run")
+        .into_iter()
+        .map(|transaction| {
+            srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                msg: Some(srui_protocol::srui_message::Msg::Transaction(transaction)),
+            })
+        })
+        .collect()
+}
+
+/// A refresh whose payload exceeds the §26 frame limit commits as consecutive
+/// transactions, every one of them a frame a conforming decoder accepts.
+///
+/// Chunking by operation count alone is not enough: these rows need only four
+/// `MODEL_INSERT` operations, far inside the 10,000-operation bound, and still
+/// carry more than 16 MiB. Committing them as one transaction would advance the
+/// server's revision and then have the codec refuse the frame, detaching the
+/// client from a server that has already moved on — and the next identical tick
+/// would diff clean and republish nothing.
+#[test]
+fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
+    let session = Session::mint();
+    let max_ops = session.with_store(|store| store.limits().max_transaction_operations);
+    // Rows that all vanish in the refresh below, so the deletions this refresh
+    // plans must still precede its insertions across a size-driven split.
+    let (mut view, _) = start_from_source(
+        &session,
+        &mut Widest {
+            rows: 500,
+            first_pid: 900_000,
+        },
+    )
+    .unwrap();
+    assert_eq!(published(&session).len(), 500);
+
+    let revision = session.current_revision();
+    // 34,000 rows of 512 name bytes each: more than 16 MiB of payload in four
+    // operations.
+    let rows = 34_000;
+    let outcome = view
+        .refresh(&session, &mut Widest { rows, first_pid: 1 })
+        .unwrap();
+    assert_eq!(outcome.inserted, rows as usize);
+    assert_eq!(outcome.deleted, 500);
+    assert_eq!(published(&session).len(), rows as usize);
+    assert_shell_intact(&session);
+
+    let operations = operations_since(&session, revision);
+    assert!(
+        operations.len() <= max_ops,
+        "this refresh fits the operation bound in {} operations, so only a size \
+         bound can split it",
+        operations.len()
+    );
+    assert!(matches!(operations[0], Operation::ModelDelete { .. }));
+    let first_insert = operations
+        .iter()
+        .position(|op| matches!(op, Operation::ModelInsert { .. }))
+        .expect("the refresh inserts rows");
+    assert!(
+        operations[..first_insert]
+            .iter()
+            .all(|op| matches!(op, Operation::ModelDelete { .. })),
+        "every deletion must precede every insertion, so an insertion index is final"
+    );
+
+    let frames = frames_since(&session, revision);
+    assert_eq!(
+        frames.len(),
+        outcome.transactions,
+        "every committed transaction is in the journal"
+    );
+    for frame in &frames {
+        assert!(
+            *frame <= DEFAULT_MAX_FRAME_SIZE,
+            "a committed transaction of {frame} bytes exceeds the {DEFAULT_MAX_FRAME_SIZE}-byte \
+             frame limit and would be refused on delivery"
+        );
+    }
+    assert!(
+        frames.iter().sum::<usize>() > DEFAULT_MAX_FRAME_SIZE,
+        "the refresh as a whole must really exceed one frame; it carried {} bytes",
+        frames.iter().sum::<usize>()
+    );
+    assert!(
+        outcome.transactions > 1,
+        "this refresh cannot fit in one frame"
+    );
+
+    // An identical tick still publishes nothing.
+    let outcome = view
+        .refresh(&session, &mut Widest { rows, first_pid: 1 })
+        .unwrap();
+    assert!(!outcome.published(), "{outcome:?}");
+}
+
+/// A refresh that fits in one frame is not split: the size bound costs a large
+/// but deliverable refresh nothing.
+#[test]
+fn a_refresh_just_inside_the_frame_bound_still_commits_as_one_transaction() {
+    let session = Session::mint();
+    let (mut view, _) = start_from_source(
+        &session,
+        &mut Widest {
+            rows: 1,
+            first_pid: 900_000,
+        },
+    )
+    .unwrap();
+
+    let revision = session.current_revision();
+    // Chosen so the planner's own upper bound on this refresh stays under the
+    // ceiling; the frame it really encodes to is asserted below.
+    let rows = 27_000;
+    let outcome = view
+        .refresh(&session, &mut Widest { rows, first_pid: 1 })
+        .unwrap();
+    assert_eq!(outcome.inserted, rows as usize);
+    assert_eq!(
+        outcome.transactions, 1,
+        "a refresh that fits in one frame must not be split"
+    );
+
+    let frames = frames_since(&session, revision);
+    assert_eq!(frames.len(), 1);
+    assert!(
+        frames[0] <= DEFAULT_MAX_FRAME_SIZE,
+        "{} exceeds the frame limit",
+        frames[0]
+    );
+    assert!(
+        frames[0] > 13 * 1024 * 1024,
+        "this refresh must really approach the ceiling, not be a trivially small \
+         one that no bound could have split; it was {} bytes",
+        frames[0]
+    );
 }
 
 /// A single refresh larger than the §26 transaction bound is still published

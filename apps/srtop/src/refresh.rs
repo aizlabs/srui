@@ -3,7 +3,7 @@
 //! by [`crate::initialize_from_source`]; every later tick emits nothing but
 //! model mutations and — only when it actually changed — the status text.
 //!
-//! Three rules shape this module:
+//! Four rules shape this module:
 //!
 //! * A tick that observed no user-visible change opens no transaction at all.
 //!   Nothing that changes on its own — the sample time, an issue count, a
@@ -20,10 +20,32 @@
 //! * Every published change is recorded as it commits, so the view's idea of
 //!   what the client holds is exactly what the store holds even when a later
 //!   batch of one refresh fails.
+//! * A refresh is split into transactions no client can refuse: by the §26
+//!   operation bound, by the §26 items-per-operation bound, *and* by the §26
+//!   frame size. The three are independent — a host that grows from a handful
+//!   of rows to tens of thousands of long names needs only four operations to
+//!   publish, and those four operations still encode to more than one 16 MiB
+//!   frame. A transaction that the store commits and the codec then refuses to
+//!   write would advance the server's revision, detach the client, and leave
+//!   nothing to republish on the next tick, because the next tick diffs clean.
+//!
+//! ## Why the size bound holds
+//!
+//! Splitting by size needs a per-operation number the encoder cannot exceed,
+//! not one it usually stays under, so every quantity below is an upper bound on
+//! what protobuf will emit. Strings are counted in encoded UTF-8 bytes rather
+//! than in characters: a display name is bounded to
+//! [`crate::source::MAX_DISPLAY_NAME_CHARS`] *characters*, and one character
+//! encodes to as many as four bytes, so counting characters would understate a
+//! full-width name fourfold. Every length prefix is charged its widest varint,
+//! every field its tag, and the ceiling itself is
+//! [`srui_protocol::DEFAULT_MAX_FRAME_SIZE`] less a fixed allowance for the
+//! envelope the operations travel in, so payload is never mistaken for frame.
 
 use crate::projection::{Row, SessionItemIds};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
 use crate::{initialize_rows, published_status, MODEL, STATUS};
+use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, Operation, Value, TEXT};
 use srui_semantic_tree::DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION;
 use srui_sessiond::{Session, SessionError};
@@ -40,6 +62,87 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 /// Slowest configurable interval.
 pub const MAX_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Bytes of a transaction's frame that carry no operation payload: the
+/// `SruiMessage.transaction` tag and length prefix, and the transaction's own
+/// `base_revision`, `new_revision` and `priority` fields. Each of those is one
+/// tag byte plus a varint of at most ten bytes, and the length prefix of a frame
+/// below 16 MiB needs at most five, so 64 is above every encoding of them. The
+/// allowance exists so this module never mistakes payload for frame.
+const TRANSACTION_ENVELOPE_BYTES: usize = 64;
+
+/// The most operation payload one transaction may carry and still encode into a
+/// frame every conforming decoder accepts (§26).
+///
+/// Derived from the protocol's own frame limit rather than from a number of this
+/// app's choosing, so raising or lowering that limit moves this bound with it.
+const MAX_TRANSACTION_PAYLOAD_BYTES: usize = DEFAULT_MAX_FRAME_SIZE - TRANSACTION_ENVELOPE_BYTES;
+
+/// Bytes one operation costs a transaction beyond its own body: the
+/// `Transaction.operations` tag and length prefix, and the `Operation` oneof tag
+/// and length prefix. Every tag here is one byte, and no length below 16 MiB
+/// needs more than five varint bytes.
+const OPERATION_FRAMING_BYTES: usize = 12;
+
+/// Bytes an operation body costs before its first item: the widest fixed header
+/// any operation this module plans carries. `ModelDeleteOp` is the widest at
+/// three uint64 fields plus the tag and length prefix of its packed `item_ids`;
+/// `SetPropertyOp` carries a node ID and a two-field `PropertyRef` submessage;
+/// `ModelInsertOp` and `ModelUpdateOp` carry only a model ID and an index. Every
+/// field is a tag byte plus a varint of at most ten, so 48 is above all of them.
+const OPERATION_HEADER_BYTES: usize = 48;
+
+/// Bytes one `ModelItem` costs beyond its value: its `items` tag and length
+/// prefix, and its `item_id` tag and varint.
+const MODEL_ITEM_FRAMING_BYTES: usize = 17;
+
+/// Bytes one item ID costs inside `ModelDeleteOp.item_ids`: a tag byte and a
+/// ten-byte varint. That field is packed on the wire, which is smaller still.
+const ITEM_ID_BYTES: usize = 11;
+
+/// Bytes one `Value` costs beyond its own body: its oneof tag, which is two
+/// bytes for the highest field numbers this module reaches, and a length prefix
+/// of at most five.
+const VALUE_FRAMING_BYTES: usize = 7;
+
+/// Bytes any `Value` variant that nests no other value occupies at most: the
+/// widest is a rectangle's four doubles at nine bytes each, and a 32-byte
+/// resource hash is smaller still.
+const SCALAR_VALUE_BYTES: usize = 64;
+
+/// Bytes one record property costs beyond its own value: its `properties` tag
+/// and length prefix and its two-field `PropertyRef` submessage.
+const RECORD_PROPERTY_BYTES: usize = 24;
+
+/// An upper bound on the bytes `value` occupies inside an encoded operation,
+/// its own tag and length prefix included.
+///
+/// A string is charged its encoded UTF-8 length, never its character count: the
+/// display name in a row is bounded in characters, and one character encodes to
+/// as many as four bytes. Lists and records recurse; every other variant nests
+/// nothing and fits in [`SCALAR_VALUE_BYTES`].
+fn value_wire_bytes(value: &Value) -> usize {
+    VALUE_FRAMING_BYTES
+        + match value {
+            Value::String(text) => text.len(),
+            Value::List(values) => values.iter().map(value_wire_bytes).sum(),
+            Value::Record(record) => {
+                RECORD_PROPERTY_BYTES
+                    + record
+                        .properties
+                        .iter()
+                        .map(|property| RECORD_PROPERTY_BYTES + value_wire_bytes(&property.value))
+                        .sum::<usize>()
+            }
+            _ => SCALAR_VALUE_BYTES,
+        }
+}
+
+/// An upper bound on the bytes one row occupies inside a `MODEL_INSERT` or
+/// `MODEL_UPDATE` operation.
+fn row_wire_bytes(row: &Row) -> usize {
+    MODEL_ITEM_FRAMING_BYTES + value_wire_bytes(&row.value)
+}
 
 /// What one refresh published.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -149,7 +252,12 @@ impl ProcessView {
             // of the same refresh does not commit.
             plan.push(Planned::new(Effect::Status(status)));
         }
-        plan.extend(diff(&self.rows, &target, batch));
+        plan.extend(diff(
+            &self.rows,
+            &target,
+            batch,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+        ));
 
         let mut result = Refreshed {
             retained,
@@ -171,8 +279,14 @@ impl ProcessView {
             return Ok(result);
         }
 
-        let (transactions, outcome) =
-            commit(session, &plan, max_ops, &mut self.rows, &mut self.status);
+        let (transactions, outcome) = commit(
+            session,
+            &plan,
+            max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut self.rows,
+            &mut self.status,
+        );
         result.transactions = transactions;
         self.ids.retain(&self.rows);
         outcome.map(|()| result)
@@ -189,22 +303,43 @@ impl ProcessView {
     }
 }
 
-/// Commits a plan as consecutive transactions of at most `max_ops` operations.
+/// Commits a plan as consecutive transactions of at most `max_ops` operations
+/// and at most `max_bytes` of operation payload.
 ///
-/// §26 bounds the operations one transaction may carry, and a refresh of a large
-/// collection can exceed it. Each transaction is still atomic, and each is
-/// recorded into `rows` and `status` as it commits, so a plan that stops partway
-/// leaves this app's idea of what the client holds equal to what the store
-/// holds. Returns how many transactions committed and the first failure.
+/// §26 bounds both the operations one transaction may carry and the size of the
+/// frame it travels in, and a refresh of a large collection can exceed either
+/// one without exceeding the other: tens of thousands of long names need only a
+/// handful of operations and still will not fit in one frame. Exceeding the
+/// frame bound is the worse failure, because the store commits the transaction
+/// and the codec then refuses to write it, so the client is detached from a
+/// server whose revision already moved on. Each transaction is still atomic, and
+/// each is recorded into `rows` and `status` as it commits, so a plan that stops
+/// partway leaves this app's idea of what the client holds equal to what the
+/// store holds. Returns how many transactions committed and the first failure.
 fn commit(
     session: &Session,
     plan: &[Planned],
     max_ops: usize,
+    max_bytes: usize,
     rows: &mut Vec<Row>,
     status: &mut String,
 ) -> (usize, Result<(), SessionError>) {
     let mut committed = 0;
-    for chunk in plan.chunks(max_ops) {
+    let mut start = 0;
+    while start < plan.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        // At least one operation always travels, so a plan always makes
+        // progress; the planner keeps any single operation inside `max_bytes`.
+        while end < plan.len() && end - start < max_ops {
+            let cost = plan[end].bytes;
+            if end > start && bytes + cost > max_bytes {
+                break;
+            }
+            bytes += cost;
+            end += 1;
+        }
+        let chunk = &plan[start..end];
         match session.transaction(|ui| {
             for planned in chunk {
                 ui.apply_op(&planned.op)?;
@@ -217,6 +352,7 @@ fn commit(
             }
             Err(error) => return (committed, Err(error)),
         }
+        start = end;
     }
     (committed, Ok(()))
 }
@@ -294,12 +430,13 @@ fn retain_unconfirmed(published: &[Row], confirmed: Vec<Row>, retention: &Retent
     merged.append(&mut tail);
     merged
 }
-
-/// One planned mutation: the wire operation and the effect it has on the
-/// published rows, derived from one description so the two cannot disagree.
+/// One planned mutation: the wire operation, the effect it has on the published
+/// rows — derived from one description so the two cannot disagree — and an upper
+/// bound on the bytes the operation adds to an encoded transaction.
 struct Planned {
     op: Operation,
     effect: Effect,
+    bytes: usize,
 }
 
 enum Effect {
@@ -323,11 +460,22 @@ impl Planned {
                 Operation::model_update(MODEL, None, rows.iter().map(Row::to_model_item))
             }
         };
-        Self { op, effect }
+        let bytes = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES + effect.payload_bytes();
+        Self { op, effect, bytes }
     }
 }
 
 impl Effect {
+    /// An upper bound on the bytes this effect's operation body carries beyond
+    /// its fixed header.
+    fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Status(text) => VALUE_FRAMING_BYTES + text.len(),
+            Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
+            Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
+        }
+    }
+
     /// Applies this effect to the view's record of what the client holds. Called
     /// only after the transaction carrying the matching operation committed.
     fn record(&self, rows: &mut Vec<Row>, status: &mut String) {
@@ -415,7 +563,13 @@ fn insert_run(rows: &mut Vec<Row>, inserts: &[Planned]) {
 /// row that moved backwards relative to its neighbours is deleted and reinserted
 /// rather than left in an inconsistent position. The shape of this algorithm
 /// follows the collection diff already proven in `examples/process-monitor`.
-fn diff(published: &[Row], target: &[Row], batch: usize) -> Vec<Planned> {
+///
+/// Every operation carries at most `batch` items and at most `max_bytes` of
+/// encoded transaction payload. The byte bound is applied here, not only when
+/// the plan is chunked into transactions, because a transaction must hold at
+/// least one operation: an operation that alone exceeded the frame bound could
+/// not be rescued by any later split.
+fn diff(published: &[Row], target: &[Row], batch: usize, max_bytes: usize) -> Vec<Planned> {
     let target_positions: HashMap<ItemId, usize> = target
         .iter()
         .enumerate()
@@ -439,27 +593,39 @@ fn diff(published: &[Row], target: &[Row], batch: usize) -> Vec<Planned> {
         }
     }
 
+    // What one operation may spend on items once its own framing and header are
+    // paid for.
+    let budget = max_bytes
+        .saturating_sub(OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES)
+        .max(1);
+
     let mut plan = Vec::new();
-    for chunk in deleted.chunks(batch) {
+    // Every deleted row costs the same fixed number of bytes, so the byte bound
+    // is a second cap on the chunk length rather than a running total.
+    let deleted_batch = batch.min(budget / ITEM_ID_BYTES).max(1);
+    for chunk in deleted.chunks(deleted_batch) {
         plan.push(Planned::new(Effect::Delete(chunk.to_vec())));
     }
 
     let mut run_start: u64 = 0;
     let mut run: Vec<Row> = Vec::new();
+    let mut run_bytes: usize = 0;
     for (index, row) in target.iter().enumerate() {
         if retained.contains(&row.item_id) {
-            flush_insert(&mut plan, run_start, &mut run);
+            flush_insert(&mut plan, run_start, &mut run, &mut run_bytes);
             continue;
+        }
+        let cost = row_wire_bytes(row);
+        if !run.is_empty() && (run.len() == batch || run_bytes + cost > budget) {
+            flush_insert(&mut plan, run_start, &mut run, &mut run_bytes);
         }
         if run.is_empty() {
             run_start = index as u64;
         }
         run.push(row.clone());
-        if run.len() == batch {
-            flush_insert(&mut plan, run_start, &mut run);
-        }
+        run_bytes += cost;
     }
-    flush_insert(&mut plan, run_start, &mut run);
+    flush_insert(&mut plan, run_start, &mut run, &mut run_bytes);
 
     let previous: HashMap<ItemId, &Value> = published
         .iter()
@@ -475,13 +641,25 @@ fn diff(published: &[Row], target: &[Row], batch: usize) -> Vec<Planned> {
         })
         .cloned()
         .collect();
-    for chunk in changed.chunks(batch) {
-        plan.push(Planned::new(Effect::Update(chunk.to_vec())));
+    let mut updates: Vec<Row> = Vec::new();
+    let mut update_bytes: usize = 0;
+    for row in changed {
+        let cost = row_wire_bytes(&row);
+        if !updates.is_empty() && (updates.len() == batch || update_bytes + cost > budget) {
+            plan.push(Planned::new(Effect::Update(std::mem::take(&mut updates))));
+            update_bytes = 0;
+        }
+        updates.push(row);
+        update_bytes += cost;
+    }
+    if !updates.is_empty() {
+        plan.push(Planned::new(Effect::Update(updates)));
     }
     plan
 }
 
-fn flush_insert(plan: &mut Vec<Planned>, start: u64, rows: &mut Vec<Row>) {
+fn flush_insert(plan: &mut Vec<Planned>, start: u64, rows: &mut Vec<Row>, bytes: &mut usize) {
+    *bytes = 0;
     if rows.is_empty() {
         return;
     }
@@ -538,8 +716,8 @@ pub async fn poll<S>(
 mod tests {
     use super::*;
     use crate::source::{
-        Completeness, EnumerationIssue, IssueScope, MissingReason, Observed, ProcessKey,
-        ScriptedFakeSource, SkippedRecords,
+        Completeness, DisplayName, EnumerationIssue, IssueScope, MissingReason, Observed,
+        ProcessKey, ScriptedFakeSource, SkippedRecords, MAX_DISPLAY_NAME_CHARS,
     };
     use std::collections::BTreeSet;
 
@@ -588,6 +766,156 @@ mod tests {
         // The same scan, having accounted for that absence, deletes it instead.
         let believed = retain_unconfirmed(&first, confirmed.clone(), &only(&[]));
         assert_eq!(keyed(&believed), keyed(&confirmed));
+    }
+
+    /// A display name of the longest kind this app can publish: every character
+    /// four UTF-8 bytes, none of them one the sanitizer replaces or trims.
+    fn widest_display_name() -> DisplayName {
+        let name = DisplayName::from("\u{20000}".repeat(MAX_DISPLAY_NAME_CHARS).as_str());
+        assert_eq!(
+            name.as_str().chars().count(),
+            MAX_DISPLAY_NAME_CHARS,
+            "the sanitizer must keep this name whole"
+        );
+        assert_eq!(
+            name.as_str().len(),
+            MAX_DISPLAY_NAME_CHARS * 4,
+            "every character must cost four encoded bytes"
+        );
+        name
+    }
+
+    /// `rows` rows carrying the widest name this app can publish, with item IDs
+    /// no fixture in this module has already published.
+    fn widest_rows(rows: u64) -> Vec<Row> {
+        let name = widest_display_name();
+        let template = crate::source::FakeProcessSource.snapshot().records[0]
+            .key
+            .clone();
+        (0..rows)
+            .map(|index| Row {
+                key: ProcessKey {
+                    pid: Observed::Known(index as u32 + 1),
+                    creation: crate::source::CreationToken::Opaque(format!("widest-{index}")),
+                    ..template.clone()
+                },
+                item_id: ItemId::new(1_000 + index),
+                value: Value::List(vec![
+                    Value::UnsignedInt(index + 1),
+                    Value::String(name.as_str().to_string()),
+                ]),
+            })
+            .collect()
+    }
+
+    /// The bytes a transaction carrying `plan` really occupies, measured by the
+    /// protocol's own encoder exactly as `SruiCodec` measures a frame (§26).
+    fn encoded_frame_bytes(plan: &[Planned]) -> usize {
+        let transaction = srui_protocol::Transaction {
+            // The widest revisions and priority any transaction could carry, so
+            // the measurement never flatters the envelope allowance.
+            base_revision: u64::MAX,
+            new_revision: u64::MAX,
+            priority: u32::MAX,
+            operations: plan.iter().map(|planned| planned.op.to_wire()).collect(),
+        };
+        srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(transaction)),
+        })
+    }
+
+    /// The planned size of an operation is a bound the encoder cannot exceed,
+    /// not an average: every string is charged its encoded UTF-8 length, so the
+    /// widest name this app publishes is counted at four bytes a character.
+    #[test]
+    fn a_planned_operation_is_never_smaller_than_what_the_encoder_emits() {
+        let rows = widest_rows(64);
+        let plan = vec![
+            Planned::new(Effect::Status("x".repeat(4096))),
+            Planned::new(Effect::Delete(
+                rows.iter().map(|row| row.item_id).collect::<Vec<ItemId>>(),
+            )),
+            Planned::new(Effect::Insert(0, rows.clone())),
+            Planned::new(Effect::Update(rows)),
+        ];
+        for planned in &plan {
+            let alone = std::slice::from_ref(planned);
+            assert!(
+                encoded_frame_bytes(alone) <= planned.bytes + TRANSACTION_ENVELOPE_BYTES,
+                "planned {} bytes but the encoder emitted {}",
+                planned.bytes,
+                encoded_frame_bytes(alone)
+            );
+        }
+        let planned_total: usize = plan.iter().map(|planned| planned.bytes).sum();
+        assert!(
+            encoded_frame_bytes(&plan) <= planned_total + TRANSACTION_ENVELOPE_BYTES,
+            "a whole transaction must also stay inside the sum of its planned bytes"
+        );
+    }
+
+    /// A plan no single frame can carry commits as consecutive transactions,
+    /// each one inside the byte ceiling it was given, with the deletion still
+    /// ahead of the insertions.
+    #[test]
+    fn a_plan_too_large_for_one_frame_commits_as_several() {
+        let session = srui_sessiond::Session::mint();
+        let mut source = ScriptedFakeSource::default();
+        let (mut view, _) = ProcessView::start(&session, &mut source).unwrap();
+        let rows = widest_rows(8);
+        let plan = vec![
+            Planned::new(Effect::Delete(vec![view.rows[0].item_id])),
+            Planned::new(Effect::Insert(2, rows[..4].to_vec())),
+            Planned::new(Effect::Insert(6, rows[4..].to_vec())),
+        ];
+        // Above any one operation and below the first two together, so only the
+        // byte bound can split this plan: three operations are far inside the
+        // operation bound it is also given.
+        let ceiling = plan[0].bytes + plan[1].bytes;
+        let (transactions, outcome) = commit(
+            &session,
+            &plan,
+            1_000,
+            ceiling,
+            &mut view.rows,
+            &mut view.status,
+        );
+        assert!(outcome.is_ok());
+        assert_eq!(transactions, 2, "three operations, two frames");
+        assert_eq!(session.current_revision(), 3);
+        assert_eq!(view.row_count(), 10);
+        assert_eq!(rows_of(&view), store_rows(&session));
+
+        // Measured on the real encoder, not on the planner's own arithmetic.
+        let frames: Vec<usize> = session
+            .collect_replayed_transactions(1)
+            .expect("the journal holds this run")
+            .into_iter()
+            .map(|transaction| {
+                srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                    msg: Some(srui_protocol::srui_message::Msg::Transaction(transaction)),
+                })
+            })
+            .collect();
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            assert!(
+                frame <= ceiling + TRANSACTION_ENVELOPE_BYTES,
+                "a committed frame of {frame} bytes exceeded the {ceiling}-byte ceiling"
+            );
+        }
+        let committed = session
+            .collect_replayed_transactions(1)
+            .expect("the journal holds this run");
+        let ops: Vec<Operation> = committed
+            .into_iter()
+            .flat_map(|transaction| transaction.operations)
+            .map(|op| Operation::try_from(op).expect("a committed operation decodes"))
+            .collect();
+        assert!(matches!(ops[0], Operation::ModelDelete { .. }));
+        assert!(ops[1..]
+            .iter()
+            .all(|op| matches!(op, Operation::ModelInsert { .. })));
     }
 
     #[test]
@@ -670,7 +998,14 @@ mod tests {
         };
 
         let plan: Vec<Planned> = (0..4).map(appended).collect();
-        let (transactions, outcome) = commit(&session, &plan, 2, &mut view.rows, &mut view.status);
+        let (transactions, outcome) = commit(
+            &session,
+            &plan,
+            2,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut view.rows,
+            &mut view.status,
+        );
         assert!(outcome.is_ok());
         assert_eq!(transactions, 2, "four operations, two per transaction");
         assert_eq!(session.current_revision(), 3);
@@ -687,7 +1022,14 @@ mod tests {
                 ..template.clone()
             }],
         ));
-        let (transactions, outcome) = commit(&session, &plan, 2, &mut view.rows, &mut view.status);
+        let (transactions, outcome) = commit(
+            &session,
+            &plan,
+            2,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut view.rows,
+            &mut view.status,
+        );
         assert!(outcome.is_err(), "a duplicate item ID must be refused");
         assert_eq!(transactions, 1);
         assert_eq!(view.row_count(), 9, "only the committed chunk is recorded");

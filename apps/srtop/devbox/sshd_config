@@ -1,0 +1,15 @@
+# sshd for the srtop Linux dev box. Public key only, one account, one subsystem.
+Port 22
+ListenAddress 0.0.0.0
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile /home/srui/.ssh/authorized_keys
+UsePAM no
+PrintMotd no
+X11Forwarding no
+AllowTcpForwarding no
+AllowUsers srui
+Subsystem srui /usr/local/bin/srui-ssh-bridge --socket /home/srui/run/srtop.sock
+LogLevel INFO

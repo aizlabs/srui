@@ -28,6 +28,23 @@
 //!   frame. A transaction that the store commits and the codec then refuses to
 //!   write would advance the server's revision, detach the client, and leave
 //!   nothing to republish on the next tick, because the next tick diffs clean.
+//! * The collection this app publishes is never larger than a client can be
+//!   *sent*. Splitting the live mutations is not enough on its own: a client
+//!   that attaches, or resyncs after a journal gap, is brought up by one
+//!   catch-up snapshot transaction (§18, §21) that carries every cached range
+//!   of the model at once and is bounded only by its operation count. A model
+//!   that encodes to more than one frame is therefore a collection no fresh
+//!   client can attach to at all, however carefully each refresh was split. The
+//!   rows that do not fit are not published, and the status says how many.
+//!
+//! ## Why the collection is bounded rather than the snapshot chunked
+//!
+//! Chunked snapshot delivery is runtime work: it needs a snapshot-framing
+//! signal on the wire and conformance coverage on both replicas, which is
+//! tracked as PX-004-G01 and is not this app's to invent. What is this app's
+//! is what it publishes, so the ceiling is applied where the rows are chosen —
+//! on the start path and on every refresh alike, since both produce the model a
+//! later snapshot must carry.
 //!
 //! ## Why the size bound holds
 //!
@@ -114,6 +131,25 @@ const SCALAR_VALUE_BYTES: usize = 64;
 /// and length prefix and its two-field `PropertyRef` submessage.
 const RECORD_PROPERTY_BYTES: usize = 24;
 
+/// Bytes a catch-up snapshot spends on everything that is not a model row: the
+/// `CREATE_MODEL` operation and one `CREATE_NODE` operation per shell node,
+/// each with its framing, header and properties (§13, §18).
+///
+/// The shell is five nodes with fixed labels and a two-column header, so the
+/// real cost is a few hundred bytes; 4 KiB is far above every encoding of them
+/// and leaves the ceiling insensitive to a later label. The status text is the
+/// one property a scan can lengthen, so it is charged separately and exactly.
+const SNAPSHOT_SHELL_BYTES: usize = 4096;
+
+/// Bytes one `MODEL_RESET_RANGE` operation of a snapshot costs beyond its items.
+/// A snapshot emits one per [`DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION`] rows.
+const SNAPSHOT_RANGE_BYTES: usize = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
+
+/// Bytes reserved for the status clause that truncation adds: fixed wording and
+/// one decimal count. Reserving it rather than measuring it keeps the budget
+/// independent of the count it produces.
+const TRUNCATION_CLAUSE_BYTES: usize = 64;
+
 /// An upper bound on the bytes `value` occupies inside an encoded operation,
 /// its own tag and length prefix included.
 ///
@@ -152,6 +188,9 @@ pub struct Refreshed {
     pub updated: usize,
     /// Rows the scan did not confirm and that were kept rather than deleted.
     pub retained: usize,
+    /// Rows this app declined to publish because the resulting collection would
+    /// not fit in one catch-up snapshot frame (§18, §26).
+    pub truncated: usize,
     pub status_changed: bool,
     /// Transactions this refresh committed. Zero means the snapshot held no
     /// user-visible change and nothing was sent.
@@ -182,8 +221,15 @@ impl ProcessView {
         let source_status = source.status_text().to_string();
         let snapshot = source.snapshot();
         let mut ids = SessionItemIds::default();
-        let rows = ids.project(&snapshot)?;
-        let status = published_status(&source_status, &snapshot);
+        let mut rows = ids.project(&snapshot)?;
+        // The start path is exactly the attach path the ceiling exists for: the
+        // first publication is one transaction, and every client that attaches
+        // later is brought up by one snapshot of this same model.
+        let provisional = refresh_status(&source_status, &snapshot, 0, None, 0);
+        let truncated =
+            bound_to_snapshot_frame(&mut rows, provisional.len() + TRUNCATION_CLAUSE_BYTES);
+        let status = refresh_status(&source_status, &snapshot, 0, None, truncated);
+        debug_assert!(status.len() <= provisional.len() + TRUNCATION_CLAUSE_BYTES);
         initialize_rows(
             session,
             rows.iter().map(Row::to_model_item).collect(),
@@ -229,10 +275,36 @@ impl ProcessView {
         } else {
             snapshot.retention()
         };
-        let confirmed_count = confirmed.len();
-        let target = retain_unconfirmed(&self.rows, confirmed, &retention);
-        let retained = target.len() - confirmed_count;
-        let status = refresh_status(source_status, snapshot, retained, rejected.as_deref());
+        let confirmed_ids: HashSet<ItemId> = confirmed.iter().map(|row| row.item_id).collect();
+        let mut target = retain_unconfirmed(&self.rows, confirmed, &retention);
+        let unconfirmed_in = |rows: &[Row]| {
+            rows.iter()
+                .filter(|row| !confirmed_ids.contains(&row.item_id))
+                .count()
+        };
+        // A client receives the status and the rows in the same catch-up
+        // snapshot, so the status is charged against the frame before the rows
+        // are. The clause truncation adds is charged a fixed allowance instead
+        // of being measured, so the count it states cannot move the budget that
+        // produced it; every other clause can only shrink when rows are dropped.
+        let provisional = refresh_status(
+            source_status,
+            snapshot,
+            unconfirmed_in(&target),
+            rejected.as_deref(),
+            0,
+        );
+        let truncated =
+            bound_to_snapshot_frame(&mut target, provisional.len() + TRUNCATION_CLAUSE_BYTES);
+        let retained = unconfirmed_in(&target);
+        let status = refresh_status(
+            source_status,
+            snapshot,
+            retained,
+            rejected.as_deref(),
+            truncated,
+        );
+        debug_assert!(status.len() <= provisional.len() + TRUNCATION_CLAUSE_BYTES);
 
         let (batch, max_ops) = session.with_store(|store| {
             let limits = store.limits();
@@ -261,6 +333,7 @@ impl ProcessView {
 
         let mut result = Refreshed {
             retained,
+            truncated,
             ..Refreshed::default()
         };
         for planned in &plan {
@@ -358,15 +431,24 @@ fn commit(
 }
 
 /// The published status: what the source says it read, what the scan could not
-/// see, and how many rows on screen the scan did not confirm.
+/// see, how many rows on screen the scan did not confirm, and how many rows
+/// this app declined to publish because they would not fit one snapshot frame.
 ///
 /// Every clause is derived from counts and from fixed wording. No record's own
 /// text ever reaches the status line, so a process cannot write into it.
+///
+/// The truncation clause names its own cause and is deliberately distinct from
+/// every other shortfall: rows beyond the publishable size were read perfectly
+/// well, so calling them unreadable would report a failure that never happened,
+/// and they are not the entries the collector's own record bound left unread
+/// (`beyond the record limit`) either — this bound belongs to the wire, not to
+/// the scan.
 pub fn refresh_status(
     source_status: &str,
     snapshot: &ProcessSnapshot,
     retained: usize,
     rejected: Option<&str>,
+    truncated: usize,
 ) -> String {
     let mut status = published_status(source_status, snapshot);
     if let Some(reason) = rejected {
@@ -379,7 +461,52 @@ pub fn refresh_status(
             if retained == 1 { "row" } else { "rows" }
         );
     }
+    if truncated > 0 {
+        let _ = write!(
+            status,
+            " · {truncated} {} beyond the publishable size limit",
+            if truncated == 1 { "row" } else { "rows" }
+        );
+    }
     status
+}
+
+/// Drops the trailing rows a catch-up snapshot of the resulting model could not
+/// carry, and returns how many were dropped (§18, §26).
+///
+/// `sessiond` exports a snapshot as one transaction holding every cached range
+/// of every model, and checks only its operation count, so a model larger than
+/// one frame is one no client can be sent — not on attach and not on resync.
+/// Every quantity charged here is the same upper bound the refresh planner
+/// charges, computed on the values actually being published, plus the
+/// `MODEL_RESET_RANGE` operation the snapshot opens per
+/// [`DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION`] rows and a fixed allowance for the
+/// shell that travels with them.
+///
+/// The rows kept are the *leading* ones, in the order the source already
+/// publishes — `ProcFsSource` sorts by ascending PID — so the published window
+/// is a deterministic function of the snapshot alone. An unchanged host keeps
+/// exactly the rows it kept last tick: no row churns in and out, and an
+/// identical tick still publishes nothing.
+fn bound_to_snapshot_frame(rows: &mut Vec<Row>, status_bytes: usize) -> usize {
+    let budget = MAX_TRANSACTION_PAYLOAD_BYTES.saturating_sub(SNAPSHOT_SHELL_BYTES + status_bytes);
+    let mut spent = 0usize;
+    let mut kept = 0usize;
+    for row in rows.iter() {
+        let mut cost = row_wire_bytes(row);
+        if kept.is_multiple_of(DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION) {
+            // This row opens another operation of the exported snapshot.
+            cost += SNAPSHOT_RANGE_BYTES;
+        }
+        if spent + cost > budget {
+            break;
+        }
+        spent += cost;
+        kept += 1;
+    }
+    let dropped = rows.len() - kept;
+    rows.truncate(kept);
+    dropped
 }
 
 /// Keeps rows the scan did not confirm and could not account for, in the
@@ -938,9 +1065,9 @@ mod tests {
         let mut source = ScriptedFakeSource::default();
         let snapshot = source.snapshot();
         let label = ScriptedFakeSource::STATUS_TEXT;
-        assert_eq!(refresh_status(label, &snapshot, 0, None), label);
+        assert_eq!(refresh_status(label, &snapshot, 0, None, 0), label);
         assert_eq!(
-            refresh_status(label, &snapshot, 1, None),
+            refresh_status(label, &snapshot, 1, None, 0),
             format!("{label} · 1 row retained from an earlier scan")
         );
         assert_eq!(
@@ -948,13 +1075,31 @@ mod tests {
                 label,
                 &snapshot,
                 2,
-                Some("duplicate process instance identity")
+                Some("duplicate process instance identity"),
+                0
             ),
             format!(
                 "{label} · snapshot rejected: duplicate process instance identity · \
                  2 rows retained from an earlier scan"
             )
         );
+        // Rows left unpublished for size are their own clause: they were read,
+        // so they are never "unreadable", and they are not the entries the
+        // collector's record bound never read either.
+        assert_eq!(
+            refresh_status(label, &snapshot, 0, None, 1),
+            format!("{label} · 1 row beyond the publishable size limit")
+        );
+        let truncated = refresh_status(label, &snapshot, 2, None, 7);
+        assert_eq!(
+            truncated,
+            format!(
+                "{label} · 2 rows retained from an earlier scan · \
+                 7 rows beyond the publishable size limit"
+            )
+        );
+        assert!(!truncated.contains("unreadable"), "{truncated}");
+        assert!(!truncated.contains("record limit"), "{truncated}");
         let mut failed = snapshot.clone();
         failed.records.clear();
         failed.completeness = Completeness::from_scan(
@@ -966,12 +1111,33 @@ mod tests {
             }],
         );
         assert_eq!(
-            refresh_status(label, &failed, 3, None),
+            refresh_status(label, &failed, 3, None, 0),
             format!(
                 "{label} · incomplete scan · process list unavailable: permission denied · \
                  3 rows retained from an earlier scan"
             )
         );
+    }
+
+    /// The clause truncation adds is charged a fixed allowance before the rows
+    /// are budgeted, so that allowance must cover the widest count it can ever
+    /// state — otherwise the status could outgrow the frame the rows were
+    /// chosen to fit.
+    #[test]
+    fn the_truncation_clause_never_exceeds_the_allowance_reserved_for_it() {
+        let mut source = ScriptedFakeSource::default();
+        let snapshot = source.snapshot();
+        let label = ScriptedFakeSource::STATUS_TEXT;
+        let base = refresh_status(label, &snapshot, 0, None, 0);
+        for truncated in [1usize, 9, 6_683, usize::MAX] {
+            let status = refresh_status(label, &snapshot, 0, None, truncated);
+            assert!(
+                status.len() - base.len() <= TRUNCATION_CLAUSE_BYTES,
+                "{truncated} rows cost {} bytes of status, above the {TRUNCATION_CLAUSE_BYTES} \
+                 reserved for the clause",
+                status.len() - base.len()
+            );
+        }
     }
 
     /// A plan that does not fit in one transaction commits as several, and a

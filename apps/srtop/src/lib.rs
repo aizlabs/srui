@@ -108,6 +108,14 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
+/// Publishes the shell and `items` in one transaction.
+///
+/// `items` must already be bounded to what one catch-up snapshot of the
+/// resulting model can carry: this is the start path, and a client that
+/// attaches to this session at any later moment is brought up by a single
+/// snapshot transaction of exactly this model (§18, §26). The bound is applied
+/// where the rows are chosen, by `refresh::ProcessView::start`, because only
+/// there can the status honestly say how many rows were left out.
 pub(crate) fn initialize_rows(
     session: &Session,
     items: Vec<srui_semantic_tree::ModelItem>,

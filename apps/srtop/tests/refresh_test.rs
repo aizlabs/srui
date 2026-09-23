@@ -450,15 +450,125 @@ fn frames_since(session: &Session, revision: u64) -> Vec<usize> {
         .collect()
 }
 
+/// The bytes a fresh client's catch-up snapshot of this session occupies,
+/// taken from the real attach path a client uses — `bootstrap_fresh_client`,
+/// which exports the snapshot `sessiond` would actually send (§18) — and
+/// measured with the protocol's own encoder, the quantity `SruiCodec` compares
+/// against the frame limit before writing it (§26).
+fn snapshot_frame_bytes(session: &Session) -> usize {
+    let hello = srui_protocol::ClientHello {
+        core_version: "0.5.0".to_string(),
+        profiles: vec!["org.srui.standard-widgets/1".to_string()],
+        limits: None,
+        client_instance_id: vec![1, 2, 3],
+        client_metadata: Default::default(),
+        known_resource_hashes: vec![],
+    };
+    let snapshot = session
+        .bootstrap_fresh_client(&hello)
+        .expect("a fresh client attaches")
+        .snapshot
+        .expect("a populated session sends a catch-up snapshot");
+    srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+        msg: Some(srui_protocol::srui_message::Msg::Transaction(snapshot)),
+    })
+}
+
+/// A collection that would not fit in one catch-up snapshot frame is published
+/// truncated, and says so.
+///
+/// Splitting the live mutations is not enough: `export_snapshot_transaction`
+/// puts every cached range of the model into one transaction and checks only
+/// its operation count, so a model larger than one frame is refused by
+/// `SruiCodec` for every fresh client and every resync — nobody can attach at
+/// all. The rows that do not fit are therefore never published.
+#[test]
+fn a_collection_larger_than_one_snapshot_frame_is_published_truncated() {
+    let session = Session::mint();
+    let rows = 34_000;
+    let (mut view, _) = start_from_source(&session, &mut Widest { rows, first_pid: 1 }).unwrap();
+
+    // The authoritative check first: the snapshot a fresh client is really sent.
+    let frame = snapshot_frame_bytes(&session);
+    assert!(
+        frame <= DEFAULT_MAX_FRAME_SIZE,
+        "a catch-up snapshot of {frame} bytes exceeds the {DEFAULT_MAX_FRAME_SIZE}-byte frame \
+         limit and would be refused for every client that attaches"
+    );
+    assert!(
+        frame > 13 * 1024 * 1024,
+        "the collection must really approach the ceiling, not be trivially small; it was \
+         {frame} bytes"
+    );
+
+    let first = published(&session);
+    assert!(
+        first.len() < rows as usize,
+        "34,000 widest rows cannot fit one frame; {} were published",
+        first.len()
+    );
+    assert!(
+        first.len() > 20_000,
+        "the ceiling must cost only what it has to; {} rows were published",
+        first.len()
+    );
+    let dropped = rows as usize - first.len();
+    assert_eq!(
+        status_text(&session),
+        format!("{FAKE_STATUS_TEXT} · {dropped} rows beyond the publishable size limit"),
+        "the truncation is stated in counts and fixed wording only"
+    );
+    // The rows kept are the leading ones of the order the source publishes.
+    assert_eq!(
+        names(&first)
+            .iter()
+            .map(|(pid, _)| *pid)
+            .collect::<Vec<u64>>(),
+        (1..=first.len() as u64).collect::<Vec<u64>>()
+    );
+    assert_shell_intact(&session);
+
+    // Stability: the same oversized snapshot publishes nothing and moves no row.
+    for _ in 0..3 {
+        let outcome = view
+            .refresh(&session, &mut Widest { rows, first_pid: 1 })
+            .unwrap();
+        assert!(!outcome.published(), "{outcome:?}");
+        assert_eq!(outcome.truncated, dropped);
+        assert_eq!(published(&session), first, "no row may churn in or out");
+    }
+}
+
+/// A collection that fits is published whole: the ceiling costs a large but
+/// deliverable model nothing, and adds no clause to the status.
+#[test]
+fn a_collection_just_inside_the_snapshot_frame_is_published_whole() {
+    let session = Session::mint();
+    let rows = 27_000;
+    start_from_source(&session, &mut Widest { rows, first_pid: 1 }).unwrap();
+
+    assert_eq!(published(&session).len(), rows as usize);
+    assert_eq!(status_text(&session), FAKE_STATUS_TEXT);
+    let frame = snapshot_frame_bytes(&session);
+    assert!(
+        frame <= DEFAULT_MAX_FRAME_SIZE,
+        "{frame} exceeds the frame limit"
+    );
+    assert!(
+        frame > 13 * 1024 * 1024,
+        "this collection must really approach the ceiling; it was {frame} bytes"
+    );
+}
+
 /// A refresh whose payload exceeds the §26 frame limit commits as consecutive
 /// transactions, every one of them a frame a conforming decoder accepts.
 ///
 /// Chunking by operation count alone is not enough: these rows need only four
 /// `MODEL_INSERT` operations, far inside the 10,000-operation bound, and still
-/// carry more than 16 MiB. Committing them as one transaction would advance the
-/// server's revision and then have the codec refuse the frame, detaching the
-/// client from a server that has already moved on — and the next identical tick
-/// would diff clean and republish nothing.
+/// carry a frame's worth of payload. Committing them as one transaction would
+/// advance the server's revision and then have the codec refuse the frame,
+/// detaching the client from a server that has already moved on — and the next
+/// identical tick would diff clean and republish nothing.
 #[test]
 fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
     let session = Session::mint();
@@ -468,23 +578,27 @@ fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
     let (mut view, _) = start_from_source(
         &session,
         &mut Widest {
-            rows: 500,
+            rows: 4_000,
             first_pid: 900_000,
         },
     )
     .unwrap();
-    assert_eq!(published(&session).len(), 500);
+    assert_eq!(published(&session).len(), 4_000);
 
     let revision = session.current_revision();
-    // 34,000 rows of 512 name bytes each: more than 16 MiB of payload in four
-    // operations.
+    // 34,000 rows of 512 name bytes each, in four operations. The published
+    // collection is bounded to one snapshot frame, so not all of them are
+    // published; replacing 4,000 rows with as many as do fit still carries more
+    // than one frame of payload, which only a size bound can split.
     let rows = 34_000;
     let outcome = view
         .refresh(&session, &mut Widest { rows, first_pid: 1 })
         .unwrap();
-    assert_eq!(outcome.inserted, rows as usize);
-    assert_eq!(outcome.deleted, 500);
-    assert_eq!(published(&session).len(), rows as usize);
+    let published_rows = published(&session).len();
+    assert!(published_rows < rows as usize && published_rows > 20_000);
+    assert_eq!(outcome.inserted, published_rows);
+    assert_eq!(outcome.truncated, rows as usize - published_rows);
+    assert_eq!(outcome.deleted, 4_000);
     assert_shell_intact(&session);
 
     let operations = operations_since(&session, revision);
@@ -494,13 +608,16 @@ fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
          bound can split it",
         operations.len()
     );
-    assert!(matches!(operations[0], Operation::ModelDelete { .. }));
+    // The status changed — this refresh truncates — so it leads the plan, ahead
+    // of the deletions, and every deletion still precedes every insertion.
+    assert!(matches!(operations[0], Operation::SetProperty { .. }));
+    assert!(matches!(operations[1], Operation::ModelDelete { .. }));
     let first_insert = operations
         .iter()
         .position(|op| matches!(op, Operation::ModelInsert { .. }))
         .expect("the refresh inserts rows");
     assert!(
-        operations[..first_insert]
+        operations[1..first_insert]
             .iter()
             .all(|op| matches!(op, Operation::ModelDelete { .. })),
         "every deletion must precede every insertion, so an insertion index is final"
@@ -519,15 +636,25 @@ fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
              frame limit and would be refused on delivery"
         );
     }
+    // The published collection is itself bounded to one snapshot frame now, so
+    // a refresh that rebuilds it whole cannot exceed one frame in *encoded*
+    // bytes any more: it exceeds the planner's deliberately conservative upper
+    // bound, which is what splits it here. That the split is driven by size and
+    // not by operation count is asserted above; that a plan is split by a
+    // ceiling its real encoding would cross is asserted on the real encoder in
+    // `a_plan_too_large_for_one_frame_commits_as_several` (src/refresh.rs).
     assert!(
-        frames.iter().sum::<usize>() > DEFAULT_MAX_FRAME_SIZE,
-        "the refresh as a whole must really exceed one frame; it carried {} bytes",
+        frames.iter().sum::<usize>() > 13 * 1024 * 1024,
+        "this refresh must really be near the ceiling, not a small one no bound \
+         could have split; it carried {} bytes",
         frames.iter().sum::<usize>()
     );
     assert!(
         outcome.transactions > 1,
         "this refresh cannot fit in one frame"
     );
+    // And the collection it left behind is one a fresh client can be sent.
+    assert!(snapshot_frame_bytes(&session) <= DEFAULT_MAX_FRAME_SIZE);
 
     // An identical tick still publishes nothing.
     let outcome = view
@@ -558,6 +685,10 @@ fn a_refresh_just_inside_the_frame_bound_still_commits_as_one_transaction() {
         .refresh(&session, &mut Widest { rows, first_pid: 1 })
         .unwrap();
     assert_eq!(outcome.inserted, rows as usize);
+    assert_eq!(
+        outcome.truncated, 0,
+        "a collection that fits must be published whole"
+    );
     assert_eq!(
         outcome.transactions, 1,
         "a refresh that fits in one frame must not be split"
@@ -663,7 +794,7 @@ fn the_published_status_names_only_what_happened() {
     let mut source = ScriptedFakeSource::default();
     let snapshot = source.snapshot();
     assert_eq!(
-        refresh_status(ScriptedFakeSource::STATUS_TEXT, &snapshot, 0, None),
+        refresh_status(ScriptedFakeSource::STATUS_TEXT, &snapshot, 0, None, 0),
         ScriptedFakeSource::STATUS_TEXT,
         "a complete scan of a healthy host says nothing extra"
     );

@@ -52,6 +52,19 @@
       "evidence": [
         "docs/process-explorer/completions/PX-004.md"
       ]
+    },
+    {
+      "feature_id": "SRUI-PX004-004",
+      "feature": "The published collection is never larger than one catch-up snapshot frame: rows beyond that ceiling are not published, the rows kept are the leading ones of the order the source already publishes so an unchanged host churns none of them, and the status states how many were left out in counts and fixed wording alone",
+      "scope": "PX-004/all sources/read-only; the runtime's own unchunked snapshot export is tracked by PX-004-G01 and not changed here",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-004",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004.md"
+      ]
     }
   ]
 }

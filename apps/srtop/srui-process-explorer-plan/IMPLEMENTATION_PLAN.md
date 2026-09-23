@@ -385,6 +385,32 @@ Apply the standing completion contract. Record evidence in `docs/process-explore
 
 ---
 
+#### PX-004-G01 — Deliver catch-up snapshots for collections larger than one frame
+
+**Phase:** A · **Scope size:** M · **Status:** planned · **Gate:** none
+**Dependencies:** PX-004
+**Read:** D1 §§13, 18, 21, 26, 32; D2 T21, T25
+
+##### Build
+
+`export_snapshot_transaction` builds one transaction carrying every cached range of every model and checks only `max_transaction_operations`, so a store whose models encode past the §26 frame limit produces a catch-up snapshot `SruiCodec` refuses to write: no fresh client can attach and no resync can recover. Give the runtime a generic way to deliver such a snapshot — chunked delivery with an explicit snapshot-framing signal on the wire, or an explicit size-bounded export — decided in the protocol and the runtime, never per application.
+Measure the encoded snapshot size on the server before a frame is written, and make an undeliverable snapshot explicit and diagnosable on both sides instead of a detach loop a reconnect reproduces byte for byte. Keep §18 replay and resync, §21 continuity and every §26 limit intact; do not raise the frame limit.
+PX-004 bounds what srtop itself publishes so that app cannot reach this limitation today, which is an app-level ceiling on rows rather than a fix: every other SRUI application, and srtop's own later virtualized ranges, still need the generic facility.
+
+##### Out of scope
+
+No app-specific snapshot path, no raised frame limit, no new transport or retry stack, and no change to the srtop published-collection ceiling.
+
+##### Verification / acceptance criteria
+
+Deterministic Rust tests cover a store whose model encodes past one frame: the fresh-client handshake and the resync path both deliver it, every emitted frame measures under `DEFAULT_MAX_FRAME_SIZE` through `srui_protocol::framed_payload_len`, and the replica reconstructs exactly the exported store. Add §32 conformance coverage for chunked or size-bounded snapshot export — fixtures under `protocol/conformance-vectors` with the manifest counts and `expected.json` updated in the same commit — and assert the Swift client applies the delivered snapshot identically to the Rust replica. A snapshot that still cannot be delivered fails loudly at handshake with a diagnosable error on both sides. Negative tests cover the size bound as well as the operation bound.
+
+##### Handoff and completion
+
+Apply the standing completion contract. Record evidence in `docs/process-explorer/completions/PX-004-G01.md`, update the individual feature ledger, and commit only this bounded change after required checks pass. A gate remains open if a required behavior or native test is missing.
+
+---
+
 #### PX-005 — Add resident memory with accurate units and unavailable states
 
 **Phase:** A · **Scope size:** S · **Status:** planned · **Gate:** none

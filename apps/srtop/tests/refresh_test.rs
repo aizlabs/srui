@@ -2,7 +2,7 @@
 //! keeps unchanged rows, and never lets a failed scan empty the table
 //! (§§8, 12.1, 13, 23).
 use srui_process_explorer::procfs::MAX_RECORDS;
-use srui_process_explorer::refresh::refresh_status;
+use srui_process_explorer::refresh::{refresh_status, RefreshCounts};
 use srui_process_explorer::source::*;
 use srui_process_explorer::{start_from_source, COLUMN, HEADING, MODEL, STATUS, SURFACE, TABLE};
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
@@ -539,6 +539,164 @@ fn a_collection_larger_than_one_snapshot_frame_is_published_truncated() {
     }
 }
 
+/// A scan that fails over a collection already sitting at the snapshot ceiling
+/// deletes nothing, however long its failure makes the status (PX-004 review
+/// round 7).
+///
+/// The regression: the status travels in the same catch-up snapshot as the rows,
+/// so it is charged against that frame before they are. Charging *this tick's*
+/// text meant that a rejected or unlistable scan — whose status is the longest
+/// this app emits, carrying the failure, the retained-row clause and every
+/// degradation the scan reports — shrank the row budget and truncated the
+/// target, and the ensuing diff deleted last-known rows that no scan had said
+/// were gone. The reserve is fixed now, and a refresh that confirmed nothing
+/// plans no row mutation at all.
+#[test]
+fn a_failed_scan_at_the_snapshot_ceiling_deletes_no_row_however_long_its_status() {
+    let session = Session::mint();
+    let rows = 34_000;
+    let (mut view, _) = start_from_source(&session, &mut Widest { rows, first_pid: 1 }).unwrap();
+    let before = published(&session);
+    let dropped = rows as usize - before.len();
+    assert!(
+        dropped > 0 && before.len() > 20_000,
+        "the collection must really sit at the ceiling; {} rows were published",
+        before.len()
+    );
+    let settled_status = status_text(&session);
+
+    // A million entries listed past the record bound, none of them nameable:
+    // the widest count and the most degraded ledger one scan can report.
+    let overloaded_ledger = || {
+        let mut capped = CappedRecords::with_limit(0);
+        for _ in 0..1_000_000u32 {
+            capped.record(0);
+        }
+        capped
+    };
+    let identity_lost = || EnumerationIssue {
+        scope: IssueScope::BootIdentity,
+        reason: MissingReason::Denied,
+        detail: "sys/kernel/random/boot_id: Permission denied (os error 13)".into(),
+    };
+    // The process list itself could not be read.
+    let unlistable = || {
+        let mut snapshot = Widest {
+            rows: 0,
+            first_pid: 1,
+        }
+        .snapshot();
+        snapshot.capped = overloaded_ledger();
+        snapshot.completeness = Completeness::from_scan(
+            SkippedRecords::unenumerable(),
+            vec![
+                EnumerationIssue {
+                    scope: IssueScope::Root,
+                    reason: MissingReason::Denied,
+                    detail: "/proc: Permission denied (os error 13)".into(),
+                },
+                identity_lost(),
+            ],
+        );
+        snapshot
+    };
+    // The records were read and this app refuses to identify them.
+    let rejected = || {
+        let mut snapshot = Widest {
+            rows: 2,
+            first_pid: 1,
+        }
+        .snapshot();
+        snapshot.records[1].key = snapshot.records[0].key.clone();
+        snapshot.capped = overloaded_ledger();
+        let mut skipped = SkippedRecords::with_limit(0);
+        skipped.unnamed();
+        snapshot.completeness = Completeness::from_scan(
+            skipped,
+            vec![
+                EnumerationIssue {
+                    scope: IssueScope::Entry,
+                    reason: MissingReason::Unavailable,
+                    detail: "directory entry: Input/output error (os error 5)".into(),
+                },
+                identity_lost(),
+            ],
+        );
+        snapshot
+    };
+
+    for (name, build) in [
+        ("unlistable", &unlistable as &dyn Fn() -> ProcessSnapshot),
+        ("rejected", &rejected),
+    ] {
+        let revision = session.current_revision();
+        let outcome = view.apply(&session, FAKE_STATUS_TEXT, &build()).unwrap();
+        assert_eq!(
+            (outcome.deleted, outcome.inserted, outcome.updated),
+            (0, 0, 0),
+            "{name}: a failed scan is not evidence that any process ended"
+        );
+        assert_eq!(
+            (outcome.evicted, outcome.truncated),
+            (0, 0),
+            "{name}: a refresh that publishes no row evicts and truncates none"
+        );
+        assert_eq!(outcome.retained, before.len());
+        assert_eq!(
+            published(&session),
+            before,
+            "{name}: every row keeps its identity, its value and its place"
+        );
+        let ops = operations_since(&session, revision);
+        assert!(
+            ops.iter().all(|op| matches!(
+                op,
+                Operation::SetProperty {
+                    id: STATUS,
+                    property: TEXT,
+                    ..
+                }
+            )),
+            "{name}: an error-only refresh must plan no row mutation: {ops:?}"
+        );
+        // The status really did carry every clause it can, each stating its own
+        // count, and none of it is a process's own text.
+        let status = status_text(&session);
+        for clause in [
+            "incomplete scan",
+            "1000000 beyond the record limit",
+            "host identity incomplete",
+            "retained from an earlier scan",
+        ] {
+            assert!(status.contains(clause), "{name}: {status}");
+        }
+        assert!(
+            status.len() > settled_status.len() + 100,
+            "{name}: this status must really be far longer than the one the rows were chosen \
+             under; it was {} bytes against {}",
+            status.len(),
+            settled_status.len()
+        );
+    }
+
+    // Recovery converges: the same host scanned successfully again publishes
+    // nothing but the status it started with.
+    let revision = session.current_revision();
+    let outcome = view
+        .refresh(&session, &mut Widest { rows, first_pid: 1 })
+        .unwrap();
+    assert_eq!(
+        (outcome.inserted, outcome.deleted, outcome.updated),
+        (0, 0, 0),
+        "recovery moves no row"
+    );
+    assert_eq!(outcome.truncated, dropped);
+    assert_eq!(published(&session), before);
+    assert_eq!(status_text(&session), settled_status);
+    assert_eq!(operations_since(&session, revision).len(), 1);
+    assert_shell_intact(&session);
+}
+
 /// A collection that fits is published whole: the ceiling costs a large but
 /// deliverable model nothing, and adds no clause to the status.
 #[test]
@@ -794,7 +952,11 @@ fn the_published_status_names_only_what_happened() {
     let mut source = ScriptedFakeSource::default();
     let snapshot = source.snapshot();
     assert_eq!(
-        refresh_status(ScriptedFakeSource::STATUS_TEXT, &snapshot, 0, None, 0),
+        refresh_status(
+            ScriptedFakeSource::STATUS_TEXT,
+            &snapshot,
+            &RefreshCounts::default()
+        ),
         ScriptedFakeSource::STATUS_TEXT,
         "a complete scan of a healthy host says nothing extra"
     );

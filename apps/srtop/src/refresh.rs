@@ -36,6 +36,23 @@
 //!   that encodes to more than one frame is therefore a collection no fresh
 //!   client can attach to at all, however carefully each refresh was split. The
 //!   rows that do not fit are not published, and the status says how many.
+//! * The rows that fit never depend on what the status says. The status travels
+//!   in the same catch-up snapshot as the rows, so it is charged against that
+//!   frame first — at a fixed reserve covering the longest status this app can
+//!   emit, never at this tick's length. Charging the current text would let a
+//!   failed scan, whose status is the longest of all because it carries both the
+//!   failure and the retained-row clause, shrink the row budget and delete rows
+//!   that same scan had just said it could not account for. A refresh that
+//!   confirmed nothing and may delete nothing goes further and plans no row
+//!   mutation at all.
+//! * The collection is bounded in rows as well as in bytes. Retention keeps a
+//!   row whose absence a scan could not account for, and a scan that cannot
+//!   enumerate its uncertainty accounts for nothing, so on such a host every
+//!   absent row would be kept for ever — short rows fit a frame in their tens of
+//!   thousands, so the frame ceiling does not stop that growth. No refresh ever
+//!   publishes more than [`MAX_PUBLISHED_ROWS`] rows: the unconfirmed rows
+//!   beyond that are evicted, leading window first, and the status says how
+//!   many.
 //!
 //! ## Why the collection is bounded rather than the snapshot chunked
 //!
@@ -61,10 +78,15 @@
 
 use crate::projection::{Row, SessionItemIds};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
-use crate::{initialize_rows, published_status, MODEL, STATUS};
+use crate::{
+    bounded, initialize_rows, published_status_from, ScanReport, MAX_PUBLISHED_LABEL_BYTES, MODEL,
+    STATUS,
+};
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
 use srui_sdk::{ItemId, Operation, Value, TEXT};
-use srui_semantic_tree::DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION;
+use srui_semantic_tree::{
+    DEFAULT_MAX_CACHED_ITEMS_PER_MODEL, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION,
+};
 use srui_sessiond::{Session, SessionError};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -145,10 +167,44 @@ const SNAPSHOT_SHELL_BYTES: usize = 4096;
 /// A snapshot emits one per [`DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION`] rows.
 const SNAPSHOT_RANGE_BYTES: usize = OPERATION_FRAMING_BYTES + OPERATION_HEADER_BYTES;
 
-/// Bytes reserved for the status clause that truncation adds: fixed wording and
-/// one decimal count. Reserving it rather than measuring it keeps the budget
-/// independent of the count it produces.
-const TRUNCATION_CLAUSE_BYTES: usize = 64;
+/// Bytes reserved for everything the status builders can add to a source's own
+/// label: every clause they can emit, each stating its widest count, and the
+/// widest rejection reason one of them can quote.
+///
+/// Reserved rather than measured. A status is charged against the snapshot frame
+/// before the rows are, so measuring *this tick's* text would let a scan that
+/// failed — whose status is the longest this app publishes, because it carries
+/// the failure and the retained-row clause — shrink the row budget and evict
+/// rows a failed scan is entitled to keep. The allowance is asserted against the
+/// real builder, with every count at `usize::MAX`, by
+/// `the_reserved_status_allowance_covers_the_longest_status_the_builder_can_emit`.
+const MAX_STATUS_CLAUSE_BYTES: usize = 1024;
+
+/// Bytes the published status is charged against the catch-up snapshot frame,
+/// whatever this tick's status turns out to say: the widest label a source can
+/// publish plus the widest set of clauses a scan can add to it.
+const STATUS_RESERVE_BYTES: usize = MAX_PUBLISHED_LABEL_BYTES + MAX_STATUS_CLAUSE_BYTES;
+
+/// The most of a rejection reason the status quotes. The reason is this app's
+/// own error text, not a record's, and it is bounded all the same so that the
+/// status stays inside [`MAX_STATUS_CLAUSE_BYTES`] whatever a later error says.
+const MAX_REJECTION_BYTES: usize = 128;
+
+/// The most rows this app ever publishes, however a scan degrades and however
+/// long it stays degraded (§26; PX-004 review round 7).
+///
+/// The frame ceiling bounds a collection of *wide* rows, and the scan's own
+/// ledgers bound the identities one scan can leave uncertain — but a ledger that
+/// overflows reports itself unenumerable, and a scan that cannot enumerate its
+/// uncertainty keeps every absent row. Short rows fit a frame in their tens of
+/// thousands, so without a bound on the rows carried forward, ordinary churn on
+/// a host whose ledger overflows grows the collection past the model's own §26
+/// cached-item limit, after which every insert is refused and no refresh can
+/// converge again. This is that bound, and it is a bound on the published
+/// collection rather than on one scan's memory, so no ledger, issue list or
+/// retention decision can lift it.
+pub const MAX_PUBLISHED_ROWS: usize = DEFAULT_MAX_CACHED_ITEMS_PER_MODEL;
+const _: () = assert!(MAX_PUBLISHED_ROWS <= DEFAULT_MAX_CACHED_ITEMS_PER_MODEL);
 
 /// An upper bound on the bytes `value` occupies inside an encoded operation,
 /// its own tag and length prefix included.
@@ -188,8 +244,12 @@ pub struct Refreshed {
     pub updated: usize,
     /// Rows the scan did not confirm and that were kept rather than deleted.
     pub retained: usize,
+    /// Rows the scan did not confirm and that were dropped anyway, because
+    /// carrying them would publish more than [`MAX_PUBLISHED_ROWS`] rows.
+    pub evicted: usize,
     /// Rows this app declined to publish because the resulting collection would
-    /// not fit in one catch-up snapshot frame (§18, §26).
+    /// not fit in one catch-up snapshot frame, or would hold more rows than a
+    /// model may cache (§18, §26).
     pub truncated: usize,
     pub status_changed: bool,
     /// Transactions this refresh committed. Zero means the snapshot held no
@@ -209,6 +269,9 @@ pub struct ProcessView {
     ids: SessionItemIds,
     rows: Vec<Row>,
     status: String,
+    /// The most rows this view publishes: [`MAX_PUBLISHED_ROWS`], further
+    /// lowered to whatever this session's store will cache.
+    published_limit: usize,
 }
 
 impl ProcessView {
@@ -222,21 +285,58 @@ impl ProcessView {
         let snapshot = source.snapshot();
         let mut ids = SessionItemIds::default();
         let mut rows = ids.project(&snapshot)?;
+        // Both bounds are this store's as well as the protocol's: a session
+        // minted with a lower cached-item limit publishes fewer rows, never rows
+        // its own store would refuse.
+        let published_limit = session
+            .with_store(|store| MAX_PUBLISHED_ROWS.min(store.limits().max_cached_items_per_model));
         // The start path is exactly the attach path the ceiling exists for: the
         // first publication is one transaction, and every client that attaches
-        // later is brought up by one snapshot of this same model.
-        let provisional = refresh_status(&source_status, &snapshot, 0, None, 0);
-        let truncated =
-            bound_to_snapshot_frame(&mut rows, provisional.len() + TRUNCATION_CLAUSE_BYTES);
-        let status = refresh_status(&source_status, &snapshot, 0, None, truncated);
-        debug_assert!(status.len() <= provisional.len() + TRUNCATION_CLAUSE_BYTES);
+        // later is brought up by one snapshot of this same model. The status is
+        // charged its fixed reserve, never its current length, so the rows that
+        // fit do not depend on what this tick's status happens to say.
+        let truncated = bound_to_publishable_collection(&mut rows, published_limit);
+        let status = refresh_status(
+            &source_status,
+            &snapshot,
+            &RefreshCounts {
+                truncated,
+                ..RefreshCounts::default()
+            },
+        );
+        debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
         initialize_rows(
             session,
             rows.iter().map(Row::to_model_item).collect(),
             &status,
         )?;
         ids.retain(&rows);
-        Ok((Self { ids, rows, status }, snapshot))
+        Ok((
+            Self {
+                ids,
+                rows,
+                status,
+                published_limit,
+            },
+            snapshot,
+        ))
+    }
+
+    /// Lowers this view's published-row ceiling.
+    ///
+    /// The ceiling can only ever be lowered: whatever a caller asks for, no view
+    /// publishes more than [`MAX_PUBLISHED_ROWS`] rows, or more than its own
+    /// store will cache. It exists so a test can drive the eviction that ceiling
+    /// causes without publishing a hundred thousand rows per tick.
+    #[must_use]
+    pub fn with_published_limit(mut self, limit: usize) -> Self {
+        self.published_limit = self.published_limit.min(limit.max(1));
+        self
+    }
+
+    /// The most rows this view will publish.
+    pub fn published_limit(&self) -> usize {
+        self.published_limit
     }
 
     /// Samples the source once and publishes the difference.
@@ -275,36 +375,41 @@ impl ProcessView {
         } else {
             snapshot.retention()
         };
+        // A scan that confirmed nothing and is entitled to delete nothing has no
+        // row work to do at all: the target *is* the published rows. It plans
+        // only its status, so a failure whose text is the longest this app emits
+        // cannot cost a row — there is no row budget, no diff and no eviction on
+        // this path to cost one.
+        if confirmed.is_empty() && retention.is_global() {
+            return self.publish_status_only(session, source_status, snapshot, rejected);
+        }
         let confirmed_ids: HashSet<ItemId> = confirmed.iter().map(|row| row.item_id).collect();
         let mut target = retain_unconfirmed(&self.rows, confirmed, &retention);
-        let unconfirmed_in = |rows: &[Row]| {
-            rows.iter()
-                .filter(|row| !confirmed_ids.contains(&row.item_id))
-                .count()
-        };
+        // Retention is bounded by construction, whatever a scan can and cannot
+        // enumerate: the rows carried forward are evicted down to what the
+        // published-row ceiling leaves once this scan's own rows are counted.
+        let evicted = evict_unconfirmed_beyond(&mut target, &confirmed_ids, self.published_limit);
         // A client receives the status and the rows in the same catch-up
         // snapshot, so the status is charged against the frame before the rows
-        // are. The clause truncation adds is charged a fixed allowance instead
-        // of being measured, so the count it states cannot move the budget that
-        // produced it; every other clause can only shrink when rows are dropped.
-        let provisional = refresh_status(
-            source_status,
-            snapshot,
-            unconfirmed_in(&target),
-            rejected.as_deref(),
-            0,
-        );
-        let truncated =
-            bound_to_snapshot_frame(&mut target, provisional.len() + TRUNCATION_CLAUSE_BYTES);
-        let retained = unconfirmed_in(&target);
+        // are — at its fixed reserve, never at this tick's length, so no clause a
+        // degraded scan adds can shrink the row budget and delete a row the scan
+        // never said had ended.
+        let truncated = bound_to_publishable_collection(&mut target, self.published_limit);
+        let retained = target
+            .iter()
+            .filter(|row| !confirmed_ids.contains(&row.item_id))
+            .count();
         let status = refresh_status(
             source_status,
             snapshot,
-            retained,
-            rejected.as_deref(),
-            truncated,
+            &RefreshCounts {
+                retained,
+                rejected,
+                evicted,
+                truncated,
+            },
         );
-        debug_assert!(status.len() <= provisional.len() + TRUNCATION_CLAUSE_BYTES);
+        debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
 
         let (batch, max_ops) = session.with_store(|store| {
             let limits = store.limits();
@@ -333,6 +438,7 @@ impl ProcessView {
 
         let mut result = Refreshed {
             retained,
+            evicted,
             truncated,
             ..Refreshed::default()
         };
@@ -356,6 +462,56 @@ impl ProcessView {
             session,
             &plan,
             max_ops,
+            MAX_TRANSACTION_PAYLOAD_BYTES,
+            &mut self.rows,
+            &mut self.status,
+        );
+        result.transactions = transactions;
+        self.ids.retain(&self.rows);
+        outcome.map(|()| result)
+    }
+
+    /// Publishes an error over the last-known rows and mutates no row.
+    ///
+    /// This is the whole of a refresh whose scan confirmed nothing and accounted
+    /// for no absence — a rejected snapshot, or a process list that could not be
+    /// listed. Such a tick is evidence about the scan, never about a process, so
+    /// there is nothing to diff: the published rows are already inside every
+    /// bound they were published under, and re-choosing them here is exactly how
+    /// a longer status could evict one.
+    fn publish_status_only(
+        &mut self,
+        session: &Session,
+        source_status: &str,
+        snapshot: &ProcessSnapshot,
+        rejected: Option<String>,
+    ) -> Result<Refreshed, SessionError> {
+        let retained = self.rows.len();
+        let status = refresh_status(
+            source_status,
+            snapshot,
+            &RefreshCounts {
+                retained,
+                rejected,
+                ..RefreshCounts::default()
+            },
+        );
+        debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
+        let mut result = Refreshed {
+            retained,
+            ..Refreshed::default()
+        };
+        if status == self.status {
+            // An identical failure republishes nothing at all.
+            self.ids.retain(&self.rows);
+            return Ok(result);
+        }
+        result.status_changed = true;
+        let plan = [Planned::new(Effect::Status(status))];
+        let (transactions, outcome) = commit(
+            session,
+            &plan,
+            1,
             MAX_TRANSACTION_PAYLOAD_BYTES,
             &mut self.rows,
             &mut self.status,
@@ -443,36 +599,90 @@ fn commit(
 /// and they are not the entries the collector's own record bound left unread
 /// (`beyond the record limit`) either — this bound belongs to the wire, not to
 /// the scan.
+///
+/// The eviction clause is distinct again, and from the truncation clause too: an
+/// evicted row is one this app *had* published and stopped carrying because no
+/// scan has confirmed it since and the collection may not grow without bound. It
+/// is not a process that ended — those leave no clause, because their rows are
+/// simply deleted — not a record that could not be read, not an entry beyond the
+/// collector's record bound, and not a row of this snapshot that did not fit.
 pub fn refresh_status(
     source_status: &str,
     snapshot: &ProcessSnapshot,
-    retained: usize,
-    rejected: Option<&str>,
-    truncated: usize,
+    counts: &RefreshCounts,
 ) -> String {
-    let mut status = published_status(source_status, snapshot);
-    if let Some(reason) = rejected {
-        let _ = write!(status, " · snapshot rejected: {reason}");
-    }
-    if retained > 0 {
+    refresh_status_from(source_status, &ScanReport::of(snapshot), counts)
+}
+
+/// What one refresh adds to the status its scan already reported.
+///
+/// Grouped so the reserve [`refresh`](ProcessView::refresh) charges the frame
+/// can be measured against this builder with every count at its widest, rather
+/// than against the counts a test can arrange.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshCounts {
+    /// Rows the scan did not confirm and that were kept.
+    pub retained: usize,
+    /// Why this snapshot was refused whole, when it was.
+    pub rejected: Option<String>,
+    /// Unconfirmed rows dropped to stay inside the published-row ceiling.
+    pub evicted: usize,
+    /// Rows left unpublished because the collection would not fit.
+    pub truncated: usize,
+}
+
+/// The same status, from a scan's report rather than from the scan itself.
+pub(crate) fn refresh_status_from(
+    source_status: &str,
+    scan: &ScanReport,
+    counts: &RefreshCounts,
+) -> String {
+    let mut status = published_status_from(source_status, scan);
+    if let Some(reason) = &counts.rejected {
         let _ = write!(
             status,
-            " · {retained} {} retained from an earlier scan",
-            if retained == 1 { "row" } else { "rows" }
+            " · snapshot rejected: {}",
+            bounded(reason, MAX_REJECTION_BYTES)
         );
     }
-    if truncated > 0 {
+    if counts.retained > 0 {
         let _ = write!(
             status,
-            " · {truncated} {} beyond the publishable size limit",
-            if truncated == 1 { "row" } else { "rows" }
+            " · {} {} retained from an earlier scan",
+            counts.retained,
+            rows_word(counts.retained)
+        );
+    }
+    if counts.evicted > 0 {
+        let _ = write!(
+            status,
+            " · {} unconfirmed {} dropped to stay inside the published row limit",
+            counts.evicted,
+            rows_word(counts.evicted)
+        );
+    }
+    if counts.truncated > 0 {
+        let _ = write!(
+            status,
+            " · {} {} beyond the publishable size limit",
+            counts.truncated,
+            rows_word(counts.truncated)
         );
     }
     status
 }
 
-/// Drops the trailing rows a catch-up snapshot of the resulting model could not
-/// carry, and returns how many were dropped (§18, §26).
+fn rows_word(count: usize) -> &'static str {
+    if count == 1 {
+        "row"
+    } else {
+        "rows"
+    }
+}
+
+/// Drops the trailing rows this app cannot publish — those a catch-up snapshot
+/// of the resulting model could not carry, and those beyond `limit` — and
+/// returns how many were dropped (§18, §26).
 ///
 /// `sessiond` exports a snapshot as one transaction holding every cached range
 /// of every model, and checks only its operation count, so a model larger than
@@ -483,16 +693,30 @@ pub fn refresh_status(
 /// [`DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION`] rows and a fixed allowance for the
 /// shell that travels with them.
 ///
+/// The frame bounds bytes and `limit` bounds rows, and neither implies the
+/// other: tens of thousands of long names overflow a frame, while short rows fit
+/// one frame in numbers a model may not cache. Both are applied here, where the
+/// rows are chosen.
+///
+/// The status is charged [`STATUS_RESERVE_BYTES`] rather than its own length, so
+/// the rows that fit are a function of the rows alone. A status that grew
+/// because a scan failed therefore cannot shrink the row budget and delete a row
+/// no scan said had ended.
+///
 /// The rows kept are the *leading* ones, in the order the source already
 /// publishes — `ProcFsSource` sorts by ascending PID — so the published window
 /// is a deterministic function of the snapshot alone. An unchanged host keeps
 /// exactly the rows it kept last tick: no row churns in and out, and an
 /// identical tick still publishes nothing.
-fn bound_to_snapshot_frame(rows: &mut Vec<Row>, status_bytes: usize) -> usize {
-    let budget = MAX_TRANSACTION_PAYLOAD_BYTES.saturating_sub(SNAPSHOT_SHELL_BYTES + status_bytes);
+fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
+    let budget =
+        MAX_TRANSACTION_PAYLOAD_BYTES.saturating_sub(SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES);
     let mut spent = 0usize;
     let mut kept = 0usize;
     for row in rows.iter() {
+        if kept == limit {
+            break;
+        }
         let mut cost = row_wire_bytes(row);
         if kept.is_multiple_of(DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION) {
             // This row opens another operation of the exported snapshot.
@@ -507,6 +731,52 @@ fn bound_to_snapshot_frame(rows: &mut Vec<Row>, status_bytes: usize) -> usize {
     let dropped = rows.len() - kept;
     rows.truncate(kept);
     dropped
+}
+
+/// Drops the unconfirmed rows a collection bounded to `limit` has no room for,
+/// and returns how many were dropped (PX-004 review round 7).
+///
+/// Retention keeps a row whose absence a scan could not account for, and a scan
+/// that cannot enumerate its uncertainty at all — a ledger that overflowed, an
+/// entry it could not examine — accounts for nothing, so on such a host every
+/// absent row would be kept for ever and ordinary churn would grow the
+/// collection until the model's own §26 item limit refused the next insert. This
+/// is the bound that cannot happen under: it is applied to every refresh, under
+/// every kind of retention, and depends on no property of the scan.
+///
+/// Which rows go is a function of the published order alone: the rows kept are
+/// the leading unconfirmed ones, the same deterministic window the snapshot
+/// ceiling keeps, so two runs of the same ticks publish the same rows. That
+/// window is also the useful one, because [`retain_unconfirmed`] anchors a row
+/// the current scan did not confirm behind the rows it did: a row drifts towards
+/// the end for as long as it goes unconfirmed, so the trailing rows evicted here
+/// are the stalest ones. A row a scan did confirm is never evicted, an evicted
+/// row is never re-admitted from history — it has left the published collection
+/// — and nothing here depends on iteration order or on a clock.
+fn evict_unconfirmed_beyond(
+    rows: &mut Vec<Row>,
+    confirmed: &HashSet<ItemId>,
+    limit: usize,
+) -> usize {
+    if rows.len() <= limit {
+        return 0;
+    }
+    let mut excess = rows.len() - limit;
+    let mut evicted: HashSet<ItemId> = HashSet::new();
+    for row in rows.iter().rev() {
+        if excess == 0 {
+            break;
+        }
+        if !confirmed.contains(&row.item_id) {
+            evicted.insert(row.item_id);
+            excess -= 1;
+        }
+    }
+    if evicted.is_empty() {
+        return 0;
+    }
+    rows.retain(|row| !evicted.contains(&row.item_id));
+    evicted.len()
 }
 
 /// Keeps rows the scan did not confirm and could not account for, in the
@@ -843,9 +1113,11 @@ pub async fn poll<S>(
 mod tests {
     use super::*;
     use crate::source::{
-        Completeness, DisplayName, EnumerationIssue, IssueScope, MissingReason, Observed,
-        ProcessKey, ScriptedFakeSource, SkippedRecords, MAX_DISPLAY_NAME_CHARS,
+        CappedRecords, Completeness, CreationToken, DisplayName, EnumerationIssue,
+        FakeProcessSource, IssueScope, MissingReason, Observed, ProcessKey, ProcessRecord,
+        ScriptedFakeSource, SkippedRecords, FAKE_STATUS_TEXT, MAX_DISPLAY_NAME_CHARS,
     };
+    use crate::MAX_SOURCE_STATUS_BYTES;
     use std::collections::BTreeSet;
 
     /// Retention that keeps every row a scan did not confirm.
@@ -1060,23 +1332,34 @@ mod tests {
         );
     }
 
+    /// A refresh's counts, with everything the caller did not name left at zero.
+    fn counted(retained: usize, rejected: Option<&str>, truncated: usize) -> RefreshCounts {
+        RefreshCounts {
+            retained,
+            rejected: rejected.map(str::to_string),
+            truncated,
+            ..RefreshCounts::default()
+        }
+    }
+
     #[test]
     fn a_status_clause_is_added_only_for_what_actually_happened() {
         let mut source = ScriptedFakeSource::default();
         let snapshot = source.snapshot();
         let label = ScriptedFakeSource::STATUS_TEXT;
-        assert_eq!(refresh_status(label, &snapshot, 0, None, 0), label);
         assert_eq!(
-            refresh_status(label, &snapshot, 1, None, 0),
+            refresh_status(label, &snapshot, &RefreshCounts::default()),
+            label
+        );
+        assert_eq!(
+            refresh_status(label, &snapshot, &counted(1, None, 0)),
             format!("{label} · 1 row retained from an earlier scan")
         );
         assert_eq!(
             refresh_status(
                 label,
                 &snapshot,
-                2,
-                Some("duplicate process instance identity"),
-                0
+                &counted(2, Some("duplicate process instance identity"), 0)
             ),
             format!(
                 "{label} · snapshot rejected: duplicate process instance identity · \
@@ -1087,10 +1370,10 @@ mod tests {
         // so they are never "unreadable", and they are not the entries the
         // collector's record bound never read either.
         assert_eq!(
-            refresh_status(label, &snapshot, 0, None, 1),
+            refresh_status(label, &snapshot, &counted(0, None, 1)),
             format!("{label} · 1 row beyond the publishable size limit")
         );
-        let truncated = refresh_status(label, &snapshot, 2, None, 7);
+        let truncated = refresh_status(label, &snapshot, &counted(2, None, 7));
         assert_eq!(
             truncated,
             format!(
@@ -1100,6 +1383,39 @@ mod tests {
         );
         assert!(!truncated.contains("unreadable"), "{truncated}");
         assert!(!truncated.contains("record limit"), "{truncated}");
+        // A row dropped because the collection may not grow says exactly that,
+        // and is never confused with a row that would not fit, with a record
+        // that could not be read, or with an entry beyond the record bound.
+        let evicted = refresh_status(
+            label,
+            &snapshot,
+            &RefreshCounts {
+                retained: 4,
+                evicted: 1,
+                ..RefreshCounts::default()
+            },
+        );
+        assert_eq!(
+            evicted,
+            format!(
+                "{label} · 4 rows retained from an earlier scan · \
+                 1 unconfirmed row dropped to stay inside the published row limit"
+            )
+        );
+        assert!(!evicted.contains("unreadable"), "{evicted}");
+        assert!(!evicted.contains("record limit"), "{evicted}");
+        assert!(!evicted.contains("publishable size"), "{evicted}");
+        assert_eq!(
+            refresh_status(
+                label,
+                &snapshot,
+                &RefreshCounts {
+                    evicted: 2,
+                    ..RefreshCounts::default()
+                }
+            ),
+            format!("{label} · 2 unconfirmed rows dropped to stay inside the published row limit")
+        );
         let mut failed = snapshot.clone();
         failed.records.clear();
         failed.completeness = Completeness::from_scan(
@@ -1111,7 +1427,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            refresh_status(label, &failed, 3, None, 0),
+            refresh_status(label, &failed, &counted(3, None, 0)),
             format!(
                 "{label} · incomplete scan · process list unavailable: permission denied · \
                  3 rows retained from an earlier scan"
@@ -1119,25 +1435,269 @@ mod tests {
         );
     }
 
-    /// The clause truncation adds is charged a fixed allowance before the rows
-    /// are budgeted, so that allowance must cover the widest count it can ever
-    /// state — otherwise the status could outgrow the frame the rows were
-    /// chosen to fit.
+    /// The status is charged a fixed allowance before the rows are budgeted, so
+    /// that allowance must cover the longest status the builder can produce —
+    /// otherwise the status could outgrow the frame the rows were chosen to fit.
+    ///
+    /// Measured against the builder itself, on every clause it can emit with
+    /// every count at `usize::MAX`, rather than against a status a fixture
+    /// happens to be able to construct: a count is a number, and no ledger bound
+    /// limits how large a number a host can produce.
     #[test]
-    fn the_truncation_clause_never_exceeds_the_allowance_reserved_for_it() {
-        let mut source = ScriptedFakeSource::default();
-        let snapshot = source.snapshot();
-        let label = ScriptedFakeSource::STATUS_TEXT;
-        let base = refresh_status(label, &snapshot, 0, None, 0);
-        for truncated in [1usize, 9, 6_683, usize::MAX] {
-            let status = refresh_status(label, &snapshot, 0, None, truncated);
+    fn the_reserved_status_allowance_covers_the_longest_status_the_builder_can_emit() {
+        // A label longer than any source may publish, in four-byte characters so
+        // the cut lands mid-character if it is done by bytes alone.
+        let label = "\u{20000}".repeat(MAX_SOURCE_STATUS_BYTES);
+        let widest_scan = |root| ScanReport {
+            degraded: true,
+            root,
+            listed: usize::MAX,
+            unreadable: usize::MAX,
+            capped: usize::MAX,
+            identity_incomplete: true,
+        };
+        let widest_counts = RefreshCounts {
+            retained: usize::MAX,
+            rejected: Some("\u{20000}".repeat(MAX_REJECTION_BYTES)),
+            evicted: usize::MAX,
+            truncated: usize::MAX,
+        };
+        // Both branches of the scan clause: a root that could not be listed
+        // publishes its reason, any other degradation publishes its counts.
+        for root in [
+            None,
+            Some(MissingReason::Denied),
+            Some(MissingReason::Unavailable),
+        ] {
+            let status = refresh_status_from(&label, &widest_scan(root), &widest_counts);
             assert!(
-                status.len() - base.len() <= TRUNCATION_CLAUSE_BYTES,
-                "{truncated} rows cost {} bytes of status, above the {TRUNCATION_CLAUSE_BYTES} \
-                 reserved for the clause",
-                status.len() - base.len()
+                status.len() <= STATUS_RESERVE_BYTES,
+                "the widest status is {} bytes, above the {STATUS_RESERVE_BYTES} reserved for \
+                 it: {status}",
+                status.len()
+            );
+            assert!(
+                status.len() > STATUS_RESERVE_BYTES / 2,
+                "the reserve must be measured against a status that really is wide; this one \
+                 was {} bytes",
+                status.len()
             );
         }
+        // The label is cut, marked, and never cut through a character.
+        let cut = published_status_from(&label, &ScanReport::default());
+        assert!(cut.len() <= MAX_PUBLISHED_LABEL_BYTES);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(label.starts_with(cut.trim_end_matches('…')));
+        // A label that fits is published exactly as the source wrote it.
+        assert_eq!(
+            published_status_from(ScriptedFakeSource::STATUS_TEXT, &ScanReport::default()),
+            ScriptedFakeSource::STATUS_TEXT
+        );
+    }
+
+    /// A host large enough to sit at the snapshot ceiling, whose rows are narrow
+    /// enough that the longest status this app can publish costs more than one
+    /// of them — so a row budget charged the live status could not pass
+    /// [`the_row_budget_never_shrinks_when_the_status_lengthens`] by luck.
+    struct Host {
+        rows: u32,
+        name: DisplayName,
+    }
+
+    impl Host {
+        fn new(rows: u32, name_chars: usize) -> Self {
+            let name = DisplayName::from("\u{20000}".repeat(name_chars).as_str());
+            assert_eq!(
+                name.as_str().len(),
+                name_chars * 4,
+                "every character must cost four encoded bytes"
+            );
+            Self { rows, name }
+        }
+
+        /// A complete scan of every process from `first` on, in publishing order.
+        fn scan(&self, first: u32) -> ProcessSnapshot {
+            let template = FakeProcessSource.snapshot().records[0].key.clone();
+            let mut snapshot = FakeProcessSource.snapshot();
+            snapshot.records = (first..self.rows)
+                .map(|index| ProcessRecord {
+                    key: ProcessKey {
+                        pid: Observed::Known(index + 1),
+                        creation: CreationToken::Opaque(format!("host-{index}")),
+                        ..template.clone()
+                    },
+                    display_name: self.name.clone(),
+                })
+                .collect();
+            snapshot
+        }
+
+        /// The same scan, degraded in every way its own status can report: an
+        /// entry it could not examine at all, a global identity file it could
+        /// not read, and a million entries listed past its record bound.
+        fn degraded(&self, first: u32) -> ProcessSnapshot {
+            let mut snapshot = self.scan(first);
+            let mut skipped = SkippedRecords::with_limit(0);
+            skipped.unnamed();
+            let mut capped = CappedRecords::with_limit(0);
+            for _ in 0..1_000_000u32 {
+                capped.record(0);
+            }
+            snapshot.capped = capped;
+            snapshot.completeness = Completeness::from_scan(
+                skipped,
+                vec![
+                    EnumerationIssue {
+                        scope: IssueScope::Entry,
+                        reason: MissingReason::Unavailable,
+                        detail: "directory entry: Input/output error (os error 5)".into(),
+                    },
+                    EnumerationIssue {
+                        scope: IssueScope::BootIdentity,
+                        reason: MissingReason::Denied,
+                        detail: "sys/kernel/random/boot_id: Permission denied".into(),
+                    },
+                ],
+            );
+            snapshot
+        }
+    }
+
+    impl ProcessSource for Host {
+        fn status_text(&self) -> &str {
+            FAKE_STATUS_TEXT
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            self.scan(0)
+        }
+    }
+
+    /// The regression the fixed reserve exists for. A collection sitting at the
+    /// snapshot ceiling is published; the next scan is degraded in every way it
+    /// can report, under the longest label a source may publish, so its status
+    /// is far longer than the one the rows were chosen under. Charging that text
+    /// against the frame would shrink the row budget and delete trailing rows
+    /// the scan never said had ended.
+    #[test]
+    fn the_row_budget_never_shrinks_when_the_status_lengthens() {
+        let session = srui_sessiond::Session::mint();
+        let mut source = Host::new(58_000, 48);
+        let (mut view, snapshot) = ProcessView::start(&session, &mut source).unwrap();
+        let published = view.row_count();
+        let truncated = snapshot.records.len() - published;
+        assert!(
+            truncated > 0,
+            "this collection must really sit at the ceiling: all {published} rows fit"
+        );
+        let before: Vec<ItemId> = view.rows.iter().map(|row| row.item_id).collect();
+        let short = view.status().to_string();
+
+        // The same host, degraded, missing its three leading records — so the
+        // status carries the retained clause too — under a label at this app's
+        // own label bound.
+        let label = "\u{20000}".repeat(MAX_SOURCE_STATUS_BYTES);
+        let outcome = view.apply(&session, &label, &source.degraded(3)).unwrap();
+        let long = view.status().to_string();
+        assert!(
+            long.len() - short.len() > row_wire_bytes(&view.rows[0]),
+            "this status must cost more than one row — {} bytes against a {}-byte row — or a \
+             budget charged the live status could pass this test by luck",
+            long.len() - short.len(),
+            row_wire_bytes(&view.rows[0])
+        );
+        assert_eq!(
+            (outcome.deleted, outcome.evicted),
+            (0, 0),
+            "a longer status must not cost the collection a row"
+        );
+        assert_eq!(outcome.retained, 3);
+        assert_eq!(view.row_count(), published);
+        assert_eq!(
+            view.rows
+                .iter()
+                .map(|row| row.item_id)
+                .collect::<Vec<ItemId>>(),
+            before,
+            "every row keeps the identity and the place it already had"
+        );
+    }
+
+    /// The published-row ceiling is declared, not negotiated: a caller may lower
+    /// it, and nothing can raise it above the model's own §26 item bound.
+    #[test]
+    fn the_published_row_ceiling_is_declared_and_can_only_be_lowered() {
+        let session = srui_sessiond::Session::mint();
+        let store_limit = session.with_store(|store| store.limits().max_cached_items_per_model);
+        let (view, _) = ProcessView::start(&session, &mut ScriptedFakeSource::default()).unwrap();
+        assert_eq!(view.published_limit(), MAX_PUBLISHED_ROWS);
+        assert_eq!(
+            MAX_PUBLISHED_ROWS, store_limit,
+            "the ceiling is the model's own cached-item bound"
+        );
+        let raised = view.with_published_limit(usize::MAX);
+        assert_eq!(
+            raised.published_limit(),
+            MAX_PUBLISHED_ROWS,
+            "no caller may raise the ceiling"
+        );
+        let lowered = raised.with_published_limit(7);
+        assert_eq!(lowered.published_limit(), 7);
+        assert_eq!(
+            lowered.with_published_limit(0).published_limit(),
+            1,
+            "a view always publishes at least one row"
+        );
+    }
+
+    /// Eviction is a function of the published order alone: the unconfirmed rows
+    /// kept are the leading ones, a confirmed row is never evicted, and a
+    /// collection inside the bound loses nothing.
+    #[test]
+    fn eviction_keeps_the_leading_unconfirmed_rows_and_never_a_confirmed_one() {
+        let rows = widest_rows(10);
+        let ids = |rows: &[Row]| rows.iter().map(|row| row.item_id).collect::<Vec<ItemId>>();
+        let confirmed: HashSet<ItemId> = [rows[1].item_id, rows[8].item_id].into_iter().collect();
+
+        let mut inside = rows.clone();
+        assert_eq!(evict_unconfirmed_beyond(&mut inside, &confirmed, 10), 0);
+        assert_eq!(
+            ids(&inside),
+            ids(&rows),
+            "nothing is evicted to meet a bound"
+        );
+
+        let mut bounded_rows = rows.clone();
+        assert_eq!(
+            evict_unconfirmed_beyond(&mut bounded_rows, &confirmed, 6),
+            4
+        );
+        assert_eq!(
+            ids(&bounded_rows),
+            vec![
+                rows[0].item_id,
+                rows[1].item_id,
+                rows[2].item_id,
+                rows[3].item_id,
+                rows[4].item_id,
+                rows[8].item_id,
+            ],
+            "the rows kept are the leading unconfirmed ones and every confirmed one"
+        );
+        // Repeating the same eviction is the same eviction: nothing here depends
+        // on iteration order or on when a row was last seen.
+        let mut again = rows.clone();
+        assert_eq!(evict_unconfirmed_beyond(&mut again, &confirmed, 6), 4);
+        assert_eq!(ids(&again), ids(&bounded_rows));
+
+        let every: HashSet<ItemId> = rows.iter().map(|row| row.item_id).collect();
+        let mut confirmed_only = rows.clone();
+        assert_eq!(
+            evict_unconfirmed_beyond(&mut confirmed_only, &every, 3),
+            0,
+            "a row this scan confirmed is never evicted"
+        );
+        assert_eq!(ids(&confirmed_only), ids(&rows));
     }
 
     /// A plan that does not fit in one transaction commits as several, and a

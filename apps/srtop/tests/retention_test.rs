@@ -22,6 +22,15 @@
 //! a listing entry is a PID, so those entries are named too and only a ledger
 //! asked to hold more than `MAX_UNCERTAIN_PIDS` identities is unenumerable.
 //!
+//! Round 7's defect: a host with more readable PID entries than the capped
+//! ledger may name overflows it, so every scan reports itself unenumerable and
+//! keeps every absent row — the same unbounded growth again, at the highest
+//! threshold yet, and the one the frame ceiling cannot stop, because short rows
+//! fit a frame in their tens of thousands. Retention is bounded by construction
+//! now: no refresh publishes more than `refresh::MAX_PUBLISHED_ROWS` rows, the
+//! unconfirmed rows beyond that are evicted from the trailing end of the
+//! published order, and the status names the eviction in its own wording.
+//!
 //! Round 5's defect: a scan that could not read one *global* identity file —
 //! `sys/kernel/hostname`, `sys/kernel/random/boot_id`, `1/ns/pid` — skips no PID,
 //! so retention keeps nothing, while every record's `ProcessKey` loses that
@@ -585,6 +594,116 @@ fn churn_under_a_permanently_denied_record_does_not_grow_the_published_rows() {
              1 row retained from an earlier scan"
         )
     );
+}
+
+/// Round 7's defect, over a long run. A host with more readable PID entries
+/// than the capped ledger may name overflows it, so *every* scan reports itself
+/// unenumerable and retains every absent row: ordinary churn then grew the
+/// published collection past the model's own §26 item bound — short rows fit a
+/// frame in their tens of thousands, so the snapshot ceiling never stopped it —
+/// after which every insert was refused and no refresh could converge again.
+///
+/// Retention is bounded by construction now: the unconfirmed rows beyond the
+/// published-row ceiling are evicted, leading window first, and the status says
+/// how many. The ceiling is lowered here so the run is cheap; nothing about the
+/// mechanism depends on its value.
+#[test]
+fn churn_on_a_host_whose_ledger_overflows_holds_the_collection_at_the_declared_bound() {
+    const BOUND: usize = 64;
+    // The host the finding describes: one entry past `MAX_UNCERTAIN_PIDS`
+    // listed beyond the record bound, and the ledger can no longer name what it
+    // left out — on every tick, for as long as the host stays that size.
+    let overloaded: Vec<u32> = (1..=MAX_UNCERTAIN_PIDS as u32 + 1).collect();
+    assert!(
+        !capped_beyond(&overloaded, MAX_UNCERTAIN_PIDS).is_enumerable(),
+        "a host with more than {} entries past {MAX_RECORDS} records overflows the ledger",
+        MAX_UNCERTAIN_PIDS
+    );
+
+    let (session, view) = started(&[4101, 4102, 5000]);
+    let mut view = view.with_published_limit(BOUND);
+    assert_eq!(view.published_limit(), BOUND);
+    let mut previous = published(&session);
+
+    for tick in 1..=200u32 {
+        // Every tick: one stable process, one short-lived process replacing the
+        // previous one, and a ledger that overflowed, so every absent row is
+        // uncertain and nothing but the ceiling can bound what is kept.
+        let ephemeral = 5000 + tick;
+        let mut scanned = scan(&[4101, ephemeral]);
+        scanned.vanished = 1;
+        scanned.capped = capped_beyond(&[9000, 9001, 9002], 2);
+        scanned.completeness = at_the_record_bound(2);
+        assert!(
+            scanned.retention().is_global(),
+            "tick {tick}: an overflowed ledger cannot name which absences are uncertain"
+        );
+        let outcome = view.apply(&session, STATUS_TEXT, &scanned).unwrap();
+
+        let rows = published(&session);
+        let expected = (3 + tick as usize).min(BOUND);
+        assert_eq!(
+            rows.len(),
+            expected,
+            "tick {tick}: the collection grows to the declared bound and stops there"
+        );
+        assert_eq!(view.row_count(), rows.len());
+        assert!(
+            pids(&rows).contains(&u64::from(ephemeral)),
+            "tick {tick}: the live process is always published"
+        );
+        if 3 + tick as usize <= BOUND {
+            assert_eq!(
+                (outcome.evicted, outcome.deleted),
+                (0, 0),
+                "tick {tick}: nothing is evicted while the collection fits"
+            );
+            for row in &previous {
+                assert!(rows.contains(row), "tick {tick}: no row may be dropped yet");
+            }
+        } else {
+            assert_eq!(
+                (outcome.evicted, outcome.deleted),
+                (1, 1),
+                "tick {tick}: exactly the one row the bound has no room for"
+            );
+            // Which row goes is a function of the published order alone: the
+            // trailing one, the row that has gone longest without confirmation.
+            let evicted = *previous.last().expect("the collection is not empty");
+            assert!(
+                !rows.contains(&evicted),
+                "tick {tick}: the evicted row is the trailing one of the published order"
+            );
+            for row in &previous[..previous.len() - 1] {
+                assert!(
+                    rows.contains(row),
+                    "tick {tick}: every other row keeps its identity and its value"
+                );
+            }
+        }
+        previous = rows;
+    }
+    // The status says what was evicted, in counts and fixed wording, and never
+    // confuses it with a record that could not be read or with an entry beyond
+    // the collector's own record bound.
+    assert_eq!(
+        status_text(&session),
+        format!(
+            "{STATUS_TEXT} · incomplete scan · 2 processes listed · 3 beyond the record limit · \
+             {} rows retained from an earlier scan · \
+             1 unconfirmed row dropped to stay inside the published row limit",
+            BOUND - 2
+        )
+    );
+    assert!(!status_text(&session).contains("unreadable"));
+
+    // And a scan that can account for every absence still deletes what really
+    // ended: the bound froze nothing.
+    let outcome = view.apply(&session, STATUS_TEXT, &scan(&[4101])).unwrap();
+    assert_eq!(outcome.evicted, 0);
+    assert_eq!(outcome.deleted, BOUND - 1);
+    assert_eq!(pids(&published(&session)), vec![4101]);
+    assert_eq!(status_text(&session), STATUS_TEXT);
 }
 
 /// One of the three global identity components a scan stamps every record with.

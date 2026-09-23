@@ -39,13 +39,19 @@ pub const MAX_RECORDS: usize = 65_536;
 /// records it read and could not use ([`SkippedRecords`]), and the entries it
 /// listed but never read ([`CappedRecords`]).
 ///
-/// This is what keeps the *published collection* bounded, not just one scan's
-/// memory. A refresh publishes at most one row per PID the scan either confirmed
-/// or left uncertain (PX-004), so the collection holds at most
-/// `MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS` rows — exactly the model's own §26
-/// item bound. A ledger asked to name more says so, and that scan retains every
-/// absent row, which is why the bound is a ceiling on naming rather than a
-/// budget the collection may spend.
+/// This is what keeps *scoped* retention bounded, not just one scan's memory. A
+/// refresh publishes at most one row per PID the scan either confirmed or left
+/// uncertain (PX-004), so as long as both ledgers can name what they left out,
+/// the collection holds at most `MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS` rows —
+/// exactly the model's own §26 item bound.
+///
+/// A ledger asked to name more says so, and that scan retains every absent row,
+/// which is why this is a ceiling on naming rather than a budget the collection
+/// may spend. What bounds the collection in *that* case — an overflowed ledger
+/// on a host with more readable entries than one scan may name, where every tick
+/// is unenumerable — is not here but at
+/// [`crate::refresh::MAX_PUBLISHED_ROWS`], which no scan, ledger or retention
+/// decision can lift.
 pub const MAX_UNCERTAIN_PIDS: usize = (DEFAULT_MAX_CACHED_ITEMS_PER_MODEL - MAX_RECORDS) / 2;
 const _: () = assert!(MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS <= DEFAULT_MAX_CACHED_ITEMS_PER_MODEL);
 /// Bound on every single file this scan reads.

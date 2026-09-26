@@ -4797,13 +4797,6 @@ public final class SessionController: @unchecked Sendable {
                 }
                 return
             }
-            // The tree mounted below queues Terminal input through the callbacks this snapshot's
-            // incarnation owns, so the pump's sender has to be rebound before the mount: a drain
-            // holding the previous incarnation's sender refuses the item and drops it (§21).
-            await rebindTerminalPumpOwnership(
-                binding: connectionBinding,
-                sessionIncarnation: snapshotIncarnation
-            )
             applyResult = published.result
             renderToken = published.renderToken
             renderSessionIncarnation = snapshotIncarnation
@@ -4844,6 +4837,21 @@ public final class SessionController: @unchecked Sendable {
             }
             let terminalNodeIDs = await terminalNodeIDs(in: snapshot.store)
             await terminalPump.prune(retainedStreamIDs: terminalNodeIDs)
+            if isResyncSnapshot {
+                // The tree mounted below queues Terminal input through the callbacks this
+                // snapshot's incarnation owns, so the pump's sender has to be rebound before the
+                // mount: a drain still holding the previous incarnation's sender refuses the item
+                // and `drain()` discards it rather than retrying (§21).
+                //
+                // Strictly after the prune above: `attach` re-queues every retained resize and
+                // kicks a drain, so rebinding first would re-send a resize for a stream this
+                // snapshot removed, which the server answers with `UnexpectedMessage` and drops
+                // the connection.
+                await rebindTerminalPumpOwnership(
+                    binding: connectionBinding,
+                    sessionIncarnation: renderSessionIncarnation
+                )
+            }
             let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,
                 snapshot: snapshot,

@@ -49,6 +49,8 @@ bash scripts/parse-changed-swift.sh                      # syntax-only; no type 
 bash scripts/check-logical-channel-scheduling-imports.sh
 bash scripts/check-test-process-stdio.sh                 # no test may leak the binary's stdio
 bash scripts/run-swift-tests.sh                          # `swift test` under a wedge watchdog
+bash scripts/reap-test-servers.sh --dry-run              # leaked fixture servers and /tmp sockets
+bash scripts/test_reap_test_servers.sh                   # the reaper's selection-rule tests
 
 # §31 benchmark drivers — the Swift package is nested and resolved on its own
 swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release
@@ -129,4 +131,5 @@ Layering is enforced by CI, not just convention:
 - Swift files carry an equivalent header comment, plus the AppKit prohibition note in `SemanticModel`.
 - `benchmarks/` contains the §31 native benchmark drivers, orchestration, and committed report. `examples/coding-agent-demo`, `examples/process-monitor`, and `examples/counter` are executable reference applications.
 - A Swift test that spawns a process **must** set both `standardOutput` and `standardError` before `run()`. `swift-test` reads the test binary's stdout/stderr through pipes and returns only on EOF, so a server that inherits them and outlives the binary wedges the whole run with every test already passed and nothing printed. `scripts/check-test-process-stdio.sh` enforces this; `SSHTestSupport.launchSSHD`/`terminate` are the sshd choke point (sshd re-execs itself, so only shell-level redirection survives).
+- A run that wedges or is killed never reaches its fixtures' `defer`, so the fixture servers (`counter`, `srui-sessiond`, `coding-agent-demo`, `srtop`) survive, reparent to init, and keep holding their `/tmp/srui-*` socket directories forever — hundreds of them accumulate across worktrees. `scripts/reap-test-servers.sh` kills fixture processes that are both orphaned (`ppid 1`) and older than 30 minutes (`SRUI_REAP_AGE_MINUTES`) and removes socket directories no live process names on its command line; anything with a live parent belongs to a running test and is never touched. `scripts/run-swift-tests.sh` and `apps/srtop/test.sh` sweep before they start; run it by hand (`--dry-run` first) after a bare `swift test` wedges or you ^C one. `scripts/test_reap_test_servers.sh` tests its selection rules.
 - The `mcp__lc__edit` tool preserves mtimes and SwiftPM keys off mtime, so `touch` any edited Swift file before `swift test` or you will verify a stale binary.

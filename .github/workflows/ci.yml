@@ -297,7 +297,9 @@ jobs:
       # stage runs even if an earlier one times out.
       - name: Stage 1 - suite without process-launching or AppKit-window suites
         run: |
-          timeout 900 swift test \
+          # macOS has no `timeout`; perl's alarm is the portable bound.
+          bounded() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          bounded 900 swift test \
             --skip CounterSocketIntegrationTests \
             --skip CollectionRangeSocketIntegrationTests \
             --skip CodingAgentFallbackSocketTests \
@@ -310,17 +312,19 @@ jobs:
       - name: Stage 2 - process-launching socket suites only
         if: always()
         run: |
-          timeout 600 swift test --filter CounterSocketIntegrationTests && echo COUNTER_OK || echo "COUNTER_EXIT=$?"
-          timeout 600 swift test --filter CollectionRangeSocketIntegrationTests && echo RANGE_OK || echo "RANGE_EXIT=$?"
-          timeout 600 swift test --filter CodingAgentFallbackSocketTests && echo AGENT_OK || echo "AGENT_EXIT=$?"
+          bounded() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          bounded 600 swift test --filter CounterSocketIntegrationTests && echo COUNTER_OK || echo "COUNTER_EXIT=$?"
+          bounded 600 swift test --filter CollectionRangeSocketIntegrationTests && echo RANGE_OK || echo "RANGE_EXIT=$?"
+          bounded 600 swift test --filter CodingAgentFallbackSocketTests && echo AGENT_OK || echo "AGENT_EXIT=$?"
         working-directory: client-macos
       - name: Stage 3 - SSH and AppKit-window suites only
         if: always()
         run: |
-          timeout 600 swift test --filter ProcessExplorerShellTests && echo SRTOP_OK || echo "SRTOP_EXIT=$?"
-          timeout 600 swift test --filter SSHTransportLiveIntegrationTests && echo SSHLIVE_OK || echo "SSHLIVE_EXIT=$?"
-          timeout 600 swift test --filter SSHTransportPersistenceIntegrationTests && echo SSHPERSIST_OK || echo "SSHPERSIST_EXIT=$?"
-          timeout 600 swift test --filter SemanticInspectionAutomationTests && echo INSPECT_OK || echo "INSPECT_EXIT=$?"
+          bounded() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          bounded 600 swift test --filter ProcessExplorerShellTests && echo SRTOP_OK || echo "SRTOP_EXIT=$?"
+          bounded 600 swift test --filter SSHTransportLiveIntegrationTests && echo SSHLIVE_OK || echo "SSHLIVE_EXIT=$?"
+          bounded 600 swift test --filter SSHTransportPersistenceIntegrationTests && echo SSHPERSIST_OK || echo "SSHPERSIST_EXIT=$?"
+          bounded 600 swift test --filter SemanticInspectionAutomationTests && echo INSPECT_OK || echo "INSPECT_EXIT=$?"
         working-directory: client-macos
       - name: Verify committed generated protocol outputs are fresh
         run: |

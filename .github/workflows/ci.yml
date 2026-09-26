@@ -292,9 +292,17 @@ jobs:
         run: swift test --package-path client-macos/LogicalChannelScheduling
       - name: Verify Accessibility API boundary (§22.9, §32.11)
         run: scripts/check-accessibility-api-boundary.sh
-      - name: Build and test client-macos
-        run: swift test
+      - name: Build and test client-macos in bounded per-suite stages (temporary evidence run)
         working-directory: client-macos
+        run: |
+          # macOS has no `timeout`; perl's alarm is the portable bound.
+          bounded() { local s=$1; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }
+          bounded 600 swift test --filter CollectionRangeSocketIntegrationTests && echo RANGE_SOCKET_OK || echo "RANGE_SOCKET_EXIT=$?"
+          bounded 600 swift test --filter CollectionRangeSessionTests && echo RANGE_PUMP_OK || echo "RANGE_PUMP_EXIT=$?"
+          bounded 600 swift test --filter SemanticInspectionAutomationTests && echo INSPECT_OK || echo "INSPECT_EXIT=$?"
+          bounded 600 swift test --filter CounterSocketIntegrationTests && echo COUNTER_OK || echo "COUNTER_EXIT=$?"
+          bounded 600 swift test --filter CodingAgentFallbackSocketTests && echo AGENT_OK || echo "AGENT_EXIT=$?"
+          bounded 900 swift test --filter SessionControllerResyncTests --filter SessionResumeContinuityTests --filter TextEditingIntegrationTests --filter SessionLifecycleEventTests --filter EventOutboxTests --filter ConnectionManagerTests && echo SESSION_OK || echo "SESSION_EXIT=$?"
       - name: Verify committed generated protocol outputs are fresh
         run: |
           ./protocol/generate_proto.sh

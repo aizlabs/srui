@@ -1,9 +1,10 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
-//! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003). No action handlers are
-//! installed and no process is ever opened for control.
+//! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004). No action handlers
+//! are installed and no process is ever opened for control.
 
 pub mod procfs;
 mod projection;
+pub mod refresh;
 pub mod source;
 
 use srui_sdk::*;
@@ -24,18 +25,25 @@ pub fn initialize(session: &Session) -> Result<(), SessionError> {
     initialize_rows(session, vec![], STATUS_TEXT)
 }
 
-/// Samples only the injected source and publishes its model rows atomically with the shell,
+/// Samples the injected source once and publishes its model rows atomically with the shell,
 /// labeling the status with the source's own truthful description rather than a fixed
-/// fixture string. No periodic collection or process actions are installed.
+/// fixture string. No process actions are installed.
+///
+/// The returned view is what a later refresh diffs against; a caller that only
+/// wants the one-shot publication can use [`initialize_from_source`].
+pub fn start_from_source(
+    session: &Session,
+    source: &mut impl source::ProcessSource,
+) -> Result<(refresh::ProcessView, source::ProcessSnapshot), Box<dyn std::error::Error>> {
+    refresh::ProcessView::start(session, source)
+}
+
+/// Publishes one snapshot and discards the refresh state.
 pub fn initialize_from_source(
     session: &Session,
     source: &mut impl source::ProcessSource,
 ) -> Result<source::ProcessSnapshot, Box<dyn std::error::Error>> {
-    let status = source.status_text().to_string();
-    let snapshot = source.snapshot();
-    let items = projection::SessionItemIds::default().project(&snapshot)?;
-    initialize_rows(session, items, &published_status(&status, &snapshot))?;
-    Ok(snapshot)
+    start_from_source(session, source).map(|(_, snapshot)| snapshot)
 }
 
 /// The published status line: the source's own truthful description, plus an
@@ -50,42 +58,128 @@ pub fn initialize_from_source(
 /// was readable. A scan degraded only in its identity files says that, instead
 /// of reporting an unreadable count of zero.
 pub fn published_status(source_status: &str, snapshot: &source::ProcessSnapshot) -> String {
-    let source::Completeness::Incomplete { skipped, issues } = &snapshot.completeness else {
-        return source_status.to_string();
-    };
-    let mut clauses = vec!["incomplete scan".to_string()];
-    let root = issues
-        .iter()
-        .find(|issue| issue.scope == source::IssueScope::Root);
-    if let Some(root) = root {
-        clauses.push(format!(
-            "process list unavailable: {}",
-            root.reason.describe()
-        ));
-    } else {
-        let listed = snapshot.records.len();
-        clauses.push(format!("{listed} {} listed", plural(listed)));
-        if *skipped > 0 {
-            clauses.push(format!("{skipped} unreadable"));
+    published_status_from(source_status, &ScanReport::of(snapshot))
+}
+
+/// Everything about one scan that can reach the status line: counts and fixed
+/// categories, never a record's own text (PX-004 review round 7).
+///
+/// The status is built from exactly this, so the longest status this app can
+/// publish is a property of these fields at their widest — which is what
+/// [`crate::refresh`] reserves snapshot-frame space for before it chooses how
+/// many rows fit. Extracting the report from a snapshot is therefore separate
+/// from wording it, so that reserve can be measured against the real builder
+/// with every count at `usize::MAX`, instead of against the largest count a test
+/// happens to be able to construct.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Whether this scan fell short at all. A complete scan publishes no clause.
+    pub degraded: bool,
+    /// Why the enumeration root itself could not be listed, when it could not.
+    /// No record count is then published: "0 unreadable" beside an empty table
+    /// would claim the opposite of the truth.
+    pub root: Option<source::MissingReason>,
+    /// Records this scan listed.
+    pub listed: usize,
+    /// Records that existed and could not be read.
+    pub unreadable: usize,
+    /// Entries this scan listed but never read, its own record bound reached.
+    pub capped: usize,
+    /// Whether a global identity file could not be read.
+    pub identity_incomplete: bool,
+}
+
+impl ScanReport {
+    /// What `snapshot` says about its own shortfalls.
+    pub fn of(snapshot: &source::ProcessSnapshot) -> Self {
+        let source::Completeness::Incomplete { skipped, issues } = &snapshot.completeness else {
+            return Self::default();
+        };
+        Self {
+            degraded: true,
+            root: issues
+                .iter()
+                .find(|issue| issue.scope == source::IssueScope::Root)
+                .map(|issue| issue.reason),
+            listed: snapshot.records.len(),
+            unreadable: skipped.count(),
+            // Records omitted by the collector's own bound were never read:
+            // publishing them as unreadable would claim a read failure or a
+            // permission problem that never happened.
+            capped: snapshot.capped.count(),
+            identity_incomplete: issues.iter().any(|issue| {
+                matches!(
+                    issue.scope,
+                    source::IssueScope::HostIdentity
+                        | source::IssueScope::BootIdentity
+                        | source::IssueScope::PidNamespace
+                )
+            }),
         }
     }
-    // Records omitted by the collector's own bound were never read: publishing
-    // them as unreadable would claim a read failure or a permission problem that
-    // never happened.
-    if snapshot.capped > 0 {
-        clauses.push(format!("{} beyond the record limit", snapshot.capped));
+}
+
+/// The published status of a scan that reported `scan`.
+pub fn published_status_from(source_status: &str, scan: &ScanReport) -> String {
+    let label = bounded(source_status, MAX_SOURCE_STATUS_BYTES);
+    if !scan.degraded {
+        return label;
     }
-    if issues.iter().any(|issue| {
-        matches!(
-            issue.scope,
-            source::IssueScope::HostIdentity
-                | source::IssueScope::BootIdentity
-                | source::IssueScope::PidNamespace
-        )
-    }) {
+    let mut clauses = vec!["incomplete scan".to_string()];
+    if let Some(root) = scan.root {
+        clauses.push(format!("process list unavailable: {}", root.describe()));
+    } else {
+        let listed = scan.listed;
+        clauses.push(format!("{listed} {} listed", plural(listed)));
+        if scan.unreadable > 0 {
+            clauses.push(format!("{} unreadable", scan.unreadable));
+        }
+    }
+    if scan.capped > 0 {
+        clauses.push(format!("{} beyond the record limit", scan.capped));
+    }
+    if scan.identity_incomplete {
         clauses.push("host identity incomplete".to_string());
     }
-    format!("{source_status} · {}", clauses.join(" · "))
+    format!("{label} · {}", clauses.join(" · "))
+}
+
+/// The most of a source's own status label the published status carries, in
+/// encoded bytes (PX-004 review round 7).
+///
+/// A label is source-owned text of no fixed length, and the published status is
+/// charged against the catch-up snapshot frame *before* the rows are, so an
+/// unbounded label would be an unbounded charge against the row budget — the
+/// same defect as charging a degraded scan's own clauses against it. Bounding
+/// the label is what makes the longest status this app can publish a constant.
+pub const MAX_SOURCE_STATUS_BYTES: usize = 256;
+
+/// The widest label [`published_status`] can emit: [`MAX_SOURCE_STATUS_BYTES`]
+/// plus the ellipsis that marks a label as cut.
+pub const MAX_PUBLISHED_LABEL_BYTES: usize = MAX_SOURCE_STATUS_BYTES + ELLIPSIS.len_utf8();
+
+/// Marks text this app had to cut. Never a character a source supplied.
+const ELLIPSIS: char = '…';
+
+/// `text`, cut to at most `limit` encoded bytes at a character boundary and
+/// marked with [`ELLIPSIS`] when it was cut.
+///
+/// Cutting is marked rather than silent, and the mark is this app's own
+/// character. The cut is by encoded bytes because the budget it protects is a
+/// byte budget, and it lands on a character boundary because a `String` may not
+/// hold half a code point.
+pub(crate) fn bounded(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut cut = String::with_capacity(end + ELLIPSIS.len_utf8());
+    cut.push_str(&text[..end]);
+    cut.push(ELLIPSIS);
+    cut
 }
 
 fn plural(count: usize) -> &'static str {
@@ -96,7 +190,15 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
-fn initialize_rows(
+/// Publishes the shell and `items` in one transaction.
+///
+/// `items` must already be bounded to what one catch-up snapshot of the
+/// resulting model can carry: this is the start path, and a client that
+/// attaches to this session at any later moment is brought up by a single
+/// snapshot transaction of exactly this model (§18, §26). The bound is applied
+/// where the rows are chosen, by `refresh::ProcessView::start`, because only
+/// there can the status honestly say how many rows were left out.
+pub(crate) fn initialize_rows(
     session: &Session,
     items: Vec<srui_semantic_tree::ModelItem>,
     status: &str,
@@ -168,7 +270,25 @@ pub fn update_title(session: &Session, title: &str) -> Result<(), SessionError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use source::{Completeness, EnumerationIssue, IssueScope, MissingReason, ProcessSource};
+    use source::{
+        Completeness, EnumerationIssue, IssueScope, MissingReason, ProcessSource, SkippedRecords,
+    };
+
+    /// The completeness of a scan that could not read `pids`, naming each one,
+    /// exactly as a real scan records them.
+    fn denied(pids: &[u32]) -> Completeness {
+        let mut skipped = SkippedRecords::with_limit(pids.len());
+        let mut issues = Vec::new();
+        for pid in pids {
+            skipped.record(*pid);
+            issues.push(EnumerationIssue {
+                scope: IssueScope::Process(*pid),
+                reason: MissingReason::Denied,
+                detail: "denied".into(),
+            });
+        }
+        Completeness::from_scan(skipped, issues)
+    }
 
     fn empty_snapshot(completeness: Completeness) -> source::ProcessSnapshot {
         let mut snapshot = source::FakeProcessSource.snapshot();
@@ -189,14 +309,7 @@ mod tests {
             published_status(label, &source::FakeProcessSource.snapshot()),
             label
         );
-        let degraded = Completeness::from_scan(
-            4,
-            vec![EnumerationIssue {
-                scope: IssueScope::Process(7),
-                reason: MissingReason::Denied,
-                detail: "denied".into(),
-            }],
-        );
+        let degraded = denied(&[7, 8, 9, 10]);
         // An empty degraded scan never reads like an authoritative empty result.
         let empty_but_degraded = published_status(label, &empty_snapshot(degraded.clone()));
         assert_eq!(
@@ -213,7 +326,7 @@ mod tests {
             published_status(label, &partial),
             format!("{label} · incomplete scan · 3 processes listed · 4 unreadable")
         );
-        let mut single = empty_snapshot(Completeness::from_scan(1, vec![]));
+        let mut single = empty_snapshot(denied(&[7]));
         single.records = source::FakeProcessSource.snapshot().records;
         single.records.truncate(1);
         assert_eq!(
@@ -229,7 +342,7 @@ mod tests {
         // `skipped` is legitimately 0 and "0 unreadable" would read as "every
         // process was readable" beside an empty table.
         let unlistable = empty_snapshot(Completeness::from_scan(
-            0,
+            SkippedRecords::unenumerable(),
             vec![EnumerationIssue {
                 scope: IssueScope::Root,
                 reason: MissingReason::Unavailable,
@@ -243,7 +356,7 @@ mod tests {
         );
         assert!(!published.contains("unreadable"), "{published}");
         let denied_root = empty_snapshot(Completeness::from_scan(
-            0,
+            SkippedRecords::unenumerable(),
             vec![EnumerationIssue {
                 scope: IssueScope::Root,
                 reason: MissingReason::Denied,
@@ -258,7 +371,7 @@ mod tests {
         // and nothing was skipped, so no unreadable count is published either.
         let mut identity_only = source::FakeProcessSource.snapshot();
         identity_only.completeness = Completeness::from_scan(
-            0,
+            SkippedRecords::none(),
             vec![EnumerationIssue {
                 scope: IssueScope::BootIdentity,
                 reason: MissingReason::Unavailable,

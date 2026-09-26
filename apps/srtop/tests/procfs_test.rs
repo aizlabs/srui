@@ -12,8 +12,9 @@ use srui_process_explorer::procfs::{
 use srui_process_explorer::published_status;
 use srui_process_explorer::source::{
     Completeness, CreationToken, DisplayName, IssueScope, MissingReason, Observed, ProcessSource,
-    SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
+    Retention, SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
 };
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -306,6 +307,88 @@ fn a_wholly_unreadable_root_keeps_issue_memory_bounded_while_counting_every_reco
         MAX_RECORDED_ISSUES,
         "retained explanations stay at the bound"
     );
+    // What the scan skipped is its own knowledge, not a reading of the
+    // explanations it kept: every one of those records is still named, so an
+    // absence this scan did not name is still a real exit.
+    let skipped = snapshot
+        .completeness
+        .skipped_records()
+        .expect("a degraded scan reports what it skipped");
+    assert_eq!(skipped.pids().len(), denied);
+    assert!(skipped.is_enumerable());
+    let Retention::Skipped(uncertain) = snapshot.retention() else {
+        panic!("a scan that named every record it skipped can enumerate them")
+    };
+    assert_eq!(uncertain.len(), denied);
+    assert!(
+        !uncertain.contains(&(denied as u32 + 1)),
+        "and no other PID"
+    );
+}
+
+#[test]
+fn a_scan_that_skips_more_records_than_its_bound_can_name_says_so_instead_of_growing() {
+    let fixture = ProcFixture::new();
+    fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
+    let bound = 2;
+    for pid in 1..=10u32 {
+        fixture.denied(pid);
+    }
+    let snapshot = fixture.source().with_record_limit(bound).snapshot();
+    assert!(snapshot.records.is_empty());
+    assert_eq!(
+        snapshot.completeness.skipped(),
+        10,
+        "the count is the truth"
+    );
+    let skipped = snapshot
+        .completeness
+        .skipped_records()
+        .expect("a degraded scan reports what it skipped");
+    assert_eq!(
+        skipped.pids().len(),
+        bound,
+        "the skipped identities never exceed the scan's own record bound"
+    );
+    assert!(!skipped.is_enumerable());
+    // Unable to name everything it skipped, the scan keeps every absent row.
+    assert_eq!(snapshot.retention(), Retention::Unenumerable);
+}
+
+/// The capped ledger is bounded like the skipped one: a scan that listed more
+/// entries past its record bound than it may name says so, rather than growing a
+/// set per scan, and that answer keeps every absent row (PX-004 round 3).
+#[test]
+fn more_capped_entries_than_the_ledger_can_name_says_so_instead_of_growing() {
+    let fixture = ProcFixture::new();
+    fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
+    for pid in 1..=5u32 {
+        fixture.process(pid, b"worker", 100 + u64::from(pid));
+    }
+    let snapshot = fixture
+        .source()
+        .with_record_limit(2)
+        .with_uncertain_limit(1)
+        .snapshot();
+    assert_eq!(snapshot.records.len(), 2);
+    assert_eq!(snapshot.capped.count(), 3, "the count is the truth");
+    assert_eq!(
+        snapshot.capped.pids().len(),
+        1,
+        "the named entries never exceed the ledger's own bound"
+    );
+    assert!(!snapshot.capped.is_enumerable());
+    // Unable to name everything it left out, the scan keeps every absent row.
+    assert_eq!(snapshot.retention(), Retention::Unenumerable);
+    // The status still counts what happened, and still claims no read failure.
+    let published = published_status(LIVE_STATUS_TEXT, &snapshot);
+    assert_eq!(
+        published,
+        format!(
+            "{LIVE_STATUS_TEXT} · incomplete scan · 2 processes listed · 3 beyond the record limit"
+        )
+    );
+    assert!(!published.contains("unreadable"), "{published}");
 }
 
 #[test]
@@ -409,8 +492,35 @@ fn records_beyond_the_collector_limit_are_never_reported_as_unreadable() {
     let snapshot = fixture.source().with_record_limit(2).snapshot();
     assert_eq!(snapshot.records.len(), 2);
     // The omitted entries were never opened: nothing denied or hid them.
-    assert_eq!(snapshot.capped, 3);
+    assert_eq!(snapshot.capped.count(), 3);
     assert_eq!(snapshot.completeness.skipped(), 0);
+    // The listing that produced them still named them, so their absences stay
+    // attributable and this scan deletes the rows of processes that really ended
+    // (PX-004 round 3).
+    assert!(snapshot.capped.is_enumerable());
+    let Retention::Skipped(uncertain) = snapshot.retention() else {
+        panic!("a capped scan enumerates the entries it listed and never read")
+    };
+    assert_eq!(uncertain.len(), 3);
+    // Directory order decides which two of the five were read; between them the
+    // published records and the named entries account for every listed PID, and
+    // for no other.
+    let published_pids: BTreeSet<u32> = snapshot
+        .records
+        .iter()
+        .map(|record| match record.key.pid {
+            Observed::Known(pid) => pid,
+            Observed::Missing(_) => panic!("a fixture record has an observable PID"),
+        })
+        .collect();
+    assert!(published_pids.is_disjoint(&uncertain));
+    assert_eq!(
+        published_pids
+            .union(&uncertain)
+            .copied()
+            .collect::<Vec<_>>(),
+        (1..=5u32).collect::<Vec<_>>()
+    );
     let issues = snapshot.completeness.issues();
     assert_eq!(
         issues.len(),
@@ -616,8 +726,11 @@ fn oversized_records_are_bounded_rather_than_read_without_limit() {
 #[cfg(target_os = "linux")]
 mod live {
     use super::*;
-    use srui_process_explorer::{initialize_from_source, published_status, MODEL};
-    use srui_sdk::Value;
+    use srui_process_explorer::refresh::DEFAULT_REFRESH_INTERVAL;
+    use srui_process_explorer::{
+        initialize_from_source, published_status, start_from_source, MODEL,
+    };
+    use srui_sdk::{ItemId, Value};
     use srui_sessiond::Session;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
@@ -790,5 +903,90 @@ mod live {
                 );
             }
         });
+    }
+
+    /// PX-004 acceptance on a real host: a process this test creates, and then
+    /// ends, reaches the published collection within two sampling intervals —
+    /// through the refresh path, not a fresh publication.
+    #[test]
+    fn a_test_owned_worker_appears_and_exits_within_two_sampling_intervals() {
+        let interval = DEFAULT_REFRESH_INTERVAL;
+        let session = Session::mint();
+        let mut source = ProcFsSource::live();
+        let (mut view, _) = start_from_source(&session, &mut source).unwrap();
+        let before = session.current_revision();
+        assert_eq!(before, 1);
+
+        let mut worker = Worker::start();
+        let pid = worker.pid();
+        let started = Instant::now();
+        let mut appeared = None;
+        for tick in 1..=2 {
+            std::thread::sleep(interval);
+            view.refresh(&session, &mut source).unwrap();
+            if let Some(row) = row_for(&session, pid) {
+                appeared = Some((tick, started.elapsed(), row));
+                break;
+            }
+        }
+        let (appeared_tick, appeared_after, row) =
+            appeared.expect("an owned worker must reach the collection within two intervals");
+        let Value::List(cells) = &row.1 else {
+            panic!("expected table cells")
+        };
+        assert_eq!(cells[0], Value::UnsignedInt(u64::from(pid)));
+        assert_eq!(cells[1], Value::String("sleep".into()));
+        // The shell was built once and is refreshed in place.
+        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        assert!(session.current_revision() > before);
+
+        // A refresh that sees the same worker leaves its row identity alone.
+        view.refresh(&session, &mut source).unwrap();
+        assert_eq!(
+            row_for(&session, pid).map(|(id, _)| id),
+            Some(row.0),
+            "a process that did not change must keep its row"
+        );
+
+        worker.0.kill().unwrap();
+        worker.0.wait().unwrap();
+        let ended = Instant::now();
+        let mut gone = None;
+        for tick in 1..=2 {
+            std::thread::sleep(interval);
+            view.refresh(&session, &mut source).unwrap();
+            if row_for(&session, pid).is_none() {
+                gone = Some((tick, ended.elapsed()));
+                break;
+            }
+        }
+        let (gone_tick, gone_after) =
+            gone.expect("an ended worker must leave the collection within two intervals");
+        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        println!(
+            "PX-004 live evidence: interval={interval:?} worker_pid={pid} item_id={} \
+             appeared_tick={appeared_tick} appeared_after={appeared_after:?} \
+             exited_tick={gone_tick} exited_after={gone_after:?} rows={} revision={} status={:?}",
+            row.0.get(),
+            view.row_count(),
+            session.current_revision(),
+            view.status(),
+        );
+    }
+
+    /// The published row of `pid`, if the collection currently holds one.
+    fn row_for(session: &Session, pid: u32) -> Option<(ItemId, Value)> {
+        session.with_store(|store| {
+            store
+                .get_model(MODEL)
+                .unwrap()
+                .items
+                .values()
+                .find(|item| {
+                    matches!(&item.value, Value::List(cells)
+                        if cells[0] == Value::UnsignedInt(u64::from(pid)))
+                })
+                .map(|item| (item.item_id, item.value.clone()))
+        })
     }
 }

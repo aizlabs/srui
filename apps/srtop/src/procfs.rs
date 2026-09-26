@@ -7,11 +7,19 @@
 //! on any platform. Only [`ProcFsSource::live`] reads the real `/proc`, which
 //! exists on Linux; on other systems it honestly reports an incomplete scan
 //! instead of an authoritative empty result.
+//!
+//! One scan's memory is bounded by [`MAX_RECORDS`] published records, by
+//! [`crate::source::MAX_RECORDED_ISSUES`] retained explanations, and by
+//! [`MAX_UNCERTAIN_PIDS`] named identities in each of its two ledgers — the
+//! records it read and could not use, and the entries it listed but never read
+//! (PX-003, PX-004). A scan that would have to name more than a ledger holds
+//! reports itself unenumerable rather than growing a set per scan.
 use crate::source::{
-    record_issue, BootId, Completeness, CreationToken, DisplayName, EnumerationIssue, HostId,
-    IssueScope, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
-    ProcessSnapshot, ProcessSource, SnapshotTime, SourceId,
+    record_issue, BootId, CappedRecords, Completeness, CreationToken, DisplayName,
+    EnumerationIssue, HostId, IssueScope, MissingReason, Observed, PidNamespaceId, ProcessKey,
+    ProcessRecord, ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime, SourceId,
 };
+use srui_semantic_tree::DEFAULT_MAX_CACHED_ITEMS_PER_MODEL;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read};
@@ -27,6 +35,25 @@ pub const LIVE_STATUS_TEXT: &str = "Read-only · Live process snapshot";
 /// Default bound on records published from one scan; entries beyond it are
 /// counted as capped, never as unreadable.
 pub const MAX_RECORDS: usize = 65_536;
+/// Bound on the identities one scan may name in each of its two ledgers: the
+/// records it read and could not use ([`SkippedRecords`]), and the entries it
+/// listed but never read ([`CappedRecords`]).
+///
+/// This is what keeps *scoped* retention bounded, not just one scan's memory. A
+/// refresh publishes at most one row per PID the scan either confirmed or left
+/// uncertain (PX-004), so as long as both ledgers can name what they left out,
+/// the collection holds at most `MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS` rows —
+/// exactly the model's own §26 item bound.
+///
+/// A ledger asked to name more says so, and that scan retains every absent row,
+/// which is why this is a ceiling on naming rather than a budget the collection
+/// may spend. What bounds the collection in *that* case — an overflowed ledger
+/// on a host with more readable entries than one scan may name, where every tick
+/// is unenumerable — is not here but at
+/// [`crate::refresh::MAX_PUBLISHED_ROWS`], which no scan, ledger or retention
+/// decision can lift.
+pub const MAX_UNCERTAIN_PIDS: usize = (DEFAULT_MAX_CACHED_ITEMS_PER_MODEL - MAX_RECORDS) / 2;
+const _: () = assert!(MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS <= DEFAULT_MAX_CACHED_ITEMS_PER_MODEL);
 /// Bound on every single file this scan reads.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// `/proc/<pid>/stat` field 22 (start time) is the 20th field after `comm`.
@@ -54,6 +81,8 @@ pub struct ProcFsSource {
     source: SourceId,
     status: String,
     record_limit: usize,
+    /// Bound on the identities either ledger of one scan may name.
+    uncertain_limit: usize,
     /// Whether the root names one fixed tree for the life of this source. A
     /// relative root that could not be anchored does not, and is never scanned.
     anchored: bool,
@@ -100,6 +129,7 @@ impl ProcFsSource {
                     given.display()
                 ),
                 record_limit: MAX_RECORDS,
+                uncertain_limit: MAX_UNCERTAIN_PIDS,
                 anchored: false,
             };
         };
@@ -117,6 +147,7 @@ impl ProcFsSource {
             source,
             status,
             record_limit: MAX_RECORDS,
+            uncertain_limit: MAX_UNCERTAIN_PIDS,
             anchored: true,
         }
     }
@@ -125,6 +156,15 @@ impl ProcFsSource {
     /// reported as capped rather than unreadable, and the scan is not complete.
     pub fn with_record_limit(mut self, limit: usize) -> Self {
         self.record_limit = limit;
+        self
+    }
+
+    /// Bounds how many identities one scan may name in each of its two ledgers.
+    /// A scan that would have to name more reports itself unenumerable, which
+    /// keeps every absent row; see [`MAX_UNCERTAIN_PIDS`] for why the default is
+    /// what it is.
+    pub fn with_uncertain_limit(mut self, limit: usize) -> Self {
+        self.uncertain_limit = limit;
         self
     }
 
@@ -304,13 +344,21 @@ impl ProcessSource for ProcFsSource {
                 sampled_at,
                 records: Vec::new(),
                 vanished: 0,
-                capped: 0,
-                completeness: Completeness::from_scan(0, issues),
+                capped: CappedRecords::none(),
+                // Nothing was enumerated at all: no absence can be attributed.
+                completeness: Completeness::from_scan(SkippedRecords::unenumerable(), issues),
             };
         }
-        let mut skipped = 0usize;
+        // The unpublished records are named as the scan leaves them out, so the
+        // uncertain set never depends on how many explanations were retained.
+        // A record this scan reads and cannot use is bounded by the scan's own
+        // record bound as well as by the ceiling: it could not have skipped more
+        // records than it would have published. An entry beyond the record bound
+        // is bounded by the ceiling alone, because by construction there are as
+        // many of those as the host has PIDs past that bound.
+        let mut skipped = SkippedRecords::with_limit(self.record_limit.min(self.uncertain_limit));
         let mut vanished = 0usize;
-        let mut capped = 0usize;
+        let mut capped = CappedRecords::with_limit(self.uncertain_limit);
         let mount = self.mount_kind();
         // `sys/kernel/hostname` is a sysctl: the kernel answers it from the
         // *reader's* UTS namespace, whatever mount it is read through. Two
@@ -354,7 +402,9 @@ impl ProcessSource for ProcFsSource {
             Ok(entries) => entries,
             Err(error) => {
                 // The whole scan failed: an empty list here is explicitly not
-                // an authoritative "no processes" answer.
+                // an authoritative "no processes" answer, and the records it
+                // hides were never read, so none of them can be named.
+                skipped.mark_unenumerable();
                 record_issue(&mut issues, || EnumerationIssue {
                     scope: IssueScope::Root,
                     reason: reason_for(&error),
@@ -374,7 +424,9 @@ impl ProcessSource for ProcFsSource {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    skipped += 1;
+                    // The entry itself could not be examined, so this record has
+                    // no PID to name and its absence cannot be attributed.
+                    skipped.unnamed();
                     record_issue(&mut issues, || EnumerationIssue {
                         scope: IssueScope::Entry,
                         reason: reason_for(&error),
@@ -393,8 +445,14 @@ impl ProcessSource for ProcFsSource {
                 // This entry was never read: it is omitted by the collector's own
                 // bound, not because anything denied or hid it. Counting it as
                 // skipped would publish a read failure that never happened.
-                capped += 1;
-                if capped == 1 {
+                //
+                // The bound stopped the read, not the listing, and the listing
+                // already named this record: its PID is recorded so its absence
+                // from the published rows stays attributable, and a host larger
+                // than the record bound does not make every scan keep every
+                // absent row (PX-004).
+                capped.record(pid);
+                if capped.count() == 1 {
                     let limit = self.record_limit;
                     record_issue(&mut issues, || EnumerationIssue {
                         scope: IssueScope::Limit,
@@ -415,7 +473,7 @@ impl ProcessSource for ProcFsSource {
                 // One unreadable record is skipped with a reason; it never fails
                 // the snapshot (PX-003).
                 Err(error) => {
-                    skipped += 1;
+                    skipped.record(pid);
                     record_issue(&mut issues, || EnumerationIssue {
                         scope: IssueScope::Process(pid),
                         reason: reason_for(&error),
@@ -424,7 +482,7 @@ impl ProcessSource for ProcFsSource {
                 }
                 Ok(bytes) => match parse_stat(pid, &bytes) {
                     None => {
-                        skipped += 1;
+                        skipped.record(pid);
                         record_issue(&mut issues, || EnumerationIssue {
                             scope: IssueScope::Process(pid),
                             reason: MissingReason::Unavailable,
@@ -736,6 +794,7 @@ mod tests {
             source: SourceId("procfs-unanchored:proc".into()),
             status: "unanchored".into(),
             record_limit: MAX_RECORDS,
+            uncertain_limit: MAX_UNCERTAIN_PIDS,
             anchored: false,
         };
         let snapshot = unanchored.snapshot();

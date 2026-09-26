@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-004",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Polled incremental refresh of the read-only process collection; no process controls, no sorting, no metrics beyond PID and name, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX004-001",
+      "feature": "Configurable one-second polling that publishes each snapshot difference as bounded model operations on the existing transaction path, leaving the semantic node tree built once",
+      "scope": "PX-004/fake, scripted and live procfs sources/read-only",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-004",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX004-002",
+      "feature": "A tick whose snapshot holds no user-visible change opens no transaction, and no self-changing value such as the sample time is ever serialized",
+      "scope": "PX-004/all sources/read-only",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-004",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX004-003",
+      "feature": "A scan deletes a row only when it accounted for that absence: an incomplete scan keeps the last-known rows whose absence it could not account for, with their item identities, and publishes an explanation instead of deleting them, while the processes it proved ended are still removed; recovery converges without moving a row",
+      "scope": "PX-004/all sources/read-only",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-004",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX004-004",
+      "feature": "The published collection is never larger than one catch-up snapshot frame: rows beyond that ceiling are not published, the rows kept are the leading ones of the order the source already publishes so an unchanged host churns none of them, and the status states how many were left out in counts and fixed wording alone",
+      "scope": "PX-004/all sources/read-only; the runtime's own unchunked snapshot export is tracked by PX-004-G01 and not changed here",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-004",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-004.md"
+      ]
+    }
+  ]
+}

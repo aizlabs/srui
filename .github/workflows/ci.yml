@@ -292,8 +292,35 @@ jobs:
         run: swift test --package-path client-macos/LogicalChannelScheduling
       - name: Verify Accessibility API boundary (§22.9, §32.11)
         run: scripts/check-accessibility-api-boundary.sh
-      - name: Build and test client-macos
-        run: swift test
+      # TEMPORARY (codex/ci-swift-bisect): locate the suite that parks the macOS run.
+      # Each stage is bounded so a hang fails in minutes instead of hours, and every
+      # stage runs even if an earlier one times out.
+      - name: Stage 1 - suite without process-launching or AppKit-window suites
+        run: |
+          timeout 900 swift test \
+            --skip CounterSocketIntegrationTests \
+            --skip CollectionRangeSocketIntegrationTests \
+            --skip CodingAgentFallbackSocketTests \
+            --skip ProcessExplorerShellTests \
+            --skip SSHTransportLiveIntegrationTests \
+            --skip SSHTransportPersistenceIntegrationTests \
+            --skip SemanticInspectionAutomationTests \
+            && echo STAGE1_OK || echo "STAGE1_EXIT=$?"
+        working-directory: client-macos
+      - name: Stage 2 - process-launching socket suites only
+        if: always()
+        run: |
+          timeout 600 swift test --filter CounterSocketIntegrationTests && echo COUNTER_OK || echo "COUNTER_EXIT=$?"
+          timeout 600 swift test --filter CollectionRangeSocketIntegrationTests && echo RANGE_OK || echo "RANGE_EXIT=$?"
+          timeout 600 swift test --filter CodingAgentFallbackSocketTests && echo AGENT_OK || echo "AGENT_EXIT=$?"
+        working-directory: client-macos
+      - name: Stage 3 - SSH and AppKit-window suites only
+        if: always()
+        run: |
+          timeout 600 swift test --filter ProcessExplorerShellTests && echo SRTOP_OK || echo "SRTOP_EXIT=$?"
+          timeout 600 swift test --filter SSHTransportLiveIntegrationTests && echo SSHLIVE_OK || echo "SSHLIVE_EXIT=$?"
+          timeout 600 swift test --filter SSHTransportPersistenceIntegrationTests && echo SSHPERSIST_OK || echo "SSHPERSIST_EXIT=$?"
+          timeout 600 swift test --filter SemanticInspectionAutomationTests && echo INSPECT_OK || echo "INSPECT_EXIT=$?"
         working-directory: client-macos
       - name: Verify committed generated protocol outputs are fresh
         run: |

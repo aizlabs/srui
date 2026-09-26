@@ -142,9 +142,14 @@ public final class LayoutRenderer {
 
     public func showWindows() {
         surfacesShown = true
+        let presentation = SurfacePresentation.forHostApplication()
         for handle in registry.surfaceHandles {
-            handle.window?.makeKeyAndOrderFront(nil)
+            guard let window = handle.window else { continue }
+            presentation.present(window)
         }
+        RendererDiagnostics.log(
+            "showWindows presentation=\(presentation) surfaces=\(registry.surfaceHandles.count)"
+        )
     }
 
     /// Validates extension negotiation and fallback structure without mutating AppKit state.

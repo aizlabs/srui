@@ -31,14 +31,16 @@ struct ProcessExplorerShellTests {
 
         let surfaceHandle = try #require(renderer.registry.handle(for: NodeId(1)))
         let window = try #require(surfaceHandle.window)
-        defer { window.close() }
+        defer { window.orderOut(nil); window.close() }
         let headingHandle = try #require(renderer.registry.handle(for: NodeId(3)))
         let heading = try #require(headingHandle.view as? NSTextField)
         let status = try #require(renderer.registry.handle(for: NodeId(4))?.view as? NSTextField)
         let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
         let scroll = try #require(tableHandle.view as? NSScrollView)
         let table = try #require(scroll.documentView as? NSTableView)
-        window.makeKeyAndOrderFront(nil)
+        // The session already ordered the surface in; re-order it under the host's own
+        // presentation policy rather than forcing it front over the developer's desktop.
+        SurfacePresentation.forHostApplication().present(window)
         window.contentView?.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
         #expect(window.isVisible)
@@ -103,12 +105,12 @@ struct ProcessExplorerShellTests {
         }
         let surfaceHandle = try #require(renderer.registry.handle(for: NodeId(1)))
         let window = try #require(surfaceHandle.window)
-        defer { window.close() }
+        defer { window.orderOut(nil); window.close() }
         let statusField = try #require(renderer.registry.handle(for: NodeId(4))?.view as? NSTextField)
         let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
         let scroll = try #require(tableHandle.view as? NSScrollView)
         let table = try #require(scroll.documentView as? NSTableView)
-        window.makeKeyAndOrderFront(nil)
+        SurfacePresentation.forHostApplication().present(window)
         window.contentView?.layoutSubtreeIfNeeded()
         let windowNumber = window.windowNumber
 

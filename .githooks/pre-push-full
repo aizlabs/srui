@@ -97,7 +97,36 @@ if [ "$(uname -s)" = Darwin ]; then
 	run "swift: build example servers" cargo build --manifest-path examples/counter/Cargo.toml
 	run "swift: build coding-agent demo" cargo build --manifest-path examples/coding-agent-demo/Cargo.toml
 	run "swift: build Process Explorer" cargo build --locked --manifest-path apps/srtop/Cargo.toml
-	run "swift: swift test" swift test --package-path client-macos
+	# The client-macos suite can park: 0% CPU, no output, nothing printed, never returns, with
+	# every test already passed (see `scripts/run-swift-tests.sh`'s header, and branch
+	# `codex/swift-suite-park` for the current instance). A bare `swift test` here turned that park
+	# into an indefinite `git push` hang, which is how everyone ended up pushing `--no-verify` and
+	# losing the hook entirely. Route it through the existing watchdog instead: it diagnoses the
+	# wedge, kills the run's process group, and returns non-zero, so a park costs a bounded wait
+	# and fails the hook honestly. A healthy suite is not slowed at all. Reuses that script rather
+	# than adding a third timeout mechanism (macOS has no timeout(1)); override the bound with
+	# SRUI_TEST_TIMEOUT, the same knob the script documents.
+	client_test_timeout=${SRUI_TEST_TIMEOUT:-900}
+	swift_client_tests() {
+		if SRUI_TEST_TIMEOUT="$client_test_timeout" bash scripts/run-swift-tests.sh; then
+			return 0
+		else
+			status=$?
+			# 137 is the watchdog's SIGKILL of the process group, not a failing test, so say what
+			# happened: a park leaves no failing test to point at, and a bound set too low for a
+			# cold build looks identical from the exit status alone.
+			if [ "$status" -eq 137 ]; then
+				printf '\033[31mthe client-macos suite did not finish within %ss; the watchdog killed it.\033[0m\n' \
+					"$client_test_timeout"
+				printf 'If the diagnosis above shows swift-test parked with every test already passed, that is\n'
+				printf 'the known suite park (branch codex/swift-suite-park), not your change. If it was still\n'
+				printf 'compiling, the bound was simply too short: re-run with SRUI_TEST_TIMEOUT=<seconds>.\n'
+				printf 'Either way this push is blocked; bypass deliberately with git push --no-verify.\n'
+			fi
+			return "$status"
+		fi
+	}
+	run "swift: swift test (watchdog, ${client_test_timeout}s)" swift_client_tests
 	run "benchmarks: isolated Swift driver tests" \
 		swift test --disable-automatic-resolution --package-path client-macos/Benchmarks -c release
 

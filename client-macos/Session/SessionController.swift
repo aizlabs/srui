@@ -3451,7 +3451,11 @@ public final class SessionController: @unchecked Sendable {
             forceRemount: true,
             preserveLocalTextForRemount: true,
             binding: binding,
-            renderToken: renderToken
+            renderToken: renderToken,
+            rewireOwnershipAtMount: SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
         )
         guard rendererUpdate.didRender else {
             if rendererUpdate.wasSuperseded {
@@ -4761,20 +4765,6 @@ public final class SessionController: @unchecked Sendable {
                 }
                 return
             }
-            // The remount below publishes an interactive native tree, and its adapters emit
-            // range requests as soon as a viewport exists. Those callbacks are fenced by the
-            // incarnation captured when they were wired, so they must be re-wired here rather
-            // than in `completeSnapshotCatchUp()`: a request (or Terminal input) emitted between
-            // the mount and that later reinstall would otherwise be fenced out, and the adapter
-            // keeps the window marked in flight, so nothing re-requests it (§8, §22.7).
-            await MainActor.run {
-                self.ensureActionHandlerWired(
-                    ownership: SemanticActionOwnership(
-                        binding: connectionBinding,
-                        sessionIncarnation: snapshotIncarnation
-                    )
-                )
-            }
             applyResult = published.result
             renderToken = published.renderToken
             renderSessionIncarnation = snapshotIncarnation
@@ -4821,7 +4811,13 @@ public final class SessionController: @unchecked Sendable {
                 forceRemount: isResyncSnapshot,
                 discardTextEditsForResync: isResyncSnapshot,
                 binding: connectionBinding,
-                renderToken: renderToken
+                renderToken: renderToken,
+                rewireOwnershipAtMount: isResyncSnapshot
+                    ? SemanticActionOwnership(
+                        binding: connectionBinding,
+                        sessionIncarnation: renderSessionIncarnation
+                    )
+                    : nil
             )
 
             if !isResyncSnapshot {
@@ -5203,7 +5199,11 @@ public final class SessionController: @unchecked Sendable {
         discardTextEditsForResync: Bool = false,
         preserveLocalTextForRemount: Bool = false,
         binding: EventOutboxConnectionBinding,
-        renderToken: UUID
+        renderToken: UUID,
+        // Ownership the remounted tree's native callbacks must carry. A snapshot that advances the
+        // session incarnation fences out the callbacks wired at connect time, so they are
+        // reinstalled at the mount itself rather than afterwards (see the mount branch below).
+        rewireOwnershipAtMount: SemanticActionOwnership? = nil
     ) async -> RendererUpdateResult {
         guard let cachedResources = await resourceCache.beginRenderReferenceLease(
             ownerEpoch: binding.resourceOwnershipEpoch,
@@ -5245,6 +5245,18 @@ public final class SessionController: @unchecked Sendable {
                 do {
                     try self.rendererUpdateInterceptorForTesting?()
                     if forceRemount || !self.hasMountedInitialTree {
+                        // A resync/catch-up snapshot advances the session incarnation before it
+                        // mounts, so the ownership-fenced callbacks wired at connect time would
+                        // reject everything the new tree emits — and a dropped range request stays
+                        // marked in flight in the adapter, so nothing re-requests it (§8, §22.7).
+                        // Reinstalling them *here* is what makes this safe rather than merely
+                        // earlier: this block replaces the tree synchronously, so the outgoing tree
+                        // never gets a chance to send under the new incarnation, while adapters
+                        // built by the mount below — which can emit their first viewport request as
+                        // they are constructed — are already authorized.
+                        if let rewireOwnershipAtMount {
+                            self.ensureActionHandlerWired(ownership: rewireOwnershipAtMount)
+                        }
                         if preserveLocalTextForRemount {
                             try renderer.layoutRenderer.mount(
                                 store: snapshot.store,

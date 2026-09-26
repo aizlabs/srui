@@ -18,10 +18,14 @@ enum AsyncTestSupport {
         }
     }
 
-    /// Poll interval. Deliberately a real sleep rather than `Task.yield()`: most conditions here
-    /// are `@MainActor`, and a tight yield loop on the main actor keeps re-enqueuing cooperative
-    /// work, so the main thread never goes idle and never services its run-loop sources, while
-    /// burning a whole core that CI (3 cores) needs for the work being awaited.
+    /// Poll interval. A real sleep rather than `Task.yield()`, which busy-waits: every condition
+    /// polled here depends on I/O or an actor hop, so re-checking thousands of times per second
+    /// buys nothing and costs CPU that the awaited work needs (CI runners have 3 cores).
+    ///
+    /// This is hygiene, not a fix for any known failure: with `Task.yield()` restored, the two
+    /// tests this helper was suspected of breaking still pass. In particular it is *not*
+    /// justified by run-loop starvation — sampling a parked test helper shows 0% CPU and a main
+    /// thread idle in `CFRunLoopRun`/`mach_msg`, so that hang is a lost wakeup, not contention.
     static let pollInterval = Duration.milliseconds(10)
 
     static func eventuallyAsync(

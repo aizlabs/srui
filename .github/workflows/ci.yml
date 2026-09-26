@@ -76,8 +76,18 @@ jobs:
 
       # CI and the Codex review start independently on `opened` and `ready_for_review`. Querying
       # threads immediately would find none and pass, letting every expensive job run against code
-      # a review is about to flag. Waiting for a review of *this* head closes that race.
-      - name: Wait for a Codex review of the current head
+      # a review is about to flag. Waiting for a verdict on *this* head closes that race.
+      #
+      # Codex reports a verdict in one of two shapes, and both have to count:
+      #   * findings      -> a review object on `/pulls/$PR/reviews` with `commit_id` = head
+      #   * no findings   -> NO review object at all, just an issue comment whose body starts
+      #                      `Codex Review: Didn't find any major issues.` and names the reviewed
+      #                      commit (abbreviated) in a `**Reviewed commit:**` field.
+      # Polling only for review objects therefore timed out on exactly the heads review liked
+      # most; clearing it needed `workflow_dispatch` with `skip_review_gate=true`, i.e. a bypass
+      # to merge a clean review. Evidence: PR #64, heads 888bf797e7… and b40844b42a…, two clean
+      # comments and zero review objects.
+      - name: Wait for a Codex review verdict on the current head
         if: steps.pr.outputs.number != '' && !inputs.skip_review_gate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -100,8 +110,33 @@ jobs:
               echo "Codex has reviewed ${HEAD_SHA}."
               exit 0
             fi
+            # The clean-verdict comment, paginated the same way. Three things keep this narrow:
+            #   * the author must be the bot, matched exactly as the review query matches it, so a
+            #     human quoting the sentence cannot satisfy the gate;
+            #   * the body must *start* with the clean-verdict sentence, which excludes the bot's
+            #     own "Codex Review Summary" comment (it tabulates an abbreviated sha too);
+            #   * the sha is compared prefix-wise, because the comment abbreviates it, but the
+            #     prefix is *captured out of the `**Reviewed commit:**` field* rather than
+            #     searched for anywhere in the body -- a 7-char prefix mentioned in prose is not
+            #     a verdict. `$ENV.HEAD_SHA` keeps the sha out of the jq program text.
+            clean=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+              --jq '[ .[]
+                      | select((.user.login // "") | startswith("chatgpt-codex-connector"))
+                      | (.body // "")
+                      | select(startswith("Codex Review: Didn'\''t find any major issues."))
+                      | capture("Reviewed commit:\\*\\*\\s*`(?<sha>[0-9a-fA-F]{7,40})`").sha
+                      | ascii_downcase as $sha
+                      | select(($ENV.HEAD_SHA | ascii_downcase) | startswith($sha))
+                    ] | length' \
+              | jq -s 'add // 0')
+            if [ "$clean" -gt 0 ]; then
+              # "A review happened", not "findings are resolved": the next step still fails on
+              # every unresolved Codex thread, including ones opened against an earlier head.
+              echo "Codex reviewed ${HEAD_SHA} and reported no findings."
+              exit 0
+            fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "No Codex review of ${HEAD_SHA} after 15 minutes."
+              echo "No Codex review or clean-verdict comment for ${HEAD_SHA} after 15 minutes."
               echo
               echo "Fail closed rather than run the suite against unreviewed code. Either:"
               echo "  - comment '@codex review' on the PR and re-run, or"

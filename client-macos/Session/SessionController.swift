@@ -800,6 +800,38 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// Rebinds the Terminal pump's authorized sender, leaving the native callbacks alone.
+    ///
+    /// `TerminalCommandPump.drain()` discards an item its sender refuses, so the pump has to own
+    /// the incarnation a snapshot just established *before* that snapshot's tree can queue input;
+    /// otherwise those keystrokes are dropped rather than retried (§21, §22.2). Queueing itself
+    /// stays fenced by the native callbacks, which `updateRenderer` reinstalls inside the guarded
+    /// mount, so rebinding here cannot let an outgoing tree send under the new incarnation.
+    /// `reinstallInteractionOwnership` rebinds both together for every other path.
+    @discardableResult
+    private func rebindTerminalPumpOwnership(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        guard let lease = continuityContext.acquireMutation(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return false
+        }
+        defer { continuityContext.releaseMutation(lease) }
+        await terminalPump.attach(
+            sendIfAuthorized: terminalCommandSender(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        )
+        return continuityContext.isActive(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
+    }
+
     private func terminalCommandSender(
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
@@ -4765,6 +4797,13 @@ public final class SessionController: @unchecked Sendable {
                 }
                 return
             }
+            // The tree mounted below queues Terminal input through the callbacks this snapshot's
+            // incarnation owns, so the pump's sender has to be rebound before the mount: a drain
+            // holding the previous incarnation's sender refuses the item and drops it (§21).
+            await rebindTerminalPumpOwnership(
+                binding: connectionBinding,
+                sessionIncarnation: snapshotIncarnation
+            )
             applyResult = published.result
             renderToken = published.renderToken
             renderSessionIncarnation = snapshotIncarnation

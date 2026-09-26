@@ -26,8 +26,25 @@ trap 'rm -f "$log" "$plain"' EXIT
 # `script` gives the run a pty so its output stays line-buffered. A wedged run that the watchdog
 # kills would otherwise lose everything still sitting in stdio's block buffer, and the accounting
 # below would have nothing to read.
+# `run-swift-tests.sh` samples `swift-test`, the parent that only reads the helper's pipes. When
+# the stall is inside the test host itself the useful stacks are in `swiftpm-testing-helper`, so
+# sample that process a little before the inner watchdog kills the group.
+timeout_seconds=${SRUI_TEST_TIMEOUT:-300}
+sample_at=$(( timeout_seconds > 45 ? timeout_seconds - 30 : timeout_seconds ))
+(
+    sleep "$sample_at"
+    helper=$(pgrep -x swiftpm-testing-helper 2>/dev/null | head -1)
+    [ -z "$helper" ] && exit 0
+    echo "=== stalled test host: sample of swiftpm-testing-helper pid=$helper ===" >&2
+    sample "$helper" 2 -mayDie 2>/dev/null >&2
+    echo "=== end sample ===" >&2
+) &
+sampler_pid=$!
+
 script -q "$log" scripts/run-swift-tests.sh "$@" >/dev/null 2>&1
 status=$?
+kill "$sampler_pid" 2>/dev/null
+wait "$sampler_pid" 2>/dev/null
 
 # The pty also makes swift-testing colourise its output, so strip CRs and ANSI SGR sequences
 # before matching. `cat` replays the original, colour and all, for the human reading the log.

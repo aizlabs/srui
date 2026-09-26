@@ -292,9 +292,19 @@ jobs:
         run: swift test --package-path client-macos/LogicalChannelScheduling
       - name: Verify Accessibility API boundary (§22.9, §32.11)
         run: scripts/check-accessibility-api-boundary.sh
+      # Tests must never nest a CFRunLoop activation on the main run loop: under Swift 6.2 that
+      # run loop *is* the main-actor executor, so nesting inside it either strands every
+      # `@MainActor` test (the suite parks at 0% CPU) or lets the executor's own CFRunLoopStop
+      # escape to `swift_task_asyncMainDrainQueue`, ending the process with `exit(0)` while tests
+      # are still in flight. The script documents the measurement.
+      - name: Verify tests do not nest the main run loop
+        run: scripts/check-test-main-runloop-nesting.sh
+      # `swift test` alone cannot be trusted to mean "every test passed": it reports success when
+      # the test host exits early, with no summary and no result for the tests still running. This
+      # wrapper runs the same suite under the wedge watchdog and then fails if the run did not
+      # account for every test it started.
       - name: Build and test client-macos
-        run: swift test
-        working-directory: client-macos
+        run: scripts/assert-swift-test-run-complete.sh
       - name: Verify committed generated protocol outputs are fresh
         run: |
           ./protocol/generate_proto.sh

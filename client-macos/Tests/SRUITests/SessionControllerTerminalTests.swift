@@ -699,7 +699,26 @@ struct SessionControllerTerminalTests {
         ) {
             await recording.terminalFrameCount >= 1
         }
-        #expect(try await recording.resizeCount(forStream: terminalID.value) >= 1)
+        // Every legal re-send has to be drained before the baseline below, or one crossing it
+        // would read as the stale re-send this test is looking for. A reattach during the
+        // handshake legitimately repeats the retained size once, and its ordering against the
+        // first resize depends on machine speed.
+        func settledResizeCount() async throws -> Int {
+            var last = -1
+            var stableRounds = 0
+            while stableRounds < 3 {
+                let current = try await recording.resizeCount(forStream: terminalID.value)
+                if current == last {
+                    stableRounds += 1
+                } else {
+                    stableRounds = 0
+                    last = current
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            return last
+        }
+        #expect(try await settledResizeCount() >= 1)
 
         var resync = SRUIServerResyncRequired()
         resync.sessionID = welcome.sessionID
@@ -719,10 +738,10 @@ struct SessionControllerTerminalTests {
         )
         var snapshotMessage = SRUIMessage()
         snapshotMessage.transaction = snapshot.toWire()
-        // Baseline taken once the snapshot is authoritative-to-be: from here on, every resize for
-        // this stream is stale. Reattaching the pump re-queues retained sizes, and a resize whose
+        // Baseline after the resync has settled: from the snapshot on, every resize for this
+        // stream is stale. Reattaching the pump re-queues retained sizes, and a resize whose
         // stream the snapshot removed costs the connection, so the count must not move.
-        let resizesBeforeSnapshot = try await recording.resizeCount(forStream: terminalID.value)
+        let resizesBeforeSnapshot = try await settledResizeCount()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
 
         try await AsyncTestSupport.eventually(
@@ -732,11 +751,9 @@ struct SessionControllerTerminalTests {
             applier.lastAppliedRevision == Revision(2)
                 && renderer.registry.view(for: terminalID) == nil
         }
-        // Negative assertion: give a drain kicked by the rebind time to reach the transport.
-        try await Task.sleep(for: .milliseconds(250))
-        #expect(
-            try await recording.resizeCount(forStream: terminalID.value) == resizesBeforeSnapshot
-        )
+        // Negative assertion: a drain kicked by the rebind reaches the transport immediately, so
+        // settling is enough to catch it.
+        #expect(try await settledResizeCount() == resizesBeforeSnapshot)
 
         await controller.stop()
         await serverTransport.close()

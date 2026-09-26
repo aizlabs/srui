@@ -4761,6 +4761,20 @@ public final class SessionController: @unchecked Sendable {
                 }
                 return
             }
+            // The remount below publishes an interactive native tree, and its adapters emit
+            // range requests as soon as a viewport exists. Those callbacks are fenced by the
+            // incarnation captured when they were wired, so they must be re-wired here rather
+            // than in `completeSnapshotCatchUp()`: a request (or Terminal input) emitted between
+            // the mount and that later reinstall would otherwise be fenced out, and the adapter
+            // keeps the window marked in flight, so nothing re-requests it (§8, §22.7).
+            await MainActor.run {
+                self.ensureActionHandlerWired(
+                    ownership: SemanticActionOwnership(
+                        binding: connectionBinding,
+                        sessionIncarnation: snapshotIncarnation
+                    )
+                )
+            }
             applyResult = published.result
             renderToken = published.renderToken
             renderSessionIncarnation = snapshotIncarnation

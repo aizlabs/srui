@@ -828,6 +828,12 @@ private final class SemanticInspectionHarness {
         resync.reason = "semantic inspection stale-handle coverage"
         resync.continuity = .replaced
         resync.lastProcessedEventSeq = 0
+        // A replacement session is a *new* session: §18 requires it to re-advertise its
+        // negotiation metadata, and `SessionController` fails the session outright when it does
+        // not ("live replacement resync omitted negotiation metadata for its new session").
+        // Without these profiles the resync never reaches `awaitingSnapshot`, so the snapshot
+        // below is rejected and no replacement tree ever mounts.
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
         var resyncMessage = SRUIMessage()
         resyncMessage.serverResyncRequired = resync
         await controller.handleIncomingMessage(resyncMessage)

@@ -18,6 +18,12 @@ enum AsyncTestSupport {
         }
     }
 
+    /// Poll interval. Deliberately a real sleep rather than `Task.yield()`: most conditions here
+    /// are `@MainActor`, and a tight yield loop on the main actor keeps re-enqueuing cooperative
+    /// work, so the main thread never goes idle and never services its run-loop sources, while
+    /// burning a whole core that CI (3 cores) needs for the work being awaited.
+    static let pollInterval = Duration.milliseconds(10)
+
     static func eventuallyAsync(
         isolation: isolated (any Actor)? = #isolation,
         timeout: Duration = .seconds(2),
@@ -31,7 +37,7 @@ enum AsyncTestSupport {
             guard clock.now < deadline else {
                 throw AsyncTestTimeout(description: "Timed out waiting for \(description)")
             }
-            await Task.yield()
+            try await Task.sleep(for: pollInterval)
         }
     }
 }

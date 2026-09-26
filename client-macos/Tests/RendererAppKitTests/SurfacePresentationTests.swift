@@ -28,6 +28,35 @@ struct SurfacePresentationTests {
         #expect(SurfacePresentation.forHostApplication() == .concealed)
     }
 
+    /// Both directions of the policy mapping, so nobody can quietly flip the default:
+    /// an app that declares it presents UI keeps presenting it.
+    @Test
+    func policyMappingRunsBothWays() {
+        #expect(SurfacePresentation.forActivationPolicy(.regular) == .onScreen)
+        #expect(SurfacePresentation.forActivationPolicy(.accessory) == .onScreen)
+        #expect(SurfacePresentation.forActivationPolicy(.prohibited) == .concealed)
+    }
+
+    /// The `.onScreen` branch must order the surface in and conceal nothing.
+    ///
+    /// The window is pre-concealed by the test itself (not by the policy) so that exercising
+    /// the foreground branch inside a `.prohibited` test host still paints nothing on the
+    /// developer's display; what is asserted is that the policy leaves alpha and mouse
+    /// handling alone and brings the window into the window list.
+    @Test
+    func onScreenPresentationOrdersTheSurfaceInAndConcealsNothing() throws {
+        let handle = try ControlFactory().makeHandle(for: Node(id: 1, nodeType: .surface))
+        let window = try #require(handle.window)
+        window.alphaValue = 0
+        defer { window.orderOut(nil); window.close() }
+
+        SurfacePresentation.onScreen.present(window)
+
+        #expect(window.isVisible)
+        #expect(window.alphaValue == 0, "the foreground branch must not touch alpha")
+        #expect(window.ignoresMouseEvents == false, "the foreground branch must stay interactive")
+    }
+
     private func makeSurfaceStore() throws -> SemanticStore {
         var store = SemanticStore()
         try SemanticModel.Operation.createNode(id: 1, nodeType: .surface).apply(to: &store)

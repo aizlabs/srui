@@ -55,6 +55,8 @@ struct CodingAgentFallbackSocketTests {
         }
 
         let surfaceWindow = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        // Leave nothing in the window list behind this test.
+        defer { surfaceWindow.orderOut(nil) }
         #expect(surfaceWindow.styleMask.contains(.resizable))
         #expect(surfaceWindow.contentMaxSize.width > surfaceWindow.contentMinSize.width)
         surfaceWindow.setContentSize(NSSize(width: 900, height: 900))

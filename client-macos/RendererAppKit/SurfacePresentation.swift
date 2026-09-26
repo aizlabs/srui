@@ -31,11 +31,11 @@ public enum SurfacePresentation: Equatable, Sendable {
     /// Order the surface in, but transparent, non-interactive and behind everything else.
     case concealed
 
-    /// The presentation implied by `application`'s declared activation policy.
-    public static func forHostApplication(
-        _ application: NSApplication = NSApplication.shared
+    /// The presentation implied by a declared activation policy.
+    public static func forActivationPolicy(
+        _ policy: NSApplication.ActivationPolicy
     ) -> SurfacePresentation {
-        switch application.activationPolicy() {
+        switch policy {
         case .regular, .accessory:
             return .onScreen
         case .prohibited:
@@ -43,6 +43,13 @@ public enum SurfacePresentation: Equatable, Sendable {
         @unknown default:
             return .concealed
         }
+    }
+
+    /// The presentation implied by `application`'s declared activation policy.
+    public static func forHostApplication(
+        _ application: NSApplication = NSApplication.shared
+    ) -> SurfacePresentation {
+        forActivationPolicy(application.activationPolicy())
     }
 
     /// Brings `window` into the window list under this policy.

@@ -26,7 +26,7 @@ struct SemanticInspectionAutomationTests {
                     as? NSButton
             )
 
-            button.performClick(nil)
+            NativeActivation.click(button)
             let returnedEvent = try await handle.activate()
 
             let captured = await harness.transport.recordedEvents()
@@ -100,7 +100,7 @@ struct SemanticInspectionAutomationTests {
                     as? NSButton
             )
             #expect(button.isEnabled == false)
-            button.performClick(nil)
+            NativeActivation.click(button)
 
             do {
                 _ = try await handle.activate()
@@ -491,7 +491,7 @@ struct SemanticInspectionAutomationTests {
                     as? NSButton
             )
 
-            button.performClick(nil)
+            NativeActivation.click(button)
             await gate.waitUntilEntered()
             do {
                 try await harness.deleteApproveButton()

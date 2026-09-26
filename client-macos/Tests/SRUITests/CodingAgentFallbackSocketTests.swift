@@ -173,7 +173,7 @@ struct CodingAgentFallbackSocketTests {
         var expectedRevision: UInt64 = 4
         for index in 0..<10 {
             let isReject = index.isMultiple(of: 2)
-            (isReject ? rejectButton : approveButton).performClick(nil)
+            NativeActivation.click(isReject ? rejectButton : approveButton)
             expectedRevision += 1
             try await Self.waitForRevision(
                 applier,

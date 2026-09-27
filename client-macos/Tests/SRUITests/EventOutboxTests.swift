@@ -2157,8 +2157,15 @@ private func waitForResumeGeneration(
     return false
 }
 
+/// Blocks the main actor on purpose, to prove work queued behind a stalled renderer still settles.
+///
+/// The `release` wait stays a semaphore: `block()` is the deliberate main-thread stall under test.
+/// Waiting for it to be *reached*, though, must not block - `Task.detached { entered.wait() }` parks
+/// a cooperative thread, and swift-testing runs the suite concurrently on a pool only as wide as
+/// the machine's cores, so a few such waits deadlock the whole run on a small machine (see
+/// `AsyncTestSignal`).
 private final class MainActorRenderBlocker: @unchecked Sendable {
-    private let entered = DispatchSemaphore(value: 0)
+    private let entered = AsyncTestSignal()
     private let release = DispatchSemaphore(value: 0)
 
     @MainActor
@@ -2168,13 +2175,7 @@ private final class MainActorRenderBlocker: @unchecked Sendable {
     }
 
     func waitUntilEntered() async {
-        await Task.detached { [self] in
-            waitForEntry()
-        }.value
-    }
-
-    private func waitForEntry() {
-        entered.wait()
+        await entered.wait()
     }
 
     func releaseRender() {

@@ -38,13 +38,16 @@ struct TransportBackpressureTests {
     /// limit. Dropping is not an alternative in this direction: committed transactions may never
     /// be silently discarded (§20.4).
     @Test("A reader parks at the backlog limit and resumes only once the consumer acknowledges")
-    func readerParksUntilConsumerCatchesUp() throws {
+    func readerParksUntilConsumerCatchesUp() async throws {
         let gate = InboundBacklogGate(limitBytes: 1024)
         gate.recordDelivered(1024)
         #expect(gate.outstandingBytes == 1024)
 
-        let entered = DispatchSemaphore(value: 0)
-        let admitted = DispatchSemaphore(value: 0)
+        // The reader under test still parks a real `Thread` - that is the behaviour being checked.
+        // What this test must not do is park the *cooperative* thread it runs on while it waits for
+        // that reader; see `AsyncTestSignal`.
+        let entered = AsyncTestSignal()
+        let admitted = AsyncTestSignal()
         let capacityGranted = Box(false)
 
         let reader = Thread {
@@ -54,16 +57,17 @@ struct TransportBackpressureTests {
             admitted.signal()
         }
         reader.start()
-        entered.wait()
+        await entered.wait()
 
+        try await Task.sleep(for: .milliseconds(250))
         #expect(
-            admitted.wait(timeout: .now() + 0.25) == .timedOut,
+            admitted.signalCount == 0,
             "the reader must stay parked while the consumer is at the limit"
         )
 
         gate.recordConsumed(1024)
         #expect(
-            admitted.wait(timeout: .now() + 5) == .success,
+            await admitted.waitOrTimeout(timeout: .seconds(5)),
             "acknowledging consumption must release the reader"
         )
         #expect(capacityGranted.value)
@@ -73,11 +77,11 @@ struct TransportBackpressureTests {
     /// Teardown must never deadlock on the gate: a parked reader is released, not left waiting for
     /// a consumer that has gone away.
     @Test("Releasing the gate wakes a parked reader and tells it to stop")
-    func releaseWakesParkedReader() throws {
+    func releaseWakesParkedReader() async throws {
         let gate = InboundBacklogGate(limitBytes: 16)
         gate.recordDelivered(64)
 
-        let admitted = DispatchSemaphore(value: 0)
+        let admitted = AsyncTestSignal()
         let capacityGranted = Box(true)
 
         let reader = Thread {
@@ -86,9 +90,10 @@ struct TransportBackpressureTests {
         }
         reader.start()
 
-        #expect(admitted.wait(timeout: .now() + 0.25) == .timedOut)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(admitted.signalCount == 0)
         gate.release()
-        #expect(admitted.wait(timeout: .now() + 5) == .success)
+        #expect(await admitted.waitOrTimeout(timeout: .seconds(5)))
         #expect(
             capacityGranted.value == false,
             "a released gate must tell the reader to exit rather than to read again"
@@ -180,7 +185,7 @@ struct TransportBackpressureTests {
             }
         }
 
-        sink.waitUntilEntered(1)
+        await sink.waitUntilEntered(1)
         writer.stop()
         sink.fail(TransportError.closed)
         latch.stop()
@@ -208,7 +213,7 @@ struct TransportBackpressureTests {
             }
         }
 
-        sink.waitUntilEntered(1)
+        await sink.waitUntilEntered(1)
         sink.fail(TransportError.ioError("injected failure"))
 
         for task in tasks {
@@ -242,16 +247,21 @@ struct TransportBackpressureTests {
     }
 }
 
+/// A sink that parks the writer's own drain queue until the test fails it.
+///
+/// The park inside `write` is deliberate and stays blocking: `SocketWriter` calls the sink from its
+/// private `DispatchQueue`, not from the cooperative pool, so blocking there models a stalled peer
+/// without costing the test runner a thread. `waitUntilEntered` is a different matter - it runs on
+/// the test's own cooperative thread, so it suspends via `AsyncTestSignal` instead of blocking.
 private final class GatedFailingSink: @unchecked Sendable {
     private let condition = NSCondition()
-    private var entered = 0
     private var failure: (any Error)?
+    private let entries = AsyncTestSignal()
 
     func write(_ data: Data) throws {
         _ = data
+        entries.signal()
         condition.lock()
-        entered += 1
-        condition.broadcast()
         while failure == nil {
             condition.wait()
         }
@@ -260,12 +270,8 @@ private final class GatedFailingSink: @unchecked Sendable {
         throw error
     }
 
-    func waitUntilEntered(_ count: Int) {
-        condition.lock()
-        while entered < count {
-            condition.wait()
-        }
-        condition.unlock()
+    func waitUntilEntered(_ count: Int) async {
+        await entries.wait(until: count)
     }
 
     func fail(_ error: any Error) {

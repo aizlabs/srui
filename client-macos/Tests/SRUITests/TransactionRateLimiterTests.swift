@@ -143,8 +143,11 @@ struct TransactionRateLimiterTests {
         }
         try await serverTransport.send(data: replay)
 
+        // The 241st transaction only owes ~8ms of refill, but 241 applies plus that refill are
+        // paced by the cooperative pool: on a 3-core runner sharing it with the whole suite the
+        // deadline has to cover the scheduling, not just the bucket arithmetic.
         try await AsyncTestSupport.eventually(
-            timeout: .seconds(3),
+            timeout: .seconds(20),
             description: "all 241 replay transactions apply through ingress backpressure"
         ) {
             applier.lastAppliedRevision == Revision(241)

@@ -142,6 +142,16 @@ struct CodingAgentFallbackSocketTests {
             "Terminal did not publish the minimum PTY size: \(reportedTerminalSizes)"
         )
 
+        // The demo's session is already past revision 0, so this handshake catches up through a
+        // snapshot, and that snapshot mounts every node before the controller finishes the
+        // catch-up that reopens event dispatch. Semantic activation is refused as inactive until
+        // then, so wait for that boundary rather than for the mount alone (§15, §18.3).
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(10),
+            description: "coding-agent snapshot catch-up reopens event dispatch"
+        ) {
+            controller.isEventDispatchEnabled
+        }
         let semanticInspector = controller.makeSemanticInspector()
         let semanticApprove = try #require(
             semanticInspector.find(role: .button, label: "Approve")

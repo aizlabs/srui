@@ -37,24 +37,38 @@ struct SurfacePresentationTests {
         #expect(SurfacePresentation.forActivationPolicy(.prohibited) == .concealed)
     }
 
-    /// The `.onScreen` branch must order the surface in and conceal nothing.
-    ///
-    /// The window is pre-concealed by the test itself (not by the policy) so that exercising
-    /// the foreground branch inside a `.prohibited` test host still paints nothing on the
-    /// developer's display; what is asserted is that the policy leaves alpha and mouse
-    /// handling alone and brings the window into the window list.
+    /// The `.onScreen` branch must order the surface in *and* undo any earlier concealment: a host
+    /// that mounted its surfaces while `.prohibited` and then declared `.regular` or `.accessory`
+    /// presents the same windows again, and an invisible click-through window ordered front is
+    /// worse than no window at all (§22.3).
     @Test
-    func onScreenPresentationOrdersTheSurfaceInAndConcealsNothing() throws {
+    func onScreenPresentationUndoesAPreviousConcealment() throws {
         let handle = try ControlFactory().makeHandle(for: Node(id: 1, nodeType: .surface))
         let window = try #require(handle.window)
-        window.alphaValue = 0
-        defer { window.orderOut(nil); window.close() }
+        // One pixel, and concealed again before it is ordered out. The foreground branch genuinely
+        // makes a window visible and this test host is `.prohibited` — which suppresses activation
+        // but not window display — so the window has to be too small to register on the developer's
+        // display for the moment it is ordered in. This body is synchronous, so it holds the main
+        // actor throughout and no sibling test can sample the window server while alpha is 1.
+        window.setFrame(NSRect(x: 0, y: 0, width: 1, height: 1), display: false)
+        defer {
+            window.alphaValue = 0
+            window.orderOut(nil)
+            window.close()
+        }
+
+        SurfacePresentation.concealed.present(window)
+        #expect(window.alphaValue == 0)
+        #expect(window.ignoresMouseEvents)
 
         SurfacePresentation.onScreen.present(window)
 
         #expect(window.isVisible)
-        #expect(window.alphaValue == 0, "the foreground branch must not touch alpha")
-        #expect(window.ignoresMouseEvents == false, "the foreground branch must stay interactive")
+        #expect(window.alphaValue == 1, "the foreground branch must undo concealment's alpha")
+        #expect(
+            window.ignoresMouseEvents == false,
+            "the foreground branch must restore mouse handling"
+        )
     }
 
     private func makeSurfaceStore() throws -> SemanticStore {
@@ -87,14 +101,17 @@ struct SurfacePresentationTests {
         #expect(NSApplication.shared.isActive == false)
 
         // Confirmed through the window server rather than the renderer's own state: window
-        // registration is asynchronous, so give it time to appear before asserting that nothing
-        // this process has on screen is drawn at all.
+        // registration is asynchronous, so let it appear before asserting that nothing this
+        // process has on screen is drawn at all.
         //
-        // Awaited, never `RunLoop.current.run(until:)`: in a main-actor test that nests a second
-        // activation of the run loop that *is* the main-actor executor, which either strands every
-        // suspended main-actor test or lets the executor's own `CFRunLoopStop` end the process
-        // mid-run (see scripts/check-test-main-runloop-nesting.sh). Sleeping yields the main actor,
-        // so the run loop keeps turning and window registration still lands.
+        // The wait is an `await`, never `RunLoop.run(until:)`. This test is `@MainActor`, so
+        // `RunLoop.current` is the main run loop, which under Swift 6.2 *is* the main-actor
+        // executor (`swift_task_asyncMainDrainQueue` -> `CFMainExecutor.run()` ->
+        // `CFRunLoopRun()`). Servicing it here nests a second activation: the exact park and
+        // early-exit that `scripts/check-test-main-runloop-nesting.sh` exists to keep out of this
+        // suite. Suspending instead hands the main actor back to that one outer activation, which
+        // services window registration on its own.
+        // Monotonic: a wall-clock deadline can be moved by an NTP step mid-test.
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(2))
         while clock.now < deadline,

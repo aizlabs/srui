@@ -53,9 +53,17 @@ public enum SurfacePresentation: Equatable, Sendable {
     }
 
     /// Brings `window` into the window list under this policy.
+    ///
+    /// Either branch fully determines the window's presentation state, so a host that mounted its
+    /// surfaces before declaring `.regular`/`.accessory` — or that declares one later and presents
+    /// again — gets a visible, interactive window rather than the transparent, click-through one a
+    /// previous `concealed` presentation left behind. `1` is `NSWindow`'s own default alpha; a host
+    /// that wants a translucent surface sets its alpha after presenting.
     public func present(_ window: NSWindow) {
         switch self {
         case .onScreen:
+            window.alphaValue = 1
+            window.ignoresMouseEvents = false
             window.makeKeyAndOrderFront(nil)
         case .concealed:
             window.alphaValue = 0

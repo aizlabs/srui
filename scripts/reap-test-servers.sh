@@ -24,15 +24,37 @@
 #   4. executable path match (`SRUI_REAP_PATTERN`). Matched against argv[0] — the binary's path,
 #      not the whole command line — so a grep over arguments cannot make an editor or a log
 #      tailer look like a fixture server.
+#   5. not bound to the default runtime socket. `ppid 1` is not proof of debris on its own: a
+#      `srui-sessiond` a human detached deliberately also reads as `ppid 1` — it ignores SIGHUP
+#      precisely so it survives an SSH disconnect (§17, §20.2) — and it is the process every client
+#      reaches through `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/srui-<uid>/srui-sessiond.sock`. Killing
+#      it discards the authoritative in-memory session. A fixture never binds that path (tests pass
+#      an explicit `--socket` under a per-run directory), so holding it is taken as proof that the
+#      process is not debris. Ownership evidence beyond this — a marker a test run writes for its
+#      own fixtures — is still missing; a daemon detached by hand onto some *other* explicit socket
+#      is still read as debris once it is old enough.
 #
 # Directories (`/tmp/srui-*`, `/tmp/px0*`, `/tmp/srtop-*`) are removed only when no live process
-# references them. "Referenced" is derived from the command lines of every live process (their
-# `--socket` arguments and any other absolute path they carry), never from mtime: a bound unix
-# socket's mtime does not advance while it is in use, so mtime says nothing about whether a
-# server is still serving on it. mtime is used for one narrower purpose only — a directory
-# touched within the age window is left alone regardless, because a test that has just created
-# its runtime directory may not have spawned the server that names it yet, and some tests bind
-# the socket in-process so no command line ever mentions the path.
+# references them. "Referenced" has two independent sources, and either one spares a directory:
+#
+#   a. the command lines of every live process — their `--socket` arguments and any other absolute
+#      path they carry;
+#   b. the kernel's unix-socket table (`lsof -U`), which names the socket a server actually holds
+#      even when nothing on its command line does. `srui-sessiond` with no `--socket` computes
+#      `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/srui-<uid>/srui-sessiond.sock` internally
+#      (`unix_security::default_socket_path`), so a developer's deliberately detached daemon is
+#      invisible to (a) alone — and unlinking its socket takes the authoritative session away from
+#      every new and reconnecting client. If no socket inventory can be read at all, directory
+#      removal is skipped rather than guessed at.
+#
+# The default runtime directory itself is never removed, whatever the evidence says: no fixture
+# uses it (tests always pass an explicit `--socket` under a per-run directory), so there is nothing
+# to gain and a live daemon to lose.
+#
+# Never from mtime: a bound unix socket's mtime does not advance while it is in use, so mtime says
+# nothing about whether a server is still serving on it. mtime is used for one narrower purpose
+# only — a directory touched within the age window is left alone regardless, because a test that
+# has just created its runtime directory may not have spawned the server that names it yet.
 #
 # Safe to run while tests are running, here or in another checkout: it takes a `ps` snapshot,
 # signals only processes no live run can own, and tolerates losing every race (a pid that exits
@@ -95,9 +117,12 @@ process_terminated() {
     esac
 }
 
-# pid<TAB>argv[0] for every fixture process that is orphaned, old enough, and ours.
+# pid<TAB>argv[0] for every fixture process that is orphaned, old enough, ours, and not holding the
+# default runtime socket (rule 5).
 select_orphans() {
-    awk -v pattern="$pattern" -v min_age="$age_seconds" -v my_uid="$my_uid" -v self="$$" '
+    awk -v pattern="$pattern" -v min_age="$age_seconds" -v my_uid="$my_uid" -v self="$$" \
+        -v spared="$default_socket_pids" '
+        BEGIN { n = split(spared, list, " "); for (i = 1; i <= n; i++) keep[list[i] + 0] = 1 }
         function age_seconds(e,   days, part, n, secs, split_day) {
             days = 0
             if (e ~ /-/) { split(e, split_day, "-"); days = split_day[1] + 0; e = split_day[2] }
@@ -108,6 +133,7 @@ select_orphans() {
             return days * 86400 + secs
         }
         $1 + 0 == self + 0 { next }
+        $1 + 0 in keep { next }                 # serving the default socket: a human started this
         $3 + 0 != my_uid + 0 { next }
         $2 + 0 != 1 { next }                    # live parent: a running test owns this process
         age_seconds($4) < min_age + 0 { next }  # too young to be debris
@@ -131,6 +157,45 @@ referenced_paths() {
         }
     '
 }
+
+# pid<TAB>socket path for every unix socket a live process holds, read from the kernel's socket
+# table rather than from any command line: a server that computed its socket path internally is
+# invisible to a command-line scan but not to this. Relative names (a bind against a directory fd)
+# carry no directory and are dropped. Empty output means "no evidence available", not "nothing is
+# held", and every caller below fails safe on it.
+socket_holders() {
+    lsof -n -P -U -F pn 2>/dev/null | awk '
+        /^p/ { pid = substr($0, 2) + 0; next }
+        /^n\// { print pid "\t" substr($0, 2) }
+    '
+}
+
+# The socket paths from that snapshot, minus the ones held by processes we just killed.
+held_socket_paths() {
+    local killed_pids=$1
+    awk -F'\t' -v killed="$killed_pids" '
+        BEGIN { n = split(killed, list, " "); for (i = 1; i <= n; i++) dead[list[i] + 0] = 1 }
+        $1 + 0 in dead { next }
+        { print $2 }
+    '
+}
+
+# The runtime directory the servers pick when no socket is given. Both spellings are listed because
+# `std::env::temp_dir()` is `$TMPDIR` where it is set (macOS) and `/tmp` where it is not (Linux).
+default_tmp=${TMPDIR:-/tmp}
+default_runtime_dirs="${XDG_RUNTIME_DIR:-} ${default_tmp%/}/srui-$my_uid /tmp/srui-$my_uid"
+
+# One socket-table snapshot, taken before any kill, serves both rule 5 and the directory sweep.
+socket_snapshot=$(socket_holders)
+default_socket_pids=$(printf '%s\n' "$socket_snapshot" |
+    awk -F'\t' -v dirs="$default_runtime_dirs" '
+        BEGIN { n = split(dirs, list, " ") }
+        {
+            for (i = 1; i <= n; i++) {
+                if (list[i] != "" && index($2, list[i] "/") == 1) { print $1; next }
+            }
+        }
+    ' | sort -u | tr '\n' ' ')
 
 snapshot=$(process_snapshot)
 if [ -z "$snapshot" ]; then
@@ -181,6 +246,13 @@ else
     live_snapshot=$(process_snapshot)
 fi
 referenced=$(printf '%s\n' "$live_snapshot" | referenced_paths "$killed_pids")
+held_sockets=$(printf '%s\n' "$socket_snapshot" | held_socket_paths "$killed_pids")
+socket_evidence=1
+if [ -z "$socket_snapshot" ]; then
+    socket_evidence=0
+    echo "note: no unix socket inventory (lsof); leaving every socket directory in place" >&2
+fi
+referenced=$(printf '%s\n%s\n' "$referenced" "$held_sockets")
 
 # shellcheck disable=SC2086 # deliberate word splitting: tmp_globs is a list of globs
 set -- $tmp_globs
@@ -197,6 +269,17 @@ removed_kb=0
 held=0
 fresh=0
 for dir in "${candidates[@]+"${candidates[@]}"}"; do
+    if [ "$socket_evidence" -eq 0 ]; then
+        held=$((held + 1))
+        continue
+    fi
+    # The default runtime directory belongs to whatever daemon a human started, never to a test.
+    # shellcheck disable=SC2086 # deliberate word splitting: a space-separated list of directories
+    if printf '%s\n' $default_runtime_dirs |
+        awk -v dir="$dir" '$0 != "" && $0 == dir { found = 1 } END { exit !found }'; then
+        held=$((held + 1))
+        continue
+    fi
     if printf '%s\n' "$referenced" |
         awk -v dir="$dir" '$0 == dir || index($0, dir "/") == 1 { found = 1 } END { exit !found }'; then
         held=$((held + 1))

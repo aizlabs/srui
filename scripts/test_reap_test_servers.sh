@@ -284,6 +284,93 @@ else
     fi
     kill -9 "$unreaping_parent_pid" 2>/dev/null
 fi
+echo "case 9: a directory whose socket is bound in-process, named on no command line, is kept"
+# Short names on purpose: an absolute unix socket path is capped at 104 bytes, and the sandbox
+# already spends 70 of them.
+bound_dir="$sandbox/tmp/srui-b"
+mkdir -p "$bound_dir"
+# The socket path is baked into the script body, so nothing on the binder's command line mentions
+# it: the only evidence that the directory is live is the kernel's socket table. This is the shape
+# of `srui-sessiond` started with no `--socket`, which computes its default path internally.
+cat >"$sandbox/bin/socket-binder.py" <<PY
+import socket, time
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind("$bound_dir/s")
+sock.listen(1)
+time.sleep(600)
+PY
+python3 "$sandbox/bin/socket-binder.py" >/dev/null 2>&1 &
+binder=$!
+spawned_pids+=("$binder")
+disown "$binder" 2>/dev/null
+for _ in $(seq 1 50); do
+    [ -S "$bound_dir/s" ] && break
+    sleep 0.1
+done
+if [ ! -S "$bound_dir/s" ]; then
+    fail "could not bind a unix socket for the in-process case"
+else
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null
+    assert_dir_present "$bound_dir" "directory holding a live, unnamed bound socket was kept"
+fi
+kill -9 "$binder" 2>/dev/null
+
+echo "case 10: the default runtime directory is never swept, and its siblings still are"
+runtime_root="$sandbox/tmproot"
+default_dir="$runtime_root/srui-$(id -u)"
+sibling_dir="$runtime_root/srui-fixture-leftover"
+mkdir -p "$default_dir" "$sibling_dir"
+# TMPDIR is what the servers resolve their default socket path against on macOS; the sweep is
+# pointed at that root so the guard is exercised without touching the real /tmp.
+SRUI_REAP_PATTERN='NEVER_MATCHES_ANY_EXECUTABLE' \
+    SRUI_REAP_AGE_MINUTES=0 \
+    SRUI_REAP_TMP_GLOBS="$runtime_root/srui-*" \
+    TMPDIR="$runtime_root" \
+    bash "$reaper" >/dev/null 2>&1
+assert_dir_present "$default_dir" "the default runtime directory survived a zero-age sweep"
+assert_dir_absent "$sibling_dir" "an unreferenced sibling directory was still removed"
+
+echo "case 11: an orphaned process serving the default runtime socket is never killed"
+# The shape of a `srui-sessiond` a human detached on purpose: ppid 1, old enough, argv[0] matching
+# the fixture pattern, and bound to the default runtime socket. `nc -lU` stands in for the daemon
+# through a symlink, so argv[0] is a path this case controls.
+default_root="$sandbox/tmp2"
+default_socket_dir="$default_root/srui-$(id -u)"
+mkdir -p "$default_socket_dir"
+if ! command -v nc >/dev/null 2>&1; then
+    fail "nc is unavailable; cannot stage a default-socket server"
+else
+    listener=$(make_marker fixture-default-socket)
+    ln -sf "$(command -v nc)" "$listener"
+    ("$listener" -lU "$default_socket_dir/s" >/dev/null 2>&1 &) 2>/dev/null
+    listener_pid=""
+    for _ in $(seq 1 50); do
+        listener_pid=$(pgrep -f "^$listener -lU" 2>/dev/null | head -1)
+        [ -n "$listener_pid" ] && [ -S "$default_socket_dir/s" ] && break
+        sleep 0.1
+    done
+    if [ -z "$listener_pid" ] || [ ! -S "$default_socket_dir/s" ]; then
+        fail "could not stage a server bound to the default runtime socket"
+    else
+        spawned_pids+=("$listener_pid")
+        output=$(SRUI_REAP_PATTERN="$(marker_pattern "$listener")" \
+            SRUI_REAP_AGE_MINUTES=0 \
+            SRUI_REAP_TMP_GLOBS="$default_root/srui-*" \
+            TMPDIR="$default_root" \
+            bash "$reaper" 2>&1)
+        assert_alive "$listener_pid" "the daemon on the default runtime socket survived a zero-age sweep"
+        assert_dir_present "$default_socket_dir" "its runtime directory survived with it"
+        if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $listener_pid"; then
+            fail "the reaper announced a kill for the default-socket daemon"
+            printf '%s\n' "    reaper said: $output" >&2
+        else
+            pass "the reaper never selected it"
+        fi
+    fi
+    kill -9 "${listener_pid:-0}" 2>/dev/null
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "reap-test-servers selection rules: all cases passed."

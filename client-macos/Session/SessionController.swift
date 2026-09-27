@@ -2588,15 +2588,11 @@ public final class SessionController: @unchecked Sendable {
                 return nil
             }
             guard let binding = outboxConnectionBinding,
-                  let sessionIncarnation = outboxSessionIncarnation else {
+                  outboxSessionIncarnation != nil else {
                 rejectedPhase = currentPhase
                 return nil
             }
             let generation = lifecycleGeneration
-            let ownership = SemanticActionOwnership(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation
-            )
             let predecessor = transactionIngressTail
             let task = Task { [weak self] in
                 guard let self else { return }
@@ -2605,7 +2601,7 @@ public final class SessionController: @unchecked Sendable {
                     taskID: taskID,
                     predecessor: predecessor,
                     lifecycleGeneration: generation,
-                    ownership: ownership
+                    binding: binding
                 )
             }
             transactionIngressTasks[taskID] = task
@@ -2626,7 +2622,7 @@ public final class SessionController: @unchecked Sendable {
         taskID: UUID,
         predecessor: Task<Void, Never>?,
         lifecycleGeneration: UInt64,
-        ownership: SemanticActionOwnership
+        binding: EventOutboxConnectionBinding
     ) async {
         defer { finishQueuedTransaction(taskID) }
         await predecessor?.value
@@ -2635,7 +2631,7 @@ public final class SessionController: @unchecked Sendable {
         }
 
         do {
-            guard try await waitForTransactionAdmission(ownership: ownership) else { return }
+            guard try await waitForTransactionAdmission(binding: binding) else { return }
         } catch is CancellationError {
             // Teardown cancelled the wait. The transaction is intentionally dropped along with the
             // rest of the connection; there is no replica to diverge from.
@@ -2652,6 +2648,7 @@ public final class SessionController: @unchecked Sendable {
 
         guard !Task.isCancelled,
               ownsTransactionIngressLifecycle(lifecycleGeneration),
+              let ownership = currentTransactionIngressOwnership(binding: binding),
               continuityContext.isActive(
                   binding: ownership.binding,
                   sessionIncarnation: ownership.sessionIncarnation
@@ -2662,15 +2659,40 @@ public final class SessionController: @unchecked Sendable {
         await handleTransaction(wireTransaction)
     }
 
+    /// The current session incarnation of the connection a queued transaction arrived on.
+    ///
+    /// A full-resync snapshot advances the session incarnation from *inside* this same lane
+    /// (`adoptFullResyncInteractionBoundary`, §18.3), so a live transaction that was already
+    /// decoded when the snapshot committed holds the pre-snapshot incarnation. It is still
+    /// authoritative: it arrived on this connection and after that snapshot, and fencing it out
+    /// would skip a revision silently — the *next* transaction then diverges the replica on a
+    /// stale base (§12.1, §4 inv. 13). Only a different binding, meaning a newer connection whose
+    /// own catch-up supersedes this one, may drop it.
+    private func currentTransactionIngressOwnership(
+        binding: EventOutboxConnectionBinding
+    ) -> SemanticActionOwnership? {
+        withStateLock {
+            guard outboxConnectionBinding == binding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+    }
+
     private func waitForTransactionAdmission(
-        ownership: SemanticActionOwnership
+        binding: EventOutboxConnectionBinding
     ) async throws -> Bool {
         while true {
             try Task.checkCancellation()
-            guard let lease = await acquireSharedMutationLease(
-                binding: ownership.binding,
-                sessionIncarnation: ownership.sessionIncarnation
-            ) else {
+            guard let ownership = currentTransactionIngressOwnership(binding: binding),
+                  let lease = await acquireSharedMutationLease(
+                      binding: ownership.binding,
+                      sessionIncarnation: ownership.sessionIncarnation
+                  ) else {
                 return false
             }
             let admission = await transactionIngressGate.admissionAttempt()
@@ -2855,7 +2877,7 @@ public final class SessionController: @unchecked Sendable {
                 }
                 guard let ownership = currentSharedOwnership() else { return }
                 do {
-                    guard try await waitForTransactionAdmission(ownership: ownership) else {
+                    guard try await waitForTransactionAdmission(binding: ownership.binding) else {
                         return
                     }
                 } catch is CancellationError {
@@ -2866,9 +2888,11 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                guard continuityContext.isActive(
-                    binding: ownership.binding,
-                    sessionIncarnation: ownership.sessionIncarnation
+                guard let current = currentTransactionIngressOwnership(
+                    binding: ownership.binding
+                ), continuityContext.isActive(
+                    binding: current.binding,
+                    sessionIncarnation: current.sessionIncarnation
                 ), allowsDataPlane(withStateLock({ self.phase })) else {
                     return
                 }

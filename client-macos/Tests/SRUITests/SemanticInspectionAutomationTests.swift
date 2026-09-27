@@ -828,6 +828,10 @@ private final class SemanticInspectionHarness {
         resync.reason = "semantic inspection stale-handle coverage"
         resync.continuity = .replaced
         resync.lastProcessedEventSeq = 0
+        // A replacement is a new session, so it must re-advertise its own negotiation
+        // metadata; a live RESYNC_REQUIRED that omits it is a protocol violation and the
+        // controller fails the session instead of mounting the snapshot (§18).
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
         var resyncMessage = SRUIMessage()
         resyncMessage.serverResyncRequired = resync
         await controller.handleIncomingMessage(resyncMessage)

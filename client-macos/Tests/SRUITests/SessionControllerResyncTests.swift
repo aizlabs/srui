@@ -1923,6 +1923,93 @@ struct SessionControllerResyncTests {
         await controller.stop()
         await serverTransport.close()
     }
+
+    /// A transaction the server sent after the catch-up snapshot must be applied, not discarded.
+    ///
+    /// The snapshot advances the session incarnation as it commits (§18.3). Everything the server
+    /// sent behind it is already decoded and queued on the ordered ingress lane under the previous
+    /// incarnation, so fencing those on their enqueue-time incarnation dropped committed work
+    /// silently — and the transaction after *that* then diverged the replica on a revision gap the
+    /// server never produced. Delivering welcome, snapshot and one live transaction in a single
+    /// chunk queues the live transaction before the snapshot can finalize, which is exactly the
+    /// ordering a loaded client sees on every reconnect (§18, §22.2).
+    @Test("A transaction queued behind the catch-up snapshot is applied, not dropped")
+    @MainActor
+    func liveTransactionBehindCatchUpSnapshotIsApplied() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let failures = ManagedAtomic<[String]>([])
+        controller.onFailure = { failure in
+            failures.store(failures.load() + [failure.description])
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "catch-up-then-live"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        // A positive initial revision makes the next transaction the catch-up snapshot (§18).
+        welcome.initialRevision = 1
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+
+        let surfaceID = NodeId(1)
+        let textID = NodeId(2)
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(
+                    id: textID,
+                    nodeType: .text,
+                    parentID: surfaceID,
+                    properties: [Property(property: .text, value: .string("from snapshot"))]
+                ),
+            ]
+        )
+        let live = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(id: textID, property: .text, value: .string("sent behind snapshot")),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        var liveMessage = SRUIMessage()
+        liveMessage.transaction = live.toWire()
+
+        var combined = Data()
+        combined.append(try SRUIFraming.encodeFramed(welcomeMessage))
+        combined.append(try SRUIFraming.encodeFramed(snapshotMessage))
+        combined.append(try SRUIFraming.encodeFramed(liveMessage))
+        try await serverTransport.send(data: combined)
+
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "both the catch-up snapshot and the transaction behind it apply"
+        ) {
+            applier.lastAppliedRevision == Revision(2) || failures.load().isEmpty == false
+        }
+        #expect(failures.load() == [], "no transaction was lost, so nothing may diverge")
+        #expect(applier.lastAppliedRevision == Revision(2))
+        #expect(
+            applier.store.getNode(textID)?.getProperty(.text)?.asString == "sent behind snapshot"
+        )
+        #expect(controller.isDiverged == false)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
 }
 
 private enum ResyncTestSupportError: Error {

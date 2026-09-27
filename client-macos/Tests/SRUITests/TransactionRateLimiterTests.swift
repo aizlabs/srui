@@ -146,8 +146,13 @@ struct TransactionRateLimiterTests {
         // The claim is that the 241st transaction is *backpressured*, not failed, so the wait ends
         // on either outcome and asserts which one it was. Waiting out the whole budget for a
         // session that already failed would report a timeout instead of the failure that caused it.
+        //
+        // 3s had no headroom at all: applying 241 transactions takes 4.3-4.8s measured inside this
+        // suite on an idle 12-core host, because each one hops to the main actor that all twelve
+        // parallel tests share. It failed 5 runs out of 5 there, so the old budget was asserting
+        // this machine's scheduling, not §26's backpressure.
         try await AsyncTestSupport.eventuallyAsync(
-            timeout: .seconds(3),
+            timeout: .seconds(30),
             description: "all 241 replay transactions apply through ingress backpressure"
         ) {
             if applier.lastAppliedRevision == Revision(241) { return true }

@@ -152,17 +152,26 @@ run_reaper() {
         bash "$reaper" "$@"
 }
 
+# Both assertions read the process state rather than calling `kill -0`, because `kill -0` succeeds
+# for a zombie: under an init that does not reap (a container running a plain shell as pid 1) it
+# would call a killed process alive, failing every "was killed" case and passing every "survived"
+# case for the wrong reason. Alive means a state that is not `Z`; terminated means gone from the
+# table or `Z`.
+process_state() {
+    ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]'
+}
 assert_alive() {
-    if kill -0 "$1" 2>/dev/null; then pass "$2"; else fail "$2 (pid $1 is gone)"; fi
+    local state
+    state=$(process_state "$1")
+    case $state in
+        '') fail "$2 (pid $1 is gone)" ;;
+        Z*) fail "$2 (pid $1 is a zombie)" ;;
+        *) pass "$2" ;;
+    esac
 }
-assert_dead() {
-    if kill -0 "$1" 2>/dev/null; then fail "$2 (pid $1 still alive)"; else pass "$2"; fi
-}
-# Terminated means gone from the process table *or* a zombie: a killed process whose parent has not
-# reaped it is dead, whatever `kill -0` says.
 assert_terminated() {
     local state
-    state=$(ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]')
+    state=$(process_state "$1")
     case $state in
         '' | Z*) pass "$2" ;;
         *) fail "$2 (pid $1 is in state '$state')" ;;
@@ -201,7 +210,7 @@ if [ -z "$pid" ]; then
     fail "could not spawn an orphan marker"
 else
     run_reaper "$(marker_pattern "$marker")" 0 >/dev/null
-    assert_dead "$pid" "orphaned, old-enough marker was killed"
+    assert_terminated "$pid" "orphaned, old-enough marker was killed"
 fi
 
 echo "case 3: an orphan younger than the threshold is not killed"

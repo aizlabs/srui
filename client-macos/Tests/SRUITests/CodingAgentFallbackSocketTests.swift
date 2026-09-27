@@ -145,7 +145,7 @@ struct CodingAgentFallbackSocketTests {
         surfaceWindow.setContentSize(NSSize(width: 1000, height: 1000))
         surfaceWindow.contentView?.layoutSubtreeIfNeeded()
         terminalView.layout()
-        let terminalResizeDeadline = Date().addingTimeInterval(10)
+        let terminalResizeDeadline = Date().addingTimeInterval(3)
         while Date() < terminalResizeDeadline,
               !reportedTerminalSizes.contains(where: {
                   $0.columns >= TerminalView.conventionalColumns

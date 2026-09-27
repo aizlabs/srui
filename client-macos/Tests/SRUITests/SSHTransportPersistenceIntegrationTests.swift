@@ -89,7 +89,7 @@ struct SSHTransportPersistenceIntegrationTests {
             sessiond.waitUntilExit()
         }
 
-        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 30)
+        try await Self.waitForSocket(at: socketPath, timeoutSeconds: 5)
 
         // 2. Launch ephemeral sshd daemon
         let sshd = try SSHTestSupport.launchSSHD(
@@ -236,7 +236,7 @@ struct SSHTransportPersistenceIntegrationTests {
             sessiond.standardError = FileHandle.nullDevice
             try sessiond.run()
 
-            try await Self.waitForSocket(at: socketPath, timeoutSeconds: 30)
+            try await Self.waitForSocket(at: socketPath, timeoutSeconds: 5)
 
             // Connect directly via Unix domain socket transport
             let transport = UnixSocketTransport(socketPath: socketPath)
@@ -275,12 +275,6 @@ struct SSHTransportPersistenceIntegrationTests {
             .deletingLastPathComponent()
     }
 
-    /// Bounded wait for a spawned daemon to publish its socket.
-    ///
-    /// The bound exists to fail a daemon that never starts, not to measure how fast this machine
-    /// starts one: every other test in this process is spawning servers of its own at the same
-    /// time, so a few seconds of scheduling delay is normal and says nothing about the behaviour
-    /// under test.
     private static func waitForSocket(at path: String, timeoutSeconds: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {

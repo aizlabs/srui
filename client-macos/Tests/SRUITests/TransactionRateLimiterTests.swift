@@ -143,12 +143,11 @@ struct TransactionRateLimiterTests {
         }
         try await serverTransport.send(data: replay)
 
-        // The claim is that the 241st transaction is *backpressured*, not failed, so the wait is
-        // bounded only generously and stops early on any reported failure. A tight wall-clock
-        // budget would turn a loaded machine into a false positive for the defect this guards
-        // against, while a failure still surfaces immediately.
+        // The claim is that the 241st transaction is *backpressured*, not failed, so the wait ends
+        // on either outcome and asserts which one it was. Waiting out the whole budget for a
+        // session that already failed would report a timeout instead of the failure that caused it.
         try await AsyncTestSupport.eventuallyAsync(
-            timeout: .seconds(60),
+            timeout: .seconds(3),
             description: "all 241 replay transactions apply through ingress backpressure"
         ) {
             if applier.lastAppliedRevision == Revision(241) { return true }
@@ -503,7 +502,7 @@ struct TransactionRateLimiterTests {
         try await serverTransport.send(data: combined)
 
         try await AsyncTestSupport.eventuallyAsync(
-            timeout: .seconds(30),
+            timeout: .seconds(5),
             description: "oversized control ACK rejected"
         ) {
             await failures.contains("invalid event_id")

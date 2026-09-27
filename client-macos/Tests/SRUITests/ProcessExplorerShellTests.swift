@@ -31,7 +31,7 @@ struct ProcessExplorerShellTests {
                                            renderer: renderer, sessionId: "srtop")
         controller.attachRenderer(renderer)
         try await controller.start()
-        try await AsyncTestSupport.eventually(timeout: .seconds(45), description: "native empty shell over SSH") {
+        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "native empty shell over SSH") {
             applier.lastAppliedRevision == Revision(1) && renderer.registry.handle(for: NodeId(5)) != nil
         }
 
@@ -70,7 +70,7 @@ struct ProcessExplorerShellTests {
         try await Self.capture(window: window, name: fakeSource ? "fake-initial" : "initial")
 
         #expect(kill(harness.server.processIdentifier, SIGUSR1) == 0)
-        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "title mutation over SSH") {
+        try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "title mutation over SSH") {
             applier.lastAppliedRevision == Revision(2) &&
                 window.title == "Process Explorer — title fixture" &&
                 heading.stringValue == "Process Explorer — title fixture"
@@ -106,7 +106,7 @@ struct ProcessExplorerShellTests {
                                            applier: applier, renderer: renderer, sessionId: "srtop")
         controller.attachRenderer(renderer)
         try await controller.start()
-        try await AsyncTestSupport.eventually(timeout: .seconds(45), description: "native process table over SSH") {
+        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "native process table over SSH") {
             applier.lastAppliedRevision.value >= 1 && renderer.registry.handle(for: NodeId(5)) != nil
         }
         let surfaceHandle = try #require(renderer.registry.handle(for: NodeId(1)))
@@ -131,7 +131,7 @@ struct ProcessExplorerShellTests {
         var discardedRuns = 0
         let clock = ContinuousClock()
         let start = clock.now
-        let deadline = start.advanced(by: .seconds(60))
+        let deadline = start.advanced(by: .seconds(30))
         var stamps: [Duration] = []
         while clock.now < deadline {
             window.contentView?.layoutSubtreeIfNeeded()
@@ -167,7 +167,7 @@ struct ProcessExplorerShellTests {
         try #require(
             trace.filter({ $0.rows == Self.initialRows }).count >= 3,
             """
-            no gap-free run of published states covered two full five-tick cycles within 60s: \
+            no gap-free run of published states covered two full five-tick cycles within 30s: \
             longest contiguous run was \(longestRun) state(s) across \(discardedRuns + 1) run(s); \
             last applied revision \(applier.lastAppliedRevision.value)
             """
@@ -329,7 +329,7 @@ struct ProcessExplorerShellTests {
             server.standardOutput = FileHandle.nullDevice
             server.standardError = FileHandle.nullDevice
             try server.run()
-            try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "srtop private socket") {
+            try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "srtop private socket") {
                 FileManager.default.fileExists(atPath: socket)
             }
             let sshd = try SSHTestSupport.launchSSHD(configPath: config.path, hostKeyPath: hostKey, port: port)

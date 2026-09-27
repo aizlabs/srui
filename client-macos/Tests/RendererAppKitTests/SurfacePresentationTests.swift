@@ -64,7 +64,7 @@ struct SurfacePresentationTests {
     }
 
     @Test
-    func showWindowsKeepsSurfacesOffTheDisplayWithoutHidingThemFromTheRenderer() throws {
+    func showWindowsKeepsSurfacesOffTheDisplayWithoutHidingThemFromTheRenderer() async throws {
         let store = try makeSurfaceStore()
         let renderer = AppKitRenderer()
         try renderer.attach(store: store)
@@ -87,12 +87,19 @@ struct SurfacePresentationTests {
         #expect(NSApplication.shared.isActive == false)
 
         // Confirmed through the window server rather than the renderer's own state: window
-        // registration is asynchronous, so give it run-loop turns to appear before asserting
-        // that nothing this process has on screen is drawn at all.
-        let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline,
+        // registration is asynchronous, so give it time to appear before asserting that nothing
+        // this process has on screen is drawn at all.
+        //
+        // Awaited, never `RunLoop.current.run(until:)`: in a main-actor test that nests a second
+        // activation of the run loop that *is* the main-actor executor, which either strands every
+        // suspended main-actor test or lets the executor's own `CFRunLoopStop` end the process
+        // mid-run (see scripts/check-test-main-runloop-nesting.sh). Sleeping yields the main actor,
+        // so the run loop keeps turning and window registration still lands.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while clock.now < deadline,
               !Self.onScreenWindowsOwnedByThisProcess().contains(where: { $0.number == window.windowNumber }) {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            try await Task.sleep(for: .milliseconds(50))
         }
         let onScreen = Self.onScreenWindowsOwnedByThisProcess()
         #expect(onScreen.allSatisfy { $0.alpha == 0 },

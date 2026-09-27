@@ -116,6 +116,97 @@ struct SessionControllerResyncTests {
         await serverTransport.close()
     }
 
+    /// A live transaction decoded while the catch-up snapshot is still committing must still be
+    /// applied. The snapshot advances the session incarnation from inside the transaction lane
+    /// (§18.3), and fencing a queued transaction on its *enqueue-time* incarnation dropped it
+    /// silently — after which the next transaction diverged the replica on a stale base (§12.1,
+    /// §4 inv. 13). Any server that keeps committing while a client catches up hits this.
+    @Test("A live transaction queued behind the catch-up snapshot still applies")
+    @MainActor
+    func liveTransactionQueuedBehindCatchUpSnapshotApplies() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let failure = ManagedAtomic<String?>(nil)
+        controller.onFailure = { failure.store(String(describing: $0)) }
+        try await controller.start()
+
+        // initial_revision > 0 makes this handshake a catch-up: the client awaits a snapshot.
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "catch-up-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 2
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        let surfaceID = NodeId(1)
+        let textID = NodeId(2)
+        func framed(_ transaction: Transaction) throws -> Data {
+            var message = SRUIMessage()
+            message.transaction = transaction.toWire()
+            return try SRUIFraming.encodeFramed(message)
+        }
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(
+                    id: textID,
+                    nodeType: .text,
+                    parentID: surfaceID,
+                    properties: [Property(property: .text, value: .string("snapshot"))]
+                ),
+            ]
+        )
+        let third = Transaction(
+            baseRevision: Revision(2),
+            newRevision: Revision(3),
+            operations: [.setProperty(id: textID, property: .text, value: .string("live 3"))]
+        )
+        let fourth = Transaction(
+            baseRevision: Revision(3),
+            newRevision: Revision(4),
+            operations: [.setProperty(id: textID, property: .text, value: .string("live 4"))]
+        )
+
+        // One write, so the receive loop decodes and queues both live transactions while the
+        // snapshot is still committing — what a server that keeps publishing during a client's
+        // catch-up produces.
+        var batch = Data()
+        batch.append(try framed(snapshot))
+        batch.append(try framed(third))
+        batch.append(try framed(fourth))
+        try await serverTransport.send(data: batch)
+
+        // The applier commits ahead of the renderer inside a transaction's own task, so wait for
+        // the painted value rather than sampling it the moment the revision lands.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "catch-up snapshot and both live transactions applied and painted"
+        ) {
+            applier.lastAppliedRevision == Revision(4)
+                && (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue
+                    == "live 4"
+        }
+        #expect(applier.lastAppliedRevision == Revision(4))
+        #expect(failure.load() == nil)
+        #expect(
+            (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue == "live 4"
+        )
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     @Test("Invalid extension resync is rejected before replacing the replica")
     @MainActor
     func invalidExtensionResyncPreservesCommittedReplica() async throws {

@@ -79,6 +79,19 @@ struct CollectionRangeSocketIntegrationTests {
 
         try await controller.start()
         try await Self.waitForRevision(applier, atLeast: Revision(3), timeoutSeconds: 8)
+        // The counter's session is already past revision 0, so this handshake catches up through
+        // a resync snapshot. The snapshot mounts the table *before* the controller rebinds the
+        // renderer's callbacks to the incarnation that snapshot established, and a request
+        // emitted in that window carries the pre-snapshot incarnation and is refused by design
+        // (§18.3, §22.2 — `hard snapshots rebind Terminal and collection callbacks`). Event
+        // dispatch opens only once that rebind has happened, so it is the boundary to wait for
+        // before asking the adapter for a range.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(8),
+            description: "snapshot catch-up to reopen event dispatch"
+        ) {
+            controller.isEventDispatchEnabled
+        }
 
         let tableID = NodeId(10)
         // The applier commits ahead of the renderer: the mount is a separate main-actor

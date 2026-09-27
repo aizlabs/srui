@@ -37,6 +37,9 @@ banned=(
     '.runModal(|a modal session nests the main run loop; assert on the model instead'
     'CFRunLoopRun(|nesting the main run loop strands the main-actor executor'
     'RunLoop.main.run(|nesting the main run loop strands the main-actor executor'
+    # `RunLoop.current` is `RunLoop.main` in any main-actor test, so this spelling nests the same
+    # activation. It reached the suite once already, past the list above.
+    'RunLoop.current.run(|nesting the main run loop strands the main-actor executor; await instead'
 )
 
 status=0

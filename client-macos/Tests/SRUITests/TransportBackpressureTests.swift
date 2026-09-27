@@ -13,6 +13,12 @@ import Foundation
 import Darwin
 #endif
 
+/// Which socket object a descriptor refers to, independent of its number.
+private struct SocketObjectIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+}
+
 /// Minimal cross-thread cell; the semaphores in each test provide the ordering.
 private final class Box<T>: @unchecked Sendable {
     private let lock = NSLock()
@@ -38,13 +44,16 @@ struct TransportBackpressureTests {
     /// limit. Dropping is not an alternative in this direction: committed transactions may never
     /// be silently discarded (§20.4).
     @Test("A reader parks at the backlog limit and resumes only once the consumer acknowledges")
-    func readerParksUntilConsumerCatchesUp() throws {
+    func readerParksUntilConsumerCatchesUp() async throws {
         let gate = InboundBacklogGate(limitBytes: 1024)
         gate.recordDelivered(1024)
         #expect(gate.outstandingBytes == 1024)
 
-        let entered = DispatchSemaphore(value: 0)
-        let admitted = DispatchSemaphore(value: 0)
+        // The reader under test still parks a real `Thread` - that is the behaviour being checked.
+        // What this test must not do is park the *cooperative* thread it runs on while it waits for
+        // that reader; see `AsyncTestSignal`.
+        let entered = AsyncTestSignal()
+        let admitted = AsyncTestSignal()
         let capacityGranted = Box(false)
 
         let reader = Thread {
@@ -54,16 +63,17 @@ struct TransportBackpressureTests {
             admitted.signal()
         }
         reader.start()
-        entered.wait()
+        await entered.wait()
 
+        try await Task.sleep(for: .milliseconds(250))
         #expect(
-            admitted.wait(timeout: .now() + 0.25) == .timedOut,
+            admitted.signalCount == 0,
             "the reader must stay parked while the consumer is at the limit"
         )
 
         gate.recordConsumed(1024)
         #expect(
-            admitted.wait(timeout: .now() + 5) == .success,
+            await admitted.waitOrTimeout(timeout: .seconds(5)),
             "acknowledging consumption must release the reader"
         )
         #expect(capacityGranted.value)
@@ -73,11 +83,11 @@ struct TransportBackpressureTests {
     /// Teardown must never deadlock on the gate: a parked reader is released, not left waiting for
     /// a consumer that has gone away.
     @Test("Releasing the gate wakes a parked reader and tells it to stop")
-    func releaseWakesParkedReader() throws {
+    func releaseWakesParkedReader() async throws {
         let gate = InboundBacklogGate(limitBytes: 16)
         gate.recordDelivered(64)
 
-        let admitted = DispatchSemaphore(value: 0)
+        let admitted = AsyncTestSignal()
         let capacityGranted = Box(true)
 
         let reader = Thread {
@@ -86,9 +96,10 @@ struct TransportBackpressureTests {
         }
         reader.start()
 
-        #expect(admitted.wait(timeout: .now() + 0.25) == .timedOut)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(admitted.signalCount == 0)
         gate.release()
-        #expect(admitted.wait(timeout: .now() + 5) == .success)
+        #expect(await admitted.waitOrTimeout(timeout: .seconds(5)))
         #expect(
             capacityGranted.value == false,
             "a released gate must tell the reader to exit rather than to read again"
@@ -180,7 +191,7 @@ struct TransportBackpressureTests {
             }
         }
 
-        sink.waitUntilEntered(1)
+        await sink.waitUntilEntered(1)
         writer.stop()
         sink.fail(TransportError.closed)
         latch.stop()
@@ -208,7 +219,7 @@ struct TransportBackpressureTests {
             }
         }
 
-        sink.waitUntilEntered(1)
+        await sink.waitUntilEntered(1)
         sink.fail(TransportError.ioError("injected failure"))
 
         for task in tasks {
@@ -218,12 +229,41 @@ struct TransportBackpressureTests {
         latch.stop()
     }
 
+    /// Which *socket object* a descriptor number refers to, or `nil` when the number is not open.
+    ///
+    /// Measured on this platform: every socket gets a distinct `st_ino`, and a `dup` of one
+    /// reports the same `(st_dev, st_ino)` pair. Comparing against a sentinel `dup` therefore
+    /// answers "does this number still refer to *that* socket", which is the only form of the
+    /// question that survives descriptor recycling.
+    private func socketIdentity(of descriptor: Int32) -> SocketObjectIdentity? {
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0 else { return nil }
+        return SocketObjectIdentity(device: metadata.st_dev, inode: metadata.st_ino)
+    }
+
     /// The latch must not release a descriptor number while an I/O call still holds it, or the
     /// kernel can recycle it under a parked `read`/`write`.
+    ///
+    /// Both halves are observed against a `dup` of the same socket rather than against the
+    /// descriptor *number*. The test host runs hundreds of tests concurrently, so another one can
+    /// be handed that number the instant the latch closes it — after which `fcntl(number,
+    /// F_GETFD)` reports a perfectly healthy descriptor that belongs to somebody else, failing
+    /// this test for a reason it is not about (and, before the close, passing it for one).
+    /// Identity against the sentinel is immune both ways: a recycled number refers to a different
+    /// object, which is itself proof that the latch let go of it.
+    ///
+    /// Peer EOF cannot stand in for this: `stop()` shuts the socket down *before* deferring the
+    /// close, and a shut-down peer already reads 0, so EOF cannot tell the two states apart.
     @Test("A stop during an outstanding claim defers the close to the claim holder")
     func stopDefersCloseWhileClaimed() throws {
         let (writable, unread) = try makeStalledSocketPair()
         defer { Darwin.close(unread) }
+        // A second reference keeps the socket object itself alive once the latch drops its own,
+        // so the comparisons below stay answerable after the close.
+        let sentinel = dup(writable)
+        try #require(sentinel >= 0)
+        defer { Darwin.close(sentinel) }
+        let adoptedSocket = try #require(socketIdentity(of: sentinel))
 
         let latch = SocketReadLatch()
         latch.adopt(descriptor: writable)
@@ -233,45 +273,38 @@ struct TransportBackpressureTests {
 
         latch.stop()
         #expect(latch.isStopped)
-        // Still open: the claim holder has not finished, so the number cannot be recycled yet.
-        #expect(fcntl(writable, F_GETFD) != -1)
-        // Identity, not liveness. `close(2)` frees the *number*, and this process runs other tests
-        // in parallel that open descriptors of their own, so the kernel can hand this number to one
-        // of them before the assertion below runs. What the latch owes us is that the number no
-        // longer names this socket.
-        let claimedIdentity = try #require(Self.descriptorIdentity(writable))
+        // Still the adopted socket: the claim holder has not finished, so the latch may not have
+        // closed it and the number cannot have been recycled.
+        #expect(
+            socketIdentity(of: writable) == adoptedSocket,
+            "a stop during an outstanding claim must not close the descriptor"
+        )
 
         latch.endIO()
         #expect(
-            Self.descriptorIdentity(writable) != claimedIdentity,
+            socketIdentity(of: writable) != adoptedSocket,
             "the last claim release must perform the close"
         )
         #expect(latch.beginIO() == nil, "a stopped latch hands out no further claims")
     }
 
-    /// What `fd` currently names, or nil when the number is not open at all.
-    private static func descriptorIdentity(_ fd: Int32) -> DescriptorIdentity? {
-        var info = stat()
-        guard fstat(fd, &info) == 0 else { return nil }
-        return DescriptorIdentity(device: info.st_dev, inode: info.st_ino)
-    }
-
-    private struct DescriptorIdentity: Equatable {
-        let device: dev_t
-        let inode: ino_t
-    }
 }
 
+/// A sink that parks the writer's own drain queue until the test fails it.
+///
+/// The park inside `write` is deliberate and stays blocking: `SocketWriter` calls the sink from its
+/// private `DispatchQueue`, not from the cooperative pool, so blocking there models a stalled peer
+/// without costing the test runner a thread. `waitUntilEntered` is a different matter - it runs on
+/// the test's own cooperative thread, so it suspends via `AsyncTestSignal` instead of blocking.
 private final class GatedFailingSink: @unchecked Sendable {
     private let condition = NSCondition()
-    private var entered = 0
     private var failure: (any Error)?
+    private let entries = AsyncTestSignal()
 
     func write(_ data: Data) throws {
         _ = data
+        entries.signal()
         condition.lock()
-        entered += 1
-        condition.broadcast()
         while failure == nil {
             condition.wait()
         }
@@ -280,12 +313,8 @@ private final class GatedFailingSink: @unchecked Sendable {
         throw error
     }
 
-    func waitUntilEntered(_ count: Int) {
-        condition.lock()
-        while entered < count {
-            condition.wait()
-        }
-        condition.unlock()
+    func waitUntilEntered(_ count: Int) async {
+        await entries.wait(until: count)
     }
 
     func fail(_ error: any Error) {

@@ -102,8 +102,14 @@ jobs:
             # something like "0\n1", the numeric test below errors, and the gate times out even
             # though the current head has been reviewed. `jq -s add` folds the pages into one
             # integer.
+            # Identity by immutable account id, never by login prefix. `startswith` would accept
+            # any account whose login merely begins with the bot's name, and on a public repo
+            # anyone can create one and forge a verdict on their own pull request. Measured on this
+            # repository, REST reports the reviewer as
+            # {"login": "chatgpt-codex-connector[bot]", "id": 199175422, "type": "Bot"};
+            # the id also survives a rename, which a login match would not.
             reviewed=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --paginate \
-              --jq "[.[] | select((.user.login // \"\") | startswith(\"chatgpt-codex-connector\"))
+              --jq "[.[] | select(.user.id == 199175422)
                      | select(.commit_id == \"$HEAD_SHA\")] | length" \
               | jq -s 'add // 0')
             if [ "$reviewed" -gt 0 ]; then
@@ -111,8 +117,8 @@ jobs:
               exit 0
             fi
             # The clean-verdict comment, paginated the same way. Three things keep this narrow:
-            #   * the author must be the bot, matched exactly as the review query matches it, so a
-            #     human quoting the sentence cannot satisfy the gate;
+            #   * the author must be the bot, by the same immutable account id as above, so no
+            #     human - and no look-alike login - can satisfy the gate by quoting the sentence;
             #   * the body must *start* with the clean-verdict sentence, which excludes the bot's
             #     own "Codex Review Summary" comment (it tabulates an abbreviated sha too);
             #   * the sha is compared prefix-wise, because the comment abbreviates it, but the
@@ -121,7 +127,7 @@ jobs:
             #     a verdict. `$ENV.HEAD_SHA` keeps the sha out of the jq program text.
             clean=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
               --jq '[ .[]
-                      | select((.user.login // "") | startswith("chatgpt-codex-connector"))
+                      | select(.user.id == 199175422)
                       | (.body // "")
                       | select(startswith("Codex Review: Didn'\''t find any major issues."))
                       | capture("Reviewed commit:\\*\\*\\s*`(?<sha>[0-9a-fA-F]{7,40})`").sha
@@ -166,11 +172,12 @@ jobs:
                     reviewThreads(first:100, after:$endCursor){
                       pageInfo{ hasNextPage endCursor }
                       nodes{ isResolved path
-                        comments(first:1){ nodes{ author{login} } } } } } } }' \
+                        comments(first:1){ nodes{ author{login __typename} } } } } } } }' \
             -F owner="${GITHUB_REPOSITORY%/*}" -F repo="${GITHUB_REPOSITORY#*/}" -F pr="$PR" \
             --jq '.data.repository.pullRequest.reviewThreads.nodes[]
                   | select(.isResolved == false)
-                  | select((.comments.nodes[0].author.login // "") | startswith("chatgpt-codex-connector"))
+                  | select(.comments.nodes[0].author.__typename == "Bot")
+                  | select((.comments.nodes[0].author.login // "") == "chatgpt-codex-connector")
                   | .path' | sort | uniq -c | sed 's/^ */  - /')
 
           if [ -z "$unresolved" ]; then

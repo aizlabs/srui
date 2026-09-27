@@ -8,15 +8,27 @@
 # `SRUI_REAP_TMP_GLOBS` points inside a private temp directory. No real fixture server and no
 # real /tmp/srui-* directory is ever in scope, so this is safe to run while tests are running.
 #
+# The reaper under test is a *copy*, placed in a sandbox git repository with a linked worktree of
+# its own. That is not indirection for its own sake: rule 6 only reaps binaries that live inside a
+# checkout of the repository the script itself sits in, so the sandbox has to be that repository
+# for a marker to be reapable at all - and markers outside it are how rule 6 is tested.
+#
 # Run: bash scripts/test_reap_test_servers.sh
 
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-reaper="$repo_root/scripts/reap-test-servers.sh"
 
 sandbox=$(mktemp -d "${TMPDIR:-/tmp}/reap-selftest.XXXXXX")
-mkdir -p "$sandbox/bin" "$sandbox/tmp"
+mkdir -p "$sandbox/bin" "$sandbox/tmp" "$sandbox/repo/scripts" "$sandbox/repo/target/debug" \
+    "$sandbox/elsewhere/target/debug" "$sandbox/usr-local-bin"
+git -C "$sandbox/repo" init -q
+git -C "$sandbox/repo" -c user.email=selftest@example.invalid -c user.name=selftest \
+    commit -q --allow-empty -m "sandbox root"
+git -C "$sandbox/repo" worktree add -q "$sandbox/wt" -b selftest
+mkdir -p "$sandbox/wt/target/debug"
+cp "$repo_root/scripts/reap-test-servers.sh" "$sandbox/repo/scripts/reap-test-servers.sh"
+reaper="$sandbox/repo/scripts/reap-test-servers.sh"
 failures=0
 spawned_pids=()
 spawned_pid=""
@@ -39,13 +51,31 @@ fail() {
     failures=$((failures + 1))
 }
 
-# An executable whose argv[0] is a path we control. A copied binary would be SIGKILLed by code
-# signing on Apple silicon and a shebang script would report /bin/sh as argv[0], which is exactly
-# the column the reaper matches on.
+# An executable whose argv[0] is a path we control, under the sandbox repository's own
+# `target/debug` - the layout a real fixture server has, and inside a checkout, so rule 6 lets it
+# be reaped. A copied binary would be SIGKILLed by code signing on Apple silicon and a shebang
+# script would report /bin/sh as argv[0], which is exactly the column the reaper matches on.
 make_marker() {
     local name=$1
-    ln -sf /bin/sleep "$sandbox/bin/$name"
-    printf '%s' "$sandbox/bin/$name"
+    ln -sf /bin/sleep "$sandbox/repo/target/debug/$name"
+    printf '%s' "$sandbox/repo/target/debug/$name"
+}
+
+# The same marker in the sandbox repository's linked worktree: reapable only if the reaper reads
+# `git worktree list` rather than just its own toplevel.
+make_worktree_marker() {
+    local name=$1
+    ln -sf /bin/sleep "$sandbox/wt/target/debug/$name"
+    printf '%s' "$sandbox/wt/target/debug/$name"
+}
+
+# A marker at a path that belongs to no checkout of this repository: `$1` is a directory under the
+# sandbox but outside `repo` and `wt`, standing in for `/usr/local/bin` or another project's
+# `target/debug`.
+make_foreign_marker() {
+    local dir=$1 name=$2
+    ln -sf /bin/sleep "$dir/$name"
+    printf '%s' "$dir/$name"
 }
 
 # ERE that matches only this marker's path.
@@ -379,6 +409,42 @@ else
     fi
     kill -9 "${listener_pid:-0}" 2>/dev/null
 fi
+
+echo "case 12: an orphan in a linked worktree of this repository is reaped"
+marker=$(make_worktree_marker fixture-worktree)
+spawn_orphan "$marker"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn an orphan marker in the linked worktree"
+else
+    run_reaper "$(marker_pattern "$marker")" 0 >/dev/null
+    assert_terminated "$pid" "orphan under a linked worktree was killed"
+fi
+
+echo "case 13: an identically named orphan outside every checkout is never signalled"
+# Line 3 and line 4 of the rule: a system install, and a sibling project's build output. Same
+# binary name, same orphanhood, same age - only the path differs.
+for spec in "$sandbox/usr-local-bin:srui-sessiond" "$sandbox/elsewhere/target/debug:srui-sessiond"; do
+    foreign_dir=${spec%:*}
+    foreign_name=${spec##*:}
+    marker=$(make_foreign_marker "$foreign_dir" "$foreign_name")
+    spawn_orphan "$marker"
+    pid=$spawned_pid
+    if [ -z "$pid" ]; then
+        fail "could not spawn an orphan marker at $marker"
+        continue
+    fi
+    output=$(run_reaper "$(marker_pattern "$marker")" 0 2>&1)
+    assert_alive "$pid" "orphan at $foreign_dir survived a zero-age sweep"
+    if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $pid"; then
+        fail "the reaper announced a kill for $marker"
+        printf '%s\n' "    reaper said: $output" >&2
+    else
+        pass "the reaper never selected $foreign_dir"
+    fi
+    assert_contains "$output" "1 outside this repository" "the sweep accounted for it as foreign"
+    kill -9 "$pid" 2>/dev/null
+done
 
 echo
 if [ "$failures" -eq 0 ]; then

@@ -30,9 +30,27 @@
 #      reaches through `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/srui-<uid>/srui-sessiond.sock`. Killing
 #      it discards the authoritative in-memory session. A fixture never binds that path (tests pass
 #      an explicit `--socket` under a per-run directory), so holding it is taken as proof that the
-#      process is not debris. Ownership evidence beyond this — a marker a test run writes for its
-#      own fixtures — is still missing; a daemon detached by hand onto some *other* explicit socket
-#      is still read as debris once it is old enough.
+#      process is not debris.
+#   6. launched from a checkout of *this* repository. The binary's path must lie inside the main
+#      checkout or one of its linked worktrees (`git worktree list`), which is the one thing that
+#      makes a process *this* repository's test debris rather than some other program with a
+#      familiar name. `/usr/local/bin/srui-sessiond`, a sibling project's
+#      `target/debug/srui-sessiond`, and anything whose path cannot be determined are never
+#      signalled, however leak-shaped they look. Both spellings of the candidate's path are
+#      accepted — as `ps` reports it and with its directory resolved through symlinks — because a
+#      `target` directory symlinked into a shared build cache must not make a real fixture
+#      unreapable; a fixture launched *through* the cache path rather than through the checkout is
+#      out of scope, since nothing in this repository launches one that way.
+#
+#      The cost, deliberately accepted: an orphan left by a run in a worktree that has since been
+#      deleted is no longer reapable, because its path is now inside no checkout. Those pids
+#      survive every sweep and have to be killed by hand. Stale-worktree pruning makes this a
+#      one-way ratchet, and it is the right trade — the alternative is a sweep that can reach
+#      binaries this repository never built.
+#
+#      Ownership evidence finer than rules 5 and 6 — a marker each test run writes for its own
+#      fixtures — is still missing; a daemon detached by hand from inside a checkout, onto some
+#      explicit socket other than the default, is still read as debris once it is old enough.
 #
 # Directories (`/tmp/srui-*`, `/tmp/px0*`, `/tmp/srtop-*`) are removed only when no live process
 # references them. "Referenced" has two independent sources, and either one spares a directory:
@@ -117,6 +135,48 @@ process_terminated() {
     esac
 }
 
+# The checkouts of this repository: the main one plus every linked worktree, each in both the
+# spelling git reports and its symlink-resolved form. Derived from where this script lives, not from
+# the caller's cwd, so a sweep run from anywhere still means "debris of *this* repository". Empty
+# when the script is not inside a git checkout, which rule 6 treats as "nothing is reapable".
+repo_checkout_roots() {
+    local script_dir root line path physical
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || return 0
+    root=$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null) || return 0
+    [ -n "$root" ] || return 0
+    git -C "$root" worktree list --porcelain 2>/dev/null | while IFS= read -r line; do
+        case $line in
+            worktree\ *) path=${line#worktree } ;;
+            *) continue ;;
+        esac
+        [ -n "$path" ] || continue
+        printf '%s\n' "${path%/}"
+        physical=$(cd "$path" 2>/dev/null && pwd -P) || continue
+        [ "${physical%/}" = "${path%/}" ] || printf '%s\n' "${physical%/}"
+    done
+}
+
+# Rule 6: is this binary inside a checkout of this repository? An argv[0] that is not an absolute
+# path tells us nothing about where the binary lives, so it is not reapable.
+inside_repo_checkout() {
+    local exe=$1 dir resolved root
+    case $exe in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    resolved=
+    if dir=$(cd "$(dirname "$exe")" 2>/dev/null && pwd -P); then
+        resolved="${dir%/}/$(basename "$exe")"
+    fi
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        case $exe in "$root"/*) return 0 ;; esac
+        [ -n "$resolved" ] || continue
+        case $resolved in "$root"/*) return 0 ;; esac
+    done <<<"$repo_roots"
+    return 1
+}
+
 # pid<TAB>argv[0] for every fixture process that is orphaned, old enough, ours, and not holding the
 # default runtime socket (rule 5).
 select_orphans() {
@@ -197,6 +257,11 @@ default_socket_pids=$(printf '%s\n' "$socket_snapshot" |
         }
     ' | sort -u | tr '\n' ' ')
 
+repo_roots=$(repo_checkout_roots)
+if [ -z "$repo_roots" ]; then
+    echo "note: not inside a git checkout; no process is reapable (rule 6)" >&2
+fi
+
 snapshot=$(process_snapshot)
 if [ -z "$snapshot" ]; then
     echo "error: could not read the process table (ps produced nothing)" >&2
@@ -207,6 +272,20 @@ matched_total=$(printf '%s\n' "$snapshot" |
     awk -v pattern="$pattern" -v my_uid="$my_uid" '$3 + 0 == my_uid + 0 && $5 ~ pattern' |
     wc -l | tr -d ' ')
 orphans=$(printf '%s\n' "$snapshot" | select_orphans)
+
+# Rule 6, applied here rather than in the awk above because resolving a path through symlinks needs
+# a shell. A candidate outside every checkout of this repository is not this repository's debris.
+foreign=0
+reapable=
+while IFS=$'\t' read -r pid exe; do
+    [ -n "${pid:-}" ] || continue
+    if inside_repo_checkout "$exe"; then
+        reapable="${reapable}${pid}"$'\t'"${exe}"$'\n'
+    else
+        foreign=$((foreign + 1))
+    fi
+done <<<"$orphans"
+orphans=${reapable%$'\n'}
 
 killed=0
 killed_pids=
@@ -309,17 +388,17 @@ for dir in "${candidates[@]+"${candidates[@]}"}"; do
     removed_kb=$((removed_kb + ${size_kb:-0}))
 done
 
-spared=$((matched_total - killed))
+spared=$((matched_total - killed - foreign))
 verb_killed=killed
 verb_removed=removed
 if [ "$dry_run" -eq 1 ]; then
     verb_killed="would kill"
     verb_removed="would remove"
 fi
-printf 'reap-test-servers: %s %d fixture server(s), %s %d socket director(y|ies) (%d.%d MB); left %d fixture process(es) with a live parent or too young, %d referenced director(y|ies), %d recently touched.\n' \
+printf 'reap-test-servers: %s %d fixture server(s), %s %d socket director(y|ies) (%d.%d MB); left %d fixture process(es) with a live parent or too young, %d outside this repository, %d referenced director(y|ies), %d recently touched.\n' \
     "$verb_killed" "$killed" "$verb_removed" "$removed" \
     "$((removed_kb / 1024))" "$(((removed_kb % 1024) * 10 / 1024))" \
-    "$spared" "$held" "$fresh"
+    "$spared" "$foreign" "$held" "$fresh"
 
 if [ "$failures" -gt 0 ]; then
     echo "reap-test-servers: $failures failure(s)" >&2

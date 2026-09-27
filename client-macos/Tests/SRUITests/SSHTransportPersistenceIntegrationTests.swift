@@ -123,7 +123,14 @@ struct SSHTransportPersistenceIntegrationTests {
         controllerA.attachRenderer(rendererA)
 
         try await controllerA.start()
-        try await AsyncTestSupport.eventually(description: "connection A initial revision over SSH") {
+        // Every wait in this test crosses a real SSH connection (and, for connection B, a fresh
+        // one): an `ssh` client process, sshd's authentication, the bridge subsystem exec and the
+        // sessiond handshake. The 2s default is a local-actor budget; on a 3-core runner sharing
+        // itself with the whole suite that round trip is seconds.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(15),
+            description: "connection A initial revision over SSH"
+        ) {
             applierA.lastAppliedRevision == Revision(1)
                 && controllerA.isEventDispatchEnabled
         }
@@ -134,7 +141,10 @@ struct SSHTransportPersistenceIntegrationTests {
         // Run 3 click cycles on Connection A
         for cycle in 1...3 {
             _ = try await controllerA.sendActivate(nodeId: buttonID)
-            try await AsyncTestSupport.eventually(description: "connection A cycle \(cycle)") {
+            try await AsyncTestSupport.eventually(
+                timeout: .seconds(15),
+                description: "connection A cycle \(cycle)"
+            ) {
                 guard applierA.lastAppliedRevision == Revision(UInt64(cycle + 1)) else {
                     return false
                 }
@@ -168,7 +178,10 @@ struct SSHTransportPersistenceIntegrationTests {
         controllerB.attachRenderer(rendererB)
 
         try await controllerB.start()
-        try await AsyncTestSupport.eventually(description: "connection B receives preserved state over SSH") {
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(15),
+            description: "connection B receives preserved state over SSH"
+        ) {
             guard applierB.lastAppliedRevision == Revision(4),
                   controllerB.isEventDispatchEnabled else {
                 return false
@@ -189,7 +202,10 @@ struct SSHTransportPersistenceIntegrationTests {
 
         // 6. Perform click on Connection B and verify counter increments to Count: 4
         _ = try await controllerB.sendActivate(nodeId: buttonID)
-        try await AsyncTestSupport.eventually(description: "connection B cycle 4") {
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(15),
+            description: "connection B cycle 4"
+        ) {
             guard applierB.lastAppliedRevision == Revision(5) else {
                 return false
             }
@@ -247,7 +263,10 @@ struct SSHTransportPersistenceIntegrationTests {
             )
 
             try await controller.start()
-            try await AsyncTestSupport.eventually(description: "handshake on restart \(iteration)") {
+            try await AsyncTestSupport.eventually(
+                timeout: .seconds(15),
+                description: "handshake on restart \(iteration)"
+            ) {
                 guard controller.sessionId != nil else { return false }
                 guard applier.lastAppliedRevision == Revision(1) else { return false }
                 guard controller.isHandshakeComplete else { return false }

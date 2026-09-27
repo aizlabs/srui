@@ -21,7 +21,8 @@ cd "$repo_root"
 
 log=$(mktemp "${TMPDIR:-/tmp}/srui-swift-test-log.XXXXXX")
 plain=$(mktemp "${TMPDIR:-/tmp}/srui-swift-test-plain.XXXXXX")
-trap 'rm -f "$log" "$plain"' EXIT
+runner_status_file=$(mktemp "${TMPDIR:-/tmp}/srui-swift-test-status.XXXXXX")
+trap 'rm -f "$log" "$plain" "$runner_status_file"' EXIT
 
 # `script` gives the run a pty so its output stays line-buffered. A wedged run that the watchdog
 # kills would otherwise lose everything still sitting in stdio's block buffer, and the accounting
@@ -41,8 +42,27 @@ sample_at=$(( timeout_seconds > 45 ? timeout_seconds - 30 : timeout_seconds ))
 ) &
 sampler_pid=$!
 
-script -q "$log" scripts/run-swift-tests.sh "$@" >/dev/null 2>&1
-status=$?
+# The runner's exit status comes back through a file it writes itself, not through `script`.
+# `script(1)` owns its own exit status: it is the *typescript* utility's, and the only reason the
+# child's shows through on macOS is an implementation detail of `finish()` (it happens to call
+# `done(WEXITSTATUS(status))`, and `done(0)` when the `waitpid` does not match). util-linux needs
+# `-e` for the same thing, and macOS accepts `-e` only "for compatibility". A green wrapper is the
+# one thing this script must never produce by accident: the accounting below deliberately counts a
+# *failing* test as reported, so if `status` were 0 for a run whose tests failed, every check here
+# would pass and CI would call the run green.
+SRUI_RUN_STATUS_FILE="$runner_status_file" script -q "$log" \
+    /bin/bash -c 'scripts/run-swift-tests.sh "$@"; echo "$?" >"$SRUI_RUN_STATUS_FILE"' \
+    srui-run "$@" >/dev/null 2>&1
+script_status=$?
+
+status=$(LC_ALL=C tr -dc '0-9' <"$runner_status_file")
+missing_status=0
+if [ -z "$status" ]; then
+    # The runner never returned: `script` died, or the whole group was killed. Fail closed.
+    missing_status=1
+    status=$script_status
+    [ "$status" -eq 0 ] && status=1
+fi
 kill "$sampler_pid" 2>/dev/null
 wait "$sampler_pid" 2>/dev/null
 
@@ -77,6 +97,10 @@ reported_count=$(printf '%s\n' "$reported" | grep -c . || true)
 echo "run accounting: ${started_count} test(s) started, ${reported_count} reported."
 
 problems=0
+if [ "$missing_status" -ne 0 ]; then
+    echo "MISSING STATUS: the test runner never reported an exit status (script exited ${script_status})." >&2
+    problems=1
+fi
 if [ -n "$missing" ]; then
     echo "MISSING RESULT - these tests started and never reported:" >&2
     printf '%s\n' "$missing" | sed 's/^/  /' >&2

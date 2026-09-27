@@ -94,6 +94,55 @@ SH
     disown "$spawned_pid" 2>/dev/null
 }
 
+# A marker whose parent never calls `wait`: the intermediate shell `exec`s into `sleep`, so it
+# keeps the same pid and the marker keeps the same parent, and when the marker dies it stays in the
+# process table as a zombie instead of vanishing. That is exactly the state a killed orphan is left
+# in on a host whose pid 1 does not reap (a container running a plain shell as init). It cannot be
+# staged with a *real* orphan here, because launchd reaps one in microseconds; `make_fake_ps` below
+# supplies the missing half. Publishes `spawned_pid` and `unreaping_parent_pid`.
+spawn_unreaped_child() {
+    local marker=$1 pidfile="$sandbox/unreaped.pid"
+    rm -f "$pidfile"
+    cat >"$sandbox/bin/unreaping-parent.sh" <<'SH'
+#!/bin/sh
+"$1" 600 >/dev/null 2>&1 &
+echo "$!" >"$2"
+exec /bin/sleep 900
+SH
+    chmod +x "$sandbox/bin/unreaping-parent.sh"
+    "$sandbox/bin/unreaping-parent.sh" "$marker" "$pidfile" >/dev/null 2>&1 &
+    unreaping_parent_pid=$!
+    spawned_pids+=("$unreaping_parent_pid")
+    disown "$unreaping_parent_pid" 2>/dev/null
+    spawned_pid=""
+    local waited=0
+    while [ "$waited" -lt 50 ]; do
+        spawned_pid=$(cat "$pidfile" 2>/dev/null)
+        [ -n "$spawned_pid" ] && break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [ -n "$spawned_pid" ] && spawned_pids+=("$spawned_pid")
+}
+
+# A `ps` stand-in that reports one pid as reparented to init in the process-table snapshot the
+# reaper takes, and passes every other query (notably the `-o state= -p` liveness check) straight
+# through to the real `ps`. Rewriting that one column is what lets the sandbox present a process
+# the selection rules accept while its real parent is alive and not reaping it. Prints its bin dir.
+make_fake_ps() {
+    local dir="$sandbox/fakebin"
+    mkdir -p "$dir"
+    cat >"$dir/ps" <<'SH'
+#!/bin/sh
+case $1 in
+    -eo) /bin/ps "$@" | awk -v p="${SRUI_FAKE_ORPHAN_PID:-0}" '{ if ($1 + 0 == p + 0) $2 = 1; print }' ;;
+    *) exec /bin/ps "$@" ;;
+esac
+SH
+    chmod +x "$dir/ps"
+    printf '%s' "$dir"
+}
+
 run_reaper() {
     local pattern=$1 age=$2
     shift 2
@@ -108,6 +157,16 @@ assert_alive() {
 }
 assert_dead() {
     if kill -0 "$1" 2>/dev/null; then fail "$2 (pid $1 still alive)"; else pass "$2"; fi
+}
+# Terminated means gone from the process table *or* a zombie: a killed process whose parent has not
+# reaped it is dead, whatever `kill -0` says.
+assert_terminated() {
+    local state
+    state=$(ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]')
+    case $state in
+        '' | Z*) pass "$2" ;;
+        *) fail "$2 (pid $1 is in state '$state')" ;;
+    esac
 }
 assert_dir_present() {
     if [ -d "$1" ]; then pass "$2"; else fail "$2 ($1 was removed)"; fi
@@ -196,6 +255,35 @@ echo "case 7: an empty sweep succeeds"
 run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null
 if [ $? -eq 0 ]; then pass "nothing to reap is not a failure"; else fail "empty sweep exited non-zero"; fi
 
+echo "case 8: a fixture server that dies into an unreaped zombie counts as killed, not survived"
+marker=$(make_marker fixture-zombie)
+fake_bin=$(make_fake_ps)
+unreaping_parent_pid=""
+spawn_unreaped_child "$marker"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn a marker under a non-reaping parent"
+else
+    # The PATH override lives inside the command substitution's subshell, so the stand-in `ps` is
+    # visible to this invocation of the reaper and to nothing else.
+    output=$(PATH="$fake_bin:$PATH" SRUI_FAKE_ORPHAN_PID="$pid" \
+        run_reaper "$(marker_pattern "$marker")" 0 2>&1)
+    reaper_status=$?
+    assert_terminated "$pid" "the staged orphan was terminated"
+    if [ "$reaper_status" -eq 0 ]; then
+        pass "the reaper exited 0 after killing a process its parent never reaped"
+    else
+        fail "the reaper exited $reaper_status after killing a process its parent never reaped"
+        printf '%s\n' "    reaper said: $output" >&2
+    fi
+    if printf '%s' "$output" | grep -qF "survived SIGKILL"; then
+        fail "the reaper called an unreaped zombie a survivor of SIGKILL"
+        printf '%s\n' "    reaper said: $output" >&2
+    else
+        pass "no spurious 'survived SIGKILL' for an unreaped zombie"
+    fi
+    kill -9 "$unreaping_parent_pid" 2>/dev/null
+fi
 echo
 if [ "$failures" -eq 0 ]; then
     echo "reap-test-servers selection rules: all cases passed."

@@ -78,6 +78,23 @@ process_snapshot() {
     ps -eo pid=,ppid=,uid=,etime=,command= 2>/dev/null
 }
 
+# True when a pid we signalled is no longer running: either gone from the process table, or a
+# zombie its parent has not reaped yet. `kill -0` cannot tell those apart from "still serving" —
+# it succeeds for a zombie on macOS and on Linux — and every orphan this script kills is a child
+# of pid 1, so whether the zombie disappears in microseconds or never is entirely up to that
+# process: launchd reaps immediately, a container whose pid 1 is a plain shell never does. Using
+# `kill -0` there reported every successfully killed fixture server as having survived SIGKILL,
+# which made the sweep exit 1 and `run-swift-tests.sh` print a spurious pre-test warning.
+process_terminated() {
+    local state
+    state=$(ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]')
+    case $state in
+        '') return 0 ;; # gone from the process table
+        Z*) return 0 ;; # dead, waiting to be reaped
+        *) return 1 ;;
+    esac
+}
+
 # pid<TAB>argv[0] for every fixture process that is orphaned, old enough, and ours.
 select_orphans() {
     awk -v pattern="$pattern" -v min_age="$age_seconds" -v my_uid="$my_uid" -v self="$$" '
@@ -139,14 +156,14 @@ while IFS=$'\t' read -r pid exe; do
     echo "killing orphaned fixture server pid $pid $exe"
     kill -TERM "$pid" 2>/dev/null
     for _ in $(seq 1 20); do
-        kill -0 "$pid" 2>/dev/null || break
+        process_terminated "$pid" && break
         sleep 0.1
     done
-    if kill -0 "$pid" 2>/dev/null; then
+    if ! process_terminated "$pid"; then
         kill -KILL "$pid" 2>/dev/null
         sleep 0.2
     fi
-    if kill -0 "$pid" 2>/dev/null; then
+    if ! process_terminated "$pid"; then
         echo "error: pid $pid survived SIGKILL" >&2
         failures=$((failures + 1))
         continue

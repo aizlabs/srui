@@ -53,6 +53,16 @@ struct CodingAgentFallbackSocketTests {
         try await AsyncTestSupport.eventually(description: "coding-agent snapshot rendered") {
             renderer.registry.handle(for: NodeId(18)) != nil
         }
+        // The catch-up snapshot mounts the native tree *before* the session releases the snapshot
+        // latch, so a node handle existing is not yet evidence that user events may be dispatched
+        // (§18.3). Automation below sends events; wait for the condition it needs rather than
+        // assuming the tail of snapshot finalization already ran.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(10),
+            description: "session releases the snapshot latch and admits events"
+        ) {
+            controller.isEventDispatchEnabled
+        }
 
         let surfaceWindow = try #require(renderer.registry.handle(for: NodeId(1))?.window)
         // Leave nothing in the window list behind this test.
@@ -127,8 +137,15 @@ struct CodingAgentFallbackSocketTests {
             reportedTerminalSizes.append((columns, rows))
             forwardResize?(columns, rows, width, height)
         }
+        // The view publishes its PTY geometry on a debounce after each layout and only when that
+        // geometry *changed*, so an interceptor installed after the mount's own publish would see
+        // nothing at all — which made this expectation depend on how quickly the test reached this
+        // line. Grow the surface so the next publish is unconditional, and keep requiring the
+        // reported geometry to be at least the conventional 80×24.
+        surfaceWindow.setContentSize(NSSize(width: 1000, height: 1000))
+        surfaceWindow.contentView?.layoutSubtreeIfNeeded()
         terminalView.layout()
-        let terminalResizeDeadline = Date().addingTimeInterval(3)
+        let terminalResizeDeadline = Date().addingTimeInterval(10)
         while Date() < terminalResizeDeadline,
               !reportedTerminalSizes.contains(where: {
                   $0.columns >= TerminalView.conventionalColumns

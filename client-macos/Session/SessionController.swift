@@ -774,6 +774,29 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
+    /// Current ownership of `binding`, or nil once a replacement connection took over.
+    ///
+    /// A queued transaction must be fenced on the *connection*, not on the session incarnation it
+    /// happened to be enqueued under: a catch-up or resync snapshot ahead of it on the same FIFO
+    /// ingress lane advances that incarnation as it commits (§18.3), and the transactions the
+    /// server sent after that snapshot were already decoded and queued under the previous one.
+    /// Fencing those on the enqueue-time incarnation discarded committed transactions and made the
+    /// next one diverge the replica on a revision gap the server never produced (§18, §22.2).
+    private func currentIngressOwnership(
+        for binding: EventOutboxConnectionBinding
+    ) -> SemanticActionOwnership? {
+        withStateLock {
+            guard outboxConnectionBinding == binding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+    }
+
     private func acquireSharedMutationLease(
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
@@ -2658,11 +2681,18 @@ public final class SessionController: @unchecked Sendable {
         taskID: UUID,
         predecessor: Task<Void, Never>?,
         lifecycleGeneration: UInt64,
-        ownership: SemanticActionOwnership
+        ownership enqueuedOwnership: SemanticActionOwnership
     ) async {
         defer { finishQueuedTransaction(taskID) }
         await predecessor?.value
         guard !Task.isCancelled, ownsTransactionIngressLifecycle(lifecycleGeneration) else {
+            return
+        }
+
+        // Every predecessor on this lane has finished, so any snapshot ahead of this transaction
+        // has already published the session incarnation this transaction belongs to. Re-derive it
+        // instead of carrying the enqueue-time value forward; see `currentIngressOwnership`.
+        guard let ownership = currentIngressOwnership(for: enqueuedOwnership.binding) else {
             return
         }
 

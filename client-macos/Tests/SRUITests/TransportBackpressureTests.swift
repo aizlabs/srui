@@ -235,10 +235,30 @@ struct TransportBackpressureTests {
         #expect(latch.isStopped)
         // Still open: the claim holder has not finished, so the number cannot be recycled yet.
         #expect(fcntl(writable, F_GETFD) != -1)
+        // Identity, not liveness. `close(2)` frees the *number*, and this process runs other tests
+        // in parallel that open descriptors of their own, so the kernel can hand this number to one
+        // of them before the assertion below runs. What the latch owes us is that the number no
+        // longer names this socket.
+        let claimedIdentity = try #require(Self.descriptorIdentity(writable))
 
         latch.endIO()
-        #expect(fcntl(writable, F_GETFD) == -1, "the last claim release must perform the close")
+        #expect(
+            Self.descriptorIdentity(writable) != claimedIdentity,
+            "the last claim release must perform the close"
+        )
         #expect(latch.beginIO() == nil, "a stopped latch hands out no further claims")
+    }
+
+    /// What `fd` currently names, or nil when the number is not open at all.
+    private static func descriptorIdentity(_ fd: Int32) -> DescriptorIdentity? {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { return nil }
+        return DescriptorIdentity(device: info.st_dev, inode: info.st_ino)
+    }
+
+    private struct DescriptorIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
     }
 }
 

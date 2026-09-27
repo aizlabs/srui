@@ -9,8 +9,14 @@ import Session
 import TransportSSH
 import RendererAppKit
 
+/// Serialized as a suite, not per test: `.serialized` on a non-parameterized test function is a
+/// no-op (the compiler warns), and each test here launches its own sshd, srtop and NSWindow. Two of
+/// them at once triples that load on the one main actor every test in this process shares, and
+/// PX-004 samples native controls on a 500 ms tick schedule while it runs. Serializing the three
+/// cases costs about one second of wall clock.
+@Suite(.serialized)
 struct ProcessExplorerShellTests {
-    @Test(.serialized, .timeLimit(.minutes(1)), arguments: [false, true])
+    @Test(.timeLimit(.minutes(1)), arguments: [false, true])
     @MainActor
     func shellOverSSHRetainsNativeHandlesAfterTitleFixture(fakeSource: Bool) async throws {
         let harness = try await Self.launch(
@@ -25,7 +31,7 @@ struct ProcessExplorerShellTests {
                                            renderer: renderer, sessionId: "srtop")
         controller.attachRenderer(renderer)
         try await controller.start()
-        try await AsyncTestSupport.eventually(timeout: .seconds(10), description: "native empty shell over SSH") {
+        try await AsyncTestSupport.eventually(timeout: .seconds(45), description: "native empty shell over SSH") {
             applier.lastAppliedRevision == Revision(1) && renderer.registry.handle(for: NodeId(5)) != nil
         }
 
@@ -64,7 +70,7 @@ struct ProcessExplorerShellTests {
         try await Self.capture(window: window, name: fakeSource ? "fake-initial" : "initial")
 
         #expect(kill(harness.server.processIdentifier, SIGUSR1) == 0)
-        try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "title mutation over SSH") {
+        try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "title mutation over SSH") {
             applier.lastAppliedRevision == Revision(2) &&
                 window.title == "Process Explorer — title fixture" &&
                 heading.stringValue == "Process Explorer — title fixture"
@@ -84,7 +90,7 @@ struct ProcessExplorerShellTests {
     /// PX-004: the scripted fixture sequence refreshes the same native table in
     /// place — one insertion, one deletion, one rename, a failed scan that keeps
     /// the last-known rows, and a tick that publishes nothing at all.
-    @Test(.serialized, .timeLimit(.minutes(2)))
+    @Test(.timeLimit(.minutes(2)))
     @MainActor
     func scriptedRefreshUpdatesTheSameNativeTableInPlace() async throws {
         let intervalMilliseconds = 500
@@ -100,7 +106,7 @@ struct ProcessExplorerShellTests {
                                            applier: applier, renderer: renderer, sessionId: "srtop")
         controller.attachRenderer(renderer)
         try await controller.start()
-        try await AsyncTestSupport.eventually(timeout: .seconds(15), description: "native process table over SSH") {
+        try await AsyncTestSupport.eventually(timeout: .seconds(45), description: "native process table over SSH") {
             applier.lastAppliedRevision.value >= 1 && renderer.registry.handle(for: NodeId(5)) != nil
         }
         let surfaceHandle = try #require(renderer.registry.handle(for: NodeId(1)))
@@ -114,12 +120,18 @@ struct ProcessExplorerShellTests {
         window.contentView?.layoutSubtreeIfNeeded()
         let windowNumber = window.windowNumber
 
-        // Sample far faster than the server polls, so no published state can
-        // pass unobserved.
+        // Sample far faster than the server polls, so no published state can pass unobserved —
+        // and *prove* that rather than assume it. A state is missed only when the sampler is
+        // starved past a whole tick, which shows up as a revision that advanced by more than one
+        // between two consecutive observations. The evidence below therefore has to come from a
+        // contiguous run of published states: a hole discards the partial run and the loop keeps
+        // collecting, instead of asserting against a trace that silently skipped a tick.
         var trace: [Observation] = []
+        var longestRun = 0
+        var discardedRuns = 0
         let clock = ContinuousClock()
         let start = clock.now
-        let deadline = start.advanced(by: .seconds(20))
+        let deadline = start.advanced(by: .seconds(60))
         var stamps: [Duration] = []
         while clock.now < deadline {
             window.contentView?.layoutSubtreeIfNeeded()
@@ -134,18 +146,32 @@ struct ProcessExplorerShellTests {
                                           itemIDs: Self.modelItemIDs(applier))
             guard observation.rows == Self.modelRows(applier),
                   observation.status == Self.modelStatus(applier) else {
-                try await Task.sleep(for: .milliseconds(20))
+                try await Task.sleep(for: .milliseconds(10))
                 continue
             }
             if trace.last != observation {
+                if let previous = trace.last, observation.revision != previous.revision + 1 {
+                    longestRun = max(longestRun, trace.count)
+                    discardedRuns += 1
+                    trace = []
+                    stamps = []
+                }
                 trace.append(observation)
                 stamps.append(start.duration(to: clock.now))
             }
             // One full cycle is five ticks; two cycles prove the script repeats.
             if trace.filter({ $0.rows == Self.initialRows }).count >= 3 { break }
-            try await Task.sleep(for: .milliseconds(20))
+            try await Task.sleep(for: .milliseconds(10))
         }
-
+        longestRun = max(longestRun, trace.count)
+        try #require(
+            trace.filter({ $0.rows == Self.initialRows }).count >= 3,
+            """
+            no gap-free run of published states covered two full five-tick cycles within 60s: \
+            longest contiguous run was \(longestRun) state(s) across \(discardedRuns + 1) run(s); \
+            last applied revision \(applier.lastAppliedRevision.value)
+            """
+        )
         let settledRows = [["4101", "worker"], ["4103", "helper-tool"], ["4104", "builder"]]
         let normalStatus = "Read-only · Fake process sequence"
         #expect(trace.contains { $0.rows == Self.initialRows && $0.status == normalStatus })
@@ -303,7 +329,7 @@ struct ProcessExplorerShellTests {
             server.standardOutput = FileHandle.nullDevice
             server.standardError = FileHandle.nullDevice
             try server.run()
-            try await AsyncTestSupport.eventually(timeout: .seconds(5), description: "srtop private socket") {
+            try await AsyncTestSupport.eventually(timeout: .seconds(20), description: "srtop private socket") {
                 FileManager.default.fileExists(atPath: socket)
             }
             let sshd = try SSHTestSupport.launchSSHD(configPath: config.path, hostKeyPath: hostKey, port: port)

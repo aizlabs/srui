@@ -446,6 +446,49 @@ for spec in "$sandbox/usr-local-bin:srui-sessiond" "$sandbox/elsewhere/target/de
     kill -9 "$pid" 2>/dev/null
 done
 
+echo "case 14: without a socket inventory, a sweep kills nothing while a default socket exists"
+# `lsof` missing or denied empties rule 5's evidence, so a detached daemon on the default socket
+# would be indistinguishable from debris. The stand-in prints nothing and fails, like a denied or
+# absent lsof; the real one stays untouched outside this case.
+mkdir -p "$sandbox/nolsof"
+printf '#!/bin/sh\nexit 1\n' >"$sandbox/nolsof/lsof"
+chmod +x "$sandbox/nolsof/lsof"
+blind_root="$sandbox/tmp3"
+blind_default="$blind_root/srui-$(id -u)"
+mkdir -p "$blind_default"
+# A socket file in the default runtime directory, left behind by a process that has exited: the
+# reaper must not need to know *who* holds it to decide to keep its hands off.
+python3 -c "import socket; socket.socket(socket.AF_UNIX).bind('$blind_default/s')" 2>/dev/null
+marker=$(make_marker fixture-blind)
+spawn_orphan "$marker"
+pid=$spawned_pid
+if [ -z "$pid" ] || [ ! -S "$blind_default/s" ]; then
+    fail "could not stage a blind sweep (pid='${pid:-}', socket present: $([ -S "$blind_default/s" ] && echo yes || echo no))"
+else
+    output=$(PATH="$sandbox/nolsof:$PATH" \
+        SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$blind_root/srui-*" \
+        TMPDIR="$blind_root" \
+        bash "$reaper" 2>&1)
+    assert_alive "$pid" "the orphan survived a sweep that could not read the socket table"
+    assert_dir_present "$blind_default" "the default runtime directory survived it too"
+    assert_contains "$output" "killing nothing" "the sweep said why it killed nothing"
+
+    # The gate is the missing evidence plus something to protect, not the missing evidence alone:
+    # with no socket in the default runtime directory there is no daemon to confuse with debris.
+    rm -f "$blind_default/s"
+    output=$(PATH="$sandbox/nolsof:$PATH" \
+        SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$blind_root/srui-*" \
+        TMPDIR="$blind_root" \
+        bash "$reaper" 2>&1)
+    assert_terminated "$pid" "with no default socket on disk, the same orphan was killed"
+    assert_contains "$output" "nothing to protect" "the sweep said why it proceeded"
+fi
+kill -9 "${pid:-0}" 2>/dev/null
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "reap-test-servers selection rules: all cases passed."

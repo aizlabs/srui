@@ -30,7 +30,9 @@
 #      reaches through `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/srui-<uid>/srui-sessiond.sock`. Killing
 #      it discards the authoritative in-memory session. A fixture never binds that path (tests pass
 #      an explicit `--socket` under a per-run directory), so holding it is taken as proof that the
-#      process is not debris.
+#      process is not debris. This rule needs the socket table: where `lsof` is missing or denied,
+#      nothing can be told apart from that daemon, so the sweep kills nothing at all unless it can
+#      rule the daemon out independently — no socket in any default runtime directory.
 #   6. launched from a checkout of *this* repository. The binary's path must lie inside the main
 #      checkout or one of its linked worktrees (`git worktree list`), which is the one thing that
 #      makes a process *this* repository's test debris rather than some other program with a
@@ -245,8 +247,26 @@ held_socket_paths() {
 default_tmp=${TMPDIR:-/tmp}
 default_runtime_dirs="${XDG_RUNTIME_DIR:-} ${default_tmp%/}/srui-$my_uid /tmp/srui-$my_uid"
 
+# Any socket sitting in a default runtime directory, bound or stale. Used only when the socket
+# table cannot be read: it answers "could there be a daemon here to protect?" without naming who
+# holds what.
+default_socket_present() {
+    local dir entry
+    # shellcheck disable=SC2086 # deliberate word splitting: a space-separated list of directories
+    for dir in $default_runtime_dirs; do
+        [ -n "$dir" ] || continue
+        [ -d "${dir%/}" ] || continue
+        for entry in "${dir%/}"/*; do
+            [ -S "$entry" ] && return 0
+        done
+    done
+    return 1
+}
+
 # One socket-table snapshot, taken before any kill, serves both rule 5 and the directory sweep.
 socket_snapshot=$(socket_holders)
+socket_evidence=1
+[ -n "$socket_snapshot" ] || socket_evidence=0
 default_socket_pids=$(printf '%s\n' "$socket_snapshot" |
     awk -F'\t' -v dirs="$default_runtime_dirs" '
         BEGIN { n = split(dirs, list, " ") }
@@ -256,6 +276,24 @@ default_socket_pids=$(printf '%s\n' "$socket_snapshot" |
             }
         }
     ' | sort -u | tr '\n' ' ')
+
+# Rule 5 is only enforceable while the socket table is readable. Without `lsof` — missing, or denied
+# — `default_socket_pids` is empty, and a deliberately detached daemon serving the default socket
+# becomes indistinguishable from debris, so it would be signalled by rules 1-4 and 6 alone. Killing
+# is therefore gated on being able to rule that daemon out independently: no socket in any default
+# runtime directory means there is nobody there to protect. A *stale* socket file stops the sweep
+# too, which is the safe way round.
+kill_allowed=1
+if [ "$socket_evidence" -eq 0 ]; then
+    if default_socket_present; then
+        kill_allowed=0
+        echo "note: no unix socket inventory (lsof) and a socket exists in a default runtime" \
+            "directory; killing nothing, because rule 5 cannot be enforced" >&2
+    else
+        echo "note: no unix socket inventory (lsof); no socket in any default runtime directory," \
+            "so rule 5 has nothing to protect" >&2
+    fi
+fi
 
 repo_roots=$(repo_checkout_roots)
 if [ -z "$repo_roots" ]; then
@@ -286,6 +324,15 @@ while IFS=$'\t' read -r pid exe; do
     fi
 done <<<"$orphans"
 orphans=${reapable%$'\n'}
+
+if [ "$kill_allowed" -eq 0 ]; then
+    ungated=$(printf '%s\n' "$orphans" | grep -c . || true)
+    if [ "$ungated" -gt 0 ]; then
+        echo "note: leaving $ungated otherwise reapable fixture process(es) alive: no socket" \
+            "evidence to tell a detached daemon from debris" >&2
+    fi
+    orphans=
+fi
 
 killed=0
 killed_pids=
@@ -326,9 +373,7 @@ else
 fi
 referenced=$(printf '%s\n' "$live_snapshot" | referenced_paths "$killed_pids")
 held_sockets=$(printf '%s\n' "$socket_snapshot" | held_socket_paths "$killed_pids")
-socket_evidence=1
-if [ -z "$socket_snapshot" ]; then
-    socket_evidence=0
+if [ "$socket_evidence" -eq 0 ]; then
     echo "note: no unix socket inventory (lsof); leaving every socket directory in place" >&2
 fi
 referenced=$(printf '%s\n%s\n' "$referenced" "$held_sockets")

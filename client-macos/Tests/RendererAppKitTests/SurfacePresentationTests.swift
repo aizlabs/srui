@@ -64,7 +64,7 @@ struct SurfacePresentationTests {
     }
 
     @Test
-    func showWindowsKeepsSurfacesOffTheDisplayWithoutHidingThemFromTheRenderer() throws {
+    func showWindowsKeepsSurfacesOffTheDisplayWithoutHidingThemFromTheRenderer() async throws {
         let store = try makeSurfaceStore()
         let renderer = AppKitRenderer()
         try renderer.attach(store: store)
@@ -87,12 +87,20 @@ struct SurfacePresentationTests {
         #expect(NSApplication.shared.isActive == false)
 
         // Confirmed through the window server rather than the renderer's own state: window
-        // registration is asynchronous, so give it run-loop turns to appear before asserting
-        // that nothing this process has on screen is drawn at all.
+        // registration is asynchronous, so let it appear before asserting that nothing this
+        // process has on screen is drawn at all.
+        //
+        // The wait is an `await`, never `RunLoop.run(until:)`. This test is `@MainActor`, so
+        // `RunLoop.current` is the main run loop, which under Swift 6.2 *is* the main-actor
+        // executor (`swift_task_asyncMainDrainQueue` -> `CFMainExecutor.run()` ->
+        // `CFRunLoopRun()`). Servicing it here nests a second activation: the exact park and
+        // early-exit that `scripts/check-test-main-runloop-nesting.sh` exists to keep out of this
+        // suite. Suspending instead hands the main actor back to that one outer activation, which
+        // services window registration on its own.
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline,
               !Self.onScreenWindowsOwnedByThisProcess().contains(where: { $0.number == window.windowNumber }) {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            try await Task.sleep(for: .milliseconds(50))
         }
         let onScreen = Self.onScreenWindowsOwnedByThisProcess()
         #expect(onScreen.allSatisfy { $0.alpha == 0 },

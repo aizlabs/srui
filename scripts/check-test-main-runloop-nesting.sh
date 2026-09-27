@@ -37,6 +37,12 @@ banned=(
     '.runModal(|a modal session nests the main run loop; assert on the model instead'
     'CFRunLoopRun(|nesting the main run loop strands the main-actor executor'
     'RunLoop.main.run(|nesting the main run loop strands the main-actor executor'
+    # A `@MainActor` test's `RunLoop.current` *is* the main run loop, so the spelling matters as
+    # little as the receiver: any `run(until:)` on the main thread nests the executor's own
+    # activation. Suspend with `await Task.sleep` instead — that hands the main actor back to the
+    # single outer `CFRunLoopRun()` rather than starting another one.
+    'RunLoop.current.run(|a @MainActor test'"'"'s RunLoop.current is the main run loop; await instead of servicing it'
+    '.run(until:|servicing a run loop from a test nests the main-actor executor; await Task.sleep instead'
 )
 
 status=0

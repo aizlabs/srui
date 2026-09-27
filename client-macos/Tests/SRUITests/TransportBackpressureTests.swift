@@ -13,6 +13,12 @@ import Foundation
 import Darwin
 #endif
 
+/// Which socket object a descriptor refers to, independent of its number.
+private struct SocketObjectIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+}
+
 /// Minimal cross-thread cell; the semaphores in each test provide the ordering.
 private final class Box<T>: @unchecked Sendable {
     private let lock = NSLock()
@@ -223,12 +229,41 @@ struct TransportBackpressureTests {
         latch.stop()
     }
 
+    /// Which *socket object* a descriptor number refers to, or `nil` when the number is not open.
+    ///
+    /// Measured on this platform: every socket gets a distinct `st_ino`, and a `dup` of one
+    /// reports the same `(st_dev, st_ino)` pair. Comparing against a sentinel `dup` therefore
+    /// answers "does this number still refer to *that* socket", which is the only form of the
+    /// question that survives descriptor recycling.
+    private func socketIdentity(of descriptor: Int32) -> SocketObjectIdentity? {
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0 else { return nil }
+        return SocketObjectIdentity(device: metadata.st_dev, inode: metadata.st_ino)
+    }
+
     /// The latch must not release a descriptor number while an I/O call still holds it, or the
     /// kernel can recycle it under a parked `read`/`write`.
+    ///
+    /// Both halves are observed against a `dup` of the same socket rather than against the
+    /// descriptor *number*. The test host runs hundreds of tests concurrently, so another one can
+    /// be handed that number the instant the latch closes it — after which `fcntl(number,
+    /// F_GETFD)` reports a perfectly healthy descriptor that belongs to somebody else, failing
+    /// this test for a reason it is not about (and, before the close, passing it for one).
+    /// Identity against the sentinel is immune both ways: a recycled number refers to a different
+    /// object, which is itself proof that the latch let go of it.
+    ///
+    /// Peer EOF cannot stand in for this: `stop()` shuts the socket down *before* deferring the
+    /// close, and a shut-down peer already reads 0, so EOF cannot tell the two states apart.
     @Test("A stop during an outstanding claim defers the close to the claim holder")
     func stopDefersCloseWhileClaimed() throws {
         let (writable, unread) = try makeStalledSocketPair()
         defer { Darwin.close(unread) }
+        // A second reference keeps the socket object itself alive once the latch drops its own,
+        // so the comparisons below stay answerable after the close.
+        let sentinel = dup(writable)
+        try #require(sentinel >= 0)
+        defer { Darwin.close(sentinel) }
+        let adoptedSocket = try #require(socketIdentity(of: sentinel))
 
         let latch = SocketReadLatch()
         latch.adopt(descriptor: writable)
@@ -238,11 +273,18 @@ struct TransportBackpressureTests {
 
         latch.stop()
         #expect(latch.isStopped)
-        // Still open: the claim holder has not finished, so the number cannot be recycled yet.
-        #expect(fcntl(writable, F_GETFD) != -1)
+        // Still the adopted socket: the claim holder has not finished, so the latch may not have
+        // closed it and the number cannot have been recycled.
+        #expect(
+            socketIdentity(of: writable) == adoptedSocket,
+            "a stop during an outstanding claim must not close the descriptor"
+        )
 
         latch.endIO()
-        #expect(fcntl(writable, F_GETFD) == -1, "the last claim release must perform the close")
+        #expect(
+            socketIdentity(of: writable) != adoptedSocket,
+            "the last claim release must perform the close"
+        )
         #expect(latch.beginIO() == nil, "a stopped latch hands out no further claims")
     }
 }

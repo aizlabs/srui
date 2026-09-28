@@ -110,6 +110,44 @@ exit 0
 SH
 chmod +x "$sandbox/bin/script-silent"
 
+# A faithful util-linux `script(1)`: `script [options] [file]`, command *only* through `-c`, and a
+# trailing positional command rejected as bad usage. Linux is where the wrapper's BSD spelling used
+# to die before the runner ever started, and a macOS CI runner has no util-linux to catch it - so
+# the dialect is emulated here rather than left to whoever next runs the suite on Linux.
+cat >"$sandbox/bin/script-utillinux" <<'SH'
+#!/bin/sh
+command=""
+file=""
+return_child_status=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        --version) echo "script from util-linux 2.38.1"; exit 0 ;;
+        -e) return_child_status=1; shift ;;
+        -c) command=$2; shift 2 ;;
+        -q|-a|-f) shift ;;
+        -*) shift ;;
+        *)
+            if [ -z "$file" ]; then
+                file=$1; shift
+            else
+                # This is the BSD spelling. util-linux does not accept it.
+                echo "script: bad usage: unexpected argument '$1'" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+if [ -z "$command" ] || [ -z "$file" ]; then
+    echo "script: bad usage" >&2
+    exit 1
+fi
+/bin/sh -c "$command" >"$file" 2>&1
+child=$?
+[ "$return_child_status" -eq 1 ] && exit "$child"
+exit 0
+SH
+chmod +x "$sandbox/bin/script-utillinux"
+
 # Installs one of the stand-ins as `script`; `real` restores the system one.
 use_script() {
     rm -f "$sandbox/bin/script"
@@ -192,6 +230,17 @@ use_script real
 run_wrapper truncated 0
 assert_nonzero_status $? "wrapper refused a run that left tests unreported"
 assert_output_contains "MISSING RESULT" "wrapper named the unreported tests"
+
+echo "case 6: the util-linux script(1) dialect runs the same accounting"
+use_script utillinux
+run_wrapper complete-pass 0
+assert_status $? 0 "wrapper exited 0 under util-linux script"
+assert_output_contains "run accounting: 2 test(s) started, 3 reported." "accounting survived the -c invocation"
+
+echo "case 7: util-linux reports a failing run through -e, not through the typescript"
+use_script utillinux
+run_wrapper complete-fail 1
+assert_nonzero_status $? "wrapper reported the failing run under util-linux script"
 
 echo
 if [ "$failures" -eq 0 ]; then

@@ -50,9 +50,26 @@ sampler_pid=$!
 # one thing this script must never produce by accident: the accounting below deliberately counts a
 # *failing* test as reported, so if `status` were 0 for a run whose tests failed, every check here
 # would pass and CI would call the run green.
-SRUI_RUN_STATUS_FILE="$runner_status_file" script -q "$log" \
-    /bin/bash -c 'scripts/run-swift-tests.sh "$@"; echo "$?" >"$SRUI_RUN_STATUS_FILE"' \
-    srui-run "$@" >/dev/null 2>&1
+# `script(1)` has two incompatible dialects, and this repository is developed on both. BSD (macOS)
+# takes the command as trailing positional words - `script [-q] file command [args...]` - and has
+# no `-c` at all. util-linux takes `script [options] [file]` and rejects that trailing command
+# outright, so the BSD spelling fails before the runner ever starts. Pick by asking the binary
+# which one it is, and hand util-linux the command through `-c` as a single string; `-e` makes its
+# exit status the child's, which BSD does unconditionally.
+run_command='scripts/run-swift-tests.sh'
+for arg in "$@"; do
+    run_command+=" $(printf '%q' "$arg")"
+done
+run_command+='; echo "$?" >"$SRUI_RUN_STATUS_FILE"'
+
+export SRUI_RUN_STATUS_FILE="$runner_status_file"
+if script --version 2>/dev/null | grep -qi util-linux; then
+    # Invoke bash explicitly: util-linux runs `-c` through `$SHELL`, and the quoting above is
+    # bash's own.
+    script -q -e -c "/bin/bash -c $(printf '%q' "$run_command")" "$log" >/dev/null 2>&1
+else
+    script -q "$log" /bin/bash -c "$run_command" >/dev/null 2>&1
+fi
 script_status=$?
 
 status=$(LC_ALL=C tr -dc '0-9' <"$runner_status_file")

@@ -124,6 +124,34 @@ SH
     disown "$spawned_pid" 2>/dev/null
 }
 
+# A controlled `lsof`, because the reaper's decisions are only as portable as its evidence.
+#
+# `reap-test-servers.sh` fails closed without a socket table: no inventory means rule 5 cannot be
+# enforced and *no* socket directory is removed. So on a host where `lsof` is missing or denied -
+# plenty of Linux containers - every "unreferenced directory was removed" case here asserts an
+# outcome the machine cannot produce. Measured on such a host: cases 4, 6 and 10 failed for that
+# reason alone, with the reaper working exactly as designed.
+#
+# The stand-in emulates the single invocation the reaper makes, `lsof -n -P -U -F pn`, and reads
+# its table from a file this test writes. Every entry staged below is true at the moment it is
+# staged: a real process really is holding that socket. Case 15 still exercises the real `lsof`
+# wherever the host has one, so the parser is not left untested.
+lsof_table="$sandbox/lsof-table"
+: >"$lsof_table"
+mkdir -p "$sandbox/lsofbin"
+cat >"$sandbox/lsofbin/lsof" <<'SH'
+#!/bin/sh
+# Only `-F pn` output is emulated; the reaper asks for nothing else.
+[ -r "${SRUI_TEST_LSOF_TABLE:-}" ] || exit 1
+awk -F'\t' '$1 != "" { printf "p%s\nn%s\n", $1, $2 }' "$SRUI_TEST_LSOF_TABLE"
+SH
+chmod +x "$sandbox/lsofbin/lsof"
+
+# Record that `pid` holds `path`, the way the kernel's socket table would report it.
+socket_table_add() {
+    printf '%s\t%s\n' "$1" "$2" >>"$lsof_table"
+}
+
 # A marker whose parent never calls `wait`: the intermediate shell `exec`s into `sleep`, so it
 # keeps the same pid and the marker keeps the same parent, and when the marker dies it stays in the
 # process table as a zombie instead of vanishing. That is exactly the state a killed orphan is left
@@ -176,7 +204,9 @@ SH
 run_reaper() {
     local pattern=$1 age=$2
     shift 2
-    SRUI_REAP_PATTERN="$pattern" \
+    PATH="$sandbox/lsofbin:$PATH" \
+        SRUI_TEST_LSOF_TABLE="$lsof_table" \
+        SRUI_REAP_PATTERN="$pattern" \
         SRUI_REAP_AGE_MINUTES="$age" \
         SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
         bash "$reaper" "$@"
@@ -262,6 +292,7 @@ mkdir -p "$referenced" "$unreferenced"
 spawn_socket_holder "$referenced/sessiond.sock"
 holder=$spawned_pid
 sleep 0.3
+socket_table_add "$holder" "$referenced/sessiond.sock"
 run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null
 assert_dir_present "$referenced" "directory named by a live --socket argument was kept"
 assert_dir_absent "$unreferenced" "unreferenced directory was removed"
@@ -350,6 +381,9 @@ done
 if [ ! -S "$bound_dir/s" ]; then
     fail "could not bind a unix socket for the in-process case"
 else
+    # The whole point of the case: this pairing exists *only* in the socket table. Nothing on the
+    # binder's command line mentions the path.
+    socket_table_add "$binder" "$bound_dir/s"
     run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null
     assert_dir_present "$bound_dir" "directory holding a live, unnamed bound socket was kept"
 fi
@@ -362,13 +396,25 @@ sibling_dir="$runtime_root/srui-fixture-leftover"
 mkdir -p "$default_dir" "$sibling_dir"
 # TMPDIR is what the servers resolve their default socket path against on macOS; the sweep is
 # pointed at that root so the guard is exercised without touching the real /tmp.
-SRUI_REAP_PATTERN='NEVER_MATCHES_ANY_EXECUTABLE' \
+# A third directory, genuinely held, so the sweep has socket evidence to act on at all: without it
+# the reaper would keep the sibling too, and the case would pass for the wrong reason.
+held_dir="$runtime_root/srui-held"
+mkdir -p "$held_dir"
+spawn_socket_holder "$held_dir/s"
+held_holder=$spawned_pid
+sleep 0.3
+socket_table_add "$held_holder" "$held_dir/s"
+PATH="$sandbox/lsofbin:$PATH" \
+    SRUI_TEST_LSOF_TABLE="$lsof_table" \
+    SRUI_REAP_PATTERN='NEVER_MATCHES_ANY_EXECUTABLE' \
     SRUI_REAP_AGE_MINUTES=0 \
     SRUI_REAP_TMP_GLOBS="$runtime_root/srui-*" \
     TMPDIR="$runtime_root" \
     bash "$reaper" >/dev/null 2>&1
 assert_dir_present "$default_dir" "the default runtime directory survived a zero-age sweep"
+assert_dir_present "$held_dir" "a directory whose socket is held survived it"
 assert_dir_absent "$sibling_dir" "an unreferenced sibling directory was still removed"
+kill -9 "${held_holder:-0}" 2>/dev/null
 
 echo "case 11: an orphaned process serving the default runtime socket is never killed"
 # The shape of a `srui-sessiond` a human detached on purpose: ppid 1, old enough, argv[0] matching
@@ -393,7 +439,13 @@ else
         fail "could not stage a server bound to the default runtime socket"
     else
         spawned_pids+=("$listener_pid")
-        output=$(SRUI_REAP_PATTERN="$(marker_pattern "$listener")" \
+        # Rule 5's actual input: the daemon is protected because the socket table shows it holding
+        # a socket in a default runtime directory. Without this entry the sweep would still spare
+        # it - but through the no-evidence gate, which is case 14's subject, not this one's.
+        socket_table_add "$listener_pid" "$default_socket_dir/s"
+        output=$(PATH="$sandbox/lsofbin:$PATH" \
+            SRUI_TEST_LSOF_TABLE="$lsof_table" \
+            SRUI_REAP_PATTERN="$(marker_pattern "$listener")" \
             SRUI_REAP_AGE_MINUTES=0 \
             SRUI_REAP_TMP_GLOBS="$default_root/srui-*" \
             TMPDIR="$default_root" \
@@ -488,6 +540,52 @@ else
     assert_contains "$output" "nothing to protect" "the sweep said why it proceeded"
 fi
 kill -9 "${pid:-0}" 2>/dev/null
+
+echo "case 15: the host's own lsof, where it has one, yields the same decision"
+# Every case above drives a stand-in, which tests the reaper's *logic* but not its reading of real
+# `lsof -F pn` output. This case closes that gap wherever the host can: a real holder, the real
+# binary, no stand-in on PATH. It is skipped - loudly, never silently - where `lsof` is absent or
+# denied, which is precisely the environment the stand-in exists for.
+real_lsof_dir="$sandbox/tmp/srui-real"
+mkdir -p "$real_lsof_dir"
+if ! command -v lsof >/dev/null 2>&1; then
+    echo "  skipped: no lsof on this host (the stand-in above covered the logic)"
+else
+    # A *bound* socket, not merely a path on a command line: `spawn_socket_holder` names its path
+    # in argv and binds nothing, so the kernel's table would never mention it and this case would
+    # skip itself for the wrong reason.
+    cat >"$sandbox/bin/real-binder.py" <<PY
+import socket, time
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.bind("$real_lsof_dir/s")
+sock.listen(1)
+time.sleep(600)
+PY
+    python3 "$sandbox/bin/real-binder.py" >/dev/null 2>&1 &
+    real_holder=$!
+    spawned_pids+=("$real_holder")
+    disown "$real_holder" 2>/dev/null
+    for _ in $(seq 1 50); do
+        [ -S "$real_lsof_dir/s" ] && break
+        sleep 0.1
+    done
+    # Captured and matched with `case`, never `lsof | grep -q`: under `set -o pipefail` that
+    # pipeline reports 141 when grep exits early on a match and lsof dies of SIGPIPE, so the case
+    # would skip itself exactly when the socket *was* found. Measured here before this form.
+    real_holders=$(lsof -n -P -U -F pn 2>/dev/null)
+    if ! case $real_holders in *"$real_lsof_dir/s"*) true ;; *) false ;; esac; then
+        echo "  skipped: lsof is present but reports no unix sockets here (denied, or sandboxed)"
+    else
+        # No stand-in and no table: the reaper reads the kernel's table through the real binary.
+        SRUI_REAP_PATTERN='NEVER_MATCHES_ANY_EXECUTABLE' \
+            SRUI_REAP_AGE_MINUTES=0 \
+            SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-real*" \
+            bash "$reaper" >/dev/null 2>&1
+        assert_dir_present "$real_lsof_dir" "real lsof output kept the directory of a held socket"
+    fi
+    kill -9 "${real_holder:-0}" 2>/dev/null
+fi
 
 echo
 if [ "$failures" -eq 0 ]; then

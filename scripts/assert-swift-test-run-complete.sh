@@ -63,7 +63,13 @@ done
 run_command+='; echo "$?" >"$SRUI_RUN_STATUS_FILE"'
 
 export SRUI_RUN_STATUS_FILE="$runner_status_file"
-if script --version 2>/dev/null | grep -qi util-linux; then
+# Captured, then matched without a pipe. Under `set -o pipefail` a `cmd | grep -q` reports 141:
+# `grep -q` exits on its first match and the producer dies of SIGPIPE, so the pipeline "fails"
+# precisely when the match succeeds - which would silently select the BSD spelling on Linux and
+# reintroduce the bug this detection exists to avoid. `tr` consumes all of its input, so it cannot
+# lose the same way.
+script_version=$(script --version 2>/dev/null | tr '[:upper:]' '[:lower:]')
+if case $script_version in *util-linux*) true ;; *) false ;; esac; then
     # Invoke bash explicitly: util-linux runs `-c` through `$SHELL`, and the quoting above is
     # bash's own.
     script -q -e -c "/bin/bash -c $(printf '%q' "$run_command")" "$log" >/dev/null 2>&1

@@ -50,7 +50,7 @@ struct CodingAgentFallbackSocketTests {
         controller.attachRenderer(renderer)
         try await controller.start()
         try await Self.waitForRevision(applier, expected: Revision(3))
-        try await AsyncTestSupport.eventually(description: "coding-agent snapshot rendered") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "coding-agent snapshot rendered") {
             renderer.registry.handle(for: NodeId(18)) != nil
         }
         // The catch-up snapshot mounts the native tree *before* the session releases the snapshot
@@ -177,7 +177,7 @@ struct CodingAgentFallbackSocketTests {
         )
         _ = try await semanticApprove.activate()
         try await Self.waitForRevision(applier, expected: Revision(4))
-        try await AsyncTestSupport.eventually(description: "approval rendered") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "approval rendered") {
             let conversation = (renderer.registry.view(for: NodeId(9)) as? NSScrollView)?
                 .documentView as? NSTextView
             return conversation?.string.contains("approved") == true

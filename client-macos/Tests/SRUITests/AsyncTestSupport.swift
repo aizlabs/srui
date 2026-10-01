@@ -6,6 +6,27 @@ struct AsyncTestTimeout: Error, CustomStringConvertible {
     let description: String
 }
 
+extension Duration {
+    /// Budget for an `AsyncTestSupport.eventually` condition that spans a full transport round
+    /// trip: a frame pushed into a `PipeTransport`/unix socket/SSH subsystem, read back by the
+    /// session's reader task, negotiated, applied on the `TransactionApplier`, and rendered on the
+    /// main actor.
+    ///
+    /// The helper's 2-second default stays as it is on purpose — a short default is what keeps a
+    /// genuinely hung condition from spending the whole suite's time budget — but it is not enough
+    /// for a multi-step round trip on a loaded 3-core CI runner. Observed on GitHub's hosted
+    /// runner: `SessionControllerTerminalTests` "A recreated process cold-resumes Terminal after
+    /// authoritative negotiation" failed with `Timed out waiting for cold Terminal replay mounted`
+    /// while passing locally and on a rerun of the identical tree, i.e. the deadline expired, not
+    /// the product.
+    ///
+    /// A deadline is only an upper bound: on a healthy run every one of these conditions is met in
+    /// milliseconds and nothing here is ever asserted against, so raising it costs no wall time and
+    /// weakens no assertion. `.seconds(10)` matches what the live SSH and socket integration suites
+    /// in this target already use for the same shape.
+    static let roundTrip = Duration.seconds(10)
+}
+
 enum AsyncTestSupport {
     @MainActor
     static func eventually(

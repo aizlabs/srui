@@ -729,6 +729,7 @@ private final class SemanticInspectionHarness {
             try await pair.server.send(data: try SRUIFraming.encodeFramed(mount))
 
             try await AsyncTestSupport.eventually(
+                timeout: .roundTrip,
                 description: "semantic inspection fixture mounted"
             ) {
                 applier.lastAppliedRevision == Revision(1)
@@ -775,7 +776,7 @@ private final class SemanticInspectionHarness {
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(message))
 
-        try await AsyncTestSupport.eventually(description: "Approve button relabeled") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "Approve button relabeled") {
             applier.lastAppliedRevision == Revision(2)
                 && (renderer.registry.view(for: SemanticInspectionFixture.approveID) as? NSButton)?
                     .title == label
@@ -793,7 +794,7 @@ private final class SemanticInspectionHarness {
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(message))
 
-        try await AsyncTestSupport.eventually(description: "Approve button deleted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "Approve button deleted") {
             applier.lastAppliedRevision == Revision(2)
                 && renderer.registry.handle(for: SemanticInspectionFixture.approveID) == nil
         }
@@ -814,7 +815,7 @@ private final class SemanticInspectionHarness {
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(message))
 
-        try await AsyncTestSupport.eventually(description: "Approve button disabled") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "Approve button disabled") {
             applier.lastAppliedRevision == Revision(2)
                 && (renderer.registry.view(for: SemanticInspectionFixture.approveID) as? NSButton)?
                     .isEnabled == false

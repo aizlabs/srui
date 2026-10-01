@@ -132,7 +132,7 @@ struct CollectionRangeSocketIntegrationTests {
             atLeast: Revision(revisionBeforeRequest.value + 1),
             timeoutSeconds: 8
         )
-        try await AsyncTestSupport.eventually(description: "delayed range painted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "delayed range painted") {
             adapter.rowContent(at: 10_000)?.cells.last == "Row 10000"
         }
         #expect(adapter.rowContent(at: 10_000)?.itemID == ItemId(10_001))

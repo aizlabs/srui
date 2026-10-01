@@ -250,6 +250,7 @@ struct SessionRobustnessTests {
         try await serverTransport.send(data: try Self.framed(mountTx))
         #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "revision 1 button render completes"
         ) {
             renderer.registry.handle(for: buttonID) != nil

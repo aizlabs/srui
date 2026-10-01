@@ -122,6 +122,7 @@ struct CounterSocketIntegrationTests {
         let textID = NodeId(2)
         let buttonID = NodeId(4)
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "initial counter render reaches Count: 0"
         ) {
             guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
@@ -138,6 +139,7 @@ struct CounterSocketIntegrationTests {
                 timeoutSeconds: 5
             )
             try await AsyncTestSupport.eventually(
+                timeout: .roundTrip,
                 description: "counter render reaches Count: \(cycle)"
             ) {
                 guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
@@ -210,7 +212,7 @@ struct CounterSocketIntegrationTests {
 
         try await controller.start()
         try await Self.waitForRevision(applier, expected: Revision(1), timeoutSeconds: 5)
-        try await AsyncTestSupport.eventually(description: "HELLO catch-up enables event dispatch") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "HELLO catch-up enables event dispatch") {
             controller.isEventDispatchEnabled
         }
 
@@ -220,6 +222,7 @@ struct CounterSocketIntegrationTests {
         _ = try await controller.sendActivate(nodeId: buttonID)
         try await Self.waitForRevision(applier, expected: Revision(2), timeoutSeconds: 5)
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "HELLO catch-up counter render reaches Count: 1"
         ) {
             guard let field = renderer.registry.handle(for: textID)?.view as? NSTextField else {
@@ -295,7 +298,7 @@ struct CounterSocketIntegrationTests {
 
         try await controller.start()
 
-        try await AsyncTestSupport.eventually(description: "handshake failure on profile mismatch against live server") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake failure on profile mismatch against live server") {
             controller.isDiverged && (failurePromise.load() != nil || !controller.isHandshakeComplete)
         }
         #expect(!controller.isHandshakeComplete)
@@ -374,7 +377,7 @@ struct CounterSocketIntegrationTests {
             in: resourceCache,
             timeoutSeconds: 10
         )
-        try await AsyncTestSupport.eventually(description: "renderer retains committed image") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "renderer retains committed image") {
             renderer.resolveResourceImage(pendingHash) != nil
         }
 
@@ -473,7 +476,7 @@ struct CounterSocketIntegrationTests {
         if let button = renderer.registry.allHandles.first(where: { $0.nodeType == .button }) {
             let before = applier.lastAppliedRevision
             _ = try await controller.sendActivate(nodeId: button.nodeID)
-            try await AsyncTestSupport.eventually(description: "post-corruption activate advances revision") {
+            try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "post-corruption activate advances revision") {
                 applier.lastAppliedRevision > before
             }
         }

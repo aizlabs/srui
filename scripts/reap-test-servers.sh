@@ -134,7 +134,9 @@ fi
 age_seconds=$((age_minutes * 60))
 
 pattern=${SRUI_REAP_PATTERN:-'/target/debug/(counter|srui-sessiond|coding-agent-demo|srtop)$'}
-tmp_globs=${SRUI_REAP_TMP_GLOBS:-'/tmp/srui-* /tmp/px0* /tmp/srtop-*'}
+# `/tmp/px0*` used to be the Process Explorer pattern; it also matches an unrelated `/tmp/px0-cache`.
+# The fixtures name their directories `px0NN-...`, so the ticket digits are spelled out.
+tmp_globs=${SRUI_REAP_TMP_GLOBS:-'/tmp/srui-* /tmp/px0[0-9][0-9]-* /tmp/srtop-*'}
 my_uid=$(id -u)
 failures=0
 
@@ -506,6 +508,25 @@ if [ "$socket_evidence" -eq 0 ]; then
 fi
 referenced=$(printf '%s\n%s\n' "$referenced" "$held_sockets")
 
+# Does this directory hold a server's sockets and nothing else?
+#
+# A name match is not ownership. `/tmp/srui-notes` or `/tmp/px0-cache` can be a developer's own
+# directory that is old, unreferenced, and - before this check - recursively deleted by a sweep that
+# runs automatically before tests. What the sweep is actually for is reclaiming the runtime
+# directories of leaked fixture servers, and those contain unix sockets and nothing else. An empty
+# directory qualifies too - a server that created its runtime directory and died before binding
+# leaves exactly that. Any regular file, subdirectory or symlink means the directory is somebody
+# else's and is left alone.
+#
+# Note for anyone extending this: the coding-agent demo's leftovers in /tmp are `*.sock.lock`
+# *files*, not directories (76 of them on the machine this was written on), so the sweep has never
+# considered them at all. Collecting those would need its own rule, with its own evidence.
+socket_only_directory() {
+    local dir=$1
+    [ -O "$dir" ] || return 1 # not ours to delete
+    [ -z "$(find "$dir" -mindepth 1 -maxdepth 1 ! -type s -print -quit 2>/dev/null)" ]
+}
+
 # shellcheck disable=SC2086 # deliberate word splitting: tmp_globs is a list of globs
 set -- $tmp_globs
 candidates=()
@@ -520,9 +541,15 @@ removed=0
 removed_kb=0
 held=0
 fresh=0
+unverified=0
 for dir in "${candidates[@]+"${candidates[@]}"}"; do
     if [ "$socket_evidence" -eq 0 ]; then
         held=$((held + 1))
+        continue
+    fi
+    # Evidence before `rm -rf`, never a name match alone.
+    if ! socket_only_directory "$dir"; then
+        unverified=$((unverified + 1))
         continue
     fi
     # The default runtime directory belongs to whatever daemon a human started, never to a test.
@@ -568,10 +595,10 @@ if [ "$dry_run" -eq 1 ]; then
     verb_killed="would kill"
     verb_removed="would remove"
 fi
-printf 'reap-test-servers: %s %d fixture server(s), %s %d socket director(y|ies) (%d.%d MB); left %d fixture process(es) with a live parent or too young, %d outside this repository, %d replaced before signalling, %d referenced director(y|ies), %d recently touched.\n' \
+printf 'reap-test-servers: %s %d fixture server(s), %s %d socket director(y|ies) (%d.%d MB); left %d fixture process(es) with a live parent or too young, %d outside this repository, %d replaced before signalling, %d referenced director(y|ies), %d not socket director(y|ies), %d recently touched.\n' \
     "$verb_killed" "$killed" "$verb_removed" "$removed" \
     "$((removed_kb / 1024))" "$(((removed_kb % 1024) * 10 / 1024))" \
-    "$spared" "$foreign" "$replaced" "$held" "$fresh"
+    "$spared" "$foreign" "$replaced" "$held" "$unverified" "$fresh"
 
 if [ "$failures" -gt 0 ]; then
     echo "reap-test-servers: $failures failure(s)" >&2

@@ -541,6 +541,49 @@ else
 fi
 kill -9 "${pid:-0}" 2>/dev/null
 
+echo "case 20: only directories holding nothing but sockets are removed"
+# A name match is not ownership: a sweep runs automatically before tests, so anything matching the
+# glob and old enough used to be `rm -rf`'d - including a developer's own `/tmp/srui-notes` or
+# `/tmp/px0-cache`. The sweep is for the runtime directories of leaked servers, which hold sockets
+# and nothing else; an empty directory qualifies too, being what a server that died before binding
+# leaves behind.
+own_dir="$sandbox/tmp/srui-mine"
+sock_dir="$sandbox/tmp/srui-sockets"
+empty_dir="$sandbox/tmp/srui-empty"
+mkdir -p "$own_dir" "$sock_dir" "$empty_dir"
+printf 'notes a developer would miss\n' >"$own_dir/notes.txt"
+mkdir -p "$own_dir/subdir"
+python3 -c "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])" "$sock_dir/s" 2>/dev/null
+# One real holder so the sweep has socket evidence to act on at all.
+spawn_socket_holder "$sandbox/tmp/srui-held20/s"
+mkdir -p "$sandbox/tmp/srui-held20"
+holder20=$spawned_pid
+socket_table_add "$holder20" "$sandbox/tmp/srui-held20/s"
+if [ ! -S "$sock_dir/s" ]; then
+    echo "  skipped: could not bind a stale socket (path length?)"
+else
+    output=$(run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+    assert_dir_present "$own_dir" "a matching directory holding a developer's files was kept"
+    assert_dir_absent "$sock_dir" "a directory holding only a stale socket was removed"
+    assert_dir_absent "$empty_dir" "an empty runtime directory was removed"
+    assert_contains "$output" "1 not socket director" "the sweep accounted for the one it refused"
+fi
+kill -9 "${holder20:-0}" 2>/dev/null
+
+echo "case 21: the default glob no longer matches an unrelated px0 directory"
+# `/tmp/px0*` also matched `/tmp/px0-cache`; the fixtures use `px0NN-`.
+default_globs=$(awk -F"'" '/^tmp_globs=/ { print $2 }' "$reaper")
+matched_cache=no
+matched_fixture=no
+for pattern in $default_globs; do
+    case /tmp/px0-cache in $pattern) matched_cache=yes ;; esac
+    case /tmp/px001-shell in $pattern) matched_fixture=yes ;; esac
+done
+[ "$matched_cache" = no ] && pass "the default glob does not match /tmp/px0-cache" ||
+    fail "the default glob still matches /tmp/px0-cache"
+[ "$matched_fixture" = yes ] && pass "the default glob still matches /tmp/px001-shell" ||
+    fail "the default glob no longer matches the fixture prefix /tmp/px001-shell"
+
 echo "case 17: an absolute path that escapes the checkout through .. is never signalled"
 # `/…/repo/../elsewhere/target/debug/x` matches the `/…/repo/` prefix by spelling while resolving
 # into a sibling project. Launched that way, an unrelated project's daemon looked like this

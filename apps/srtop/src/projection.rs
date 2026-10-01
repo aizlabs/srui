@@ -1,8 +1,8 @@
 //! Server-side row projection and session-local item allocation
-//! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh).
-use crate::source::{
-    BootId, HostId, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot,
-};
+//! (§§6.2, 8; PX-002 rows, PX-003 process-instance keys, PX-004 refresh,
+//! PX-005 metric cells).
+use crate::metric;
+use crate::source::{BootId, HostId, Observed, PidNamespaceId, ProcessKey, ProcessSnapshot};
 use srui_sdk::{ItemId, Value};
 use srui_semantic_tree::ModelItem;
 use std::collections::{HashMap, HashSet};
@@ -168,10 +168,9 @@ impl SessionItemIds {
                 };
                 let pid = match key.pid {
                     Observed::Known(pid) => Value::UnsignedInt(u64::from(pid)),
-                    Observed::Missing(MissingReason::Unavailable) => {
-                        Value::String("Unavailable".into())
+                    Observed::Missing(reason) => {
+                        Value::String(metric::missing_text(reason).to_string())
                     }
-                    Observed::Missing(MissingReason::Denied) => Value::String("Denied".into()),
                 };
                 Ok(Row {
                     key,
@@ -179,6 +178,10 @@ impl SessionItemIds {
                     value: Value::List(vec![
                         pid,
                         Value::String(record.display_name.as_str().to_string()),
+                        // The one place a byte count becomes text: the stored
+                        // value stays an exact integer, and the client renders
+                        // what this produced rather than scaling a unit itself.
+                        Value::String(metric::bytes_cell(&record.resident)),
                     ]),
                 })
             })
@@ -189,7 +192,7 @@ impl SessionItemIds {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{CreationToken, FakeProcessSource, ProcessSource, SourceId};
+    use crate::source::{CreationToken, FakeProcessSource, MissingReason, ProcessSource, SourceId};
 
     /// One way a scan can answer for a global identity component.
     type KeyChange = fn(&mut ProcessKey);
@@ -370,15 +373,21 @@ mod tests {
         snapshot.records[0].key.pid = Observed::Known(0);
         snapshot.records[1].key.pid = Observed::Missing(MissingReason::Denied);
         let rows = SessionItemIds::default().project(&snapshot).unwrap();
+        // Every cell of a row states its own availability: this fixture's first
+        // record carries a known zero PID beside a readable metric, its second a
+        // denied PID beside a known-zero metric, and its third an unavailable PID
+        // beside a denied metric. No pair of them is the same state, and no
+        // unread value is published as a quantity.
         for (row, expected) in rows.iter().zip([
-            Value::UnsignedInt(0),
-            Value::String("Denied".into()),
-            Value::String("Unavailable".into()),
+            (Value::UnsignedInt(0), "1.1 MiB"),
+            (Value::String("Denied".into()), "0 B"),
+            (Value::String("Unavailable".into()), "Denied"),
         ]) {
             let Value::List(cells) = &row.value else {
                 panic!("expected table cells")
             };
-            assert_eq!(cells[0], expected);
+            assert_eq!(cells[0], expected.0);
+            assert_eq!(cells[2], Value::String(expected.1.into()));
         }
     }
 

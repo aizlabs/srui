@@ -55,12 +55,19 @@ struct ProcessExplorerShellTests {
         #expect(status.stringValue == (fakeSource ? "Read-only · Fake process snapshot" : "Read-only · Process collection not started"))
         #expect(status.isEditable == false)
         #expect(table.numberOfRows == (fakeSource ? 3 : 0))
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident"])
         #expect(tableHandle.actionTrampoline == nil)
         if fakeSource {
-            let expected = [["4101", "worker"], ["4102", "worker"], ["Unavailable", "helper"]]
+            // PX-005: the server published the unit, so the generic client shows
+            // it verbatim — a truncated value, a known zero, and a metric this
+            // fixture's scan was denied, each distinct in the native cell.
+            let expected = [
+                ["4101", "worker", "1.1 MiB"],
+                ["4102", "worker", "0 B"],
+                ["Unavailable", "helper", "Denied"],
+            ]
             for row in 0..<3 {
-                for column in 0..<2 {
+                for column in 0..<3 {
                     let cell = try #require(table.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTextField)
                     #expect(cell.stringValue == expected[row][column])
                 }
@@ -83,7 +90,7 @@ struct ProcessExplorerShellTests {
         #expect(window.isVisible)
         #expect(table.numberOfRows == (fakeSource ? 3 : 0))
         try await Self.capture(window: window, name: fakeSource ? "fake-updated" : "updated")
-        print("PX-001/PX-002 native SSH evidence: fakeSource=\(fakeSource); revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading and Table handles retained; PID/Name columns; rows=\(table.numberOfRows).")
+        print("PX-001/PX-002/PX-005 native SSH evidence: fakeSource=\(fakeSource); revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading and Table handles retained; PID/Name/Resident columns; rows=\(table.numberOfRows); cells=\(Self.nativeRows(table)).")
         await controller.stop()
     }
 
@@ -207,7 +214,7 @@ struct ProcessExplorerShellTests {
         #expect(renderer.registry.handle(for: NodeId(4))?.view as? NSTextField === statusField)
         #expect(window.windowNumber == windowNumber)
         #expect(window.isVisible)
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident"])
         #expect(tableHandle.actionTrampoline == nil)
         try await Self.capture(window: window, name: "sequence-settled")
         let elapsed = stamps.isEmpty ? Duration.zero : stamps[stamps.count - 1]
@@ -227,8 +234,18 @@ struct ProcessExplorerShellTests {
         let itemIDs: [UInt64]
     }
 
-    private static let initialRows = [["4101", "worker"], ["4102", "worker"], ["4103", "helper"]]
-    private static let settledRows = [["4101", "worker"], ["4103", "helper-tool"], ["4104", "builder"]]
+    // PX-005: every scripted row carries its resident cell, fixed per process so
+    // that a repeated snapshot stays byte-identical and still publishes nothing.
+    private static let initialRows = [
+        ["4101", "worker", "2.0 MiB"],
+        ["4102", "worker", "1023 B"],
+        ["4103", "helper", "Unavailable"],
+    ]
+    private static let settledRows = [
+        ["4101", "worker", "2.0 MiB"],
+        ["4103", "helper-tool", "Unavailable"],
+        ["4104", "builder", "5.0 GiB"],
+    ]
     private static let normalStatus = "Read-only · Fake process sequence"
     private static let retainedRowsMarker = "retained from an earlier scan"
 

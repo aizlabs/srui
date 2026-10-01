@@ -74,6 +74,20 @@ jobs:
         run: |
           echo "::warning::Codex review gate bypassed by explicit workflow_dispatch input."
 
+      # The verdict step runs a repository script, so this job needs the repository - and it must be
+      # the *base* revision, never the pull request's head. For a fork pull request GitHub takes the
+      # workflow file from the base branch while the head is the contributor's code, so checking out
+      # the head here would let a pull request rewrite the very script that decides whether it was
+      # reviewed. The script's answer depends only on the GitHub API, so the base revision is both
+      # the safe choice and the correct one. `github.ref` covers `workflow_dispatch`, where there is
+      # no pull request payload.
+      - name: Check out the gate's own scripts from the base revision
+        if: steps.pr.outputs.number != '' && !inputs.skip_review_gate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.ref }}
+          persist-credentials: false
+
       # CI and the Codex review start independently on `opened` and `ready_for_review`. Querying
       # threads immediately would find none and pass, letting every expensive job run against code
       # a review is about to flag. Waiting for a verdict on *this* head closes that race.

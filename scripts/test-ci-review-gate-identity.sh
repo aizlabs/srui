@@ -43,6 +43,23 @@ grep -q '== "chatgpt-codex-connector"' "$workflow" ||
 grep -q '__typename == "Bot"' "$workflow" ||
     fail "the GraphQL thread matcher does not require a Bot author"
 
+# 3b. The gate script must be checked out before it is invoked, from the base revision.
+#     Extracting the logic into a script broke the gate once: the review-gate job had no
+#     `actions/checkout`, so on a fresh runner the script did not exist, every clean verdict polled
+#     for fifteen minutes and then failed closed - unmergeable without the explicit bypass. And the
+#     checkout must pin the *base* revision: for a fork pull request the workflow comes from the base
+#     branch while the head is the contributor's code, so checking out the head would let a pull
+#     request rewrite the script that judges it.
+checkout_line=$(grep -n 'pull_request.base.sha' "$workflow" | head -1 | cut -d: -f1)
+verdict_line=$(grep -n 'ci-accept-codex-verdict.sh' "$workflow" | head -1 | cut -d: -f1)
+if [ -z "$checkout_line" ]; then
+    fail "the review gate invokes a script without checking out the repository at the base revision"
+elif [ -z "$verdict_line" ]; then
+    fail "$workflow no longer invokes scripts/ci-accept-codex-verdict.sh"
+elif [ "$checkout_line" -ge "$verdict_line" ]; then
+    fail "the gate's checkout (line $checkout_line) comes after it runs the script (line $verdict_line)"
+fi
+
 # 4. Behavioural check: a byte-identical verdict from a look-alike login must not count, and the
 #    genuine one still must. Both run through the same jq program the workflow uses.
 work=$(mktemp -d)

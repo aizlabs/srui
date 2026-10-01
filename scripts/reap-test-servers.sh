@@ -196,31 +196,41 @@ process_terminated() {
     esac
 }
 
-# A pid's absolute start time *now*: the one property that distinguishes a process from a later one
-# that inherited its number. Empty when the pid is gone.
+# Why any of the identity machinery below exists: selection and signalling are not simultaneous. Each
+# candidate can occupy the kill loop for up to 2.2s (SIGTERM, twenty 0.1s liveness polls, SIGKILL,
+# 0.2s), so with several candidates a *later* one has seconds in which to exit on its own and have its
+# number handed to an unrelated process of this same user - which an unconditional kill would signal,
+# and the escalation would SIGKILL. Every signal is therefore gated on what selected the candidate.
 #
-# This matters because selection and signalling are not simultaneous. Each candidate can occupy the
-# kill loop for up to 2.2s (SIGTERM, twenty 0.1s liveness polls, SIGKILL, 0.2s), so with several
-# candidates a *later* one has seconds in which to exit on its own and have its number handed to an
-# unrelated process of this same user - which the unconditional kill would then signal, and the
-# escalation below would SIGKILL. Every signal is therefore gated on the identity recorded at
-# selection time.
+# `lstart` is the only start time `ps` will say on both platforms, and it is printed in whole seconds
+# (procps-ng included). A single coarse value is not an identity: a pid reused by another process of
+# this user *within the same second* presents the recorded one. So the comparison is not one value,
+# see `still_the_selected_process`.
+
+# A pid's start time in clock ticks since boot, where the platform will say it: field 22 of
+# `/proc/<pid>/stat`, which is immutable and has 100 ticks to `lstart`'s one second on a default
+# Linux. Empty where there is no /proc (macOS), where the pid is gone, or where the line is not the
+# shape this expects - and no tick evidence is one guard fewer, never licence to signal. The callers
+# spell "none" as `-`, because these values travel through tab-separated records that `read` would
+# collapse around an empty field.
 #
-# Used only for those pre-signal re-checks, never to record the identity: reading it here would be a
-# second observation, and a pid recycled between the selecting snapshot and that read would have the
-# *replacement's* start time recorded as the selected identity - after which every later check
-# agrees, and the reaper SIGTERMs (then SIGKILLs) an unrelated process. The recorded identity comes
-# from `process_snapshot`, and the value built there is byte-identical to this one: five tokens
-# joined by single spaces, which is what squeezing the whitespace out of `ps -o lstart=` produces.
-process_start() {
-    ps -o lstart= -p "$1" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
+# Parsed from the last `)` and never by counting whitespace from the left: field 2 is `comm`, in
+# parentheses, and a process is free to put spaces and parentheses in its own name (`(sd-pam)`,
+# `Google Chrome`), which shifts every field after it. Nothing from `state` onwards contains a paren,
+# so the last `) ` in the line always ends `comm`.
+start_ticks_from_stat_line() {
+    local line=$1 rest
+    case $line in *') '*) ;; *) return 0 ;; esac
+    rest=${line##*') '}
+    # After `comm` the fields are state(3), ppid(4), ...; starttime(22) is the 20th of them.
+    printf '%s' "$rest" | awk '{ if (NF >= 20 && $20 ~ /^[0-9]+$/) printf "%s", $20 }'
 }
 
-# True when `pid` is still the process selected, identified by its start time.
-still_the_selected_process() {
-    local pid=$1 recorded=$2 current
-    current=$(process_start "$pid")
-    [ -n "$current" ] && [ "$current" = "$recorded" ]
+process_start_ticks() {
+    local line
+    [ -r "/proc/$1/stat" ] || return 0
+    IFS= read -r line <"/proc/$1/stat" 2>/dev/null || return 0
+    start_ticks_from_stat_line "$line"
 }
 
 # The checkouts of this repository, as physical paths: the main one plus every linked worktree, with
@@ -302,8 +312,10 @@ AWK_COMMAND_LINE='
 # narrows to argv[0] alone (see `command_argv0`). A prefix test cannot miss a matching argv[0],
 # because argv[0] is itself one of the prefixes.
 #
-# The start time is read out of the very snapshot that selects the pid, so no window exists in which
-# the number could be reissued before its identity is recorded; see `process_start`.
+# The `lstart` is read out of the very snapshot that selects the pid, so no window exists in which the
+# number could be reissued before that value is recorded. The start tick `rule4_candidates` adds
+# beside it *is* a second read, and is safe for a different reason: it is one more condition a signal
+# has to satisfy, so a tick belonging to a replacement can only ever hold a signal back.
 select_pattern_candidates() {
     awk -v pattern="$pattern" -v my_uid="$my_uid" -v self="$$" "$AWK_COMMAND_LINE"'
         function age_seconds(e,   days, part, n, secs, split_day) {
@@ -331,6 +343,62 @@ select_pattern_candidates() {
             print $1 "\t" $2 "\t" age_seconds($4) "\t" $5 " " $6 " " $7 " " $8 " " $9 "\t" cmd
         }
     '
+}
+
+# pid<TAB>ppid<TAB>age in seconds<TAB>lstart<TAB>start ticks<TAB>argv[0], for every process in a
+# snapshot that is ours and whose argv[0] matches the pattern: rules 3 and 4, and the whole identity
+# of each candidate. argv[0] stays last because it can contain spaces; nothing here can contain a tab.
+#
+# Called twice with different snapshots - the process table, and a single `ps` row read immediately
+# before a signal - so the pre-signal check cannot drift from the rules that selected the candidate:
+# it *is* those rules, run again on a fresh observation.
+rule4_candidates() {
+    local snap=$1 resolved= pid ppid age start ticks cmd
+    while IFS=$'\t' read -r pid ppid age start cmd; do
+        [ -n "${pid:-}" ] || continue
+        ticks=$(process_start_ticks "$pid")
+        resolved="${resolved}${pid}"$'\t'"${ppid}"$'\t'"${age}"$'\t'"${start}"$'\t'"${ticks:--}"$'\t'"$(command_argv0 "$cmd")"$'\n'
+    done <<<"$(printf '%s\n' "$snap" | select_pattern_candidates)"
+    # Rule 4 proper, back in awk: the pattern is an environment variable, and awk is the engine that
+    # pre-filtered with it, so letting a second tool decide would mean two regex dialects (awk
+    # processes escape sequences in a `-v` assignment; grep does not) and a pattern that selects
+    # under one and not the other.
+    printf '%s' "$resolved" | awk -F'\t' -v pattern="$pattern" 'NF >= 6 && $6 ~ pattern'
+}
+
+# True when `pid` still satisfies everything that selected it, re-derived from a fresh observation
+# rather than remembered: it is ours and not this shell (rule 3), orphaned (rule 1), still past the
+# age floor (rule 2), its argv[0] still matches the pattern and is still the same path (rule 4), that
+# path still resolves inside a checkout of this repository (rule 6), its `lstart` is still the one the
+# selecting snapshot recorded, and - where /proc could say so - its start tick is unchanged.
+#
+# Independent evidence, because `lstart` alone cannot separate a pid reused inside one second from the
+# process selected. A reused pid is a brand-new process, so the age floor excludes it outright
+# whenever `SRUI_REAP_AGE_MINUTES` is non-zero, which is what every real sweep runs with.
+#
+# What remains at `SRUI_REAP_AGE_MINUTES=0`, stated rather than implied: the window narrows to "a
+# process of this user, started in the same second as the one selected (the same 10ms tick where /proc
+# is readable), whose argv[0] matches the fixture pattern, is the identical path, and lies inside a
+# checkout of this repository". It does not close. Rule 5 is not re-derived either - that would mean a
+# fresh `lsof` per signal - so a replacement that bound a default runtime socket within the window is
+# judged by the other rules alone.
+still_the_selected_process() {
+    local pid=$1 lstart=$2 ticks=$3 exe=$4 row fresh f_pid f_ppid f_age f_start f_ticks f_exe
+    # The same columns, in the same order, as `process_snapshot`: one observation, parsed by the same
+    # code.
+    row=$(ps -o pid=,ppid=,uid=,etime=,lstart=,command= -p "$pid" 2>/dev/null)
+    [ -n "$row" ] || return 1
+    fresh=$(rule4_candidates "$row")
+    [ -n "$fresh" ] || return 1
+    IFS=$'\t' read -r f_pid f_ppid f_age f_start f_ticks f_exe <<<"$fresh"
+    [ "$f_pid" = "$pid" ] || return 1
+    [ "${f_ppid:-0}" -eq 1 ] || return 1
+    [ "${f_age:-0}" -ge "$age_seconds" ] || return 1
+    [ "$f_start" = "$lstart" ] || return 1
+    [ "$f_exe" = "$exe" ] || return 1
+    [ "$ticks" = "-" ] || [ "$f_ticks" = "$ticks" ] || return 1
+    inside_repo_checkout "$f_exe" || return 1
+    return 0
 }
 
 # argv[0] out of a command line, decided by the filesystem: the longest prefix that names something
@@ -480,35 +548,24 @@ if [ -z "$snapshot" ]; then
     exit 1
 fi
 
-# argv[0] for every pre-filtered candidate, which only the filesystem can decide (rule 4). The
-# command line stays out of the output from here on: nothing downstream may match on an argument.
-resolved=
-while IFS=$'\t' read -r pid ppid age start cmd; do
-    [ -n "${pid:-}" ] || continue
-    resolved="${resolved}${pid}"$'\t'"${ppid}"$'\t'"${age}"$'\t'"${start}"$'\t'"$(command_argv0 "$cmd")"$'\n'
-done <<<"$(printf '%s\n' "$snapshot" | select_pattern_candidates)"
-
-# Rule 4 proper, back in awk: the pattern is an environment variable, and awk is the engine that
-# pre-filtered with it, so letting a second tool decide would mean two regex dialects (awk processes
-# escape sequences in a `-v` assignment; grep does not) and a pattern that selects under one and not
-# the other. argv[0] is the last field because it can contain spaces; a tab it cannot.
-matched=$(printf '%s' "$resolved" | awk -F'\t' -v pattern="$pattern" 'NF >= 5 && $5 ~ pattern')
+# Rules 3 and 4 over the snapshot, with each candidate's identity (see `rule4_candidates`).
+matched=$(rule4_candidates "$snapshot")
 matched_total=$(printf '%s\n' "$matched" | grep -c . || true)
 
 # Rules 1, 2, 5 and 6, in that order. Rule 6 is applied here rather than in any awk because
 # resolving a path through symlinks needs a filesystem.
 foreign=0
 reapable=
-while IFS=$'\t' read -r pid ppid age start exe; do
+while IFS=$'\t' read -r pid ppid age start ticks exe; do
     [ -n "${pid:-}" ] || continue
     [ "$ppid" -eq 1 ] || continue             # live parent: a running test owns this process
     [ "$age" -ge "$age_seconds" ] || continue # too young to be debris
     # Serving a default runtime socket: a human started this one (rule 5).
     case " $default_socket_pids " in *" $pid "*) continue ;; esac
     if inside_repo_checkout "$exe"; then
-        # pid, then the identity the snapshot recorded for it, then argv[0]: argv[0] can contain
+        # pid, the identity the selecting snapshot recorded for it, then argv[0]: argv[0] can contain
         # spaces, so it has to stay the last field.
-        reapable="${reapable}${pid}"$'\t'"${start}"$'\t'"${exe}"$'\n'
+        reapable="${reapable}${pid}"$'\t'"${start}"$'\t'"${ticks}"$'\t'"${exe}"$'\n'
     else
         foreign=$((foreign + 1))
     fi
@@ -527,7 +584,7 @@ fi
 killed=0
 killed_pids=
 replaced=0
-while IFS=$'\t' read -r pid start exe; do
+while IFS=$'\t' read -r pid start ticks exe; do
     [ -n "${pid:-}" ] || continue
     if [ "$dry_run" -eq 1 ]; then
         echo "would kill pid $pid $exe"
@@ -535,12 +592,11 @@ while IFS=$'\t' read -r pid start exe; do
         killed_pids="$killed_pids $pid"
         continue
     fi
-    # Compared immediately before the signal against what the selecting snapshot recorded: see
-    # `process_start`. A pid that simply exited since the snapshot is not a replacement, so it is
-    # skipped silently rather than counted as one.
-    current_start=$(process_start "$pid")
-    [ -n "$current_start" ] || continue
-    if [ "$current_start" != "$start" ]; then
+    # A pid that simply exited since the snapshot is not a replacement, so it is skipped silently
+    # rather than counted as one.
+    process_terminated "$pid" && continue
+    # Every rule, re-derived immediately before the signal: see `still_the_selected_process`.
+    if ! still_the_selected_process "$pid" "$start" "$ticks" "$exe"; then
         echo "note: pid $pid is no longer the process selected; not signalling it" >&2
         replaced=$((replaced + 1))
         continue
@@ -554,7 +610,7 @@ while IFS=$'\t' read -r pid start exe; do
     if ! process_terminated "$pid"; then
         # The same check again: SIGKILL is unanswerable, so the escalation needs its own proof that
         # the number still names the process that ignored SIGTERM.
-        if ! still_the_selected_process "$pid" "$start"; then
+        if ! still_the_selected_process "$pid" "$start" "$ticks" "$exe"; then
             echo "note: pid $pid was replaced before the escalation; not sending SIGKILL" >&2
             replaced=$((replaced + 1))
             continue

@@ -228,17 +228,29 @@ SH
     [ -n "$spawned_pid" ] && spawned_pids+=("$spawned_pid")
 }
 
-# A `ps` stand-in that reports one pid as reparented to init in the process-table snapshot the
-# reaper takes, and passes every other query (notably the `-o state= -p` liveness check) straight
-# through to the real `ps`. Rewriting that one column is what lets the sandbox present a process
-# the selection rules accept while its real parent is alive and not reaping it. Prints its bin dir.
+# A `ps` stand-in that reports one pid as reparented to init, and passes every other query (notably
+# the `-o state= -p` liveness check) straight through to the real `ps`. Rewriting that one column is
+# what lets the sandbox present a process the selection rules accept while its real parent is alive
+# and not reaping it. Prints its bin dir.
+#
+# Rewritten in *both* query shapes, which carry the same columns: the reaper re-derives the whole
+# candidate predicate from a fresh one-pid row before it signals, so a stand-in that orphaned the
+# process only in the `-eo` snapshot would have it read as having a live parent the instant it is
+# re-checked - and the reaper would correctly decline to kill it.
 make_fake_ps() {
     local dir="$sandbox/fakebin"
     mkdir -p "$dir"
     cat >"$dir/ps" <<'SH'
 #!/bin/sh
+rewrite() { awk -v p="${SRUI_FAKE_ORPHAN_PID:-0}" '{ if ($1 + 0 == p + 0) $2 = 1; print }'; }
 case $1 in
-    -eo) /bin/ps "$@" | awk -v p="${SRUI_FAKE_ORPHAN_PID:-0}" '{ if ($1 + 0 == p + 0) $2 = 1; print }' ;;
+    -eo) /bin/ps "$@" | rewrite ;;
+    -o)
+        case $2 in
+            *ppid*) /bin/ps "$@" | rewrite ;;
+            *) exec /bin/ps "$@" ;;
+        esac
+        ;;
     *) exec /bin/ps "$@" ;;
 esac
 SH
@@ -698,19 +710,26 @@ echo "case 16: a pid recycled between selection and signalling is never touched"
 # has seconds in which to exit and have its number reissued to an unrelated process of this user.
 # Staging a genuine recycle is not possible to order, so the identity the reaper checks is what
 # changes here: the process-table snapshot passes through untouched - the marker is selected, with
-# its real start time - while every `-o lstart= -p <pid>` identity probe reports a different start
-# time, which is exactly what the reaper sees once the number has been reissued. Whether the
-# reissue happened before or after the reaper recorded the identity is indistinguishable from here;
-# case 18 is what pins down *which* observation the recorded value comes from.
+# its real start time - while the pre-signal identity probe reports a different start time, which is
+# exactly what the reaper sees once the number has been reissued to a process started at another
+# moment. Whether the reissue happened before or after the reaper recorded the identity is
+# indistinguishable from here; case 18 is what pins down *which* observation the recorded value comes
+# from, and case 28 covers the reuse `lstart` alone cannot see.
 recycle_bin="$sandbox/recyclebin"
 mkdir -p "$recycle_bin"
 cat >"$recycle_bin/ps" <<'SH'
 #!/bin/sh
-# `-o lstart= -p N` is the identity probe, and it never agrees with the snapshot. Everything else,
+# The identity probe is `-o <spec> -p <pid>` with `lstart` in the spec; the reaper asks for the whole
+# row now, so the row comes back real except for the five `lstart` columns ($5..$9). Everything else,
 # the `-eo` snapshot included, passes through untouched.
-if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ "$3" = "-p" ]; then
-    echo "Thu Jan  1 00:00:00 2037"
-    exit 0
+if [ "$1" = "-o" ] && [ "$3" = "-p" ]; then
+    case $2 in
+        *lstart*)
+            /bin/ps "$@" |
+                awk '{ $5 = "Thu"; $6 = "Jan"; $7 = "1"; $8 = "00:00:00"; $9 = "2037"; print }'
+            exit 0
+            ;;
+    esac
 fi
 exec /bin/ps "$@"
 SH
@@ -750,17 +769,21 @@ echo "case 18: the identity a signal is gated on comes from the snapshot that se
 # this user. The only way to close that window is to make no second read, so that is what is
 # asserted: one identity probe per candidate on the way to a kill, not two.
 #
-# Mutation to confirm this case bites: record the identity in the rule 6 loop with
-# `start=$(process_start "$pid")` instead of taking it from the snapshot. The probe count becomes 2
-# and this case fails.
+# The start *tick* `rule4_candidates` reads from /proc is deliberately not counted here: it is a
+# second read, and it is sound for a different reason - it is one more condition a signal must
+# satisfy, so a tick belonging to a replacement can only hold a signal back, never release one.
+#
+# Mutation to confirm this case bites: have `rule4_candidates` read the start time with
+# `ps -o lstart= -p "$pid"` instead of taking it from the snapshot row. The probe count becomes 2 and
+# this case fails.
 probe_bin="$sandbox/probebin"
 mkdir -p "$probe_bin"
 cat >"$probe_bin/ps" <<'SH'
 #!/bin/sh
 # Truthful throughout - the point is not what `ps` answers but how often the reaper asks. Every
-# `-o lstart= -p N` identity probe is logged with the pid it asked about.
-if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ "$3" = "-p" ]; then
-    echo "$4" >>"$SRUI_TEST_PROBE_LOG"
+# `-o <spec with lstart> -p N` identity probe is logged with the pid it asked about.
+if [ "$1" = "-o" ] && [ "$3" = "-p" ]; then
+    case $2 in *lstart*) echo "$4" >>"$SRUI_TEST_PROBE_LOG" ;; esac
 fi
 exec /bin/ps "$@"
 SH
@@ -783,8 +806,8 @@ else
         TMPDIR="$sandbox_runtime/tmp" \
         bash "$reaper" 2>&1)
     # The kill has to happen, or the probe count below would be satisfied by a sweep that selected
-    # nothing - and it also proves the identity the snapshot built matches what `process_start`
-    # reports, byte for byte, since a mismatch would stop the signal.
+    # nothing - and it also proves the `lstart` the snapshot built matches the one the pre-signal row
+    # carries, byte for byte, since a mismatch would stop the signal.
     assert_terminated "$pid" "the orphan was still killed with its identity taken from the snapshot"
     assert_contains "$output" "killing orphaned fixture server pid $pid" "the reaper announced the kill"
     probes=$(grep -c "^$pid\$" "$probe_log" 2>/dev/null || true)
@@ -1036,6 +1059,123 @@ else
         assert_contains "$output" "killing orphaned fixture server pid $pid" "the reaper announced the kill"
     fi
     kill_marker "${pid:-}"
+fi
+
+echo "case 28: a pid reused inside one second is caught by the rest of the predicate"
+# `ps -o lstart=` has one-second resolution on both platforms (procps-ng included), so a pid reused by
+# another process of this user *within the same second* presents the identity the snapshot recorded
+# and case 16's check passes it. Comparing one coarse value is therefore not an identity: every rule
+# that selected the candidate is re-derived from a fresh `ps` row before each signal, and each probe
+# below breaks exactly one of them while leaving `lstart` truthful.
+#
+# The stand-in rewrites one element of the pre-signal `-o … -p <pid>` row only; the `-eo` snapshot
+# passes through, so selection happens normally and what changes is what the reaper re-derives.
+predicate_bin="$sandbox/predicatebin"
+mkdir -p "$predicate_bin"
+cat >"$predicate_bin/ps" <<'SH'
+#!/bin/sh
+# Columns, both queries: $1 pid, $2 ppid, $3 uid, $4 etime, $5..$9 lstart, $10.. command.
+if [ "$1" = "-eo" ]; then
+    # Only the `young` probe needs the snapshot touched: the candidate has to look old enough to be
+    # selected, so that the fresh row's real (tiny) etime is what rejects it.
+    /bin/ps "$@" | awk -v mode="${SRUI_TEST_PREDICATE_MODE:-}" -v p="${SRUI_TEST_PREDICATE_PID:-0}" '
+        mode == "young" && $1 + 0 == p + 0 { $4 = "99:00:00" }
+        { print }'
+    exit 0
+fi
+if [ "$1" = "-o" ] && [ "$3" = "-p" ]; then
+    case $2 in
+        *lstart*)
+            /bin/ps "$@" | awk -v mode="${SRUI_TEST_PREDICATE_MODE:-}" \
+                -v other="${SRUI_TEST_PREDICATE_EXE:-}" '
+                mode == "ppid" { $2 = 4242 }
+                mode == "exe"  { $10 = other; NF = 10 }
+                { print }'
+            exit 0
+            ;;
+    esac
+fi
+exec /bin/ps "$@"
+SH
+chmod +x "$predicate_bin/ps"
+
+# A second marker the pattern also matches, so one probe can change the binary without changing
+# whether rule 4 is satisfied - that is the only way to test the "same path" guard on its own.
+ident_a=$(make_marker fixture-ident-a)
+ident_b=$(make_marker fixture-ident-b)
+ident_pattern='/fixture-ident-[ab]$'
+ident_a_pattern='/fixture-ident-a$'
+
+for spec in "ppid|$ident_pattern|0|$ident_b|its parent is no longer init" \
+    "young|$ident_pattern|60|$ident_b|it is younger than the age floor" \
+    "exe|$ident_a_pattern|0|/bin/sleep|its argv[0] no longer matches the pattern" \
+    "exe|$ident_pattern|0|$ident_b|its argv[0] matches but is a different binary"; do
+    mode=${spec%%|*}
+    rest=${spec#*|}
+    probe_pattern=${rest%%|*}
+    rest=${rest#*|}
+    probe_age=${rest%%|*}
+    rest=${rest#*|}
+    probe_exe=${rest%%|*}
+    label=${rest#*|}
+    spawn_orphan "$ident_a"
+    pid=$spawned_pid
+    if [ -z "$pid" ]; then
+        fail "could not spawn an orphan marker for the '$label' probe"
+        continue
+    fi
+    output=$(PATH="$predicate_bin:$sandbox/lsofbin:$PATH" \
+        SRUI_TEST_PREDICATE_MODE="$mode" \
+        SRUI_TEST_PREDICATE_PID="$pid" \
+        SRUI_TEST_PREDICATE_EXE="$probe_exe" \
+        SRUI_TEST_LSOF_TABLE="$lsof_table" \
+        SRUI_REAP_PATTERN="$probe_pattern" \
+        SRUI_REAP_AGE_MINUTES="$probe_age" \
+        SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        TMPDIR="$sandbox_runtime/tmp" \
+        bash "$reaper" 2>&1)
+    assert_alive "$pid" "a reused pid was not signalled when $label"
+    assert_contains "$output" "no longer the process selected" "the sweep said why it held off ($mode)"
+    assert_contains "$output" "1 replaced before signalling" "the summary accounted for it ($mode)"
+    if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $pid"; then
+        fail "the reaper announced a kill for a pid whose predicate no longer holds ($label)"
+        printf '%s\n' "    reaper said: $output" >&2
+    fi
+    kill_marker "$pid"
+done
+rm -f "$ident_b"
+
+echo "case 29: a /proc stat line is parsed from the last ), never by counting columns"
+# Where /proc is readable the identity also carries field 22 of `/proc/<pid>/stat`, the start time in
+# clock ticks - 100 to `lstart`'s one second. Field 2 is `comm`, in parentheses, and a process chooses
+# its own name: `(sd-pam)` and `Google Chrome` both shift every field after it, so counting whitespace
+# from the left reads the wrong number and the guard silently compares garbage.
+#
+# There is no /proc on macOS, so the parser is lifted out of the script and fed crafted lines rather
+# than left untested on half the machines. The Linux CI run exercises the real file in every "was
+# killed" case, but only catches an *unstable* parse - a consistently wrong field would be read twice
+# and agree with itself - so the value is asserted here instead of merely the kill it permits.
+ticks_parser=$(awk '/^start_ticks_from_stat_line\(\) \{/, /^}$/' "$reaper")
+if [ -z "$ticks_parser" ]; then
+    fail "could not lift start_ticks_from_stat_line out of $reaper"
+else
+    stat_tail='S 1 4242 4242 0 -1 4194304 100 0 0 0 1 2 0 0 20 0 1 0 8899123 5 6 7'
+    for spec in "4242 (counter) $stat_tail|8899123|a plain comm" \
+        "4242 (Google Chrome (helper)) $stat_tail|8899123|a comm with spaces and parentheses" \
+        "4242 ((sd-pam)) $stat_tail|8899123|a comm that is itself parenthesised" \
+        "not a stat line at all||a line of the wrong shape"; do
+        stat_line=${spec%%|*}
+        rest=${spec#*|}
+        expect=${rest%%|*}
+        label=${rest#*|}
+        got=$(bash -c "$ticks_parser"$'\n''start_ticks_from_stat_line "$1"' bash "$stat_line")
+        if [ "$got" = "$expect" ]; then
+            pass "$label yields '${expect:-}'"
+        else
+            fail "$label yielded '$got', expected '${expect:-}'"
+        fi
+    done
 fi
 
 echo "case 27: an unusable SRUI_REAP_PATTERN is refused, not swept past"

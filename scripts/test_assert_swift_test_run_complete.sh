@@ -64,6 +64,29 @@ case ${FAKE_RUNNER_SHAPE:-complete-pass} in
         printf '%s\n' "✘ Test fakeExample() failed after 0.001 seconds."
         printf '%s\n' "✘ Test run with 1 test failed after 0.002 seconds."
         ;;
+    swift-testing-died)
+        # The shape of the real failure this guard was built for: the XCTest half finishes and
+        # summarises, while the swift-testing host dies mid-run and never prints its own summary.
+        # Measured on CI at the time: 723 started, 149 reported, XCTest's `Executed 149 tests` line
+        # present, no `Test run with N tests` line at all.
+        printf '%s\n' "Test Case '-[SRUITests.FakeTests testOne]' started."
+        printf '%s\n' "Test Case '-[SRUITests.FakeTests testOne]' passed (0.001 seconds)."
+        printf '%s\n' "Executed 1 test, with 0 failures (0 unexpected) in 0.001 (0.001) seconds"
+        printf '%s\n' "\xe2\x97\x87 Test fakeExample() started."
+        printf '%s\n' "\xe2\x9c\x94 Test fakeExample() passed after 0.001 seconds."
+        printf '%s\n' "\xe2\x97\x87 Test fakeSecond() started."
+        ;;
+    dropped-result)
+        # Both tests ran and both summaries were printed; one result line never made it into the
+        # typescript, exactly as the capture layer loses them under load.
+        printf '%s\n' "Test Case '-[SRUITests.FakeTests testOne]' started."
+        printf '%s\n' "Test Case '-[SRUITests.FakeTests testOne]' passed (0.001 seconds)."
+        printf '%s\n' "Executed 1 test, with 0 failures (0 unexpected) in 0.001 (0.001) seconds"
+        printf '%s\n' "\xe2\x97\x87 Test fakeExample() started."
+        printf '%s\n' "\xe2\x97\x87 Test fakeDropped() started."
+        printf '%s\n' "\xe2\x9c\x94 Test fakeExample() passed after 0.001 seconds."
+        printf '%s\n' "\xe2\x9c\x94 Test run with 2 tests passed after 0.002 seconds."
+        ;;
     truncated)
         printf '%s\n' "Test Case '-[SRUITests.FakeTests testOne]' started."
         printf '%s\n' "◇ Test fakeExample() started."
@@ -229,7 +252,29 @@ echo "case 5: a truncated run is refused even when the runner exits 0"
 use_script real
 run_wrapper truncated 0
 assert_nonzero_status $? "wrapper refused a run that left tests unreported"
-assert_output_contains "MISSING RESULT" "wrapper named the unreported tests"
+# A truncated host prints no summary at all, and that - not the per-test tally - is what refuses the
+# run: the tally is advisory because the pty capture layer provably drops lines under load.
+assert_output_contains "MISSING SUMMARY" "wrapper named the missing summary"
+assert_output_contains "started without a matching result line" "wrapper still reported the tally"
+
+echo "case 5b: a dropped result line is advisory while both summaries are present"
+# Measured on a macos-15 runner: 588 started, 537 result lines, summary `578 tests passed`, no skips
+# and no interleaved writes - `script(1)` dropped the rest. Failing on that would make this guard
+# trip on every CI run.
+use_script real
+run_wrapper dropped-result 0
+assert_status $? 0 "wrapper accepted a run whose capture lost a result line"
+assert_output_contains "started without a matching result line" "wrapper noted the loss"
+assert_output_contains "advisory only" "wrapper said the note is advisory"
+
+echo "case 5c: a swift-testing host that dies after XCTest finished is refused"
+# Isolates the swift-testing summary check: XCTest's own summary is present, so only the
+# swift-testing one can reject this. Without a case of this shape, removing that check passes the
+# suite - which is how it was found.
+use_script real
+run_wrapper swift-testing-died 0
+assert_nonzero_status $? "wrapper refused a run whose swift-testing host never summarised"
+assert_output_contains 'swift-testing never printed' "wrapper named the missing swift-testing summary"
 
 echo "case 6: the util-linux script(1) dialect runs the same accounting"
 use_script utillinux

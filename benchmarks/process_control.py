@@ -251,8 +251,15 @@ def spawn_supervisor(
 
 
 def process_group_members(process_group: int) -> set[int]:
+    """Return the live members of a process group, ignoring exited zombies.
+
+    The sentinel is stopped while its group drains, so it cannot reap its own exec
+    child. Counting that already-exited child would make the graceful-drain check in
+    terminate_supervised_process unreachable for every supervised command.
+    """
+
     result = subprocess.run(
-        ["ps", "-axo", "pid=,pgid="],
+        ["ps", "-axo", "pid=,pgid=,state="],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -267,14 +274,19 @@ def process_group_members(process_group: int) -> set[int]:
     members: set[int] = set()
     for line in result.stdout.splitlines():
         fields = line.split()
-        if len(fields) != 2:
+        if len(fields) != 3:
             continue
         try:
-            pid, pgid = map(int, fields)
+            pid, pgid = int(fields[0]), int(fields[1])
         except ValueError:
             continue
-        if pgid == process_group:
-            members.add(pid)
+        if pgid != process_group:
+            continue
+        # A zombie holds no resources and cannot be signalled; only a waitpid by its
+        # parent clears it, and the pinned sentinel stays stopped until the group kill.
+        if fields[2].startswith("Z"):
+            continue
+        members.add(pid)
     return members
 
 

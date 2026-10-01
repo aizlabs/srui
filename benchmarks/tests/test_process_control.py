@@ -34,6 +34,17 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
 time.sleep(60)
 """
 
+TERMINABLE_SLEEPER = """
+import os
+import sys
+import time
+
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(str(os.getpid()))
+    output.flush()
+time.sleep(60)
+"""
+
 SPAWNER = """
 import subprocess
 import sys
@@ -328,6 +339,64 @@ def test_enumeration_failure_still_kills_and_reaps_pinned_group(
 
     assert managed.closed
     assert_process_gone(child_pid)
+
+
+def test_group_enumeration_lists_live_members_and_skips_exited_zombies() -> None:
+    own_group = os.getpgid(0)
+    exited = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    try:
+        # WNOWAIT observes the exit without reaping, so the PID is still carried in
+        # the process group while the enumeration below runs.
+        os.waitid(os.P_PID, exited.pid, os.WEXITED | os.WNOWAIT)
+        members = process_control.process_group_members(own_group)
+    finally:
+        exited.wait(timeout=5)
+
+    assert os.getpid() in members, "a live group member must be enumerated"
+    assert exited.pid not in members, "an exited zombie must not count as a member"
+
+
+def test_pinned_group_drains_within_the_cleanup_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "drain-child.pid"
+    managed = ManagedProcess.start(
+        [sys.executable, "-c", TERMINABLE_SLEEPER, str(pid_file)],
+        cwd=tmp_path,
+        label="graceful drain",
+        cleanup_grace_seconds=5.0,
+    )
+    child_pid = wait_for_pid(pid_file)
+    assert managed.supervisor is not None
+    supervisor_pid = managed.supervisor.pid
+
+    original_members = process_control.process_group_members
+    observations: list[set[int]] = []
+
+    def record(process_group: int) -> set[int]:
+        members = original_members(process_group)
+        observations.append(members)
+        return members
+
+    monkeypatch.setattr(process_control, "process_group_members", record)
+    managed.terminate()
+
+    assert managed.closed
+    assert_process_gone(child_pid)
+    assert observations, "the cleanup grace window must enumerate the group"
+    # The stopped sentinel cannot reap its exec child, so a zombie-counting
+    # enumeration leaves this loop to expire on its deadline every single time.
+    assert observations[-1] <= {supervisor_pid}, (
+        "the SIGTERM'd group never drained inside the grace window; last "
+        f"enumeration was {sorted(observations[-1])}"
+    )
 
 
 def test_failed_reap_keeps_control_files_until_retry(

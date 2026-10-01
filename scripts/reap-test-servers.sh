@@ -110,6 +110,31 @@
 #      Ownership evidence finer than rules 5 and 6 — a marker each test run writes for its own
 #      fixtures — is still missing; a daemon detached by hand from inside a checkout, onto some
 #      explicit socket other than the default, is still read as debris once it is old enough.
+#   7. a fixture `sshd`, recognized by the configuration file it was started from rather than by its
+#      executable. The SSH integration tests spawn the system `sshd` (`SSHTestSupport.launchSSHD`),
+#      so its executable is `/usr/sbin/sshd` — outside every checkout, which rule 6 refuses and is
+#      right to refuse. It is still this repository's debris, and when a run is killed it survives as
+#      an orphaned listener holding the fixture directory its keys live in.
+#
+#      The evidence is `-f <path>`: a path inside one of the fixture directory families this sweep
+#      already collects (`SRUI_REAP_TMP_GLOBS`). Nothing but a test writes an `sshd_config` there, so
+#      a daemon configured from one is a fixture by construction. The system's own `sshd` reads
+#      `/etc/ssh/sshd_config` and is never selected; neither is one whose `-f` path is relative
+#      (nothing can say what it resolves to from a `ps` snapshot alone), one with no `-f` at all, or
+#      one belonging to another user. Rules 1, 2 and 3 apply unchanged, so a listener a running suite
+#      owns, or one younger than the age floor, is never touched.
+#
+#      This is deliberately not rule 4 with a wider pattern: matching `sshd` by name and then applying
+#      rule 6 selects nothing (the binary is never in a checkout), and matching it by name *without*
+#      rule 6 would put every `sshd` on this machine — including a host's real one, if a sweep ever
+#      ran as root — one age check away from being killed. The configuration path is the narrowest
+#      evidence that separates a fixture from a service.
+#
+#   Deliberately out of scope: `swift-test`. It is a toolchain binary
+#   (`…/Xcode.app/…/usr/bin/swift-test`, `/usr/bin/swift-test`), so it lies outside every checkout and
+#   no rule here can admit it without giving up what rule 6 promises. It does not need one: it waits
+#   on the `swiftpm-testing-helper` that rules 4 and 6 *do* admit, so reaping the helper ends the
+#   driver too. A `swift-test` that somehow outlives its helper has to be killed by hand.
 #
 # Directories (`/tmp/srui-*`, `/tmp/px0*`, `/tmp/srtop-*`) are removed only when no live process
 # references them. "Referenced" has two independent sources, and either one spares a directory:
@@ -168,7 +193,11 @@ if ! printf '%s' "$age_minutes" | grep -Eq '^[0-9]+$'; then
 fi
 age_seconds=$((age_minutes * 60))
 
-pattern=${SRUI_REAP_PATTERN:-'/target/debug/(counter|srui-sessiond|coding-agent-demo|srtop)$'}
+# The cargo fixture servers, plus the SwiftPM processes a killed `swift test` leaves behind: the
+# testing helper and the test bundle's own executable, both built inside a checkout's `.build` and so
+# admitted by rule 6 exactly as a `target/debug` fixture is. `swift-test` itself is not here; see the
+# out-of-scope note above.
+pattern=${SRUI_REAP_PATTERN:-'/target/debug/(counter|srui-sessiond|coding-agent-demo|srtop)$|/\.build/[^ ]*/(swiftpm-testing-helper|[^/ ]+\.xctest/Contents/MacOS/[^/ ]+)$'}
 # An unusable pattern must say so rather than sweep quietly: an invalid ERE made awk fail on every
 # line and the run print a clean all-zeros summary, which reads exactly like "nothing to reap".
 # Checked by the same engine that will use it, so the verdict cannot disagree with the matcher.
@@ -179,6 +208,9 @@ fi
 # `/tmp/px0*` used to be the Process Explorer pattern; it also matches an unrelated `/tmp/px0-cache`.
 # The fixtures name their directories `px0NN-...`, so the ticket digits are spelled out.
 tmp_globs=${SRUI_REAP_TMP_GLOBS:-'/tmp/srui-* /tmp/px0[0-9][0-9]-* /tmp/srtop-*'}
+# Rule 7 matches `sshd` by name only to find candidates; what admits one is the configuration path
+# (`inside_fixture_directory`), never this pattern on its own.
+sshd_pattern='(^|/)sshd$'
 my_uid=$(id -u)
 failures=0
 
@@ -267,17 +299,22 @@ repo_checkout_roots() {
     done
 }
 
-# Where a checkout's `target` symlinks actually point: the shared build cache layout, in which the
+# Where a checkout's build directories actually point: the shared build cache layout, in which the
 # physical path of a perfectly ordinary fixture binary lies outside the checkout. Naming the cache as
 # a root is what keeps those fixtures reapable now that only resolved paths are compared.
 #
-# A real `target` directory is pruned rather than descended into - it holds the whole build output,
-# and walking it on every sweep (this script runs before each test run) would cost more than the
-# sweep does. `-maxdepth 3` covers the layouts this repository has: `target`, `<crate>/target` and
-# `<group>/<crate>/target`.
+# Both build directories count, because both hold processes this sweep reaps: cargo's `target` and
+# SwiftPM's `.build` (whose `swiftpm-testing-helper` and test bundle rule 4 now selects). A checkout
+# that symlinks either one into a shared cache would otherwise leave those orphans unreapable, which
+# is the same defect the `target` case was fixed for.
+#
+# A real build directory is pruned rather than descended into - it holds the whole build output, and
+# walking it on every sweep (this script runs before each test run) would cost more than the sweep
+# does. `-maxdepth 3` covers the layouts this repository has: `target`, `<crate>/target`,
+# `<group>/<crate>/target` and `client-macos/.build`.
 target_cache_roots() {
     local root=$1 link dir
-    find "$root" -maxdepth 3 \( -name .git -o -name target \) \
+    find "$root" -maxdepth 3 \( -name .git -o -name target -o -name .build \) \
         \( -type l -print -o -prune \) 2>/dev/null | while IFS= read -r link; do
         [ -L "$link" ] || continue
         dir=$(cd "$link" 2>/dev/null && pwd -P) || continue
@@ -349,8 +386,10 @@ AWK_COMMAND_LINE='
 # number could be reissued before that value is recorded. The start tick `rule4_candidates` adds
 # beside it *is* a second read, and is safe for a different reason: it is one more condition a signal
 # has to satisfy, so a tick belonging to a replacement can only ever hold a signal back.
+# The pattern is an argument rather than the global, so rule 7 can reuse this selection with its own
+# (`sshd_pattern`) and both families are parsed by the same code.
 select_pattern_candidates() {
-    awk -v pattern="$pattern" -v my_uid="$my_uid" -v self="$$" "$AWK_COMMAND_LINE"'
+    awk -v pattern="${1:-$pattern}" -v my_uid="$my_uid" -v self="$$" "$AWK_COMMAND_LINE"'
         function age_seconds(e,   days, part, n, secs, split_day) {
             days = 0
             if (e ~ /-/) { split(e, split_day, "-"); days = split_day[1] + 0; e = split_day[2] }
@@ -397,6 +436,109 @@ rule4_candidates() {
     # processes escape sequences in a `-v` assignment; grep does not) and a pattern that selects
     # under one and not the other.
     printf '%s' "$resolved" | awk -F'\t' -v pattern="$pattern" 'NF >= 6 && $6 ~ pattern'
+}
+
+# The `-f <path>` an `sshd` was started from, or empty when it names none. `-f path` and `-f/path`
+# are both accepted, because both are how it is written.
+#
+# A relative path yields nothing: what it resolves to depends on a working directory no `ps` snapshot
+# records, so there is no evidence here to act on. A path containing a space is out of scope for the
+# same reason argv[0] is (see rule 4) - `ps` joins argv with spaces and nothing can split it back.
+sshd_config_path() {
+    local cmd=$1 token next=0
+    local -a tokens=()
+    read -r -a tokens <<<"$cmd" # `read -a`, never `for token in $cmd`: no glob expansion
+    for token in "${tokens[@]+"${tokens[@]}"}"; do
+        if [ "$next" -eq 1 ]; then
+            case $token in /*) printf '%s' "$token" ;; esac
+            return 0
+        fi
+        case $token in
+            -f) next=1 ;;
+            -f/*)
+                printf '%s' "${token#-f}"
+                return 0
+                ;;
+        esac
+    done
+}
+
+# Rule 7's evidence: is `path` inside one of the fixture directory families this sweep collects?
+#
+# The glob list is iterated with pathname expansion disabled. Unquoted, each pattern would be
+# expanded against the real filesystem first and the loop would compare `path` against whatever
+# happens to exist in /tmp today - so the test would pass or fail depending on the machine's litter
+# rather than on the pattern. (The self-test hit exactly that: see its case 21.)
+inside_fixture_directory() {
+    local path=$1 glob
+    [ -n "$path" ] || return 1
+    case $path in /*) ;; *) return 1 ;; esac
+    set -f
+    # shellcheck disable=SC2086 # deliberate word splitting, with globbing off: a list of patterns
+    set -- $tmp_globs
+    set +f
+    for glob in "$@"; do
+        # shellcheck disable=SC2254 # $glob is a pattern here, by design
+        case $path in $glob/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# pid<TAB>ppid<TAB>age<TAB>lstart<TAB>start ticks<TAB>config path<TAB>argv[0] for every `sshd` of ours
+# started from a configuration file inside a fixture directory: rule 7, and the whole identity of each
+# candidate, in the same shape rule 4's candidates carry.
+#
+# Selected through the same snapshot and the same column parsing as every other candidate, so the two
+# families cannot disagree about who a pid is. Only the admission evidence differs: rule 6 asks where
+# the executable lives, rule 7 asks which configuration file it was handed.
+fixture_sshd_candidates() {
+    local snap=$1 pid ppid age start ticks cmd exe config
+    while IFS=$'\t' read -r pid ppid age start cmd; do
+        [ -n "${pid:-}" ] || continue
+        exe=$(command_argv0 "$cmd")
+        case $(basename "$exe") in sshd) ;; *) continue ;; esac
+        config=$(sshd_config_path "$cmd")
+        inside_fixture_directory "$config" || continue
+        ticks=$(process_start_ticks "$pid")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$pid" "$ppid" "$age" "$start" "${ticks:--}" "$config" "$exe"
+    done <<<"$(printf '%s\n' "$snap" | select_pattern_candidates "$sshd_pattern")"
+}
+
+# Re-derives, for the family that admitted this pid, every rule that selected it. A candidate is only
+# ever re-checked against its own evidence: rule 6 would refuse every fixture `sshd` (its executable is
+# outside the checkout, which is why rule 7 exists), and rule 7 would admit no cargo fixture (it is
+# configured from no file at all).
+still_selected_by_family() {
+    local family=$1 pid=$2 start=$3 ticks=$4 evidence=$5 exe=$6
+    if [ "$family" = sshd ]; then
+        still_the_selected_sshd "$pid" "$start" "$ticks" "$evidence" "$exe"
+    else
+        still_the_selected_process "$pid" "$start" "$ticks" "$exe"
+    fi
+}
+
+# True when `pid` still satisfies everything that selected it under rule 7, re-derived from a fresh
+# observation exactly as `still_the_selected_process` does for rules 4 and 6: ours, orphaned, still
+# past the age floor, the same `lstart` and start tick, the same argv[0], and still configured from the
+# same fixture path. The evidence is re-read rather than remembered, so an `sshd` that was restarted
+# on the same pid with a different configuration is not signalled.
+still_the_selected_sshd() {
+    local pid=$1 lstart=$2 ticks=$3 config=$4 exe=$5 row fresh
+    local f_pid f_ppid f_age f_start f_ticks f_config f_exe
+    row=$(ps -o pid=,ppid=,uid=,etime=,lstart=,command= -p "$pid" 2>/dev/null)
+    [ -n "$row" ] || return 1
+    fresh=$(fixture_sshd_candidates "$row")
+    [ -n "$fresh" ] || return 1
+    IFS=$'\t' read -r f_pid f_ppid f_age f_start f_ticks f_config f_exe <<<"$fresh"
+    [ "$f_pid" = "$pid" ] || return 1
+    [ "${f_ppid:-0}" -eq 1 ] || return 1
+    [ "${f_age:-0}" -ge "$age_seconds" ] || return 1
+    [ "$f_start" = "$lstart" ] || return 1
+    [ "$f_config" = "$config" ] || return 1
+    [ "$f_exe" = "$exe" ] || return 1
+    [ "$ticks" = "-" ] || [ "$f_ticks" = "$ticks" ] || return 1
+    return 0
 }
 
 # True when `pid` still satisfies everything that selected it, re-derived from a fresh observation
@@ -618,13 +760,33 @@ while IFS=$'\t' read -r pid ppid age start ticks exe; do
     # Serving a default runtime socket: a human started this one (rule 5).
     case " $default_socket_pids " in *" $pid "*) continue ;; esac
     if inside_repo_checkout "$exe"; then
-        # pid, the identity the selecting snapshot recorded for it, then argv[0]: argv[0] can contain
-        # spaces, so it has to stay the last field.
-        reapable="${reapable}${pid}"$'\t'"${start}"$'\t'"${ticks}"$'\t'"${exe}"$'\n'
+        # pid, the identity the selecting snapshot recorded for it, which family admitted it and on
+        # what evidence, then argv[0]: argv[0] can contain spaces, so it has to stay the last field.
+        #
+        # The evidence field is `-` rather than empty for this family, which carries none. A tab is
+        # an IFS *whitespace* character, so `read` collapses a run of them: an empty field here
+        # silently shifted argv[0] into `evidence` and left `exe` empty, after which every
+        # pre-signal re-check failed and the sweep killed nothing while reporting each candidate as
+        # "no longer the process selected". Placeholders are how the start tick already handles this.
+        reapable="${reapable}${pid}"$'\t'"${start}"$'\t'"${ticks}"$'\t'checkout$'\t'-$'\t'"${exe}"$'\n'
     else
         foreign=$((foreign + 1))
     fi
 done <<<"$matched"
+
+# Rule 7, over the same snapshot: a fixture `sshd`, admitted by the configuration file it was started
+# from rather than by where its executable lives. Rules 1, 2 and 3 are applied here too, and rule 5
+# needs no mention - an `sshd` binds no unix socket at all, let alone a default runtime one.
+sshd_matched=0
+while IFS=$'\t' read -r pid ppid age start ticks config exe; do
+    [ -n "${pid:-}" ] || continue
+    sshd_matched=$((sshd_matched + 1))
+    [ "$ppid" -eq 1 ] || continue
+    [ "$age" -ge "$age_seconds" ] || continue
+    reapable="${reapable}${pid}"$'\t'"${start}"$'\t'"${ticks}"$'\t'sshd$'\t'"${config}"$'\t'"${exe}"$'\n'
+done <<<"$(fixture_sshd_candidates "$snapshot")"
+matched_total=$((matched_total + sshd_matched))
+
 orphans=${reapable%$'\n'}
 
 if [ "$kill_allowed" -eq 0 ]; then
@@ -639,7 +801,7 @@ fi
 killed=0
 killed_pids=
 replaced=0
-while IFS=$'\t' read -r pid start ticks exe; do
+while IFS=$'\t' read -r pid start ticks family evidence exe; do
     [ -n "${pid:-}" ] || continue
     if [ "$dry_run" -eq 1 ]; then
         echo "would kill pid $pid $exe"
@@ -650,8 +812,8 @@ while IFS=$'\t' read -r pid start ticks exe; do
     # A pid that simply exited since the snapshot is not a replacement, so it is skipped silently
     # rather than counted as one.
     process_terminated "$pid" && continue
-    # Every rule, re-derived immediately before the signal: see `still_the_selected_process`.
-    if ! still_the_selected_process "$pid" "$start" "$ticks" "$exe"; then
+    # Every rule, re-derived immediately before the signal, by the family that admitted this pid.
+    if ! still_selected_by_family "$family" "$pid" "$start" "$ticks" "$evidence" "$exe"; then
         echo "note: pid $pid is no longer the process selected; not signalling it" >&2
         replaced=$((replaced + 1))
         continue
@@ -664,8 +826,9 @@ while IFS=$'\t' read -r pid start ticks exe; do
     done
     if ! process_terminated "$pid"; then
         # The same check again: SIGKILL is unanswerable, so the escalation needs its own proof that
-        # the number still names the process that ignored SIGTERM.
-        if ! still_the_selected_process "$pid" "$start" "$ticks" "$exe"; then
+        # the number still names the process that ignored SIGTERM - by the same family, for the same
+        # reason the selection used it.
+        if ! still_selected_by_family "$family" "$pid" "$start" "$ticks" "$evidence" "$exe"; then
             echo "note: pid $pid was replaced before the escalation; not sending SIGKILL" >&2
             replaced=$((replaced + 1))
             continue

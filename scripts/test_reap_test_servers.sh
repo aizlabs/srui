@@ -74,13 +74,66 @@ fail() {
     failures=$((failures + 1))
 }
 
-# An executable whose argv[0] is a path we control, under the sandbox repository's own
-# `target/debug` - the layout a real fixture server has, and inside a checkout, so rule 6 lets it
-# be reaped. A copied binary would be SIGKILLed by code signing on Apple silicon and a shebang
-# script would report /bin/sh as argv[0], which is exactly the column the reaper matches on.
+# The stand-in fixture server every marker below is a copy of: a *real* executable, compiled here.
+#
+# It used to be `ln -sf /bin/sleep`, which is no longer stageable: rule 6 resolves the final component
+# of argv[0], so a symlink to /bin/sleep names a file outside every root and no marker would be
+# reapable at all. Copying /bin/sleep instead is not an option either - a platform binary's signature
+# does not survive the copy and the kernel SIGKILLs it on exec on Apple silicon (measured: exit 137).
+# A locally compiled binary has an ad-hoc signature that travels with the file, and copies run fine.
+# A shebang script cannot stand in either: it reports /bin/sh as argv[0], which is the column the
+# reaper matches on.
+#
+# Two modes, so one binary covers both kinds of staging:
+#   marker <seconds>                 sleep, like a fixture server waiting for connections
+#   marker --bind <path> <seconds>    bind that unix socket first, like a daemon on its default socket
+marker_binary="$sandbox/bin/srui-reap-selftest-fixture"
+cat >"$sandbox/bin/fixture.c" <<'C'
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    const char *bind_path = NULL;
+    unsigned seconds = 600;
+    int i, fd;
+    struct sockaddr_un addr;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            bind_path = argv[++i];
+        } else {
+            seconds = (unsigned)strtoul(argv[i], NULL, 10);
+        }
+    }
+    if (bind_path != NULL) {
+        if (strlen(bind_path) >= sizeof addr.sun_path) return 1;
+        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return 1;
+        memset(&addr, 0, sizeof addr);
+        addr.sun_family = AF_UNIX;
+        strcpy(addr.sun_path, bind_path);
+        if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) return 1;
+        if (listen(fd, 1) != 0) return 1;
+    }
+    while (seconds > 0) seconds = sleep(seconds);
+    return 0;
+}
+C
+if ! cc -o "$marker_binary" "$sandbox/bin/fixture.c" 2>"$sandbox/bin/cc.log"; then
+    echo "FAIL: cannot compile the stand-in fixture server; a C compiler is required to run this" >&2
+    echo "      suite, because rule 6 resolves argv[0] and a symlinked marker is not reapable." >&2
+    sed 's/^/      /' "$sandbox/bin/cc.log" >&2
+    exit 1
+fi
+
+# A marker under the sandbox repository's own `target/debug` - the layout a real fixture server has,
+# and inside a checkout, so rule 6 lets it be reaped.
 make_marker() {
     local name=$1
-    ln -sf /bin/sleep "$sandbox/repo/target/debug/$name"
+    cp "$marker_binary" "$sandbox/repo/target/debug/$name"
     printf '%s' "$sandbox/repo/target/debug/$name"
 }
 
@@ -88,7 +141,7 @@ make_marker() {
 # `git worktree list` rather than just its own toplevel.
 make_worktree_marker() {
     local name=$1
-    ln -sf /bin/sleep "$sandbox/wt/target/debug/$name"
+    cp "$marker_binary" "$sandbox/wt/target/debug/$name"
     printf '%s' "$sandbox/wt/target/debug/$name"
 }
 
@@ -96,14 +149,14 @@ make_worktree_marker() {
 # reports is inside the checkout, the file is not inside it at all.
 make_cached_marker() {
     local name=$1
-    ln -sf /bin/sleep "$sandbox/buildcache/debug/$name"
+    cp "$marker_binary" "$sandbox/buildcache/debug/$name"
     printf '%s' "$sandbox/wt-cache/target/debug/$name"
 }
 
 # A marker in a linked worktree whose path contains a space.
 make_spaced_marker() {
     local name=$1
-    ln -sf /bin/sleep "$sandbox/wt space/target/debug/$name"
+    cp "$marker_binary" "$sandbox/wt space/target/debug/$name"
     printf '%s' "$sandbox/wt space/target/debug/$name"
 }
 
@@ -112,7 +165,7 @@ make_spaced_marker() {
 # `target/debug`.
 make_foreign_marker() {
     local dir=$1 name=$2
-    ln -sf /bin/sleep "$dir/$name"
+    cp "$marker_binary" "$dir/$name"
     printf '%s' "$dir/$name"
 }
 
@@ -491,20 +544,19 @@ kill_marker "${held_holder:-}"
 
 echo "case 11: an orphaned process serving the default runtime socket is never killed"
 # The shape of a `srui-sessiond` a human detached on purpose: ppid 1, old enough, argv[0] matching
-# the fixture pattern, and bound to the default runtime socket. `nc -lU` stands in for the daemon
-# through a symlink, so argv[0] is a path this case controls.
+# the fixture pattern, and really bound to the default runtime socket - the marker binary's `--bind`
+# mode stands in for the daemon, so the socket the table records is one that genuinely exists.
 default_root="$sandbox/tmp2"
 default_socket_dir="$default_root/srui-$(id -u)"
 mkdir -p "$default_socket_dir"
-if ! command -v nc >/dev/null 2>&1; then
-    fail "nc is unavailable; cannot stage a default-socket server"
+if [ ! -x "$marker_binary" ]; then
+    fail "the stand-in fixture server is missing; cannot stage a default-socket daemon"
 else
     listener=$(make_marker fixture-default-socket)
-    ln -sf "$(command -v nc)" "$listener"
-    ("$listener" -lU "$default_socket_dir/s" >/dev/null 2>&1 &) 2>/dev/null
+    ("$listener" --bind "$default_socket_dir/s" 600 >/dev/null 2>&1 &) 2>/dev/null
     listener_pid=""
     for _ in $(seq 1 50); do
-        listener_pid=$(pgrep -f "^$listener -lU" 2>/dev/null | head -1)
+        listener_pid=$(pgrep -f "^$listener --bind" 2>/dev/null | head -1)
         [ -n "$listener_pid" ] && [ -S "$default_socket_dir/s" ] && break
         sleep 0.1
     done
@@ -687,7 +739,7 @@ mkdir -p "$sandbox/elsewhere/target/debug"
 # not share a prefix with the root, and the pre-fix defect would hide again.
 escaping_root=$(git -C "$sandbox/repo" rev-parse --show-toplevel)
 escaping="$escaping_root/../elsewhere/target/debug/fixture-dotdot"
-ln -sf /bin/sleep "$sandbox/elsewhere/target/debug/fixture-dotdot"
+cp "$marker_binary" "$sandbox/elsewhere/target/debug/fixture-dotdot"
 spawn_orphan "$escaping"
 pid=$spawned_pid
 if [ -z "$pid" ]; then
@@ -829,12 +881,12 @@ echo "case 19: a daemon on a default socket outside this shell's runtime directo
 # under any `TMPDIR`, and the `srui-sessiond.sock` file name it gets under any `XDG_RUNTIME_DIR`,
 # whose directory carries no recognizable spelling at all.
 #
-# `nc -lU` through a symlink stands in for the daemon, as in case 11: ppid 1, old enough, argv[0]
-# matching the fixture pattern, and really holding the socket it is recorded as holding.
+# The marker binary's `--bind` mode stands in for the daemon, as in case 11: ppid 1, old enough,
+# argv[0] matching the fixture pattern, and really holding the socket it is recorded as holding.
 away_tmp="$sandbox/t4"
 mkdir -p "$away_tmp"
-if ! command -v nc >/dev/null 2>&1; then
-    fail "nc is unavailable; cannot stage a daemon on a foreign default socket"
+if [ ! -x "$marker_binary" ]; then
+    fail "the stand-in fixture server is missing; cannot stage a foreign default-socket daemon"
 else
     probe=0
     for spec in "$sandbox/srui-$(id -u)|s|a foreign TMPDIR's srui-$(id -u) directory" \
@@ -853,11 +905,10 @@ else
             continue
         fi
         listener=$(make_marker "fixture-foreign-runtime-$probe")
-        ln -sf "$(command -v nc)" "$listener"
-        ("$listener" -lU "$socket_path" >/dev/null 2>&1 &) 2>/dev/null
+        ("$listener" --bind "$socket_path" 600 >/dev/null 2>&1 &) 2>/dev/null
         listener_pid=""
         for _ in $(seq 1 50); do
-            listener_pid=$(pgrep -f "^$listener -lU" 2>/dev/null | head -1)
+            listener_pid=$(pgrep -f "^$listener --bind" 2>/dev/null | head -1)
             [ -n "$listener_pid" ] && [ -S "$socket_path" ] && break
             sleep 0.1
         done
@@ -1002,7 +1053,7 @@ echo "case 24: a foreign binary reached through a symlink inside the checkout is
 mkdir -p "$sandbox/sibling/target/debug"
 sibling_root=$(git -C "$sandbox/repo" rev-parse --show-toplevel)
 ln -sfn ../sibling "$sibling_root/cache"
-ln -sf /bin/sleep "$sandbox/sibling/target/debug/fixture-sibling"
+cp "$marker_binary" "$sandbox/sibling/target/debug/fixture-sibling"
 sibling_marker="$sibling_root/cache/target/debug/fixture-sibling"
 spawn_orphan "$sibling_marker"
 pid=$spawned_pid
@@ -1060,6 +1111,178 @@ else
     fi
     kill_marker "${pid:-}"
 fi
+
+echo "case 30: whitespace in TMPDIR or XDG_RUNTIME_DIR does not corrupt the default-directory list"
+# The finding: the reaper carried its default runtime directories as a space-separated string and
+# iterated them unquoted, so a space in either variable split the real directory into nonexistent
+# fragments. Three consequences, one probe each - and both variables are paths a user controls, so
+# this is not a hypothetical spelling.
+space_root="$sandbox/t s"
+mkdir -p "$space_root" "$sandbox/nolsof"
+# An `lsof` that fails, as on a host without one: staged here too rather than borrowed from case 14,
+# so this case does not depend on another having run.
+printf '#!/bin/sh\nexit 1\n' >"$sandbox/nolsof/lsof"
+chmod +x "$sandbox/nolsof/lsof"
+marker=$(make_marker fixture-space-runtime)
+spawn_orphan "$marker"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn an orphan marker for the whitespace probes"
+else
+    # (a) and (b): no socket inventory, and a socket in the default runtime directory. Rule 5 cannot
+    # be enforced, so the sweep must kill *nothing* - which is what the split list defeated: it found
+    # no socket under a directory it had mis-spelled, decided there was nothing to protect, and
+    # killed the orphan. A detached `srui-sessiond` in a checkout is the real victim of that.
+    for spec in "tmp|$space_root/srui-$(id -u)|a TMPDIR containing a space" \
+        "xdg|$space_root/x y|an XDG_RUNTIME_DIR containing a space"; do
+        which=${spec%%|*}
+        rest=${spec#*|}
+        probe_dir=${rest%%|*}
+        label=${rest#*|}
+        mkdir -p "$probe_dir"
+        if [ "${#probe_dir}" -gt 98 ]; then
+            fail "cannot stage $label: $probe_dir/s is over the 104-byte unix socket path limit"
+            continue
+        fi
+        python3 -c "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])" \
+            "$probe_dir/s" 2>/dev/null
+        if [ ! -S "$probe_dir/s" ]; then
+            fail "cannot stage $label: nothing bound in $probe_dir"
+            continue
+        fi
+        if [ "$which" = tmp ]; then
+            probe_tmp=$space_root
+            probe_xdg="$sandbox_runtime/xdg-absent"
+        else
+            probe_tmp="$sandbox_runtime/tmp"
+            probe_xdg=$probe_dir
+        fi
+        # The space in the glob is spelled `?`: `SRUI_REAP_TMP_GLOBS` is a space-separated list of
+        # globs by documented design, so a glob cannot itself contain one. The *expansion* of that
+        # glob keeps the space - pathname expansion happens after word splitting - which is what
+        # probe (c) below depends on.
+        output=$(PATH="$sandbox/nolsof:$PATH" \
+            SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
+            SRUI_REAP_AGE_MINUTES=0 \
+            SRUI_REAP_TMP_GLOBS="$sandbox/t?s/srui-*" \
+            TMPDIR="$probe_tmp" \
+            XDG_RUNTIME_DIR="$probe_xdg" \
+            bash "$reaper" 2>&1)
+        assert_alive "$pid" "the orphan survived a blind sweep with $label"
+        assert_contains "$output" "killing nothing" "the sweep still found the default socket under $label"
+        rm -f "$probe_dir/s"
+    done
+
+    # (c) The directory sweep's own exemption: the default runtime directory is never removed. The
+    # same split list made the comparison miss, so a `TMPDIR` with a space in it had its default
+    # runtime directory deleted. Socket evidence is present here, and an unreferenced sibling is
+    # removed in the same pass, so the probe cannot pass by the sweep doing nothing at all.
+    #
+    # The fourth assertion is a third instance of the same class, found while staging this one: the
+    # candidate loop expanded `$tmp_globs` twice, so every matched path containing a space was split
+    # back into fragments - which both lost the directory and, where a fragment happened to name
+    # another directory of ours, put one on the candidate list that no glob had matched.
+    space_default="$space_root/srui-$(id -u)"
+    space_sibling="$space_root/srui-fixture-leftover"
+    space_named="$space_root/srui-a b"
+    mkdir -p "$space_default" "$space_sibling" "$space_named"
+    mkdir -p "$space_root/srui-held30"
+    spawn_socket_holder "$space_root/srui-held30/s"
+    holder30=$spawned_pid
+    socket_table_add "$holder30" "$space_root/srui-held30/s"
+    PATH="$sandbox/lsofbin:$PATH" \
+        SRUI_TEST_LSOF_TABLE="$lsof_table" \
+        SRUI_REAP_PATTERN='NEVER_MATCHES_ANY_EXECUTABLE' \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$sandbox/t?s/srui-*" \
+        TMPDIR="$space_root" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        bash "$reaper" >/dev/null 2>&1
+    assert_dir_present "$space_default" "the default runtime directory under a TMPDIR with a space survived"
+    assert_dir_absent "$space_sibling" "an unreferenced sibling under the same root was still removed"
+    assert_dir_absent "$space_named" "a candidate directory whose own name contains a space was collected and removed"
+    kill_marker "${holder30:-}"
+
+    # (d) Rule 5's socket-table matcher, which took the same list through awk's `-v`. Isolated from
+    # the two environment-independent shapes beside it on purpose: the socket is *not* named
+    # `srui-sessiond.sock` and its directory is *not* named `srui-<uid>`, so the only thing that can
+    # spare this daemon is the directory list - which is how srtop's and the demos' default sockets
+    # are protected.
+    probe_xdg="$space_root/x y"
+    mkdir -p "$probe_xdg"
+    listener=$(make_marker fixture-space-xdg)
+    ("$listener" --bind "$probe_xdg/srtop.sock" 600 >/dev/null 2>&1 &) 2>/dev/null
+    listener_pid=""
+    for _ in $(seq 1 50); do
+        listener_pid=$(pgrep -f "^$listener --bind" 2>/dev/null | head -1)
+        [ -n "$listener_pid" ] && [ -S "$probe_xdg/srtop.sock" ] && break
+        sleep 0.1
+    done
+    if [ -z "$listener_pid" ] || [ ! -S "$probe_xdg/srtop.sock" ]; then
+        fail "could not stage a daemon on a default socket under an XDG_RUNTIME_DIR with a space"
+    else
+        spawned_pids+=("$listener_pid")
+        socket_table_add "$listener_pid" "$probe_xdg/srtop.sock"
+        output=$(PATH="$sandbox/lsofbin:$PATH" \
+            SRUI_TEST_LSOF_TABLE="$lsof_table" \
+            SRUI_REAP_PATTERN="$(marker_pattern "$listener")" \
+            SRUI_REAP_AGE_MINUTES=0 \
+            SRUI_REAP_TMP_GLOBS="$sandbox/t?s/srui-*" \
+            TMPDIR="$sandbox_runtime/tmp" \
+            XDG_RUNTIME_DIR="$probe_xdg" \
+            bash "$reaper" 2>&1)
+        assert_alive "$listener_pid" "a daemon on a default socket under an XDG_RUNTIME_DIR with a space survived"
+        if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $listener_pid"; then
+            fail "the reaper announced a kill for the daemon under a whitespace XDG_RUNTIME_DIR"
+            printf '%s\n' "    reaper said: $output" >&2
+        else
+            pass "the reaper never selected it"
+        fi
+    fi
+    kill_marker "${listener_pid:-}"
+fi
+kill_marker "${pid:-}"
+
+echo "case 31: rule 6 judges the file argv[0] resolves to, not the directory it sits in"
+# A fixture-named symlink inside the checkout, pointing at a binary outside every root: the name is
+# in the right place and the executable is an installed daemon or another project's build output.
+# Resolving all of a path but its final component passed it, and the orphan was signalled.
+#
+# The second probe is what keeps that from being over-tightened: a symlink inside the checkout whose
+# target is also inside it is still ordinary debris and must still be reaped.
+aliased_outside="$sandbox/repo/target/debug/fixture-aliased-outside"
+outside_target=$(make_foreign_marker "$sandbox/usr-local-bin" srui-sessiond-installed)
+ln -sf "$outside_target" "$aliased_outside"
+aliased_inside="$sandbox/repo/target/debug/fixture-aliased-inside"
+inside_target=$(make_marker fixture-aliased-real)
+ln -sf "$inside_target" "$aliased_inside"
+
+for spec in "$aliased_outside|alive|a symlink to a binary outside every root" \
+    "$aliased_inside|terminated|a symlink to a binary inside a root"; do
+    probe_marker=${spec%%|*}
+    rest=${spec#*|}
+    expect=${rest%%|*}
+    label=${rest#*|}
+    spawn_orphan "$probe_marker"
+    pid=$spawned_pid
+    if [ -z "$pid" ]; then
+        fail "could not spawn an orphan through $label"
+        continue
+    fi
+    output=$(run_reaper "$(marker_pattern "$probe_marker")" 0 2>&1)
+    if [ "$expect" = alive ]; then
+        assert_alive "$pid" "an orphan launched through $label was not signalled"
+        assert_contains "$output" "1 outside this repository" "the sweep accounted for it as foreign"
+        if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $pid"; then
+            fail "the reaper announced a kill for $label"
+            printf '%s\n' "    reaper said: $output" >&2
+        fi
+    else
+        assert_terminated "$pid" "an orphan launched through $label was still killed"
+        assert_contains "$output" "killing orphaned fixture server pid $pid" "the reaper announced the kill"
+    fi
+    kill_marker "${pid:-}"
+done
 
 echo "case 28: a pid reused inside one second is caught by the rest of the predicate"
 # `ps -o lstart=` has one-second resolution on both platforms (procps-ng included), so a pid reused by

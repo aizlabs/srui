@@ -67,32 +67,44 @@
 #      `lsof`, a daemon whose runtime directory the reaper cannot name is spared only if rule 6
 #      spares it — an installed `/usr/local/bin/srui-sessiond` is safe, one built in a checkout of
 #      this repository and detached by hand is not.
-#   6. launched from a checkout of *this* repository. The binary's path, with its directory resolved
-#      through symlinks, must lie inside the main checkout or one of its linked worktrees
-#      (`git worktree list`), which is the one thing that makes a process *this* repository's test
-#      debris rather than some other program with a familiar name. `/usr/local/bin/srui-sessiond`, a
-#      sibling project's `target/debug/srui-sessiond`, and anything whose path cannot be determined
-#      are never signalled, however leak-shaped they look.
+#   6. the file it is running lives inside a checkout of *this* repository. That is the one thing
+#      which makes a process this repository's test debris rather than some other program with a
+#      familiar name, so it is the whole of the rule, in three parts:
 #
-#      Only the resolved spelling is compared, never the one `ps` reports. Comparing the reported
-#      spelling — even with `.` and `..` folded out of it — admits any foreign path reachable
-#      through a symlink inside a checkout: with `repo/cache -> ../sibling`, a candidate
-#      `…/repo/cache/target/debug/srui-sessiond` carries the checkout's prefix letter for letter
-#      while living in another project, and the sweep killed that project's daemon (measured).
-#      The one thing the reported spelling was there to rescue — a worktree whose `target` is a
-#      symlink into a shared build cache, where every ordinary fixture's physical path lies outside
-#      the checkout — is served instead by naming the cache itself as a root: every `target` symlink
-#      inside a checkout contributes its resolved destination to the root set. Residual, accepted
-#      deliberately: a binary in such a cache is then reapable however it was launched, including
-#      one that got there because a *different* project pointed its own `target` at the same cache.
-#      A build cache a checkout of this repository points into is in scope; a symlink anywhere else
-#      in the tree is not. A candidate whose directory no longer exists is also spared, since there
-#      is nothing left to resolve.
+#        * the root set is the physical path (`pwd -P`) of the main checkout and of every linked
+#          worktree (`git worktree list`), plus the resolved destination of every `target` symlink
+#          inside them;
+#        * the candidate is argv[0] *fully resolved* — absolute, with every symlink component
+#          followed, the final one included (`resolved_executable`);
+#        * it is reapable only if that file lies under a root.
 #
-#      The cost, deliberately accepted: an orphan left by a run in a worktree that has since been
-#      deleted is no longer reapable, because its path is now inside no checkout. Those pids
-#      survive every sweep and have to be killed by hand. Stale-worktree pruning makes this a
-#      one-way ratchet, and it is the right trade — the alternative is a sweep that can reach
+#      What that promises, exactly: a process is signalled only when the executable it is running is
+#      a file inside a checkout of this repository, or inside a build cache one of those checkouts
+#      points its `target` at. How the process was *launched* is not evidence of anything.
+#      `/usr/local/bin/srui-sessiond`, a sibling project's `target/debug/srui-sessiond`, a path whose
+#      directory no longer exists, and anything whose path cannot be determined at all are never
+#      signalled, however leak-shaped they look.
+#
+#      Each part is there because the cheaper version of it killed something, and all three failures
+#      were measured here:
+#        * comparing the path as `ps` spells it, even with `.` and `..` folded out, admits any
+#          foreign file reachable through a symlink inside a checkout — with `repo/cache ->
+#          ../sibling`, `…/repo/cache/target/debug/srui-sessiond` carries the checkout's prefix
+#          letter for letter while living in another project, whose daemon the sweep killed;
+#        * comparing only physical paths, without the cache roots, makes every fixture in a worktree
+#          whose `target` is a symlink into a shared build cache unreapable, since their files are
+#          outside the checkout by design;
+#        * resolving all of a path but its last component admits a fixture-named symlink inside a
+#          checkout that points at an installed daemon or another project's build output — the name
+#          is in the right place, the executable is not.
+#
+#      Costs, accepted deliberately. An orphan left by a run in a worktree that has since been
+#      deleted is no longer reapable, because its file is now inside no checkout; those pids survive
+#      every sweep and have to be killed by hand, and stale-worktree pruning makes that a one-way
+#      ratchet. A file in a shared build cache is reapable however it was launched, including one
+#      that got there because a *different* project pointed its own `target` at the same cache: a
+#      cache a checkout of this repository points into is in scope, a symlink anywhere else in the
+#      tree is not. Both are the right way round — the alternative is a sweep that can reach
 #      binaries this repository never built.
 #
 #      Ownership evidence finer than rules 5 and 6 — a marker each test run writes for its own
@@ -273,21 +285,42 @@ target_cache_roots() {
     done
 }
 
-# Rule 6: is this binary inside a checkout of this repository? An argv[0] that is not an absolute
-# path tells us nothing about where the binary lives, so it is not reapable.
+# The file argv[0] actually names: every symlink component followed, the final one included, so that
+# what rule 6 compares against the roots is the executable itself and not a name that happens to sit
+# in the right place. Empty when the path is relative, when a directory along it is gone, or when the
+# links loop.
 #
-# Only the resolved spelling is compared; see rule 6 for why the reported one cannot be trusted.
-# The *directory* is resolved and the final component is not: a binary in a `target/debug` may
-# itself be a symlink (in the self-tests it always is), and resolving that would compare some
-# altogether different file against the roots.
-inside_repo_checkout() {
-    local exe=$1 dir resolved root
-    case $exe in
+# Resolved by hand rather than with `readlink -f`/`realpath`, neither of which is portable to both
+# platforms this script runs on. The directory is re-resolved at each step because a link target may
+# itself be relative and lead through further symlinks; sixteen steps is ELOOP's usual ceiling.
+resolved_executable() {
+    local path=$1 dir base target depth=0
+    case $path in
         /*) ;;
         *) return 1 ;;
     esac
-    dir=$(cd "$(dirname "$exe")" 2>/dev/null && pwd -P) || return 1
-    resolved="${dir%/}/$(basename "$exe")"
+    while [ "$depth" -lt 16 ]; do
+        dir=$(cd "$(dirname "$path")" 2>/dev/null && pwd -P) || return 1
+        base=$(basename "$path")
+        path="${dir%/}/$base"
+        [ -L "$path" ] || break
+        target=$(readlink "$path" 2>/dev/null) || return 1
+        [ -n "$target" ] || return 1
+        case $target in
+            /*) path=$target ;;
+            *) path="${dir%/}/$target" ;;
+        esac
+        depth=$((depth + 1))
+    done
+    [ "$depth" -lt 16 ] || return 1
+    printf '%s' "$path"
+}
+
+# Rule 6: is the file this process is running inside a checkout of this repository?
+inside_repo_checkout() {
+    local exe=$1 resolved root
+    resolved=$(resolved_executable "$exe") || return 1
+    [ -n "$resolved" ] || return 1
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         case $resolved in "$root"/*) return 0 ;; esac
@@ -462,8 +495,27 @@ held_socket_paths() {
 # Derived from *this* shell's environment, so it only names the directories a daemon started from a
 # shell like this one would use. The shapes below are what recognize one started from a shell with a
 # different `XDG_RUNTIME_DIR` or `TMPDIR`.
+# An array, never a space-separated string, and every expansion quoted. `TMPDIR` and
+# `XDG_RUNTIME_DIR` are paths a user controls, and a space in either one split the list into
+# nonexistent fragments: `default_socket_present` then found no socket in a directory it had just
+# mis-spelled, `kill_allowed` stayed 1 on a host with no `lsof`, and a detached `srui-sessiond`
+# serving its default socket was killed as debris. The array is never empty - the last two elements
+# are unconditional - which the awk matcher below relies on.
 default_tmp=${TMPDIR:-/tmp}
-default_runtime_dirs="${XDG_RUNTIME_DIR:-} ${default_tmp%/}/srui-$my_uid /tmp/srui-$my_uid"
+default_runtime_dirs=()
+[ -n "${XDG_RUNTIME_DIR:-}" ] && default_runtime_dirs+=("${XDG_RUNTIME_DIR%/}")
+default_runtime_dirs+=("${default_tmp%/}/srui-$my_uid" "/tmp/srui-$my_uid")
+
+# Is this exactly one of those directories? Compared in the shell rather than handed to awk, which
+# processes escape sequences in a `-v` assignment and would read a directory named with a backslash
+# as something else.
+is_default_runtime_dir() {
+    local candidate=${1%/} dir
+    for dir in "${default_runtime_dirs[@]}"; do
+        [ "${dir%/}" = "$candidate" ] && return 0
+    done
+    return 1
+}
 
 # The environment-independent shapes of a default socket (`unix_security::default_socket_path`):
 # the `srui-<uid>` directory component it gets under any `TMPDIR`, and the file name it gets under
@@ -484,8 +536,7 @@ default_socket_name="srui-sessiond.sock"
 # installed one, while one built in this repository and detached by hand stays at risk.
 default_socket_present() {
     local dir entry
-    # shellcheck disable=SC2086 # deliberate word splitting: a space-separated list of directories
-    for dir in $default_runtime_dirs; do
+    for dir in "${default_runtime_dirs[@]}"; do
         [ -n "$dir" ] || continue
         [ -d "${dir%/}" ] || continue
         for entry in "${dir%/}"/*; do
@@ -499,15 +550,18 @@ default_socket_present() {
 socket_snapshot=$(socket_holders)
 socket_evidence=1
 [ -n "$socket_snapshot" ] || socket_evidence=0
-default_socket_pids=$(printf '%s\n' "$socket_snapshot" |
-    awk -F'\t' -v dirs="$default_runtime_dirs" -v leaf="$default_runtime_leaf" \
-        -v sock_name="$default_socket_name" '
-        BEGIN { n = split(dirs, list, " ") }
+# The directory list arrives as the first input file, one path per line, rather than through `-v`:
+# `split(dirs, list, " ")` could not carry a path containing a space, and an assignment would have
+# its escape sequences processed on the way in. `NR == FNR` is safe because that file always has at
+# least the two unconditional entries of `default_runtime_dirs`.
+default_socket_pids=$(awk -F'\t' -v leaf="$default_runtime_leaf" \
+    -v sock_name="$default_socket_name" '
+        NR == FNR { if ($0 != "") list[++n] = $0; next }
         {
             # A directory this sweep can name: protects every default socket under it, sessiond or
             # not (srtop and the demos have their own default names).
             for (i = 1; i <= n; i++) {
-                if (list[i] != "" && index($2, list[i] "/") == 1) { print $1; next }
+                if (index($2, list[i] "/") == 1) { print $1; next }
             }
             # Shape, for a daemon whose runtime directory this sweep cannot name: the default
             # runtime directory under a `TMPDIR` other than ours...
@@ -517,7 +571,8 @@ default_socket_pids=$(printf '%s\n' "$socket_snapshot" |
             sub(/^.*\//, "", name)
             if (name == sock_name) { print $1; next }
         }
-    ' | sort -u | tr '\n' ' ')
+    ' <(printf '%s\n' "${default_runtime_dirs[@]}") <(printf '%s\n' "$socket_snapshot") |
+    sort -u | tr '\n' ' ')
 
 # Rule 5 is only enforceable while the socket table is readable. Without `lsof` — missing, or denied
 # — `default_socket_pids` is empty, and a deliberately detached daemon serving the default socket
@@ -680,14 +735,19 @@ socket_only_directory() {
     [ -z "$(find "$dir" -mindepth 1 -maxdepth 1 ! -type s -print -quit 2>/dev/null)" ]
 }
 
-# shellcheck disable=SC2086 # deliberate word splitting: tmp_globs is a list of globs
+# `set --` splits the list on whitespace *and* expands each glob, so `"$@"` is already the matched
+# paths. Expanding them a second time (`for path in $glob`, unquoted) split every match that contains
+# a space back into fragments: a directory named `/tmp/srui-my notes` was then never collected at all,
+# and - worse - a fragment that happened to name some *other* directory of ours put it on the
+# candidate list without any glob matching it. A glob that matches nothing stays here as the pattern
+# itself, which `-d` discards. A glob cannot contain a space, by the documented design of
+# `SRUI_REAP_TMP_GLOBS`; the paths it matches can.
+# shellcheck disable=SC2086 # deliberate word splitting: tmp_globs is a space-separated list of globs
 set -- $tmp_globs
 candidates=()
-for glob in "$@"; do
-    for path in $glob; do
-        [ -d "$path" ] || continue
-        candidates+=("$path")
-    done
+for path in "$@"; do
+    [ -d "$path" ] || continue
+    candidates+=("$path")
 done
 
 removed=0
@@ -706,9 +766,7 @@ for dir in "${candidates[@]+"${candidates[@]}"}"; do
         continue
     fi
     # The default runtime directory belongs to whatever daemon a human started, never to a test.
-    # shellcheck disable=SC2086 # deliberate word splitting: a space-separated list of directories
-    if printf '%s\n' $default_runtime_dirs |
-        awk -v dir="$dir" '$0 != "" && $0 == dir { found = 1 } END { exit !found }'; then
+    if is_default_runtime_dir "$dir"; then
         held=$((held + 1))
         continue
     fi

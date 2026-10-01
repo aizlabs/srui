@@ -1184,6 +1184,16 @@ mod tests {
         name
     }
 
+    /// The longest text a metric cell can carry. Asserted against the metric
+    /// module's own reserved bound, so a later metric that publishes something
+    /// wider cannot quietly leave this fixture — and the frame ceiling it proves
+    /// — measuring a row narrower than the real one.
+    fn widest_metric_cell() -> String {
+        let cell = crate::metric::missing_text(MissingReason::Unavailable).to_string();
+        assert_eq!(cell.len(), crate::metric::MAX_CELL_BYTES);
+        cell
+    }
+
     /// `rows` rows carrying the widest name this app can publish, with item IDs
     /// no fixture in this module has already published.
     fn widest_rows(rows: u64) -> Vec<Row> {
@@ -1202,6 +1212,10 @@ mod tests {
                 value: Value::List(vec![
                     Value::UnsignedInt(index + 1),
                     Value::String(name.as_str().to_string()),
+                    // The widest metric cell this app can publish, so the
+                    // ceiling this fixture proves covers every real row
+                    // (PX-005).
+                    Value::String(widest_metric_cell()),
                 ]),
             })
             .collect()
@@ -1527,6 +1541,9 @@ mod tests {
                         ..template.clone()
                     },
                     display_name: self.name.clone(),
+                    // Unread, which is the widest cell a metric publishes: this
+                    // host exists to measure the largest collection that fits.
+                    resident: Observed::Missing(MissingReason::Unavailable),
                 })
                 .collect();
             snapshot
@@ -1718,6 +1735,7 @@ mod tests {
                     value: Value::List(vec![
                         Value::UnsignedInt(9000 + offset),
                         Value::String("appended".into()),
+                        Value::String("0 B".into()),
                     ]),
                 }],
             ))

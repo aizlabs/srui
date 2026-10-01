@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-005",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Resident memory as one defined read-only metric beside PID and name, with explicit unavailable states; no sorting, no further memory fields, no proportional or shared-page accounting, no process controls, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX005-001",
+      "feature": "Resident memory is published as a third table column, stored as an exact u64 byte count and converted once on the server into IEC multiples with the fraction truncated rather than rounded, so a count just below a multiple is never displayed as the multiple it never reached and a value too large for a float is still published exactly",
+      "scope": "PX-005/fake, scripted and live procfs sources/read-only",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-005",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005-002",
+      "feature": "A metric definition states the interface the number is read from (/proc/<pid>/stat field 24 in pages, times the page size the scanned mount reports through AT_PAGESZ) and what it does not account for: shared pages counted in full for every mapper, swapped-out and never-faulted pages not counted, and the kernel's own inaccuracy caveat",
+      "scope": "PX-005/metric definition only; the metric registry, scheduling and availability model are PX-042",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-005",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005-003",
+      "feature": "Every cell carries its own availability: a resident value the scan could not read is published as Unavailable, or Denied when a permission refused it, never as zero, while a genuine zero stays 0 B; a record whose metric is unreadable is still a published record, so an unreadable field does not make the record list incomplete or add a clause to the status line",
+      "scope": "PX-005/all sources/read-only",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-005",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005-004",
+      "feature": "The page size is read from the scanned mount's own auxiliary vector rather than from this machine, refused when it is not a believable power of two, and the conversion is checked, so a mount that cannot state a page size publishes no resident value instead of attributing another host's page size or a wrapped product to records never measured under it",
+      "scope": "PX-005/live and fixture procfs roots/read-only",
+      "source_refs": [
+        "K1"
+      ],
+      "owner": "PX-005",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005-005",
+      "feature": "On a real Linux host a bounded allocation owned by the test moves the published resident value within a documented tolerance, and the collector's byte count agrees within tolerance with the kernel's own VmRSS for the same process, which the kernel reports in kibibytes and therefore witnesses the page-size conversion independently",
+      "scope": "PX-005/live procfs source/read-only; tolerances rather than byte equality, because live accounting is not a contract",
+      "source_refs": [
+        "K1"
+      ],
+      "owner": "PX-005",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005.md"
+      ]
+    }
+  ]
+}

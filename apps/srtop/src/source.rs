@@ -235,6 +235,20 @@ impl From<&str> for DisplayName {
 pub struct ProcessRecord {
     pub key: ProcessKey,
     pub display_name: DisplayName,
+    /// Resident memory in bytes, or why this scan could not read it
+    /// ([`crate::metric::RESIDENT_MEMORY`]).
+    ///
+    /// The stored value is the exact byte count, never a display string: a row's
+    /// text is derived from it once, at projection, and nothing downstream has to
+    /// parse a unit back out of a cell. A metric a scan could not read is
+    /// [`Observed::Missing`] rather than zero, and a *known* zero — a kernel
+    /// thread holds no resident pages — stays a known zero.
+    ///
+    /// A record whose metric could not be read is still a record: its identity
+    /// and name are intact, so it is published with that one field reported
+    /// unread. Per-field unavailability is therefore not a [`Completeness`]
+    /// degradation, which is about whether the record *list* is authoritative.
+    pub resident: Observed<u64>,
 }
 
 /// What part of the scan could not be observed.
@@ -629,17 +643,24 @@ impl ProcessSource for FakeProcessSource {
             source: SourceId(Self::SOURCE.into()),
             sampled_at: SnapshotTime(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)),
             records: vec![
+                // A value whose fraction is truncated rather than rounded.
                 ProcessRecord {
                     key: Self::key("worker-a", Observed::Known(4101)),
                     display_name: "worker".into(),
+                    resident: Observed::Known(1_234_567),
                 },
+                // A known zero, which must survive as one.
                 ProcessRecord {
                     key: Self::key("worker-b", Observed::Known(4102)),
                     display_name: "worker".into(),
+                    resident: Observed::Known(0),
                 },
+                // Both fields unread, for different reasons: the states are
+                // per field, not per record.
                 ProcessRecord {
                     key: Self::key("helper", Observed::Missing(MissingReason::Unavailable)),
                     display_name: "helper".into(),
+                    resident: Observed::Missing(MissingReason::Denied),
                 },
             ],
             vanished: 0,
@@ -701,28 +722,42 @@ impl ScriptedFakeSource {
         }
     }
 
-    fn record(token: &str, pid: u32, name: &str) -> ProcessRecord {
+    /// One scripted record. Its resident value is fixed per process, because a
+    /// metric that moved on every step would make the two identical steps
+    /// different and hide the "an unchanged snapshot publishes nothing" case the
+    /// script exists to cover.
+    fn record(token: &str, pid: u32, name: &str, resident: Observed<u64>) -> ProcessRecord {
         ProcessRecord {
             key: Self::key(token, pid),
             display_name: name.into(),
+            resident,
         }
     }
 
     /// The records and completeness of one step, independent of the sample time.
     pub fn script(step: usize) -> (Vec<ProcessRecord>, Completeness) {
+        let worker_a = || Self::record("worker-a", 4101, "worker", Observed::Known(2_097_152));
+        let helper = |name: &str| {
+            Self::record(
+                "helper",
+                4103,
+                name,
+                Observed::Missing(MissingReason::Unavailable),
+            )
+        };
         let settled = || {
             vec![
-                Self::record("worker-a", 4101, "worker"),
-                Self::record("helper", 4103, "helper-tool"),
-                Self::record("builder", 4104, "builder"),
+                worker_a(),
+                helper("helper-tool"),
+                Self::record("builder", 4104, "builder", Observed::Known(5_368_709_120)),
             ]
         };
         match step % Self::STEPS {
             0 | 1 => (
                 vec![
-                    Self::record("worker-a", 4101, "worker"),
-                    Self::record("worker-b", 4102, "worker"),
-                    Self::record("helper", 4103, "helper"),
+                    worker_a(),
+                    Self::record("worker-b", 4102, "worker", Observed::Known(1023)),
+                    helper("helper"),
                 ],
                 Completeness::Complete,
             ),

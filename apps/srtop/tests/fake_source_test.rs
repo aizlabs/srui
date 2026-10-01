@@ -65,17 +65,23 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
         assert_eq!(
             rows.iter().map(|row| row.value.clone()).collect::<Vec<_>>(),
             vec![
+                // A resident value whose fraction is truncated, a known zero,
+                // and a metric this fixture's scan was denied: three distinct
+                // availability states, none of them published as the others.
                 Value::List(vec![
                     Value::UnsignedInt(4101),
-                    Value::String("worker".into())
+                    Value::String("worker".into()),
+                    Value::String("1.1 MiB".into())
                 ]),
                 Value::List(vec![
                     Value::UnsignedInt(4102),
-                    Value::String("worker".into())
+                    Value::String("worker".into()),
+                    Value::String("0 B".into())
                 ]),
                 Value::List(vec![
                     Value::String("Unavailable".into()),
-                    Value::String("helper".into())
+                    Value::String("helper".into()),
+                    Value::String("Denied".into())
                 ]),
             ]
         );
@@ -140,6 +146,7 @@ fn a_snapshot_larger_than_one_model_batch_is_published_whole() {
                         ..template.clone()
                     },
                     display_name: DisplayName::sanitize(b"worker"),
+                    resident: Observed::Known(4096),
                 })
                 .collect();
             snapshot

@@ -2,6 +2,7 @@
 //! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004). No action handlers
 //! are installed and no process is ever opened for control.
 
+pub mod metric;
 pub mod procfs;
 mod projection;
 pub mod refresh;
@@ -247,7 +248,14 @@ pub(crate) fn initialize_rows(
         Table::builder(TABLE)
             .parent(COLUMN)
             .model_ref(MODEL)
-            .columns([Value::String("PID".into()), Value::String("Name".into())])
+            // Headings come from the metric definitions the cells are built
+            // from, so a column cannot be labeled as something other than what
+            // the server published into it (PX-005).
+            .columns([
+                Value::String("PID".into()),
+                Value::String("Name".into()),
+                Value::String(metric::RESIDENT_MEMORY.label.into()),
+            ])
             .label("Processes")
             .grow(1.0)
             .create(ui)?;
@@ -425,7 +433,8 @@ mod tests {
                 store.get_node(TABLE).unwrap().get_property(COLUMNS),
                 Some(&Value::List(vec![
                     Value::String("PID".into()),
-                    Value::String("Name".into())
+                    Value::String("Name".into()),
+                    Value::String("Resident".into())
                 ]))
             );
         });

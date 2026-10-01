@@ -68,6 +68,9 @@ fn record(pid: u32) -> ProcessRecord {
     ProcessRecord {
         key: key(pid),
         display_name: format!("worker-{pid}").as_str().into(),
+        // One page of a 4 KiB-page host, so a retained row's metric is a value
+        // these tests can recognize rather than an unread one.
+        resident: Observed::Known(4096),
     }
 }
 

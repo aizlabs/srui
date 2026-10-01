@@ -40,6 +40,11 @@ impl ProcFixture {
         Self(path)
     }
 
+    /// Identity files, plus the page size the scan converts resident pages with.
+    /// A fixture states its own page size for the same reason it states its own
+    /// hostname: a canned tree is not this machine, and a test that borrowed this
+    /// machine's page size would publish different byte counts on a 4 KiB host
+    /// and a 16 KiB one.
     fn identity(&self, hostname: &str, boot_id: &str, namespace: &str) -> &Self {
         fs::create_dir_all(self.0.join("sys/kernel/random")).unwrap();
         fs::write(self.0.join("sys/kernel/hostname"), format!("{hostname}\n")).unwrap();
@@ -50,11 +55,39 @@ impl ProcFixture {
         .unwrap();
         fs::create_dir_all(self.0.join("self/ns")).unwrap();
         std::os::unix::fs::symlink(namespace, self.0.join("self/ns/pid")).unwrap();
+        self.page_size(FIXTURE_PAGE_SIZE)
+    }
+
+    /// The page size this tree reports through `AT_PAGESZ` in its own
+    /// `self/auxv`, exactly as a kernel reports one.
+    fn page_size(&self, bytes: u64) -> &Self {
+        self.auxv(&auxv(&[(AT_PAGESZ, bytes), (AT_NULL, 0)]))
+    }
+
+    /// A verbatim auxiliary vector, for the cases a well-formed one cannot cover.
+    fn auxv(&self, bytes: &[u8]) -> &Self {
+        let path = self.0.join("self");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("auxv"), bytes).unwrap();
         self
     }
 
     fn process(&self, pid: u32, comm: &[u8], ticks: u64) -> &Self {
         self.raw(pid, &stat_line(pid, comm, ticks))
+    }
+
+    /// A record whose `stat` reports `resident_pages` in field 24.
+    fn resident(&self, pid: u32, comm: &[u8], ticks: u64, resident_pages: u64) -> &Self {
+        self.raw(
+            pid,
+            &stat_line_with_resident(pid, comm, ticks, &resident_pages.to_string()),
+        )
+    }
+
+    /// A record whose `stat` reports `field` where its resident page count
+    /// belongs — a count no scan can read as a number of pages.
+    fn unreadable_resident(&self, pid: u32, comm: &[u8], ticks: u64, field: &str) -> &Self {
+        self.raw(pid, &stat_line_with_resident(pid, comm, ticks, field))
     }
 
     fn raw(&self, pid: u32, stat: &[u8]) -> &Self {
@@ -88,6 +121,13 @@ impl ProcFixture {
         fs::create_dir_all(self.0.join(format!("{named}/ns"))).unwrap();
         std::os::unix::fs::symlink(namespace, self.0.join(format!("{named}/ns/pid"))).unwrap();
         std::os::unix::fs::symlink(named.to_string(), self.0.join("self")).unwrap();
+        // `self` now resolves elsewhere, so the page size this tree reported
+        // through the directory it replaced is restored behind the new link.
+        fs::write(
+            self.0.join(format!("{named}/auxv")),
+            auxv(&[(AT_PAGESZ, FIXTURE_PAGE_SIZE), (AT_NULL, 0)]),
+        )
+        .unwrap();
         self
     }
 
@@ -113,15 +153,45 @@ impl Drop for ProcFixture {
     }
 }
 
-/// `/proc/<pid>/stat`: `pid (comm) state ...` with start time as field 22 (K1).
+/// Page size every fixture tree reports unless a test states another one. Chosen
+/// to differ from this machine's: a byte count built from the host's page size
+/// would be a different number on a 4 KiB host and a 16 KiB one.
+const FIXTURE_PAGE_SIZE: u64 = 8192;
+/// `AT_PAGESZ` and `AT_NULL` as the kernel writes them into an auxiliary vector
+/// (K1, `getauxval(3)`). Transcribed here rather than imported, so the collector
+/// and this suite cannot drift onto the same wrong constant.
+const AT_PAGESZ: u64 = 6;
+const AT_NULL: u64 = 0;
+
+/// `entries` as an auxiliary vector: pairs of native-endian pointer-width words,
+/// exactly the layout `/proc/<pid>/auxv` carries.
+fn auxv(entries: &[(u64, u64)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (key, value) in entries {
+        for word in [key, value] {
+            bytes.extend_from_slice(&(*word as usize).to_ne_bytes());
+        }
+    }
+    bytes
+}
+
+/// `/proc/<pid>/stat`: `pid (comm) state ...` with start time as field 22 and a
+/// resident page count of zero as field 24 (K1).
 fn stat_line(pid: u32, comm: &[u8], ticks: u64) -> Vec<u8> {
+    stat_line_with_resident(pid, comm, ticks, "0")
+}
+
+/// The same line with `resident` written verbatim as field 24, so a test can
+/// supply a count, a nonsense field, or nothing at all.
+fn stat_line_with_resident(pid: u32, comm: &[u8], ticks: u64, resident: &str) -> Vec<u8> {
     let mut line = format!("{pid} (").into_bytes();
     line.extend_from_slice(comm);
     line.extend_from_slice(b") S");
     for filler in 1..=18 {
         line.extend_from_slice(format!(" {filler}").as_bytes());
     }
-    line.extend_from_slice(format!(" {ticks} 4096 0 18446744073709551615\n").as_bytes());
+    // Field 22 is the start time, 23 the virtual size, 24 the resident pages.
+    line.extend_from_slice(format!(" {ticks} 4096 {resident} 18446744073709551615\n").as_bytes());
     line
 }
 
@@ -650,7 +720,7 @@ fn hostile_names_cannot_shift_fields_or_reach_the_ui_as_live_content() {
     }
     // Direct parser checks, independent of the directory scan.
     assert_eq!(
-        parse_stat(808, &stat_line(808, hostile, 77)).map(|(_, ticks)| ticks),
+        parse_stat(808, &stat_line(808, hostile, 77)).map(|stat| stat.start_ticks),
         Some(77)
     );
     assert_eq!(parse_stat(808, &stat_line(809, b"x", 77)), None);
@@ -697,7 +767,7 @@ fn oversized_records_are_bounded_rather_than_read_without_limit() {
     straddling.extend_from_slice(b"907081358 4096 0 18446744073709551615\n");
     assert!(straddling.len() as u64 > MAX_FILE_BYTES);
     assert_eq!(
-        parse_stat(901, &straddling[..MAX_FILE_BYTES as usize]).map(|(_, ticks)| ticks),
+        parse_stat(901, &straddling[..MAX_FILE_BYTES as usize]).map(|stat| stat.start_ticks),
         Some(9070),
         "a silent cut would mint this wrong creation token"
     );
@@ -721,6 +791,250 @@ fn oversized_records_are_bounded_rather_than_read_without_limit() {
         Some(MissingReason::Unavailable),
         "an oversized record is skipped with a reason, never silently shortened"
     );
+}
+
+/// The resident cell of every published row, in published order.
+fn resident_cells(session: &srui_sessiond::Session) -> Vec<String> {
+    session.with_store(|store| {
+        store
+            .get_model(srui_process_explorer::MODEL)
+            .expect("the shell publishes one collection")
+            .items
+            .values()
+            .map(|item| {
+                let srui_sdk::Value::List(cells) = &item.value else {
+                    panic!("expected table cells, got {:?}", item.value)
+                };
+                let srui_sdk::Value::String(text) = &cells[2] else {
+                    panic!("a metric cell is published as text, got {:?}", cells[2])
+                };
+                text.clone()
+            })
+            .collect()
+    })
+}
+
+/// The resident value of every record a scan published, in scan order.
+fn resident_of(snapshot: &srui_process_explorer::source::ProcessSnapshot) -> Vec<Observed<u64>> {
+    snapshot
+        .records
+        .iter()
+        .map(|record| record.resident.clone())
+        .collect()
+}
+
+/// PX-005: a resident page count becomes an exact byte count through the page
+/// size the scanned mount itself reports, and reaches the row as IEC text.
+#[test]
+fn resident_memory_is_published_from_pages_and_the_mounts_own_page_size() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity(
+            "fixture-host",
+            "11111111-2222-3333-4444-555555555555",
+            "pid:[4026531836]",
+        )
+        .resident(1, b"systemd", 7, 1)
+        .resident(2, b"kernel-thread", 9, 0)
+        .resident(3, b"builder", 11, 1_500_000);
+    let snapshot = fixture.source().snapshot();
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![
+            Observed::Known(FIXTURE_PAGE_SIZE),
+            // A process with no resident pages is a known zero, not a gap.
+            Observed::Known(0),
+            Observed::Known(1_500_000 * FIXTURE_PAGE_SIZE),
+        ]
+    );
+
+    // The published text names the multiple it is in, and the byte count behind
+    // it is the exact product — 12,288,000,000 bytes is 11.4 GiB, truncated
+    // rather than rounded up to 11.5.
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
+    assert_eq!(
+        resident_cells(&session),
+        vec!["8.0 KiB".to_string(), "0 B".into(), "11.4 GiB".into()]
+    );
+    assert_eq!(1_500_000 * FIXTURE_PAGE_SIZE, 12_288_000_000);
+
+    // The same page counts under a different page size are different byte
+    // counts: the unit is the mount's, never this machine's.
+    let narrower = ProcFixture::new();
+    narrower
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .page_size(4096)
+        .resident(1, b"systemd", 7, 1)
+        .resident(3, b"builder", 11, 1_500_000);
+    assert_eq!(
+        resident_of(&narrower.source().snapshot()),
+        vec![Observed::Known(4096), Observed::Known(6_144_000_000)]
+    );
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut narrower.source()).unwrap();
+    assert_eq!(
+        resident_cells(&session),
+        vec!["4.0 KiB".to_string(), "5.7 GiB".into()]
+    );
+}
+
+/// A metric is not an identity: a record whose resident field cannot be read is
+/// still published, with that one field reported unread.
+#[test]
+fn a_resident_field_a_scan_cannot_read_is_unavailable_rather_than_zero() {
+    // A line that ends before field 24 exists at all.
+    let mut truncated = b"12 (short) S".to_vec();
+    for filler in 1..=18 {
+        truncated.extend_from_slice(format!(" {filler}").as_bytes());
+    }
+    truncated.extend_from_slice(b" 55\n");
+
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        // `rss` is a signed long in the kernel's own format string, so a
+        // negative value is possible on the wire and is not a page count.
+        .unreadable_resident(10, b"negative", 5, "-1")
+        .unreadable_resident(11, b"words", 5, "many")
+        .raw(12, &truncated);
+    let snapshot = fixture.source().snapshot();
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Missing(MissingReason::Unavailable),
+        ]
+    );
+    // The records themselves are intact: names, creation tokens and a complete
+    // scan. An unreadable metric is not an unreadable record.
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    assert_eq!(snapshot.records.len(), 3);
+    assert_eq!(
+        snapshot
+            .records
+            .iter()
+            .map(|record| record.key.creation.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            CreationToken::LinuxBootTicks(5),
+            CreationToken::LinuxBootTicks(5),
+            CreationToken::LinuxBootTicks(55),
+        ]
+    );
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
+    assert_eq!(resident_cells(&session), vec!["Unavailable"; 3]);
+    // And the status still describes an authoritative, complete scan: one field
+    // of one record is not a degraded record list.
+    assert_eq!(
+        published_status(fixture.source().status_text(), &snapshot),
+        fixture.source().status_text()
+    );
+}
+
+/// A mount that cannot state its page size cannot state a byte count either, and
+/// says so in every row rather than publishing zeros or this machine's page size.
+#[test]
+fn a_mount_that_cannot_state_its_page_size_publishes_no_resident_value() {
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        // A vector that never mentions AT_PAGESZ.
+        ("no page-size entry", auxv(&[(31, 4096), (AT_NULL, 0)])),
+        // Terminated first: nothing after AT_NULL is defined, so a page size
+        // written past the terminator is not an answer.
+        (
+            "after the terminator",
+            auxv(&[(AT_NULL, 0), (AT_PAGESZ, 4096)]),
+        ),
+        (
+            "not a power of two",
+            auxv(&[(AT_PAGESZ, 5000), (AT_NULL, 0)]),
+        ),
+        ("zero", auxv(&[(AT_PAGESZ, 0), (AT_NULL, 0)])),
+        ("too small", auxv(&[(AT_PAGESZ, 256), (AT_NULL, 0)])),
+        (
+            "implausibly large",
+            auxv(&[(AT_PAGESZ, 1 << 31), (AT_NULL, 0)]),
+        ),
+        // Half a word is not a value.
+        ("a partial word", vec![0xff, 0x01, 0x02]),
+        ("empty", Vec::new()),
+    ];
+    for (label, bytes) in cases {
+        let fixture = ProcFixture::new();
+        fixture
+            .identity("fixture-host", "boot-a", "pid:[4026531836]")
+            .auxv(&bytes)
+            .resident(1, b"systemd", 7, 10);
+        let snapshot = fixture.source().snapshot();
+        assert_eq!(
+            resident_of(&snapshot),
+            vec![Observed::Missing(MissingReason::Unavailable)],
+            "{label}"
+        );
+        // The record list is still authoritative: the page size says nothing
+        // about which processes exist.
+        assert_eq!(snapshot.completeness, Completeness::Complete, "{label}");
+        let session = srui_sessiond::Session::mint();
+        srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
+        assert_eq!(resident_cells(&session), vec!["Unavailable"], "{label}");
+    }
+
+    // No auxiliary vector at all: the file is simply absent.
+    let absent = ProcFixture::new();
+    absent
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(1, b"systemd", 7, 10);
+    fs::remove_file(absent.0.join("self/auxv")).unwrap();
+    assert_eq!(
+        resident_of(&absent.source().snapshot()),
+        vec![Observed::Missing(MissingReason::Unavailable)]
+    );
+
+    // Present but unreadable: the reason a value is missing is reported, not
+    // flattened into "unavailable".
+    let denied = ProcFixture::new();
+    denied
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(1, b"systemd", 7, 10);
+    let path = denied.0.join("self/auxv");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let snapshot = denied.source().snapshot();
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![Observed::Missing(MissingReason::Denied)]
+    );
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut denied.source()).unwrap();
+    assert_eq!(resident_cells(&session), vec!["Denied"]);
+}
+
+/// A page count that cannot be converted is reported unread, never wrapped into
+/// a small confident number.
+#[test]
+fn a_page_count_too_large_to_convert_is_unavailable_rather_than_wrapped() {
+    assert!(u64::MAX.checked_mul(FIXTURE_PAGE_SIZE).is_none());
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(1, b"absurd", 7, u64::MAX)
+        // One page past what the conversion can represent.
+        .resident(2, b"absurd", 8, u64::MAX / FIXTURE_PAGE_SIZE + 1)
+        // The largest count that still converts.
+        .resident(3, b"largest", 9, u64::MAX / FIXTURE_PAGE_SIZE);
+    let snapshot = fixture.source().snapshot();
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Known((u64::MAX / FIXTURE_PAGE_SIZE) * FIXTURE_PAGE_SIZE),
+        ]
+    );
+    assert_eq!(snapshot.completeness, Completeness::Complete);
 }
 
 #[cfg(target_os = "linux")]
@@ -784,12 +1098,24 @@ mod live {
             .find(|record| record.key.pid == Observed::Known(pid))
             .expect("the owned worker must appear in a live snapshot");
         assert_eq!(record.display_name.as_str(), "sleep");
+        // A sleeping worker holds a real, readable amount of memory: a live
+        // record's metric is a value, not an unread field (PX-005).
+        let Observed::Known(resident) = record.resident else {
+            panic!(
+                "a live record's resident memory must be readable: {:?}",
+                record.resident
+            )
+        };
+        assert!(resident > 0, "a running process holds resident pages");
         let CreationToken::LinuxBootTicks(ticks) = record.key.creation else {
             panic!("a live Linux record must carry a boot-ticks creation token")
         };
         assert!(ticks > 0);
         let raw = std::fs::read(format!("/proc/{pid}/stat")).unwrap();
-        assert_eq!(parse_stat(pid, &raw).map(|(_, ticks)| ticks), Some(ticks));
+        assert_eq!(
+            parse_stat(pid, &raw).map(|stat| stat.start_ticks),
+            Some(ticks)
+        );
         assert!(matches!(record.key.boot, Observed::Known(_)));
         assert!(matches!(record.key.host, Observed::Known(_)));
         assert!(matches!(record.key.pid_namespace, Observed::Known(_)));
@@ -972,6 +1298,136 @@ mod live {
             session.current_revision(),
             view.status(),
         );
+    }
+
+    /// PX-005 acceptance on a real host: a bounded allocation this test owns
+    /// moves the resident value the collector publishes for this very process,
+    /// and the number it publishes agrees with the kernel's own `VmRSS` for the
+    /// same process — which the kernel reports in kibibytes, so the page-size
+    /// conversion is checked against a unit this app did not choose.
+    ///
+    /// Tolerances rather than equality, because live accounting is not a
+    /// contract: the two reads happen at different instants, every other test
+    /// thread in this process shares its address space, and a host under memory
+    /// pressure may reclaim pages between them. Both bounds are one-sided in the
+    /// direction that cannot pass by accident — the growth must be *at least*
+    /// what was touched, less the stated slack, and the two independent reports
+    /// must agree *within* it.
+    #[test]
+    fn a_test_owned_allocation_moves_the_published_resident_memory() {
+        /// Bytes this test allocates and touches, then frees.
+        const TOUCHED: u64 = 64 * 1024 * 1024;
+        /// Slack allowed between what was touched and the growth observed.
+        const GROWTH_SLACK: u64 = 16 * 1024 * 1024;
+        /// Slack allowed between the collector's byte count and the kernel's own
+        /// `VmRSS` for the same process, read moments apart.
+        const AGREEMENT_SLACK: u64 = 32 * 1024 * 1024;
+        /// Smallest page size any Linux host uses, so writing at this stride
+        /// touches every page whatever the real page size is.
+        const STRIDE: usize = 4096;
+
+        let own = std::process::id();
+        let session = Session::mint();
+        let mut source = ProcFsSource::live();
+        let (mut view, first) = start_from_source(&session, &mut source).unwrap();
+        let before = resident_bytes_of(&first, own);
+        assert_eq!(
+            published_resident(&session, own),
+            srui_process_explorer::metric::format_iec_bytes(before),
+            "the first publication already carries this process's own resident memory"
+        );
+
+        // Touched, not merely allocated: an untouched mapping is not resident,
+        // and one byte per page is what forces each page to exist.
+        let mut block = vec![0u8; TOUCHED as usize];
+        let mut offset = 0;
+        while offset < block.len() {
+            block[offset] = 1;
+            offset += STRIDE;
+        }
+        std::hint::black_box(&block);
+
+        let snapshot = source.snapshot();
+        let kernel = vm_rss_bytes();
+        let after = resident_bytes_of(&snapshot, own);
+        let outcome = view.apply(&session, LIVE_STATUS_TEXT, &snapshot).unwrap();
+        assert!(
+            after >= before + TOUCHED - GROWTH_SLACK,
+            "resident memory went from {before} to {after} bytes, which is less than the \
+             {TOUCHED} bytes this test touched, less {GROWTH_SLACK} bytes of slack"
+        );
+        assert!(
+            after.abs_diff(kernel) <= AGREEMENT_SLACK,
+            "the collector published {after} bytes where the kernel's own VmRSS says {kernel}"
+        );
+        // The moved value reached the published row, through a refresh of the
+        // shell that was already built.
+        assert!(outcome.updated >= 1, "{outcome:?}");
+        assert_eq!(
+            published_resident(&session, own),
+            srui_process_explorer::metric::format_iec_bytes(after)
+        );
+        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        println!(
+            "PX-005 live evidence: pid={own} touched={TOUCHED} before={before} after={after} \
+             growth={} kernel_vm_rss={kernel} published={:?} records={} updated={}",
+            after - before,
+            published_resident(&session, own),
+            snapshot.records.len(),
+            outcome.updated,
+        );
+        drop(block);
+    }
+
+    /// The resident bytes `snapshot` observed for `pid`, which a live scan of
+    /// this process's own `/proc` entry must be able to read.
+    fn resident_bytes_of(
+        snapshot: &srui_process_explorer::source::ProcessSnapshot,
+        pid: u32,
+    ) -> u64 {
+        let record = snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .expect("a live scan lists the scanning process itself");
+        match record.resident {
+            Observed::Known(bytes) => bytes,
+            ref unread => {
+                panic!("this process's own resident memory must be readable: {unread:?}")
+            }
+        }
+    }
+
+    /// The resident cell a client would show for `pid`.
+    fn published_resident(session: &Session, pid: u32) -> String {
+        let (_, value) = row_for(session, pid).expect("the row of this process is published");
+        let Value::List(cells) = value else {
+            panic!("expected table cells")
+        };
+        let Value::String(text) = &cells[2] else {
+            panic!("a metric cell is published as text, got {:?}", cells[2])
+        };
+        text.clone()
+    }
+
+    /// `VmRSS` from this process's `/proc/self/status`, in bytes. The kernel
+    /// prints it in kibibytes, so it is an independent witness to the page-size
+    /// conversion this collector performs.
+    fn vm_rss_bytes() -> u64 {
+        let status =
+            std::fs::read_to_string("/proc/self/status").expect("a Linux host has a status file");
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .expect("a process with an address space reports VmRSS");
+        let mut fields = line.split_whitespace();
+        let kibibytes: u64 = fields
+            .nth(1)
+            .expect("VmRSS carries a value")
+            .parse()
+            .expect("VmRSS is a decimal count");
+        assert_eq!(fields.next(), Some("kB"), "{line}");
+        kibibytes * 1024
     }
 
     /// The published row of `pid`, if the collection currently holds one.

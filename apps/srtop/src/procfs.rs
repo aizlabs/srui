@@ -58,6 +58,23 @@ const _: () = assert!(MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS <= DEFAULT_MAX_CACHED
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// `/proc/<pid>/stat` field 22 (start time) is the 20th field after `comm`.
 const STARTTIME_FIELD_AFTER_COMM: usize = 19;
+/// `/proc/<pid>/stat` field 24 (`rss`, resident pages) is the 22nd field after
+/// `comm` — two past the start time (K1).
+const RSS_FIELD_AFTER_COMM: usize = 21;
+/// `AT_PAGESZ`: the auxiliary-vector entry through which the kernel tells a
+/// process its page size (K1, `getauxval(3)`). It is read from the scanned
+/// mount's own `self/auxv`, the same interface `sysconf(_SC_PAGESIZE)` answers
+/// from, so this scan needs no new dependency and a fixture tree can state its
+/// own page size as deterministically as it states its own hostname.
+const AT_PAGESZ: u64 = 6;
+/// `AT_NULL`: terminates the auxiliary vector. Nothing after it is defined.
+const AT_NULL: u64 = 0;
+/// Largest page size this scan will believe. Real base page sizes are 4 KiB to
+/// 64 KiB; a gibibyte is far above every one of them and still refuses an
+/// implausible value that would turn a page count into a nonsense byte count.
+const MAX_PAGE_SIZE: u64 = 1 << 30;
+/// Smallest page size this scan will believe.
+const MIN_PAGE_SIZE: u64 = 512;
 
 /// What a scanned root is, as far as an unprivileged scan can prove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +187,25 @@ impl ProcFsSource {
 
     pub fn source_id(&self) -> &SourceId {
         &self.source
+    }
+
+    /// The page size this scan converts resident page counts with, read from the
+    /// scanned mount's own `self/auxv` ([`AT_PAGESZ`]).
+    ///
+    /// Read through the scanned root rather than from the real `/proc`, for the
+    /// same reason the identity files are: a source is whatever its root says it
+    /// is. A fixture tree states its own page size and is therefore deterministic
+    /// on any host, and a scan of a tree that states none reports the metric
+    /// unread instead of attributing this machine's page size to records that
+    /// were never measured on it.
+    fn page_size(&self) -> Observed<u64> {
+        match read_bounded(&self.root.join("self/auxv")) {
+            Ok(bytes) => match parse_page_size(&bytes) {
+                Some(size) => Observed::Known(size),
+                None => Observed::Missing(MissingReason::Unavailable),
+            },
+            Err(error) => Observed::Missing(reason_for(&error)),
+        }
     }
 
     fn identity<T>(
@@ -397,6 +433,13 @@ impl ProcessSource for ProcFsSource {
             BootId,
         );
         let pid_namespace = self.pid_namespace(mount, &mut issues);
+        // Read once per scan, not once per record: the page size is a property of
+        // the kernel behind the scanned mount, and every record's page count is
+        // in those pages. A mount that cannot state it publishes every resident
+        // value as unread (see [`resident_bytes`]) — visibly, in every row —
+        // rather than degrading `Completeness`, which is about whether the record
+        // *list* is authoritative, not about one field of a record.
+        let page_size = self.page_size();
         let mut records = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
@@ -489,16 +532,17 @@ impl ProcessSource for ProcFsSource {
                             detail: format!("{pid}/stat is not parsable for this PID"),
                         });
                     }
-                    Some((display_name, ticks)) => records.push(ProcessRecord {
+                    Some(stat) => records.push(ProcessRecord {
                         key: ProcessKey {
                             source: self.source.clone(),
                             host: host.clone(),
                             boot: boot.clone(),
                             pid_namespace: pid_namespace.clone(),
                             pid: Observed::Known(pid),
-                            creation: CreationToken::LinuxBootTicks(ticks),
+                            creation: CreationToken::LinuxBootTicks(stat.start_ticks),
                         },
-                        display_name,
+                        display_name: stat.display_name,
+                        resident: resident_bytes(stat.resident_pages, &page_size),
                     }),
                 },
             }
@@ -671,14 +715,31 @@ fn parse_namespace_of_kind(link: &str, kind: &str) -> Option<u64> {
     inner.parse().ok()
 }
 
-/// Parses `comm` and the creation token out of one `/proc/<pid>/stat` line.
+/// What one `/proc/<pid>/stat` line says about a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatFields {
+    pub display_name: DisplayName,
+    /// Field 22: start time in kernel clock ticks since boot. Mandatory — it is
+    /// this record's creation token, and a record without one is not identified.
+    pub start_ticks: u64,
+    /// Field 24: resident pages, when the line carries a parsable one.
+    ///
+    /// Optional where the creation token is not, because a metric is not an
+    /// identity: a line that stops before field 24, or whose field 24 is not a
+    /// plain count, still names an identified process whose resident memory this
+    /// scan could not read. It is reported unread rather than published as zero.
+    pub resident_pages: Option<u64>,
+}
+
+/// Parses `comm`, the creation token and the resident page count out of one
+/// `/proc/<pid>/stat` line.
 ///
 /// `comm` is raw bytes wrapped in parentheses and may itself contain spaces,
 /// parentheses, control characters and invalid UTF-8 (K1). Fields are therefore
 /// located from the first `(` and the **last** `)`, never by splitting on
 /// whitespace, so a hostile name cannot shift the field indices. The leading PID
 /// field must also match the directory this line came from.
-pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<(DisplayName, u64)> {
+pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
     let open = bytes.iter().position(|byte| *byte == b'(')?;
     let close = bytes.iter().rposition(|byte| *byte == b')')?;
     if close < open {
@@ -690,11 +751,74 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<(DisplayName, u64)> {
     let mut fields = bytes[close + 1..]
         .split(u8::is_ascii_whitespace)
         .filter(|field| !field.is_empty());
-    let ticks = std::str::from_utf8(fields.nth(STARTTIME_FIELD_AFTER_COMM)?)
+    let start_ticks = std::str::from_utf8(fields.nth(STARTTIME_FIELD_AFTER_COMM)?)
         .ok()?
         .parse::<u64>()
         .ok()?;
-    Some((DisplayName::sanitize(&bytes[open + 1..close]), ticks))
+    // Counted from the field after the start time, which the line above consumed.
+    let resident_pages = fields
+        .nth(RSS_FIELD_AFTER_COMM - STARTTIME_FIELD_AFTER_COMM - 1)
+        .and_then(|field| std::str::from_utf8(field).ok())
+        // `rss` is printed as a signed long (K1). A negative count is not a
+        // number of pages, so it is unread rather than reinterpreted.
+        .and_then(|field| field.parse::<u64>().ok());
+    Some(StatFields {
+        display_name: DisplayName::sanitize(&bytes[open + 1..close]),
+        start_ticks,
+        resident_pages,
+    })
+}
+
+/// The page size an auxiliary vector reports, if it reports a believable one.
+///
+/// The vector is pairs of native-endian `unsigned long` words, terminated by
+/// [`AT_NULL`] (K1). The word size is this target's pointer width, so a 32-bit
+/// build reads the 32-bit vector a 32-bit kernel writes. A trailing partial word
+/// ends the walk: half a word is not a value.
+///
+/// A value that is not a power of two, or is outside [`MIN_PAGE_SIZE`] ..=
+/// [`MAX_PAGE_SIZE`], is refused rather than used. Multiplying a page count by a
+/// wrong page size would publish a confident, wrong byte count for every process
+/// on the host, which is worse than reporting the metric unread.
+fn parse_page_size(bytes: &[u8]) -> Option<u64> {
+    let word = std::mem::size_of::<usize>();
+    for pair in bytes.chunks_exact(word * 2) {
+        let read = |slice: &[u8]| {
+            let mut native = [0u8; std::mem::size_of::<usize>()];
+            native.copy_from_slice(slice);
+            usize::from_ne_bytes(native) as u64
+        };
+        let key = read(&pair[..word]);
+        if key == AT_NULL {
+            return None;
+        }
+        if key != AT_PAGESZ {
+            continue;
+        }
+        let value = read(&pair[word..]);
+        return (value.is_power_of_two() && (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&value))
+            .then_some(value);
+    }
+    None
+}
+
+/// A record's resident memory in bytes, or why this scan could not state it.
+///
+/// Both inputs are needed and neither is guessed: a page count with no page size
+/// is not a byte count, and a page size with no count describes nothing. The
+/// multiplication is checked, so a kernel reporting an absurd count reports the
+/// metric unread rather than a wrapped one.
+fn resident_bytes(pages: Option<u64>, page_size: &Observed<u64>) -> Observed<u64> {
+    match (pages, page_size) {
+        (Some(pages), Observed::Known(size)) => match pages.checked_mul(*size) {
+            Some(bytes) => Observed::Known(bytes),
+            None => Observed::Missing(MissingReason::Unavailable),
+        },
+        (None, _) => Observed::Missing(MissingReason::Unavailable),
+        // The page size is a property of the scanned mount's kernel, so its
+        // reason applies to every record equally.
+        (_, Observed::Missing(reason)) => Observed::Missing(*reason),
+    }
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {

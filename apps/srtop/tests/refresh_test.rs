@@ -420,6 +420,9 @@ impl ProcessSource for Widest {
                         ..template.clone()
                     },
                     display_name: name.clone(),
+                    // Unread: the widest cell a metric can publish, which is
+                    // what a widest-row fixture must carry.
+                    resident: Observed::Missing(MissingReason::Unavailable),
                 }
             })
             .collect();
@@ -699,10 +702,14 @@ fn a_failed_scan_at_the_snapshot_ceiling_deletes_no_row_however_long_its_status(
 
 /// A collection that fits is published whole: the ceiling costs a large but
 /// deliverable model nothing, and adds no clause to the status.
+///
+/// The row count tracks how wide a row is. PX-005 added the resident cell, so the
+/// largest collection that still fits one frame is smaller than it was — which is
+/// the ceiling working, not a regression.
 #[test]
 fn a_collection_just_inside_the_snapshot_frame_is_published_whole() {
     let session = Session::mint();
-    let rows = 27_000;
+    let rows = 26_000;
     start_from_source(&session, &mut Widest { rows, first_pid: 1 }).unwrap();
 
     assert_eq!(published(&session).len(), rows as usize);
@@ -837,8 +844,10 @@ fn a_refresh_just_inside_the_frame_bound_still_commits_as_one_transaction() {
 
     let revision = session.current_revision();
     // Chosen so the planner's own upper bound on this refresh stays under the
-    // ceiling; the frame it really encodes to is asserted below.
-    let rows = 27_000;
+    // ceiling; the frame it really encodes to is asserted below. It tracks the
+    // width of a row, so a ticket that adds a column lowers it (PX-005 added the
+    // resident cell, which is why this is no longer 27,000).
+    let rows = 26_000;
     let outcome = view
         .refresh(&session, &mut Widest { rows, first_pid: 1 })
         .unwrap();
@@ -891,6 +900,7 @@ fn a_refresh_beyond_the_transaction_bound_is_published_whole() {
                         ..template.clone()
                     },
                     display_name: "worker".into(),
+                    resident: Observed::Known(4096),
                 })
                 .collect();
             ProcessSnapshot {

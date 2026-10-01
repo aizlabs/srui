@@ -31,15 +31,8 @@ struct SSHTransportPersistenceIntegrationTests {
             return
         }
 
-        let tempDir = URL(fileURLWithPath: "/tmp/srui-persist-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: tempDir.path
-        )
-        defer {
-            try? FileManager.default.removeItem(at: tempDir)
-        }
+        let tempDir = try TestFixtureDirectory.make(prefix: "srui-persist")
+        defer { TestFixtureDirectory.release(tempDir) }
 
         let socketPath = tempDir.appendingPathComponent("sessiond.sock").path
         let hostKeyPath = tempDir.appendingPathComponent("host_key").path
@@ -231,15 +224,8 @@ struct SSHTransportPersistenceIntegrationTests {
             return
         }
 
-        let tempDir = URL(fileURLWithPath: "/tmp/srui-restarts-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: tempDir.path
-        )
-        defer {
-            try? FileManager.default.removeItem(at: tempDir)
-        }
+        let tempDir = try TestFixtureDirectory.make(prefix: "srui-restarts")
+        defer { TestFixtureDirectory.release(tempDir) }
 
         var seenSessionIds = Set<String>()
         constRestartLoop: for iteration in 1...5 {

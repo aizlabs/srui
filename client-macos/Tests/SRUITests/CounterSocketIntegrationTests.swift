@@ -31,9 +31,9 @@ struct CounterSocketIntegrationTests {
         guard FileManager.default.fileExists(atPath: counterBinary.path) else { return }
 
         // Deliberately *not* pre-created: the server must build the private parent itself.
-        let runtimeDirectory = URL(fileURLWithPath: "/tmp/srui-counter-private-\(UUID().uuidString)")
+        let runtimeDirectory = TestFixtureDirectory.reserve(prefix: "srui-counter-private")
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
 
         let server = Process()
         server.executableURL = counterBinary
@@ -78,16 +78,9 @@ struct CounterSocketIntegrationTests {
             return
         }
 
-        let tempDir = URL(fileURLWithPath: "/tmp/srui-counter-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: false)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: tempDir.path
-        )
+        let tempDir = try TestFixtureDirectory.make(prefix: "srui-counter-test")
+        defer { TestFixtureDirectory.release(tempDir) }
         let socketPath = tempDir.appendingPathComponent("counter.sock").path
-        defer {
-            try? FileManager.default.removeItem(at: tempDir)
-        }
 
         let server = Process()
         server.executableURL = counterBinary
@@ -160,18 +153,8 @@ struct CounterSocketIntegrationTests {
     @Test("Fresh HELLO against a seeded counter session applies the catch-up snapshot")
     @MainActor
     func helloCatchUpSnapshotOverUnixSocket() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-hello-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-hello")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -194,7 +177,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -242,18 +224,8 @@ struct CounterSocketIntegrationTests {
     @Test("Connection fails cleanly at handshake time when server requires an unsupported profile (§4 inv. 13)")
     @MainActor
     func mismatchedRequiredProfileFailsAtHandshake() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-mismatch-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-mismatch")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -276,7 +248,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -310,18 +281,8 @@ struct CounterSocketIntegrationTests {
     @Test("Image fixture delivers a committed resource that paints the Image node (§14)")
     @MainActor
     func imageFixtureCommitsAndPaintsImageView() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-image-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-image")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -348,7 +309,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -398,18 +358,8 @@ struct CounterSocketIntegrationTests {
     @Test("Corrupted resource chunk is dropped; session and placeholder survive (§14)")
     @MainActor
     func corruptedResourceChunkKeepsPlaceholderAndSession() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-counter-image-corrupt-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-counter-corrupt")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot
@@ -436,7 +386,6 @@ struct CounterSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)

@@ -710,8 +710,13 @@ struct SessionRobustnessTests {
 
     @Test("A closed socket transport refuses to silently reconnect")
     func closedTransportRefusesToReconnect() async throws {
+        // Reserved rather than created: nothing must ever bind here. Registering it anyway means
+        // that if a future regression did make the transport create the path, the fixture is still
+        // removed instead of becoming another /tmp leftover.
+        let fixture = TestFixtureDirectory.reserve(prefix: "srui-never-bound")
+        defer { TestFixtureDirectory.release(fixture) }
         let transport = UnixSocketTransport(
-            socketPath: "/tmp/srui-never-bound-\(UUID().uuidString).sock"
+            socketPath: fixture.appendingPathComponent("never-bound.sock").path
         )
         await transport.close()
 

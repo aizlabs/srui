@@ -74,18 +74,24 @@ jobs:
         run: |
           echo "::warning::Codex review gate bypassed by explicit workflow_dispatch input."
 
-      # The verdict step runs a repository script, so this job needs the repository - and it must be
-      # the *base* revision, never the pull request's head. For a fork pull request GitHub takes the
-      # workflow file from the base branch while the head is the contributor's code, so checking out
-      # the head here would let a pull request rewrite the very script that decides whether it was
-      # reviewed. The script's answer depends only on the GitHub API, so the base revision is both
-      # the safe choice and the correct one. `github.ref` covers `workflow_dispatch`, where there is
-      # no pull request payload.
-      - name: Check out the gate's own scripts from the base revision
+      # The verdict step runs a repository script, so this job needs the repository checked out.
+      #
+      # Deliberately the default ref - the pull request's merge ref - and *not* the base revision.
+      # Pinning the base looks safer and is not: a `pull_request` run takes the workflow definition
+      # from the pull request itself (measured - PR #70's run executed a step that existed only on
+      # its branch), so an author who can change this script can change this file too. What a base
+      # pin does achieve is breaking the gate on any pull request that *adds* a gate script, which
+      # by definition is absent from the base: the clean-verdict branch would then invoke a missing
+      # file, and because that invocation is an `if` condition `set -e` would not stop it - the gate
+      # would poll for fifteen minutes and fail closed, needing the bypass to merge a clean review.
+      #
+      # What actually protects the gate is outside this file: branch protection on `main`, review of
+      # workflow changes, and - for fork pull requests - a read-only token plus the approval a
+      # first-time contributor's workflow run requires.
+      - name: Check out the gate's own scripts
         if: steps.pr.outputs.number != '' && !inputs.skip_review_gate
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.ref }}
           persist-credentials: false
 
       # CI and the Codex review start independently on `opened` and `ready_for_review`. Querying

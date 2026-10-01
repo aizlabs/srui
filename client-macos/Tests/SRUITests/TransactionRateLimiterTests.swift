@@ -21,6 +21,11 @@ private actor TransactionRateFailureLog {
         messages.isEmpty
     }
 
+    /// Every recorded failure, so an assertion can name the cause instead of printing `false`.
+    var recorded: [String] {
+        messages
+    }
+
     func contains(_ fragment: String) -> Bool {
         messages.contains { $0.contains(fragment) }
     }
@@ -158,7 +163,11 @@ struct TransactionRateLimiterTests {
             if applier.lastAppliedRevision == Revision(241) { return true }
             return await failures.isEmpty == false
         }
-        #expect(await failures.isEmpty)
+        let recordedFailures = await failures.recorded
+        #expect(
+            recordedFailures.isEmpty,
+            "session failed instead of applying through ingress backpressure: \(recordedFailures)"
+        )
         #expect(applier.lastAppliedRevision == Revision(241))
         #expect(
             applier.store.node(for: NodeId(1))?.getProperty(.label)

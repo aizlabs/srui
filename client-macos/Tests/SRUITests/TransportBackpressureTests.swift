@@ -32,7 +32,15 @@ private final class Box<T>: @unchecked Sendable {
     }
 }
 
-@Suite("Transport Backpressure & Write Preemption (§20.4, §22.2, §26)")
+/// Every rendezvous in this suite is bounded and asserted, and `.timeLimit` is the outer fence.
+///
+/// Both are needed, and neither substitutes for the other: a `withCheckedContinuation` park — what
+/// `AsyncTestSignal.wait(until:)` is — ignores task cancellation, so the time limit records its
+/// issue and the run still hangs (measured: a parked `wait(until:)` under `.timeLimit(.minutes(1))`
+/// outlived 300s, while a cancellable `Task.sleep` failed at 60s). The waits therefore carry their
+/// own deadlines and `#expect` the outcome, and the time limit catches the cancellable stalls that
+/// are left. A parked test is otherwise indistinguishable from a wedged CI job.
+@Suite("Transport Backpressure & Write Preemption (§20.4, §22.2, §26)", .timeLimit(.minutes(1)))
 struct TransportBackpressureTests {
 
     // MARK: - Inbound backlog gate (§26)
@@ -63,7 +71,10 @@ struct TransportBackpressureTests {
             admitted.signal()
         }
         reader.start()
-        await entered.wait()
+        #expect(
+            await entered.waitOrTimeout(timeout: .seconds(5)),
+            "the reader thread never entered the gate"
+        )
 
         try await Task.sleep(for: .milliseconds(250))
         #expect(
@@ -191,7 +202,10 @@ struct TransportBackpressureTests {
             }
         }
 
-        await sink.waitUntilEntered(1)
+        #expect(
+            await sink.waitUntilEntered(1),
+            "no write ever reached the stalled sink"
+        )
         writer.stop()
         sink.fail(TransportError.closed)
         latch.stop()
@@ -219,7 +233,10 @@ struct TransportBackpressureTests {
             }
         }
 
-        await sink.waitUntilEntered(1)
+        #expect(
+            await sink.waitUntilEntered(1),
+            "no write ever reached the stalled sink"
+        )
         sink.fail(TransportError.ioError("injected failure"))
 
         for task in tasks {
@@ -313,8 +330,13 @@ private final class GatedFailingSink: @unchecked Sendable {
         throw error
     }
 
-    func waitUntilEntered(_ count: Int) async {
-        await entries.wait(until: count)
+    /// Bounded, and reports whether the writer arrived: `AsyncTestSignal.wait(until:)` suspends on
+    /// a continuation that nothing resumes if the writer never calls `write`, and a continuation
+    /// park ignores task cancellation — so a suite `.timeLimit` records its issue and still leaves
+    /// the run hanging. Measured: a parked `wait(until:)` under `.timeLimit(.minutes(1))` ran past
+    /// 300s and had to be killed, while a cancellable `Task.sleep` failed at 60s.
+    func waitUntilEntered(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        await entries.waitOrTimeout(until: count, timeout: timeout)
     }
 
     func fail(_ error: any Error) {

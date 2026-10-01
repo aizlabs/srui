@@ -63,16 +63,11 @@ private final class GatedByteSink: @unchecked Sendable {
         dispatches.signal()
     }
 
-    private var hasFailed: Bool {
-        condition.lock()
-        defer { condition.unlock() }
-        return failure != nil
-    }
-
-    func waitUntilDispatched(_ count: Int) async {
-        while snapshot().count < count, !hasFailed {
-            try? await Task.sleep(for: .milliseconds(2))
-        }
+    /// Bounded, and signal-driven rather than polling: `write` signals `dispatches` as it appends,
+    /// so the waiter resumes on the dispatch itself and reports whether the count was reached.
+    /// A test that parks here forever is indistinguishable from a wedged CI job.
+    func waitUntilDispatched(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        await dispatches.waitOrTimeout(until: count, timeout: timeout)
     }
 
     func snapshot() -> [Data] {
@@ -81,8 +76,11 @@ private final class GatedByteSink: @unchecked Sendable {
         return dispatched
     }
 
-    func waitUntilEntered(_ count: Int) async {
-        await entries.wait(until: count)
+    /// Bounded for the same reason as `waitUntilDispatched`: nothing resumes this continuation if
+    /// the writer never reaches `write`, and a continuation park ignores the task cancellation a
+    /// suite `.timeLimit` relies on.
+    func waitUntilEntered(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        await entries.waitOrTimeout(until: count, timeout: timeout)
     }
 
     func release(_ count: Int = 1) {
@@ -129,7 +127,16 @@ private actor RecordingTransport: Transport {
     }
 }
 
-@Suite("Logical Channel Transport Classification (§19.2)")
+/// Every rendezvous in this suite is bounded and asserted, and `.timeLimit` is the outer fence.
+///
+/// `GatedByteSink.write` parks a real `DispatchQueue` thread on purpose — that is the stalled peer
+/// under test — but the waits that observe it run on the test's own cooperative thread and used to
+/// have no deadline at all. A `.timeLimit` alone does not cover them: a `withCheckedContinuation`
+/// park ignores task cancellation, so the limit records its issue and the run still hangs
+/// (measured: a parked `AsyncTestSignal.wait(until:)` under `.timeLimit(.minutes(1))` outlived
+/// 300s, while a cancellable `Task.sleep` failed at 60s). A parked test is otherwise
+/// indistinguishable from a wedged CI job.
+@Suite("Logical Channel Transport Classification (§19.2)", .timeLimit(.minutes(1)))
 struct LogicalChannelTransportTests {
 
     @Test("Resource backlog yields to newly ready control, input, and UI")
@@ -152,7 +159,10 @@ struct LogicalChannelTransportTests {
                     claiming: latch
                 )
             }
-            await sink.waitUntilEntered(1)
+            #expect(
+                await sink.waitUntilEntered(1),
+                "the first resource write never reached the gated sink"
+            )
 
             for id in UInt32(1)..<UInt32(200) {
                 let payload = resourceToken(id)
@@ -186,7 +196,10 @@ struct LogicalChannelTransportTests {
             try await waitUntilQueued(1, in: .ui, writer: writer)
 
             sink.release(8)
-            await sink.waitUntilDispatched(4)
+            #expect(
+                await sink.waitUntilDispatched(4),
+                "the writer never dispatched 4 frames after 8 permits were released"
+            )
 
             let dispatched = sink.snapshot()
             #expect(dispatched.count >= 4)

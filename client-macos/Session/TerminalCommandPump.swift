@@ -29,23 +29,48 @@ actor TerminalCommandPump {
     private var latestSize: [NodeId: (UInt32, UInt32, UInt32, UInt32)] = [:]
     private var connected = false
     private var sendIfAuthorized: SendIfAuthorized?
+    /// Which session incarnation the installed sender authorizes for, when the caller names one.
+    private var authority: EventOutboxSessionIncarnation?
 
     func attach(transport: any Transport) {
-        attach { data, logicalClass in
-            try await transport.send(data: data, logicalClass: logicalClass)
-            return true
-        }
+        attach(
+            sendIfAuthorized: { data, logicalClass in
+                try await transport.send(data: data, logicalClass: logicalClass)
+                return true
+            },
+            authority: nil
+        )
     }
 
-    func attach(sendIfAuthorized: @escaping SendIfAuthorized) {
+    /// Installs the authorized sender, re-queueing every retained size only for a *new* authority.
+    ///
+    /// Re-queueing is how a freshly bound connection or session incarnation tells the remote PTY
+    /// how large its terminals are: the SIGWINCH the previous authority delivered never reached
+    /// this one (§21). Re-queueing for the authority already installed costs a *duplicate*
+    /// SIGWINCH and the full-screen redraw a curses app answers it with. A resync snapshot rebinds
+    /// the pump twice on purpose — once before the native mount, so the mounted tree's keystrokes
+    /// are authorized by the incarnation the snapshot established (§22.2), and once at
+    /// finalization alongside the renderer callbacks (§18.3) — and the native mount between them
+    /// has long let the first drain flush, so `queue.removeAll` coalesces nothing. Both rebinds
+    /// stay, and the second one no longer re-sends the size.
+    ///
+    /// `authority: nil` keeps the unconditional re-queue for callers that carry no incarnation.
+    func attach(
+        sendIfAuthorized: @escaping SendIfAuthorized,
+        authority: EventOutboxSessionIncarnation? = nil
+    ) {
+        let sameAuthority = connected && authority != nil && authority == self.authority
         self.sendIfAuthorized = sendIfAuthorized
+        self.authority = authority
         connected = true
-        for (id, size) in latestSize {
-            queue.removeAll { item in
-                if case .resize(let other, _, _, _, _) = item { return other == id }
-                return false
+        if !sameAuthority {
+            for (id, size) in latestSize {
+                queue.removeAll { item in
+                    if case .resize(let other, _, _, _, _) = item { return other == id }
+                    return false
+                }
+                queue.append(.resize(id, size.0, size.1, size.2, size.3))
             }
-            queue.append(.resize(id, size.0, size.1, size.2, size.3))
         }
         kick()
     }
@@ -53,6 +78,7 @@ actor TerminalCommandPump {
     func disconnect() {
         connected = false
         sendIfAuthorized = nil
+        authority = nil
         queue.removeAll { item in
             if case .input = item { return true }
             return false
@@ -60,11 +86,13 @@ actor TerminalCommandPump {
     }
 
     func resetForReplacementSession(
-        sendIfAuthorized: @escaping SendIfAuthorized
+        sendIfAuthorized: @escaping SendIfAuthorized,
+        authority: EventOutboxSessionIncarnation? = nil
     ) {
         queue.removeAll(keepingCapacity: true)
         latestSize.removeAll(keepingCapacity: true)
         self.sendIfAuthorized = sendIfAuthorized
+        self.authority = authority
     }
 
     var retainedResizeCountForTesting: Int {

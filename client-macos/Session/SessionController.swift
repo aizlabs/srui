@@ -609,6 +609,12 @@ public final class SessionController: @unchecked Sendable {
         get { withStateLock { _terminalCommandWillAuthorizeForTesting } }
         set { withStateLock { _terminalCommandWillAuthorizeForTesting = newValue } }
     }
+
+    private var _resyncSnapshotWillRebindTerminalPumpForTesting: (@Sendable () async -> Void)?
+    var resyncSnapshotWillRebindTerminalPumpForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _resyncSnapshotWillRebindTerminalPumpForTesting } }
+        set { withStateLock { _resyncSnapshotWillRebindTerminalPumpForTesting = newValue } }
+    }
     private var _collectionRangeDispatchDidFinishForTesting: (@Sendable () -> Void)?
     var collectionRangeDispatchDidFinishForTesting: (@Sendable () -> Void)? {
         get { withStateLock { _collectionRangeDispatchDidFinishForTesting } }
@@ -808,7 +814,10 @@ public final class SessionController: @unchecked Sendable {
     /// stays fenced by the native callbacks, which `updateRenderer` reinstalls inside the guarded
     /// mount, so rebinding here cannot let an outgoing tree send under the new incarnation.
     /// `reinstallInteractionOwnership` rebinds both together for every other path.
-    @discardableResult
+    ///
+    /// Returning `false` means a replacement took the mutation lease or the ownership retired
+    /// under this call: the pump still holds the *previous* incarnation's sender, so the caller
+    /// must abandon the path instead of mounting a tree whose keystrokes that sender refuses.
     private func rebindTerminalPumpOwnership(
         binding: EventOutboxConnectionBinding,
         sessionIncarnation: EventOutboxSessionIncarnation
@@ -824,7 +833,8 @@ public final class SessionController: @unchecked Sendable {
             sendIfAuthorized: terminalCommandSender(
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
-            )
+            ),
+            authority: sessionIncarnation
         )
         return continuityContext.isActive(
             binding: binding,
@@ -1690,11 +1700,14 @@ public final class SessionController: @unchecked Sendable {
         }
         defer { continuityContext.releaseMutation(lease) }
 
+        // Naming the authority keeps this rebind from re-sending a retained TERMINAL_RESIZE the
+        // resync path's pre-mount rebind already sent under the same incarnation (§21).
         await terminalPump.attach(
             sendIfAuthorized: terminalCommandSender(
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
-            )
+            ),
+            authority: sessionIncarnation
         )
         await MainActor.run {
             guard let renderer = self.interactionRenderer ?? self.renderer else { return }
@@ -2128,7 +2141,8 @@ public final class SessionController: @unchecked Sendable {
                 sendIfAuthorized: terminalCommandSender(
                     binding: connectionBinding,
                     sessionIncarnation: sessionIncarnation
-                )
+                ),
+                authority: sessionIncarnation
             )
 
             // The detached loop waits behind this gate until its task is published under the
@@ -2839,6 +2853,14 @@ public final class SessionController: @unchecked Sendable {
 
     var retainedTerminalResizeCountForTesting: Int {
         get async { await terminalPump.retainedResizeCountForTesting }
+    }
+
+    /// Test seam for the refused-mutation-lease paths: retires the live continuity ownership the
+    /// way a replacement binding does, so every lease taken after this point is refused. Lets a
+    /// test lose ownership at one named instant instead of racing a second controller's handshake.
+    func retireContinuityOwnershipForTesting() {
+        guard let binding = withStateLock({ outboxConnectionBinding }) else { return }
+        continuityContext.retire(binding: binding)
     }
 
     func waitForTerminalCommandDrainForTesting() async {
@@ -4067,7 +4089,8 @@ public final class SessionController: @unchecked Sendable {
             sendIfAuthorized: terminalCommandSender(
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
-            )
+            ),
+            authority: sessionIncarnation
         )
         if let renderer {
             await renderer.terminalSession.resetForReplacementSession()
@@ -4879,10 +4902,24 @@ public final class SessionController: @unchecked Sendable {
                 // kicks a drain, so rebinding first would re-send a resize for a stream this
                 // snapshot removed, which the server answers with `UnexpectedMessage` and drops
                 // the connection.
-                await rebindTerminalPumpOwnership(
+                if let interceptor = resyncSnapshotWillRebindTerminalPumpForTesting {
+                    await interceptor()
+                }
+                guard await rebindTerminalPumpOwnership(
                     binding: connectionBinding,
                     sessionIncarnation: renderSessionIncarnation
-                )
+                ) else {
+                    // A refused lease leaves the pump on the previous incarnation's sender, which
+                    // `drain()` answers by discarding keystrokes. Mounting anyway would lose the
+                    // input this rebind exists to authorize, so report supersession instead.
+                    let context = "resync snapshot lost terminal writer ownership before mounting"
+                    if let outstandingGeneration {
+                        await failRefusedResumeDecision(outstandingGeneration, context)
+                    } else {
+                        await reportFailure(.superseded(context))
+                    }
+                    return
+                }
             }
             let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,

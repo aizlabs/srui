@@ -27,16 +27,39 @@ git -C "$sandbox/repo" -c user.email=selftest@example.invalid -c user.name=selft
     commit -q --allow-empty -m "sandbox root"
 git -C "$sandbox/repo" worktree add -q "$sandbox/wt" -b selftest
 mkdir -p "$sandbox/wt/target/debug"
+# A linked worktree whose `target` is a symlink into a shared build cache (the layout rule 6 names a
+# cache root for), and one whose path contains a space (where argv[0] is not the first token of the
+# command line `ps` prints). Both are checkouts of the sandbox repository, so rule 6 admits them.
+git -C "$sandbox/repo" worktree add -q "$sandbox/wt-cache" -b selftest-cache
+mkdir -p "$sandbox/buildcache/debug"
+ln -sfn "$sandbox/buildcache" "$sandbox/wt-cache/target"
+git -C "$sandbox/repo" worktree add -q "$sandbox/wt space" -b selftest-space
+mkdir -p "$sandbox/wt space/target/debug"
 cp "$repo_root/scripts/reap-test-servers.sh" "$sandbox/repo/scripts/reap-test-servers.sh"
 reaper="$sandbox/repo/scripts/reap-test-servers.sh"
 failures=0
 spawned_pids=()
 spawned_pid=""
 
+# Kill one marker, by pid, and never a process group.
+#
+# `kill -9 "${pid:-0}"` - the shape all eighteen teardowns here used to have - expands to
+# `kill -9 0` when the variable is empty, and pid 0 means *the sender's whole process group*: this
+# suite, the shell that invoked it, and the CI step it runs in. The empty-variable paths are exactly
+# the `fail` branches those teardowns sit under, and `spawn_orphan`'s `pgrep` loop coming up empty is
+# enough to reach one. Measured: with a 76-character `TMPDIR`, no unix socket under the sandbox can
+# bind, case 11 failed, and the run died there with exit -9 - every later case unrun, the calling
+# shell killed, nothing printed about why. Case 22 holds this shape in place.
+kill_marker() {
+    [ -n "${1:-}" ] || return 0
+    kill -9 "$1" 2>/dev/null
+    return 0
+}
+
 cleanup() {
     local pid
     for pid in "${spawned_pids[@]+"${spawned_pids[@]}"}"; do
-        kill -9 "$pid" 2>/dev/null
+        kill_marker "$pid"
     done
     pkill -9 -f "$sandbox" 2>/dev/null
     rm -rf -- "$sandbox"
@@ -67,6 +90,21 @@ make_worktree_marker() {
     local name=$1
     ln -sf /bin/sleep "$sandbox/wt/target/debug/$name"
     printf '%s' "$sandbox/wt/target/debug/$name"
+}
+
+# A marker in a linked worktree whose `target` is a symlink into a shared build cache: the path `ps`
+# reports is inside the checkout, the file is not inside it at all.
+make_cached_marker() {
+    local name=$1
+    ln -sf /bin/sleep "$sandbox/buildcache/debug/$name"
+    printf '%s' "$sandbox/wt-cache/target/debug/$name"
+}
+
+# A marker in a linked worktree whose path contains a space.
+make_spaced_marker() {
+    local name=$1
+    ln -sf /bin/sleep "$sandbox/wt space/target/debug/$name"
+    printf '%s' "$sandbox/wt space/target/debug/$name"
 }
 
 # A marker at a path that belongs to no checkout of this repository: `$1` is a directory under the
@@ -218,6 +256,9 @@ SH
 sandbox_runtime="$sandbox/runtime"
 mkdir -p "$sandbox_runtime"
 
+# `reap_globs` lets a case point the directory sweep at a private root, so its "not a socket
+# directory" accounting is not perturbed by what an earlier case left in `$sandbox/tmp`.
+reap_globs=""
 run_reaper() {
     local pattern=$1 age=$2
     shift 2
@@ -227,7 +268,7 @@ run_reaper() {
         SRUI_TEST_LSOF_TABLE="$lsof_table" \
         SRUI_REAP_PATTERN="$pattern" \
         SRUI_REAP_AGE_MINUTES="$age" \
-        SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
+        SRUI_REAP_TMP_GLOBS="${reap_globs:-$sandbox/tmp/srui-*}" \
         bash "$reaper" "$@"
 }
 
@@ -279,7 +320,7 @@ spawn_with_live_parent "$marker"
 pid=$spawned_pid
 run_reaper "$(marker_pattern "$marker")" 0 >/dev/null
 assert_alive "$pid" "live-parent marker survived a zero-age sweep"
-kill -9 "$pid" 2>/dev/null
+kill_marker "$pid"
 
 echo "case 2: an orphaned fixture process past the age threshold is killed"
 marker=$(make_marker fixture-orphan-old)
@@ -301,7 +342,7 @@ if [ -z "$pid" ]; then
 else
     run_reaper "$(marker_pattern "$marker")" 60 >/dev/null
     assert_alive "$pid" "young orphan survived a 60-minute threshold"
-    kill -9 "$pid" 2>/dev/null
+    kill_marker "$pid"
 fi
 
 echo "case 4: a directory a live process references is kept; an unreferenced one is removed"
@@ -315,7 +356,7 @@ socket_table_add "$holder" "$referenced/sessiond.sock"
 run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null
 assert_dir_present "$referenced" "directory named by a live --socket argument was kept"
 assert_dir_absent "$unreferenced" "unreferenced directory was removed"
-kill -9 "$holder" 2>/dev/null
+kill_marker "$holder"
 
 echo "case 5: an unreferenced directory touched inside the age window is kept"
 fresh="$sandbox/tmp/srui-fresh"
@@ -337,7 +378,7 @@ else
     assert_dir_present "$dry_dir" "--dry-run left the reapable directory in place"
     assert_contains "$output" "would kill pid $pid" "--dry-run reported the orphan it would kill"
     assert_contains "$output" "would remove $dry_dir" "--dry-run reported the directory"
-    kill -9 "$pid" 2>/dev/null
+    kill_marker "$pid"
 fi
 
 echo "case 7: an empty sweep succeeds"
@@ -371,7 +412,7 @@ else
     else
         pass "no spurious 'survived SIGKILL' for an unreaped zombie"
     fi
-    kill -9 "$unreaping_parent_pid" 2>/dev/null
+    kill_marker "$unreaping_parent_pid"
 fi
 echo "case 9: a directory whose socket is bound in-process, named on no command line, is kept"
 # Short names on purpose: an absolute unix socket path is capped at 104 bytes, and the sandbox
@@ -406,7 +447,7 @@ else
     run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null
     assert_dir_present "$bound_dir" "directory holding a live, unnamed bound socket was kept"
 fi
-kill -9 "$binder" 2>/dev/null
+kill_marker "$binder"
 
 echo "case 10: the default runtime directory is never swept, and its siblings still are"
 runtime_root="$sandbox/tmproot"
@@ -434,7 +475,7 @@ PATH="$sandbox/lsofbin:$PATH" \
 assert_dir_present "$default_dir" "the default runtime directory survived a zero-age sweep"
 assert_dir_present "$held_dir" "a directory whose socket is held survived it"
 assert_dir_absent "$sibling_dir" "an unreferenced sibling directory was still removed"
-kill -9 "${held_holder:-0}" 2>/dev/null
+kill_marker "${held_holder:-}"
 
 echo "case 11: an orphaned process serving the default runtime socket is never killed"
 # The shape of a `srui-sessiond` a human detached on purpose: ppid 1, old enough, argv[0] matching
@@ -480,7 +521,7 @@ else
             pass "the reaper never selected it"
         fi
     fi
-    kill -9 "${listener_pid:-0}" 2>/dev/null
+    kill_marker "${listener_pid:-}"
 fi
 
 echo "case 12: an orphan in a linked worktree of this repository is reaped"
@@ -516,7 +557,7 @@ for spec in "$sandbox/usr-local-bin:srui-sessiond" "$sandbox/elsewhere/target/de
         pass "the reaper never selected $foreign_dir"
     fi
     assert_contains "$output" "1 outside this repository" "the sweep accounted for it as foreign"
-    kill -9 "$pid" 2>/dev/null
+    kill_marker "$pid"
 done
 
 echo "case 14: without a socket inventory, a sweep kills nothing while a default socket exists"
@@ -562,7 +603,7 @@ else
     assert_terminated "$pid" "with no default socket on disk, the same orphan was killed"
     assert_contains "$output" "nothing to protect" "the sweep said why it proceeded"
 fi
-kill -9 "${pid:-0}" 2>/dev/null
+kill_marker "${pid:-}"
 
 echo "case 20: only directories holding nothing but sockets are removed"
 # A name match is not ownership: a sweep runs automatically before tests, so anything matching the
@@ -576,22 +617,36 @@ empty_dir="$sandbox/tmp/srui-empty"
 mkdir -p "$own_dir" "$sock_dir" "$empty_dir"
 printf 'notes a developer would miss\n' >"$own_dir/notes.txt"
 mkdir -p "$own_dir/subdir"
+# An absolute unix socket path is capped at 104 bytes and the sandbox already spends most of them.
+# Said out loud and counted as a failure, never skipped: the assertions below are the newest safety
+# rule's only coverage, and this case used to hide all of them - `assert_dir_absent "$empty_dir"`
+# included, which needs no socket at all - behind `if [ ! -S "$sock_dir/s" ]; then echo skipped`,
+# leaving `failures` untouched. Measured with a 76-character `TMPDIR`: the rule went entirely
+# unexercised while the suite reported "all cases passed".
+if [ "${#sock_dir}" -gt 98 ]; then
+    fail "cannot stage case 20: $sock_dir/s is $((${#sock_dir} + 2)) bytes, over the 104-byte unix socket path limit"
+fi
 python3 -c "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])" "$sock_dir/s" 2>/dev/null
+# Recorded before the sweep, because a successful sweep is what removes the evidence.
+staged_socket=no
+[ -S "$sock_dir/s" ] && staged_socket=yes
 # One real holder so the sweep has socket evidence to act on at all.
 spawn_socket_holder "$sandbox/tmp/srui-held20/s"
 mkdir -p "$sandbox/tmp/srui-held20"
 holder20=$spawned_pid
 socket_table_add "$holder20" "$sandbox/tmp/srui-held20/s"
-if [ ! -S "$sock_dir/s" ]; then
-    echo "  skipped: could not bind a stale socket (path length?)"
-else
-    output=$(run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
-    assert_dir_present "$own_dir" "a matching directory holding a developer's files was kept"
+output=$(run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+assert_dir_present "$own_dir" "a matching directory holding a developer's files was kept"
+assert_dir_absent "$empty_dir" "an empty runtime directory was removed"
+assert_contains "$output" "1 not socket director" "the sweep accounted for the one it refused"
+if [ "$staged_socket" = yes ]; then
     assert_dir_absent "$sock_dir" "a directory holding only a stale socket was removed"
-    assert_dir_absent "$empty_dir" "an empty runtime directory was removed"
-    assert_contains "$output" "1 not socket director" "the sweep accounted for the one it refused"
+else
+    # Not a skip: with nothing bound, `$sock_dir` is an *empty* directory, which the rule removes
+    # for a different reason - so the assertion would pass without testing anything.
+    fail "could not bind a stale socket in $sock_dir; the stale-socket half of case 20 did not run"
 fi
-kill -9 "${holder20:-0}" 2>/dev/null
+kill_marker "${holder20:-}"
 
 echo "case 21: the default glob no longer matches an unrelated px0 directory"
 # `/tmp/px0*` also matched `/tmp/px0-cache`; the fixtures use `px0NN-`.
@@ -636,7 +691,7 @@ else
         pass "the reaper never selected it"
     fi
 fi
-kill -9 "${pid:-0}" 2>/dev/null
+kill_marker "${pid:-}"
 
 echo "case 16: a pid recycled between selection and signalling is never touched"
 # The window is real: each candidate can hold the kill loop for up to 2.2s, so a later candidate
@@ -684,7 +739,7 @@ else
         pass "the reaper never announced a kill for it"
     fi
 fi
-kill -9 "${pid:-0}" 2>/dev/null
+kill_marker "${pid:-}"
 
 echo "case 18: the identity a signal is gated on comes from the snapshot that selected the pid"
 # Case 16 proves a changed identity stops the signal; this one proves *where* the identity the
@@ -740,7 +795,7 @@ else
         printf '%s\n' "    reaper said: $output" >&2
     fi
 fi
-kill -9 "${pid:-0}" 2>/dev/null
+kill_marker "${pid:-}"
 
 echo "case 19: a daemon on a default socket outside this shell's runtime directory is never killed"
 # The finding: the directory list rule 5 matches against is derived from the *reaper's*
@@ -785,7 +840,7 @@ else
         done
         if [ -z "$listener_pid" ] || [ ! -S "$socket_path" ]; then
             fail "could not stage a daemon bound to $socket_path"
-            kill -9 "${listener_pid:-0}" 2>/dev/null
+            kill_marker "${listener_pid:-}"
             continue
         fi
         spawned_pids+=("$listener_pid")
@@ -808,7 +863,7 @@ else
         else
             pass "the reaper never selected the daemon on $label"
         fi
-        kill -9 "$listener_pid" 2>/dev/null
+        kill_marker "$listener_pid"
         rm -f "$socket_path"
     done
 fi
@@ -858,8 +913,142 @@ PY
             bash "$reaper" >/dev/null 2>&1
         assert_dir_present "$real_lsof_dir" "real lsof output kept the directory of a held socket"
     fi
-    kill -9 "${real_holder:-0}" 2>/dev/null
+    kill_marker "${real_holder:-}"
 fi
+
+echo "case 22: a teardown with no pid never signals the caller's process group"
+# `kill -9 "${pid:-0}"` means `kill -9 0`, which is SIGKILL to the sender's whole process group: this
+# suite, the shell that invoked it, and the CI step around it. The helper is driven in a child with a
+# process group of its own, so a regression is *reported* here instead of killing the run that would
+# have reported it. Mutation to confirm this case bites: make `kill_marker` run
+# `kill -9 "${1:-0}"` - the child dies of signal 9 and this case fails.
+if ! command -v perl >/dev/null 2>&1; then
+    fail "perl is unavailable; cannot isolate a process group to test the teardown shape"
+else
+    victim=$(perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' \
+        bash -c "set -uo pipefail; $(declare -f kill_marker); kill_marker \"\"; kill_marker; echo survived" 2>&1)
+    victim_status=$?
+    if [ "$victim_status" -eq 0 ] && [ "$victim" = survived ]; then
+        pass "an empty pid, and no pid at all, signalled nothing"
+    else
+        fail "the teardown helper signalled its own process group (exit $victim_status, output '$victim')"
+    fi
+fi
+
+echo "case 23: a symlinked directory is never certified as socket-only"
+# `find -P` does not descend a symlinked start point, so `find "$dir" -mindepth 1 ! -type s` printed
+# nothing for one and the socket-only test read "no non-socket entries" as "nothing but sockets".
+# Measured: `/tmp/srui-link -> <a directory holding NOTES.md>` was unlinked by the sweep, which the
+# rule's own header says cannot happen. Swept in a private root so the "not a socket directory"
+# accounting below belongs to this case alone.
+link_root="$sandbox/tmp23"
+mkdir -p "$link_root" "$sandbox/notes"
+printf 'notes a developer would miss\n' >"$sandbox/notes/NOTES.md"
+ln -sfn "$sandbox/notes" "$link_root/srui-link"
+# A real holder under the same glob, so the sweep has socket evidence and is willing to remove at all.
+mkdir -p "$link_root/srui-held23"
+spawn_socket_holder "$link_root/srui-held23/s"
+holder23=$spawned_pid
+socket_table_add "$holder23" "$link_root/srui-held23/s"
+reap_globs="$link_root/srui-*"
+output=$(run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+reap_globs=""
+if [ -L "$link_root/srui-link" ]; then
+    pass "a matching symlink survived a zero-age sweep"
+else
+    fail "the sweep unlinked $link_root/srui-link"
+    printf '%s\n' "    reaper said: $output" >&2
+fi
+if [ -f "$sandbox/notes/NOTES.md" ]; then
+    pass "the directory it pointed at is untouched"
+else
+    fail "the sweep removed the contents of the symlink's target"
+fi
+assert_contains "$output" "1 not socket director" "the sweep accounted for the symlink it refused"
+kill_marker "${holder23:-}"
+
+echo "case 24: a foreign binary reached through a symlink inside the checkout is never signalled"
+# Rule 6 used to accept the path as `ps` spells it, with only `.` and `..` folded out. A symlink
+# inside the checkout defeats that without a single `..`: with `repo/cache -> ../sibling`, the
+# candidate carries the checkout's prefix letter for letter and the file is another project's.
+# Measured: the sweep killed the sibling project's `srui-sessiond`.
+#
+# Built from `git rev-parse --show-toplevel`, as case 17 is and for the same reason: that is the
+# spelling the reaper derives its roots from, and on macOS /var is a symlink to /private/var, so a
+# path built any other way would not share a prefix with the root and the defect would hide.
+mkdir -p "$sandbox/sibling/target/debug"
+sibling_root=$(git -C "$sandbox/repo" rev-parse --show-toplevel)
+ln -sfn ../sibling "$sibling_root/cache"
+ln -sf /bin/sleep "$sandbox/sibling/target/debug/fixture-sibling"
+sibling_marker="$sibling_root/cache/target/debug/fixture-sibling"
+spawn_orphan "$sibling_marker"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn an orphan behind a symlink into a sibling project"
+else
+    output=$(run_reaper "$(marker_pattern "$sibling_marker")" 0 2>&1)
+    assert_alive "$pid" "a sibling project's orphan reached through a symlink survived"
+    assert_contains "$output" "1 outside this repository" "the sweep accounted for it as foreign"
+    if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $pid"; then
+        fail "the reaper announced a kill for a binary outside the checkout"
+        printf '%s\n' "    reaper said: $output" >&2
+    else
+        pass "the reaper never selected it"
+    fi
+fi
+kill_marker "${pid:-}"
+
+echo "case 25: an orphan in a worktree whose target is a symlinked build cache is still reaped"
+# The layout the discarded lexical branch existed to protect, and the one the resolved-path rule has
+# to keep working: `wt-cache/target -> $sandbox/buildcache`, so the binary `ps` reports inside the
+# checkout physically lives outside it. Rule 6 covers it by naming the cache a root. Mutation to
+# confirm this case bites: make `target_cache_roots` print nothing - the marker becomes foreign and
+# this case fails.
+marker=$(make_cached_marker fixture-cache)
+spawn_orphan "$marker"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn an orphan in the symlinked build cache"
+else
+    output=$(run_reaper "$(marker_pattern "$marker")" 0 2>&1)
+    assert_terminated "$pid" "an orphan reached through a symlinked target was killed"
+    assert_contains "$output" "killing orphaned fixture server pid $pid" "the reaper announced the kill"
+fi
+kill_marker "${pid:-}"
+
+echo "case 26: an orphan whose checkout path contains a space is selected by the shipped pattern"
+# argv[0] was read as awk's `$10`, the first whitespace token after the nine fixed `ps` columns. A
+# real orphan under a path with a space in it therefore presented as `/tmp/reap`, matched nothing,
+# and survived an all-zeros sweep (measured; Chrome reads as `/Applications/Google` the same way).
+# The *shipped* pattern is used, read out of the reaper, because that is the one that failed.
+default_pattern=$(awk -F"'" '/^pattern=/ { print $2 }' "$reaper")
+marker=$(make_spaced_marker counter)
+if [ -z "$default_pattern" ]; then
+    fail "could not read the default SRUI_REAP_PATTERN out of $reaper"
+else
+    spawn_orphan "$marker"
+    pid=$spawned_pid
+    if [ -z "$pid" ]; then
+        fail "could not spawn an orphan under a path containing a space"
+    else
+        output=$(run_reaper "$default_pattern" 0 2>&1)
+        assert_terminated "$pid" "an orphan under '$marker' was killed"
+        assert_contains "$output" "killing orphaned fixture server pid $pid" "the reaper announced the kill"
+    fi
+    kill_marker "${pid:-}"
+fi
+
+echo "case 27: an unusable SRUI_REAP_PATTERN is refused, not swept past"
+# An ERE awk cannot compile made it fail per line, and the run printed a clean all-zeros summary -
+# indistinguishable from "nothing to reap".
+output=$(run_reaper 'counter(' 0 2>&1)
+if [ $? -eq 2 ]; then
+    pass "an invalid pattern exits 2"
+else
+    fail "an invalid pattern did not exit 2"
+    printf '%s\n' "    reaper said: $output" >&2
+fi
+assert_contains "$output" "not a regular expression awk accepts" "the reaper said what was wrong"
 
 echo
 if [ "$failures" -eq 0 ]; then

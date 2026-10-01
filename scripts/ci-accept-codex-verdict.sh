@@ -51,7 +51,12 @@ pr_shas=$(gh api "repos/$repo/pulls/$pr/commits" --paginate --jq '.[].sha' 2>/de
 
 for abbrev in $abbrevs; do
     full=$(gh api "repos/$repo/commits/$abbrev" --jq '.sha' 2>/dev/null | tr 'A-F' 'a-f')
-    [ -n "$full" ] || continue       # unknown or ambiguous: 422, and nothing to compare
+    [ -n "$full" ] || continue # unknown or ambiguous: 422, and nothing to compare
+    # The resolved sha must actually begin with what the comment named. `GET /commits/{ref}` takes
+    # any ref, not just an abbreviation - a branch or tag resolves just as happily - and
+    # `[0-9a-fA-F]{7,40}` is a legal ref name. Without this, a ref of that shape pointing at the
+    # head would satisfy the gate for a comment that reviewed something else entirely.
+    case $full in "$abbrev"*) ;; *) continue ;; esac
     [ "$full" = "$head" ] || continue # a verdict for some other commit, including an ancestor
 
     # Belt and braces, in case the API ever resolves an ambiguous abbreviation to an arbitrary

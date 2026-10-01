@@ -360,3 +360,28 @@ jobs:
             client-macos/SemanticModel/RegistryTables.swift \
             client-macos/LogicalChannelScheduling/Sources/LogicalChannelScheduling/LogicalChannelPolicy.generated.swift \
             server-rust/sessiond/src/outbound/logical_channel_policy.generated.rs
+
+  # These three suites verify the scripts that act on a developer's machine and on CI itself: the
+  # reaper that kills processes and deletes directories, the wrapper that decides whether a test run
+  # counts as green, and the review gate that decides whether code was reviewed at all. 1,092 lines
+  # of them existed in this repository without ever running in CI, which is how verification rots.
+  #
+  # Both platforms deliberately: the reaper reads `ps`, `lsof` and `script(1)`, and every one of those
+  # differs between BSD and util-linux. Two of this PR's bugs were exactly that difference.
+  scripts:
+    name: Script self-tests (${{ matrix.os }})
+    needs: review-gate
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Review gate identity and verdict acceptance
+        run: bash scripts/test-ci-review-gate-identity.sh
+      - name: Run-accounting wrapper exit status
+        run: bash scripts/test_assert_swift_test_run_complete.sh
+      - name: Reaper selection rules
+        run: bash scripts/test_reap_test_servers.sh

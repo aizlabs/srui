@@ -576,22 +576,19 @@ echo "case 16: a pid recycled between selection and signalling is never touched"
 # The window is real: each candidate can hold the kill loop for up to 2.2s, so a later candidate
 # has seconds in which to exit and have its number reissued to an unrelated process of this user.
 # Staging a genuine recycle is not possible to order, so the identity the reaper checks is what
-# changes here: a `ps` stand-in reports a different start time for `-o lstart= -p <pid>` from the
-# moment the reaper has finished selecting, which is exactly what a reissued number looks like.
+# changes here: the process-table snapshot passes through untouched - the marker is selected, with
+# its real start time - while every `-o lstart= -p <pid>` identity probe reports a different start
+# time, which is exactly what the reaper sees once the number has been reissued. Whether the
+# reissue happened before or after the reaper recorded the identity is indistinguishable from here;
+# case 18 is what pins down *which* observation the recorded value comes from.
 recycle_bin="$sandbox/recyclebin"
 mkdir -p "$recycle_bin"
 cat >"$recycle_bin/ps" <<'SH'
 #!/bin/sh
-# `-o lstart= -p N` is the identity probe; everything else passes through untouched. The first
-# call answers truthfully (selection), every later one reports a different start time (the number
-# now names something else).
+# `-o lstart= -p N` is the identity probe, and it never agrees with the snapshot. Everything else,
+# the `-eo` snapshot included, passes through untouched.
 if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ "$3" = "-p" ]; then
-    if [ -f "$SRUI_TEST_RECYCLE_MARKER" ]; then
-        echo "Thu Jan  1 00:00:00 2037"
-    else
-        : >"$SRUI_TEST_RECYCLE_MARKER"
-        exec /bin/ps "$@"
-    fi
+    echo "Thu Jan  1 00:00:00 2037"
     exit 0
 fi
 exec /bin/ps "$@"
@@ -604,7 +601,6 @@ if [ -z "$pid" ]; then
     fail "could not spawn an orphan marker"
 else
     output=$(PATH="$recycle_bin:$sandbox/lsofbin:$PATH" \
-        SRUI_TEST_RECYCLE_MARKER="$sandbox/recycled-once" \
         SRUI_TEST_LSOF_TABLE="$lsof_table" \
         SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
         SRUI_REAP_AGE_MINUTES=0 \
@@ -620,8 +616,132 @@ else
         pass "the reaper never announced a kill for it"
     fi
 fi
-rm -f "$sandbox/recycled-once"
 kill -9 "${pid:-0}" 2>/dev/null
+
+echo "case 18: the identity a signal is gated on comes from the snapshot that selected the pid"
+# Case 16 proves a changed identity stops the signal; this one proves *where* the identity the
+# reaper compares against was read. It has to be the same `ps` snapshot that selected the pid: an
+# identity read a second time, after selection, leaves a window in which the candidate exits, its
+# number is reissued, and the replacement's start time is recorded as the selected identity - after
+# which every later check agrees and the reaper SIGTERMs, then SIGKILLs, an unrelated process of
+# this user. The only way to close that window is to make no second read, so that is what is
+# asserted: one identity probe per candidate on the way to a kill, not two.
+#
+# Mutation to confirm this case bites: record the identity in the rule 6 loop with
+# `start=$(process_start "$pid")` instead of taking it from the snapshot. The probe count becomes 2
+# and this case fails.
+probe_bin="$sandbox/probebin"
+mkdir -p "$probe_bin"
+cat >"$probe_bin/ps" <<'SH'
+#!/bin/sh
+# Truthful throughout - the point is not what `ps` answers but how often the reaper asks. Every
+# `-o lstart= -p N` identity probe is logged with the pid it asked about.
+if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ "$3" = "-p" ]; then
+    echo "$4" >>"$SRUI_TEST_PROBE_LOG"
+fi
+exec /bin/ps "$@"
+SH
+chmod +x "$probe_bin/ps"
+probe_log="$sandbox/identity-probes"
+: >"$probe_log"
+marker=$(make_marker fixture-one-probe)
+spawn_orphan "$marker"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn an orphan marker"
+else
+    output=$(PATH="$probe_bin:$sandbox/lsofbin:$PATH" \
+        SRUI_TEST_PROBE_LOG="$probe_log" \
+        SRUI_TEST_LSOF_TABLE="$lsof_table" \
+        SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
+        bash "$reaper" 2>&1)
+    # The kill has to happen, or the probe count below would be satisfied by a sweep that selected
+    # nothing - and it also proves the identity the snapshot built matches what `process_start`
+    # reports, byte for byte, since a mismatch would stop the signal.
+    assert_terminated "$pid" "the orphan was still killed with its identity taken from the snapshot"
+    assert_contains "$output" "killing orphaned fixture server pid $pid" "the reaper announced the kill"
+    probes=$(grep -c "^$pid\$" "$probe_log" 2>/dev/null || true)
+    if [ "${probes:-0}" -eq 1 ]; then
+        pass "the identity was read once, immediately before the signal"
+    else
+        fail "the reaper made ${probes:-0} identity probes for pid $pid, not 1"
+        printf '%s\n' "    reaper said: $output" >&2
+    fi
+fi
+kill -9 "${pid:-0}" 2>/dev/null
+
+echo "case 19: a daemon on a default socket outside this shell's runtime directory is never killed"
+# The finding: the directory list rule 5 matches against is derived from the *reaper's*
+# `XDG_RUNTIME_DIR`/`TMPDIR`, so a `srui-sessiond` detached from a shell with different values holds
+# a default socket that appears under none of those directories - and the sweep killed it, taking
+# the authoritative session with it. Both shapes of `unix_security::default_socket_path` are staged
+# under runtime directories this sweep is pointed away from: the `srui-<uid>` directory a daemon gets
+# under any `TMPDIR`, and the `srui-sessiond.sock` file name it gets under any `XDG_RUNTIME_DIR`,
+# whose directory carries no recognizable spelling at all.
+#
+# `nc -lU` through a symlink stands in for the daemon, as in case 11: ppid 1, old enough, argv[0]
+# matching the fixture pattern, and really holding the socket it is recorded as holding.
+away_tmp="$sandbox/t4"
+mkdir -p "$away_tmp"
+if ! command -v nc >/dev/null 2>&1; then
+    fail "nc is unavailable; cannot stage a daemon on a foreign default socket"
+else
+    probe=0
+    for spec in "$sandbox/srui-$(id -u)|s|a foreign TMPDIR's srui-$(id -u) directory" \
+        "$sandbox/x|srui-sessiond.sock|a foreign XDG_RUNTIME_DIR's default socket name"; do
+        probe=$((probe + 1))
+        foreign_dir=${spec%%|*}
+        rest=${spec#*|}
+        socket_name=${rest%%|*}
+        label=${rest#*|}
+        socket_path="$foreign_dir/$socket_name"
+        mkdir -p "$foreign_dir"
+        # An absolute unix socket path is capped at 104 bytes and the sandbox already spends most
+        # of them; a host with a long TMPDIR cannot stage this, and says so rather than passing.
+        if [ "${#socket_path}" -gt 100 ]; then
+            echo "  skipped: $socket_path is ${#socket_path} bytes, too long to bind here"
+            continue
+        fi
+        listener=$(make_marker "fixture-foreign-runtime-$probe")
+        ln -sf "$(command -v nc)" "$listener"
+        ("$listener" -lU "$socket_path" >/dev/null 2>&1 &) 2>/dev/null
+        listener_pid=""
+        for _ in $(seq 1 50); do
+            listener_pid=$(pgrep -f "^$listener -lU" 2>/dev/null | head -1)
+            [ -n "$listener_pid" ] && [ -S "$socket_path" ] && break
+            sleep 0.1
+        done
+        if [ -z "$listener_pid" ] || [ ! -S "$socket_path" ]; then
+            fail "could not stage a daemon bound to $socket_path"
+            kill -9 "${listener_pid:-0}" 2>/dev/null
+            continue
+        fi
+        spawned_pids+=("$listener_pid")
+        socket_table_add "$listener_pid" "$socket_path"
+        # TMPDIR and XDG_RUNTIME_DIR both point somewhere the staged socket is *not*, so the
+        # directory list the reaper derives cannot cover it. Without that the case would pass
+        # through the pre-existing rule and prove nothing.
+        output=$(PATH="$sandbox/lsofbin:$PATH" \
+            SRUI_TEST_LSOF_TABLE="$lsof_table" \
+            SRUI_REAP_PATTERN="$(marker_pattern "$listener")" \
+            SRUI_REAP_AGE_MINUTES=0 \
+            SRUI_REAP_TMP_GLOBS="$away_tmp/srui-*" \
+            TMPDIR="$away_tmp" \
+            XDG_RUNTIME_DIR="$away_tmp/xdg" \
+            bash "$reaper" 2>&1)
+        assert_alive "$listener_pid" "the daemon on $label survived a zero-age sweep"
+        if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $listener_pid"; then
+            fail "the reaper announced a kill for the daemon on $label"
+            printf '%s\n' "    reaper said: $output" >&2
+        else
+            pass "the reaper never selected the daemon on $label"
+        fi
+        kill -9 "$listener_pid" 2>/dev/null
+        rm -f "$socket_path"
+    done
+fi
 
 echo "case 15: the host's own lsof, where it has one, yields the same decision"
 # Every case above drives a stand-in, which tests the reaper's *logic* but not its reading of real

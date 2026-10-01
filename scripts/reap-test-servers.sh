@@ -24,15 +24,37 @@
 #   4. executable path match (`SRUI_REAP_PATTERN`). Matched against argv[0] — the binary's path,
 #      not the whole command line — so a grep over arguments cannot make an editor or a log
 #      tailer look like a fixture server.
-#   5. not bound to the default runtime socket. `ppid 1` is not proof of debris on its own: a
+#   5. not bound to a default runtime socket. `ppid 1` is not proof of debris on its own: a
 #      `srui-sessiond` a human detached deliberately also reads as `ppid 1` — it ignores SIGHUP
 #      precisely so it survives an SSH disconnect (§17, §20.2) — and it is the process every client
-#      reaches through `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/srui-<uid>/srui-sessiond.sock`. Killing
-#      it discards the authoritative in-memory session. A fixture never binds that path (tests pass
-#      an explicit `--socket` under a per-run directory), so holding it is taken as proof that the
-#      process is not debris. This rule needs the socket table: where `lsof` is missing or denied,
-#      nothing can be told apart from that daemon, so the sweep kills nothing at all unless it can
-#      rule the daemon out independently — no socket in any default runtime directory.
+#      reaches through `unix_security::default_socket_path`: `$XDG_RUNTIME_DIR/srui-sessiond.sock`
+#      where that variable is set, and `${TMPDIR:-/tmp}/srui-<uid>/srui-sessiond.sock` where it is
+#      not. Killing it discards the authoritative in-memory session. A fixture never binds that
+#      path (tests pass an explicit `--socket` under a per-run directory), so holding it is taken as
+#      proof that the process is not debris.
+#
+#      Recognized by *shape*, not only by this sweep's own environment. A daemon launched from a
+#      shell whose `XDG_RUNTIME_DIR` or `TMPDIR` differs from the one running the sweep serves a
+#      default socket that lies outside every directory this script can derive, and matching the
+#      reaper-derived directory list alone left exactly that daemon unprotected — the authoritative
+#      session, killed because it was started in a different shell. So two shapes in the socket
+#      inventory spare their holder as well, wherever the socket lives: a path with a directory
+#      component named `srui-<uid>` (the default runtime directory under any `TMPDIR`), and a path
+#      whose file name is `srui-sessiond.sock` (the default name under any `XDG_RUNTIME_DIR`, whose
+#      directory has no recognizable spelling at all). Neither shape can come from a fixture:
+#      `srui-sessiond.sock` is produced by nothing but `default_socket_path`, and no test names it.
+#      The environment-derived directory list is still consulted on top of the shapes, because it
+#      also protects default sockets that are not sessiond's, such as srtop's.
+#
+#      This rule needs the socket table: where `lsof` is missing or denied, nothing can be told
+#      apart from that daemon, so the sweep kills nothing at all unless it can rule the daemon out
+#      independently — no socket in any default runtime directory it can see. That fallback stays
+#      environment-bound, and cannot be made otherwise: with no inventory there is nothing to read
+#      a foreign `TMPDIR` or `XDG_RUNTIME_DIR` out of, so a daemon serving a default socket under
+#      one is invisible to the sweep. Residual exposure, left open deliberately: on a host with no
+#      `lsof`, a daemon whose runtime directory the reaper cannot name is spared only if rule 6
+#      spares it — an installed `/usr/local/bin/srui-sessiond` is safe, one built in a checkout of
+#      this repository and detached by hand is not.
 #   6. launched from a checkout of *this* repository. The binary's path must lie inside the main
 #      checkout or one of its linked worktrees (`git worktree list`), which is the one thing that
 #      makes a process *this* repository's test debris rather than some other program with a
@@ -61,7 +83,7 @@
 #      path they carry;
 #   b. the kernel's unix-socket table (`lsof -U`), which names the socket a server actually holds
 #      even when nothing on its command line does. `srui-sessiond` with no `--socket` computes
-#      `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/srui-<uid>/srui-sessiond.sock` internally
+#      `$XDG_RUNTIME_DIR/srui-sessiond.sock`, or `${TMPDIR:-/tmp}/srui-<uid>/srui-sessiond.sock`,
 #      (`unix_security::default_socket_path`), so a developer's deliberately detached daemon is
 #      invisible to (a) alone — and unlinking its socket takes the authoritative session away from
 #      every new and reconnecting client. If no socket inventory can be read at all, directory
@@ -116,8 +138,13 @@ tmp_globs=${SRUI_REAP_TMP_GLOBS:-'/tmp/srui-* /tmp/px0* /tmp/srtop-*'}
 my_uid=$(id -u)
 failures=0
 
+# One snapshot of the process table, carrying everything every rule needs — including each
+# process's absolute start time, so that selection and identity come from the *same* observation.
+# `lstart=` is exactly five whitespace-separated tokens (`Thu Oct  1 13:54:00 2026`) on both macOS
+# and Linux, so the columns awk sees are: $1 pid, $2 ppid, $3 uid, $4 etime, $5..$9 lstart,
+# $10 argv[0], $11.. the rest of the command line.
 process_snapshot() {
-    ps -eo pid=,ppid=,uid=,etime=,command= 2>/dev/null
+    ps -eo pid=,ppid=,uid=,etime=,lstart=,command= 2>/dev/null
 }
 
 # True when a pid we signalled is no longer running: either gone from the process table, or a
@@ -137,8 +164,8 @@ process_terminated() {
     esac
 }
 
-# A pid's absolute start time: the one property that distinguishes a process from a later one that
-# inherited its number. Empty when the pid is gone.
+# A pid's absolute start time *now*: the one property that distinguishes a process from a later one
+# that inherited its number. Empty when the pid is gone.
 #
 # This matters because selection and signalling are not simultaneous. Each candidate can occupy the
 # kill loop for up to 2.2s (SIGTERM, twenty 0.1s liveness polls, SIGKILL, 0.2s), so with several
@@ -146,6 +173,13 @@ process_terminated() {
 # unrelated process of this same user - which the unconditional kill would then signal, and the
 # escalation below would SIGKILL. Every signal is therefore gated on the identity recorded at
 # selection time.
+#
+# Used only for those pre-signal re-checks, never to record the identity: reading it here would be a
+# second observation, and a pid recycled between the selecting snapshot and that read would have the
+# *replacement's* start time recorded as the selected identity - after which every later check
+# agrees, and the reaper SIGTERMs (then SIGKILLs) an unrelated process. The recorded identity comes
+# from `process_snapshot`, and the value built there is byte-identical to this one: five tokens
+# joined by single spaces, which is what squeezing the whitespace out of `ps -o lstart=` produces.
 process_start() {
     ps -o lstart= -p "$1" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
 }
@@ -223,8 +257,10 @@ inside_repo_checkout() {
     return 1
 }
 
-# pid<TAB>argv[0] for every fixture process that is orphaned, old enough, ours, and not holding the
-# default runtime socket (rule 5).
+# pid<TAB>start<TAB>argv[0] for every fixture process that is orphaned, old enough, ours, and not
+# holding a default runtime socket (rule 5). The start time is read out of the very snapshot that
+# selects the pid, so no window exists in which the number could be reissued before its identity is
+# recorded; see `process_start`.
 select_orphans() {
     awk -v pattern="$pattern" -v min_age="$age_seconds" -v my_uid="$my_uid" -v self="$$" \
         -v spared="$default_socket_pids" '
@@ -243,7 +279,7 @@ select_orphans() {
         $3 + 0 != my_uid + 0 { next }
         $2 + 0 != 1 { next }                    # live parent: a running test owns this process
         age_seconds($4) < min_age + 0 { next }  # too young to be debris
-        $5 ~ pattern { print $1 "\t" $5 }
+        $10 ~ pattern { print $1 "\t" $5 " " $6 " " $7 " " $8 " " $9 "\t" $10 }
     '
 }
 
@@ -255,7 +291,7 @@ referenced_paths() {
         BEGIN { n = split(killed, list, " "); for (i = 1; i <= n; i++) dead[list[i] + 0] = 1 }
         $1 + 0 in dead { next }
         {
-            for (i = 5; i <= NF; i++) {
+            for (i = 10; i <= NF; i++) {
                 token = $i
                 sub(/^--[A-Za-z0-9-]+=/, "", token)
                 if (token ~ /^\//) print token
@@ -288,12 +324,30 @@ held_socket_paths() {
 
 # The runtime directory the servers pick when no socket is given. Both spellings are listed because
 # `std::env::temp_dir()` is `$TMPDIR` where it is set (macOS) and `/tmp` where it is not (Linux).
+#
+# Derived from *this* shell's environment, so it only names the directories a daemon started from a
+# shell like this one would use. The shapes below are what recognize one started from a shell with a
+# different `XDG_RUNTIME_DIR` or `TMPDIR`.
 default_tmp=${TMPDIR:-/tmp}
 default_runtime_dirs="${XDG_RUNTIME_DIR:-} ${default_tmp%/}/srui-$my_uid /tmp/srui-$my_uid"
+
+# The environment-independent shapes of a default socket (`unix_security::default_socket_path`):
+# the `srui-<uid>` directory component it gets under any `TMPDIR`, and the file name it gets under
+# any `XDG_RUNTIME_DIR` — where the directory is whatever that variable said and has no
+# recognizable spelling. No fixture produces either shape.
+default_runtime_leaf="srui-$my_uid"
+default_socket_name="srui-sessiond.sock"
 
 # Any socket sitting in a default runtime directory, bound or stale. Used only when the socket
 # table cannot be read: it answers "could there be a daemon here to protect?" without naming who
 # holds what.
+#
+# Limited to the directories this shell's environment names, and that cannot be fixed: the shapes
+# above need a socket inventory to match against, and without one there is nothing to discover an
+# arbitrary `TMPDIR` or `XDG_RUNTIME_DIR` from — a filesystem-wide search for a default socket is
+# not something a pre-test sweep can do. So on a host with no `lsof`, a daemon serving a default
+# socket under a runtime directory unlike this shell's is invisible here; rule 6 still spares an
+# installed one, while one built in this repository and detached by hand stays at risk.
 default_socket_present() {
     local dir entry
     # shellcheck disable=SC2086 # deliberate word splitting: a space-separated list of directories
@@ -312,12 +366,22 @@ socket_snapshot=$(socket_holders)
 socket_evidence=1
 [ -n "$socket_snapshot" ] || socket_evidence=0
 default_socket_pids=$(printf '%s\n' "$socket_snapshot" |
-    awk -F'\t' -v dirs="$default_runtime_dirs" '
+    awk -F'\t' -v dirs="$default_runtime_dirs" -v leaf="$default_runtime_leaf" \
+        -v sock_name="$default_socket_name" '
         BEGIN { n = split(dirs, list, " ") }
         {
+            # A directory this sweep can name: protects every default socket under it, sessiond or
+            # not (srtop and the demos have their own default names).
             for (i = 1; i <= n; i++) {
                 if (list[i] != "" && index($2, list[i] "/") == 1) { print $1; next }
             }
+            # Shape, for a daemon whose runtime directory this sweep cannot name: the default
+            # runtime directory under a `TMPDIR` other than ours...
+            if (index($2, "/" leaf "/") > 0) { print $1; next }
+            # ...and the default socket file name under an `XDG_RUNTIME_DIR` other than ours.
+            name = $2
+            sub(/^.*\//, "", name)
+            if (name == sock_name) { print $1; next }
         }
     ' | sort -u | tr '\n' ' ')
 
@@ -351,7 +415,7 @@ if [ -z "$snapshot" ]; then
 fi
 
 matched_total=$(printf '%s\n' "$snapshot" |
-    awk -v pattern="$pattern" -v my_uid="$my_uid" '$3 + 0 == my_uid + 0 && $5 ~ pattern' |
+    awk -v pattern="$pattern" -v my_uid="$my_uid" '$3 + 0 == my_uid + 0 && $10 ~ pattern' |
     wc -l | tr -d ' ')
 orphans=$(printf '%s\n' "$snapshot" | select_orphans)
 
@@ -359,12 +423,11 @@ orphans=$(printf '%s\n' "$snapshot" | select_orphans)
 # a shell. A candidate outside every checkout of this repository is not this repository's debris.
 foreign=0
 reapable=
-while IFS=$'\t' read -r pid exe; do
+while IFS=$'\t' read -r pid start exe; do
     [ -n "${pid:-}" ] || continue
     if inside_repo_checkout "$exe"; then
-        # Start time first: the command can contain spaces, so it has to stay the last field.
-        start=$(process_start "$pid")
-        [ -n "$start" ] || continue # exited between the snapshot and now; nothing to signal
+        # pid, then the identity the snapshot recorded for it, then argv[0]: the command can contain
+        # spaces, so it has to stay the last field.
         reapable="${reapable}${pid}"$'\t'"${start}"$'\t'"${exe}"$'\n'
     else
         foreign=$((foreign + 1))
@@ -392,8 +455,12 @@ while IFS=$'\t' read -r pid start exe; do
         killed_pids="$killed_pids $pid"
         continue
     fi
-    # Checked immediately before the signal, not once at selection: see `process_start`.
-    if ! still_the_selected_process "$pid" "$start"; then
+    # Compared immediately before the signal against what the selecting snapshot recorded: see
+    # `process_start`. A pid that simply exited since the snapshot is not a replacement, so it is
+    # skipped silently rather than counted as one.
+    current_start=$(process_start "$pid")
+    [ -n "$current_start" ] || continue
+    if [ "$current_start" != "$start" ]; then
         echo "note: pid $pid is no longer the process selected; not signalling it" >&2
         replaced=$((replaced + 1))
         continue

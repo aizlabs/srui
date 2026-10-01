@@ -116,29 +116,14 @@ jobs:
               echo "Codex has reviewed ${HEAD_SHA}."
               exit 0
             fi
-            # The clean-verdict comment, paginated the same way. Three things keep this narrow:
-            #   * the author must be the bot, by the same immutable account id as above, so no
-            #     human - and no look-alike login - can satisfy the gate by quoting the sentence;
-            #   * the body must *start* with the clean-verdict sentence, which excludes the bot's
-            #     own "Codex Review Summary" comment (it tabulates an abbreviated sha too);
-            #   * the sha is compared prefix-wise, because the comment abbreviates it, but the
-            #     prefix is *captured out of the `**Reviewed commit:**` field* rather than
-            #     searched for anywhere in the body -- a 7-char prefix mentioned in prose is not
-            #     a verdict. `$ENV.HEAD_SHA` keeps the sha out of the jq program text.
-            clean=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-              --jq '[ .[]
-                      | select(.user.id == 199175422)
-                      | (.body // "")
-                      | select(startswith("Codex Review: Didn'\''t find any major issues."))
-                      | capture("Reviewed commit:\\*\\*\\s*`(?<sha>[0-9a-fA-F]{7,40})`").sha
-                      | ascii_downcase as $sha
-                      | select(($ENV.HEAD_SHA | ascii_downcase) | startswith($sha))
-                    ] | length' \
-              | jq -s 'add // 0')
-            if [ "$clean" -gt 0 ]; then
+            # The clean-verdict comment, which Codex posts instead of a review object when it finds
+            # nothing. Extracted into a script because it is security-critical and a prefix
+            # comparison here was forgeable by grinding a commit with the same abbreviated sha; the
+            # script resolves the abbreviation in full and is unit-tested against that attack by
+            # scripts/test-ci-review-gate-identity.sh.
+            if scripts/ci-accept-codex-verdict.sh "$PR" "$HEAD_SHA"; then
               # "A review happened", not "findings are resolved": the next step still fails on
               # every unresolved Codex thread, including ones opened against an earlier head.
-              echo "Codex reviewed ${HEAD_SHA} and reported no findings."
               exit 0
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then

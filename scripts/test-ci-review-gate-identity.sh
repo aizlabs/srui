@@ -28,8 +28,14 @@ if grep -q 'startswith("chatgpt-codex-connector' "$workflow"; then
 fi
 
 # 2. Both REST matchers (the review query and the clean-verdict query) key on the account id.
+# One matcher per place the bot is identified: the review query in the workflow, and the
+# clean-verdict acceptance in its own script.
 rest_hits=$(grep -c '\.user\.id == 199175422' "$workflow" || true)
-[ "$rest_hits" -eq 2 ] || fail "expected 2 REST identity checks (.user.id == 199175422), found $rest_hits"
+[ "$rest_hits" -eq 1 ] || fail "expected 1 REST identity check in $workflow, found $rest_hits"
+grep -q 'CODEX_BOT_ID=199175422' scripts/ci-accept-codex-verdict.sh ||
+    fail "scripts/ci-accept-codex-verdict.sh does not identify Codex by account id"
+grep -q 'startswith(\"chatgpt-codex-connector' scripts/ci-accept-codex-verdict.sh &&
+    fail "scripts/ci-accept-codex-verdict.sh identifies Codex by login prefix"
 
 # 3. The GraphQL matcher compares the login exactly and requires a Bot author.
 grep -q '== "chatgpt-codex-connector"' "$workflow" ||
@@ -66,6 +72,93 @@ real=$(jq "$matcher" "$work/real.json")
 forged=$(jq "$matcher" "$work/forged.json")
 [ "$real" = "1" ] || fail "the genuine clean verdict is no longer accepted (count $real)"
 [ "$forged" = "0" ] || fail "a forged clean verdict from a look-alike login is accepted (count $forged)"
+
+# 5. The clean-verdict acceptance, driven through a `gh` stand-in. Each case answers the three
+#    endpoints the script calls - the PR's comments, commit resolution, and the PR's commit list -
+#    from fixtures, so the decision is exercised with no network and no live pull request.
+#
+#    The attack under test: collect a verdict on a benign head, then grind a replacement commit that
+#    shares the comment's abbreviated sha. 10 hex is 40 bits and 7 hex is 28, both cheap, so the gate
+#    must never accept a stale verdict for a head nobody reviewed.
+verdict_script=scripts/ci-accept-codex-verdict.sh
+[ -x "$verdict_script" ] || fail "$verdict_script is not executable"
+
+reviewed=aaaaaaaaaa111111111111111111111111111111   # the benign head Codex reviewed
+ground=aaaaaaaaaa222222222222222222222222222222     # same 10-hex prefix, never reviewed
+abbrev=aaaaaaaaaa
+
+stub_dir=$(mktemp -d "${TMPDIR:-/tmp}/gate-gh-stub.XXXXXX")
+cat >"$stub_dir/gh" <<'STUB'
+#!/bin/sh
+# Answers only what ci-accept-codex-verdict.sh asks of `gh api`:
+#   GATE_COMMENT_SHA  the abbreviation the bot's verdict names ('' => no verdict comment)
+#   GATE_RESOLVES_TO  what the API resolves that abbreviation to ('' => HTTP 422)
+#   GATE_PR_SHAS      commits of the pull request, newline separated
+api_path=
+for arg in "$@"; do
+    case $arg in repos/*) api_path=$arg ;; esac
+done
+case $api_path in
+    */issues/*/comments)
+        [ -n "${GATE_COMMENT_SHA:-}" ] || exit 0
+        printf '%s\n' "$GATE_COMMENT_SHA"
+        ;;
+    */commits/*)
+        if [ -z "${GATE_RESOLVES_TO:-}" ]; then
+            echo 'gh: No commit found for SHA (HTTP 422)' >&2
+            exit 1
+        fi
+        printf '%s\n' "$GATE_RESOLVES_TO"
+        ;;
+    */pulls/*/commits)
+        printf '%b\n' "${GATE_PR_SHAS:-}"
+        ;;
+esac
+STUB
+chmod +x "$stub_dir/gh"
+
+accepts_verdict() {
+    PATH="$stub_dir:$PATH" GITHUB_REPOSITORY=aizlabs/srui \
+        GATE_COMMENT_SHA="$1" GATE_RESOLVES_TO="$2" GATE_PR_SHAS="$3" \
+        bash "$verdict_script" 72 "$4" >/dev/null 2>&1
+}
+
+if accepts_verdict "$abbrev" "$reviewed" "$reviewed" "$reviewed"; then
+    echo "  ok: a genuine verdict for this head is accepted"
+else
+    fail "a genuine verdict for the current head was rejected"
+fi
+
+# The grind: head is the ground commit, while the verdict's abbreviation resolves to the reviewed one.
+if accepts_verdict "$abbrev" "$reviewed" "$reviewed\n$ground" "$ground"; then
+    fail "a stale verdict satisfied the gate for an unreviewed head sharing its abbreviation"
+else
+    echo "  ok: a verdict naming a different commit is rejected for a ground look-alike head"
+fi
+
+# The same grind after a force-push that drops the reviewed commit, so the pull request contains only
+# the ground one. Nothing is ambiguous any more, and the collision guard cannot help: comparing the
+# resolved sha in full is the only thing left that can reject this.
+if accepts_verdict "$abbrev" "$reviewed" "$ground" "$ground"; then
+    fail "a stale verdict satisfied the gate after a force-push that removed the reviewed commit"
+else
+    echo "  ok: rejected even when the reviewed commit is no longer in the pull request"
+fi
+
+# An abbreviation the API will not resolve (ambiguous or unknown) leaves nothing to compare.
+if accepts_verdict "$abbrev" "" "$reviewed" "$reviewed"; then
+    fail "a verdict whose abbreviation cannot be resolved was accepted"
+else
+    echo "  ok: an unresolvable abbreviation is refused"
+fi
+
+if accepts_verdict "" "$reviewed" "$reviewed" "$reviewed"; then
+    fail "the gate accepted a head with no verdict comment"
+else
+    echo "  ok: no verdict comment means no acceptance"
+fi
+
+rm -rf "$stub_dir"
 
 if [ "$status" -eq 0 ]; then
     echo "Review gate identifies Codex by account identity: genuine verdict accepted, forged rejected."

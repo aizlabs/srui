@@ -5,12 +5,18 @@ import AppKit
 import Darwin
 import SemanticModel
 import Protocol
-import Session
+@testable import Session
 import TransportSSH
 import RendererAppKit
 
+/// Serialized as a suite, not per test: `.serialized` on a non-parameterized test function is a
+/// no-op (the compiler warns), and each test here launches its own sshd, srtop and NSWindow. Two of
+/// them at once triples that load on the one main actor every test in this process shares, and
+/// PX-004 samples native controls on a 500 ms tick schedule while it runs. Serializing the three
+/// cases costs about one second of wall clock.
+@Suite(.serialized)
 struct ProcessExplorerShellTests {
-    @Test(.serialized, .timeLimit(.minutes(1)), arguments: [false, true])
+    @Test(.timeLimit(.minutes(1)), arguments: [false, true])
     @MainActor
     func shellOverSSHRetainsNativeHandlesAfterTitleFixture(fakeSource: Bool) async throws {
         let harness = try await Self.launch(
@@ -31,14 +37,16 @@ struct ProcessExplorerShellTests {
 
         let surfaceHandle = try #require(renderer.registry.handle(for: NodeId(1)))
         let window = try #require(surfaceHandle.window)
-        defer { window.close() }
+        defer { window.orderOut(nil); window.close() }
         let headingHandle = try #require(renderer.registry.handle(for: NodeId(3)))
         let heading = try #require(headingHandle.view as? NSTextField)
         let status = try #require(renderer.registry.handle(for: NodeId(4))?.view as? NSTextField)
         let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
         let scroll = try #require(tableHandle.view as? NSScrollView)
         let table = try #require(scroll.documentView as? NSTableView)
-        window.makeKeyAndOrderFront(nil)
+        // The session already ordered the surface in; re-order it under the host's own
+        // presentation policy rather than forcing it front over the developer's desktop.
+        SurfacePresentation.forHostApplication().present(window)
         window.contentView?.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
         #expect(window.isVisible)
@@ -82,7 +90,7 @@ struct ProcessExplorerShellTests {
     /// PX-004: the scripted fixture sequence refreshes the same native table in
     /// place — one insertion, one deletion, one rename, a failed scan that keeps
     /// the last-known rows, and a tick that publishes nothing at all.
-    @Test(.serialized, .timeLimit(.minutes(2)))
+    @Test(.timeLimit(.minutes(2)))
     @MainActor
     func scriptedRefreshUpdatesTheSameNativeTableInPlace() async throws {
         let intervalMilliseconds = 500
@@ -103,53 +111,68 @@ struct ProcessExplorerShellTests {
         }
         let surfaceHandle = try #require(renderer.registry.handle(for: NodeId(1)))
         let window = try #require(surfaceHandle.window)
-        defer { window.close() }
+        defer { window.orderOut(nil); window.close() }
         let statusField = try #require(renderer.registry.handle(for: NodeId(4))?.view as? NSTextField)
         let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
         let scroll = try #require(tableHandle.view as? NSScrollView)
         let table = try #require(scroll.documentView as? NSTableView)
-        window.makeKeyAndOrderFront(nil)
+        SurfacePresentation.forHostApplication().present(window)
         window.contentView?.layoutSubtreeIfNeeded()
         let windowNumber = window.windowNumber
 
-        // Sample far faster than the server polls, so no published state can
-        // pass unobserved.
-        var trace: [Observation] = []
+        // Record one entry per rendered transaction from the renderer's own completion hook
+        // instead of sampling the controls. A poll loop only sees what it happens to be
+        // scheduled for: on a contended machine (3-core CI, the whole suite in parallel) a
+        // 20ms sleep can resume after a whole 500ms tick, so states the assertions below name
+        // — the failed scan and its recovery — can pass unobserved even though the client
+        // published them. The hook runs after the transaction is applied *and* rendered and
+        // before the next one is, so no published state can be missed at any machine speed.
+        // A session that fails mid-run must name itself in the timeout below rather than look
+        // like a slow machine.
+        let sessionFailure = ManagedAtomic<String?>(nil)
+        controller.onFailure = { failure in sessionFailure.store(String(describing: failure)) }
+        let recorder = PublishedStateRecorder(applier: applier, window: window,
+                                              statusField: statusField, table: table)
+        controller.rendererDidRenderInterceptorForTesting = { [recorder] in
+            await recorder.record()
+        }
+        defer { controller.rendererDidRenderInterceptorForTesting = nil }
+
+        // Wait for the states the assertions read rather than for a cycle count: two cycle
+        // starts prove the five-tick script repeats, and the failed scan needs the state that
+        // follows it to show the recovery. Sleep between checks rather than spinning the main
+        // actor - recording is event-driven, so polling only decides when to stop, and a
+        // multi-second main-actor spin would delay the very renders being recorded.
         let clock = ContinuousClock()
-        let start = clock.now
-        let deadline = start.advanced(by: .seconds(20))
-        var stamps: [Duration] = []
-        while clock.now < deadline {
-            window.contentView?.layoutSubtreeIfNeeded()
-            // The renderer applies a transaction just after the applier does, so
-            // a sample taken between the two would pair a new revision with the
-            // previous rows. Only a sample where the native controls already
-            // show what the client holds is a published state — which is also
-            // the assertion that the native table mirrors the model.
-            let observation = Observation(revision: applier.lastAppliedRevision.value,
-                                          status: statusField.stringValue,
-                                          rows: Self.nativeRows(table),
-                                          itemIDs: Self.modelItemIDs(applier))
-            guard observation.rows == Self.modelRows(applier),
-                  observation.status == Self.modelStatus(applier) else {
-                try await Task.sleep(for: .milliseconds(20))
-                continue
+        let deadline = clock.now.advanced(by: .seconds(60))
+        while Self.coversTwoScriptedCycles(recorder.states) == false {
+            guard clock.now < deadline else {
+                throw ScriptedSequenceIncomplete(
+                    description: "the scripted sequence did not complete in 60s; recorded "
+                        + "\(recorder.states.count) published states: "
+                        + "\(recorder.states.map { "\($0.revision):\($0.status)" }); "
+                        + "revision=\(applier.lastAppliedRevision.value) "
+                        + "serverRunning=\(harness.server.isRunning) "
+                        + "sshdRunning=\(harness.sshd.isRunning) "
+                        + "sessionFailure=\(sessionFailure.load() ?? "none")"
+                )
             }
-            if trace.last != observation {
-                trace.append(observation)
-                stamps.append(start.duration(to: clock.now))
-            }
-            // One full cycle is five ticks; two cycles prove the script repeats.
-            if trace.filter({ $0.rows == Self.initialRows }).count >= 3 { break }
             try await Task.sleep(for: .milliseconds(20))
         }
+        controller.rendererDidRenderInterceptorForTesting = nil
+        let trace = recorder.states
+        let stamps = recorder.stamps
+        // Every entry was read after its own transaction had rendered, so the native controls
+        // must already show what the client holds — this is the assertion that the native table
+        // mirrors the model, not a filter that drops the states where it does not.
+        #expect(recorder.divergences.isEmpty, "native controls diverged from the client's model")
 
-        let settledRows = [["4101", "worker"], ["4103", "helper-tool"], ["4104", "builder"]]
-        let normalStatus = "Read-only · Fake process sequence"
+        let settledRows = Self.settledRows
+        let normalStatus = Self.normalStatus
         #expect(trace.contains { $0.rows == Self.initialRows && $0.status == normalStatus })
         #expect(trace.contains { $0.rows == settledRows && $0.status == normalStatus })
         // A failed scan keeps every row it had and says so.
-        let failed = try #require(trace.first { $0.status.contains("retained from an earlier scan") })
+        let failed = try #require(trace.first { $0.status.contains(Self.retainedRowsMarker) })
         #expect(failed.rows == settledRows, "a failed scan must not empty the table")
         #expect(failed.status == "\(normalStatus) · incomplete scan · process list unavailable: permission denied · 3 rows retained from an earlier scan")
         // Recovery converges back onto the same rows.
@@ -197,7 +220,7 @@ struct ProcessExplorerShellTests {
     }
 
     /// What a client actually holds and shows at one moment.
-    private struct Observation: Equatable {
+    fileprivate struct Observation: Equatable, Sendable {
         let revision: UInt64
         let status: String
         let rows: [[String]]
@@ -205,9 +228,23 @@ struct ProcessExplorerShellTests {
     }
 
     private static let initialRows = [["4101", "worker"], ["4102", "worker"], ["4103", "helper"]]
+    private static let settledRows = [["4101", "worker"], ["4103", "helper-tool"], ["4104", "builder"]]
+    private static let normalStatus = "Read-only · Fake process sequence"
+    private static let retainedRowsMarker = "retained from an earlier scan"
+
+    /// Whether the recorded states cover every state the PX-004 assertions read.
+    private static func coversTwoScriptedCycles(_ trace: [Observation]) -> Bool {
+        guard trace.filter({ $0.rows == initialRows && $0.status == normalStatus }).count >= 2,
+              trace.contains(where: { $0.rows == settledRows && $0.status == normalStatus }),
+              let failed = trace.firstIndex(where: { $0.status.contains(retainedRowsMarker) }),
+              failed + 1 < trace.count else {
+            return false
+        }
+        return true
+    }
 
     @MainActor
-    private static func nativeRows(_ table: NSTableView) -> [[String]] {
+    fileprivate static func nativeRows(_ table: NSTableView) -> [[String]] {
         (0..<table.numberOfRows).map { row in
             (0..<table.tableColumns.count).map { column in
                 (table.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTextField)?
@@ -218,14 +255,14 @@ struct ProcessExplorerShellTests {
 
     /// Stable item identities held by the client, in published order.
     @MainActor
-    private static func modelItemIDs(_ applier: TransactionApplier) -> [UInt64] {
+    fileprivate static func modelItemIDs(_ applier: TransactionApplier) -> [UInt64] {
         guard let model = applier.store.getModel(ModelId(1)) else { return [] }
         return model.items.sorted { $0.key < $1.key }.map { $0.value.itemID.value }
     }
 
     /// The row cells the client holds, in published order.
     @MainActor
-    private static func modelRows(_ applier: TransactionApplier) -> [[String]] {
+    fileprivate static func modelRows(_ applier: TransactionApplier) -> [[String]] {
         guard let model = applier.store.getModel(ModelId(1)) else { return [] }
         return model.items.sorted { $0.key < $1.key }.map { item in
             guard case .list(let cells) = item.value.value else { return [] }
@@ -241,7 +278,7 @@ struct ProcessExplorerShellTests {
 
     /// The status text the client holds.
     @MainActor
-    private static func modelStatus(_ applier: TransactionApplier) -> String {
+    fileprivate static func modelStatus(_ applier: TransactionApplier) -> String {
         guard case .string(let text)? = applier.store.getNode(NodeId(4))?.getProperty(.text) else {
             return ""
         }
@@ -352,5 +389,59 @@ struct ProcessExplorerShellTests {
         ]
         try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
             .write(to: output.appendingPathComponent("\(name).json"))
+    }
+}
+
+private struct ScriptedSequenceIncomplete: Error, CustomStringConvertible {
+    let description: String
+}
+
+/// Every state the client published, one entry per rendered transaction.
+///
+/// `rendererDidRenderInterceptorForTesting` is the only vantage point from which a published
+/// state is observable without sampling: it runs once per transaction, after that transaction
+/// has been applied and rendered and before the next one is, so the record is complete and
+/// ordered however slow or contended the machine is.
+@MainActor
+private final class PublishedStateRecorder {
+    private(set) var states: [ProcessExplorerShellTests.Observation] = []
+    private(set) var stamps: [Duration] = []
+    /// Revisions where the native controls did not show what the client held after rendering.
+    private(set) var divergences: [String] = []
+
+    private let applier: TransactionApplier
+    private let window: NSWindow
+    private let statusField: NSTextField
+    private let table: NSTableView
+    private let clock = ContinuousClock()
+    private let start: ContinuousClock.Instant
+
+    init(applier: TransactionApplier, window: NSWindow, statusField: NSTextField, table: NSTableView) {
+        self.applier = applier
+        self.window = window
+        self.statusField = statusField
+        self.table = table
+        self.start = clock.now
+    }
+
+    func record() {
+        window.contentView?.layoutSubtreeIfNeeded()
+        let observation = ProcessExplorerShellTests.Observation(
+            revision: applier.lastAppliedRevision.value,
+            status: statusField.stringValue,
+            rows: ProcessExplorerShellTests.nativeRows(table),
+            itemIDs: ProcessExplorerShellTests.modelItemIDs(applier)
+        )
+        let modelRows = ProcessExplorerShellTests.modelRows(applier)
+        let modelStatus = ProcessExplorerShellTests.modelStatus(applier)
+        if observation.rows != modelRows || observation.status != modelStatus {
+            divergences.append(
+                "rev \(observation.revision): native \(observation.rows)/\(observation.status)"
+                    + " vs model \(modelRows)/\(modelStatus)"
+            )
+        }
+        guard states.last != observation else { return }
+        states.append(observation)
+        stamps.append(start.duration(to: clock.now))
     }
 }

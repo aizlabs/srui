@@ -21,6 +21,11 @@ private actor TransactionRateFailureLog {
         messages.isEmpty
     }
 
+    /// Every recorded failure, so an assertion can name the cause instead of printing `false`.
+    var recorded: [String] {
+        messages
+    }
+
     func contains(_ fragment: String) -> Bool {
         messages.contains { $0.contains(fragment) }
     }
@@ -143,13 +148,27 @@ struct TransactionRateLimiterTests {
         }
         try await serverTransport.send(data: replay)
 
-        try await AsyncTestSupport.eventually(
-            timeout: .seconds(3),
+        // The claim is that the 241st transaction is *backpressured*, not failed, so the wait ends
+        // on either outcome and asserts which one it was. Waiting out the whole budget for a
+        // session that already failed would report a timeout instead of the failure that caused it.
+        //
+        // 3s had no headroom at all: applying 241 transactions takes 4.3-4.8s measured inside this
+        // suite on an idle 12-core host, because each one hops to the main actor that all twelve
+        // parallel tests share. It failed 5 runs out of 5 there, so the old budget was asserting
+        // this machine's scheduling, not §26's backpressure.
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(30),
             description: "all 241 replay transactions apply through ingress backpressure"
         ) {
-            applier.lastAppliedRevision == Revision(241)
+            if applier.lastAppliedRevision == Revision(241) { return true }
+            return await failures.isEmpty == false
         }
-        #expect(await failures.isEmpty)
+        let recordedFailures = await failures.recorded
+        #expect(
+            recordedFailures.isEmpty,
+            "session failed instead of applying through ingress backpressure: \(recordedFailures)"
+        )
+        #expect(applier.lastAppliedRevision == Revision(241))
         #expect(
             applier.store.node(for: NodeId(1))?.getProperty(.label)
                 == .string("revision-241")
@@ -440,7 +459,17 @@ struct TransactionRateLimiterTests {
             transactionRateLimits: limits
         )
         let failures = TransactionRateFailureLog()
+        // Sampled *at the moment the control failure is reported*, not by polling afterwards: the
+        // claim is an ordering one — the oversized ACK is refused while the second transaction is
+        // still parked on rate credit — and a poll loop can only observe that ordering if it is
+        // scheduled inside the window. Recording the revision inside the callback makes the
+        // assertion independent of how promptly this test's own task is scheduled.
+        let revisionAtControlFailure = ManagedAtomic<UInt64?>(nil)
+        let throttledApplier = controller.applier
         controller.onFailure = { failure in
+            if failure.description.contains("invalid event_id") {
+                revisionAtControlFailure.store(throttledApplier.lastAppliedRevision.value)
+            }
             Task { await failures.record(failure) }
         }
 
@@ -487,11 +516,18 @@ struct TransactionRateLimiterTests {
         try await serverTransport.send(data: combined)
 
         try await AsyncTestSupport.eventuallyAsync(
-            timeout: .milliseconds(300),
-            description: "oversized control ACK rejected without waiting one second for rate credit"
+            timeout: .seconds(5),
+            description: "oversized control ACK rejected"
         ) {
             await failures.contains("invalid event_id")
         }
+        // Burst capacity is 1 and sustained credit is 1/s, so the second transaction cannot have
+        // been admitted yet unless the control message queued behind the throttled lane.
+        let observedRevision = try #require(revisionAtControlFailure.load())
+        #expect(
+            observedRevision < 2,
+            "control ACK refused only after the throttled lane drained; revision \(observedRevision)"
+        )
 
         await controller.stop()
         await serverTransport.close()

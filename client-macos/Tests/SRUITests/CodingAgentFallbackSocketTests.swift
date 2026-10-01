@@ -53,8 +53,20 @@ struct CodingAgentFallbackSocketTests {
         try await AsyncTestSupport.eventually(description: "coding-agent snapshot rendered") {
             renderer.registry.handle(for: NodeId(18)) != nil
         }
+        // The catch-up snapshot mounts the native tree *before* the session releases the snapshot
+        // latch, so a node handle existing is not yet evidence that user events may be dispatched
+        // (§18.3). Automation below sends events; wait for the condition it needs rather than
+        // assuming the tail of snapshot finalization already ran.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(10),
+            description: "session releases the snapshot latch and admits events"
+        ) {
+            controller.isEventDispatchEnabled
+        }
 
         let surfaceWindow = try #require(renderer.registry.handle(for: NodeId(1))?.window)
+        // Leave nothing in the window list behind this test.
+        defer { surfaceWindow.orderOut(nil) }
         #expect(surfaceWindow.styleMask.contains(.resizable))
         #expect(surfaceWindow.contentMaxSize.width > surfaceWindow.contentMinSize.width)
         surfaceWindow.setContentSize(NSSize(width: 900, height: 900))
@@ -125,6 +137,13 @@ struct CodingAgentFallbackSocketTests {
             reportedTerminalSizes.append((columns, rows))
             forwardResize?(columns, rows, width, height)
         }
+        // The view publishes its PTY geometry on a debounce after each layout and only when that
+        // geometry *changed*, so an interceptor installed after the mount's own publish would see
+        // nothing at all — which made this expectation depend on how quickly the test reached this
+        // line. Grow the surface so the next publish is unconditional, and keep requiring the
+        // reported geometry to be at least the conventional 80×24.
+        surfaceWindow.setContentSize(NSSize(width: 1000, height: 1000))
+        surfaceWindow.contentView?.layoutSubtreeIfNeeded()
         terminalView.layout()
         let terminalResizeDeadline = Date().addingTimeInterval(3)
         while Date() < terminalResizeDeadline,
@@ -142,6 +161,16 @@ struct CodingAgentFallbackSocketTests {
             "Terminal did not publish the minimum PTY size: \(reportedTerminalSizes)"
         )
 
+        // The demo's session is already past revision 0, so this handshake catches up through a
+        // snapshot, and that snapshot mounts every node before the controller finishes the
+        // catch-up that reopens event dispatch. Semantic activation is refused as inactive until
+        // then, so wait for that boundary rather than for the mount alone (§15, §18.3).
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(10),
+            description: "coding-agent snapshot catch-up reopens event dispatch"
+        ) {
+            controller.isEventDispatchEnabled
+        }
         let semanticInspector = controller.makeSemanticInspector()
         let semanticApprove = try #require(
             semanticInspector.find(role: .button, label: "Approve")
@@ -171,7 +200,7 @@ struct CodingAgentFallbackSocketTests {
         var expectedRevision: UInt64 = 4
         for index in 0..<10 {
             let isReject = index.isMultiple(of: 2)
-            (isReject ? rejectButton : approveButton).performClick(nil)
+            NativeActivation.click(isReject ? rejectButton : approveButton)
             expectedRevision += 1
             try await Self.waitForRevision(
                 applier,

@@ -21,7 +21,10 @@ import Session
 import TransportSSH
 import RendererAppKit
 
-@Suite("Session Robustness Tests")
+// A parked test is indistinguishable from a wedged CI job, so every test here carries a hard
+// ceiling: swift-testing cancels the test task at the limit and reports a failure instead of
+// letting the whole run sit at 0% CPU (§4 inv. 13 applied to the suite itself).
+@Suite("Session Robustness Tests", .timeLimit(.minutes(1)))
 struct SessionRobustnessTests {
 
     // MARK: - Helpers
@@ -63,6 +66,52 @@ struct SessionRobustnessTests {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return await condition()
+    }
+
+    /// Raised instead of waiting forever when an expected outbound event never arrives.
+    struct OutboundEventTimeout: Error, CustomStringConvertible {
+        let seconds: Double
+        var description: String {
+            "no outbound EVENT frame arrived within \(seconds)s"
+        }
+    }
+
+    /// Returns the `observed_revision` of the first outbound EVENT on `stream`, or throws
+    /// `OutboundEventTimeout`.
+    ///
+    /// A bare `for try await chunk in stream` here is an unbounded wait: every path that can
+    /// legitimately drop a queued interaction (a stale handle, a node disabled by a later
+    /// revision, an inactive session — §7.7) does so without an outbound frame, so the loop parks
+    /// the whole `swift test` process at 0% CPU with no failing test to point at. Bound it and
+    /// fail loudly instead.
+    private static func firstEventObservedRevision(
+        in stream: AsyncThrowingStream<Data, Error>,
+        timeout: Double = 5.0
+    ) async throws -> Revision {
+        try await withThrowingTaskGroup(of: Revision?.self) { group in
+            group.addTask {
+                var decoder = SRUIMessageStreamDecoder()
+                for try await chunk in stream {
+                    for msg in try decoder.appendAndExtract(incoming: chunk) {
+                        if case .event(let wireEvent) = msg.msg {
+                            return try ProtocolDecoder()
+                                .validateAndConvertEvent(wire: wireEvent).observedRevision
+                        }
+                    }
+                }
+                return nil
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return nil
+            }
+            let first = try await group.next() ?? nil
+            group.cancelAll()
+            guard let revision = first else {
+                throw OutboundEventTimeout(seconds: timeout)
+            }
+            return revision
+        }
     }
 
     private static func surfaceAndText(_ text: String) -> [SemanticModel.Operation] {
@@ -216,24 +265,22 @@ struct SessionRobustnessTests {
         // Before the outbound dispatch gets a chance to run, revision 2 commits. This is exactly
         // the race §7.7 cares about: the server validates the action "at the event's observed
         // revision", so the event must still say 1 — the state the user actually acted on.
+        //
+        // The racing commit must leave the node *activatable*. `SessionController` re-authorizes a
+        // queued action against a fresh snapshot after every suspension, so a revision 2 that set
+        // `enabled = false` would legitimately reject the click as `nodeDisabled` — and that
+        // rejection is deliberately not reported (§7.7), so the test would then wait forever for
+        // an event that can never be sent. Relabelling commits the same revision without
+        // withdrawing the affordance the user acted on.
         _ = applier.apply(
             baseRevision: Revision(1),
-            operations: [.setProperty(id: buttonID, property: .enabled, value: .bool(false))]
+            operations: [
+                .setProperty(id: buttonID, property: .label, value: .string("Increment more")),
+            ]
         )
         #expect(applier.lastAppliedRevision == Revision(2))
 
-        var streamDecoder = SRUIMessageStreamDecoder()
-        var observed: Revision?
-        for try await chunk in serverStream {
-            for msg in try streamDecoder.appendAndExtract(incoming: chunk) {
-                if case .event(let wireEvent) = msg.msg {
-                    observed = try ProtocolDecoder()
-                        .validateAndConvertEvent(wire: wireEvent).observedRevision
-                }
-            }
-            if observed != nil { break }
-        }
-
+        let observed = try await Self.firstEventObservedRevision(in: serverStream)
         #expect(observed == Revision(1))
 
         await controller.stop()

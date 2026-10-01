@@ -10,7 +10,7 @@ import Foundation
 import AppKit
 import SemanticModel
 import Protocol
-import Session
+@testable import Session
 import TransportSSH
 import RendererAppKit
 import Collections
@@ -137,6 +137,134 @@ struct CollectionRangeSessionTests {
 
         await controller.stop()
         await serverTransport.close()
+    }
+
+    /// A catch-up snapshot advances the session incarnation *before* it mounts, so the native
+    /// callbacks wired at connect time are fenced out until the snapshot finalizes. A viewport
+    /// request emitted by the freshly mounted adapter in that window must still reach the wire:
+    /// dropping it silently also leaves the window marked in flight, so nothing re-requests it
+    /// (§8, §18, §22.7).
+    @Test("Range request emitted while the catch-up snapshot mounts still reaches the wire")
+    @MainActor
+    func rangeRequestEmittedDuringSnapshotMountReachesTheWire() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let recording = UIRecordingTransport(inner: clientPipe)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: recording,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+
+        let surfaceID = NodeId(1)
+        let tableID = NodeId(12)
+        let modelID = ModelId(99)
+
+        // Fires inside the snapshot's own renderer update, immediately after the native mount and
+        // before `completeSnapshotCatchUp()` reinstalls interaction ownership.
+        let emittedDuringMount = ManagedAtomic<Bool>(false)
+        controller.rendererDidRenderInterceptorForTesting = { [renderer] in
+            guard emittedDuringMount.load() == false else { return }
+            await MainActor.run {
+                guard let adapter = renderer.registry.handle(for: tableID)?
+                    .modelAdapter as? TableCollectionAdapter else {
+                    return
+                }
+                emittedDuringMount.store(true)
+                adapter.noteVisibleRange(start: 0, count: 8)
+            }
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "range-snapshot-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        // A positive initial revision makes the next transaction the catch-up snapshot (§18).
+        welcome.initialRevision = 1
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createModel(id: modelID, modelType: .table, itemCount: 500_000),
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(
+                    id: tableID,
+                    nodeType: .table,
+                    parentID: surfaceID,
+                    properties: [
+                        Property(property: .modelRef, value: .unsignedInt(modelID.value)),
+                        Property(property: .columns, value: .list([.string("Label")])),
+                    ]
+                ),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(5),
+            description: "mounted snapshot emitted its viewport request"
+        ) {
+            emittedDuringMount.load()
+        }
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(5),
+            description: "range request reached the transport"
+        ) {
+            await recording.uiFrameCount >= 1
+        }
+
+        let framed = try #require(await recording.uiFrames.first)
+        let decoded = try SRUIFraming.decodeFramed(SRUIMessage.self, from: framed)
+        guard case .clientModelRangeRequest(let request)? = decoded.msg else {
+            Issue.record("expected ClientModelRangeRequest, got \(String(describing: decoded.msg))")
+            return
+        }
+        #expect(request.nodeID == tableID.value)
+        #expect(request.modelID == modelID.value)
+        #expect(request.startIndex == 0)
+        #expect(request.count == 128)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+}
+
+/// Records `.ui` frames without gating them.
+actor UIRecordingTransport: Transport {
+    let inner: PipeTransport
+    private let stream: AsyncThrowingStream<Data, Error>
+    private(set) var uiFrames: [Data] = []
+
+    init(inner: PipeTransport) {
+        self.inner = inner
+        self.stream = inner.receiveStream()
+    }
+
+    var uiFrameCount: Int { uiFrames.count }
+
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        if logicalClass == .ui {
+            uiFrames.append(data)
+        }
+        try await inner.send(data: data, logicalClass: logicalClass)
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        await inner.close()
     }
 }
 

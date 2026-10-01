@@ -123,7 +123,14 @@ struct SSHTransportLiveIntegrationTests {
         controller.attachRenderer(renderer)
 
         try await controller.start()
-        try await AsyncTestSupport.eventually(description: "initial revision over SSH") {
+        // Every wait in this test crosses a real SSH connection: an `ssh` client process, sshd's
+        // authentication, the bridge subsystem exec and the sessiond handshake. The 2s default is
+        // a local-actor budget; on a 3-core runner sharing itself with the whole suite that round
+        // trip is seconds, so the deadline has to cover the transport rather than a hop.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(15),
+            description: "initial revision over SSH"
+        ) {
             applier.lastAppliedRevision == Revision(1)
         }
 
@@ -133,7 +140,10 @@ struct SSHTransportLiveIntegrationTests {
         // 4. Perform 3 consecutive click-and-observe cycles over SSH transport
         for cycle in 1...3 {
             _ = try await controller.sendActivate(nodeId: buttonID)
-            try await AsyncTestSupport.eventually(description: "counter cycle \(cycle) over SSH") {
+            try await AsyncTestSupport.eventually(
+                timeout: .seconds(15),
+                description: "counter cycle \(cycle) over SSH"
+            ) {
                 guard applier.lastAppliedRevision == Revision(UInt64(cycle + 1)) else {
                     return false
                 }

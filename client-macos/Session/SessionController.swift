@@ -609,6 +609,12 @@ public final class SessionController: @unchecked Sendable {
         get { withStateLock { _terminalCommandWillAuthorizeForTesting } }
         set { withStateLock { _terminalCommandWillAuthorizeForTesting = newValue } }
     }
+
+    private var _resyncSnapshotWillRebindTerminalPumpForTesting: (@Sendable () async -> Void)?
+    var resyncSnapshotWillRebindTerminalPumpForTesting: (@Sendable () async -> Void)? {
+        get { withStateLock { _resyncSnapshotWillRebindTerminalPumpForTesting } }
+        set { withStateLock { _resyncSnapshotWillRebindTerminalPumpForTesting = newValue } }
+    }
     private var _collectionRangeDispatchDidFinishForTesting: (@Sendable () -> Void)?
     var collectionRangeDispatchDidFinishForTesting: (@Sendable () -> Void)? {
         get { withStateLock { _collectionRangeDispatchDidFinishForTesting } }
@@ -798,6 +804,42 @@ public final class SessionController: @unchecked Sendable {
                 body
             )
         }
+    }
+
+    /// Rebinds the Terminal pump's authorized sender, leaving the native callbacks alone.
+    ///
+    /// `TerminalCommandPump.drain()` discards an item its sender refuses, so the pump has to own
+    /// the incarnation a snapshot just established *before* that snapshot's tree can queue input;
+    /// otherwise those keystrokes are dropped rather than retried (§21, §22.2). Queueing itself
+    /// stays fenced by the native callbacks, which `updateRenderer` reinstalls inside the guarded
+    /// mount, so rebinding here cannot let an outgoing tree send under the new incarnation.
+    /// `reinstallInteractionOwnership` rebinds both together for every other path.
+    ///
+    /// Returning `false` means a replacement took the mutation lease or the ownership retired
+    /// under this call: the pump still holds the *previous* incarnation's sender, so the caller
+    /// must abandon the path instead of mounting a tree whose keystrokes that sender refuses.
+    private func rebindTerminalPumpOwnership(
+        binding: EventOutboxConnectionBinding,
+        sessionIncarnation: EventOutboxSessionIncarnation
+    ) async -> Bool {
+        guard let lease = continuityContext.acquireMutation(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        ) else {
+            return false
+        }
+        defer { continuityContext.releaseMutation(lease) }
+        await terminalPump.attach(
+            sendIfAuthorized: terminalCommandSender(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            ),
+            authority: sessionIncarnation
+        )
+        return continuityContext.isActive(
+            binding: binding,
+            sessionIncarnation: sessionIncarnation
+        )
     }
 
     private func terminalCommandSender(
@@ -1658,11 +1700,14 @@ public final class SessionController: @unchecked Sendable {
         }
         defer { continuityContext.releaseMutation(lease) }
 
+        // Naming the authority keeps this rebind from re-sending a retained TERMINAL_RESIZE the
+        // resync path's pre-mount rebind already sent under the same incarnation (§21).
         await terminalPump.attach(
             sendIfAuthorized: terminalCommandSender(
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
-            )
+            ),
+            authority: sessionIncarnation
         )
         await MainActor.run {
             guard let renderer = self.interactionRenderer ?? self.renderer else { return }
@@ -2096,7 +2141,8 @@ public final class SessionController: @unchecked Sendable {
                 sendIfAuthorized: terminalCommandSender(
                     binding: connectionBinding,
                     sessionIncarnation: sessionIncarnation
-                )
+                ),
+                authority: sessionIncarnation
             )
 
             // The detached loop waits behind this gate until its task is published under the
@@ -2588,15 +2634,11 @@ public final class SessionController: @unchecked Sendable {
                 return nil
             }
             guard let binding = outboxConnectionBinding,
-                  let sessionIncarnation = outboxSessionIncarnation else {
+                  outboxSessionIncarnation != nil else {
                 rejectedPhase = currentPhase
                 return nil
             }
             let generation = lifecycleGeneration
-            let ownership = SemanticActionOwnership(
-                binding: binding,
-                sessionIncarnation: sessionIncarnation
-            )
             let predecessor = transactionIngressTail
             let task = Task { [weak self] in
                 guard let self else { return }
@@ -2605,7 +2647,7 @@ public final class SessionController: @unchecked Sendable {
                     taskID: taskID,
                     predecessor: predecessor,
                     lifecycleGeneration: generation,
-                    ownership: ownership
+                    binding: binding
                 )
             }
             transactionIngressTasks[taskID] = task
@@ -2626,7 +2668,7 @@ public final class SessionController: @unchecked Sendable {
         taskID: UUID,
         predecessor: Task<Void, Never>?,
         lifecycleGeneration: UInt64,
-        ownership: SemanticActionOwnership
+        binding: EventOutboxConnectionBinding
     ) async {
         defer { finishQueuedTransaction(taskID) }
         await predecessor?.value
@@ -2634,8 +2676,10 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
+        // Ownership is re-derived from `binding` where it is used - inside the admission wait and
+        // again below - rather than captured once here; see `currentTransactionIngressOwnership`.
         do {
-            guard try await waitForTransactionAdmission(ownership: ownership) else { return }
+            guard try await waitForTransactionAdmission(binding: binding) else { return }
         } catch is CancellationError {
             // Teardown cancelled the wait. The transaction is intentionally dropped along with the
             // rest of the connection; there is no replica to diverge from.
@@ -2652,6 +2696,7 @@ public final class SessionController: @unchecked Sendable {
 
         guard !Task.isCancelled,
               ownsTransactionIngressLifecycle(lifecycleGeneration),
+              let ownership = currentTransactionIngressOwnership(binding: binding),
               continuityContext.isActive(
                   binding: ownership.binding,
                   sessionIncarnation: ownership.sessionIncarnation
@@ -2662,15 +2707,46 @@ public final class SessionController: @unchecked Sendable {
         await handleTransaction(wireTransaction)
     }
 
+    /// The current session incarnation of the connection a queued transaction arrived on.
+    ///
+    /// A queued transaction is fenced on the *connection*, never on the session incarnation it
+    /// happened to be enqueued under. A catch-up or full-resync snapshot ahead of it on this same
+    /// FIFO ingress lane advances that incarnation as it commits
+    /// (`adoptFullResyncInteractionBoundary`, §18.3), so a live transaction already decoded when
+    /// the snapshot committed still holds the pre-snapshot value. It remains authoritative: it
+    /// arrived on this connection and after that snapshot, and fencing it out discarded a committed
+    /// transaction silently — the *next* one then diverged the replica on a revision gap the server
+    /// never produced (§12.1, §18, §22.2, §4 inv. 13). Only a different binding, meaning a newer
+    /// connection whose own catch-up supersedes this one, may drop it.
+    ///
+    /// Derived where it is used rather than captured once, because the incarnation can also advance
+    /// off this lane (a resume completing its catch-up) while a rate-limited transaction waits for
+    /// admission.
+    private func currentTransactionIngressOwnership(
+        binding: EventOutboxConnectionBinding
+    ) -> SemanticActionOwnership? {
+        withStateLock {
+            guard outboxConnectionBinding == binding,
+                  let sessionIncarnation = outboxSessionIncarnation else {
+                return nil
+            }
+            return SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
+        }
+    }
+
     private func waitForTransactionAdmission(
-        ownership: SemanticActionOwnership
+        binding: EventOutboxConnectionBinding
     ) async throws -> Bool {
         while true {
             try Task.checkCancellation()
-            guard let lease = await acquireSharedMutationLease(
-                binding: ownership.binding,
-                sessionIncarnation: ownership.sessionIncarnation
-            ) else {
+            guard let ownership = currentTransactionIngressOwnership(binding: binding),
+                  let lease = await acquireSharedMutationLease(
+                      binding: ownership.binding,
+                      sessionIncarnation: ownership.sessionIncarnation
+                  ) else {
                 return false
             }
             let admission = await transactionIngressGate.admissionAttempt()
@@ -2779,6 +2855,14 @@ public final class SessionController: @unchecked Sendable {
         get async { await terminalPump.retainedResizeCountForTesting }
     }
 
+    /// Test seam for the refused-mutation-lease paths: retires the live continuity ownership the
+    /// way a replacement binding does, so every lease taken after this point is refused. Lets a
+    /// test lose ownership at one named instant instead of racing a second controller's handshake.
+    func retireContinuityOwnershipForTesting() {
+        guard let binding = withStateLock({ outboxConnectionBinding }) else { return }
+        continuityContext.retire(binding: binding)
+    }
+
     func waitForTerminalCommandDrainForTesting() async {
         await terminalPump.waitUntilIdleForTesting()
     }
@@ -2855,7 +2939,7 @@ public final class SessionController: @unchecked Sendable {
                 }
                 guard let ownership = currentSharedOwnership() else { return }
                 do {
-                    guard try await waitForTransactionAdmission(ownership: ownership) else {
+                    guard try await waitForTransactionAdmission(binding: ownership.binding) else {
                         return
                     }
                 } catch is CancellationError {
@@ -2866,9 +2950,11 @@ public final class SessionController: @unchecked Sendable {
                     ))
                     return
                 }
-                guard continuityContext.isActive(
-                    binding: ownership.binding,
-                    sessionIncarnation: ownership.sessionIncarnation
+                guard let current = currentTransactionIngressOwnership(
+                    binding: ownership.binding
+                ), continuityContext.isActive(
+                    binding: current.binding,
+                    sessionIncarnation: current.sessionIncarnation
                 ), allowsDataPlane(withStateLock({ self.phase })) else {
                     return
                 }
@@ -3451,7 +3537,11 @@ public final class SessionController: @unchecked Sendable {
             forceRemount: true,
             preserveLocalTextForRemount: true,
             binding: binding,
-            renderToken: renderToken
+            renderToken: renderToken,
+            rewireOwnershipAtMount: SemanticActionOwnership(
+                binding: binding,
+                sessionIncarnation: sessionIncarnation
+            )
         )
         guard rendererUpdate.didRender else {
             if rendererUpdate.wasSuperseded {
@@ -3999,7 +4089,8 @@ public final class SessionController: @unchecked Sendable {
             sendIfAuthorized: terminalCommandSender(
                 binding: binding,
                 sessionIncarnation: sessionIncarnation
-            )
+            ),
+            authority: sessionIncarnation
         )
         if let renderer {
             await renderer.terminalSession.resetForReplacementSession()
@@ -4801,13 +4892,48 @@ public final class SessionController: @unchecked Sendable {
             }
             let terminalNodeIDs = await terminalNodeIDs(in: snapshot.store)
             await terminalPump.prune(retainedStreamIDs: terminalNodeIDs)
+            if isResyncSnapshot {
+                // The tree mounted below queues Terminal input through the callbacks this
+                // snapshot's incarnation owns, so the pump's sender has to be rebound before the
+                // mount: a drain still holding the previous incarnation's sender refuses the item
+                // and `drain()` discards it rather than retrying (§21).
+                //
+                // Strictly after the prune above: `attach` re-queues every retained resize and
+                // kicks a drain, so rebinding first would re-send a resize for a stream this
+                // snapshot removed, which the server answers with `UnexpectedMessage` and drops
+                // the connection.
+                if let interceptor = resyncSnapshotWillRebindTerminalPumpForTesting {
+                    await interceptor()
+                }
+                guard await rebindTerminalPumpOwnership(
+                    binding: connectionBinding,
+                    sessionIncarnation: renderSessionIncarnation
+                ) else {
+                    // A refused lease leaves the pump on the previous incarnation's sender, which
+                    // `drain()` answers by discarding keystrokes. Mounting anyway would lose the
+                    // input this rebind exists to authorize, so report supersession instead.
+                    let context = "resync snapshot lost terminal writer ownership before mounting"
+                    if let outstandingGeneration {
+                        await failRefusedResumeDecision(outstandingGeneration, context)
+                    } else {
+                        await reportFailure(.superseded(context))
+                    }
+                    return
+                }
+            }
             let rendererUpdate = await updateRenderer(
                 transaction: isResyncSnapshot ? nil : domainTx,
                 snapshot: snapshot,
                 forceRemount: isResyncSnapshot,
                 discardTextEditsForResync: isResyncSnapshot,
                 binding: connectionBinding,
-                renderToken: renderToken
+                renderToken: renderToken,
+                rewireOwnershipAtMount: isResyncSnapshot
+                    ? SemanticActionOwnership(
+                        binding: connectionBinding,
+                        sessionIncarnation: renderSessionIncarnation
+                    )
+                    : nil
             )
 
             if !isResyncSnapshot {
@@ -5189,7 +5315,11 @@ public final class SessionController: @unchecked Sendable {
         discardTextEditsForResync: Bool = false,
         preserveLocalTextForRemount: Bool = false,
         binding: EventOutboxConnectionBinding,
-        renderToken: UUID
+        renderToken: UUID,
+        // Ownership the remounted tree's native callbacks must carry. A snapshot that advances the
+        // session incarnation fences out the callbacks wired at connect time, so they are
+        // reinstalled at the mount itself rather than afterwards (see the mount branch below).
+        rewireOwnershipAtMount: SemanticActionOwnership? = nil
     ) async -> RendererUpdateResult {
         guard let cachedResources = await resourceCache.beginRenderReferenceLease(
             ownerEpoch: binding.resourceOwnershipEpoch,
@@ -5231,6 +5361,18 @@ public final class SessionController: @unchecked Sendable {
                 do {
                     try self.rendererUpdateInterceptorForTesting?()
                     if forceRemount || !self.hasMountedInitialTree {
+                        // A resync/catch-up snapshot advances the session incarnation before it
+                        // mounts, so the ownership-fenced callbacks wired at connect time would
+                        // reject everything the new tree emits — and a dropped range request stays
+                        // marked in flight in the adapter, so nothing re-requests it (§8, §22.7).
+                        // Reinstalling them *here* is what makes this safe rather than merely
+                        // earlier: this block replaces the tree synchronously, so the outgoing tree
+                        // never gets a chance to send under the new incarnation, while adapters
+                        // built by the mount below — which can emit their first viewport request as
+                        // they are constructed — are already authorized.
+                        if let rewireOwnershipAtMount {
+                            self.ensureActionHandlerWired(ownership: rewireOwnershipAtMount)
+                        }
                         if preserveLocalTextForRemount {
                             try renderer.layoutRenderer.mount(
                                 store: snapshot.store,

@@ -31,17 +31,24 @@ private func tokenId(_ data: Data) -> UInt32? {
     return data.subdata(in: 1..<5).withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
 }
 
+/// Gates `SocketWriter`'s drain queue so a test can inspect scheduler ordering mid-flight.
+///
+/// The park inside `write` stays blocking: it runs on the writer's private `DispatchQueue`, which is
+/// the stalled-peer behaviour under test. The *waiters* may not block, because they run on the
+/// test's own cooperative thread and the writes they are waiting for are child tasks that need a
+/// cooperative thread of their own - blocking here deadlocks the test outright wherever the pool has
+/// no spare thread. See `AsyncTestSignal`.
 private final class GatedByteSink: @unchecked Sendable {
     private let condition = NSCondition()
     private var permits = 0
-    private var entered = 0
     private var failure: (any Error)?
     private(set) var dispatched: [Data] = []
+    private let entries = AsyncTestSignal()
+    private let dispatches = AsyncTestSignal()
 
     func write(_ data: Data) throws {
+        entries.signal()
         condition.lock()
-        entered += 1
-        condition.broadcast()
         while permits == 0 && failure == nil {
             condition.wait()
         }
@@ -53,14 +60,14 @@ private final class GatedByteSink: @unchecked Sendable {
         dispatched.append(data)
         condition.broadcast()
         condition.unlock()
+        dispatches.signal()
     }
 
-    func waitUntilDispatched(_ count: Int) {
-        condition.lock()
-        while dispatched.count < count && failure == nil {
-            condition.wait()
-        }
-        condition.unlock()
+    /// Bounded, and signal-driven rather than polling: `write` signals `dispatches` as it appends,
+    /// so the waiter resumes on the dispatch itself and reports whether the count was reached.
+    /// A test that parks here forever is indistinguishable from a wedged CI job.
+    func waitUntilDispatched(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        await dispatches.waitOrTimeout(until: count, timeout: timeout)
     }
 
     func snapshot() -> [Data] {
@@ -69,12 +76,11 @@ private final class GatedByteSink: @unchecked Sendable {
         return dispatched
     }
 
-    func waitUntilEntered(_ count: Int) {
-        condition.lock()
-        while entered < count {
-            condition.wait()
-        }
-        condition.unlock()
+    /// Bounded for the same reason as `waitUntilDispatched`: nothing resumes this continuation if
+    /// the writer never reaches `write`, and a continuation park ignores the task cancellation a
+    /// suite `.timeLimit` relies on.
+    func waitUntilEntered(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        await entries.waitOrTimeout(until: count, timeout: timeout)
     }
 
     func release(_ count: Int = 1) {
@@ -121,7 +127,16 @@ private actor RecordingTransport: Transport {
     }
 }
 
-@Suite("Logical Channel Transport Classification (§19.2)")
+/// Every rendezvous in this suite is bounded and asserted, and `.timeLimit` is the outer fence.
+///
+/// `GatedByteSink.write` parks a real `DispatchQueue` thread on purpose — that is the stalled peer
+/// under test — but the waits that observe it run on the test's own cooperative thread and used to
+/// have no deadline at all. A `.timeLimit` alone does not cover them: a `withCheckedContinuation`
+/// park ignores task cancellation, so the limit records its issue and the run still hangs
+/// (measured: a parked `AsyncTestSignal.wait(until:)` under `.timeLimit(.minutes(1))` outlived
+/// 300s, while a cancellable `Task.sleep` failed at 60s). A parked test is otherwise
+/// indistinguishable from a wedged CI job.
+@Suite("Logical Channel Transport Classification (§19.2)", .timeLimit(.minutes(1)))
 struct LogicalChannelTransportTests {
 
     @Test("Resource backlog yields to newly ready control, input, and UI")
@@ -144,7 +159,10 @@ struct LogicalChannelTransportTests {
                     claiming: latch
                 )
             }
-            sink.waitUntilEntered(1)
+            #expect(
+                await sink.waitUntilEntered(1),
+                "the first resource write never reached the gated sink"
+            )
 
             for id in UInt32(1)..<UInt32(200) {
                 let payload = resourceToken(id)
@@ -178,7 +196,10 @@ struct LogicalChannelTransportTests {
             try await waitUntilQueued(1, in: .ui, writer: writer)
 
             sink.release(8)
-            sink.waitUntilDispatched(4)
+            #expect(
+                await sink.waitUntilDispatched(4),
+                "the writer never dispatched 4 frames after 8 permits were released"
+            )
 
             let dispatched = sink.snapshot()
             #expect(dispatched.count >= 4)

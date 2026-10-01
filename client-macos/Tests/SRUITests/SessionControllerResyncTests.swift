@@ -116,6 +116,97 @@ struct SessionControllerResyncTests {
         await serverTransport.close()
     }
 
+    /// A live transaction decoded while the catch-up snapshot is still committing must still be
+    /// applied. The snapshot advances the session incarnation from inside the transaction lane
+    /// (§18.3), and fencing a queued transaction on its *enqueue-time* incarnation dropped it
+    /// silently — after which the next transaction diverged the replica on a stale base (§12.1,
+    /// §4 inv. 13). Any server that keeps committing while a client catches up hits this.
+    @Test("A live transaction queued behind the catch-up snapshot still applies")
+    @MainActor
+    func liveTransactionQueuedBehindCatchUpSnapshotApplies() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let failure = ManagedAtomic<String?>(nil)
+        controller.onFailure = { failure.store(String(describing: $0)) }
+        try await controller.start()
+
+        // initial_revision > 0 makes this handshake a catch-up: the client awaits a snapshot.
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "catch-up-session"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.initialRevision = 2
+        var welcomeMsg = SRUIMessage()
+        welcomeMsg.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
+
+        let surfaceID = NodeId(1)
+        let textID = NodeId(2)
+        func framed(_ transaction: Transaction) throws -> Data {
+            var message = SRUIMessage()
+            message.transaction = transaction.toWire()
+            return try SRUIFraming.encodeFramed(message)
+        }
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(
+                    id: textID,
+                    nodeType: .text,
+                    parentID: surfaceID,
+                    properties: [Property(property: .text, value: .string("snapshot"))]
+                ),
+            ]
+        )
+        let third = Transaction(
+            baseRevision: Revision(2),
+            newRevision: Revision(3),
+            operations: [.setProperty(id: textID, property: .text, value: .string("live 3"))]
+        )
+        let fourth = Transaction(
+            baseRevision: Revision(3),
+            newRevision: Revision(4),
+            operations: [.setProperty(id: textID, property: .text, value: .string("live 4"))]
+        )
+
+        // One write, so the receive loop decodes and queues both live transactions while the
+        // snapshot is still committing — what a server that keeps publishing during a client's
+        // catch-up produces.
+        var batch = Data()
+        batch.append(try framed(snapshot))
+        batch.append(try framed(third))
+        batch.append(try framed(fourth))
+        try await serverTransport.send(data: batch)
+
+        // The applier commits ahead of the renderer inside a transaction's own task, so wait for
+        // the painted value rather than sampling it the moment the revision lands.
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "catch-up snapshot and both live transactions applied and painted"
+        ) {
+            applier.lastAppliedRevision == Revision(4)
+                && (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue
+                    == "live 4"
+        }
+        #expect(applier.lastAppliedRevision == Revision(4))
+        #expect(failure.load() == nil)
+        #expect(
+            (renderer.registry.handle(for: textID)?.view as? NSTextField)?.stringValue == "live 4"
+        )
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     @Test("Invalid extension resync is rejected before replacing the replica")
     @MainActor
     func invalidExtensionResyncPreservesCommittedReplica() async throws {
@@ -1919,6 +2010,93 @@ struct SessionControllerResyncTests {
         let imageHandle = try #require(renderer.registry.handle(for: imageID))
         let imageView = try #require(imageHandle.view as? NSImageView)
         #expect(imageView.image != nil)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    /// A transaction the server sent after the catch-up snapshot must be applied, not discarded.
+    ///
+    /// The snapshot advances the session incarnation as it commits (§18.3). Everything the server
+    /// sent behind it is already decoded and queued on the ordered ingress lane under the previous
+    /// incarnation, so fencing those on their enqueue-time incarnation dropped committed work
+    /// silently — and the transaction after *that* then diverged the replica on a revision gap the
+    /// server never produced. Delivering welcome, snapshot and one live transaction in a single
+    /// chunk queues the live transaction before the snapshot can finalize, which is exactly the
+    /// ordering a loaded client sees on every reconnect (§18, §22.2).
+    @Test("A transaction queued behind the catch-up snapshot is applied, not dropped")
+    @MainActor
+    func liveTransactionBehindCatchUpSnapshotIsApplied() async throws {
+        let (clientTransport, serverTransport) = await PipeTransport.createPair()
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: clientTransport,
+            applier: applier,
+            renderer: renderer
+        )
+        controller.attachRenderer(renderer)
+        let failures = ManagedAtomic<[String]>([])
+        controller.onFailure = { failure in
+            failures.store(failures.load() + [failure.description])
+        }
+
+        try await controller.start()
+
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "catch-up-then-live"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        // A positive initial revision makes the next transaction the catch-up snapshot (§18).
+        welcome.initialRevision = 1
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+
+        let surfaceID = NodeId(1)
+        let textID = NodeId(2)
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(
+                    id: textID,
+                    nodeType: .text,
+                    parentID: surfaceID,
+                    properties: [Property(property: .text, value: .string("from snapshot"))]
+                ),
+            ]
+        )
+        let live = Transaction(
+            baseRevision: Revision(1),
+            newRevision: Revision(2),
+            operations: [
+                .setProperty(id: textID, property: .text, value: .string("sent behind snapshot")),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        var liveMessage = SRUIMessage()
+        liveMessage.transaction = live.toWire()
+
+        var combined = Data()
+        combined.append(try SRUIFraming.encodeFramed(welcomeMessage))
+        combined.append(try SRUIFraming.encodeFramed(snapshotMessage))
+        combined.append(try SRUIFraming.encodeFramed(liveMessage))
+        try await serverTransport.send(data: combined)
+
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "both the catch-up snapshot and the transaction behind it apply"
+        ) {
+            applier.lastAppliedRevision == Revision(2) || failures.load().isEmpty == false
+        }
+        #expect(failures.load() == [], "no transaction was lost, so nothing may diverge")
+        #expect(applier.lastAppliedRevision == Revision(2))
+        #expect(
+            applier.store.getNode(textID)?.getProperty(.text)?.asString == "sent behind snapshot"
+        )
+        #expect(controller.isDiverged == false)
 
         await controller.stop()
         await serverTransport.close()

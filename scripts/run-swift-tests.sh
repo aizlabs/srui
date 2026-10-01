@@ -18,6 +18,12 @@ cd "$repo_root"
 timeout_seconds=${SRUI_TEST_TIMEOUT:-300}
 package=client-macos
 
+# Sweep the debris of runs that died before their fixtures' `defer` ran: orphaned fixture servers
+# and the /tmp socket directories they hold. The post-run reap below only covers the process group
+# this invocation creates, so without this a wedged run's servers survive every later run. The
+# reaper's guards keep it off anything a live run owns, here or in another checkout.
+"$repo_root/scripts/reap-test-servers.sh" || echo "note: pre-test sweep failed; continuing" >&2
+
 # Job control puts the test run in its own process group. Everything a fixture spawns inherits
 # that group, and — crucially — a process keeps its group when it is orphaned and reparented to
 # init. So the group is an exact handle on "processes this invocation created", which a

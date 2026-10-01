@@ -10,7 +10,7 @@ import Foundation
 import Protocol
 import RendererAppKit
 import SemanticModel
-import Session
+@testable import Session
 import Testing
 import Terminal
 import Text
@@ -549,6 +549,474 @@ struct SessionControllerTerminalTests {
         await freshServer.close()
     }
 
+    /// A catch-up snapshot advances the session incarnation before it mounts. The native callbacks
+    /// are reinstalled at the mount, so the tree the snapshot publishes can queue Terminal input
+    /// immediately — and `TerminalCommandPump.drain()` *discards* an item its sender refuses, so a
+    /// pump still bound to the previous incarnation loses those keystrokes instead of retrying them
+    /// (§21, §22.2).
+    @Test("Terminal input typed while a catch-up snapshot mounts reaches the wire")
+    @MainActor
+    func terminalInputDuringSnapshotMountIsSent() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let recording = TerminalRecordingTransport(inner: clientPipe)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: recording,
+            applier: applier,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1, Profile.terminalV1]
+        )
+        controller.attachRenderer(renderer)
+
+        let terminalID = NodeId(30)
+        let typed = ManagedAtomic<Bool>(false)
+        // Fires inside the snapshot's own renderer update: the window between the native mount and
+        // `completeSnapshotCatchUp()`'s reinstall, i.e. exactly when a user can type into the
+        // freshly shown window.
+        controller.rendererDidRenderInterceptorForTesting = { [renderer] in
+            guard typed.load() == false else { return }
+            await MainActor.run {
+                guard renderer.registry.view(for: terminalID) is TerminalView else { return }
+                typed.store(true)
+                // A resize ahead of the keystroke, because that is what the real mount does:
+                // `TerminalView` publishes a 50 ms debounced resize on this same `.terminalHigh`
+                // class after its layout pass (`RendererAppKit/TerminalView.swift`
+                // `scheduleResize`). Sending one here makes that ordering deterministic instead of
+                // leaving it to a contended runner, so the assertion below may not read the first
+                // frame.
+                renderer.onTerminalResize?(terminalID, 80, 24, 0, 0)
+                renderer.onTerminalInput?(terminalID, Data("ls\n".utf8))
+            }
+        }
+
+        try await controller.start()
+
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-catch-up"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.extensionNamespaces = [mapping]
+        // A positive initial revision makes the next transaction the catch-up snapshot (§18).
+        welcome.initialRevision = 1
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+
+        let terminalType = TypeRef(namespaceID: 3, localID: 1)
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(id: terminalID, nodeType: terminalType, parentID: surfaceID),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(5),
+            description: "input typed while the snapshot mounted"
+        ) {
+            typed.load()
+        }
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(10),
+            description: "TERMINAL_INPUT reached the transport"
+        ) {
+            await recording.terminalInputCount >= 1
+        }
+
+        // The claim is that the keystroke *was* sent, not that it was the first `.terminalHigh`
+        // frame: a debounced resize legitimately shares the class and may precede it.
+        let decodedFrames = try await recording.terminalFrames.map {
+            try SRUIFraming.decodeFramed(SRUIMessage.self, from: $0)
+        }
+        let inputs = decodedFrames.compactMap { message -> SRUITerminalInput? in
+            guard case .terminalInput(let input)? = message.msg else { return nil }
+            return input
+        }
+        guard let input = inputs.first(where: { $0.streamID == terminalID.value }) else {
+            Issue.record(
+                "expected a TerminalInput for the mounted stream, got \(decodedFrames.map { String(describing: $0.msg) })"
+            )
+            return
+        }
+        #expect(input.data == Data("ls\n".utf8))
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    /// Rebinding the pump re-queues every retained resize and kicks a drain, so it has to happen
+    /// after the snapshot's streams have been pruned: a resize for a stream the snapshot removed is
+    /// answered with `UnexpectedMessage` and costs the connection
+    /// (`server-rust/sessiond/src/connection.rs` `handle_terminal_resize`).
+    @Test("A resync snapshot that removes a terminal re-sends no resize for it")
+    @MainActor
+    func resyncSnapshotDroppingTerminalSendsNoStaleResize() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let recording = TerminalRecordingTransport(inner: clientPipe)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: recording,
+            applier: applier,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1, Profile.terminalV1]
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        let terminalID = NodeId(30)
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-prune-before-rebind"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+        try await AsyncTestSupport.eventually(description: "handshake") {
+            controller.isHandshakeComplete
+        }
+
+        let terminalType = TypeRef(namespaceID: 3, localID: 1)
+        let mount = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(id: terminalID, nodeType: terminalType, parentID: surfaceID),
+            ]
+        )
+        var mountMessage = SRUIMessage()
+        mountMessage.transaction = mount.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMessage))
+        try await AsyncTestSupport.eventually(description: "terminal mounted") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.view(for: terminalID) is TerminalView
+        }
+
+        // Retains a size for this stream inside the pump, which `attach` would re-queue.
+        renderer.onTerminalResize?(terminalID, 80, 24, 0, 0)
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(5),
+            description: "initial resize sent"
+        ) {
+            await recording.terminalFrameCount >= 1
+        }
+        // Every legal re-send has to be drained before the baseline below, or one crossing it
+        // would read as the stale re-send this test is looking for. A reattach during the
+        // handshake legitimately repeats the retained size once, and its ordering against the
+        // first resize depends on machine speed.
+        func settledResizeCount() async throws -> Int {
+            var last = -1
+            var stableRounds = 0
+            while stableRounds < 3 {
+                let current = try await recording.resizeCount(forStream: terminalID.value)
+                if current == last {
+                    stableRounds += 1
+                } else {
+                    stableRounds = 0
+                    last = current
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            return last
+        }
+        #expect(try await settledResizeCount() >= 1)
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = welcome.sessionID
+        resync.snapshotRevision = 2
+        resync.reason = "snapshot drops the terminal"
+        resync.continuity = .sameSession
+        resync.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        resync.extensionNamespaces = [mapping]
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMessage))
+
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [.createNode(id: surfaceID, nodeType: .surface)]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        // Baseline after the resync has settled: from the snapshot on, every resize for this
+        // stream is stale. Reattaching the pump re-queues retained sizes, and a resize whose
+        // stream the snapshot removed costs the connection, so the count must not move.
+        let resizesBeforeSnapshot = try await settledResizeCount()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "replacement snapshot mounted without the terminal"
+        ) {
+            applier.lastAppliedRevision == Revision(2)
+                && renderer.registry.view(for: terminalID) == nil
+        }
+        // Negative assertion: a drain kicked by the rebind reaches the transport immediately, so
+        // settling is enough to catch it.
+        #expect(try await settledResizeCount() == resizesBeforeSnapshot)
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    /// A resync rebinds the Terminal pump twice on purpose: once before the native mount, so the
+    /// mounted tree's keystrokes are authorized by the incarnation the snapshot established
+    /// (§22.2), and once at finalization alongside the renderer callbacks (§18.3). `attach`
+    /// re-queues every retained size, and the mount between the two rebinds lets the first drain
+    /// flush, so re-queueing twice costs the remote PTY a second SIGWINCH — and a curses app a
+    /// full-screen redraw — on every resync. The server accepts the duplicate idempotently, so
+    /// only a count catches it.
+    @Test("A resync snapshot re-sends exactly one resize per retained terminal")
+    @MainActor
+    func resyncSnapshotRetainingTerminalSendsExactlyOneResize() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let recording = TerminalRecordingTransport(inner: clientPipe)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: recording,
+            applier: applier,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1, Profile.terminalV1]
+        )
+        controller.attachRenderer(renderer)
+        try await controller.start()
+
+        let terminalID = NodeId(30)
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-retained-across-resync"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+        try await AsyncTestSupport.eventually(description: "handshake") {
+            controller.isHandshakeComplete
+        }
+
+        let terminalType = TypeRef(namespaceID: 3, localID: 1)
+        let mount = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(id: terminalID, nodeType: terminalType, parentID: surfaceID),
+            ]
+        )
+        var mountMessage = SRUIMessage()
+        mountMessage.transaction = mount.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMessage))
+        try await AsyncTestSupport.eventually(description: "terminal mounted") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.view(for: terminalID) is TerminalView
+        }
+
+        // The mounted `TerminalView` publishes its own debounced resize once it has been laid out
+        // (`RendererAppKit/TerminalView.swift` `scheduleResize`), and that size would overwrite the
+        // one the pump retains. Let it land first, then inject a size no layout can produce, so
+        // every frame counted below is a pump re-send of this exact tuple.
+        try await AsyncTestSupport.eventuallyAsync(
+            timeout: .seconds(5),
+            description: "the mounted terminal view published its own size"
+        ) {
+            ((try? await recording.resizeCount(forStream: terminalID.value)) ?? 0) >= 1
+        }
+        renderer.onTerminalResize?(terminalID, 97, 31, 777, 555)
+
+        // Settles, so a re-send still in flight is never missed.
+        func settledResizeCount() async throws -> Int {
+            var last = -1
+            var stableRounds = 0
+            while stableRounds < 3 {
+                let current = try await recording.resizeCount(
+                    forStream: terminalID.value,
+                    columns: 97,
+                    rows: 31,
+                    pixelWidth: 777,
+                    pixelHeight: 555
+                )
+                if current == last {
+                    stableRounds += 1
+                } else {
+                    stableRounds = 0
+                    last = current
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            return last
+        }
+        let resizesBeforeSnapshot = try await settledResizeCount()
+        #expect(
+            resizesBeforeSnapshot == 1,
+            "the injected size must reach the wire exactly once before the resync"
+        )
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = welcome.sessionID
+        resync.snapshotRevision = 2
+        resync.reason = "snapshot retains the terminal"
+        resync.continuity = .sameSession
+        resync.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        resync.extensionNamespaces = [mapping]
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMessage))
+
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(id: terminalID, nodeType: terminalType, parentID: surfaceID),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "replacement snapshot remounted the terminal"
+        ) {
+            applier.lastAppliedRevision == Revision(2)
+                && renderer.registry.view(for: terminalID) is TerminalView
+        }
+        // Waits past the *second* rebind: event dispatch reopens only once
+        // `completeSnapshotCatchUp()` has reinstalled interaction ownership (§18.3).
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "snapshot catch-up finalized"
+        ) {
+            controller.isEventDispatchEnabled
+        }
+
+        #expect(
+            try await settledResizeCount() == resizesBeforeSnapshot + 1,
+            "a retained terminal must see exactly one TERMINAL_RESIZE across a resync snapshot"
+        )
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
+    /// `rebindTerminalPumpOwnership` exists because `TerminalCommandPump.drain()` *discards* an
+    /// item its sender refuses. A refused mutation lease therefore leaves the pump on the previous
+    /// incarnation's sender, which is exactly the keystroke loss the rebind prevents, so the
+    /// snapshot must be abandoned and the supersession reported rather than mounted anyway.
+    @Test("A refused terminal-writer rebind abandons the resync snapshot")
+    @MainActor
+    func resyncSnapshotRefusedTerminalRebindReportsSupersession() async throws {
+        let (clientPipe, serverTransport) = await PipeTransport.createPair()
+        let recording = TerminalRecordingTransport(inner: clientPipe)
+        let applier = TransactionApplier()
+        let renderer = AppKitRenderer()
+        let controller = SessionController(
+            transport: recording,
+            applier: applier,
+            renderer: renderer,
+            clientCapabilities: [Profile.standardWidgetsV1, Profile.terminalV1]
+        )
+        controller.attachRenderer(renderer)
+        let reported = ManagedAtomic<String>("")
+        controller.onFailure = { reported.store(String(describing: $0)) }
+        // Retires the live continuity ownership at the one instant the pre-mount rebind needs it:
+        // the lease it takes next is refused, the way a replacement binding refuses it.
+        controller.resyncSnapshotWillRebindTerminalPumpForTesting = { [weak controller] in
+            controller?.retireContinuityOwnershipForTesting()
+        }
+        try await controller.start()
+
+        let terminalID = NodeId(30)
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = terminalProfileURI
+        mapping.namespaceID = 3
+        var welcome = SRUIServerWelcome()
+        welcome.coreVersion = SRUICoreVersion
+        welcome.sessionID = "terminal-rebind-refused"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        welcome.extensionNamespaces = [mapping]
+        var welcomeMessage = SRUIMessage()
+        welcomeMessage.serverWelcome = welcome
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
+        try await AsyncTestSupport.eventually(description: "handshake") {
+            controller.isHandshakeComplete
+        }
+
+        let terminalType = TypeRef(namespaceID: 3, localID: 1)
+        let mount = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(1),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(id: terminalID, nodeType: terminalType, parentID: surfaceID),
+            ]
+        )
+        var mountMessage = SRUIMessage()
+        mountMessage.transaction = mount.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMessage))
+        try await AsyncTestSupport.eventually(description: "terminal mounted") {
+            applier.lastAppliedRevision == Revision(1)
+                && renderer.registry.view(for: terminalID) is TerminalView
+        }
+        _ = recording
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = welcome.sessionID
+        resync.snapshotRevision = 2
+        resync.reason = "rebind refusal"
+        resync.continuity = .sameSession
+        resync.requiredProfiles = ["org.srui.standard-widgets/1", terminalProfileURI]
+        resync.extensionNamespaces = [mapping]
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMessage))
+
+        let snapshot = Transaction(
+            baseRevision: .initial,
+            newRevision: Revision(2),
+            operations: [
+                .createNode(id: surfaceID, nodeType: .surface),
+                .createNode(id: terminalID, nodeType: terminalType, parentID: surfaceID),
+            ]
+        )
+        var snapshotMessage = SRUIMessage()
+        snapshotMessage.transaction = snapshot.toWire()
+        try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
+
+        try await AsyncTestSupport.eventually(
+            timeout: .seconds(5),
+            description: "the refused terminal rebind is reported"
+        ) {
+            reported.load().isEmpty == false
+        }
+        #expect(
+            reported.load().contains("terminal writer ownership"),
+            "a refused terminal-writer rebind must name itself, got \(reported.load())"
+        )
+
+        await controller.stop()
+        await serverTransport.close()
+    }
+
     private func welcomeMessage(
         sessionID: String,
         initialRevision: UInt64 = 0
@@ -561,5 +1029,79 @@ struct SessionControllerTerminalTests {
         var message = SRUIMessage()
         message.serverWelcome = welcome
         return message
+    }
+}
+
+/// Records `.terminalHigh` frames without gating them.
+private actor TerminalRecordingTransport: Transport {
+    private let inner: PipeTransport
+    private let stream: AsyncThrowingStream<Data, Error>
+    private(set) var terminalFrames: [Data] = []
+
+    init(inner: PipeTransport) {
+        self.inner = inner
+        self.stream = inner.receiveStream()
+    }
+
+    var terminalFrameCount: Int { terminalFrames.count }
+
+    /// Frames carrying TERMINAL_INPUT, so a wait can target the keystroke itself: a debounced
+    /// resize shares the `.terminalHigh` class, and waiting for "any frame" would let the
+    /// assertion run before the input is drained.
+    var terminalInputCount: Int {
+        terminalFrames.filter { framed in
+            guard case .terminalInput? =
+                try? SRUIFraming.decodeFramed(SRUIMessage.self, from: framed).msg else {
+                return false
+            }
+            return true
+        }.count
+    }
+
+    /// Resizes carrying one exact size, so a `TerminalView`'s own debounced resize (computed from
+    /// its bounds) cannot be mistaken for a pump re-send of the size a test injected.
+    func resizeCount(
+        forStream streamID: UInt64,
+        columns: UInt32,
+        rows: UInt32,
+        pixelWidth: UInt32,
+        pixelHeight: UInt32
+    ) throws -> Int {
+        try terminalFrames.filter { framed in
+            guard case .terminalResize(let resize)? =
+                try SRUIFraming.decodeFramed(SRUIMessage.self, from: framed).msg else {
+                return false
+            }
+            return resize.streamID == streamID
+                && resize.columns == columns
+                && resize.rows == rows
+                && resize.pixelWidth == pixelWidth
+                && resize.pixelHeight == pixelHeight
+        }.count
+    }
+
+    func resizeCount(forStream streamID: UInt64) throws -> Int {
+        try terminalFrames.filter { framed in
+            guard case .terminalResize(let resize)? =
+                try SRUIFraming.decodeFramed(SRUIMessage.self, from: framed).msg else {
+                return false
+            }
+            return resize.streamID == streamID
+        }.count
+    }
+
+    func send(data: Data, logicalClass: LogicalChannelClass) async throws {
+        if logicalClass == .terminalHigh {
+            terminalFrames.append(data)
+        }
+        try await inner.send(data: data, logicalClass: logicalClass)
+    }
+
+    nonisolated func receiveStream() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
+    func close() async {
+        await inner.close()
     }
 }

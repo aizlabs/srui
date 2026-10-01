@@ -13,6 +13,12 @@ import Foundation
 import Darwin
 #endif
 
+/// Which socket object a descriptor refers to, independent of its number.
+private struct SocketObjectIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+}
+
 /// Minimal cross-thread cell; the semaphores in each test provide the ordering.
 private final class Box<T>: @unchecked Sendable {
     private let lock = NSLock()
@@ -26,7 +32,15 @@ private final class Box<T>: @unchecked Sendable {
     }
 }
 
-@Suite("Transport Backpressure & Write Preemption (§20.4, §22.2, §26)")
+/// Every rendezvous in this suite is bounded and asserted, and `.timeLimit` is the outer fence.
+///
+/// Both are needed, and neither substitutes for the other: a `withCheckedContinuation` park — what
+/// `AsyncTestSignal.wait(until:)` is — ignores task cancellation, so the time limit records its
+/// issue and the run still hangs (measured: a parked `wait(until:)` under `.timeLimit(.minutes(1))`
+/// outlived 300s, while a cancellable `Task.sleep` failed at 60s). The waits therefore carry their
+/// own deadlines and `#expect` the outcome, and the time limit catches the cancellable stalls that
+/// are left. A parked test is otherwise indistinguishable from a wedged CI job.
+@Suite("Transport Backpressure & Write Preemption (§20.4, §22.2, §26)", .timeLimit(.minutes(1)))
 struct TransportBackpressureTests {
 
     // MARK: - Inbound backlog gate (§26)
@@ -38,13 +52,16 @@ struct TransportBackpressureTests {
     /// limit. Dropping is not an alternative in this direction: committed transactions may never
     /// be silently discarded (§20.4).
     @Test("A reader parks at the backlog limit and resumes only once the consumer acknowledges")
-    func readerParksUntilConsumerCatchesUp() throws {
+    func readerParksUntilConsumerCatchesUp() async throws {
         let gate = InboundBacklogGate(limitBytes: 1024)
         gate.recordDelivered(1024)
         #expect(gate.outstandingBytes == 1024)
 
-        let entered = DispatchSemaphore(value: 0)
-        let admitted = DispatchSemaphore(value: 0)
+        // The reader under test still parks a real `Thread` - that is the behaviour being checked.
+        // What this test must not do is park the *cooperative* thread it runs on while it waits for
+        // that reader; see `AsyncTestSignal`.
+        let entered = AsyncTestSignal()
+        let admitted = AsyncTestSignal()
         let capacityGranted = Box(false)
 
         let reader = Thread {
@@ -54,16 +71,20 @@ struct TransportBackpressureTests {
             admitted.signal()
         }
         reader.start()
-        entered.wait()
-
         #expect(
-            admitted.wait(timeout: .now() + 0.25) == .timedOut,
+            await entered.waitOrTimeout(timeout: .seconds(5)),
+            "the reader thread never entered the gate"
+        )
+
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(
+            admitted.signalCount == 0,
             "the reader must stay parked while the consumer is at the limit"
         )
 
         gate.recordConsumed(1024)
         #expect(
-            admitted.wait(timeout: .now() + 5) == .success,
+            await admitted.waitOrTimeout(timeout: .seconds(5)),
             "acknowledging consumption must release the reader"
         )
         #expect(capacityGranted.value)
@@ -73,11 +94,11 @@ struct TransportBackpressureTests {
     /// Teardown must never deadlock on the gate: a parked reader is released, not left waiting for
     /// a consumer that has gone away.
     @Test("Releasing the gate wakes a parked reader and tells it to stop")
-    func releaseWakesParkedReader() throws {
+    func releaseWakesParkedReader() async throws {
         let gate = InboundBacklogGate(limitBytes: 16)
         gate.recordDelivered(64)
 
-        let admitted = DispatchSemaphore(value: 0)
+        let admitted = AsyncTestSignal()
         let capacityGranted = Box(true)
 
         let reader = Thread {
@@ -86,9 +107,10 @@ struct TransportBackpressureTests {
         }
         reader.start()
 
-        #expect(admitted.wait(timeout: .now() + 0.25) == .timedOut)
+        try await Task.sleep(for: .milliseconds(250))
+        #expect(admitted.signalCount == 0)
         gate.release()
-        #expect(admitted.wait(timeout: .now() + 5) == .success)
+        #expect(await admitted.waitOrTimeout(timeout: .seconds(5)))
         #expect(
             capacityGranted.value == false,
             "a released gate must tell the reader to exit rather than to read again"
@@ -180,7 +202,10 @@ struct TransportBackpressureTests {
             }
         }
 
-        sink.waitUntilEntered(1)
+        #expect(
+            await sink.waitUntilEntered(1),
+            "no write ever reached the stalled sink"
+        )
         writer.stop()
         sink.fail(TransportError.closed)
         latch.stop()
@@ -208,7 +233,10 @@ struct TransportBackpressureTests {
             }
         }
 
-        sink.waitUntilEntered(1)
+        #expect(
+            await sink.waitUntilEntered(1),
+            "no write ever reached the stalled sink"
+        )
         sink.fail(TransportError.ioError("injected failure"))
 
         for task in tasks {
@@ -218,12 +246,41 @@ struct TransportBackpressureTests {
         latch.stop()
     }
 
+    /// Which *socket object* a descriptor number refers to, or `nil` when the number is not open.
+    ///
+    /// Measured on this platform: every socket gets a distinct `st_ino`, and a `dup` of one
+    /// reports the same `(st_dev, st_ino)` pair. Comparing against a sentinel `dup` therefore
+    /// answers "does this number still refer to *that* socket", which is the only form of the
+    /// question that survives descriptor recycling.
+    private func socketIdentity(of descriptor: Int32) -> SocketObjectIdentity? {
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0 else { return nil }
+        return SocketObjectIdentity(device: metadata.st_dev, inode: metadata.st_ino)
+    }
+
     /// The latch must not release a descriptor number while an I/O call still holds it, or the
     /// kernel can recycle it under a parked `read`/`write`.
+    ///
+    /// Both halves are observed against a `dup` of the same socket rather than against the
+    /// descriptor *number*. The test host runs hundreds of tests concurrently, so another one can
+    /// be handed that number the instant the latch closes it — after which `fcntl(number,
+    /// F_GETFD)` reports a perfectly healthy descriptor that belongs to somebody else, failing
+    /// this test for a reason it is not about (and, before the close, passing it for one).
+    /// Identity against the sentinel is immune both ways: a recycled number refers to a different
+    /// object, which is itself proof that the latch let go of it.
+    ///
+    /// Peer EOF cannot stand in for this: `stop()` shuts the socket down *before* deferring the
+    /// close, and a shut-down peer already reads 0, so EOF cannot tell the two states apart.
     @Test("A stop during an outstanding claim defers the close to the claim holder")
     func stopDefersCloseWhileClaimed() throws {
         let (writable, unread) = try makeStalledSocketPair()
         defer { Darwin.close(unread) }
+        // A second reference keeps the socket object itself alive once the latch drops its own,
+        // so the comparisons below stay answerable after the close.
+        let sentinel = dup(writable)
+        try #require(sentinel >= 0)
+        defer { Darwin.close(sentinel) }
+        let adoptedSocket = try #require(socketIdentity(of: sentinel))
 
         let latch = SocketReadLatch()
         latch.adopt(descriptor: writable)
@@ -233,25 +290,38 @@ struct TransportBackpressureTests {
 
         latch.stop()
         #expect(latch.isStopped)
-        // Still open: the claim holder has not finished, so the number cannot be recycled yet.
-        #expect(fcntl(writable, F_GETFD) != -1)
+        // Still the adopted socket: the claim holder has not finished, so the latch may not have
+        // closed it and the number cannot have been recycled.
+        #expect(
+            socketIdentity(of: writable) == adoptedSocket,
+            "a stop during an outstanding claim must not close the descriptor"
+        )
 
         latch.endIO()
-        #expect(fcntl(writable, F_GETFD) == -1, "the last claim release must perform the close")
+        #expect(
+            socketIdentity(of: writable) != adoptedSocket,
+            "the last claim release must perform the close"
+        )
         #expect(latch.beginIO() == nil, "a stopped latch hands out no further claims")
     }
+
 }
 
+/// A sink that parks the writer's own drain queue until the test fails it.
+///
+/// The park inside `write` is deliberate and stays blocking: `SocketWriter` calls the sink from its
+/// private `DispatchQueue`, not from the cooperative pool, so blocking there models a stalled peer
+/// without costing the test runner a thread. `waitUntilEntered` is a different matter - it runs on
+/// the test's own cooperative thread, so it suspends via `AsyncTestSignal` instead of blocking.
 private final class GatedFailingSink: @unchecked Sendable {
     private let condition = NSCondition()
-    private var entered = 0
     private var failure: (any Error)?
+    private let entries = AsyncTestSignal()
 
     func write(_ data: Data) throws {
         _ = data
+        entries.signal()
         condition.lock()
-        entered += 1
-        condition.broadcast()
         while failure == nil {
             condition.wait()
         }
@@ -260,12 +330,13 @@ private final class GatedFailingSink: @unchecked Sendable {
         throw error
     }
 
-    func waitUntilEntered(_ count: Int) {
-        condition.lock()
-        while entered < count {
-            condition.wait()
-        }
-        condition.unlock()
+    /// Bounded, and reports whether the writer arrived: `AsyncTestSignal.wait(until:)` suspends on
+    /// a continuation that nothing resumes if the writer never calls `write`, and a continuation
+    /// park ignores task cancellation — so a suite `.timeLimit` records its issue and still leaves
+    /// the run hanging. Measured: a parked `wait(until:)` under `.timeLimit(.minutes(1))` ran past
+    /// 300s and had to be killed, while a cancellable `Task.sleep` failed at 60s.
+    func waitUntilEntered(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        await entries.waitOrTimeout(until: count, timeout: timeout)
     }
 
     func fail(_ error: any Error) {

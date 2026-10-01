@@ -178,21 +178,45 @@ repo_checkout_roots() {
     done
 }
 
+# `.` and `..` folded away *without* resolving symlinks, so a path can be compared against the repo
+# roots by spelling. Purely lexical on purpose: resolving symlinks here would defeat the whole
+# reason the spelling is checked at all - a worktree's `target` is often a symlink into a shared
+# cache, so the physical path of a perfectly ordinary fixture binary lies outside the checkout.
+lexically_normalized() {
+    local path=$1 part out=
+    local IFS=/
+    for part in $path; do
+        case $part in
+            '' | .) continue ;;
+            ..) out=${out%/*} ;;
+            *) out="$out/$part" ;;
+        esac
+    done
+    printf '%s' "${out:-/}"
+}
+
 # Rule 6: is this binary inside a checkout of this repository? An argv[0] that is not an absolute
 # path tells us nothing about where the binary lives, so it is not reapable.
+#
+# The spelling is normalized before the prefix test. Without that, `/…/srui/../sibling/target/debug/
+# srui-sessiond` matches the `/…/srui/` prefix lexically while resolving into a *different* project,
+# and an old orphan of that project would be killed and its session discarded. The physical form is
+# still checked separately, which is what admits a fixture reached through a symlinked build
+# directory.
 inside_repo_checkout() {
-    local exe=$1 dir resolved root
+    local exe=$1 dir resolved root spelled
     case $exe in
         /*) ;;
         *) return 1 ;;
     esac
+    spelled=$(lexically_normalized "$exe")
     resolved=
     if dir=$(cd "$(dirname "$exe")" 2>/dev/null && pwd -P); then
         resolved="${dir%/}/$(basename "$exe")"
     fi
     while IFS= read -r root; do
         [ -n "$root" ] || continue
-        case $exe in "$root"/*) return 0 ;; esac
+        case $spelled in "$root"/*) return 0 ;; esac
         [ -n "$resolved" ] || continue
         case $resolved in "$root"/*) return 0 ;; esac
     done <<<"$repo_roots"

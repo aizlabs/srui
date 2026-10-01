@@ -541,6 +541,37 @@ else
 fi
 kill -9 "${pid:-0}" 2>/dev/null
 
+echo "case 17: an absolute path that escapes the checkout through .. is never signalled"
+# `/…/repo/../elsewhere/target/debug/x` matches the `/…/repo/` prefix by spelling while resolving
+# into a sibling project. Launched that way, an unrelated project's daemon looked like this
+# repository's debris.
+mkdir -p "$sandbox/elsewhere/target/debug"
+# Built from the checkout root exactly as `git worktree list` spells it: $sandbox can contain a
+# doubled slash, and that alone would make the pre-fix prefix test miss - hiding the defect this
+# case exists to catch.
+# `git rev-parse --show-toplevel`, not `pwd`: that is the exact spelling the reaper derives its
+# roots from, and on macOS /var is a symlink to /private/var - so a path built any other way would
+# not share a prefix with the root, and the pre-fix defect would hide again.
+escaping_root=$(git -C "$sandbox/repo" rev-parse --show-toplevel)
+escaping="$escaping_root/../elsewhere/target/debug/fixture-dotdot"
+ln -sf /bin/sleep "$sandbox/elsewhere/target/debug/fixture-dotdot"
+spawn_orphan "$escaping"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn an orphan behind a .. path"
+else
+    output=$(run_reaper "$(marker_pattern "$escaping")" 0 2>&1)
+    assert_alive "$pid" "an orphan whose path escapes the checkout through .. survived"
+    assert_contains "$output" "1 outside this repository" "the sweep accounted for it as foreign"
+    if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $pid"; then
+        fail "the reaper announced a kill for a path outside the checkout"
+        printf '%s\n' "    reaper said: $output" >&2
+    else
+        pass "the reaper never selected it"
+    fi
+fi
+kill -9 "${pid:-0}" 2>/dev/null
+
 echo "case 16: a pid recycled between selection and signalling is never touched"
 # The window is real: each candidate can hold the kill loop for up to 2.2s, so a later candidate
 # has seconds in which to exit and have its number reissued to an unrelated process of this user.

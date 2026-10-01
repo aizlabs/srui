@@ -8,11 +8,12 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -347,6 +348,199 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(subprocess.check_output(
             ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/codex/app-change"],
             text=True).strip(), self.git("rev-parse", "HEAD"))
+
+
+# Runs checks.guarded_run with a stub runner, so the single-flight behaviour is proved
+# without the real multi-minute cargo/SwiftPM checks. Every lock transition is appended
+# to one shared log; time.monotonic is system-wide, so the stamps order across processes.
+LOCK_HELPER = '''
+import importlib.util, os, sys, time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("pre_push_checks", sys.argv[1])
+checks = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = checks
+spec.loader.exec_module(checks)
+
+repo, log = Path(sys.argv[2]), Path(sys.argv[3])
+hold, timeout = float(sys.argv[4]), float(sys.argv[5])
+
+def record(event):
+    with log.open("a") as handle:
+        handle.write("%s %d %d\\n" % (event, os.getpid(), time.monotonic_ns()))
+
+def runner(_repo, _plan):
+    record("enter")
+    time.sleep(hold)
+    record("exit")
+    return 0
+
+plan = checks.Plan([], [], [], {}, [], [])
+raise SystemExit(checks.guarded_run(repo, plan, runner=runner, timeout=timeout, poll=0.02))
+'''
+
+
+class SingleFlightTests(unittest.TestCase):
+    """One hook run at a time: concurrent pushes used to deadlock in the build directory."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="srui-pre-push-lock-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        for args in (("init", "-q", "--initial-branch=main"),
+                     ("config", "user.name", "Pre-push test"),
+                     ("config", "user.email", "pre-push@example.invalid"),
+                     ("config", "commit.gpgsign", "false")):
+            checks.git(self.repo, *args)
+        (self.repo / "README.md").write_text("# Fixture\n")
+        checks.git(self.repo, "add", "--all")
+        checks.git(self.repo, "commit", "-qm", "fixture")
+        self.helper = self.root / "lock_helper.py"
+        self.helper.write_text(LOCK_HELPER)
+        self.log = self.root / "lock.log"
+        self.log.touch()
+
+    def spawn(self, hold, timeout, repo=None):
+        repo = self.repo if repo is None else repo
+        process = subprocess.Popen(
+            [sys.executable, str(self.helper), str(ROOT / checks.SCRIPT), str(repo),
+             str(self.log), str(hold), str(timeout)],
+            cwd=str(repo), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self.reap, process)
+        return process
+
+    def reap(self, process):
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.communicate(timeout=30)
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+
+    def events(self):
+        entries = []
+        for line in self.log.read_text().splitlines():
+            event, pid, stamp = line.split()
+            entries.append((event, int(pid), int(stamp)))
+        return entries
+
+    def await_holder(self, process):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if any(event == "enter" for event, _pid, _stamp in self.events()):
+                return
+            self.assertIsNone(process.poll(), "the holder exited before taking the lock")
+            time.sleep(0.02)
+        self.fail("the holder never reported entering the checks")
+
+    def test_concurrent_invocations_serialize_instead_of_overlapping(self):
+        holder = self.spawn(hold=1.0, timeout=30)
+        self.await_holder(holder)
+        waiter = self.spawn(hold=0.0, timeout=60)
+        for process in (holder, waiter):
+            stdout, stderr = process.communicate(timeout=120)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+        events = self.events()
+        self.assertEqual([event for event, _pid, _stamp in events],
+                         ["enter", "exit", "enter", "exit"], events)
+        self.assertEqual({pid for _event, pid, _stamp in events}, {holder.pid, waiter.pid})
+        first_exit = next(stamp for event, pid, stamp in events
+                          if event == "exit" and pid == holder.pid)
+        second_enter = next(stamp for event, pid, stamp in events
+                            if event == "enter" and pid == waiter.pid)
+        self.assertGreaterEqual(
+            second_enter, first_exit,
+            "the second push ran its checks while the first still held the lock")
+
+    def test_bounded_wait_reports_the_holder_then_exits_with_the_documented_status(self):
+        holder = self.spawn(hold=30.0, timeout=30)
+        self.await_holder(holder)
+        waiter = self.spawn(hold=0.0, timeout=0)
+        stdout, stderr = waiter.communicate(timeout=60)
+        self.assertEqual(waiter.returncode, checks.LOCK_BUSY_STATUS, stdout + stderr)
+        self.assertIn("waiting up to", stderr)
+        self.assertIn(str(holder.pid), stderr)
+        self.assertIn(checks.LOCK_FILE, stderr)
+        self.assertIn("--no-verify", stderr)
+        self.assertNotIn(waiter.pid, [pid for _event, pid, _stamp in self.events()],
+                         "the blocked push must not run any check")
+        self.reap(holder)
+
+    def test_the_lock_is_shared_across_worktrees_of_one_repository(self):
+        worktree = self.root / "linked"
+        checks.git(self.repo, "worktree", "add", "-q", "-b", "codex/linked", str(worktree))
+        self.assertFalse((worktree / ".git").is_dir(), "a linked worktree's .git is a file")
+        self.assertEqual(checks.lock_path(worktree), checks.lock_path(self.repo))
+        holder = self.spawn(hold=30.0, timeout=30)
+        self.await_holder(holder)
+        waiter = self.spawn(hold=0.0, timeout=0, repo=worktree)
+        stdout, stderr = waiter.communicate(timeout=60)
+        self.assertEqual(waiter.returncode, checks.LOCK_BUSY_STATUS, stdout + stderr)
+        self.assertIn(str(holder.pid), stderr)
+        self.reap(holder)
+
+    def test_a_dead_holder_does_not_block_the_next_push(self):
+        holder = self.spawn(hold=600.0, timeout=30)
+        self.await_holder(holder)
+        self.reap(holder)
+        waiter = self.spawn(hold=0.0, timeout=5)
+        stdout, stderr = waiter.communicate(timeout=60)
+        self.assertEqual(waiter.returncode, 0, stdout + stderr)
+        self.assertIn(("enter", waiter.pid),
+                      [(event, pid) for event, pid, _stamp in self.events()])
+
+
+class TargetIgnoreTests(unittest.TestCase):
+    """`target/` matched directories only, so a symlinked build cache was untracked noise."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="srui-pre-push-ignore-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        checks.git(self.repo, "init", "-q", "--initial-branch=main")
+        shutil.copyfile(ROOT / ".gitignore", self.repo / ".gitignore")
+
+    def check_ignore(self, *paths):
+        return subprocess.run(
+            ["git", "check-ignore", "-v", "--", *paths], cwd=self.repo,
+            env=checks.check_environment(), capture_output=True, text=True,
+        )
+
+    def test_a_target_symlink_is_ignored_like_a_target_directory(self):
+        cache = self.root / "buildcache"
+        cache.mkdir()
+        (self.repo / "server-rust").mkdir()
+        (self.repo / "target").mkdir()
+        os.symlink(cache, self.repo / "server-rust/target")
+        self.assertTrue((self.repo / "server-rust/target").is_symlink())
+        result = self.check_ignore("target", "server-rust/target")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 2, result.stdout)
+        self.assertEqual(checks.git(self.repo, "status", "--porcelain", "--untracked-files=all"),
+                         "?? .gitignore")
+
+    def test_neighbouring_paths_are_still_visible(self):
+        for name in ("server-rust/targets/keep.rs", "docs/target.md", "src/target.rs"):
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("keep\n")
+            with self.subTest(name=name):
+                self.assertEqual(self.check_ignore(name).returncode, 1)
+
+    def test_no_tracked_path_is_named_target(self):
+        # The unanchored pattern also matches a *file* named `target`. Nothing tracked is,
+        # and this fails the moment something becomes so, before the file silently vanishes.
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, check=True,
+                                 env=checks.check_environment(), capture_output=True, text=True)
+        named = [path for path in tracked.stdout.split("\0")
+                 if PurePosixPath(path).name == "target"]
+        self.assertEqual(named, [])
 
 
 if __name__ == "__main__":

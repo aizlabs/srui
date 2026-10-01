@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Select local checks from pushed revisions; full CI remains the merge gate."""
+"""Select local checks from pushed revisions; full CI remains the merge gate.
+
+The checks are single-flighted: cargo and SwiftPM serialize on one lock inside the
+shared build directory, so two concurrent pushes used to wedge indefinitely instead
+of queueing. One advisory `flock` in the repository's *common* git directory lets the
+second push wait with a bounded, reported wait instead.
+"""
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import asdict, dataclass
+import errno
+import fcntl
 import importlib.util
 import json
 import os
@@ -11,8 +20,10 @@ from pathlib import Path
 import platform
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import time
 
 SCRIPT = "scripts/pre_push_checks.py"
 PLAN = "apps/srtop/srui-process-explorer-plan"
@@ -22,9 +33,23 @@ HOOK_FILES = {
 }
 NATIVE_TEST = "client-macos/Tests/SRUITests/ProcessExplorerShellTests.swift"
 
+LOCK_FILE = "srui-pre-push.lock"
+# One full-profile run (uv sync + cargo + swift) takes several minutes, so the wait has
+# to outlast a complete run in another worktree; 15 minutes covers that with slack and
+# still fails loudly instead of hanging. SRUI_PRE_PUSH_LOCK_TIMEOUT overrides it (tests,
+# and anyone who knows their own build is slower).
+LOCK_TIMEOUT_SECONDS = 900.0
+LOCK_POLL_SECONDS = 0.5
+# Distinct from 1 (a failed check): the pushed revision was never examined.
+LOCK_BUSY_STATUS = 75
+
 
 class CheckError(RuntimeError):
     pass
+
+
+class LockBusy(RuntimeError):
+    """Another push held the single-flight lock past the bounded wait."""
 
 
 @dataclass
@@ -243,6 +268,121 @@ def run_plan(repo: Path, plan: Plan) -> int:
     return 0
 
 
+def lock_path(repo: Path) -> Path:
+    # Inside a linked worktree `.git` is a *file*, so only --git-common-dir names a
+    # directory, and it names the same one for every worktree of this repository.
+    # They all share the cargo/SwiftPM build directories, so they must all contend
+    # for one lock; a per-worktree lock would not prevent the deadlock at all.
+    common = Path(git(repo, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = repo / common
+    return common.resolve() / LOCK_FILE
+
+
+def lock_timeout() -> float:
+    raw = os.environ.get("SRUI_PRE_PUSH_LOCK_TIMEOUT")
+    if not raw:
+        return LOCK_TIMEOUT_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return LOCK_TIMEOUT_SECONDS
+
+
+def lock_holder(handle: int) -> str:
+    # Advisory only: the pid is for the waiting message, never for a decision.
+    try:
+        text = os.fsdecode(os.pread(handle, 64, 0)).strip()
+    except OSError:
+        return "unknown"
+    return text.splitlines()[0] if text else "unknown"
+
+
+@contextlib.contextmanager
+def single_flight(repo: Path, timeout: float | None = None,
+                  poll: float = LOCK_POLL_SECONDS, stream=None):
+    """Hold an exclusive advisory lock for the duration of the checks.
+
+    flock is owned by the open file description, so the kernel releases it on every
+    exit path including a crash or SIGKILL. A lock built from file existence would
+    strand every future push instead.
+    """
+    stream = sys.stderr if stream is None else stream
+    timeout = lock_timeout() if timeout is None else timeout
+    path = lock_path(repo)
+    handle = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        deadline = time.monotonic() + timeout
+        announced = False
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise
+            if not announced:
+                announced = True
+                print(f"pre-push: waiting up to {timeout:.0f}s for the pre-push checks lock "
+                      f"{path}, held by pid {lock_holder(handle)}. Concurrent cargo/SwiftPM "
+                      "builds deadlock on the shared build directory, so this push queues "
+                      "behind that one.", file=stream, flush=True)
+            if time.monotonic() >= deadline:
+                raise LockBusy(
+                    f"pid {lock_holder(handle)} still holds {path} after {timeout:.0f}s; "
+                    f"this revision was not checked (exit {LOCK_BUSY_STATUS}). Let that run "
+                    "finish and push again, or push with --no-verify to skip the local gate "
+                    "entirely -- that checks nothing at all before the push, leaving CI as "
+                    "the only gate."
+                )
+            time.sleep(poll)
+        restore = install_release_on_signal()
+        try:
+            os.ftruncate(handle, 0)
+            os.pwrite(handle, f"{os.getpid()}\n".encode(), 0)
+            yield path
+        finally:
+            restore()
+            with contextlib.suppress(OSError):
+                os.ftruncate(handle, 0)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        os.close(handle)
+
+
+def install_release_on_signal():
+    """Turn termination signals into SystemExit so the lock's cleanup still runs."""
+    def terminate(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:  # Only the main thread may install handlers.
+            previous[number] = signal.signal(number, terminate)
+        except ValueError:
+            return lambda: None
+
+    def restore() -> None:
+        for number, handler in previous.items():
+            with contextlib.suppress(ValueError):
+                signal.signal(number, handler)
+
+    return restore
+
+
+def guarded_run(repo: Path, plan: Plan, runner=run_plan, **lock) -> int:
+    """Run the selected checks, one hook invocation at a time per repository."""
+    try:
+        with single_flight(repo, **lock):
+            return runner(repo, plan)
+    except LockBusy as error:
+        print(f"pre-push: {error}", file=sys.stderr)
+        return LOCK_BUSY_STATUS
+
+
 def print_plan(plan: Plan) -> None:
     for base, head in plan.ranges:
         print(f"Range: {base[:12]}..{head[:12]}")
@@ -332,7 +472,7 @@ def main() -> int:
             return 0
         print_plan(plan)
         # Non-hook invocation is always a read-only preview for agents/humans.
-        return run_plan(repo, plan) if args.hook and not args.dry_run else 0
+        return guarded_run(repo, plan) if args.hook and not args.dry_run else 0
     except (CheckError, OSError, ValueError) as error:
         print(f"pre-push: {error}", file=sys.stderr)
         return 1

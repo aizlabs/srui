@@ -137,6 +137,26 @@ process_terminated() {
     esac
 }
 
+# A pid's absolute start time: the one property that distinguishes a process from a later one that
+# inherited its number. Empty when the pid is gone.
+#
+# This matters because selection and signalling are not simultaneous. Each candidate can occupy the
+# kill loop for up to 2.2s (SIGTERM, twenty 0.1s liveness polls, SIGKILL, 0.2s), so with several
+# candidates a *later* one has seconds in which to exit on its own and have its number handed to an
+# unrelated process of this same user - which the unconditional kill would then signal, and the
+# escalation below would SIGKILL. Every signal is therefore gated on the identity recorded at
+# selection time.
+process_start() {
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'
+}
+
+# True when `pid` is still the process selected, identified by its start time.
+still_the_selected_process() {
+    local pid=$1 recorded=$2 current
+    current=$(process_start "$pid")
+    [ -n "$current" ] && [ "$current" = "$recorded" ]
+}
+
 # The checkouts of this repository: the main one plus every linked worktree, each in both the
 # spelling git reports and its symlink-resolved form. Derived from where this script lives, not from
 # the caller's cwd, so a sweep run from anywhere still means "debris of *this* repository". Empty
@@ -318,7 +338,10 @@ reapable=
 while IFS=$'\t' read -r pid exe; do
     [ -n "${pid:-}" ] || continue
     if inside_repo_checkout "$exe"; then
-        reapable="${reapable}${pid}"$'\t'"${exe}"$'\n'
+        # Start time first: the command can contain spaces, so it has to stay the last field.
+        start=$(process_start "$pid")
+        [ -n "$start" ] || continue # exited between the snapshot and now; nothing to signal
+        reapable="${reapable}${pid}"$'\t'"${start}"$'\t'"${exe}"$'\n'
     else
         foreign=$((foreign + 1))
     fi
@@ -336,12 +359,19 @@ fi
 
 killed=0
 killed_pids=
-while IFS=$'\t' read -r pid exe; do
+replaced=0
+while IFS=$'\t' read -r pid start exe; do
     [ -n "${pid:-}" ] || continue
     if [ "$dry_run" -eq 1 ]; then
         echo "would kill pid $pid $exe"
         killed=$((killed + 1))
         killed_pids="$killed_pids $pid"
+        continue
+    fi
+    # Checked immediately before the signal, not once at selection: see `process_start`.
+    if ! still_the_selected_process "$pid" "$start"; then
+        echo "note: pid $pid is no longer the process selected; not signalling it" >&2
+        replaced=$((replaced + 1))
         continue
     fi
     echo "killing orphaned fixture server pid $pid $exe"
@@ -351,6 +381,13 @@ while IFS=$'\t' read -r pid exe; do
         sleep 0.1
     done
     if ! process_terminated "$pid"; then
+        # The same check again: SIGKILL is unanswerable, so the escalation needs its own proof that
+        # the number still names the process that ignored SIGTERM.
+        if ! still_the_selected_process "$pid" "$start"; then
+            echo "note: pid $pid was replaced before the escalation; not sending SIGKILL" >&2
+            replaced=$((replaced + 1))
+            continue
+        fi
         kill -KILL "$pid" 2>/dev/null
         sleep 0.2
     fi
@@ -440,10 +477,10 @@ if [ "$dry_run" -eq 1 ]; then
     verb_killed="would kill"
     verb_removed="would remove"
 fi
-printf 'reap-test-servers: %s %d fixture server(s), %s %d socket director(y|ies) (%d.%d MB); left %d fixture process(es) with a live parent or too young, %d outside this repository, %d referenced director(y|ies), %d recently touched.\n' \
+printf 'reap-test-servers: %s %d fixture server(s), %s %d socket director(y|ies) (%d.%d MB); left %d fixture process(es) with a live parent or too young, %d outside this repository, %d replaced before signalling, %d referenced director(y|ies), %d recently touched.\n' \
     "$verb_killed" "$killed" "$verb_removed" "$removed" \
     "$((removed_kb / 1024))" "$(((removed_kb % 1024) * 10 / 1024))" \
-    "$spared" "$foreign" "$held" "$fresh"
+    "$spared" "$foreign" "$replaced" "$held" "$fresh"
 
 if [ "$failures" -gt 0 ]; then
     echo "reap-test-servers: $failures failure(s)" >&2

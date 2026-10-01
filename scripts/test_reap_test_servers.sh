@@ -541,6 +541,57 @@ else
 fi
 kill -9 "${pid:-0}" 2>/dev/null
 
+echo "case 16: a pid recycled between selection and signalling is never touched"
+# The window is real: each candidate can hold the kill loop for up to 2.2s, so a later candidate
+# has seconds in which to exit and have its number reissued to an unrelated process of this user.
+# Staging a genuine recycle is not possible to order, so the identity the reaper checks is what
+# changes here: a `ps` stand-in reports a different start time for `-o lstart= -p <pid>` from the
+# moment the reaper has finished selecting, which is exactly what a reissued number looks like.
+recycle_bin="$sandbox/recyclebin"
+mkdir -p "$recycle_bin"
+cat >"$recycle_bin/ps" <<'SH'
+#!/bin/sh
+# `-o lstart= -p N` is the identity probe; everything else passes through untouched. The first
+# call answers truthfully (selection), every later one reports a different start time (the number
+# now names something else).
+if [ "$1" = "-o" ] && [ "$2" = "lstart=" ] && [ "$3" = "-p" ]; then
+    if [ -f "$SRUI_TEST_RECYCLE_MARKER" ]; then
+        echo "Thu Jan  1 00:00:00 2037"
+    else
+        : >"$SRUI_TEST_RECYCLE_MARKER"
+        exec /bin/ps "$@"
+    fi
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+chmod +x "$recycle_bin/ps"
+marker=$(make_marker fixture-recycled)
+spawn_orphan "$marker"
+pid=$spawned_pid
+if [ -z "$pid" ]; then
+    fail "could not spawn an orphan marker"
+else
+    output=$(PATH="$recycle_bin:$sandbox/lsofbin:$PATH" \
+        SRUI_TEST_RECYCLE_MARKER="$sandbox/recycled-once" \
+        SRUI_TEST_LSOF_TABLE="$lsof_table" \
+        SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
+        bash "$reaper" 2>&1)
+    assert_alive "$pid" "a pid whose identity changed was not signalled"
+    assert_contains "$output" "no longer the process selected" "the sweep said why it held off"
+    assert_contains "$output" "1 replaced before signalling" "the summary accounted for it"
+    if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $pid"; then
+        fail "the reaper announced a kill for a replaced pid"
+        printf '%s\n' "    reaper said: $output" >&2
+    else
+        pass "the reaper never announced a kill for it"
+    fi
+fi
+rm -f "$sandbox/recycled-once"
+kill -9 "${pid:-0}" 2>/dev/null
+
 echo "case 15: the host's own lsof, where it has one, yields the same decision"
 # Every case above drives a stand-in, which tests the reaper's *logic* but not its reading of real
 # `lsof -F pn` output. This case closes that gap wherever the host can: a real holder, the real

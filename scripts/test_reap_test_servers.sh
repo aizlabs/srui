@@ -79,8 +79,15 @@ make_foreign_marker() {
 }
 
 # ERE that matches only this marker's path.
+# A path turned into an anchored regex for `SRUI_REAP_PATTERN`.
+#
+# Dots become `[.]` rather than `\.`: the pattern is handed to awk through `-v`, and gawk processes
+# escape sequences in those assignments, so `\.` draws `warning: escape sequence '\.' treated as
+# plain '.'` on every Linux run. A bracket expression means the same thing to every awk and warns
+# nowhere - and a destructive script's stderr is worth keeping readable, since that is where its
+# notes about what it declined to kill appear.
 marker_pattern() {
-    printf '%s$' "$(printf '%s' "$1" | sed 's/[.[\*^$+?(){}|]/\\&/g')"
+    printf '%s$' "$(printf '%s' "$1" | sed -e 's/\./[.]/g' -e 's/[[\*^$+?(){}|]/\\&/g')"
 }
 
 # The spawn helpers publish `spawned_pid` rather than echoing it: a `$(...)` substitution would
@@ -201,10 +208,22 @@ SH
     printf '%s' "$dir"
 }
 
+# The reaper derives its default runtime directories from `XDG_RUNTIME_DIR` and `TMPDIR`, and it
+# refuses to kill anything when it cannot read the socket table *and* a socket exists in one of them
+# (rule 5 would be unenforceable). On a host that satisfies both - no `lsof`, and a populated
+# `/run/user/<uid>` - every "was killed" case here asserted an outcome the machine could not produce.
+# Measured on ubuntu-latest, where that is the default: cases 2 and 14 failed while the reaper worked
+# exactly as designed. So both variables are pinned into the sandbox for every invocation; the cases
+# that exercise the default runtime directory override them deliberately.
+sandbox_runtime="$sandbox/runtime"
+mkdir -p "$sandbox_runtime"
+
 run_reaper() {
     local pattern=$1 age=$2
     shift 2
     PATH="$sandbox/lsofbin:$PATH" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        TMPDIR="$sandbox_runtime/tmp" \
         SRUI_TEST_LSOF_TABLE="$lsof_table" \
         SRUI_REAP_PATTERN="$pattern" \
         SRUI_REAP_AGE_MINUTES="$age" \
@@ -410,6 +429,7 @@ PATH="$sandbox/lsofbin:$PATH" \
     SRUI_REAP_AGE_MINUTES=0 \
     SRUI_REAP_TMP_GLOBS="$runtime_root/srui-*" \
     TMPDIR="$runtime_root" \
+    XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
     bash "$reaper" >/dev/null 2>&1
 assert_dir_present "$default_dir" "the default runtime directory survived a zero-age sweep"
 assert_dir_present "$held_dir" "a directory whose socket is held survived it"
@@ -449,6 +469,7 @@ else
             SRUI_REAP_AGE_MINUTES=0 \
             SRUI_REAP_TMP_GLOBS="$default_root/srui-*" \
             TMPDIR="$default_root" \
+            XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
             bash "$reaper" 2>&1)
         assert_alive "$listener_pid" "the daemon on the default runtime socket survived a zero-age sweep"
         assert_dir_present "$default_socket_dir" "its runtime directory survived with it"
@@ -522,6 +543,7 @@ else
         SRUI_REAP_AGE_MINUTES=0 \
         SRUI_REAP_TMP_GLOBS="$blind_root/srui-*" \
         TMPDIR="$blind_root" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
         bash "$reaper" 2>&1)
     assert_alive "$pid" "the orphan survived a sweep that could not read the socket table"
     assert_dir_present "$blind_default" "the default runtime directory survived it too"
@@ -535,6 +557,7 @@ else
         SRUI_REAP_AGE_MINUTES=0 \
         SRUI_REAP_TMP_GLOBS="$blind_root/srui-*" \
         TMPDIR="$blind_root" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
         bash "$reaper" 2>&1)
     assert_terminated "$pid" "with no default socket on disk, the same orphan was killed"
     assert_contains "$output" "nothing to protect" "the sweep said why it proceeded"
@@ -648,6 +671,8 @@ else
         SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
         SRUI_REAP_AGE_MINUTES=0 \
         SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        TMPDIR="$sandbox_runtime/tmp" \
         bash "$reaper" 2>&1)
     assert_alive "$pid" "a pid whose identity changed was not signalled"
     assert_contains "$output" "no longer the process selected" "the sweep said why it held off"
@@ -699,6 +724,8 @@ else
         SRUI_REAP_PATTERN="$(marker_pattern "$marker")" \
         SRUI_REAP_AGE_MINUTES=0 \
         SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        TMPDIR="$sandbox_runtime/tmp" \
         bash "$reaper" 2>&1)
     # The kill has to happen, or the probe count below would be satisfied by a sweep that selected
     # nothing - and it also proves the identity the snapshot built matches what `process_start`
@@ -826,6 +853,8 @@ PY
         SRUI_REAP_PATTERN='NEVER_MATCHES_ANY_EXECUTABLE' \
             SRUI_REAP_AGE_MINUTES=0 \
             SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-real*" \
+            XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+            TMPDIR="$sandbox_runtime/tmp" \
             bash "$reaper" >/dev/null 2>&1
         assert_dir_present "$real_lsof_dir" "real lsof output kept the directory of a held socket"
     fi

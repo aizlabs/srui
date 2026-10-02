@@ -31,7 +31,7 @@ struct CounterSocketIntegrationTests {
         guard FileManager.default.fileExists(atPath: counterBinary.path) else { return }
 
         // Deliberately *not* pre-created: the server must build the private parent itself.
-        let runtimeDirectory = TestFixtureDirectory.reserve(prefix: "srui-counter-private")
+        let runtimeDirectory = try TestFixtureDirectory.reserve(prefix: "srui-counter-private")
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         defer { TestFixtureDirectory.release(runtimeDirectory) }
 

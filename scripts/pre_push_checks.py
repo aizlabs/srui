@@ -410,8 +410,31 @@ def run_check(argv: list[str], cwd: Path) -> int:
         _active_check = None
 
 
-def check_process_tree(root: int) -> tuple[set[int], set[int]]:
+def process_listing(columns: str) -> str | None:
+    """One `ps` snapshot, or `None` when the process table could not be read.
+
+    `None` and "nothing is running" must never be the same answer. An empty stdout
+    from a failed `ps` read as an empty process table would let the drain below
+    conclude that an interrupted build had finished, and release the lock over a
+    cargo or SwiftPM process still writing to the shared build directory. Every
+    failure mode lands here -- nonzero exit, a timeout, `ps` missing entirely -- so
+    none of them can propagate out of a signal handler either.
+    """
+    try:
+        snapshot = subprocess.run(["ps", "-eo", columns], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, check=False, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if snapshot.returncode != 0:
+        return None
+    return snapshot.stdout
+
+
+def check_process_tree(root: int) -> tuple[set[int], set[int]] | None:
     """Every pid and process group the check `root` is responsible for.
+
+    `None` when the process table could not be read; see [`process_listing`].
 
     One `ps` snapshot, walked twice. First by parent, to find the descendants;
     then by group, because a wrapper may put its own children in a *new* process
@@ -424,12 +447,12 @@ def check_process_tree(root: int) -> tuple[set[int], set[int]]:
     This hook's own pid, group and session are never included: the point is to
     stop what the check started, not to signal the push.
     """
-    snapshot = subprocess.run(["ps", "-eo", "pid=,ppid=,pgid="], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              text=True, check=False, timeout=10)
+    listing = process_listing("pid=,ppid=,pgid=")
+    if listing is None:
+        return None
     children: dict[int, list[int]] = {}
     group_of: dict[int, int] = {}
-    for line in snapshot.stdout.splitlines():
+    for line in listing.splitlines():
         fields = line.split()
         if len(fields) != 3 or not all(field.isdigit() for field in fields):
             continue
@@ -458,20 +481,21 @@ def check_process_tree(root: int) -> tuple[set[int], set[int]]:
     return (tree | members) - mine, groups
 
 
-def live_group_members(groups: set[int]) -> set[int]:
+def live_group_members(groups: set[int]) -> set[int] | None:
     """Which processes still belong to `groups`, excluding this push's own.
 
     Membership, not parentage: a process keeps its group when its parent dies, so
-    this still sees a build whose shell has already exited.
+    this still sees a build whose shell has already exited. `None` means the table
+    could not be read, which is not the same as nothing being there.
     """
     if not groups:
         return set()
-    snapshot = subprocess.run(["ps", "-eo", "pid=,pgid=,state="], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              text=True, check=False, timeout=10)
+    listing = process_listing("pid=,pgid=,state=")
+    if listing is None:
+        return None
     mine = {os.getpid(), os.getppid()}
     live = set()
-    for line in snapshot.stdout.splitlines():
+    for line in listing.splitlines():
         fields = line.split()
         if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
             continue
@@ -505,11 +529,20 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
     process = _active_check
     if process is None or process.poll() is not None:
         return
-    _, groups = check_process_tree(process.pid)
+    # The group the check leads is known without any snapshot: `start_new_session`
+    # made it the leader of its own group, so its pid *is* that group. Everything
+    # else is discovered, and discovery can fail.
+    groups = {process.pid}
+    tree = check_process_tree(process.pid)
+    if tree is not None:
+        groups |= tree[1]
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if process.poll() is None:
-            groups |= check_process_tree(process.pid)[1]
-        if not live_group_members(groups):
+            tree = check_process_tree(process.pid)
+            if tree is not None:
+                groups |= tree[1]
+        members = live_group_members(groups)
+        if members == set():
             break
         for pgid in sorted(groups):
             with contextlib.suppress(OSError, ProcessLookupError):
@@ -519,12 +552,19 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
         while time.monotonic() < deadline:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=0.05)
-            if not live_group_members(groups):
+            # Only an *answered* enumeration can end the wait. `None` is "cannot
+            # tell", and treating it as drained is precisely how the lock would be
+            # released over a build still running.
+            if live_group_members(groups) == set():
                 drained = True
                 break
             time.sleep(0.05)
         if drained:
             break
+    if live_group_members(groups) is None:
+        print("pre-push: could not read the process table while stopping the checks; "
+              f"signalled process group(s) {sorted(groups)} and waited for the check "
+              "itself. If a build survived, kill it before pushing again.", file=sys.stderr)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=grace)
 
@@ -536,7 +576,13 @@ def install_release_on_signal():
     released while a build it was protecting is still going.
     """
     def terminate(signum, _frame):
-        stop_active_check()
+        # Nothing here may propagate: an exception raised inside the handler would
+        # unwind `single_flight` and release the lock over a check still running,
+        # which is the one outcome the handler exists to prevent.
+        try:
+            stop_active_check()
+        except BaseException as error:  # noqa: BLE001 - deliberately total
+            print(f"pre-push: stopping the checks failed: {error!r}", file=sys.stderr)
         raise SystemExit(128 + signum)
 
     previous = {}

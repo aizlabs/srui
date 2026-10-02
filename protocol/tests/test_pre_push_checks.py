@@ -673,6 +673,49 @@ class SingleFlightTests(unittest.TestCase):
         self.assertIn(child.pid, members, "the live shell must count as a member")
         self.assertNotIn(zombie, members, "a zombie was counted as a live group member")
 
+    def test_an_unreadable_process_table_is_not_an_empty_one(self):
+        """Enumeration failure must not read as "the build has finished".
+
+        A failed `ps` returns empty stdout. Parsed as an empty process table it ends
+        the drain, and the lock is released over a check that may still be writing to
+        the shared build directory.
+        """
+        for failure in (lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""),
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            subprocess.TimeoutExpired("ps", 10)),
+                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("ps"))):
+            with patch.object(checks.subprocess, "run", failure):
+                self.assertIsNone(checks.process_listing("pid=,pgid="))
+                self.assertIsNone(checks.check_process_tree(os.getpid()))
+                self.assertIsNone(checks.live_group_members({os.getpgrp()}))
+
+    def test_a_check_is_stopped_even_when_the_process_table_cannot_be_read(self):
+        """The group the check leads is known without any snapshot, so it is still
+        signalled; and an unreadable table never ends the wait early."""
+        script = self.root / "blind_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        real_run = subprocess.run
+
+        def ps_fails(argv, *args, **kwargs):
+            if argv and argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return real_run(argv, *args, **kwargs)
+
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+        stderr = io.StringIO()
+        with patch.object(checks.subprocess, "run", ps_fails), redirect_stderr(stderr):
+            checks.stop_active_check(grace=1.0)
+        thread.join(timeout=30)
+        self.assertNotRunning(root, "the check survived a stop that could not enumerate")
+        self.assertIn("could not read the process table", stderr.getvalue())
+
     def test_the_handled_signals_are_blocked_while_a_check_is_registered(self):
         """No window between spawning a check and recording it.
 

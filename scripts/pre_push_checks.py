@@ -358,6 +358,14 @@ def single_flight(repo: Path, timeout: float | None = None,
 _active_check: subprocess.Popen | None = None
 
 
+# Signals whose delivery must never land between spawning a check and recording it.
+STOP_SIGNALS = tuple(
+    number for number in (getattr(signal, name, None)
+                          for name in ("SIGTERM", "SIGHUP", "SIGINT"))
+    if number is not None
+)
+
+
 def run_check(argv: list[str], cwd: Path) -> int:
     """Run one check in its own process group and wait for it.
 
@@ -366,35 +374,98 @@ def run_check(argv: list[str], cwd: Path) -> int:
     child that outlives the hook keeps the shared build directory busy while the
     lock is already gone -- after which the next push acquires the lock and starts
     a second build into it, which is the overlap the lock exists to prevent.
+
+    The handled signals are blocked across the spawn and the registration. A
+    signal that arrived in between would find no active check, stop nothing, and
+    release the lock over a build that had just started -- the same overlap,
+    through a window a few instructions wide. Blocking does not lose it: it is
+    delivered as soon as the mask is restored, by which time the check is
+    recorded.
     """
     global _active_check
-    process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
-                               env=check_environment(), start_new_session=True)
-    _active_check = process
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                   env=check_environment(), start_new_session=True)
+        _active_check = process
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
     try:
         return process.wait()
     finally:
         _active_check = None
 
 
+def check_process_tree(root: int) -> tuple[set[int], set[int]]:
+    """Every pid and process group the check `root` is responsible for.
+
+    One `ps` snapshot, walked twice. First by parent, to find the descendants;
+    then by group, because a wrapper may put its own children in a *new* process
+    group -- `scripts/run-swift-tests.sh` does exactly that (`set -m`), precisely
+    so it can reap them by group -- and because a descendant reparented to init
+    keeps its group when it loses its parent. Signalling `root`'s group alone
+    therefore misses the `swift test` that the group boundary hides, which is how
+    a SwiftPM build outlived the lock that was protecting it.
+
+    This hook's own pid, group and session are never included: the point is to
+    stop what the check started, not to signal the push.
+    """
+    snapshot = subprocess.run(["ps", "-eo", "pid=,ppid=,pgid="], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              text=True, check=False, timeout=10)
+    children: dict[int, list[int]] = {}
+    group_of: dict[int, int] = {}
+    for line in snapshot.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or not all(field.isdigit() for field in fields):
+            continue
+        pid, ppid, pgid = (int(field) for field in fields)
+        children.setdefault(ppid, []).append(pid)
+        group_of[pid] = pgid
+
+    tree = {root}
+    queue = [root]
+    while queue:
+        for child in children.get(queue.pop(), ()):
+            if child not in tree:
+                tree.add(child)
+                queue.append(child)
+
+    mine = {os.getpid(), os.getppid()}
+    forbidden = {0, 1, os.getpgrp()} | mine
+    groups = {group_of[pid] for pid in tree if pid in group_of} - forbidden
+    members = {pid for pid, pgid in group_of.items() if pgid in groups}
+    return (tree | members) - mine, groups
+
+
 def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
-    """Stop the running check's whole process group, and wait for it to go.
+    """Stop everything the running check started, and wait for all of it to go.
 
     Waiting is the point: the lock must outlive the build it was taken for, so
-    this returns only once nothing is left writing to the build directory. The
-    group, not the pid, because cargo and swift spawn children of their own.
+    this returns only once nothing is left writing to the build directory. Groups
+    first, then any pid the groups did not cover, and the tree is re-derived
+    before each signal so a wrapper's newly created group is not missed.
     """
     process = _active_check
     if process is None or process.poll() is not None:
         return
-    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, grace)):
-        with contextlib.suppress(OSError, ProcessLookupError):
-            os.killpg(process.pid, sig)
-        try:
-            process.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        pids, groups = check_process_tree(process.pid)
+        for pgid in groups:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                os.killpg(pgid, sig)
+        for pid in pids:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                os.kill(pid, sig)
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=0.05)
+            if not check_process_tree(process.pid)[0]:
+                return
+            time.sleep(0.05)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        process.wait(timeout=grace)
 
 
 def install_release_on_signal():

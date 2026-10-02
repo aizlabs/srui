@@ -524,6 +524,82 @@ class SingleFlightTests(unittest.TestCase):
         with self.assertRaises(OSError, msg="the check outlived the hook that held the lock"):
             os.kill(child, 0)
 
+    def test_a_nested_process_group_is_stopped_with_the_check(self):
+        """A wrapper's own process group must not outlive the lock either.
+
+        `scripts/run-swift-tests.sh` puts `swift test` in a *new* process group with
+        `set -m`, so signalling the check's group does not reach it. That is the real
+        shape of the macOS full hook, and the shape this reproduces: killing the
+        directly spawned shell is not enough, because the build is one group boundary
+        further in.
+        """
+        marker = self.root / "nested.pid"
+        script = self.root / "wrapper.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "set -m\n"          # exactly what run-swift-tests.sh does
+            "sleep 60 &\n"
+            f"printf '%s' \"$!\" > {marker}\n"
+            "wait\n"
+        )
+        script.chmod(0o755)
+        helper = self.root / "signal_helper.py"
+        helper.write_text(SIGNAL_HELPER)
+        hook = subprocess.Popen(
+            [sys.executable, str(helper), str(ROOT / checks.SCRIPT), str(self.repo),
+             str(script)],
+            cwd=str(self.repo), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self.reap, hook)
+
+        deadline = time.monotonic() + 30
+        while not marker.exists() or not marker.read_text().strip():
+            self.assertIsNone(hook.poll(), "the hook exited before the wrapper started")
+            self.assertLess(time.monotonic(), deadline, "the nested job never started")
+            time.sleep(0.02)
+        nested = int(marker.read_text())
+        os.kill(nested, 0)
+        self.assertNotEqual(os.getpgid(nested), os.getpgid(hook.pid),
+                            "the fixture must put the nested job in its own group")
+
+        os.kill(hook.pid, signal.SIGTERM)
+        stdout, stderr = hook.communicate(timeout=60)
+        self.assertNotEqual(hook.returncode, 0, stdout + stderr)
+        with self.assertRaises(OSError, msg="a nested process group outlived the lock"):
+            os.kill(nested, 0)
+
+    def test_the_handled_signals_are_blocked_while_a_check_is_registered(self):
+        """No window between spawning a check and recording it.
+
+        A signal delivered in that window would find no active check, stop nothing,
+        and release the lock over a build that had just started.
+        """
+        observed = {}
+
+        class FakePopen:
+            def __init__(self, *_args, **_kwargs):
+                observed["mask"] = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+                observed["active_at_spawn"] = checks._active_check
+                self.pid = os.getpid()
+
+            def wait(self):
+                observed["active_while_waiting"] = checks._active_check is self
+                return 0
+
+            def poll(self):
+                return 0
+
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        with patch.object(checks.subprocess, "Popen", FakePopen):
+            self.assertEqual(checks.run_check(["true"], self.repo), 0)
+        self.assertTrue(set(checks.STOP_SIGNALS).issubset(observed["mask"]),
+                        f"the handled signals were deliverable during the spawn: {observed['mask']}")
+        self.assertTrue(observed["active_while_waiting"], "the check was never registered")
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), before,
+                         "the mask was not restored after registration")
+        self.assertIsNone(checks._active_check, "the check outlived its own run")
+
     def test_a_plan_with_no_checks_never_waits_for_the_lock(self):
         """A deletion-only push plans no checks, so it must not queue behind a build.
 

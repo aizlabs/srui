@@ -219,7 +219,9 @@ tmp_globs=${SRUI_REAP_TMP_GLOBS:-'/tmp/srui-* /tmp/px0[0-9][0-9]-* /tmp/srtop-*'
 # Rule 7 matches `sshd` by name only to find candidates; what admits one is the configuration -
 # inside a fixture directory (`inside_fixture_directory`) *and* declaring SRUI's own subsystem
 # (`declares_srui_subsystem`) - never this pattern on its own.
-sshd_pattern='(^|/)sshd$'
+# `sshd` or `sshd:`: a real listener rewrites its process title, so the first token of its command
+# line is `sshd:` and the path, if the title still carries one, comes after it.
+sshd_pattern='(^|/)sshd:?$'
 # Most of an `sshd_config` this sweep will read while looking for that declaration.
 MAX_CONFIG_BYTES=65536
 my_uid=$(id -u)
@@ -455,6 +457,10 @@ rule4_candidates() {
 # A relative path yields nothing: what it resolves to depends on a working directory no `ps` snapshot
 # records, so there is no evidence here to act on. A path containing a space is out of scope for the
 # same reason argv[0] is (see rule 4) - `ps` joins argv with spaces and nothing can split it back.
+#
+# A rewritten listener title keeps the original flags after the path, which is where this finds the
+# `-f`. A version whose title drops it leaves rule 7 with no evidence, and admits nothing - the
+# conservative direction.
 sshd_config_path() {
     local cmd=$1 token next=0
     local -a tokens=()
@@ -532,7 +538,16 @@ fixture_sshd_candidates() {
     while IFS=$'\t' read -r pid ppid age start cmd; do
         [ -n "${pid:-}" ] || continue
         exe=$(command_argv0 "$cmd")
-        case $(basename "$exe") in sshd) ;; *) continue ;; esac
+        # `sshd` or `sshd:`. A real listener rewrites its process title to
+        # `sshd: /usr/sbin/sshd -f … [listener]`, so no prefix of the command line names
+        # an existing file and `command_argv0` falls back to the first token, `sshd:`.
+        # Rejecting that spelling meant every orphan `SSHTestSupport.launchSSHD` leaves
+        # on Linux - the case rule 7 exists for - was never a candidate at all.
+        #
+        # A title is not identity: any process may set its own. It is only used to find
+        # candidates, exactly as the executable pattern is; what admits one is still the
+        # configuration file, which has to exist and declare SRUI's own subsystem.
+        case $(basename "$exe") in sshd | sshd:) ;; *) continue ;; esac
         config=$(sshd_config_path "$cmd")
         inside_fixture_directory "$config" || continue
         declares_srui_subsystem "$config" || continue

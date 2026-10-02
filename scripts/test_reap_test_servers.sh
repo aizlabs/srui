@@ -262,6 +262,25 @@ spawn_orphan_with_args() {
     [ -n "$spawned_pid" ] && spawned_pids+=("$spawned_pid")
 }
 
+# An orphan that rewrote its own process title, the way a real `sshd -D` listener does: argv[0] is
+# `sshd:` and the executable path, if any, follows it. `exec -a` is how a shell can set argv[0] to
+# something other than the file it runs.
+spawn_orphan_with_title() {
+    local title=$1 exe=$2
+    shift 2
+    ((exec -a "$title" "$exe" "$@" 600 >/dev/null 2>&1) &) 2>/dev/null
+    local waited=0 want
+    want="$title $* 600"
+    spawned_pid=""
+    while [ "$waited" -lt 50 ]; do
+        spawned_pid=$(pgrep -f "^$(printf '%s' "$want" | sed -e 's/[][\\.*^$+?(){}|]/\\&/g')\$" 2>/dev/null | head -1)
+        [ -n "$spawned_pid" ] && break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [ -n "$spawned_pid" ] && spawned_pids+=("$spawned_pid")
+}
+
 # A live process whose command line names a socket inside a directory, without matching the kill
 # pattern -- the shape of a real fixture server holding a runtime directory.
 spawn_socket_holder() {
@@ -1694,6 +1713,34 @@ else
 fi
 kill_marker "${sshd39_pid:-}"
 kill_marker "${cargo39_pid:-}"
+
+echo "case 41: a listener that rewrote its process title is still a rule-7 candidate"
+# A real `sshd -D` rewrites argv to `sshd: /usr/sbin/sshd -f … [listener]`. No prefix of that names
+# an existing file, so argv[0] falls back to the first token, `sshd:` - and a guard that accepted
+# only `sshd` rejected every orphan the SSH suites actually leave on Linux. Case 35 cannot catch
+# this: its stand-in keeps a literal executable path as argv[0].
+titled_dir="$sandbox/tmp/srui-titled-$$"
+mkdir -p "$titled_dir"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$titled_dir/sshd_config"
+spawn_orphan_with_title "sshd: /usr/sbin/sshd" "$fixture_sshd" -f "$titled_dir/sshd_config"
+titled_pid=$spawned_pid
+if [ -z "${titled_pid:-}" ]; then
+    fail "could not stage an orphan with a rewritten process title"
+else
+    # The title really is the shape under test: argv[0] names no file on disk.
+    if [ -e "sshd:" ]; then
+        fail "the sandbox has a file named 'sshd:', so this case proves nothing"
+    else
+        pass "argv[0] of the staged orphan names no existing file"
+    fi
+    reap_globs="$sandbox/tmp/srui-*"
+    output=$(run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+    reap_globs=""
+    assert_terminated "$titled_pid" "the retitled listener was reaped"
+    assert_contains "$output" "killing orphaned fixture server pid $titled_pid" \
+        "the sweep named the retitled listener it killed"
+fi
+kill_marker "${titled_pid:-}"
 
 echo "case 37: rules 1 and 2 apply to a fixture sshd exactly as they do to a fixture server"
 spawn_orphan_with_args "$fixture_sshd" -f "$sshd_dir/sshd_config"

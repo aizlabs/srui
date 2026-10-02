@@ -451,33 +451,46 @@ rule4_candidates() {
     printf '%s' "$resolved" | awk -F'\t' -v pattern="$pattern" 'NF >= 6 && $6 ~ pattern'
 }
 
-# The `-f <path>` an `sshd` was started from, or empty when it names none. `-f path` and `-f/path`
-# are both accepted, because both are how it is written.
+# The `-f <path>` an `sshd` is actually running from, or empty when it names none. `-f path` and
+# `-f/path` are both accepted, because both are how it is written.
 #
-# A relative path yields nothing: what it resolves to depends on a working directory no `ps` snapshot
-# records, so there is no evidence here to act on. A path containing a space is out of scope for the
-# same reason argv[0] is (see rule 4) - `ps` joins argv with spaces and nothing can split it back.
+# The **last** `-f` wins, because that is what sshd itself uses: its option loop assigns the config
+# file name on every occurrence, so an earlier one is overridden and names a file the daemon never
+# read. Taking the first let `sshd -f /tmp/srui-fixture/sshd_config -f /etc/ssh/sshd_config` read as
+# a fixture while it was in fact serving the production configuration - judging a process by
+# evidence it had already discarded, which is the one way rule 7 can kill something real.
+#
+# A relative path yields nothing: what it resolves to depends on a working directory no `ps`
+# snapshot records, so there is no evidence here to act on - and because the effective occurrence is
+# the last one, a relative path *clears* an absolute one seen earlier rather than letting it stand.
+# A path containing a space is out of scope for the same reason argv[0] is (see rule 4) - `ps` joins
+# argv with spaces and nothing can split it back.
 #
 # A rewritten listener title keeps the original flags after the path, which is where this finds the
 # `-f`. A version whose title drops it leaves rule 7 with no evidence, and admits nothing - the
 # conservative direction.
 sshd_config_path() {
-    local cmd=$1 token next=0
+    local cmd=$1 token next=0 found=
     local -a tokens=()
     read -r -a tokens <<<"$cmd" # `read -a`, never `for token in $cmd`: no glob expansion
     for token in "${tokens[@]+"${tokens[@]}"}"; do
         if [ "$next" -eq 1 ]; then
-            case $token in /*) printf '%s' "$token" ;; esac
-            return 0
+            next=0
+            case $token in
+                /*) found=$token ;;
+                *) found= ;; # Relative, and the effective one: no evidence either way.
+            esac
+            continue
         fi
         case $token in
             -f) next=1 ;;
-            -f/*)
-                printf '%s' "${token#-f}"
-                return 0
-                ;;
+            -f/*) found=${token#-f} ;;
+            -f?*) found= ;; # An attached relative path, overriding whatever came before.
         esac
     done
+    # A trailing bare `-f` has no value to judge, and sshd would have refused to start at all.
+    [ "$next" -eq 0 ] || found=
+    printf '%s' "$found"
 }
 
 # Rule 7's second half: does this configuration actually belong to one of our fixtures?

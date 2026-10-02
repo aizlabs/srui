@@ -73,4 +73,53 @@ struct TestFixtureDirectoryTests {
         ]), "a symlink points somewhere this registry never reserved")
         #expect(!TestFixtureDirectory.permitsRemoval([:]), "no attributes is no evidence")
     }
+
+    /// The predicate above is only worth having if the removal path consults it. This drives the
+    /// real `release`, with a plain file at the reserved name - the shape a test cannot stage for
+    /// the root-owned case, and the one that proves the guard is wired in rather than merely
+    /// present: with the `permitsRemoval` check deleted, `removeItem` unlinks this file.
+    @Test("Release refuses a reserved name that something else occupies")
+    func releaseWillNotRemoveAForeignOccupant() throws {
+        let reserved = try TestFixtureDirectory.reserve(prefix: "test-srui-occupied")
+        try Data("not this fixture's".utf8).write(to: reserved)
+        defer { try? FileManager.default.removeItem(at: reserved) }
+
+        TestFixtureDirectory.release(reserved)
+        #expect(FileManager.default.fileExists(atPath: reserved.path),
+                "a file at a reserved name belongs to something else and must survive release")
+    }
+
+    /// What the `atexit` hook does, driven directly: a directory whose test never released it is
+    /// still cleared - swift-testing can cut a still-unwinding `defer` short, which is the race
+    /// this registry exists for - while a reserved name something else occupies is left alone in
+    /// the same pass, so the exit hook can never be the thing that deletes another process's path.
+    ///
+    /// On a registry of this test's own, never `shared`: draining that one mid-run would remove
+    /// the fixture directories of every test executing concurrently beside this one. The
+    /// *installation* of `atexit` is not provable from inside the run that installs it; the pass
+    /// it runs is what is asserted here.
+    @Test("The exit pass clears what a test forgot and spares what is not ours")
+    func theExitPassDrainsUnderTheSameGuard() throws {
+        let registry = FixtureDirectoryRegistry(installsExitHook: false)
+        let unique = UUID().uuidString.prefix(8)
+
+        let forgotten = URL(fileURLWithPath: "/tmp/test-srui-forgotten-\(unique)")
+        try FileManager.default.createDirectory(at: forgotten, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: forgotten) }
+        try Data("key material".utf8).write(to: forgotten.appendingPathComponent("host_key"))
+        registry.add(forgotten.path)
+
+        let occupied = URL(fileURLWithPath: "/tmp/test-srui-exit-occupied-\(unique)")
+        registry.add(occupied.path, ownedOnly: true)
+        try Data("not this fixture's".utf8).write(to: occupied)
+        defer { try? FileManager.default.removeItem(at: occupied) }
+
+        registry.removeAll()
+
+        #expect(!FileManager.default.fileExists(atPath: forgotten.path),
+                "the exit pass must clear a fixture directory no defer released")
+        #expect(FileManager.default.fileExists(atPath: occupied.path),
+                "the exit pass must not remove a reserved name something else occupies")
+    }
 }

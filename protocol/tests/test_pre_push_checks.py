@@ -453,6 +453,12 @@ class SingleFlightTests(unittest.TestCase):
             entries.append((event, int(pid), int(stamp)))
         return entries
 
+    def state_of(self, pid):
+        """The process's state letter, empty when it is gone from the table."""
+        row = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                             stdout=subprocess.PIPE, text=True, check=False)
+        return row.stdout.strip()
+
     def assertNotRunning(self, pid, message):
         """Assert `pid` is no longer a running process.
 
@@ -462,9 +468,7 @@ class SingleFlightTests(unittest.TestCase):
         answers. The state column is the same evidence `live_group_members` uses, and
         an uncollected exit status is not a process using the build directory.
         """
-        row = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
-                             stdout=subprocess.PIPE, text=True, check=False)
-        state = row.stdout.strip()
+        state = self.state_of(pid)
         self.assertTrue(state == "" or state.startswith("Z"),
                         f"{message} (pid {pid} is in state {state!r})")
 
@@ -579,9 +583,26 @@ class SingleFlightTests(unittest.TestCase):
                             "the fixture must put the nested job in its own group")
 
         os.kill(hook.pid, signal.SIGTERM)
-        stdout, stderr = hook.communicate(timeout=60)
-        self.assertNotEqual(hook.returncode, 0, stdout + stderr)
+        # Wait on the hook's *state*, not on `communicate`. The nested job inherited this
+        # Popen's stdout/stderr pipes, so a leaked one holds them open and `communicate`
+        # blocks on EOF until it dies -- the swift-test wedge in miniature. Waiting there
+        # first made the leak surface as a 60-second `TimeoutExpired` instead of as the
+        # assertion below, which is both slower and a worse diagnostic than the defect
+        # deserves: the invariant is that nothing the check started outlives the lock.
+        deadline = time.monotonic() + 30
+        while self.state_of(hook.pid) not in ("", "Z"):
+            self.assertLess(time.monotonic(), deadline, "the hook never exited")
+            time.sleep(0.02)
         self.assertNotRunning(nested, "a nested process group outlived the lock")
+
+        # Only now, and tolerantly: the pipes are free once the leak is gone, and by this
+        # point the assertion that matters has already been made.
+        try:
+            stdout, stderr = hook.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            hook.kill()
+            stdout, stderr = "", ""
+        self.assertNotEqual(hook.returncode, 0, stdout + stderr)
 
     def test_a_drained_check_costs_no_second_grace_window_and_no_stale_signal(self):
         """A check that dies on SIGTERM must end the stop, not start a SIGKILL pass.
@@ -910,6 +931,190 @@ class SingleFlightTests(unittest.TestCase):
         self.assertEqual(waiter.returncode, 0, stdout + stderr)
         self.assertIn(("enter", waiter.pid),
                       [(event, pid) for event, pid, _stamp in self.events()])
+
+    def test_live_groups_answers_from_one_process_table(self):
+        """Two samples joined by pid are not one fact.
+
+        A pid that exits between the samples and is reissued comes back wearing an
+        unrelated pgid, which the stop then signals as one of the check's own; and a
+        member forked after the first sample is absent from the second, which reads as
+        drained. Staged with a table that changes between calls: the answer has to come
+        from one of them, never from a join across both.
+        """
+        leader, member, stranger = 90100, 90101, 90900
+        for pid in (leader, member, stranger):
+            self.assertNotIn(pid, {os.getpid(), os.getppid()},
+                             "the synthetic pids must not collide with this test's own")
+        first = f"{leader} {leader} S\n{member} {leader} S\n"
+        # Between the samples, `member` exited and the kernel reissued its pid to a
+        # process in an unrelated group.
+        second = f"{leader} {leader} S\n{member} {stranger} S\n"
+        listings = [first, second]
+        calls = []
+
+        def changing(columns):
+            calls.append(columns)
+            return listings[min(len(calls) - 1, len(listings) - 1)]
+
+        with patch.object(checks, "process_listing", changing):
+            by_group = checks.live_groups({leader})
+
+        self.assertEqual(len(calls), 1,
+                         f"live_groups sampled the process table {len(calls)} times")
+        self.assertEqual(by_group, {leader: {leader, member}})
+        self.assertNotIn(stranger, by_group,
+                         "an unrelated group was reported as one of the check's own")
+
+    def test_a_stop_whose_groups_are_empty_keeps_the_record_while_its_session_runs(self):
+        """Accounted-for groups are not an empty session.
+
+        A transient discovery failure is enough to miss the wrapper's nested group, and
+        killing the wrapper then empties the only group the stop knows - so the stop
+        reports nothing unaccounted for. Clearing the record on that evidence is what
+        lets the next push build into a directory the undiscovered `swift test` is
+        still writing to. Only an answered, empty session may clear it.
+        """
+        marker = self.root / "session_leftover.pid"
+        script = self.root / "wrapper_with_nested.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "set -m\n"          # exactly what run-swift-tests.sh does
+            "sleep 60 &\n"
+            f"printf '%s' \"$!\" > {marker}\n"
+            "wait\n"
+        )
+        script.chmod(0o755)
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while (checks._active_check is None or not marker.exists()
+               or not marker.read_text().strip()):
+            self.assertLess(time.monotonic(), deadline, "the nested job never started")
+            time.sleep(0.02)
+        root = checks._active_check.pid
+        nested = int(marker.read_text())
+
+        def kill_nested():
+            # Only while it is still in that session: the pid is free once it has gone.
+            if nested in (checks.live_session_members(root) or set()):
+                try:
+                    os.kill(nested, signal.SIGKILL)
+                except OSError:
+                    pass
+
+        self.addCleanup(kill_nested)
+
+        stderr = io.StringIO()
+        # Discovery that never finds the nested group - what an unreadable process table
+        # at the wrong moment leaves behind, recovered by the time the drain polls.
+        with patch.object(checks, "check_process_tree", lambda pid: ({pid}, {pid})), \
+             redirect_stderr(stderr):
+            self.assertTrue(checks.stop_and_record(self.repo, grace=1.0))
+        thread.join(timeout=30)
+
+        self.assertNotRunning(root, "the wrapper survived the stop")
+        self.assertIn(nested, checks.live_session_members(root),
+                      "this stages nothing unless the nested job outlived its wrapper")
+        self.assertTrue(checks.unverified_path(self.repo).exists(),
+                        "the record must not clear while the session still holds a build")
+        self.assertIsNotNone(checks.unverified_reason(self.repo))
+
+    def test_a_cancellation_that_cannot_be_recorded_is_not_performed(self):
+        """Stopping a build nobody can be warned about is the outcome worth refusing.
+
+        The record cannot be made to persist on a full or read-only git directory, and
+        the lock dies with this process either way. So the hook declines the
+        cancellation instead: the checks keep running, the lock stays held until they
+        finish, and the push is never left looking checked when it was not.
+        """
+        script = self.root / "unrecordable_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+
+        def unwritable(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+        stderr = io.StringIO()
+        with patch.object(checks.Path, "write_text", unwritable), redirect_stderr(stderr):
+            proceeded = checks.stop_and_record(self.repo, grace=1.0)
+
+        self.assertFalse(proceeded, "the handler must not exit and release the lock")
+        state = self.state_of(root)
+        self.assertTrue(state and not state.startswith("Z"),
+                        "the check was cancelled although the cancellation could not be "
+                        f"recorded (pid {root} is in state {state!r})")
+        self.assertIn("NOT stopped", stderr.getvalue())
+
+        # Now stop it for real, with the record writable again.
+        with redirect_stderr(stderr):
+            self.assertTrue(checks.stop_and_record(self.repo, grace=5.0))
+        thread.join(timeout=30)
+        self.assertNotRunning(root, "the check survived a recordable stop")
+
+    def test_an_unenumerable_stop_never_signals_a_pgid_it_has_already_reaped(self):
+        """Once `Popen` has reaped the check, its pid is the kernel's to reissue.
+
+        With the process table unreadable there is no per-group answer, so the stop
+        falls back to the one group it knows. That is sound only while the child has
+        not been reaped: afterwards the number is free, and the escalation pass aimed
+        at it lands on whatever group now wears it - an unrelated group of this user.
+        Staged with a live process standing in for the reuse, and a check that is
+        alive when the stop begins and reaped by the time it signals.
+        """
+        victim = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        self.addCleanup(self.reap, victim)
+
+        class ReapedMidStop:
+            """Running when the stop starts, collected before it signals anything.
+
+            Wearing `victim`'s pid, which is what pid reuse looks like from here.
+            """
+
+            def __init__(self, pid):
+                self.pid = pid
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                return None if self.polls == 1 else 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        signalled = []
+        real_killpg = os.killpg
+
+        def record_killpg(pgid, sig):
+            signalled.append((pgid, sig))
+            return real_killpg(pgid, sig)
+
+        real_run = subprocess.run
+
+        def ps_fails(argv, *args, **kwargs):
+            if argv and argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return real_run(argv, *args, **kwargs)
+
+        checks._active_check = ReapedMidStop(victim.pid)
+        self.addCleanup(setattr, checks, "_active_check", None)
+        with patch.object(checks.subprocess, "run", ps_fails), \
+             patch.object(checks.os, "killpg", record_killpg):
+            unaccounted = checks.stop_active_check(grace=0.05)
+
+        self.assertEqual(signalled, [],
+                         f"a reaped pgid was signalled without enumeration: {signalled}")
+        self.assertIsNone(victim.poll(), "an unrelated process group was signalled")
+        self.assertIn(victim.pid, unaccounted,
+                      "a stop that signalled nothing must still report itself unverified")
 
     def test_a_nested_group_the_stop_never_discovered_still_refuses_the_next_push(self):
         """The record must not clear itself in the very case it is written for.

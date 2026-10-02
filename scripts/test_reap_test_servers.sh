@@ -1789,6 +1789,84 @@ fi
 kill_marker "${young_pid:-}"
 kill_marker "${parented_pid:-}"
 
+echo "case 43: the effective -f is the last one, because that is the one sshd itself uses"
+# sshd assigns its configuration file on every -f occurrence, so an earlier one names a file the
+# daemon never read. Judging by the first let a service that overrides a fixture config on its own
+# command line be killed by the path it had already discarded - rule 7's one way to kill something
+# real. Both orderings are staged, so neither direction can pass by accident.
+lastf_fixture="$sandbox/tmp/srui-lastf-$$"
+mkdir -p "$lastf_fixture" "$sandbox/etc"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$lastf_fixture/sshd_config"
+printf 'Port 22\nSubsystem sftp /usr/lib/openssh/sftp-server\n' >"$sandbox/etc/sshd_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$lastf_fixture/sshd_config" -f "$sandbox/etc/sshd_config"
+overridden_pid=$spawned_pid
+spawn_orphan_with_args "$fixture_sshd" -f "$sandbox/etc/sshd_config" -f "$lastf_fixture/sshd_config"
+effective_pid=$spawned_pid
+if [ -z "${overridden_pid:-}" ] || [ -z "${effective_pid:-}" ]; then
+    fail "could not stage both -f orderings"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$overridden_pid" \
+        "an sshd whose fixture -f was overridden by a later one survived"
+    assert_terminated "$effective_pid" "the sshd whose last -f names the fixture was reaped"
+fi
+kill_marker "${overridden_pid:-}"
+kill_marker "${effective_pid:-}"
+
+echo "case 44: an sshd observed on a different fixture config than it was selected from is spared"
+# The pre-signal check re-derives rule 7 from a fresh `ps` row instead of trusting the snapshot, so
+# a pid selected from one fixture configuration and observed on another - the shape of a restart
+# onto a reused pid - must be refused. A process cannot rewrite its own -f, so the only way to stage
+# this is a `ps` stand-in that answers the single-pid query with the other config. Both configs are
+# inside the globs and declare the subsystem, so the row still selects as a fixture: what is under
+# test is the *identity* comparison, not whether the second path would be admitted.
+recheck_a="$sandbox/tmp/srui-recheck-a-$$"
+recheck_b="$sandbox/tmp/srui-recheck-b-$$"
+mkdir -p "$recheck_a" "$recheck_b"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$recheck_a/sshd_config"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$recheck_b/sshd_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$recheck_a/sshd_config"
+recheck_pid=$spawned_pid
+if [ -z "${recheck_pid:-}" ]; then
+    fail "could not stage an sshd for the reconfiguration case"
+else
+    restating_bin="$sandbox/restating-ps"
+    mkdir -p "$restating_bin"
+    cat >"$restating_bin/ps" <<'SH'
+#!/bin/sh
+# The `-eo` snapshot reports what the candidate was selected from; the single-pid row the reaper
+# re-reads immediately before signalling reports the other configuration.
+case $1 in
+    -o)
+        case $2 in
+            *ppid*)
+                /bin/ps "$@" | sed -e "s|$SRUI_FAKE_CONFIG_FROM|$SRUI_FAKE_CONFIG_TO|g"
+                exit $?
+                ;;
+        esac
+        ;;
+esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$restating_bin/ps"
+    reap_globs="$sandbox/tmp/srui-*"
+    output=$(PATH="$restating_bin:$PATH" \
+        SRUI_FAKE_CONFIG_FROM="$recheck_a/sshd_config" \
+        SRUI_FAKE_CONFIG_TO="$recheck_b/sshd_config" \
+        run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+    reap_globs=""
+    assert_alive "$recheck_pid" \
+        "an sshd observed on a config other than the one it was selected from survived"
+    if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $recheck_pid"; then
+        fail "the sweep signalled a pid whose configuration had changed under it"
+    else
+        pass "the sweep refused a candidate whose fresh evidence disagreed"
+    fi
+fi
+kill_marker "${recheck_pid:-}"
+
 echo
 if [ "$failures" -eq 0 ]; then
     echo "reap-test-servers selection rules: all cases passed."

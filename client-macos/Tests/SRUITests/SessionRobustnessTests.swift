@@ -59,8 +59,14 @@ struct SessionRobustnessTests {
         return try SRUIFraming.encodeFramed(msg)
     }
 
+    /// Polls `condition` until it holds or the budget expires.
+    ///
+    /// The budget is `AsyncTestSupport.roundTripSeconds`, not this suite's original two seconds:
+    /// several of these conditions are satisfied by a *different task* making progress, and a
+    /// deadline is only an upper bound, so raising it weakens no assertion and costs no wall time
+    /// on a healthy run. See the constant for the failure that justified it.
     private static func waitUntil(
-        timeout: TimeInterval = 2.0,
+        timeout: TimeInterval = AsyncTestSupport.roundTripSeconds,
         _ condition: @Sendable () async -> Bool
     ) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)

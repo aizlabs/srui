@@ -504,20 +504,30 @@ def live_groups(groups: set[int]) -> dict[int, set[int]] | None:
     while another is still running, signalling *every* accumulated group again
     would aim the escalation at a group whose leader pid has since been reissued -
     the pid-reuse hazard, one level up. Only groups present here may be signalled.
+
+    One snapshot, not two joined by pid. Sampling membership and then grouping it
+    separately let a pid exit and be reissued between the halves: the reused
+    process's unrelated pgid came back as a live group of this check and took the
+    SIGTERM, and a member forked after the first sample was missing from the second,
+    which reads as drained. Both are the same mistake as everywhere else here -
+    treating two observations of a changing table as one fact.
     """
-    members = live_group_members(groups)
-    if members is None:
-        return None
-    listing = process_listing("pid=,pgid=")
+    if not groups:
+        return {}
+    listing = process_listing("pid=,pgid=,state=")
     if listing is None:
         return None
+    mine = {os.getpid(), os.getppid()}
     by_group: dict[int, set[int]] = {}
     for line in listing.splitlines():
         fields = line.split()
-        if len(fields) != 2 or not all(field.isdigit() for field in fields):
+        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
             continue
-        pid, pgid = int(fields[0]), int(fields[1])
-        if pid in members:
+        pid, pgid, state = int(fields[0]), int(fields[1]), fields[2]
+        # A zombie holds no build directory; see [`live_group_members`].
+        if state.startswith("Z") or pid in mine:
+            continue
+        if pgid in groups:
             by_group.setdefault(pgid, set()).add(pid)
     return by_group
 
@@ -528,29 +538,19 @@ def live_group_members(groups: set[int]) -> set[int] | None:
     Membership, not parentage: a process keeps its group when its parent dies, so
     this still sees a build whose shell has already exited. `None` means the table
     could not be read, which is not the same as nothing being there.
+
+    Derived from [`live_groups`] rather than sampling the table a second time, so
+    these two questions can never be answered from two different process tables.
+
+    A zombie is an exit status nobody has collected yet, not a process still writing
+    to the build directory: it holds no resources and cannot be signalled. Counting
+    one kept the drain from ever succeeding, so every interrupted push burned its
+    full grace window and then escalated to SIGKILL against processes already gone.
     """
-    if not groups:
-        return set()
-    listing = process_listing("pid=,pgid=,state=")
-    if listing is None:
+    by_group = live_groups(groups)
+    if by_group is None:
         return None
-    mine = {os.getpid(), os.getppid()}
-    live = set()
-    for line in listing.splitlines():
-        fields = line.split()
-        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
-            continue
-        pid, pgid, state = int(fields[0]), int(fields[1]), fields[2]
-        # A zombie is an exit status nobody has collected yet, not a process still
-        # writing to the build directory: it holds no resources and cannot be
-        # signalled. Counting one kept the drain from ever succeeding, so every
-        # interrupted push burned its full grace window and then escalated to
-        # SIGKILL against processes that had already gone.
-        if state.startswith("Z"):
-            continue
-        if pgid in groups and pid not in mine:
-            live.add(pid)
-    return live
+    return {pid for members in by_group.values() for pid in members}
 
 
 def live_session_members(session: int) -> set[int] | None:
@@ -632,11 +632,20 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
         alive = live_groups(groups)
         if alive == {}:
             break
-        # Only groups with a live member right now. An unreadable table yields no
-        # per-group answer, so the known group is signalled on its own: it is the one
-        # pgid that cannot have been reissued, because this process still holds the
-        # child that leads it.
-        targets = sorted(alive) if alive is not None else [process.pid]
+        # Only groups with a live member right now.
+        if alive is not None:
+            targets = sorted(alive)
+        elif process.poll() is None:
+            # No per-group answer, so the group the check leads is signalled on its
+            # own. That is sound only while this holds: a child this process has not
+            # reaped is still running, so the kernel cannot have reissued its pid.
+            targets = [process.pid]
+        else:
+            # Reaped *and* unenumerable. The number is free for the kernel to hand
+            # out, and the group wearing it now would be someone else's, so nothing is
+            # signalled: the stop reports itself unverified and the next push refuses,
+            # rather than this pass sending SIGKILL to an unrelated group of this user.
+            targets = []
         for pgid in targets:
             with contextlib.suppress(OSError, ProcessLookupError):
                 os.killpg(pgid, sig)
@@ -691,23 +700,26 @@ def write_unverified(repo: Path, groups: set[int], session: int | None) -> bool:
         return False
 
 
-def arm_unverified_stop(repo: Path) -> int | None:
+def arm_unverified_stop(repo: Path) -> tuple[int | None, bool]:
     """Record, *before* anything is signalled, that this run may leave a build behind.
 
     Written first and removed only once the stop has proved otherwise, because the
     record has to outlive this process and this process can die in the middle of the
     stop: the SIGTERM being handled is routinely followed by a SIGKILL that no
-    handler sees. Returns the session recorded, or `None` when no check was running.
+    handler sees.
+
+    Returns the session recorded - `None` when no check was running - and whether the
+    record reached the disk, which the caller must not ignore: a cancellation nobody
+    can be told about is one this hook declines to perform.
 
     The session is what makes the record complete rather than a record of only what
     enumeration happened to discover; see [`live_session_members`].
     """
     process = _active_check
     if process is None or process.poll() is not None:
-        return None
+        return None, True  # Nothing is running, so there is nothing to lose.
     session = process.pid  # `start_new_session` made the check its own session leader.
-    write_unverified(repo, {session}, session)
-    return session
+    return session, write_unverified(repo, {session}, session)
 
 
 def record_unverified_stop(repo: Path, groups: set[int], session: int | None = None) -> None:
@@ -736,19 +748,40 @@ def clear_unverified_stop(repo: Path) -> None:
         unverified_path(repo).unlink()
 
 
-def stop_and_record(repo: Path, grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
+def stop_and_record(repo: Path, grace: float = CHECK_STOP_GRACE_SECONDS) -> bool:
     """Stop the running check and leave the next push a truthful record of the result.
 
     Arm, stop, then clear only on a proved stop. The order is the point: a record
     written after the drain is missing in precisely the case it exists for, because
     the drain is what the follow-up SIGKILL interrupts.
+
+    Returns whether the caller may exit. `False` means the record could not be
+    written, so the checks were **not** stopped: cancelling a build while being
+    unable to warn the next push about it is the one outcome worth refusing, and
+    continuing to hold the lock until the checks finish is what the lock is for.
     """
-    session = arm_unverified_stop(repo)
+    session, armed = arm_unverified_stop(repo)
+    if not armed:
+        print("pre-push: the interrupted run could not be recorded, so the checks were "
+              "NOT stopped - this hook keeps the lock until they finish rather than "
+              "cancelling a build the next push cannot be warned about. Free space in "
+              f"{unverified_path(repo).parent} and signal again, or kill this hook and "
+              "check by hand that no cargo or swift build survived it.", file=sys.stderr)
+        return False
     unaccounted = stop_active_check(grace)
     if unaccounted:
         record_unverified_stop(repo, unaccounted, session)
-    elif session is not None:
+        return True
+    if session is None:
+        return True
+    # Accounted-for groups are not an empty session: a group that was never discovered
+    # cannot appear in `unaccounted`, which is the whole case the record exists for. So
+    # only an *answered* and empty session may clear what the arm wrote.
+    if live_session_members(session) == set():
         clear_unverified_stop(repo)
+    else:
+        record_unverified_stop(repo, {session}, session)
+    return True
 
 
 def unverified_reason(repo: Path) -> str | None:
@@ -805,7 +838,8 @@ def install_release_on_signal(repo: Path):
         # unwind `single_flight` and release the lock over a check still running,
         # which is the one outcome the handler exists to prevent.
         try:
-            stop_and_record(repo)
+            if not stop_and_record(repo):
+                return  # Deliberately not SystemExit: see `stop_and_record`.
         except BaseException as error:  # noqa: BLE001 - deliberately total
             print(f"pre-push: stopping the checks failed: {error!r}", file=sys.stderr)
         raise SystemExit(128 + signum)

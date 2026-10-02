@@ -21,13 +21,24 @@ import Foundation
 /// anything but sockets precisely so an automated `rm -rf` can never delete key material. That
 /// leaves the test that created the directory as the only place the removal may legitimately
 /// happen.
-private final class FixtureDirectoryRegistry: @unchecked Sendable {
+/// Internal rather than private, and with the exit hook optional, so a test can drive a registry
+/// of its own. Draining `shared` from inside the run would remove the fixture directories of every
+/// test executing concurrently beside it - swift-testing schedules the whole target at once - which
+/// is precisely the deletion this type exists to prevent.
+final class FixtureDirectoryRegistry: @unchecked Sendable {
     static let shared = FixtureDirectoryRegistry()
 
     private let lock = NSLock()
     /// Path to whether removal must first prove the path is ours.
     private var paths: [String: Bool] = [:]
-    private var hookInstalled = false
+    private var hookInstalled: Bool
+
+    /// `installsExitHook: false` for a test instance. `atexit` takes a C function pointer and so
+    /// can capture nothing, which is why the hook below names `shared` rather than `self`: only
+    /// the shared registry's pending paths are removed on exit, and only it registers one.
+    init(installsExitHook: Bool = true) {
+        hookInstalled = !installsExitHook
+    }
 
     /// Registers a path for removal. `ownedOnly` paths are removed only if they are
     /// this user's when the time comes: a reserved path is not created here, so
@@ -147,6 +158,18 @@ enum TestFixtureDirectory {
     /// Recursively removes a directory `make` or `reserve` handed out, and deregisters it.
     static func release(_ directory: URL) {
         FixtureDirectoryRegistry.shared.remove(directory.path)
+    }
+
+    /// The same removal pass the `atexit` hook runs, for a caller that needs it before exit.
+    ///
+    /// **Not** for tests: it drains the registry that every concurrently executing test shares,
+    /// and swift-testing runs the whole target at once, so calling it mid-run would delete another
+    /// test's live fixture directory - the deletion this type exists to prevent. A test that needs
+    /// this pass covered by assertions builds its own `FixtureDirectoryRegistry(installsExitHook:
+    /// false)`, which is what that initializer is for. The `atexit` *installation* cannot be
+    /// observed from inside the run that installs it; the pass it runs can be, and is.
+    static func releaseAll() {
+        FixtureDirectoryRegistry.shared.removeAll()
     }
 
     /// Whether a *reserved* path, now occupied, may be recursively removed.

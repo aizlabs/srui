@@ -65,6 +65,12 @@ UNVERIFIED_STATUS = 76
 class Check:
     name: str
     argv: list[str]
+    # Whether this check writes the shared cargo/SwiftPM/uv state that two
+    # concurrent runs deadlock on. Only a plan containing one takes the build lock:
+    # a documentation-only push plans `git diff --check` alone, and queueing that
+    # behind another worktree's full build - then refusing it with status 75 - stalls
+    # a push that could not have collided with anything.
+    builds: bool = False
 
 
 @dataclass
@@ -166,7 +172,7 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
     if skills:
         checks.append(Check("skill frontmatter", [
             "uv", "run", "--frozen", "python", SCRIPT, "--check-skills", "--", *skills,
-        ]))
+        ], builds=True))
     if "plan" in profiles:
         checks.extend([
             Check("Process Explorer plan", ["python3", f"{PLAN}/validate_plan.py"]),
@@ -187,8 +193,9 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
         ])
     if "full" in profiles:
         checks.extend([
-            Check("locked Python development environment", ["uv", "sync", "--frozen", "--extra", "dev"]),
-            Check("full repository checks", ["sh", ".githooks/pre-push-full"]),
+            Check("locked Python development environment",
+                  ["uv", "sync", "--frozen", "--extra", "dev"], builds=True),
+            Check("full repository checks", ["sh", ".githooks/pre-push-full"], builds=True),
         ])
     elif "srtop" in profiles:
         manifest = ["--locked", "--manifest-path", "apps/srtop/Cargo.toml"]
@@ -196,13 +203,16 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
             Check("Process Explorer formatting", [
                 "cargo", "fmt", "--manifest-path", "apps/srtop/Cargo.toml",
                 "-p", "srui-process-explorer", "--check",
-            ]),
-            Check("Process Explorer Clippy", ["cargo", "clippy", *manifest, "--all-targets", "--", "-D", "warnings"]),
+            ], builds=True),
+            Check("Process Explorer Clippy",
+                  ["cargo", "clippy", *manifest, "--all-targets", "--", "-D", "warnings"],
+                  builds=True),
             Check("test process stdio", ["bash", "scripts/check-test-process-stdio.sh"]),
         ])
         if system == "Darwin":
             # This entrypoint already tests Rust and builds the app and bridge.
-            checks.append(Check("Process Explorer Rust and native SSH tests", ["bash", "apps/srtop/test.sh"]))
+            checks.append(Check("Process Explorer Rust and native SSH tests",
+                                ["bash", "apps/srtop/test.sh"], builds=True))
         else:
             if NATIVE_TEST in paths:
                 # Parse exactly the selected test. The shared range-based script
@@ -211,7 +221,8 @@ def commands(profiles: dict[str, list[str]], paths: list[str],
                     "bash", "-c", 'if [ -f "$1" ]; then swiftc -frontend -parse "$1"; fi',
                     "parse-native-test", NATIVE_TEST,
                 ]))
-            checks.append(Check("Process Explorer Rust tests", ["cargo", "test", *manifest]))
+            checks.append(Check("Process Explorer Rust tests",
+                                ["cargo", "test", *manifest], builds=True))
     return checks
 
 
@@ -542,6 +553,49 @@ def live_group_members(groups: set[int]) -> set[int] | None:
     return live
 
 
+def live_session_members(session: int) -> set[int] | None:
+    """Which live processes still belong to `session`, excluding this push's own.
+
+    The session, not the group, is what covers a process group this hook never
+    discovered. `run_check` spawns with `start_new_session`, so the check leads its
+    own session and its sid *is* its pid; every descendant inherits that session,
+    and a wrapper's `set -m` creates new process *groups* inside it rather than a
+    new session. So the `swift test` that `scripts/run-swift-tests.sh` hides behind
+    a group boundary is named here even when `ps` could not be read at the time of
+    the stop and its group was never learned.
+
+    Membership is asked of the kernel per pid because `ps` has no portable session
+    column: Linux spells it `sid`, and on macOS `sess` prints a kernel pointer that
+    is useless once the session leader has been reaped. `None` means the question
+    could not be answered, which is never the same as nothing being there.
+    """
+    if not session:
+        return set()
+    listing = process_listing("pid=,state=")
+    if listing is None:
+        return None
+    mine = {os.getpid(), os.getppid()}
+    live = set()
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        pid, state = int(fields[0]), fields[1]
+        # A zombie holds no build directory; see [`live_group_members`].
+        if state.startswith("Z") or pid in mine:
+            continue
+        try:
+            member = os.getsid(pid)
+        except ProcessLookupError:
+            continue  # Exited between the snapshot and the question.
+        except OSError:
+            # Some systems refuse getsid across sessions. "Cannot tell" must not
+            # read as "not a member", which would clear the record over a live build.
+            return None
+        if member == session:
+            live.add(pid)
+    return live
+
 def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
     """Stop everything the running check started, and wait for all of it to go.
 
@@ -616,7 +670,47 @@ def unverified_path(repo: Path) -> Path:
     return lock_path(repo).with_name(UNVERIFIED_FILE)
 
 
-def record_unverified_stop(repo: Path, groups: set[int]) -> None:
+def write_unverified(repo: Path, groups: set[int], session: int | None) -> bool:
+    """Persist the record, or say loudly that it could not be persisted.
+
+    Returns whether it is on disk. The failure must not be swallowed: a full or
+    read-only git directory used to leave the hook printing that it had recorded a
+    marker which does not exist, after which the next push found nothing, took the
+    lock, and built into a directory the interrupted build was still writing to.
+    """
+    path = unverified_path(repo)
+    payload = {"pid": os.getpid(), "groups": sorted(groups), "session": session}
+    try:
+        path.write_text(json.dumps(payload) + "\n")
+        return True
+    except OSError as error:
+        print(f"pre-push: FAILED to record the interrupted run at {path}: {error}. The "
+              f"next push will NOT be held back, so confirm nothing this one started is "
+              f"still running (process group(s) {sorted(groups)}, session {session}) "
+              "before pushing again.", file=sys.stderr)
+        return False
+
+
+def arm_unverified_stop(repo: Path) -> int | None:
+    """Record, *before* anything is signalled, that this run may leave a build behind.
+
+    Written first and removed only once the stop has proved otherwise, because the
+    record has to outlive this process and this process can die in the middle of the
+    stop: the SIGTERM being handled is routinely followed by a SIGKILL that no
+    handler sees. Returns the session recorded, or `None` when no check was running.
+
+    The session is what makes the record complete rather than a record of only what
+    enumeration happened to discover; see [`live_session_members`].
+    """
+    process = _active_check
+    if process is None or process.poll() is not None:
+        return None
+    session = process.pid  # `start_new_session` made the check its own session leader.
+    write_unverified(repo, {session}, session)
+    return session
+
+
+def record_unverified_stop(repo: Path, groups: set[int], session: int | None = None) -> None:
     """Record that a stopped run could not prove its build had finished.
 
     A lock cannot outlive the process holding it - flock is released when the fd
@@ -628,23 +722,49 @@ def record_unverified_stop(repo: Path, groups: set[int]) -> None:
     (`set -m`, and it installs no signal trap), so the nested build cannot be
     discovered, let alone awaited.
     """
-    with contextlib.suppress(OSError):
-        unverified_path(repo).write_text(
-            json.dumps({"pid": os.getpid(), "groups": sorted(groups)}) + "\n"
-        )
+    if not write_unverified(repo, groups, session):
+        return
+    named = "" if session is None else f" and session {session}"
     print(f"pre-push: could not confirm the interrupted checks had stopped; recorded "
           f"{unverified_path(repo)}. The next push will refuse until process group(s) "
-          f"{sorted(groups)} are gone.", file=sys.stderr)
+          f"{sorted(groups)}{named} are gone.", file=sys.stderr)
+
+
+def clear_unverified_stop(repo: Path) -> None:
+    """Drop the armed record: the stop accounted for everything the check started."""
+    with contextlib.suppress(OSError):
+        unverified_path(repo).unlink()
+
+
+def stop_and_record(repo: Path, grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
+    """Stop the running check and leave the next push a truthful record of the result.
+
+    Arm, stop, then clear only on a proved stop. The order is the point: a record
+    written after the drain is missing in precisely the case it exists for, because
+    the drain is what the follow-up SIGKILL interrupts.
+    """
+    session = arm_unverified_stop(repo)
+    unaccounted = stop_active_check(grace)
+    if unaccounted:
+        record_unverified_stop(repo, unaccounted, session)
+    elif session is not None:
+        clear_unverified_stop(repo)
 
 
 def unverified_reason(repo: Path) -> str | None:
     """Why this push must not run checks yet, or `None` when it may.
 
-    Self-clearing in the ordinary case: the marker names the groups a previous run
-    left unaccounted for, so once none of them has a live member the leftover build
-    really is gone and the marker is removed. It is kept - and the push refused -
-    while any of them still runs, or while the process table cannot be read at all,
-    because neither of those is proof of anything.
+    Self-clearing in the ordinary case: the record names what a previous run left
+    unaccounted for, so once none of it has a live member the leftover build really
+    is gone and the record is removed. It is kept - and the push refused - while
+    anything still runs, or while the process table cannot be read at all, because
+    neither of those is proof of anything.
+
+    Both the groups *and* the session are checked. The groups alone would clear the
+    record in exactly the case it is written for: when enumeration failed, the only
+    group known is the one the check led, so killing the wrapper empties it while the
+    separately grouped `swift test` it started keeps building. That group was never
+    discovered - its session was.
     """
     path = unverified_path(repo)
     try:
@@ -656,15 +776,19 @@ def unverified_reason(repo: Path) -> str | None:
                 "its checks had stopped; make sure no cargo or swift build is running, "
                 "then delete that file.")
     groups = {int(group) for group in recorded.get("groups", [])}
+    session = int(recorded.get("session") or 0)
     members = live_group_members(groups)
-    if members is None:
+    in_session = live_session_members(session)
+    if members is None or in_session is None:
         return (f"a previous push could not confirm its checks had stopped ({path}), and "
                 "the process table cannot be read to check now. Make sure no cargo or "
                 "swift build is running, then delete that file.")
-    if members:
-        return (f"a previous push left process(es) {sorted(members)} running in group(s) "
-                f"{sorted(groups)}. They are still writing to the build directory this "
-                f"push would build into. Stop them, or wait, then push again ({path}).")
+    leftover = members | in_session
+    if leftover:
+        return (f"a previous push left process(es) {sorted(leftover)} running from its "
+                f"interrupted checks (group(s) {sorted(groups)}, session {session}). They "
+                "are still writing to the build directory this push would build into. "
+                f"Stop them, or wait, then push again ({path}).")
     with contextlib.suppress(OSError):
         path.unlink()
     return None
@@ -681,9 +805,7 @@ def install_release_on_signal(repo: Path):
         # unwind `single_flight` and release the lock over a check still running,
         # which is the one outcome the handler exists to prevent.
         try:
-            unverified = stop_active_check()
-            if unverified:
-                record_unverified_stop(repo, unverified)
+            stop_and_record(repo)
         except BaseException as error:  # noqa: BLE001 - deliberately total
             print(f"pre-push: stopping the checks failed: {error!r}", file=sys.stderr)
         raise SystemExit(128 + signum)
@@ -711,15 +833,16 @@ def install_release_on_signal(repo: Path):
 def guarded_run(repo: Path, plan: Plan, runner=run_plan, **lock) -> int:
     """Run the selected checks, one hook invocation at a time per repository.
 
-    A plan with no checks takes no lock. What the lock exists for is two runs
-    driving cargo and SwiftPM at the same time, which deadlock on the shared
-    build directory; a plan that will not build anything cannot deadlock with
-    anything. Queueing it would only make a push that runs nothing wait out
-    another one's full build -- `git push --delete`, whose plan is empty by
-    construction (`make_plan` skips ref deletions), would block for up to the
-    lock timeout to run no check at all.
+    Only a plan that *builds* takes the lock. What the lock exists for is two runs
+    driving cargo, SwiftPM or uv at the same time, which deadlock on the shared
+    build directory; a plan that will not build cannot deadlock with anything.
+    Queueing one would only make a push that touches no build directory wait out
+    another one's full build and then fail with status 75 having checked nothing:
+    `git push --delete`, whose plan is empty by construction (`make_plan` skips ref
+    deletions), and a documentation-only push, whose whole plan is
+    `git diff --check`.
     """
-    if not plan.checks:
+    if not any(check.builds for check in plan.checks):
         return runner(repo, plan)
     try:
         with single_flight(repo, **lock):

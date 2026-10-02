@@ -367,7 +367,7 @@ sys.modules[spec.name] = checks
 spec.loader.exec_module(checks)
 
 repo, script = Path(sys.argv[2]), sys.argv[3]
-plan = checks.Plan([], [], [], {}, [checks.Check("slow", [script])], [])
+plan = checks.Plan([], [], [], {}, [checks.Check("slow", [script], builds=True)], [])
 raise SystemExit(checks.guarded_run(repo, plan, timeout=30, poll=0.02))
 '''
 
@@ -393,12 +393,12 @@ def runner(_repo, _plan):
     record("exit")
     return 0
 
-# A plan that *has* a check, because only such a plan takes the lock: one with none
-# bypasses it deliberately (see `guarded_run`), and staging an empty one here would
-# make every serialization assertion below pass without a lock existing at all.
-# `argv` is never executed, since `runner` is stubbed.
+# A plan with a check that *builds*, because only such a plan takes the lock: one that
+# builds nothing bypasses it deliberately (see `guarded_run`), and staging a docs-only
+# or empty plan here would make every serialization assertion below pass without a lock
+# existing at all. `argv` is never executed, since `runner` is stubbed.
 empty = len(sys.argv) > 6 and sys.argv[6] == '--no-checks'
-stub = [] if empty else [checks.Check('stub', ['true'])]
+stub = [] if empty else [checks.Check('stub', ['true'], builds=True)]
 plan = checks.Plan([], [], [], {}, stub, [])
 raise SystemExit(checks.guarded_run(repo, plan, runner=runner, timeout=timeout, poll=0.02))
 '''
@@ -797,7 +797,7 @@ class SingleFlightTests(unittest.TestCase):
         self.assertTrue(checks.unverified_path(self.repo).exists())
 
         ran = []
-        plan = checks.Plan([], [], [], {}, [checks.Check("stub", ["true"])], [])
+        plan = checks.Plan([], [], [], {}, [checks.Check("stub", ["true"], builds=True)], [])
         with redirect_stderr(stderr):
             status = checks.guarded_run(self.repo, plan, runner=lambda *_: ran.append(1) or 0,
                                         timeout=5, poll=0.02)
@@ -910,6 +910,167 @@ class SingleFlightTests(unittest.TestCase):
         self.assertEqual(waiter.returncode, 0, stdout + stderr)
         self.assertIn(("enter", waiter.pid),
                       [(event, pid) for event, pid, _stamp in self.events()])
+
+    def test_a_nested_group_the_stop_never_discovered_still_refuses_the_next_push(self):
+        """The record must not clear itself in the very case it is written for.
+
+        When `ps` cannot be read, the only group a stop knows is the one the check
+        leads: killing the wrapper empties that group while the separately grouped
+        `swift test` it started keeps writing to the build directory. Checking the
+        recorded groups alone therefore reports "all gone", clears the record, and the
+        next push builds into the same directory. The session covers the group nobody
+        discovered - `start_new_session` makes the check a session leader, and `set -m`
+        creates groups *inside* that session.
+        """
+        marker = self.root / "nested.pid"
+        script = self.root / "leader_with_a_nested_group.py"
+        script.write_text(
+            "import os, subprocess\n"
+            "child = subprocess.Popen(['sleep', '60'], stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+            "    preexec_fn=lambda: os.setpgid(0, 0))\n"
+            f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+        )
+        # The leader exits at once, exactly as a killed wrapper does, leaving its
+        # nested group orphaned but still inside its session.
+        leader = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        session = leader.pid
+        leader.wait()
+        deadline = time.monotonic() + 30
+        while not marker.exists() or not marker.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, "the fixture never reported its child")
+            time.sleep(0.02)
+        nested = int(marker.read_text())
+
+        def kill_nested():
+            # Only while it is still in that session: the pid is free to be reused
+            # once it has gone, and this must not signal whatever took it.
+            if nested in (checks.live_session_members(session) or set()):
+                try:
+                    os.kill(nested, signal.SIGKILL)
+                except OSError:
+                    pass
+
+        self.addCleanup(kill_nested)
+
+        # The staging the finding describes: the recorded group is already empty, so a
+        # groups-only record would clear, while the session still holds the build.
+        self.assertEqual(checks.live_group_members({session}), set(),
+                         "the leader's group must be empty for this to stage the finding")
+        self.assertIn(nested, checks.live_session_members(session),
+                      "the nested group is still in the check's session")
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            checks.record_unverified_stop(self.repo, {session}, session)
+        reason = checks.unverified_reason(self.repo)
+        self.assertIsNotNone(reason, "an undiscovered nested build must still refuse the push")
+        self.assertIn(str(nested), reason)
+        self.assertTrue(checks.unverified_path(self.repo).exists(),
+                        "the record must not clear while the nested build runs")
+
+        kill_nested()
+        while checks.live_session_members(session):
+            self.assertLess(time.monotonic(), deadline, "the nested build never exited")
+            time.sleep(0.02)
+        self.assertIsNone(checks.unverified_reason(self.repo))
+        self.assertFalse(checks.unverified_path(self.repo).exists(),
+                         "the record must clear once its session is empty")
+
+    def test_the_record_is_written_before_the_check_is_signalled(self):
+        """A record written after the drain is missing when it matters.
+
+        The SIGTERM being handled is routinely followed by a SIGKILL no handler sees,
+        so a record written only once the drain finishes is never written at all - and
+        the lock dies with the process. Armed first; cleared only when the stop proves
+        the session empty.
+        """
+        script = self.root / "armed_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        existed = []
+        real_killpg = os.killpg
+
+        def record_killpg(pgid, sig):
+            existed.append(checks.unverified_path(self.repo).exists())
+            return real_killpg(pgid, sig)
+
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+        stderr = io.StringIO()
+        with patch.object(checks.os, "killpg", record_killpg), redirect_stderr(stderr):
+            checks.stop_and_record(self.repo, grace=1.0)
+        thread.join(timeout=30)
+
+        self.assertTrue(existed and existed[0],
+                        "nothing was recorded before the check was signalled")
+        self.assertNotRunning(root, "the check survived the stop")
+        self.assertFalse(checks.unverified_path(self.repo).exists(),
+                         "a stop that accounted for everything must clear the record it armed")
+
+    def test_a_record_that_cannot_be_written_is_never_reported_as_recorded(self):
+        """A suppressed write failure left the hook claiming a marker it had not made.
+
+        The next push then finds nothing, takes the lock, and builds into a directory
+        the interrupted run may still be writing to. The write cannot be made to
+        succeed, so it must at least not be reported as having succeeded.
+        """
+        def unwritable(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+        stderr = io.StringIO()
+        with patch.object(checks.Path, "write_text", unwritable), redirect_stderr(stderr):
+            self.assertFalse(checks.write_unverified(self.repo, {4242}, 4242))
+            checks.record_unverified_stop(self.repo, {4242}, 4242)
+        message = stderr.getvalue()
+        self.assertIn("FAILED to record", message)
+        self.assertNotIn("The next push will refuse", message,
+                         "the hook claimed a record it could not write")
+        self.assertFalse(checks.unverified_path(self.repo).exists())
+
+    def test_only_a_plan_that_builds_takes_the_build_lock(self):
+        """The lock serializes builds, and a documentation-only push builds nothing.
+
+        Its whole plan is `git diff --check`, which cannot collide with anything, yet
+        it used to queue behind another worktree's full build for the 15-minute wait
+        and then refuse the push with status 75.
+        """
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("a plan that builds nothing must not take the build lock")
+
+        docs = checks.Plan([], [], [], {}, [checks.Check("whitespace", ["true"])], [])
+        with patch.object(checks, "single_flight", refuse):
+            self.assertEqual(checks.guarded_run(self.repo, docs, runner=lambda *_: 0), 0)
+            building = checks.Plan([], [], [], {},
+                                   [checks.Check("cargo", ["true"], builds=True)], [])
+            with self.assertRaises(AssertionError):
+                checks.guarded_run(self.repo, building, runner=lambda *_: 0)
+
+    def test_the_checks_that_claim_the_lock_are_the_ones_that_build(self):
+        """Which checks are build-capable, asserted at the selection layer."""
+        docs = checks.commands({"docs": ["README.md"]}, ["README.md"],
+                               [("base", "head")], ["head"], "Darwin")
+        self.assertTrue(docs, "a documentation push still plans its whitespace check")
+        self.assertFalse(any(check.builds for check in docs),
+                         f"a documentation push must plan no build: {[c.name for c in docs]}")
+        plan_paths = [f"{checks.PLAN}/docs/x.md"]
+        plan_only = checks.commands({"plan": plan_paths}, plan_paths, [], [], "Darwin")
+        self.assertTrue(plan_only)
+        self.assertFalse(any(check.builds for check in plan_only),
+                         f"plan validation builds nothing: {[c.name for c in plan_only]}")
+        for profile, paths in (("srtop", ["apps/srtop/src/main.rs"]), ("full", ["Cargo.toml"])):
+            for system in ("Darwin", "Linux"):
+                planned = checks.commands({profile: paths}, paths, [], [], system)
+                self.assertTrue(any(check.builds for check in planned),
+                                f"{profile} on {system} must hold the lock: "
+                                f"{[c.name for c in planned]}")
 
 
 class TargetIgnoreTests(unittest.TestCase):

@@ -375,7 +375,13 @@ def runner(_repo, _plan):
     record("exit")
     return 0
 
-plan = checks.Plan([], [], [], {}, [], [])
+# A plan that *has* a check, because only such a plan takes the lock: one with none
+# bypasses it deliberately (see `guarded_run`), and staging an empty one here would
+# make every serialization assertion below pass without a lock existing at all.
+# `argv` is never executed, since `runner` is stubbed.
+empty = len(sys.argv) > 6 and sys.argv[6] == '--no-checks'
+stub = [] if empty else [checks.Check('stub', ['true'])]
+plan = checks.Plan([], [], [], {}, stub, [])
 raise SystemExit(checks.guarded_run(repo, plan, runner=runner, timeout=timeout, poll=0.02))
 '''
 
@@ -402,11 +408,12 @@ class SingleFlightTests(unittest.TestCase):
         self.log = self.root / "lock.log"
         self.log.touch()
 
-    def spawn(self, hold, timeout, repo=None):
+    def spawn(self, hold, timeout, repo=None, checks_planned=True):
         repo = self.repo if repo is None else repo
         process = subprocess.Popen(
             [sys.executable, str(self.helper), str(ROOT / checks.SCRIPT), str(repo),
-             str(self.log), str(hold), str(timeout)],
+             str(self.log), str(hold), str(timeout)]
+            + ([] if checks_planned else ["--no-checks"]),
             cwd=str(repo), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -455,6 +462,24 @@ class SingleFlightTests(unittest.TestCase):
         self.assertGreaterEqual(
             second_enter, first_exit,
             "the second push ran its checks while the first still held the lock")
+
+    def test_a_plan_with_no_checks_never_waits_for_the_lock(self):
+        """A deletion-only push plans no checks, so it must not queue behind a build.
+
+        `make_plan` skips ref deletions, so `git push --delete` has an empty plan. It
+        cannot deadlock in the build directory, because it builds nothing - and before
+        this, it waited out the holder's full timeout in order to run nothing at all.
+        """
+        holder = self.spawn(hold=30.0, timeout=30)
+        self.await_holder(holder)
+        # A zero timeout: were this run to take the lock at all, it would fail at once
+        # with LOCK_BUSY_STATUS rather than run.
+        deletion = self.spawn(hold=0.0, timeout=0, checks_planned=False)
+        stdout, stderr = deletion.communicate(timeout=60)
+        self.assertEqual(deletion.returncode, 0, stdout + stderr)
+        self.assertNotIn("waiting up to", stderr)
+        self.assertIn(deletion.pid, [pid for _event, pid, _stamp in self.events()],
+                      "the deletion-only push must still run its (empty) plan")
 
     def test_bounded_wait_reports_the_holder_then_exits_with_the_documented_status(self):
         holder = self.spawn(hold=30.0, timeout=30)

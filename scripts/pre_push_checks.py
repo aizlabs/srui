@@ -374,7 +374,18 @@ def install_release_on_signal():
 
 
 def guarded_run(repo: Path, plan: Plan, runner=run_plan, **lock) -> int:
-    """Run the selected checks, one hook invocation at a time per repository."""
+    """Run the selected checks, one hook invocation at a time per repository.
+
+    A plan with no checks takes no lock. What the lock exists for is two runs
+    driving cargo and SwiftPM at the same time, which deadlock on the shared
+    build directory; a plan that will not build anything cannot deadlock with
+    anything. Queueing it would only make a push that runs nothing wait out
+    another one's full build -- `git push --delete`, whose plan is empty by
+    construction (`make_plan` skips ref deletions), would block for up to the
+    lock timeout to run no check at all.
+    """
+    if not plan.checks:
+        return runner(repo, plan)
     try:
         with single_flight(repo, **lock):
             return runner(repo, plan)

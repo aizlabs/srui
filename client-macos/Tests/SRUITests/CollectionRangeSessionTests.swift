@@ -66,7 +66,7 @@ struct CollectionRangeSessionTests {
         mountMsg.transaction = mountTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMsg))
 
-        try await AsyncTestSupport.eventually(description: "table mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "table mounted") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.handle(for: tableID) != nil
         }
@@ -88,7 +88,7 @@ struct CollectionRangeSessionTests {
         Task { @MainActor in sentinelRan = true }
         adapter.noteVisibleRange(start: 0, count: 8)
 
-        try await AsyncTestSupport.eventually(description: "MainActor sentinel") { sentinelRan }
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "MainActor sentinel") { sentinelRan }
         let uiDeadline = Date().addingTimeInterval(2)
         while Date() < uiDeadline {
             if await gated.uiFrameCount == 1 {
@@ -127,7 +127,7 @@ struct CollectionRangeSessionTests {
         resetMsg.transaction = resetTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resetMsg))
 
-        try await AsyncTestSupport.eventually(description: "range arrival painted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "range arrival painted") {
             adapter.rowContent(at: 0)?.cells == ["Row 0"]
                 && adapter.rowContent(at: 0)?.itemID == ItemId(1)
         }

@@ -50,7 +50,7 @@ struct SessionControllerTerminalTests {
         var welcomeMsg = SRUIMessage()
         welcomeMsg.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
-        try await AsyncTestSupport.eventually(description: "handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake") {
             controller.isHandshakeComplete
         }
 
@@ -70,7 +70,7 @@ struct SessionControllerTerminalTests {
         var txMsg = SRUIMessage()
         txMsg.transaction = initialTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(txMsg))
-        try await AsyncTestSupport.eventually(description: "text node mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "text node mounted") {
             applier.lastAppliedRevision == Revision(1) && renderer.registry.handle(for: editorID) != nil
         }
 
@@ -95,7 +95,7 @@ struct SessionControllerTerminalTests {
         var resyncMsg = SRUIMessage()
         resyncMsg.terminalResyncRequired = resync
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resyncMsg))
-        try await AsyncTestSupport.eventuallyAsync(description: "terminal island resync applied") {
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "terminal island resync applied") {
             await renderer.terminalSession.snapshot(for: NodeId(30))?.needsRedraw == true
         }
 
@@ -136,7 +136,7 @@ struct SessionControllerTerminalTests {
         var welcomeMsg = SRUIMessage()
         welcomeMsg.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMsg))
-        try await AsyncTestSupport.eventually(description: "handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake") {
             controller.isHandshakeComplete
         }
 
@@ -148,7 +148,7 @@ struct SessionControllerTerminalTests {
         dataMsg.terminalData = data
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(dataMsg))
 
-        try await AsyncTestSupport.eventually(description: "unnegotiated terminal frame rejected") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "unnegotiated terminal frame rejected") {
             controller.isDiverged
         }
         #expect(await renderer.terminalSession.snapshot(for: NodeId(30)) == nil)
@@ -383,7 +383,7 @@ struct SessionControllerTerminalTests {
         replayMessage.transaction = replay.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(replayMessage))
 
-        try await AsyncTestSupport.eventually(description: "cold Terminal replay mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "cold Terminal replay mounted") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.view(for: NodeId(30)) is TerminalView
         }
@@ -423,7 +423,7 @@ struct SessionControllerTerminalTests {
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
-        try await AsyncTestSupport.eventually(description: "collision handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "collision handshake") {
             controller.isHandshakeComplete
         }
 
@@ -443,7 +443,7 @@ struct SessionControllerTerminalTests {
         var transactionMessage = SRUIMessage()
         transactionMessage.transaction = transaction.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(transactionMessage))
-        try await AsyncTestSupport.eventually(description: "collision snapshot rendered") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "collision snapshot rendered") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.handle(for: NodeId(30)) != nil
         }
@@ -685,7 +685,7 @@ struct SessionControllerTerminalTests {
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
-        try await AsyncTestSupport.eventually(description: "handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake") {
             controller.isHandshakeComplete
         }
 
@@ -701,7 +701,7 @@ struct SessionControllerTerminalTests {
         var mountMessage = SRUIMessage()
         mountMessage.transaction = mount.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMessage))
-        try await AsyncTestSupport.eventually(description: "terminal mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "terminal mounted") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.view(for: terminalID) is TerminalView
         }
@@ -809,7 +809,7 @@ struct SessionControllerTerminalTests {
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
-        try await AsyncTestSupport.eventually(description: "handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake") {
             controller.isHandshakeComplete
         }
 
@@ -825,7 +825,7 @@ struct SessionControllerTerminalTests {
         var mountMessage = SRUIMessage()
         mountMessage.transaction = mount.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMessage))
-        try await AsyncTestSupport.eventually(description: "terminal mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "terminal mounted") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.view(for: terminalID) is TerminalView
         }
@@ -957,7 +957,7 @@ struct SessionControllerTerminalTests {
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
-        try await AsyncTestSupport.eventually(description: "handshake") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "handshake") {
             controller.isHandshakeComplete
         }
 
@@ -973,7 +973,7 @@ struct SessionControllerTerminalTests {
         var mountMessage = SRUIMessage()
         mountMessage.transaction = mount.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMessage))
-        try await AsyncTestSupport.eventually(description: "terminal mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "terminal mounted") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.view(for: terminalID) is TerminalView
         }

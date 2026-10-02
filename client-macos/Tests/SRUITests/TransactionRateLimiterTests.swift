@@ -116,7 +116,7 @@ struct TransactionRateLimiterTests {
         resumeEnvelope.serverResumeOk = resumeOK
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(resumeEnvelope))
 
-        try await AsyncTestSupport.eventually(description: "resume handshake completes") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "resume handshake completes") {
             controller.isHandshakeComplete
         }
 

@@ -1,5 +1,11 @@
 # Rust / Cargo
-target/
+# No trailing slash: a linked worktree's `target` is often a symlink into a shared
+# build cache (the layout scripts/test_reap_test_servers.sh exercises), and `target/`
+# matches directories only, so the symlink showed up as untracked. The unanchored
+# pattern also matches a file named `target`; no tracked path is named `target`
+# (`git ls-files | grep -E '(^|/)target$'` is empty) and protocol/tests/
+# test_pre_push_checks.py keeps it that way.
+target
 **/*.rs.bk
 
 # Swift / SwiftPM / Xcode

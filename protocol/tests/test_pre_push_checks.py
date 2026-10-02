@@ -8,11 +8,14 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -347,6 +350,981 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(subprocess.check_output(
             ["git", "--git-dir", str(bare), "rev-parse", "refs/heads/codex/app-change"],
             text=True).strip(), self.git("rev-parse", "HEAD"))
+
+
+# Runs checks.guarded_run with a stub runner, so the single-flight behaviour is proved
+# without the real multi-minute cargo/SwiftPM checks. Every lock transition is appended
+# to one shared log; time.monotonic is system-wide, so the stamps order across processes.
+# A hook run whose single check is a long-running script, driven through the real
+# `run_plan` so the child is spawned exactly as a cargo or SwiftPM check would be.
+SIGNAL_HELPER = '''
+import importlib.util, sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("pre_push_checks", sys.argv[1])
+checks = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = checks
+spec.loader.exec_module(checks)
+
+repo, script = Path(sys.argv[2]), sys.argv[3]
+plan = checks.Plan([], [], [], {}, [checks.Check("slow", [script], builds=True)], [])
+raise SystemExit(checks.guarded_run(repo, plan, timeout=30, poll=0.02))
+'''
+
+LOCK_HELPER = '''
+import importlib.util, os, sys, time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("pre_push_checks", sys.argv[1])
+checks = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = checks
+spec.loader.exec_module(checks)
+
+repo, log = Path(sys.argv[2]), Path(sys.argv[3])
+hold, timeout = float(sys.argv[4]), float(sys.argv[5])
+
+def record(event):
+    with log.open("a") as handle:
+        handle.write("%s %d %d\\n" % (event, os.getpid(), time.monotonic_ns()))
+
+def runner(_repo, _plan):
+    record("enter")
+    time.sleep(hold)
+    record("exit")
+    return 0
+
+# A plan with a check that *builds*, because only such a plan takes the lock: one that
+# builds nothing bypasses it deliberately (see `guarded_run`), and staging a docs-only
+# or empty plan here would make every serialization assertion below pass without a lock
+# existing at all. `argv` is never executed, since `runner` is stubbed.
+empty = len(sys.argv) > 6 and sys.argv[6] == '--no-checks'
+stub = [] if empty else [checks.Check('stub', ['true'], builds=True)]
+plan = checks.Plan([], [], [], {}, stub, [])
+raise SystemExit(checks.guarded_run(repo, plan, runner=runner, timeout=timeout, poll=0.02))
+'''
+
+
+class SingleFlightTests(unittest.TestCase):
+    """One hook run at a time: concurrent pushes used to deadlock in the build directory."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="srui-pre-push-lock-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        for args in (("init", "-q", "--initial-branch=main"),
+                     ("config", "user.name", "Pre-push test"),
+                     ("config", "user.email", "pre-push@example.invalid"),
+                     ("config", "commit.gpgsign", "false")):
+            checks.git(self.repo, *args)
+        (self.repo / "README.md").write_text("# Fixture\n")
+        checks.git(self.repo, "add", "--all")
+        checks.git(self.repo, "commit", "-qm", "fixture")
+        self.helper = self.root / "lock_helper.py"
+        self.helper.write_text(LOCK_HELPER)
+        self.log = self.root / "lock.log"
+        self.log.touch()
+
+    def spawn(self, hold, timeout, repo=None, checks_planned=True):
+        repo = self.repo if repo is None else repo
+        process = subprocess.Popen(
+            [sys.executable, str(self.helper), str(ROOT / checks.SCRIPT), str(repo),
+             str(self.log), str(hold), str(timeout)]
+            + ([] if checks_planned else ["--no-checks"]),
+            cwd=str(repo), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self.reap, process)
+        return process
+
+    def reap(self, process):
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.communicate(timeout=30)
+        except (subprocess.TimeoutExpired, ValueError):
+            pass
+
+    def events(self):
+        entries = []
+        for line in self.log.read_text().splitlines():
+            event, pid, stamp = line.split()
+            entries.append((event, int(pid), int(stamp)))
+        return entries
+
+    def state_of(self, pid):
+        """The process's state letter, empty when it is gone from the table."""
+        row = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                             stdout=subprocess.PIPE, text=True, check=False)
+        return row.stdout.strip()
+
+    def assertNotRunning(self, pid, message):
+        """Assert `pid` is no longer a running process.
+
+        Not `os.kill(pid, 0)`: that succeeds for a **zombie** on both platforms, so
+        where pid 1 does not reap an orphan immediately -- a container whose pid 1 is
+        a plain shell, which is where CI runs -- a correctly killed child still
+        answers. The state column is the same evidence `live_group_members` uses, and
+        an uncollected exit status is not a process using the build directory.
+        """
+        state = self.state_of(pid)
+        self.assertTrue(state == "" or state.startswith("Z"),
+                        f"{message} (pid {pid} is in state {state!r})")
+
+    def await_holder(self, process):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if any(event == "enter" for event, _pid, _stamp in self.events()):
+                return
+            self.assertIsNone(process.poll(), "the holder exited before taking the lock")
+            time.sleep(0.02)
+        self.fail("the holder never reported entering the checks")
+
+    def test_concurrent_invocations_serialize_instead_of_overlapping(self):
+        holder = self.spawn(hold=1.0, timeout=30)
+        self.await_holder(holder)
+        waiter = self.spawn(hold=0.0, timeout=60)
+        for process in (holder, waiter):
+            stdout, stderr = process.communicate(timeout=120)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+        events = self.events()
+        self.assertEqual([event for event, _pid, _stamp in events],
+                         ["enter", "exit", "enter", "exit"], events)
+        self.assertEqual({pid for _event, pid, _stamp in events}, {holder.pid, waiter.pid})
+        first_exit = next(stamp for event, pid, stamp in events
+                          if event == "exit" and pid == holder.pid)
+        second_enter = next(stamp for event, pid, stamp in events
+                            if event == "enter" and pid == waiter.pid)
+        self.assertGreaterEqual(
+            second_enter, first_exit,
+            "the second push ran its checks while the first still held the lock")
+
+    def test_a_signalled_hook_stops_its_check_before_releasing_the_lock(self):
+        """The lock must outlive the build it was taken for.
+
+        `git` signals the hook, not its process group. A check left running after the
+        hook exits keeps writing to the shared build directory while the lock is
+        already gone, and the next push then acquires the lock and starts a second
+        build into it - the overlap this mechanism exists to prevent.
+        """
+        marker = self.root / "check.pid"
+        script = self.root / "slow_check.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' \"$$\" > {marker}\n"
+            "sleep 60\n"
+        )
+        script.chmod(0o755)
+        helper = self.root / "signal_helper.py"
+        helper.write_text(SIGNAL_HELPER)
+        hook = subprocess.Popen(
+            [sys.executable, str(helper), str(ROOT / checks.SCRIPT), str(self.repo),
+             str(script)],
+            cwd=str(self.repo), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self.reap, hook)
+
+        deadline = time.monotonic() + 30
+        while not marker.exists():
+            self.assertIsNone(hook.poll(), "the hook exited before running its check")
+            self.assertLess(time.monotonic(), deadline, "the check never started")
+            time.sleep(0.02)
+        child = int(marker.read_text())
+        os.kill(child, 0)  # Running, and ours to observe.
+
+        os.kill(hook.pid, signal.SIGTERM)  # The hook alone, exactly as git does.
+        stdout, stderr = hook.communicate(timeout=60)
+        self.assertNotEqual(hook.returncode, 0, stdout + stderr)
+
+        # By the time the hook is gone - and so by the time the lock is free - the
+        # check must be gone too. No sleep here on purpose: a grace period would let
+        # the assertion pass for a build that is merely slow to notice.
+        self.assertNotRunning(child, "the check outlived the hook that held the lock")
+
+    def test_a_nested_process_group_is_stopped_with_the_check(self):
+        """A wrapper's own process group must not outlive the lock either.
+
+        `scripts/run-swift-tests.sh` puts `swift test` in a *new* process group with
+        `set -m`, so signalling the check's group does not reach it. That is the real
+        shape of the macOS full hook, and the shape this reproduces: killing the
+        directly spawned shell is not enough, because the build is one group boundary
+        further in.
+        """
+        marker = self.root / "nested.pid"
+        script = self.root / "wrapper.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "set -m\n"          # exactly what run-swift-tests.sh does
+            "sleep 60 &\n"
+            f"printf '%s' \"$!\" > {marker}\n"
+            "wait\n"
+        )
+        script.chmod(0o755)
+        helper = self.root / "signal_helper.py"
+        helper.write_text(SIGNAL_HELPER)
+        hook = subprocess.Popen(
+            [sys.executable, str(helper), str(ROOT / checks.SCRIPT), str(self.repo),
+             str(script)],
+            cwd=str(self.repo), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self.reap, hook)
+
+        deadline = time.monotonic() + 30
+        while not marker.exists() or not marker.read_text().strip():
+            self.assertIsNone(hook.poll(), "the hook exited before the wrapper started")
+            self.assertLess(time.monotonic(), deadline, "the nested job never started")
+            time.sleep(0.02)
+        nested = int(marker.read_text())
+        os.kill(nested, 0)
+        self.assertNotEqual(os.getpgid(nested), os.getpgid(hook.pid),
+                            "the fixture must put the nested job in its own group")
+
+        os.kill(hook.pid, signal.SIGTERM)
+        # Wait on the hook's *state*, not on `communicate`. The nested job inherited this
+        # Popen's stdout/stderr pipes, so a leaked one holds them open and `communicate`
+        # blocks on EOF until it dies -- the swift-test wedge in miniature. Waiting there
+        # first made the leak surface as a 60-second `TimeoutExpired` instead of as the
+        # assertion below, which is both slower and a worse diagnostic than the defect
+        # deserves: the invariant is that nothing the check started outlives the lock.
+        deadline = time.monotonic() + 30
+        while self.state_of(hook.pid) not in ("", "Z"):
+            self.assertLess(time.monotonic(), deadline, "the hook never exited")
+            time.sleep(0.02)
+        self.assertNotRunning(nested, "a nested process group outlived the lock")
+
+        # Only now, and tolerantly: the pipes are free once the leak is gone, and by this
+        # point the assertion that matters has already been made.
+        try:
+            stdout, stderr = hook.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            hook.kill()
+            stdout, stderr = "", ""
+        self.assertNotEqual(hook.returncode, 0, stdout + stderr)
+
+    def test_a_drained_check_costs_no_second_grace_window_and_no_stale_signal(self):
+        """A check that dies on SIGTERM must end the stop, not start a SIGKILL pass.
+
+        Two consequences of getting this wrong, both asserted here: every interrupted
+        push burns both grace windows, and the later pass aims SIGKILL at a pid that
+        `Popen` has already reaped -- a number the kernel is free to have reissued to
+        an unrelated process of this user.
+        """
+        script = self.root / "quick_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        signals = []
+        real_kill, real_killpg = os.kill, os.killpg
+
+        def record_kill(pid, sig):
+            signals.append(("kill", pid, sig))
+            return real_kill(pid, sig)
+
+        def record_killpg(pgid, sig):
+            signals.append(("killpg", pgid, sig))
+            return real_killpg(pgid, sig)
+
+        started = time.monotonic()
+        with patch.object(checks.os, "kill", record_kill), \
+             patch.object(checks.os, "killpg", record_killpg):
+            thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+            thread.start()
+            deadline = time.monotonic() + 30
+            while checks._active_check is None:
+                self.assertLess(time.monotonic(), deadline, "the check never registered")
+                time.sleep(0.01)
+            root = checks._active_check.pid
+            checks.stop_active_check(grace=5.0)
+            elapsed = time.monotonic() - started
+            thread.join(timeout=30)
+
+        self.assertLess(elapsed, 5.0,
+                        f"the stop burned a grace window for a check that died: {elapsed:.2f}s")
+        self.assertNotIn(signal.SIGKILL, [sig for _kind, _target, sig in signals],
+                         f"SIGKILL was sent to a check that had already gone: {signals}")
+        self.assertNotIn(("kill", root, signal.SIGTERM), signals,
+                         "the root pid was signalled by number; after reaping it may be reused")
+        self.assertNotIn(("kill", root, signal.SIGKILL), signals,
+                         "the root pid was signalled by number; after reaping it may be reused")
+        self.assertNotRunning(root, "the check survived the stop")
+
+    def test_a_zombie_in_the_group_does_not_count_as_a_live_member(self):
+        """An uncollected exit status is not a process still using the build directory.
+
+        A zombie holds no resources and cannot be signalled, so counting one keeps the
+        drain from ever succeeding: the stop burns its grace window and escalates to
+        SIGKILL against something that has already gone.
+        """
+        # A Python parent, not a shell: `sh` reaps its background jobs on SIGCHLD, so
+        # it leaves no zombie to observe. This one forks and deliberately never waits.
+        marker = self.root / "zombie.pid"
+        script = self.root / "leaves_a_zombie.py"
+        script.write_text(
+            "import os, sys, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os._exit(0)\n"
+            f"open({str(marker)!r}, 'w').write(str(pid))\n"
+            "time.sleep(60)\n"
+        )
+        child = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        self.addCleanup(self.reap, child)
+
+        deadline = time.monotonic() + 30
+        while not marker.exists() or not marker.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, "the fixture never reported its child")
+            time.sleep(0.02)
+        zombie = int(marker.read_text())
+
+        # Wait for it to actually be a zombie: still in the table, state Z.
+        def state_of(pid):
+            row = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                                 stdout=subprocess.PIPE, text=True, check=False)
+            return row.stdout.strip()
+
+        while not state_of(zombie).startswith("Z"):
+            self.assertLess(time.monotonic(), deadline, f"never became a zombie: {state_of(zombie)!r}")
+            time.sleep(0.02)
+
+        members = checks.live_group_members({child.pid})
+        self.assertIn(child.pid, members, "the live shell must count as a member")
+        self.assertNotIn(zombie, members, "a zombie was counted as a live group member")
+
+    def test_an_unreadable_process_table_is_not_an_empty_one(self):
+        """Enumeration failure must not read as "the build has finished".
+
+        A failed `ps` returns empty stdout. Parsed as an empty process table it ends
+        the drain, and the lock is released over a check that may still be writing to
+        the shared build directory.
+        """
+        for failure in (lambda *a, **k: subprocess.CompletedProcess(a, 1, "", ""),
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            subprocess.TimeoutExpired("ps", 10)),
+                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("ps"))):
+            with patch.object(checks.subprocess, "run", failure):
+                self.assertIsNone(checks.process_listing("pid=,pgid="))
+                self.assertIsNone(checks.check_process_tree(os.getpid()))
+                self.assertIsNone(checks.live_group_members({os.getpgrp()}))
+
+    def test_a_check_is_stopped_even_when_the_process_table_cannot_be_read(self):
+        """The group the check leads is known without any snapshot, so it is still
+        signalled; and an unreadable table never ends the wait early."""
+        script = self.root / "blind_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        real_run = subprocess.run
+
+        def ps_fails(argv, *args, **kwargs):
+            if argv and argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return real_run(argv, *args, **kwargs)
+
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+        with patch.object(checks.subprocess, "run", ps_fails):
+            unverified = checks.stop_active_check(grace=1.0)
+        thread.join(timeout=30)
+        self.assertNotRunning(root, "the check survived a stop that could not enumerate")
+        # It killed what it knew and then said it could not vouch for the result, which
+        # is what makes the next push refuse rather than build into the same directory.
+        self.assertIn(root, unverified,
+                      "an unenumerable stop must report the group it could not verify")
+
+    def test_only_groups_with_a_live_member_are_reported(self):
+        """Per group, not in aggregate.
+
+        When a check owns several groups and one drains while another runs, signalling
+        every accumulated group again would aim the escalation at a group whose leader
+        pid may since have been reissued - the pid-reuse hazard one level up. The stop
+        loop signals exactly the keys this returns.
+        """
+        live = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        self.addCleanup(self.reap, live)
+        drained = subprocess.Popen(["true"], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        drained.wait()
+
+        by_group = checks.live_groups({live.pid, drained.pid})
+        self.assertIsNotNone(by_group)
+        self.assertIn(live.pid, by_group, "a group with a live member must be reported")
+        self.assertNotIn(drained.pid, by_group,
+                         "a drained group must not be signalled again; its pid may be reused")
+
+    def test_a_drained_group_is_never_signalled_again(self):
+        """The stop loop signals only groups with a live member *now*.
+
+        A group that has drained may have had its leader pid reissued by the kernel, so
+        signalling it again on the escalation pass can kill an unrelated group of this
+        user. Staged by discovering a group whose only member has already exited.
+        """
+        stale = subprocess.Popen(["true"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        stale.wait()
+        script = self.root / "two_group_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        signalled = []
+        real_killpg = os.killpg
+
+        def record_killpg(pgid, sig):
+            signalled.append(pgid)
+            return real_killpg(pgid, sig)
+
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+        with patch.object(checks, "check_process_tree",
+                          lambda pid: ({pid}, {pid, stale.pid})), \
+             patch.object(checks.os, "killpg", record_killpg):
+            checks.stop_active_check(grace=1.0)
+        thread.join(timeout=30)
+
+        self.assertIn(root, signalled, "the live group must still be signalled")
+        self.assertNotIn(stale.pid, signalled,
+                         "a drained group was signalled again; its pid may have been reused")
+        self.assertNotRunning(root, "the check survived the stop")
+
+    def test_a_push_is_refused_while_an_unverified_stop_is_recorded(self):
+        """Mutual exclusion has to survive the death of the process holding the lock.
+
+        flock is released when the process dies - that is what makes it crash-safe - so
+        a stop that could not prove its build had finished records the fact instead, and
+        the next push refuses rather than building into the same directory on trust.
+        """
+        live = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        self.addCleanup(self.reap, live)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            checks.record_unverified_stop(self.repo, {live.pid})
+        self.assertTrue(checks.unverified_path(self.repo).exists())
+
+        ran = []
+        plan = checks.Plan([], [], [], {}, [checks.Check("stub", ["true"], builds=True)], [])
+        with redirect_stderr(stderr):
+            status = checks.guarded_run(self.repo, plan, runner=lambda *_: ran.append(1) or 0,
+                                        timeout=5, poll=0.02)
+        self.assertEqual(status, checks.UNVERIFIED_STATUS)
+        self.assertEqual(ran, [], "the refused push must run no check")
+        self.assertIn(str(live.pid), stderr.getvalue())
+
+        # Self-clearing once the leftover is gone: the record names the groups, so the
+        # next push can tell for itself rather than needing a human to delete a file.
+        live.kill()
+        live.wait()
+        with redirect_stderr(stderr):
+            status = checks.guarded_run(self.repo, plan, runner=lambda *_: ran.append(2) or 0,
+                                        timeout=5, poll=0.02)
+        self.assertEqual(status, 0)
+        self.assertEqual(ran, [2])
+        self.assertFalse(checks.unverified_path(self.repo).exists(),
+                         "the record must clear itself once its groups are gone")
+
+    def test_an_unreadable_record_refuses_rather_than_assuming(self):
+        checks.unverified_path(self.repo).write_text("not json\n")
+        reason = checks.unverified_reason(self.repo)
+        self.assertIsNotNone(reason)
+        self.assertIn("could not be read", reason)
+        self.assertTrue(checks.unverified_path(self.repo).exists(),
+                        "an unreadable record must be left for a human")
+
+    def test_the_handled_signals_are_blocked_while_a_check_is_registered(self):
+        """No window between spawning a check and recording it.
+
+        A signal delivered in that window would find no active check, stop nothing,
+        and release the lock over a build that had just started.
+        """
+        observed = {}
+
+        class FakePopen:
+            def __init__(self, *_args, **_kwargs):
+                observed["mask"] = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+                observed["active_at_spawn"] = checks._active_check
+                self.pid = os.getpid()
+
+            def wait(self):
+                observed["active_while_waiting"] = checks._active_check is self
+                return 0
+
+            def poll(self):
+                return 0
+
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        with patch.object(checks.subprocess, "Popen", FakePopen):
+            self.assertEqual(checks.run_check(["true"], self.repo), 0)
+        self.assertTrue(set(checks.STOP_SIGNALS).issubset(observed["mask"]),
+                        f"the handled signals were deliverable during the spawn: {observed['mask']}")
+        self.assertTrue(observed["active_while_waiting"], "the check was never registered")
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), before,
+                         "the mask was not restored after registration")
+        self.assertIsNone(checks._active_check, "the check outlived its own run")
+
+    def test_a_plan_with_no_checks_never_waits_for_the_lock(self):
+        """A deletion-only push plans no checks, so it must not queue behind a build.
+
+        `make_plan` skips ref deletions, so `git push --delete` has an empty plan. It
+        cannot deadlock in the build directory, because it builds nothing - and before
+        this, it waited out the holder's full timeout in order to run nothing at all.
+        """
+        holder = self.spawn(hold=30.0, timeout=30)
+        self.await_holder(holder)
+        # A zero timeout: were this run to take the lock at all, it would fail at once
+        # with LOCK_BUSY_STATUS rather than run.
+        deletion = self.spawn(hold=0.0, timeout=0, checks_planned=False)
+        stdout, stderr = deletion.communicate(timeout=60)
+        self.assertEqual(deletion.returncode, 0, stdout + stderr)
+        self.assertNotIn("waiting up to", stderr)
+        self.assertIn(deletion.pid, [pid for _event, pid, _stamp in self.events()],
+                      "the deletion-only push must still run its (empty) plan")
+
+    def test_bounded_wait_reports_the_holder_then_exits_with_the_documented_status(self):
+        holder = self.spawn(hold=30.0, timeout=30)
+        self.await_holder(holder)
+        waiter = self.spawn(hold=0.0, timeout=0)
+        stdout, stderr = waiter.communicate(timeout=60)
+        self.assertEqual(waiter.returncode, checks.LOCK_BUSY_STATUS, stdout + stderr)
+        self.assertIn("waiting up to", stderr)
+        self.assertIn(str(holder.pid), stderr)
+        self.assertIn(checks.LOCK_FILE, stderr)
+        self.assertIn("--no-verify", stderr)
+        self.assertNotIn(waiter.pid, [pid for _event, pid, _stamp in self.events()],
+                         "the blocked push must not run any check")
+        self.reap(holder)
+
+    def test_the_lock_is_shared_across_worktrees_of_one_repository(self):
+        worktree = self.root / "linked"
+        checks.git(self.repo, "worktree", "add", "-q", "-b", "codex/linked", str(worktree))
+        self.assertFalse((worktree / ".git").is_dir(), "a linked worktree's .git is a file")
+        self.assertEqual(checks.lock_path(worktree), checks.lock_path(self.repo))
+        holder = self.spawn(hold=30.0, timeout=30)
+        self.await_holder(holder)
+        waiter = self.spawn(hold=0.0, timeout=0, repo=worktree)
+        stdout, stderr = waiter.communicate(timeout=60)
+        self.assertEqual(waiter.returncode, checks.LOCK_BUSY_STATUS, stdout + stderr)
+        self.assertIn(str(holder.pid), stderr)
+        self.reap(holder)
+
+    def test_a_dead_holder_does_not_block_the_next_push(self):
+        holder = self.spawn(hold=600.0, timeout=30)
+        self.await_holder(holder)
+        self.reap(holder)
+        waiter = self.spawn(hold=0.0, timeout=5)
+        stdout, stderr = waiter.communicate(timeout=60)
+        self.assertEqual(waiter.returncode, 0, stdout + stderr)
+        self.assertIn(("enter", waiter.pid),
+                      [(event, pid) for event, pid, _stamp in self.events()])
+
+    def test_live_groups_answers_from_one_process_table(self):
+        """Two samples joined by pid are not one fact.
+
+        A pid that exits between the samples and is reissued comes back wearing an
+        unrelated pgid, which the stop then signals as one of the check's own; and a
+        member forked after the first sample is absent from the second, which reads as
+        drained. Staged with a table that changes between calls: the answer has to come
+        from one of them, never from a join across both.
+        """
+        leader, member, stranger = 90100, 90101, 90900
+        for pid in (leader, member, stranger):
+            self.assertNotIn(pid, {os.getpid(), os.getppid()},
+                             "the synthetic pids must not collide with this test's own")
+        first = f"{leader} {leader} S\n{member} {leader} S\n"
+        # Between the samples, `member` exited and the kernel reissued its pid to a
+        # process in an unrelated group.
+        second = f"{leader} {leader} S\n{member} {stranger} S\n"
+        listings = [first, second]
+        calls = []
+
+        def changing(columns):
+            calls.append(columns)
+            return listings[min(len(calls) - 1, len(listings) - 1)]
+
+        with patch.object(checks, "process_listing", changing):
+            by_group = checks.live_groups({leader})
+
+        self.assertEqual(len(calls), 1,
+                         f"live_groups sampled the process table {len(calls)} times")
+        self.assertEqual(by_group, {leader: {leader, member}})
+        self.assertNotIn(stranger, by_group,
+                         "an unrelated group was reported as one of the check's own")
+
+    def test_a_stop_whose_groups_are_empty_keeps_the_record_while_its_session_runs(self):
+        """Accounted-for groups are not an empty session.
+
+        A transient discovery failure is enough to miss the wrapper's nested group, and
+        killing the wrapper then empties the only group the stop knows - so the stop
+        reports nothing unaccounted for. Clearing the record on that evidence is what
+        lets the next push build into a directory the undiscovered `swift test` is
+        still writing to. Only an answered, empty session may clear it.
+        """
+        marker = self.root / "session_leftover.pid"
+        script = self.root / "wrapper_with_nested.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "set -m\n"          # exactly what run-swift-tests.sh does
+            "sleep 60 &\n"
+            f"printf '%s' \"$!\" > {marker}\n"
+            "wait\n"
+        )
+        script.chmod(0o755)
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while (checks._active_check is None or not marker.exists()
+               or not marker.read_text().strip()):
+            self.assertLess(time.monotonic(), deadline, "the nested job never started")
+            time.sleep(0.02)
+        root = checks._active_check.pid
+        nested = int(marker.read_text())
+
+        def kill_nested():
+            # Only while it is still in that session: the pid is free once it has gone.
+            if nested in (checks.live_session_members(root) or set()):
+                try:
+                    os.kill(nested, signal.SIGKILL)
+                except OSError:
+                    pass
+
+        self.addCleanup(kill_nested)
+
+        stderr = io.StringIO()
+        # Discovery that never finds the nested group - what an unreadable process table
+        # at the wrong moment leaves behind, recovered by the time the drain polls.
+        with patch.object(checks, "check_process_tree", lambda pid: ({pid}, {pid})), \
+             redirect_stderr(stderr):
+            self.assertTrue(checks.stop_and_record(self.repo, grace=1.0))
+        thread.join(timeout=30)
+
+        self.assertNotRunning(root, "the wrapper survived the stop")
+        self.assertIn(nested, checks.live_session_members(root),
+                      "this stages nothing unless the nested job outlived its wrapper")
+        self.assertTrue(checks.unverified_path(self.repo).exists(),
+                        "the record must not clear while the session still holds a build")
+        self.assertIsNotNone(checks.unverified_reason(self.repo))
+
+    def test_a_cancellation_that_cannot_be_recorded_is_not_performed(self):
+        """Stopping a build nobody can be warned about is the outcome worth refusing.
+
+        The record cannot be made to persist on a full or read-only git directory, and
+        the lock dies with this process either way. So the hook declines the
+        cancellation instead: the checks keep running, the lock stays held until they
+        finish, and the push is never left looking checked when it was not.
+        """
+        script = self.root / "unrecordable_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+
+        def unwritable(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+        stderr = io.StringIO()
+        with patch.object(checks.Path, "write_text", unwritable), redirect_stderr(stderr):
+            proceeded = checks.stop_and_record(self.repo, grace=1.0)
+
+        self.assertFalse(proceeded, "the handler must not exit and release the lock")
+        state = self.state_of(root)
+        self.assertTrue(state and not state.startswith("Z"),
+                        "the check was cancelled although the cancellation could not be "
+                        f"recorded (pid {root} is in state {state!r})")
+        self.assertIn("NOT stopped", stderr.getvalue())
+
+        # Now stop it for real, with the record writable again.
+        with redirect_stderr(stderr):
+            self.assertTrue(checks.stop_and_record(self.repo, grace=5.0))
+        thread.join(timeout=30)
+        self.assertNotRunning(root, "the check survived a recordable stop")
+
+    def test_an_unenumerable_stop_never_signals_a_pgid_it_has_already_reaped(self):
+        """Once `Popen` has reaped the check, its pid is the kernel's to reissue.
+
+        With the process table unreadable there is no per-group answer, so the stop
+        falls back to the one group it knows. That is sound only while the child has
+        not been reaped: afterwards the number is free, and the escalation pass aimed
+        at it lands on whatever group now wears it - an unrelated group of this user.
+        Staged with a live process standing in for the reuse, and a check that is
+        alive when the stop begins and reaped by the time it signals.
+        """
+        victim = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        self.addCleanup(self.reap, victim)
+
+        class ReapedMidStop:
+            """Running when the stop starts, collected before it signals anything.
+
+            Wearing `victim`'s pid, which is what pid reuse looks like from here.
+            """
+
+            def __init__(self, pid):
+                self.pid = pid
+                self.polls = 0
+
+            def poll(self):
+                self.polls += 1
+                return None if self.polls == 1 else 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        signalled = []
+        real_killpg = os.killpg
+
+        def record_killpg(pgid, sig):
+            signalled.append((pgid, sig))
+            return real_killpg(pgid, sig)
+
+        real_run = subprocess.run
+
+        def ps_fails(argv, *args, **kwargs):
+            if argv and argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 1, "", "")
+            return real_run(argv, *args, **kwargs)
+
+        checks._active_check = ReapedMidStop(victim.pid)
+        self.addCleanup(setattr, checks, "_active_check", None)
+        with patch.object(checks.subprocess, "run", ps_fails), \
+             patch.object(checks.os, "killpg", record_killpg):
+            unaccounted = checks.stop_active_check(grace=0.05)
+
+        self.assertEqual(signalled, [],
+                         f"a reaped pgid was signalled without enumeration: {signalled}")
+        self.assertIsNone(victim.poll(), "an unrelated process group was signalled")
+        self.assertIn(victim.pid, unaccounted,
+                      "a stop that signalled nothing must still report itself unverified")
+
+    def test_a_nested_group_the_stop_never_discovered_still_refuses_the_next_push(self):
+        """The record must not clear itself in the very case it is written for.
+
+        When `ps` cannot be read, the only group a stop knows is the one the check
+        leads: killing the wrapper empties that group while the separately grouped
+        `swift test` it started keeps writing to the build directory. Checking the
+        recorded groups alone therefore reports "all gone", clears the record, and the
+        next push builds into the same directory. The session covers the group nobody
+        discovered - `start_new_session` makes the check a session leader, and `set -m`
+        creates groups *inside* that session.
+        """
+        marker = self.root / "nested.pid"
+        script = self.root / "leader_with_a_nested_group.py"
+        script.write_text(
+            "import os, subprocess\n"
+            "child = subprocess.Popen(['sleep', '60'], stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+            "    preexec_fn=lambda: os.setpgid(0, 0))\n"
+            f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+        )
+        # The leader exits at once, exactly as a killed wrapper does, leaving its
+        # nested group orphaned but still inside its session.
+        leader = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        session = leader.pid
+        leader.wait()
+        deadline = time.monotonic() + 30
+        while not marker.exists() or not marker.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, "the fixture never reported its child")
+            time.sleep(0.02)
+        nested = int(marker.read_text())
+
+        def kill_nested():
+            # Only while it is still in that session: the pid is free to be reused
+            # once it has gone, and this must not signal whatever took it.
+            if nested in (checks.live_session_members(session) or set()):
+                try:
+                    os.kill(nested, signal.SIGKILL)
+                except OSError:
+                    pass
+
+        self.addCleanup(kill_nested)
+
+        # The staging the finding describes: the recorded group is already empty, so a
+        # groups-only record would clear, while the session still holds the build.
+        self.assertEqual(checks.live_group_members({session}), set(),
+                         "the leader's group must be empty for this to stage the finding")
+        self.assertIn(nested, checks.live_session_members(session),
+                      "the nested group is still in the check's session")
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            checks.record_unverified_stop(self.repo, {session}, session)
+        reason = checks.unverified_reason(self.repo)
+        self.assertIsNotNone(reason, "an undiscovered nested build must still refuse the push")
+        self.assertIn(str(nested), reason)
+        self.assertTrue(checks.unverified_path(self.repo).exists(),
+                        "the record must not clear while the nested build runs")
+
+        kill_nested()
+        while checks.live_session_members(session):
+            self.assertLess(time.monotonic(), deadline, "the nested build never exited")
+            time.sleep(0.02)
+        self.assertIsNone(checks.unverified_reason(self.repo))
+        self.assertFalse(checks.unverified_path(self.repo).exists(),
+                         "the record must clear once its session is empty")
+
+    def test_the_record_is_written_before_the_check_is_signalled(self):
+        """A record written after the drain is missing when it matters.
+
+        The SIGTERM being handled is routinely followed by a SIGKILL no handler sees,
+        so a record written only once the drain finishes is never written at all - and
+        the lock dies with the process. Armed first; cleared only when the stop proves
+        the session empty.
+        """
+        script = self.root / "armed_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        existed = []
+        real_killpg = os.killpg
+
+        def record_killpg(pgid, sig):
+            existed.append(checks.unverified_path(self.repo).exists())
+            return real_killpg(pgid, sig)
+
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+        stderr = io.StringIO()
+        with patch.object(checks.os, "killpg", record_killpg), redirect_stderr(stderr):
+            checks.stop_and_record(self.repo, grace=1.0)
+        thread.join(timeout=30)
+
+        self.assertTrue(existed and existed[0],
+                        "nothing was recorded before the check was signalled")
+        self.assertNotRunning(root, "the check survived the stop")
+        self.assertFalse(checks.unverified_path(self.repo).exists(),
+                         "a stop that accounted for everything must clear the record it armed")
+
+    def test_a_record_that_cannot_be_written_is_never_reported_as_recorded(self):
+        """A suppressed write failure left the hook claiming a marker it had not made.
+
+        The next push then finds nothing, takes the lock, and builds into a directory
+        the interrupted run may still be writing to. The write cannot be made to
+        succeed, so it must at least not be reported as having succeeded.
+        """
+        def unwritable(*_args, **_kwargs):
+            raise OSError(28, "No space left on device")
+
+        stderr = io.StringIO()
+        with patch.object(checks.Path, "write_text", unwritable), redirect_stderr(stderr):
+            self.assertFalse(checks.write_unverified(self.repo, {4242}, 4242))
+            checks.record_unverified_stop(self.repo, {4242}, 4242)
+        message = stderr.getvalue()
+        self.assertIn("FAILED to record", message)
+        self.assertNotIn("The next push will refuse", message,
+                         "the hook claimed a record it could not write")
+        self.assertFalse(checks.unverified_path(self.repo).exists())
+
+    def test_only_a_plan_that_builds_takes_the_build_lock(self):
+        """The lock serializes builds, and a documentation-only push builds nothing.
+
+        Its whole plan is `git diff --check`, which cannot collide with anything, yet
+        it used to queue behind another worktree's full build for the 15-minute wait
+        and then refuse the push with status 75.
+        """
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("a plan that builds nothing must not take the build lock")
+
+        docs = checks.Plan([], [], [], {}, [checks.Check("whitespace", ["true"])], [])
+        with patch.object(checks, "single_flight", refuse):
+            self.assertEqual(checks.guarded_run(self.repo, docs, runner=lambda *_: 0), 0)
+            building = checks.Plan([], [], [], {},
+                                   [checks.Check("cargo", ["true"], builds=True)], [])
+            with self.assertRaises(AssertionError):
+                checks.guarded_run(self.repo, building, runner=lambda *_: 0)
+
+    def test_the_checks_that_claim_the_lock_are_the_ones_that_build(self):
+        """Which checks are build-capable, asserted at the selection layer."""
+        docs = checks.commands({"docs": ["README.md"]}, ["README.md"],
+                               [("base", "head")], ["head"], "Darwin")
+        self.assertTrue(docs, "a documentation push still plans its whitespace check")
+        self.assertFalse(any(check.builds for check in docs),
+                         f"a documentation push must plan no build: {[c.name for c in docs]}")
+        plan_paths = [f"{checks.PLAN}/docs/x.md"]
+        plan_only = checks.commands({"plan": plan_paths}, plan_paths, [], [], "Darwin")
+        self.assertTrue(plan_only)
+        self.assertFalse(any(check.builds for check in plan_only),
+                         f"plan validation builds nothing: {[c.name for c in plan_only]}")
+        for profile, paths in (("srtop", ["apps/srtop/src/main.rs"]), ("full", ["Cargo.toml"])):
+            for system in ("Darwin", "Linux"):
+                planned = checks.commands({profile: paths}, paths, [], [], system)
+                self.assertTrue(any(check.builds for check in planned),
+                                f"{profile} on {system} must hold the lock: "
+                                f"{[c.name for c in planned]}")
+
+
+class TargetIgnoreTests(unittest.TestCase):
+    """`target/` matched directories only, so a symlinked build cache was untracked noise."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="srui-pre-push-ignore-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        checks.git(self.repo, "init", "-q", "--initial-branch=main")
+        shutil.copyfile(ROOT / ".gitignore", self.repo / ".gitignore")
+
+    def check_ignore(self, *paths):
+        return subprocess.run(
+            ["git", "check-ignore", "-v", "--", *paths], cwd=self.repo,
+            env=checks.check_environment(), capture_output=True, text=True,
+        )
+
+    def test_a_target_symlink_is_ignored_like_a_target_directory(self):
+        cache = self.root / "buildcache"
+        cache.mkdir()
+        (self.repo / "server-rust").mkdir()
+        (self.repo / "target").mkdir()
+        os.symlink(cache, self.repo / "server-rust/target")
+        self.assertTrue((self.repo / "server-rust/target").is_symlink())
+        result = self.check_ignore("target", "server-rust/target")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 2, result.stdout)
+        self.assertEqual(checks.git(self.repo, "status", "--porcelain", "--untracked-files=all"),
+                         "?? .gitignore")
+
+    def test_neighbouring_paths_are_still_visible(self):
+        for name in ("server-rust/targets/keep.rs", "docs/target.md", "src/target.rs"):
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("keep\n")
+            with self.subTest(name=name):
+                self.assertEqual(self.check_ignore(name).returncode, 1)
+
+    def test_no_tracked_path_is_named_target(self):
+        # The unanchored pattern also matches a *file* named `target`. Nothing tracked is,
+        # and this fails the moment something becomes so, before the file silently vanishes.
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, check=True,
+                                 env=checks.check_environment(), capture_output=True, text=True)
+        named = [path for path in tracked.stdout.split("\0")
+                 if PurePosixPath(path).name == "target"]
+        self.assertEqual(named, [])
 
 
 if __name__ == "__main__":

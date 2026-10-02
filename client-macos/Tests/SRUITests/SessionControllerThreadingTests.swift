@@ -87,6 +87,7 @@ struct SessionControllerThreadingTests {
         // The applier commits before the MainActor render hop. Wait for the exact native state
         // under test rather than treating the committed revision as a render-completion signal.
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "initial transaction rendered"
         ) {
             applier.lastAppliedRevision == Revision(1)
@@ -122,6 +123,7 @@ struct SessionControllerThreadingTests {
         try await serverTransport.send(data: bytes2)
 
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "scalar transaction rendered"
         ) {
             applier.lastAppliedRevision == Revision(2)
@@ -235,6 +237,7 @@ struct SessionControllerThreadingTests {
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(mountMsg))
 
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "interaction controls rendered"
         ) {
             applier.lastAppliedRevision == Revision(1)
@@ -255,6 +258,7 @@ struct SessionControllerThreadingTests {
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(rev2Msg))
 
         try await AsyncTestSupport.eventually(
+            timeout: .roundTrip,
             description: "revision-two button rendered"
         ) {
             applier.lastAppliedRevision == Revision(2)

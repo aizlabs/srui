@@ -453,6 +453,21 @@ class SingleFlightTests(unittest.TestCase):
             entries.append((event, int(pid), int(stamp)))
         return entries
 
+    def assertNotRunning(self, pid, message):
+        """Assert `pid` is no longer a running process.
+
+        Not `os.kill(pid, 0)`: that succeeds for a **zombie** on both platforms, so
+        where pid 1 does not reap an orphan immediately -- a container whose pid 1 is
+        a plain shell, which is where CI runs -- a correctly killed child still
+        answers. The state column is the same evidence `live_group_members` uses, and
+        an uncollected exit status is not a process using the build directory.
+        """
+        row = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                             stdout=subprocess.PIPE, text=True, check=False)
+        state = row.stdout.strip()
+        self.assertTrue(state == "" or state.startswith("Z"),
+                        f"{message} (pid {pid} is in state {state!r})")
+
     def await_holder(self, process):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -522,8 +537,7 @@ class SingleFlightTests(unittest.TestCase):
         # By the time the hook is gone - and so by the time the lock is free - the
         # check must be gone too. No sleep here on purpose: a grace period would let
         # the assertion pass for a build that is merely slow to notice.
-        with self.assertRaises(OSError, msg="the check outlived the hook that held the lock"):
-            os.kill(child, 0)
+        self.assertNotRunning(child, "the check outlived the hook that held the lock")
 
     def test_a_nested_process_group_is_stopped_with_the_check(self):
         """A wrapper's own process group must not outlive the lock either.
@@ -567,8 +581,7 @@ class SingleFlightTests(unittest.TestCase):
         os.kill(hook.pid, signal.SIGTERM)
         stdout, stderr = hook.communicate(timeout=60)
         self.assertNotEqual(hook.returncode, 0, stdout + stderr)
-        with self.assertRaises(OSError, msg="a nested process group outlived the lock"):
-            os.kill(nested, 0)
+        self.assertNotRunning(nested, "a nested process group outlived the lock")
 
     def test_a_drained_check_costs_no_second_grace_window_and_no_stale_signal(self):
         """A check that dies on SIGTERM must end the stop, not start a SIGKILL pass.
@@ -614,8 +627,7 @@ class SingleFlightTests(unittest.TestCase):
                          "the root pid was signalled by number; after reaping it may be reused")
         self.assertNotIn(("kill", root, signal.SIGKILL), signals,
                          "the root pid was signalled by number; after reaping it may be reused")
-        with self.assertRaises(OSError):
-            os.kill(root, 0)
+        self.assertNotRunning(root, "the check survived the stop")
 
     def test_a_zombie_in_the_group_does_not_count_as_a_live_member(self):
         """An uncollected exit status is not a process still using the build directory.

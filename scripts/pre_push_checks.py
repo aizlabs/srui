@@ -52,6 +52,10 @@ class LockBusy(RuntimeError):
     """Another push held the single-flight lock past the bounded wait."""
 
 
+# How long a signalled check is given to stop before, and then after, SIGKILL.
+CHECK_STOP_GRACE_SECONDS = 5.0
+
+
 @dataclass
 class Check:
     name: str
@@ -257,9 +261,9 @@ def run_plan(repo: Path, plan: Plan) -> int:
     require_candidate(repo, plan.targets)
     for check in plan.checks:
         print(f"\n== {check.name}: {shlex.join(check.argv)}", flush=True)
-        result = subprocess.run(check.argv, cwd=repo, stdin=subprocess.DEVNULL, env=check_environment())
-        if result.returncode:
-            print(f"FAILED: {check.name} (exit {result.returncode}); push aborted.", file=sys.stderr)
+        status = run_check(check.argv, repo)
+        if status:
+            print(f"FAILED: {check.name} (exit {status}); push aborted.", file=sys.stderr)
             return 1
     # Detect source changes caused by generators/tests rather than certify a
     # different tree. Ignored build artifacts do not make the checkout dirty.
@@ -350,13 +354,63 @@ def single_flight(repo: Path, timeout: float | None = None,
         os.close(handle)
 
 
+# The check this process is currently waiting on, as its own process group.
+_active_check: subprocess.Popen | None = None
+
+
+def run_check(argv: list[str], cwd: Path) -> int:
+    """Run one check in its own process group and wait for it.
+
+    Its own group, so a signal delivered to this hook alone can still stop the
+    build: `git` sends the hook a signal, not the group, and a cargo or SwiftPM
+    child that outlives the hook keeps the shared build directory busy while the
+    lock is already gone -- after which the next push acquires the lock and starts
+    a second build into it, which is the overlap the lock exists to prevent.
+    """
+    global _active_check
+    process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                               env=check_environment(), start_new_session=True)
+    _active_check = process
+    try:
+        return process.wait()
+    finally:
+        _active_check = None
+
+
+def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
+    """Stop the running check's whole process group, and wait for it to go.
+
+    Waiting is the point: the lock must outlive the build it was taken for, so
+    this returns only once nothing is left writing to the build directory. The
+    group, not the pid, because cargo and swift spawn children of their own.
+    """
+    process = _active_check
+    if process is None or process.poll() is not None:
+        return
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, grace)):
+        with contextlib.suppress(OSError, ProcessLookupError):
+            os.killpg(process.pid, sig)
+        try:
+            process.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def install_release_on_signal():
-    """Turn termination signals into SystemExit so the lock's cleanup still runs."""
+    """Turn termination signals into SystemExit so the lock's cleanup still runs.
+
+    The running check is stopped *before* the lock unwinds, so the lock is never
+    released while a build it was protecting is still going.
+    """
     def terminate(signum, _frame):
+        stop_active_check()
         raise SystemExit(128 + signum)
 
     previous = {}
-    for name in ("SIGTERM", "SIGHUP"):
+    # SIGINT too: a check in its own process group no longer receives the ^C that
+    # the terminal sends to the foreground group, so this handler has to pass it on.
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
         number = getattr(signal, name, None)
         if number is None:
             continue

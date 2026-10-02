@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -353,6 +354,22 @@ class GitFixture(unittest.TestCase):
 # Runs checks.guarded_run with a stub runner, so the single-flight behaviour is proved
 # without the real multi-minute cargo/SwiftPM checks. Every lock transition is appended
 # to one shared log; time.monotonic is system-wide, so the stamps order across processes.
+# A hook run whose single check is a long-running script, driven through the real
+# `run_plan` so the child is spawned exactly as a cargo or SwiftPM check would be.
+SIGNAL_HELPER = '''
+import importlib.util, sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("pre_push_checks", sys.argv[1])
+checks = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = checks
+spec.loader.exec_module(checks)
+
+repo, script = Path(sys.argv[2]), sys.argv[3]
+plan = checks.Plan([], [], [], {}, [checks.Check("slow", [script])], [])
+raise SystemExit(checks.guarded_run(repo, plan, timeout=30, poll=0.02))
+'''
+
 LOCK_HELPER = '''
 import importlib.util, os, sys, time
 from pathlib import Path
@@ -462,6 +479,50 @@ class SingleFlightTests(unittest.TestCase):
         self.assertGreaterEqual(
             second_enter, first_exit,
             "the second push ran its checks while the first still held the lock")
+
+    def test_a_signalled_hook_stops_its_check_before_releasing_the_lock(self):
+        """The lock must outlive the build it was taken for.
+
+        `git` signals the hook, not its process group. A check left running after the
+        hook exits keeps writing to the shared build directory while the lock is
+        already gone, and the next push then acquires the lock and starts a second
+        build into it - the overlap this mechanism exists to prevent.
+        """
+        marker = self.root / "check.pid"
+        script = self.root / "slow_check.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' \"$$\" > {marker}\n"
+            "sleep 60\n"
+        )
+        script.chmod(0o755)
+        helper = self.root / "signal_helper.py"
+        helper.write_text(SIGNAL_HELPER)
+        hook = subprocess.Popen(
+            [sys.executable, str(helper), str(ROOT / checks.SCRIPT), str(self.repo),
+             str(script)],
+            cwd=str(self.repo), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.addCleanup(self.reap, hook)
+
+        deadline = time.monotonic() + 30
+        while not marker.exists():
+            self.assertIsNone(hook.poll(), "the hook exited before running its check")
+            self.assertLess(time.monotonic(), deadline, "the check never started")
+            time.sleep(0.02)
+        child = int(marker.read_text())
+        os.kill(child, 0)  # Running, and ours to observe.
+
+        os.kill(hook.pid, signal.SIGTERM)  # The hook alone, exactly as git does.
+        stdout, stderr = hook.communicate(timeout=60)
+        self.assertNotEqual(hook.returncode, 0, stdout + stderr)
+
+        # By the time the hook is gone - and so by the time the lock is free - the
+        # check must be gone too. No sleep here on purpose: a grace period would let
+        # the assertion pass for a build that is merely slow to notice.
+        with self.assertRaises(OSError, msg="the check outlived the hook that held the lock"):
+            os.kill(child, 0)
 
     def test_a_plan_with_no_checks_never_waits_for_the_lock(self):
         """A deletion-only push plans no checks, so it must not queue behind a build.

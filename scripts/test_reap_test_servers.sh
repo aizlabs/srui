@@ -1714,6 +1714,33 @@ fi
 kill_marker "${sshd39_pid:-}"
 kill_marker "${cargo39_pid:-}"
 
+echo "case 42: a config path that only looks like a fixture's is not ownership"
+# `/tmp/srui-bait/../production-sshd_config` carries the fixture prefix letter for letter while
+# naming a file outside every fixture directory, and a symlink inside one does the same. Rule 6 was
+# fixed for exactly this; rule 7 compared spellings until now. Both escapes are staged, and both
+# configs declare the subsystem, so the *only* thing that can spare them is resolving the path.
+escape_root="$sandbox/tmp/srui-bait"
+mkdir -p "$escape_root"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sandbox/tmp/production-sshd_config"
+mkdir -p "$sandbox/outside"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sandbox/outside/sshd_config"
+ln -sfn "$sandbox/outside/sshd_config" "$escape_root/linked_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$escape_root/../production-sshd_config"
+dotdot_pid=$spawned_pid
+spawn_orphan_with_args "$fixture_sshd" -f "$escape_root/linked_config"
+linked_pid=$spawned_pid
+if [ -z "${dotdot_pid:-}" ] || [ -z "${linked_pid:-}" ]; then
+    fail "could not stage the sshd processes whose config escapes the fixture directory"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$dotdot_pid" "an sshd whose -f escapes the fixture directory through .. survived"
+    assert_alive "$linked_pid" "an sshd whose -f is a symlink out of the fixture directory survived"
+fi
+kill_marker "${dotdot_pid:-}"
+kill_marker "${linked_pid:-}"
+
 echo "case 41: a listener that rewrote its process title is still a rule-7 candidate"
 # A real `sshd -D` rewrites argv to `sshd: /usr/sbin/sshd -f … [listener]`. No prefix of that names
 # an existing file, so argv[0] falls back to the first token, `sshd:` - and a guard that accepted

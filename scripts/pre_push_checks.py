@@ -54,6 +54,11 @@ class LockBusy(RuntimeError):
 
 # How long a signalled check is given to stop before, and then after, SIGKILL.
 CHECK_STOP_GRACE_SECONDS = 5.0
+# Records a stop that could not prove the build directory was quiet again.
+UNVERIFIED_FILE = "srui-pre-push-unverified"
+# Exit status for a push refused because of such a record: not a failed check (1),
+# and not a lock held by a live run (75).
+UNVERIFIED_STATUS = 76
 
 
 @dataclass
@@ -340,7 +345,7 @@ def single_flight(repo: Path, timeout: float | None = None,
                     "the only gate."
                 )
             time.sleep(poll)
-        restore = install_release_on_signal()
+        restore = install_release_on_signal(repo)
         try:
             os.ftruncate(handle, 0)
             os.pwrite(handle, f"{os.getpid()}\n".encode(), 0)
@@ -481,6 +486,31 @@ def check_process_tree(root: int) -> tuple[set[int], set[int]] | None:
     return (tree | members) - mine, groups
 
 
+def live_groups(groups: set[int]) -> dict[int, set[int]] | None:
+    """The members of each of `groups` that are still live, keyed by group.
+
+    Per group, not in aggregate: when a check owns several groups and one drains
+    while another is still running, signalling *every* accumulated group again
+    would aim the escalation at a group whose leader pid has since been reissued -
+    the pid-reuse hazard, one level up. Only groups present here may be signalled.
+    """
+    members = live_group_members(groups)
+    if members is None:
+        return None
+    listing = process_listing("pid=,pgid=")
+    if listing is None:
+        return None
+    by_group: dict[int, set[int]] = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not all(field.isdigit() for field in fields):
+            continue
+        pid, pgid = int(fields[0]), int(fields[1])
+        if pid in members:
+            by_group.setdefault(pgid, set()).add(pid)
+    return by_group
+
+
 def live_group_members(groups: set[int]) -> set[int] | None:
     """Which processes still belong to `groups`, excluding this push's own.
 
@@ -512,8 +542,12 @@ def live_group_members(groups: set[int]) -> set[int] | None:
     return live
 
 
-def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
+def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
     """Stop everything the running check started, and wait for all of it to go.
+
+    Returns the process groups it could **not** prove are gone - empty when the
+    drain was verified. The caller records a non-empty answer, because mutual
+    exclusion has to survive this process's death: see [`record_unverified_stop`].
 
     Waiting is the point: the lock must outlive the build it was taken for, so
     this returns only once nothing is left writing to the build directory.
@@ -541,10 +575,15 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
             tree = check_process_tree(process.pid)
             if tree is not None:
                 groups |= tree[1]
-        members = live_group_members(groups)
-        if members == set():
+        alive = live_groups(groups)
+        if alive == {}:
             break
-        for pgid in sorted(groups):
+        # Only groups with a live member right now. An unreadable table yields no
+        # per-group answer, so the known group is signalled on its own: it is the one
+        # pgid that cannot have been reissued, because this process still holds the
+        # child that leads it.
+        targets = sorted(alive) if alive is not None else [process.pid]
+        for pgid in targets:
             with contextlib.suppress(OSError, ProcessLookupError):
                 os.killpg(pgid, sig)
         deadline = time.monotonic() + grace
@@ -555,21 +594,83 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
             # Only an *answered* enumeration can end the wait. `None` is "cannot
             # tell", and treating it as drained is precisely how the lock would be
             # released over a build still running.
-            if live_group_members(groups) == set():
+            if live_groups(groups) == {}:
                 drained = True
                 break
             time.sleep(0.05)
         if drained:
             break
-    if live_group_members(groups) is None:
-        print("pre-push: could not read the process table while stopping the checks; "
-              f"signalled process group(s) {sorted(groups)} and waited for the check "
-              "itself. If a build survived, kill it before pushing again.", file=sys.stderr)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=grace)
+    remaining = live_groups(groups)
+    if remaining == {}:
+        return set()
+    # Either a group is still alive, or the table could not be read at all. Both mean
+    # the same thing to the caller: this push cannot promise the build directory is
+    # quiet, and the next one must not start a build into it on trust.
+    return groups if remaining is None else set(remaining)
 
 
-def install_release_on_signal():
+def unverified_path(repo: Path) -> Path:
+    """Where an unverifiable stop is recorded, beside the lock it could not vouch for."""
+    return lock_path(repo).with_name(UNVERIFIED_FILE)
+
+
+def record_unverified_stop(repo: Path, groups: set[int]) -> None:
+    """Record that a stopped run could not prove its build had finished.
+
+    A lock cannot outlive the process holding it - flock is released when the fd
+    closes, which is exactly what makes it safe against a crash. So when a stop
+    cannot prove the build directory is quiet, the *fact* has to outlive the
+    process instead: the next push reads this and refuses to build into the same
+    directory on trust. Concretely, this is the case where `ps` is unavailable and
+    `scripts/run-swift-tests.sh` has put `swift test` in a group of its own
+    (`set -m`, and it installs no signal trap), so the nested build cannot be
+    discovered, let alone awaited.
+    """
+    with contextlib.suppress(OSError):
+        unverified_path(repo).write_text(
+            json.dumps({"pid": os.getpid(), "groups": sorted(groups)}) + "\n"
+        )
+    print(f"pre-push: could not confirm the interrupted checks had stopped; recorded "
+          f"{unverified_path(repo)}. The next push will refuse until process group(s) "
+          f"{sorted(groups)} are gone.", file=sys.stderr)
+
+
+def unverified_reason(repo: Path) -> str | None:
+    """Why this push must not run checks yet, or `None` when it may.
+
+    Self-clearing in the ordinary case: the marker names the groups a previous run
+    left unaccounted for, so once none of them has a live member the leftover build
+    really is gone and the marker is removed. It is kept - and the push refused -
+    while any of them still runs, or while the process table cannot be read at all,
+    because neither of those is proof of anything.
+    """
+    path = unverified_path(repo)
+    try:
+        recorded = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return (f"{path} exists but could not be read. A previous push could not confirm "
+                "its checks had stopped; make sure no cargo or swift build is running, "
+                "then delete that file.")
+    groups = {int(group) for group in recorded.get("groups", [])}
+    members = live_group_members(groups)
+    if members is None:
+        return (f"a previous push could not confirm its checks had stopped ({path}), and "
+                "the process table cannot be read to check now. Make sure no cargo or "
+                "swift build is running, then delete that file.")
+    if members:
+        return (f"a previous push left process(es) {sorted(members)} running in group(s) "
+                f"{sorted(groups)}. They are still writing to the build directory this "
+                f"push would build into. Stop them, or wait, then push again ({path}).")
+    with contextlib.suppress(OSError):
+        path.unlink()
+    return None
+
+
+def install_release_on_signal(repo: Path):
     """Turn termination signals into SystemExit so the lock's cleanup still runs.
 
     The running check is stopped *before* the lock unwinds, so the lock is never
@@ -580,7 +681,9 @@ def install_release_on_signal():
         # unwind `single_flight` and release the lock over a check still running,
         # which is the one outcome the handler exists to prevent.
         try:
-            stop_active_check()
+            unverified = stop_active_check()
+            if unverified:
+                record_unverified_stop(repo, unverified)
         except BaseException as error:  # noqa: BLE001 - deliberately total
             print(f"pre-push: stopping the checks failed: {error!r}", file=sys.stderr)
         raise SystemExit(128 + signum)
@@ -620,6 +723,11 @@ def guarded_run(repo: Path, plan: Plan, runner=run_plan, **lock) -> int:
         return runner(repo, plan)
     try:
         with single_flight(repo, **lock):
+            # Inside the lock, so two pushes cannot race on clearing the record.
+            refusal = unverified_reason(repo)
+            if refusal is not None:
+                print(f"pre-push: {refusal}", file=sys.stderr)
+                return UNVERIFIED_STATUS
             return runner(repo, plan)
     except LockBusy as error:
         print(f"pre-push: {error}", file=sys.stderr)

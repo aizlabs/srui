@@ -512,16 +512,31 @@ declares_srui_subsystem() {
 # happens to exist in /tmp today - so the test would pass or fail depending on the machine's litter
 # rather than on the pattern. (The self-test hit exactly that: see its case 21.)
 inside_fixture_directory() {
-    local path=$1 glob
+    local path=$1 glob resolved pattern directory
     [ -n "$path" ] || return 1
     case $path in /*) ;; *) return 1 ;; esac
+    # The *resolved* file, not the spelling. `/tmp/srui-bait/../production-sshd_config`
+    # carries a fixture prefix letter for letter while naming a file outside every
+    # fixture directory, and a symlink inside one does the same - the identical defect
+    # rule 6 was fixed for, one rule along. A path that cannot be resolved (a missing
+    # directory along it) is no evidence and admits nothing.
+    resolved=$(resolved_executable "$path") || return 1
+    [ -n "$resolved" ] || return 1
     set -f
     # shellcheck disable=SC2086 # deliberate word splitting, with globbing off: a list of patterns
     set -- $tmp_globs
     set +f
     for glob in "$@"; do
-        # shellcheck disable=SC2254 # $glob is a pattern here, by design
-        case $path in $glob/*) return 0 ;; esac
+        # Both sides resolved, or neither comparison means anything: `/tmp` is a symlink
+        # to `/private/tmp` on macOS, so a resolved path would never match an unresolved
+        # `/tmp/srui-*` and rule 7 would admit nothing at all. Only the directory part is
+        # resolved - the wildcard lives in the last component, by the documented design
+        # of `SRUI_REAP_TMP_GLOBS` - and a glob whose directory does not exist matches
+        # nothing, which is the same answer it gave before.
+        directory=$(cd "$(dirname "$glob")" 2>/dev/null && pwd -P) || continue
+        pattern="${directory%/}/$(basename "$glob")"
+        # shellcheck disable=SC2254 # $pattern is a pattern here, by design
+        case $resolved in $pattern/*) return 0 ;; esac
     done
     return 1
 }

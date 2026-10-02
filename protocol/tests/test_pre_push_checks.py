@@ -709,12 +709,121 @@ class SingleFlightTests(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, "the check never registered")
             time.sleep(0.01)
         root = checks._active_check.pid
-        stderr = io.StringIO()
-        with patch.object(checks.subprocess, "run", ps_fails), redirect_stderr(stderr):
-            checks.stop_active_check(grace=1.0)
+        with patch.object(checks.subprocess, "run", ps_fails):
+            unverified = checks.stop_active_check(grace=1.0)
         thread.join(timeout=30)
         self.assertNotRunning(root, "the check survived a stop that could not enumerate")
-        self.assertIn("could not read the process table", stderr.getvalue())
+        # It killed what it knew and then said it could not vouch for the result, which
+        # is what makes the next push refuse rather than build into the same directory.
+        self.assertIn(root, unverified,
+                      "an unenumerable stop must report the group it could not verify")
+
+    def test_only_groups_with_a_live_member_are_reported(self):
+        """Per group, not in aggregate.
+
+        When a check owns several groups and one drains while another runs, signalling
+        every accumulated group again would aim the escalation at a group whose leader
+        pid may since have been reissued - the pid-reuse hazard one level up. The stop
+        loop signals exactly the keys this returns.
+        """
+        live = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        self.addCleanup(self.reap, live)
+        drained = subprocess.Popen(["true"], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        drained.wait()
+
+        by_group = checks.live_groups({live.pid, drained.pid})
+        self.assertIsNotNone(by_group)
+        self.assertIn(live.pid, by_group, "a group with a live member must be reported")
+        self.assertNotIn(drained.pid, by_group,
+                         "a drained group must not be signalled again; its pid may be reused")
+
+    def test_a_drained_group_is_never_signalled_again(self):
+        """The stop loop signals only groups with a live member *now*.
+
+        A group that has drained may have had its leader pid reissued by the kernel, so
+        signalling it again on the escalation pass can kill an unrelated group of this
+        user. Staged by discovering a group whose only member has already exited.
+        """
+        stale = subprocess.Popen(["true"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        stale.wait()
+        script = self.root / "two_group_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        signalled = []
+        real_killpg = os.killpg
+
+        def record_killpg(pgid, sig):
+            signalled.append(pgid)
+            return real_killpg(pgid, sig)
+
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+        with patch.object(checks, "check_process_tree",
+                          lambda pid: ({pid}, {pid, stale.pid})), \
+             patch.object(checks.os, "killpg", record_killpg):
+            checks.stop_active_check(grace=1.0)
+        thread.join(timeout=30)
+
+        self.assertIn(root, signalled, "the live group must still be signalled")
+        self.assertNotIn(stale.pid, signalled,
+                         "a drained group was signalled again; its pid may have been reused")
+        self.assertNotRunning(root, "the check survived the stop")
+
+    def test_a_push_is_refused_while_an_unverified_stop_is_recorded(self):
+        """Mutual exclusion has to survive the death of the process holding the lock.
+
+        flock is released when the process dies - that is what makes it crash-safe - so
+        a stop that could not prove its build had finished records the fact instead, and
+        the next push refuses rather than building into the same directory on trust.
+        """
+        live = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        self.addCleanup(self.reap, live)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            checks.record_unverified_stop(self.repo, {live.pid})
+        self.assertTrue(checks.unverified_path(self.repo).exists())
+
+        ran = []
+        plan = checks.Plan([], [], [], {}, [checks.Check("stub", ["true"])], [])
+        with redirect_stderr(stderr):
+            status = checks.guarded_run(self.repo, plan, runner=lambda *_: ran.append(1) or 0,
+                                        timeout=5, poll=0.02)
+        self.assertEqual(status, checks.UNVERIFIED_STATUS)
+        self.assertEqual(ran, [], "the refused push must run no check")
+        self.assertIn(str(live.pid), stderr.getvalue())
+
+        # Self-clearing once the leftover is gone: the record names the groups, so the
+        # next push can tell for itself rather than needing a human to delete a file.
+        live.kill()
+        live.wait()
+        with redirect_stderr(stderr):
+            status = checks.guarded_run(self.repo, plan, runner=lambda *_: ran.append(2) or 0,
+                                        timeout=5, poll=0.02)
+        self.assertEqual(status, 0)
+        self.assertEqual(ran, [2])
+        self.assertFalse(checks.unverified_path(self.repo).exists(),
+                         "the record must clear itself once its groups are gone")
+
+    def test_an_unreadable_record_refuses_rather_than_assuming(self):
+        checks.unverified_path(self.repo).write_text("not json\n")
+        reason = checks.unverified_reason(self.repo)
+        self.assertIsNotNone(reason)
+        self.assertIn("could not be read", reason)
+        self.assertTrue(checks.unverified_path(self.repo).exists(),
+                        "an unreadable record must be left for a human")
 
     def test_the_handled_signals_are_blocked_while_a_check_is_registered(self):
         """No window between spawning a check and recording it.

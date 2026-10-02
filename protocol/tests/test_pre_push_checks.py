@@ -357,6 +357,37 @@ class GitFixture(unittest.TestCase):
 # to one shared log; time.monotonic is system-wide, so the stamps order across processes.
 # A hook run whose single check is a long-running script, driven through the real
 # `run_plan` so the child is spawned exactly as a cargo or SwiftPM check would be.
+def nested_group_wrapper(marker: Path) -> str:
+    """A check whose own child sits in a *separate* process group, like the real one.
+
+    `scripts/run-swift-tests.sh` gets that shape from `set -m`, but a fixture cannot
+    lean on shell job control: `/bin/sh` is dash on Ubuntu, and with no controlling tty
+    it prints `set: can't access tty; job control turned off` and leaves the background
+    job in the wrapper's *own* group. Measured in `ubuntu:24.04` - dash reports the job
+    and the wrapper in one group, bash gives the job its own - so the shell fixture
+    staged nothing on Linux while passing on macOS, where `/bin/sh` is bash. `setpgid`
+    asks the kernel directly and depends on no shell at all.
+
+    The nested child is handed DEVNULL so it cannot hold the hook's stdout/stderr pipes
+    open: a leak that inherits them turns the test's wait into an EOF wedge instead of
+    the assertion it is trying to make.
+
+    It reports its *own* group as well as the child's pid, because that is what a test
+    has to compare against to know the fixture staged anything. Comparing the child to
+    the **hook's** group proved nothing: `run_check` already starts the check in a
+    session of its own, so the child differs from the hook's group whether or not it
+    was ever moved into a group of its own.
+    """
+    return (
+        "import os, subprocess\n"
+        "child = subprocess.Popen(['sleep', '60'], stdin=subprocess.DEVNULL,\n"
+        "                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        "                         preexec_fn=lambda: os.setpgid(0, 0))\n"
+        f"open({str(marker)!r}, 'w').write('%d %d' % (child.pid, os.getpgid(0)))\n"
+        "child.wait()\n"
+    )
+
+
 SIGNAL_HELPER = '''
 import importlib.util, sys
 from pathlib import Path
@@ -366,8 +397,9 @@ checks = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = checks
 spec.loader.exec_module(checks)
 
-repo, script = Path(sys.argv[2]), sys.argv[3]
-plan = checks.Plan([], [], [], {}, [checks.Check("slow", [script], builds=True)], [])
+# argv[3:] so a check can be an interpreter plus a script, not only an executable.
+repo, argv = Path(sys.argv[2]), sys.argv[3:]
+plan = checks.Plan([], [], [], {}, [checks.Check("slow", argv, builds=True)], [])
 raise SystemExit(checks.guarded_run(repo, plan, timeout=30, poll=0.02))
 '''
 
@@ -452,6 +484,13 @@ class SingleFlightTests(unittest.TestCase):
             event, pid, stamp = line.split()
             entries.append((event, int(pid), int(stamp)))
         return entries
+
+    def nested_report(self, marker):
+        """The nested pid and its wrapper's process group, once the fixture reports both."""
+        fields = marker.read_text().split()
+        if len(fields) != 2:
+            return None
+        return int(fields[0]), int(fields[1])
 
     def state_of(self, pid):
         """The process's state letter, empty when it is gone from the table."""
@@ -553,42 +592,40 @@ class SingleFlightTests(unittest.TestCase):
         further in.
         """
         marker = self.root / "nested.pid"
-        script = self.root / "wrapper.sh"
-        script.write_text(
-            "#!/bin/sh\n"
-            "set -m\n"          # exactly what run-swift-tests.sh does
-            "sleep 60 &\n"
-            f"printf '%s' \"$!\" > {marker}\n"
-            "wait\n"
-        )
-        script.chmod(0o755)
+        script = self.root / "wrapper.py"
+        script.write_text(nested_group_wrapper(marker))
         helper = self.root / "signal_helper.py"
         helper.write_text(SIGNAL_HELPER)
         hook = subprocess.Popen(
             [sys.executable, str(helper), str(ROOT / checks.SCRIPT), str(self.repo),
-             str(script)],
+             sys.executable, str(script)],
             cwd=str(self.repo), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         self.addCleanup(self.reap, hook)
 
         deadline = time.monotonic() + 30
-        while not marker.exists() or not marker.read_text().strip():
+        while not marker.exists() or self.nested_report(marker) is None:
             self.assertIsNone(hook.poll(), "the hook exited before the wrapper started")
             self.assertLess(time.monotonic(), deadline, "the nested job never started")
             time.sleep(0.02)
-        nested = int(marker.read_text())
+        nested, wrapper_group = self.nested_report(marker)
         os.kill(nested, 0)
-        self.assertNotEqual(os.getpgid(nested), os.getpgid(hook.pid),
+        # Against the *wrapper's* group, not the hook's: the check already leads a
+        # session of its own, so the hook's group differs either way and comparing
+        # against it passed whether or not the nested job was ever moved anywhere.
+        self.assertNotEqual(os.getpgid(nested), wrapper_group,
                             "the fixture must put the nested job in its own group")
 
         os.kill(hook.pid, signal.SIGTERM)
-        # Wait on the hook's *state*, not on `communicate`. The nested job inherited this
-        # Popen's stdout/stderr pipes, so a leaked one holds them open and `communicate`
-        # blocks on EOF until it dies -- the swift-test wedge in miniature. Waiting there
-        # first made the leak surface as a 60-second `TimeoutExpired` instead of as the
-        # assertion below, which is both slower and a worse diagnostic than the defect
-        # deserves: the invariant is that nothing the check started outlives the lock.
+        # Wait on the hook's *state*, not on `communicate`. Anything the check leaves
+        # behind that inherited this Popen's stdout/stderr pipes holds them open, and
+        # `communicate` blocks on EOF until it dies -- the swift-test wedge in
+        # miniature. Waiting there first made a leak surface as a 60-second
+        # `TimeoutExpired` instead of as the assertion below, which is both slower and
+        # a worse diagnostic than the defect deserves: the invariant is that nothing the
+        # check started outlives the lock. (The fixture hands its nested job DEVNULL, so
+        # that one cannot be what holds them.)
         deadline = time.monotonic() + 30
         while self.state_of(hook.pid) not in ("", "Z"):
             self.assertLess(time.monotonic(), deadline, "the hook never exited")
@@ -965,6 +1002,77 @@ class SingleFlightTests(unittest.TestCase):
         self.assertNotIn(stranger, by_group,
                          "an unrelated group was reported as one of the check's own")
 
+    def test_a_group_whose_members_left_the_session_is_not_the_checks_group(self):
+        """pgid and state are exactly what matched before, so they cannot tell reuse.
+
+        A discovered group can drain and have its number reissued while another of the
+        check's groups is still consuming the grace window. One snapshot then shows live
+        members under that key again - someone else's - and signalling it kills unrelated
+        processes of this user. The session is the discriminator: nothing the check
+        started leaves it.
+        """
+        leader, stale, stranger = 90100, 90200, 90201
+        for pid in (leader, stale, stranger):
+            self.assertNotIn(pid, {os.getpid(), os.getppid()},
+                             "the synthetic pids must not collide with this test's own")
+        listing = f"{leader} {leader} S\n{stranger} {stale} S\n"
+        sessions = {leader: leader, stranger: 77777}
+
+        with patch.object(checks, "process_listing", lambda _columns: listing), \
+             patch.object(checks.os, "getsid", lambda pid: sessions[pid]):
+            scoped = checks.live_groups({leader, stale}, leader)
+            unscoped = checks.live_groups({leader, stale})
+
+        self.assertEqual(scoped, {leader: {leader}})
+        self.assertNotIn(stale, scoped,
+                         "a reissued pgid was reported as one of the check's own groups")
+        # Without the session there is no evidence to tell them apart, which is why the
+        # caller must pass it rather than this defaulting to something safe-looking.
+        self.assertIn(stale, unscoped)
+
+    def test_a_live_group_wearing_a_reissued_number_is_never_signalled(self):
+        """The unrelated-victim outcome, staged with a real process.
+
+        A group this check once owned has drained and the kernel has handed its number
+        to a `sleep` of this user's in a session of its own. The escalation must not
+        touch it, however alive that number looks.
+        """
+        victim = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        self.addCleanup(self.reap, victim)
+        script = self.root / "reissued_group_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        signalled = []
+        real_killpg = os.killpg
+
+        def record_killpg(pgid, sig):
+            signalled.append(pgid)
+            return real_killpg(pgid, sig)
+
+        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while checks._active_check is None:
+            self.assertLess(time.monotonic(), deadline, "the check never registered")
+            time.sleep(0.01)
+        root = checks._active_check.pid
+
+        # Discovery reports a group the check used to own; the victim wears that number
+        # now, and leads its own session because it was started with `start_new_session`.
+        with patch.object(checks, "check_process_tree",
+                          lambda pid: ({pid}, {pid, victim.pid})), \
+             patch.object(checks.os, "killpg", record_killpg):
+            checks.stop_active_check(grace=1.0)
+        thread.join(timeout=30)
+
+        self.assertIn(root, signalled, "the check's own group must still be signalled")
+        self.assertNotIn(victim.pid, signalled,
+                         "a group outside the check's session was signalled")
+        self.assertIsNone(victim.poll(), "an unrelated process group was killed")
+        self.assertNotRunning(root, "the check survived the stop")
+
     def test_a_stop_whose_groups_are_empty_keeps_the_record_while_its_session_runs(self):
         """Accounted-for groups are not an empty session.
 
@@ -975,24 +1083,20 @@ class SingleFlightTests(unittest.TestCase):
         still writing to. Only an answered, empty session may clear it.
         """
         marker = self.root / "session_leftover.pid"
-        script = self.root / "wrapper_with_nested.sh"
-        script.write_text(
-            "#!/bin/sh\n"
-            "set -m\n"          # exactly what run-swift-tests.sh does
-            "sleep 60 &\n"
-            f"printf '%s' \"$!\" > {marker}\n"
-            "wait\n"
-        )
-        script.chmod(0o755)
-        thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+        script = self.root / "wrapper_with_nested.py"
+        script.write_text(nested_group_wrapper(marker))
+        thread = threading.Thread(target=checks.run_check,
+                                  args=([sys.executable, str(script)], self.repo))
         thread.start()
         deadline = time.monotonic() + 30
         while (checks._active_check is None or not marker.exists()
-               or not marker.read_text().strip()):
+               or self.nested_report(marker) is None):
             self.assertLess(time.monotonic(), deadline, "the nested job never started")
             time.sleep(0.02)
         root = checks._active_check.pid
-        nested = int(marker.read_text())
+        nested, wrapper_group = self.nested_report(marker)
+        self.assertNotEqual(os.getpgid(nested), wrapper_group,
+                            "the fixture must put the nested job in its own group")
 
         def kill_nested():
             # Only while it is still in that session: the pid is free once it has gone.

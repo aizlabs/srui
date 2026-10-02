@@ -127,7 +127,7 @@ enum TestFixtureDirectory {
     /// than afterwards, so the directory is never briefly world-readable while keys are
     /// about to be written into it.
     static func make(prefix: String) throws -> URL {
-        let directory = URL(fileURLWithPath: "/tmp/\(prefix)-\(UUID().uuidString.prefix(8))")
+        let directory = URL(fileURLWithPath: "/tmp/\(prefix)-\(scopedName(prefix))")
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: false,
@@ -146,7 +146,7 @@ enum TestFixtureDirectory {
     /// the reservation refuses a name that is already taken.
     static func reserve(prefix: String) throws -> URL {
         for _ in 0..<8 {
-            let directory = URL(fileURLWithPath: "/tmp/\(prefix)-\(UUID().uuidString.prefix(8))")
+            let directory = URL(fileURLWithPath: "/tmp/\(prefix)-\(scopedName(prefix))")
             if !FileManager.default.fileExists(atPath: directory.path) {
                 FixtureDirectoryRegistry.shared.add(directory.path, ownedOnly: true)
                 return directory
@@ -170,6 +170,20 @@ enum TestFixtureDirectory {
     /// observed from inside the run that installs it; the pass it runs can be, and is.
     static func releaseAll() {
         FixtureDirectoryRegistry.shared.removeAll()
+    }
+
+    /// The unique part of a fixture path: this process's pid, then randomness.
+    ///
+    /// `permitsRemoval` can only ask whether a path is a directory this *user* owns,
+    /// which does not distinguish the reserving test's directory from any other of
+    /// this user's - and for a reserved path nothing can, because the component under
+    /// test is what creates it and will not write a token this registry chose. So the
+    /// discrimination is moved into the name: a path carrying this pid is not one
+    /// another live process of this user is reaching for by accident. What remains is
+    /// a process that synthesizes a name containing both our pid and our random
+    /// suffix, which is no longer an accident.
+    private static func scopedName(_ prefix: String) -> String {
+        "\(getpid())-\(UUID().uuidString.prefix(8))"
     }
 
     /// Whether a *reserved* path, now occupied, may be recursively removed.

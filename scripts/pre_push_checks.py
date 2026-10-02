@@ -497,8 +497,18 @@ def check_process_tree(root: int) -> tuple[set[int], set[int]] | None:
     return (tree | members) - mine, groups
 
 
-def live_groups(groups: set[int]) -> dict[int, set[int]] | None:
+def live_groups(groups: set[int], session: int | None = None) -> dict[int, set[int]] | None:
     """The members of each of `groups` that are still live, keyed by group.
+
+    `session` is the check's own, and a member outside it does not count. A pgid in
+    `groups` was true when it was discovered; by the time the escalation pass runs,
+    that group can have drained and the kernel can have reissued the number while
+    another of this check's groups was still consuming the grace window. The pgid
+    then has live members again - someone else's - and one snapshot cannot tell the
+    difference, because pgid and state are exactly what matched before. The session
+    can: `run_check` makes the check a session leader and nothing it starts leaves
+    that session, so a group with no in-session member is not this check's group,
+    whatever number it wears.
 
     Per group, not in aggregate: when a check owns several groups and one drains
     while another is still running, signalling *every* accumulated group again
@@ -525,14 +535,21 @@ def live_groups(groups: set[int]) -> dict[int, set[int]] | None:
             continue
         pid, pgid, state = int(fields[0]), int(fields[1]), fields[2]
         # A zombie holds no build directory; see [`live_group_members`].
-        if state.startswith("Z") or pid in mine:
+        if state.startswith("Z") or pid in mine or pgid not in groups:
             continue
-        if pgid in groups:
-            by_group.setdefault(pgid, set()).add(pid)
+        if session is not None:
+            try:
+                if os.getsid(pid) != session:
+                    continue  # This number is someone else's group now.
+            except ProcessLookupError:
+                continue  # Exited between the snapshot and the question.
+            except OSError:
+                return None  # "Cannot tell" is never "nothing there".
+        by_group.setdefault(pgid, set()).add(pid)
     return by_group
 
 
-def live_group_members(groups: set[int]) -> set[int] | None:
+def live_group_members(groups: set[int], session: int | None = None) -> set[int] | None:
     """Which processes still belong to `groups`, excluding this push's own.
 
     Membership, not parentage: a process keeps its group when its parent dies, so
@@ -547,7 +564,7 @@ def live_group_members(groups: set[int]) -> set[int] | None:
     one kept the drain from ever succeeding, so every interrupted push burned its
     full grace window and then escalated to SIGKILL against processes already gone.
     """
-    by_group = live_groups(groups)
+    by_group = live_groups(groups, session)
     if by_group is None:
         return None
     return {pid for members in by_group.values() for pid in members}
@@ -621,6 +638,10 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
     # made it the leader of its own group, so its pid *is* that group. Everything
     # else is discovered, and discovery can fail.
     groups = {process.pid}
+    # The check's session, for the same reason: `start_new_session` made it the leader
+    # of its own session too, so nothing it started can be outside it. Every question
+    # about whether a discovered group is *still this check's* is answered against it.
+    session = process.pid
     tree = check_process_tree(process.pid)
     if tree is not None:
         groups |= tree[1]
@@ -629,7 +650,7 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
             tree = check_process_tree(process.pid)
             if tree is not None:
                 groups |= tree[1]
-        alive = live_groups(groups)
+        alive = live_groups(groups, session)
         if alive == {}:
             break
         # Only groups with a live member right now.
@@ -657,7 +678,7 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
             # Only an *answered* enumeration can end the wait. `None` is "cannot
             # tell", and treating it as drained is precisely how the lock would be
             # released over a build still running.
-            if live_groups(groups) == {}:
+            if live_groups(groups, session) == {}:
                 drained = True
                 break
             time.sleep(0.05)
@@ -665,7 +686,7 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
             break
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=grace)
-    remaining = live_groups(groups)
+    remaining = live_groups(groups, session)
     if remaining == {}:
         return set()
     # Either a group is still alive, or the table could not be read at all. Both mean
@@ -810,7 +831,10 @@ def unverified_reason(repo: Path) -> str | None:
                 "then delete that file.")
     groups = {int(group) for group in recorded.get("groups", [])}
     session = int(recorded.get("session") or 0)
-    members = live_group_members(groups)
+    # Session-scoped here too, and not only for safety: a recorded pgid the kernel has
+    # since reissued would otherwise keep having live members forever, and the record
+    # would never clear - every later push refused with status 76 by a stranger's group.
+    members = live_group_members(groups, session or None)
     in_session = live_session_members(session)
     if members is None or in_session is None:
         return (f"a previous push could not confirm its checks had stopped ({path}), and "

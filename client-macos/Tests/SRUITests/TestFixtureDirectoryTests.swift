@@ -78,6 +78,24 @@ struct TestFixtureDirectoryTests {
     /// real `release`, with a plain file at the reserved name - the shape a test cannot stage for
     /// the root-owned case, and the one that proves the guard is wired in rather than merely
     /// present: with the `permitsRemoval` check deleted, `removeItem` unlinks this file.
+    /// A reserved name no other live process of this user is reaching for: it carries
+    /// this process's pid as well as random bytes. `permitsRemoval` cannot tell our
+    /// directory from another of this user's, and for a reserved path nothing can -
+    /// the component under test creates it and writes no token of ours - so the name
+    /// is where that distinction has to live.
+    @Test("A fixture path is scoped to this process, not just randomized")
+    func fixturePathsCarryThisProcessIdentity() throws {
+        let made = try TestFixtureDirectory.make(prefix: "test-srui-scoped")
+        defer { TestFixtureDirectory.release(made) }
+        let reserved = try TestFixtureDirectory.reserve(prefix: "test-srui-scoped")
+        defer { TestFixtureDirectory.release(reserved) }
+
+        for directory in [made, reserved] {
+            #expect(directory.lastPathComponent.hasPrefix("test-srui-scoped-\(getpid())-"),
+                    "a fixture path must name the process that reserved it: \(directory.path)")
+        }
+    }
+
     @Test("Release refuses a reserved name that something else occupies")
     func releaseWillNotRemoveAForeignOccupant() throws {
         let reserved = try TestFixtureDirectory.reserve(prefix: "test-srui-occupied")

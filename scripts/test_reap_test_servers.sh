@@ -1509,9 +1509,14 @@ else
             fail "the shipped pattern does not cover $covered"
         fi
     done
-    # And still nothing else that happens to live in a build directory: the pattern is a list of
-    # known fixture names, not "anything under .build".
+    # The literal dots really are literal. Written as `\.`, the pattern reaches gawk through `-v`
+    # with its escape sequences processed - `\.build` arrives as plain `.build`, warning on stderr -
+    # and then matches any character before `build`, so an orphan under `xbuild/` is selected as
+    # SwiftPM output and `Fooxctest` as a test bundle. Both are checked here because both dots were
+    # written that way, and both were wrong.
     for spared in \
+        "/x/client-macos/xbuild/arm64-apple-macosx/debug/swiftpm-testing-helper" \
+        "/x/client-macos/.build/arm64-apple-macosx/debug/Fooxctest/Contents/MacOS/Foo" \
         "/x/client-macos/.build/arm64-apple-macosx/debug/srui-cli" \
         "/usr/bin/swift-test" \
         "/Applications/Xcode.app/Contents/Developer/usr/bin/swift-test"; do
@@ -1521,6 +1526,18 @@ else
             pass "the shipped pattern spares $(basename "$spared")"
         fi
     done
+fi
+
+echo "case 38: the shipped pattern draws no awk warning, so its dots stay literal"
+# The warning is the symptom; the wildcard match above is the defect. Checked separately because a
+# pattern can be correct today and regress the moment someone writes `\.` into it: awk's stderr is
+# the earliest signal, and a destructive script's stderr is where its notes about what it declined to
+# kill appear, so it has to stay clean.
+awk_warning=$(awk -v pattern="$shipped_pattern" 'BEGIN { if ("" ~ pattern) exit 0 }' 2>&1)
+if [ -z "$awk_warning" ]; then
+    pass "the shipped pattern compiles with no warning on this awk"
+else
+    fail "the shipped pattern warns: $awk_warning"
 fi
 
 echo "case 33: an orphaned swiftpm test process inside a checkout is reaped, outside one is not"
@@ -1613,6 +1630,43 @@ else
     assert_alive "$bare_pid" "an sshd with no -f survived"
 fi
 for pid in $survivors; do kill_marker "$pid"; done
+
+echo "case 39: a blind sweep still reaps a fixture sshd, while sparing what could be a daemon"
+# The no-evidence gate exists to protect a detached `srui-sessiond` that cannot be told from debris
+# without the socket table. An `sshd` binds no unix socket, so it can never be that daemon - but it
+# was being cleared by the same gate, which left leaked fixture sshd processes alive on every host
+# without usable `lsof`: minimal Linux images, and any machine with a detached session daemon.
+blind2_root="$sandbox/tmp39"
+blind2_default="$blind2_root/srui-$(id -u)"
+mkdir -p "$blind2_default"
+python3 -c "import socket; socket.socket(socket.AF_UNIX).bind('$blind2_default/s')" 2>/dev/null
+sshd39_dir="$blind2_root/srui-sshfix39"
+mkdir -p "$sshd39_dir"
+: >"$sshd39_dir/sshd_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$sshd39_dir/sshd_config"
+sshd39_pid=$spawned_pid
+cargo39=$(make_marker fixture-blind39)
+spawn_orphan "$cargo39"
+cargo39_pid=$spawned_pid
+if [ -z "${sshd39_pid:-}" ] || [ -z "${cargo39_pid:-}" ] || [ ! -S "$blind2_default/s" ]; then
+    fail "could not stage a blind sweep with both families present"
+else
+    output=$(PATH="$sandbox/nolsof:$PATH" \
+        SRUI_REAP_PATTERN="$(marker_pattern "$cargo39")" \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$blind2_root/srui-*" \
+        TMPDIR="$blind2_root" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        bash "$reaper" 2>&1)
+    assert_terminated "$sshd39_pid" "the fixture sshd was reaped despite no socket inventory"
+    # The family the gate is for is still spared, on the same sweep: the exemption is scoped to
+    # rule 7, not a hole in the gate.
+    assert_alive "$cargo39_pid" "a fixture server that could be a detached daemon was spared"
+    assert_contains "$output" "killing nothing a daemon could be" \
+        "the sweep said what the gate did and did not cover"
+fi
+kill_marker "${sshd39_pid:-}"
+kill_marker "${cargo39_pid:-}"
 
 echo "case 37: rules 1 and 2 apply to a fixture sshd exactly as they do to a fixture server"
 spawn_orphan_with_args "$fixture_sshd" -f "$sshd_dir/sshd_config"

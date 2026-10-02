@@ -197,7 +197,12 @@ age_seconds=$((age_minutes * 60))
 # testing helper and the test bundle's own executable, both built inside a checkout's `.build` and so
 # admitted by rule 6 exactly as a `target/debug` fixture is. `swift-test` itself is not here; see the
 # out-of-scope note above.
-pattern=${SRUI_REAP_PATTERN:-'/target/debug/(counter|srui-sessiond|coding-agent-demo|srtop)$|/\.build/[^ ]*/(swiftpm-testing-helper|[^/ ]+\.xctest/Contents/MacOS/[^/ ]+)$'}
+# The dots are bracket expressions, not `\.`: this pattern is handed to awk through `-v`, and gawk
+# processes escape sequences in those assignments - so `\.build` arrives as plain `.build`, with a
+# warning, and matches any character before `build`. An orphan under `…/xbuild/debug/` would then be
+# selected as SwiftPM output, and `Fooxctest` as a test bundle. `[.]` means the same thing to every
+# awk and warns nowhere, which is why `marker_pattern` in the self-test spells it that way too.
+pattern=${SRUI_REAP_PATTERN:-'/target/debug/(counter|srui-sessiond|coding-agent-demo|srtop)$|/[.]build/[^ ]*/(swiftpm-testing-helper|[^/ ]+[.]xctest/Contents/MacOS/[^/ ]+)$'}
 # An unusable pattern must say so rather than sweep quietly: an invalid ERE made awk fail on every
 # line and the run print a clean all-zeros summary, which reads exactly like "nothing to reap".
 # Checked by the same engine that will use it, so the verdict cannot disagree with the matcher.
@@ -722,12 +727,16 @@ default_socket_pids=$(awk -F'\t' -v leaf="$default_runtime_leaf" \
 # is therefore gated on being able to rule that daemon out independently: no socket in any default
 # runtime directory means there is nobody there to protect. A *stale* socket file stops the sweep
 # too, which is the safe way round.
+#
+# The gate covers the candidates that risk being that daemon, which is the rules 4-and-6 family. A
+# rule-7 `sshd` binds no unix socket, so it can never be the process rule 5 spares; see where the
+# gate is applied.
 kill_allowed=1
 if [ "$socket_evidence" -eq 0 ]; then
     if default_socket_present; then
         kill_allowed=0
         echo "note: no unix socket inventory (lsof) and a socket exists in a default runtime" \
-            "directory; killing nothing, because rule 5 cannot be enforced" >&2
+            "directory; killing nothing a daemon could be, because rule 5 cannot be enforced" >&2
     else
         echo "note: no unix socket inventory (lsof); no socket in any default runtime directory," \
             "so rule 5 has nothing to protect" >&2
@@ -789,13 +798,22 @@ matched_total=$((matched_total + sshd_matched))
 
 orphans=${reapable%$'\n'}
 
+# The no-evidence gate applies to the family it was written for, and only to it.
+#
+# What it protects is a detached `srui-sessiond` that cannot be told from debris without the socket
+# table: both read as `ppid 1`, and rule 5 needs the inventory to see which one holds a default
+# runtime socket. A rule-7 `sshd` is not that risk and cannot become it - it binds no unix socket at
+# all, so it is never the daemon rule 5 spares, and its admission evidence (a configuration file
+# inside a fixture directory) is read from the filesystem rather than from `lsof`. Clearing it along
+# with the rest meant that on any host without usable `lsof` - minimal Linux images, and any machine
+# with a detached session daemon running - leaked fixture sshd processes were never reaped at all.
 if [ "$kill_allowed" -eq 0 ]; then
-    ungated=$(printf '%s\n' "$orphans" | grep -c . || true)
+    ungated=$(printf '%s\n' "$orphans" | awk -F'\t' '$4 != "sshd"' | grep -c . || true)
     if [ "$ungated" -gt 0 ]; then
         echo "note: leaving $ungated otherwise reapable fixture process(es) alive: no socket" \
             "evidence to tell a detached daemon from debris" >&2
     fi
-    orphans=
+    orphans=$(printf '%s\n' "$orphans" | awk -F'\t' '$4 == "sshd"')
 fi
 
 killed=0

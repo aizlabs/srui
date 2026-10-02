@@ -366,6 +366,19 @@ STOP_SIGNALS = tuple(
 )
 
 
+def unblock_stop_signals() -> None:
+    """Clear the inherited signal mask in a freshly forked check.
+
+    A signal *mask* survives fork and exec, unlike a handler. Blocking in the
+    parent to close the registration window below therefore handed every check a
+    mask in which SIGTERM, SIGHUP and SIGINT were blocked -- so the check ignored
+    the SIGTERM sent to stop it, the drain ran to its deadline, and the lock was
+    released only after SIGKILL. Measured: `sleep` survived SIGTERM for the full
+    five seconds. The child clears the mask for itself, between fork and exec.
+    """
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, STOP_SIGNALS)
+
+
 def run_check(argv: list[str], cwd: Path) -> int:
     """Run one check in its own process group and wait for it.
 
@@ -386,7 +399,8 @@ def run_check(argv: list[str], cwd: Path) -> int:
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     try:
         process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
-                                   env=check_environment(), start_new_session=True)
+                                   env=check_environment(), start_new_session=True,
+                                   preexec_fn=unblock_stop_signals)
         _active_check = process
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
@@ -423,13 +437,19 @@ def check_process_tree(root: int) -> tuple[set[int], set[int]]:
         children.setdefault(ppid, []).append(pid)
         group_of[pid] = pgid
 
-    tree = {root}
+    # The root is a seed for the walk, not a result: once `Popen.wait` has reaped
+    # it the number is free for the kernel to reissue, and treating it as part of
+    # the check would make the drain condition never succeed and could aim the
+    # SIGKILL pass at whatever reused the pid.
+    tree: set[int] = set()
     queue = [root]
     while queue:
         for child in children.get(queue.pop(), ()):
             if child not in tree:
                 tree.add(child)
                 queue.append(child)
+    if root in group_of:
+        tree.add(root)
 
     mine = {os.getpid(), os.getppid()}
     forbidden = {0, 1, os.getpgrp()} | mine
@@ -438,32 +458,73 @@ def check_process_tree(root: int) -> tuple[set[int], set[int]]:
     return (tree | members) - mine, groups
 
 
+def live_group_members(groups: set[int]) -> set[int]:
+    """Which processes still belong to `groups`, excluding this push's own.
+
+    Membership, not parentage: a process keeps its group when its parent dies, so
+    this still sees a build whose shell has already exited.
+    """
+    if not groups:
+        return set()
+    snapshot = subprocess.run(["ps", "-eo", "pid=,pgid=,state="], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              text=True, check=False, timeout=10)
+    mine = {os.getpid(), os.getppid()}
+    live = set()
+    for line in snapshot.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        pid, pgid, state = int(fields[0]), int(fields[1]), fields[2]
+        # A zombie is an exit status nobody has collected yet, not a process still
+        # writing to the build directory: it holds no resources and cannot be
+        # signalled. Counting one kept the drain from ever succeeding, so every
+        # interrupted push burned its full grace window and then escalated to
+        # SIGKILL against processes that had already gone.
+        if state.startswith("Z"):
+            continue
+        if pgid in groups and pid not in mine:
+            live.add(pid)
+    return live
+
+
 def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> None:
     """Stop everything the running check started, and wait for all of it to go.
 
     Waiting is the point: the lock must outlive the build it was taken for, so
-    this returns only once nothing is left writing to the build directory. Groups
-    first, then any pid the groups did not cover, and the tree is re-derived
-    before each signal so a wrapper's newly created group is not missed.
+    this returns only once nothing is left writing to the build directory.
+
+    Signalling is by *process group* only, and only groups discovered from the
+    check's own tree. Never by bare pid: the direct child is reaped by `Popen` the
+    moment it exits, after which its number is free for the kernel to reissue, and
+    a later pass that signalled it could hit an unrelated process of this user. A
+    group is only signalled while it still has live members, and the groups are
+    re-derived while the root lives, so a wrapper's `set -m` group created after
+    the first pass is still caught.
     """
     process = _active_check
     if process is None or process.poll() is not None:
         return
+    _, groups = check_process_tree(process.pid)
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        pids, groups = check_process_tree(process.pid)
-        for pgid in groups:
+        if process.poll() is None:
+            groups |= check_process_tree(process.pid)[1]
+        if not live_group_members(groups):
+            break
+        for pgid in sorted(groups):
             with contextlib.suppress(OSError, ProcessLookupError):
                 os.killpg(pgid, sig)
-        for pid in pids:
-            with contextlib.suppress(OSError, ProcessLookupError):
-                os.kill(pid, sig)
         deadline = time.monotonic() + grace
+        drained = False
         while time.monotonic() < deadline:
             with contextlib.suppress(subprocess.TimeoutExpired):
                 process.wait(timeout=0.05)
-            if not check_process_tree(process.pid)[0]:
-                return
+            if not live_group_members(groups):
+                drained = True
+                break
             time.sleep(0.05)
+        if drained:
+            break
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=grace)
 

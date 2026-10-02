@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -568,6 +569,97 @@ class SingleFlightTests(unittest.TestCase):
         self.assertNotEqual(hook.returncode, 0, stdout + stderr)
         with self.assertRaises(OSError, msg="a nested process group outlived the lock"):
             os.kill(nested, 0)
+
+    def test_a_drained_check_costs_no_second_grace_window_and_no_stale_signal(self):
+        """A check that dies on SIGTERM must end the stop, not start a SIGKILL pass.
+
+        Two consequences of getting this wrong, both asserted here: every interrupted
+        push burns both grace windows, and the later pass aims SIGKILL at a pid that
+        `Popen` has already reaped -- a number the kernel is free to have reissued to
+        an unrelated process of this user.
+        """
+        script = self.root / "quick_check.sh"
+        script.write_text("#!/bin/sh\nsleep 60\n")
+        script.chmod(0o755)
+        signals = []
+        real_kill, real_killpg = os.kill, os.killpg
+
+        def record_kill(pid, sig):
+            signals.append(("kill", pid, sig))
+            return real_kill(pid, sig)
+
+        def record_killpg(pgid, sig):
+            signals.append(("killpg", pgid, sig))
+            return real_killpg(pgid, sig)
+
+        started = time.monotonic()
+        with patch.object(checks.os, "kill", record_kill), \
+             patch.object(checks.os, "killpg", record_killpg):
+            thread = threading.Thread(target=checks.run_check, args=([str(script)], self.repo))
+            thread.start()
+            deadline = time.monotonic() + 30
+            while checks._active_check is None:
+                self.assertLess(time.monotonic(), deadline, "the check never registered")
+                time.sleep(0.01)
+            root = checks._active_check.pid
+            checks.stop_active_check(grace=5.0)
+            elapsed = time.monotonic() - started
+            thread.join(timeout=30)
+
+        self.assertLess(elapsed, 5.0,
+                        f"the stop burned a grace window for a check that died: {elapsed:.2f}s")
+        self.assertNotIn(signal.SIGKILL, [sig for _kind, _target, sig in signals],
+                         f"SIGKILL was sent to a check that had already gone: {signals}")
+        self.assertNotIn(("kill", root, signal.SIGTERM), signals,
+                         "the root pid was signalled by number; after reaping it may be reused")
+        self.assertNotIn(("kill", root, signal.SIGKILL), signals,
+                         "the root pid was signalled by number; after reaping it may be reused")
+        with self.assertRaises(OSError):
+            os.kill(root, 0)
+
+    def test_a_zombie_in_the_group_does_not_count_as_a_live_member(self):
+        """An uncollected exit status is not a process still using the build directory.
+
+        A zombie holds no resources and cannot be signalled, so counting one keeps the
+        drain from ever succeeding: the stop burns its grace window and escalates to
+        SIGKILL against something that has already gone.
+        """
+        # A Python parent, not a shell: `sh` reaps its background jobs on SIGCHLD, so
+        # it leaves no zombie to observe. This one forks and deliberately never waits.
+        marker = self.root / "zombie.pid"
+        script = self.root / "leaves_a_zombie.py"
+        script.write_text(
+            "import os, sys, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os._exit(0)\n"
+            f"open({str(marker)!r}, 'w').write(str(pid))\n"
+            "time.sleep(60)\n"
+        )
+        child = subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        self.addCleanup(self.reap, child)
+
+        deadline = time.monotonic() + 30
+        while not marker.exists() or not marker.read_text().strip():
+            self.assertLess(time.monotonic(), deadline, "the fixture never reported its child")
+            time.sleep(0.02)
+        zombie = int(marker.read_text())
+
+        # Wait for it to actually be a zombie: still in the table, state Z.
+        def state_of(pid):
+            row = subprocess.run(["ps", "-o", "state=", "-p", str(pid)],
+                                 stdout=subprocess.PIPE, text=True, check=False)
+            return row.stdout.strip()
+
+        while not state_of(zombie).startswith("Z"):
+            self.assertLess(time.monotonic(), deadline, f"never became a zombie: {state_of(zombie)!r}")
+            time.sleep(0.02)
+
+        members = checks.live_group_members({child.pid})
+        self.assertIn(child.pid, members, "the live shell must count as a member")
+        self.assertNotIn(zombie, members, "a zombie was counted as a live group member")
 
     def test_the_handled_signals_are_blocked_while_a_check_is_registered(self):
         """No window between spawning a check and recording it.

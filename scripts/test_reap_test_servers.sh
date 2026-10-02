@@ -1587,7 +1587,9 @@ echo "case 35: a fixture sshd is reaped by the config it was started from, not b
 # so rule 6 can never admit it and rule 7 has to carry the whole decision.
 sshd_dir="$sandbox/tmp/srui-sshfix-$$"
 mkdir -p "$sshd_dir"
-: >"$sshd_dir/sshd_config"
+# A fixture config, written as the SSH suites write theirs: the subsystem declaration is rule 7's
+# ownership evidence, and without it the pathname alone admits nothing.
+printf 'Port 2222\nSubsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sshd_dir/sshd_config"
 fixture_sshd=$(make_foreign_marker "$sandbox/usr-local-bin" sshd)
 spawn_orphan_with_args "$fixture_sshd" -f "$sshd_dir/sshd_config"
 sshd_pid=$spawned_pid
@@ -1607,7 +1609,7 @@ kill_marker "${sshd_pid:-}"
 echo "case 36: an sshd configured from anywhere else is never signalled"
 spared_config="$sandbox/etc"
 mkdir -p "$spared_config"
-: >"$spared_config/sshd_config"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$spared_config/sshd_config"
 survivors=""
 # A service's own config; a relative path, which no snapshot can resolve; and no -f at all.
 spawn_orphan_with_args "$fixture_sshd" -f "$spared_config/sshd_config"
@@ -1631,6 +1633,31 @@ else
 fi
 for pid in $survivors; do kill_marker "$pid"; done
 
+echo "case 40: a matching pathname is not ownership; the config must be a fixture's"
+# `/tmp/srui-production/sshd_config` satisfies the name match while belonging to a daemon nobody
+# here owns, and a path need not even exist to match a glob. So the file is read and must declare
+# SRUI's own subsystem, which every fixture config writes and no system sshd serves.
+foreign_dir="$sandbox/tmp/srui-production"
+mkdir -p "$foreign_dir"
+printf 'Port 22\nSubsystem sftp /usr/lib/openssh/sftp-server\n' >"$foreign_dir/sshd_config"
+absent_dir="$sandbox/tmp/srui-absent"
+mkdir -p "$absent_dir"
+spawn_orphan_with_args "$fixture_sshd" -f "$foreign_dir/sshd_config"
+foreign_sshd_pid=$spawned_pid
+spawn_orphan_with_args "$fixture_sshd" -f "$absent_dir/sshd_config"
+absent_sshd_pid=$spawned_pid
+if [ -z "${foreign_sshd_pid:-}" ] || [ -z "${absent_sshd_pid:-}" ]; then
+    fail "could not stage the sshd processes rule 7's ownership evidence must spare"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$foreign_sshd_pid" "an sshd whose config declares no srui subsystem survived"
+    assert_alive "$absent_sshd_pid" "an sshd whose config file does not exist survived"
+fi
+kill_marker "${foreign_sshd_pid:-}"
+kill_marker "${absent_sshd_pid:-}"
+
 echo "case 39: a blind sweep still reaps a fixture sshd, while sparing what could be a daemon"
 # The no-evidence gate exists to protect a detached `srui-sessiond` that cannot be told from debris
 # without the socket table. An `sshd` binds no unix socket, so it can never be that daemon - but it
@@ -1642,7 +1669,7 @@ mkdir -p "$blind2_default"
 python3 -c "import socket; socket.socket(socket.AF_UNIX).bind('$blind2_default/s')" 2>/dev/null
 sshd39_dir="$blind2_root/srui-sshfix39"
 mkdir -p "$sshd39_dir"
-: >"$sshd39_dir/sshd_config"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sshd39_dir/sshd_config"
 spawn_orphan_with_args "$fixture_sshd" -f "$sshd39_dir/sshd_config"
 sshd39_pid=$spawned_pid
 cargo39=$(make_marker fixture-blind39)

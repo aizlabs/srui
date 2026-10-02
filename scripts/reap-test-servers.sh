@@ -116,9 +116,12 @@
 #      right to refuse. It is still this repository's debris, and when a run is killed it survives as
 #      an orphaned listener holding the fixture directory its keys live in.
 #
-#      The evidence is `-f <path>`: a path inside one of the fixture directory families this sweep
-#      already collects (`SRUI_REAP_TMP_GLOBS`). Nothing but a test writes an `sshd_config` there, so
-#      a daemon configured from one is a fixture by construction. The system's own `sshd` reads
+#      The evidence is twofold, and a pathname alone is not enough of it: the `-f <path>` must lie
+#      inside one of the fixture directory families this sweep already collects
+#      (`SRUI_REAP_TMP_GLOBS`), *and* that file must exist and declare SRUI's own subsystem
+#      (`Subsystem srui …`), which every fixture config writes and no system `sshd` serves. A name
+#      match on its own would admit a daemon configured from a person's own
+#      `/tmp/srui-production/sshd_config` - or from a path that does not exist at all. The system's own `sshd` reads
 #      `/etc/ssh/sshd_config` and is never selected; neither is one whose `-f` path is relative
 #      (nothing can say what it resolves to from a `ps` snapshot alone), one with no `-f` at all, or
 #      one belonging to another user. Rules 1, 2 and 3 apply unchanged, so a listener a running suite
@@ -213,9 +216,12 @@ fi
 # `/tmp/px0*` used to be the Process Explorer pattern; it also matches an unrelated `/tmp/px0-cache`.
 # The fixtures name their directories `px0NN-...`, so the ticket digits are spelled out.
 tmp_globs=${SRUI_REAP_TMP_GLOBS:-'/tmp/srui-* /tmp/px0[0-9][0-9]-* /tmp/srtop-*'}
-# Rule 7 matches `sshd` by name only to find candidates; what admits one is the configuration path
-# (`inside_fixture_directory`), never this pattern on its own.
+# Rule 7 matches `sshd` by name only to find candidates; what admits one is the configuration -
+# inside a fixture directory (`inside_fixture_directory`) *and* declaring SRUI's own subsystem
+# (`declares_srui_subsystem`) - never this pattern on its own.
 sshd_pattern='(^|/)sshd$'
+# Most of an `sshd_config` this sweep will read while looking for that declaration.
+MAX_CONFIG_BYTES=65536
 my_uid=$(id -u)
 failures=0
 
@@ -468,6 +474,31 @@ sshd_config_path() {
     done
 }
 
+# Rule 7's second half: does this configuration actually belong to one of our fixtures?
+#
+# A pathname is not ownership - the same objection the socket-only directory rule exists for. A
+# path under `/tmp/srui-*` can be a person's own: `/tmp/srui-production/sshd_config` would satisfy
+# the name match while belonging to a daemon nobody here owns, and the file need not even exist for
+# a path to match. So the file is read, and it must declare SRUI's own subsystem - which is what
+# every fixture config here writes (`Subsystem srui …`, see
+# `client-macos/Tests/SRUITests/SSHTransport*.swift`) and what no system `sshd` serves.
+#
+# The keyword is matched case-insensitively because `sshd_config` keywords are, and the file is read
+# through the same bounded reader as everything else. An unreadable or absent config is not evidence
+# and admits nothing.
+#
+# Residual exposure, stated rather than implied: a real SRUI deployment whose `sshd_config` lives
+# inside one of these `/tmp` families *and* declares the subsystem would still be admitted. Both at
+# once is not a configuration anything here produces; a deployment's config lives in `/etc/ssh`.
+declares_srui_subsystem() {
+    local config=$1
+    [ -f "$config" ] || return 1
+    # Bounded: a config is a small file, and this sweep never reads an unbounded one.
+    head -c "$MAX_CONFIG_BYTES" "$config" 2>/dev/null |
+        awk 'tolower($1) == "subsystem" && tolower($2) == "srui" { found = 1 }
+             END { exit !found }'
+}
+
 # Rule 7's evidence: is `path` inside one of the fixture directory families this sweep collects?
 #
 # The glob list is iterated with pathname expansion disabled. Unquoted, each pattern would be
@@ -504,6 +535,7 @@ fixture_sshd_candidates() {
         case $(basename "$exe") in sshd) ;; *) continue ;; esac
         config=$(sshd_config_path "$cmd")
         inside_fixture_directory "$config" || continue
+        declares_srui_subsystem "$config" || continue
         ticks=$(process_start_ticks "$pid")
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$pid" "$ppid" "$age" "$start" "${ticks:--}" "$config" "$exe"

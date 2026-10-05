@@ -112,24 +112,32 @@ def wait_for_pid(path: Path) -> int:
     raise AssertionError(f"PID file was not written: {path} (last read {text!r})")
 
 
-def process_state(pid: int) -> str | None:
-    """The kernel's one-letter state for `pid`, or None once no process has it."""
+def state_and_parent(pid: int) -> tuple[str, int] | None:
+    """`pid`'s one-letter state and parent PID, or None if they could not be read.
+
+    None never means the process is gone: it may have ended since the caller
+    looked, or the reader itself may have failed.
+    """
     if sys.platform == "darwin":
         result = subprocess.run(
-            ["ps", "-o", "state=", "-p", str(pid)],
+            ["ps", "-o", "state=,ppid=", "-p", str(pid)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
             timeout=5,
         )
-        return result.stdout.strip()[:1] or None
+        fields = result.stdout.split()
+        if result.returncode != 0 or len(fields) != 2 or not fields[1].isdecimal():
+            return None
+        return fields[0][:1], int(fields[1])
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
     except (FileNotFoundError, ProcessLookupError):
         return None
-    # The state follows the parenthesized command name, which may contain ")".
-    return stat[stat.rindex(")") + 2]
+    # State and parent follow the parenthesized command name, which may contain ")".
+    state, parent = stat[stat.rindex(")") + 1 :].split()[:2]
+    return state, int(parent)
 
 
 def assert_process_gone(pid: int) -> None:
@@ -139,14 +147,18 @@ def assert_process_gone(pid: int) -> None:
             os.kill(pid, 0)
         except ProcessLookupError:
             return
-        # A zombie has exited and runs nothing; it waits only for its parent to
-        # reap it, which never happens under a PID 1 that does not reap (a
-        # container started without an init). Anything still running fails.
-        if process_state(pid) in (None, "Z", "X"):
+        # A zombie has exited and runs nothing. One left to another parent waits
+        # only for that parent to reap it, which a PID 1 that does not reap (a
+        # container started without an init) never does, so it counts as gone.
+        # A zombie of this process is a child the code under test did not reap:
+        # like a running process, or one whose state cannot be read, it waits.
+        observed = state_and_parent(pid)
+        if observed and observed[0] in ("Z", "X") and observed[1] != os.getpid():
             return
         time.sleep(0.02)
     pytest.fail(
-        f"process {pid} survived supervised cleanup (state {process_state(pid)!r})"
+        f"process {pid} survived supervised cleanup "
+        f"(state and parent {state_and_parent(pid)!r})"
     )
 
 

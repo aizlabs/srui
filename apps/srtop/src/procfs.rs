@@ -23,6 +23,14 @@
 //! instance and never inherits another process's counters. The interval is
 //! measured on an injected [`MonotonicClock`], never on the wall clock that
 //! stamps [`SnapshotTime`], so a wall-clock jump cannot stretch or shrink it.
+//!
+//! Resident memory (PX-005, PX-005-G01) is read from a second file of the same
+//! record, `statm`, after the `stat` that identifies it: `stat`'s own `rss` is
+//! approximate on every kernel since Linux 6.2, while `statm`'s is exact from
+//! 6.16. Where the reader's own procfs can name an open directory
+//! (`/proc/self/fd/<n>`, on Linux), both files are read through one handle on
+//! the record's directory, so a PID reused between the two reads cannot lend its
+//! memory to the instance `stat` identified (see `RecordAccess`).
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
     DisplayName, EnumerationIssue, HostId, IssueScope, MissingReason, Observed, PidNamespaceId,
@@ -35,6 +43,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -70,9 +79,17 @@ const _: () = assert!(MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS <= DEFAULT_MAX_CACHED
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// `/proc/<pid>/stat` field 22 (start time) is the 20th field after `comm`.
 const STARTTIME_FIELD_AFTER_COMM: usize = 19;
-/// `/proc/<pid>/stat` field 24 (`rss`, resident pages) is the 22nd field after
-/// `comm` — two past the start time (K1).
-const RSS_FIELD_AFTER_COMM: usize = 21;
+/// `/proc/<pid>/statm` is seven unsigned page counts — `size resident shared
+/// text lib data dt` — separated by single spaces and ended by a newline, and
+/// `0 0 0 0 0 0 0` for a task with no address space (`proc_pid_statm` in
+/// fs/proc/array.c; K1).
+const STATM_FIELDS: usize = 7;
+/// `resident`, the second of them: the pages of the three resident counters
+/// (file, anonymous, shared memory) `task_statm` sums (fs/proc/task_mmu.c).
+const STATM_RESIDENT: usize = 1;
+/// `ESRCH`, matched by number because `io::ErrorKind` has no stable variant for
+/// it. It is 3 on every Linux architecture (`errno-base.h`).
+const ESRCH: i32 = 3;
 /// `AT_PAGESZ`: the auxiliary-vector entry through which the kernel tells a
 /// process its page size (K1, `getauxval(3)`). It is read from the scanned
 /// mount's own `self/auxv`, the same interface `sysconf(_SC_PAGESIZE)` answers
@@ -231,6 +248,63 @@ enum MountKind {
     /// even classify. Identity read through it belongs to the reader, not to the
     /// records, and is reported unavailable rather than guessed.
     Unproven,
+}
+
+/// How one scan reaches the files of each record it reads (PX-005-G01).
+///
+/// A record is read twice — `stat` for its identity, name and CPU counters,
+/// then `statm` for its resident memory — and a PID is only a number: by path,
+/// the second read reaches whichever process holds that number *now*. Linux
+/// hands a number out again only once the process that held it has been reaped
+/// and its cyclic PID allocator has come back round to that number, so by path a
+/// misattribution needs both to happen between two back-to-back reads; a pinned
+/// directory rules it out instead of relying on that. procfs binds
+/// an open `/proc/<pid>` directory to the process instance it was opened on (its
+/// `struct pid`), so once that instance is reaped every lookup through the
+/// handle fails with `ESRCH` (`proc_pid_permission`, fs/proc/base.c) and never
+/// reaches a later process under the same number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordAccess {
+    /// Each record's directory is opened once, and its files are read through
+    /// the reader's own `/proc/self/fd/<n>` link to that handle: `std` alone,
+    /// with no `openat`.
+    Pinned,
+    /// Each file is opened by its path under the scanned root. Used where the
+    /// reader has no procfs that names an open directory: every system but
+    /// Linux, and a Linux reader without its own `/proc`.
+    ByName,
+}
+
+/// One record's directory, as one scan reaches it.
+struct RecordDir {
+    /// Where this record's files are read from: the pinned handle's link, or the
+    /// record's own path under the root.
+    base: PathBuf,
+    /// The handle `base` names, held until the record has been read and never
+    /// read itself. Dropping it closes the directory.
+    _pin: Option<File>,
+}
+
+impl RecordDir {
+    fn open(path: PathBuf, access: RecordAccess) -> io::Result<Self> {
+        match access {
+            RecordAccess::ByName => Ok(Self {
+                base: path,
+                _pin: None,
+            }),
+            RecordAccess::Pinned => {
+                let pin = File::open(&path)?;
+                Ok(Self {
+                    base: fd_link(&pin),
+                    _pin: Some(pin),
+                })
+            }
+        }
+    }
+
+    fn read(&self, file: &str) -> io::Result<Vec<u8>> {
+        read_bounded(&self.base.join(file))
+    }
 }
 
 /// One-shot reader over a `/proc`-shaped directory tree.
@@ -628,6 +702,9 @@ impl ProcessSource for ProcFsSource {
         let page_size = self.page_size();
         // Likewise the tick rate the CPU counters are in.
         let ticks_per_second = self.clock_ticks();
+        // Whether each record's two reads go through one pinned directory is a
+        // property of this reader, decided once per scan (see [`RecordAccess`]).
+        let access = record_access(&self.root);
         // Baselines taken under another boot or PID namespace count other
         // process instances; none of them may be subtracted from this scan's.
         // Both components are checked, so neither short-circuits the other's
@@ -711,12 +788,32 @@ impl ProcessSource for ProcFsSource {
                 }
                 continue;
             }
-            match read_bounded(&self.root.join(&name).join("stat")) {
+            // Both of this record's reads go through one directory, pinned where
+            // this reader can pin it (see [`RecordAccess`]).
+            let directory = match RecordDir::open(self.root.join(&name), access) {
+                Ok(directory) => directory,
+                // Gone before its directory could be pinned: the same churn as a
+                // `stat` that is already gone, below.
+                Err(error) if ended(&error) => {
+                    vanished += 1;
+                    continue;
+                }
+                Err(error) => {
+                    skipped.record(pid);
+                    record_issue(&mut issues, || EnumerationIssue {
+                        scope: IssueScope::Process(pid),
+                        reason: reason_for(&error),
+                        detail: format!("{pid}: {error}"),
+                    });
+                    continue;
+                }
+            };
+            match directory.read("stat") {
                 // The process exited between listing the root and reading it.
                 // Nothing was inaccessible: the record no longer exists at sample
                 // time, which is ordinary churn on any busy host, so it is
                 // counted apart and does not degrade the scan.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(error) if ended(&error) => {
                     vanished += 1;
                 }
                 // One unreadable record is skipped with a reason; it never fails
@@ -741,6 +838,29 @@ impl ProcessSource for ProcFsSource {
                         });
                     }
                     (read_at, Some(stat)) => {
+                        // Resident memory is read second, from the same
+                        // directory: `statm`'s `resident`, which the kernel sums
+                        // exactly from Linux 6.16, where `stat` field 24 stays
+                        // approximate on every kernel since 6.2 (PX-005-G01).
+                        let resident_pages = match directory.read("statm") {
+                            // The process ended between its own two reads, so it
+                            // no longer exists at sample time — exactly like one
+                            // whose `stat` was already gone. It is counted as
+                            // vanished, never published with half a sample, and
+                            // no counter baseline is kept for it.
+                            Err(error) if ended(&error) => {
+                                vanished += 1;
+                                continue;
+                            }
+                            // Refused, or failed for another reason: this one
+                            // field is unread, with that reason, and the record
+                            // is still published (PX-005).
+                            Err(error) => Observed::Missing(reason_for(&error)),
+                            Ok(bytes) => match parse_statm_resident(&bytes) {
+                                Some(pages) => Observed::Known(pages),
+                                None => Observed::Missing(MissingReason::Unavailable),
+                            },
+                        };
                         // The instance is the PID *and* its creation token: a
                         // reused PID is a different key, so it warms up instead
                         // of inheriting the counters of the process it replaced.
@@ -769,7 +889,7 @@ impl ProcessSource for ProcFsSource {
                                 creation: CreationToken::LinuxBootTicks(stat.start_ticks),
                             },
                             display_name: stat.display_name,
-                            resident: resident_bytes(stat.resident_pages, &page_size),
+                            resident: resident_bytes(resident_pages, &page_size),
                             cpu,
                         });
                     }
@@ -924,6 +1044,38 @@ fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Whether a read failed because the process it was reading no longer exists:
+/// by path its PID's directory is gone (`ENOENT`), and through a pinned
+/// directory the directory is still held but the instance it was opened on has
+/// been reaped (`ESRCH`, see [`RecordAccess`]). Either access can meet either
+/// error, and both are an exit during the scan, never an unreadable record.
+fn ended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
+}
+
+/// Whether this reader can pin record directories under `root`: it opens the
+/// root itself and checks that its own `/proc/self/fd/<n>` link reaches the very
+/// directory it opened. Decided per scan, so a reader without that link reads by
+/// name instead of taking every record's missing link for a process that ended.
+fn record_access(root: &Path) -> RecordAccess {
+    let Ok(directory) = File::open(root) else {
+        return RecordAccess::ByName;
+    };
+    match (std::fs::metadata(fd_link(&directory)), directory.metadata()) {
+        (Ok(linked), Ok(opened))
+            if linked.dev() == opened.dev() && linked.ino() == opened.ino() =>
+        {
+            RecordAccess::Pinned
+        }
+        _ => RecordAccess::ByName,
+    }
+}
+
+/// The reader's own name for an open handle, through its own procfs.
+fn fd_link(handle: &File) -> PathBuf {
+    Path::new(DEFAULT_PROC_ROOT).join(format!("self/fd/{}", handle.as_raw_fd()))
+}
+
 /// Accepts only a plain positive decimal PID directory name.
 pub fn parse_pid(name: &[u8]) -> Option<u32> {
     if name.is_empty() || name.len() > 10 || !name.iter().all(u8::is_ascii_digit) {
@@ -954,28 +1106,26 @@ pub struct StatFields {
     /// Field 22: start time in kernel clock ticks since boot. Mandatory — it is
     /// this record's creation token, and a record without one is not identified.
     pub start_ticks: u64,
-    /// Field 24: resident pages, when the line carries a parsable one.
-    ///
-    /// Optional where the creation token is not, because a metric is not an
-    /// identity: a line that stops before field 24, or whose field 24 is not a
-    /// plain count, still names an identified process whose resident memory this
-    /// scan could not read. It is reported unread rather than published as zero.
-    pub resident_pages: Option<u64>,
     /// Fields 14 and 15 summed: user plus kernel CPU time in clock ticks, when
-    /// both are plain counts and their sum fits. Optional for the same reason as
-    /// `resident_pages`: an unreadable counter is an unread metric, not a missing
-    /// process, and it is reported unread rather than as zero.
+    /// both are plain counts and their sum fits. Optional where the creation
+    /// token is not, because a metric is not an identity: an unreadable counter
+    /// is an unread metric of an identified process, not a missing process, and
+    /// it is reported unread rather than as zero.
     pub cpu_ticks: Option<u64>,
 }
 
-/// Parses `comm`, the creation token, the resident page count and the CPU
-/// counters out of one `/proc/<pid>/stat` line.
+/// Parses `comm`, the creation token and the CPU counters out of one
+/// `/proc/<pid>/stat` line.
 ///
 /// `comm` is raw bytes wrapped in parentheses and may itself contain spaces,
 /// parentheses, control characters and invalid UTF-8 (K1). Fields are therefore
 /// located from the first `(` and the **last** `)`, never by splitting on
 /// whitespace, so a hostile name cannot shift the field indices. The leading PID
 /// field must also match the directory this line came from.
+///
+/// Field 24 (`rss`) is not read: the kernel fills it from `get_mm_rss`, an
+/// approximate count on every kernel since 6.2, and resident memory comes from
+/// `statm` instead (PX-005-G01).
 pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
     let open = bytes.iter().position(|byte| *byte == b'(')?;
     let close = bytes.iter().rposition(|byte| *byte == b')')?;
@@ -988,11 +1138,10 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
     let fields: Vec<&[u8]> = bytes[close + 1..]
         .split(u8::is_ascii_whitespace)
         .filter(|field| !field.is_empty())
-        .take(RSS_FIELD_AFTER_COMM + 1)
+        .take(STARTTIME_FIELD_AFTER_COMM + 1)
         .collect();
-    // Every field read here is an unsigned count. `rss` is printed as a signed
-    // long (K1): a negative count is not a number of pages, so it is unread
-    // rather than reinterpreted, and the same holds for any non-numeric field.
+    // Every field read here is an unsigned count: a negative or non-numeric
+    // field is unread rather than reinterpreted.
     let count = |index: usize| {
         fields
             .get(index)
@@ -1000,16 +1149,44 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
             .and_then(|field| field.parse::<u64>().ok())
     };
     let start_ticks = count(STARTTIME_FIELD_AFTER_COMM)?;
-    let resident_pages = count(RSS_FIELD_AFTER_COMM);
     let cpu_ticks = count(UTIME_FIELD_AFTER_COMM)
         .zip(count(STIME_FIELD_AFTER_COMM))
         .and_then(|(user, system)| user.checked_add(system));
     Some(StatFields {
         display_name: DisplayName::sanitize(&bytes[open + 1..close]),
         start_ticks,
-        resident_pages,
         cpu_ticks,
     })
+}
+
+/// The `resident` page count of one `/proc/<pid>/statm` line, if the line is
+/// exactly what the kernel writes: [`STATM_FIELDS`] plain decimal counts, each
+/// fitting a `u64`, separated by single spaces and ended by one newline.
+///
+/// Anything else is refused as a whole rather than read in part — a field too
+/// many or too few, a sign, a non-digit, a count past `u64`, a doubled or
+/// leading space, a missing newline — because a count taken from a line that is
+/// not the kernel's is not a count of anything. A refused line is an unread
+/// metric, never a zero.
+fn parse_statm_resident(bytes: &[u8]) -> Option<u64> {
+    let line = bytes.strip_suffix(b"\n")?;
+    let mut fields = line.split(|byte| *byte == b' ');
+    let mut counts = [0u64; STATM_FIELDS];
+    for count in &mut counts {
+        *count = parse_count(fields.next()?)?;
+    }
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(counts[STATM_RESIDENT])
+}
+
+/// A plain unsigned decimal: digits only, at least one, fitting a `u64`.
+fn parse_count(field: &[u8]) -> Option<u64> {
+    if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(field).ok()?.parse().ok()
 }
 
 /// The value of `wanted` in an auxiliary vector, if the vector carries one.
@@ -1060,15 +1237,16 @@ fn parse_clock_ticks(bytes: &[u8]) -> Option<u64> {
 ///
 /// Both inputs are needed and neither is guessed: a page count with no page size
 /// is not a byte count, and a page size with no count describes nothing. The
-/// multiplication is checked, so a kernel reporting an absurd count reports the
-/// metric unread rather than a wrapped one.
-fn resident_bytes(pages: Option<u64>, page_size: &Observed<u64>) -> Observed<u64> {
+/// record's own reason is published before the mount's. The multiplication is
+/// checked, so a kernel reporting an absurd count reports the metric unread
+/// rather than a wrapped one.
+fn resident_bytes(pages: Observed<u64>, page_size: &Observed<u64>) -> Observed<u64> {
     match (pages, page_size) {
-        (Some(pages), Observed::Known(size)) => match pages.checked_mul(*size) {
+        (Observed::Known(pages), Observed::Known(size)) => match pages.checked_mul(*size) {
             Some(bytes) => Observed::Known(bytes),
             None => Observed::Missing(MissingReason::Unavailable),
         },
-        (None, _) => Observed::Missing(MissingReason::Unavailable),
+        (Observed::Missing(reason), _) => Observed::Missing(reason),
         // The page size is a property of the scanned mount's kernel, so its
         // reason applies to every record equally.
         (_, Observed::Missing(reason)) => Observed::Missing(*reason),
@@ -1235,18 +1413,134 @@ mod tests {
         let parsed = parse_stat(7, line("30", "12").as_bytes()).unwrap();
         assert_eq!(parsed.cpu_ticks, Some(42));
         assert_eq!(parsed.start_ticks, 900);
-        assert_eq!(parsed.resident_pages, Some(3));
         for (utime, stime) in [("-1", "2"), ("x", "2"), ("2", "-5")] {
             let parsed = parse_stat(7, line(utime, stime).as_bytes()).unwrap();
             assert_eq!(parsed.cpu_ticks, None, "{utime} {stime}");
-            // The identity and the other metric are untouched by it.
+            // The identity is untouched by it.
             assert_eq!(parsed.start_ticks, 900);
-            assert_eq!(parsed.resident_pages, Some(3));
         }
         let overflowing = format!("{}", u64::MAX);
         let parsed = parse_stat(7, line(&overflowing, "1").as_bytes()).unwrap();
         assert_eq!(parsed.cpu_ticks, None, "an overflowing sum is not wrapped");
     }
+
+    #[test]
+    fn statm_resident_is_the_second_of_exactly_seven_plain_counts() {
+        assert_eq!(parse_statm_resident(b"557 256 252 8 0 88 0\n"), Some(256));
+        // What the kernel writes for a task with no address space: a kernel
+        // thread, a zombie. A known zero, as `stat` field 24 reported it.
+        assert_eq!(parse_statm_resident(b"0 0 0 0 0 0 0\n"), Some(0));
+        let widest = format!("1 {} 0 0 0 0 0\n", u64::MAX);
+        assert_eq!(parse_statm_resident(widest.as_bytes()), Some(u64::MAX));
+        let refused: [&[u8]; 17] = [
+            b"",
+            b"\n",
+            b"557 256 252 8 0 88\n",
+            b"557 256 252 8 0 88 0 0\n",
+            b"557 256 252 8 0 88 0",
+            b"557 -256 252 8 0 88 0\n",
+            b"557 +256 252 8 0 88 0\n",
+            b"557 many 252 8 0 88 0\n",
+            b"557 18446744073709551616 252 8 0 88 0\n",
+            b"557  256 252 8 0 88 0\n",
+            b" 557 256 252 8 0 88 0\n",
+            b"557 256 252 8 0 88 0 \n",
+            b"557\t256 252 8 0 88 0\n",
+            b"557 256 252 8 0 88 0\r\n",
+            b"557 256 252 8 0 88 0\n\n",
+            // Strict about every field, not only the one it publishes: a line
+            // with any field that is not a count is not the kernel's line.
+            b"557 256 252 8 x 88 0\n",
+            b"557 256 252 8 0 88 -0\n",
+        ];
+        for line in refused {
+            assert_eq!(
+                parse_statm_resident(line),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_process_that_is_gone_counts_as_ended() {
+        assert!(ended(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(ended(&io::Error::from_raw_os_error(ESRCH)));
+        // Refused, failed or oversized reads are not exits: the record exists.
+        assert!(!ended(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(!ended(&io::Error::from_raw_os_error(5)));
+        assert!(!ended(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exceeds the read bound"
+        )));
+    }
+
+    #[test]
+    fn this_reader_pins_record_directories_wherever_its_procfs_can_name_them() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "srtop-record-access-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let access = record_access(&root);
+        std::fs::remove_dir(&root).unwrap();
+        // Linux names an open directory through `/proc/self/fd/<n>`; no other
+        // system this builds on does, and there every record is read by name.
+        let expected = if cfg!(target_os = "linux") {
+            RecordAccess::Pinned
+        } else {
+            RecordAccess::ByName
+        };
+        assert_eq!(access, expected);
+        // A root that cannot be opened is read by name, and its scan reports the
+        // root unreadable as it always has, rather than every record vanished.
+        assert_eq!(record_access(&root), RecordAccess::ByName);
+    }
+
+    /// On a real kernel, a pinned directory is what makes a record's two reads
+    /// one instance's: once the process it was opened on has been reaped, a read
+    /// through it fails with `ESRCH` — it never reaches a newcomer under the same
+    /// PID — and that failure is an exit, not an unreadable record. The worker is
+    /// bounded and owned by this test, killed and reaped before the second read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pinned_directory_of_a_reaped_process_reads_as_ended() {
+        use std::process::{Command, Stdio};
+        let mut worker = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the test owns this worker");
+        let root = Path::new(DEFAULT_PROC_ROOT);
+        let access = record_access(root);
+        let opened = RecordDir::open(root.join(worker.id().to_string()), access);
+        let alive = match &opened {
+            Ok(directory) => directory.read("statm").map(|_| ()),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+        };
+        let _ = worker.kill();
+        let _ = worker.wait();
+        let directory = opened.expect("the worker existed when its directory was opened");
+        assert!(
+            alive.is_ok(),
+            "a live worker's statm is readable: {alive:?}"
+        );
+        let error = directory
+            .read("statm")
+            .expect_err("a reaped process has no statm");
+        assert!(ended(&error), "{error:?}");
+        if access == RecordAccess::Pinned {
+            assert_eq!(error.raw_os_error(), Some(ESRCH), "{error:?}");
+        }
+    }
+
     #[test]
     fn an_unnameable_namespace_withholds_the_hostname_rather_than_labelling_it_unknown() {
         let tag = "uts:[4026531838]".to_string();

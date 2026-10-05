@@ -77,18 +77,18 @@ impl ProcFixture {
         self.raw(pid, &stat_line(pid, comm, ticks))
     }
 
-    /// A record whose `stat` reports `resident_pages` in field 24.
+    /// A record whose `statm` reports `resident_pages` as its `resident` field,
+    /// beside a `stat` whose field 24 reports [`STAT_RSS_DECOY`] pages instead:
+    /// a scan that read resident memory from `stat` would publish another number.
     fn resident(&self, pid: u32, comm: &[u8], ticks: u64, resident_pages: u64) -> &Self {
-        self.raw(
-            pid,
-            &stat_line_with_resident(pid, comm, ticks, &resident_pages.to_string()),
-        )
+        self.process(pid, comm, ticks)
+            .statm(pid, &statm_line(resident_pages))
     }
 
-    /// A record whose `stat` reports `field` where its resident page count
-    /// belongs — a count no scan can read as a number of pages.
-    fn unreadable_resident(&self, pid: u32, comm: &[u8], ticks: u64, field: &str) -> &Self {
-        self.raw(pid, &stat_line_with_resident(pid, comm, ticks, field))
+    /// A record whose `stat` reports `rss` verbatim as field 24, which this scan
+    /// does not read at all (PX-005-G01).
+    fn stat_rss(&self, pid: u32, comm: &[u8], ticks: u64, rss: &str) -> &Self {
+        self.raw(pid, &stat_line_with_rss(pid, comm, ticks, rss))
     }
 
     /// A record whose `stat` reports `utime` and `stime` verbatim as fields 14
@@ -107,10 +107,36 @@ impl ProcFixture {
         ]))
     }
 
+    /// A record's `stat`, verbatim, beside a well-formed `statm` that holds no
+    /// resident pages: every record a kernel lists has both files, and zero keeps
+    /// what PX-005 published for these records when their `stat` said 0 in field
+    /// 24. A test states another `statm` with [`Self::statm`].
     fn raw(&self, pid: u32, stat: &[u8]) -> &Self {
         let directory = self.0.join(pid.to_string());
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("stat"), stat).unwrap();
+        fs::write(directory.join("statm"), statm_line(0)).unwrap();
+        self
+    }
+
+    /// A record's `statm`, verbatim (PX-005-G01).
+    fn statm(&self, pid: u32, statm: &[u8]) -> &Self {
+        fs::write(self.0.join(pid.to_string()).join("statm"), statm).unwrap();
+        self
+    }
+
+    /// A record whose `statm` exists but cannot be read by this unprivileged
+    /// scan, while its `stat` can.
+    fn statm_denied(&self, pid: u32) -> &Self {
+        let statm = self.0.join(pid.to_string()).join("statm");
+        fs::set_permissions(&statm, fs::Permissions::from_mode(0o000)).unwrap();
+        self
+    }
+
+    /// A record whose `statm` is gone while its `stat` is still there: the
+    /// process ended between the two reads.
+    fn without_statm(&self, pid: u32) -> &Self {
+        fs::remove_file(self.0.join(pid.to_string()).join("statm")).unwrap();
         self
     }
 
@@ -194,15 +220,21 @@ fn auxv(entries: &[(u64, u64)]) -> Vec<u8> {
     bytes
 }
 
-/// `/proc/<pid>/stat`: `pid (comm) state ...` with start time as field 22 and a
-/// resident page count of zero as field 24 (K1).
+/// Resident pages every fixture `stat` reports in field 24 unless a test writes
+/// another field there. It differs from every count this suite writes into a
+/// `statm`, so a scan that took resident memory from `stat` again would publish
+/// the wrong number and fail (PX-005-G01).
+const STAT_RSS_DECOY: u64 = 4_242;
+
+/// `/proc/<pid>/stat`: `pid (comm) state ...` with start time as field 22 and
+/// [`STAT_RSS_DECOY`] as field 24 (K1).
 fn stat_line(pid: u32, comm: &[u8], ticks: u64) -> Vec<u8> {
-    stat_line_with_resident(pid, comm, ticks, "0")
+    stat_line_with_rss(pid, comm, ticks, &STAT_RSS_DECOY.to_string())
 }
 
-/// The same line with `resident` written verbatim as field 24, so a test can
-/// supply a count, a nonsense field, or nothing at all.
-fn stat_line_with_resident(pid: u32, comm: &[u8], ticks: u64, resident: &str) -> Vec<u8> {
+/// The same line with `rss` written verbatim as field 24, so a test can supply
+/// a count, a nonsense field, or nothing at all.
+fn stat_line_with_rss(pid: u32, comm: &[u8], ticks: u64, rss: &str) -> Vec<u8> {
     let mut line = format!("{pid} (").into_bytes();
     line.extend_from_slice(comm);
     line.extend_from_slice(b") S");
@@ -210,12 +242,12 @@ fn stat_line_with_resident(pid: u32, comm: &[u8], ticks: u64, resident: &str) ->
         line.extend_from_slice(format!(" {filler}").as_bytes());
     }
     // Field 22 is the start time, 23 the virtual size, 24 the resident pages.
-    line.extend_from_slice(format!(" {ticks} 4096 {resident} 18446744073709551615\n").as_bytes());
+    line.extend_from_slice(format!(" {ticks} 4096 {rss} 18446744073709551615\n").as_bytes());
     line
 }
 
 /// The same line with `utime` and `stime` written verbatim as fields 14 and 15
-/// (K1, `proc_pid_stat(5)`), and a resident count of zero.
+/// (K1, `proc_pid_stat(5)`), and [`STAT_RSS_DECOY`] as field 24.
 fn stat_line_with_cpu(pid: u32, comm: &[u8], ticks: u64, utime: &str, stime: &str) -> Vec<u8> {
     let mut line = format!("{pid} (").into_bytes();
     line.extend_from_slice(comm);
@@ -229,8 +261,23 @@ fn stat_line_with_cpu(pid: u32, comm: &[u8], ticks: u64, utime: &str, stime: &st
         };
         line.extend_from_slice(format!(" {value}").as_bytes());
     }
-    line.extend_from_slice(format!(" {ticks} 4096 0 18446744073709551615\n").as_bytes());
+    line.extend_from_slice(
+        format!(" {ticks} 4096 {STAT_RSS_DECOY} 18446744073709551615\n").as_bytes(),
+    );
     line
+}
+
+/// `/proc/<pid>/statm` as the kernel writes it — seven counts separated by
+/// single spaces and ended by one newline (`proc_pid_statm`, fs/proc/array.c) —
+/// with `resident` pages as its second field. For any non-zero count the fields
+/// beside it are other numbers, so a parser that read the wrong field fails.
+fn statm_line(resident: u64) -> Vec<u8> {
+    format!(
+        "{} {resident} {} 8 0 88 0\n",
+        resident.wrapping_add(4096),
+        resident / 2
+    )
+    .into_bytes()
 }
 
 #[test]
@@ -861,8 +908,9 @@ fn resident_of(snapshot: &srui_process_explorer::source::ProcessSnapshot) -> Vec
         .collect()
 }
 
-/// PX-005: a resident page count becomes an exact byte count through the page
-/// size the scanned mount itself reports, and reaches the row as IEC text.
+/// PX-005: a resident page count — `statm`'s `resident` field since PX-005-G01 —
+/// becomes an exact byte count through the page size the scanned mount itself
+/// reports, and reaches the row as IEC text.
 #[test]
 fn resident_memory_is_published_from_pages_and_the_mounts_own_page_size() {
     let fixture = ProcFixture::new();
@@ -918,11 +966,14 @@ fn resident_memory_is_published_from_pages_and_the_mounts_own_page_size() {
     );
 }
 
-/// A metric is not an identity: a record whose resident field cannot be read is
-/// still published, with that one field reported unread.
+/// PX-005-G01: resident memory is `statm`'s `resident` field, never `stat`'s
+/// field 24. Every fixture `stat` carries another count there
+/// ([`STAT_RSS_DECOY`]), so this test and every resident assertion in this suite
+/// fail if the scan reads `stat` for it again — and whatever `stat` holds in
+/// field 24, even nothing at all, changes nothing.
 #[test]
-fn a_resident_field_a_scan_cannot_read_is_unavailable_rather_than_zero() {
-    // A line that ends before field 24 exists at all.
+fn resident_memory_is_statms_resident_field_and_never_stats_field_24() {
+    // A `stat` line that ends before field 24 exists at all.
     let mut truncated = b"12 (short) S".to_vec();
     for filler in 1..=18 {
         truncated.extend_from_slice(format!(" {filler}").as_bytes());
@@ -932,44 +983,317 @@ fn a_resident_field_a_scan_cannot_read_is_unavailable_rather_than_zero() {
     let fixture = ProcFixture::new();
     fixture
         .identity("fixture-host", "boot-a", "pid:[4026531836]")
-        // `rss` is a signed long in the kernel's own format string, so a
-        // negative value is possible on the wire and is not a page count.
-        .unreadable_resident(10, b"negative", 5, "-1")
-        .unreadable_resident(11, b"words", 5, "many")
-        .raw(12, &truncated);
+        .resident(9, b"decoyed", 5, 3)
+        // `rss` is a signed long in the kernel's own format string, and neither
+        // of these is a page count; neither is read.
+        .stat_rss(10, b"negative", 5, "-1")
+        .statm(10, &statm_line(5))
+        .stat_rss(11, b"words", 5, "many")
+        .statm(11, &statm_line(6))
+        .raw(12, &truncated)
+        .statm(12, &statm_line(7));
     let snapshot = fixture.source().snapshot();
+    assert_eq!(snapshot.completeness, Completeness::Complete);
     assert_eq!(
         resident_of(&snapshot),
-        vec![
-            Observed::Missing(MissingReason::Unavailable),
-            Observed::Missing(MissingReason::Unavailable),
-            Observed::Missing(MissingReason::Unavailable),
-        ]
+        [3, 5, 6, 7]
+            .map(|pages| Observed::Known(pages * FIXTURE_PAGE_SIZE))
+            .to_vec()
     );
-    // The records themselves are intact: names, creation tokens and a complete
-    // scan. An unreadable metric is not an unreadable record.
-    assert_eq!(snapshot.completeness, Completeness::Complete);
-    assert_eq!(snapshot.records.len(), 3);
     assert_eq!(
         snapshot
             .records
             .iter()
             .map(|record| record.key.creation.clone())
             .collect::<Vec<_>>(),
-        vec![
-            CreationToken::LinuxBootTicks(5),
-            CreationToken::LinuxBootTicks(5),
-            CreationToken::LinuxBootTicks(55),
-        ]
+        [5, 5, 5, 55].map(CreationToken::LinuxBootTicks).to_vec()
     );
     let session = srui_sessiond::Session::mint();
     srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
-    assert_eq!(resident_cells(&session), vec!["Unavailable"; 3]);
-    // And the status still describes an authoritative, complete scan: one field
-    // of one record is not a degraded record list.
+    assert_eq!(
+        resident_cells(&session),
+        vec!["24.0 KiB", "40.0 KiB", "48.0 KiB", "56.0 KiB"]
+    );
+}
+
+/// PX-005-G01: a `statm` that is not exactly the kernel's line is an unread
+/// metric of a published record — never a zero, never a partial read, and
+/// never a reason to fall back to `stat`'s field 24.
+#[test]
+fn a_statm_line_that_is_not_the_kernels_is_unavailable_rather_than_zero() {
+    let mut oversized = statm_line(3);
+    oversized.pop();
+    oversized.extend(std::iter::repeat_n(b' ', MAX_FILE_BYTES as usize));
+    oversized.push(b'\n');
+    let malformed: Vec<(&str, Vec<u8>)> = vec![
+        ("six fields", b"4099 3 1 8 0 88\n".to_vec()),
+        ("eight fields", b"4099 3 1 8 0 88 0 0\n".to_vec()),
+        ("negative", b"4099 -3 1 8 0 88 0\n".to_vec()),
+        ("signed", b"4099 +3 1 8 0 88 0\n".to_vec()),
+        ("not a number", b"4099 many 1 8 0 88 0\n".to_vec()),
+        (
+            "past u64",
+            b"4099 18446744073709551616 1 8 0 88 0\n".to_vec(),
+        ),
+        ("doubled space", b"4099  3 1 8 0 88 0\n".to_vec()),
+        ("no newline", b"4099 3 1 8 0 88 0".to_vec()),
+        ("empty", Vec::new()),
+        ("past the read bound", oversized),
+    ];
+    let fixture = ProcFixture::new();
+    fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
+    for (pid, (_, statm)) in (20u32..).zip(&malformed) {
+        fixture.process(pid, b"malformed", 500).statm(pid, statm);
+    }
+    let snapshot = fixture.source().snapshot();
+    // Every record is still published, and the list is still authoritative: an
+    // unreadable metric is not an unreadable record.
+    assert_eq!(snapshot.records.len(), malformed.len());
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    for (record, (label, _)) in snapshot.records.iter().zip(&malformed) {
+        assert_eq!(
+            record.resident,
+            Observed::Missing(MissingReason::Unavailable),
+            "{label}"
+        );
+        assert_eq!(record.key.creation, CreationToken::LinuxBootTicks(500));
+    }
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
+    assert_eq!(
+        resident_cells(&session),
+        vec!["Unavailable"; malformed.len()]
+    );
+    // One field of a record is not a degraded record list.
     assert_eq!(
         published_status(fixture.source().status_text(), &snapshot),
         fixture.source().status_text()
+    );
+}
+
+/// A monotonic clock that, the first time the collector reads it, changes the
+/// fixture tree. The collector reads its clock once per record, right after that
+/// record's `stat` read returns and before its `statm` read, so the change lands
+/// exactly between a record's two reads (PX-005-G01).
+struct BetweenReads(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl BetweenReads {
+    fn new(change: impl FnOnce() + Send + 'static) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(Some(Box::new(change)))))
+    }
+
+    fn fired(&self) -> bool {
+        self.0.lock().unwrap().is_none()
+    }
+}
+
+impl std::fmt::Debug for BetweenReads {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BetweenReads")
+    }
+}
+
+impl MonotonicClock for BetweenReads {
+    fn now(&self) -> Duration {
+        if let Some(change) = self.0.lock().unwrap().take() {
+            change();
+        }
+        Duration::from_secs(1)
+    }
+}
+
+/// PX-005-G01: a process that ends between its `stat` and its `statm` read no
+/// longer exists at sample time. It is counted as vanished exactly like one whose
+/// `stat` was already gone: not published with half a sample, not an unreadable
+/// record, and no counter baseline is kept for it.
+#[test]
+fn a_process_that_ends_between_its_stat_and_statm_reads_has_vanished() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(1, b"systemd", 7, 2)
+        .resident(4343, b"exiting", 500, 9)
+        .without_statm(4343);
+    let mut source = fixture.source();
+    let snapshot = source.snapshot();
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![Observed::Known(2 * FIXTURE_PAGE_SIZE)]
+    );
+    assert_eq!(snapshot.records[0].key.pid, Observed::Known(1));
+    assert_eq!(snapshot.vanished, 1);
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    assert!(snapshot.completeness.issues().is_empty());
+    assert_eq!(
+        published_status(LIVE_STATUS_TEXT, &snapshot),
+        LIVE_STATUS_TEXT
+    );
+    assert_eq!(
+        source.cpu_baselines(),
+        1,
+        "no counter baseline is kept for a process that ended"
+    );
+
+    // Ending exactly between the two reads: the record's directory is removed
+    // after its `stat` was read and before its `statm` is.
+    let between = ProcFixture::new();
+    between
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(4343, b"exiting", 500, 9);
+    let directory = between.0.join("4343");
+    let clock = BetweenReads::new(move || fs::remove_dir_all(&directory).unwrap());
+    let snapshot = between.source().with_clock(clock.clone()).snapshot();
+    assert!(clock.fired(), "the record's stat was read");
+    assert!(snapshot.records.is_empty());
+    assert_eq!(snapshot.vanished, 1);
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+}
+
+/// PX-005-G01: a `statm` this scan may not read is that one field refused —
+/// published as `Denied`, never as zero — beside an intact, published record,
+/// and the record list stays authoritative.
+#[test]
+fn a_refused_statm_is_published_as_denied_and_the_record_is_kept() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(1, b"systemd", 7, 2)
+        .resident(4242, b"guarded", 500, 9)
+        .statm_denied(4242);
+    let snapshot = fixture.source().snapshot();
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![
+            Observed::Known(2 * FIXTURE_PAGE_SIZE),
+            Observed::Missing(MissingReason::Denied),
+        ]
+    );
+    assert_eq!(snapshot.records[1].display_name.as_str(), "guarded");
+    assert_eq!(
+        snapshot.records[1].key.creation,
+        CreationToken::LinuxBootTicks(500)
+    );
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    assert_eq!(snapshot.vanished, 0);
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
+    assert_eq!(
+        resident_cells(&session),
+        vec!["16.0 KiB".to_string(), "Denied".into()]
+    );
+    // The record's own reason is the one published, even beside a mount that
+    // cannot state its page size for a reason of its own.
+    fixture.auxv(&auxv(&[(AT_NULL, 0)]));
+    assert_eq!(
+        resident_of(&fixture.source().snapshot()),
+        vec![
+            Observed::Missing(MissingReason::Unavailable),
+            Observed::Missing(MissingReason::Denied),
+        ]
+    );
+}
+
+/// PX-005-G01: a task with no address space — a kernel thread, or a zombie that
+/// has exited and is not yet reaped — has the kernel's `0 0 0 0 0 0 0` as its
+/// `statm` and 0 in `stat` field 24. PX-005 published it as a known zero, `0 B`,
+/// and reading `statm` keeps exactly that.
+#[test]
+fn a_task_with_no_address_space_keeps_its_known_zero() {
+    // The state is the field after `comm`: `Z` for a zombie.
+    let zombie = String::from_utf8(stat_line_with_rss(4444, b"defunct", 600, "0"))
+        .unwrap()
+        .replacen(") S", ") Z", 1);
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .stat_rss(2, b"kthreadd", 3, "0")
+        .statm(2, b"0 0 0 0 0 0 0\n")
+        .raw(4444, zombie.as_bytes())
+        .statm(4444, b"0 0 0 0 0 0 0\n");
+    let snapshot = fixture.source().snapshot();
+    assert_eq!(resident_of(&snapshot), vec![Observed::Known(0); 2]);
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
+    assert_eq!(resident_cells(&session), vec!["0 B"; 2]);
+}
+
+/// PX-005-G01: a record's `statm` is read from the very directory its `stat` was
+/// read from. Here the PID is reused between the two reads — the first instance
+/// is reaped and a newcomer takes its number — and the resident memory published
+/// for the instance `stat` identified is still its own, never the newcomer's.
+///
+/// Linux only: the guarantee is a directory handle reached again through the
+/// reader's own `/proc/self/fd/<n>`, which no other system this builds on has.
+/// Elsewhere records are read by name, and there is no live process filesystem
+/// whose PIDs could be reused.
+#[cfg(target_os = "linux")]
+#[test]
+fn statm_is_read_from_the_directory_its_stat_was_read_from() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(700, b"first", 10_000, 3);
+    let root = fixture.0.clone();
+    let clock = BetweenReads::new(move || {
+        fs::rename(root.join("700"), root.join("reaped-700")).unwrap();
+        fs::create_dir(root.join("700")).unwrap();
+        fs::write(root.join("700/stat"), stat_line(700, b"newcomer", 10_500)).unwrap();
+        fs::write(root.join("700/statm"), statm_line(5)).unwrap();
+    });
+    let snapshot = fixture.source().with_clock(clock.clone()).snapshot();
+    assert!(clock.fired(), "the first instance's stat was read");
+    let first = snapshot
+        .records
+        .iter()
+        .find(|record| record.key.creation == CreationToken::LinuxBootTicks(10_000))
+        .expect("the instance whose stat was read is published");
+    assert_eq!(first.display_name.as_str(), "first");
+    assert_eq!(
+        first.resident,
+        Observed::Known(3 * FIXTURE_PAGE_SIZE),
+        "the newcomer's statm was attributed to the instance stat identified"
+    );
+    // The next scan reads the newcomer as what it is: another instance, with
+    // its own memory.
+    let later = fixture.source().snapshot();
+    assert_eq!(later.records.len(), 1);
+    assert_eq!(
+        later.records[0].key.creation,
+        CreationToken::LinuxBootTicks(10_500)
+    );
+    assert_eq!(
+        later.records[0].resident,
+        Observed::Known(5 * FIXTURE_PAGE_SIZE)
+    );
+}
+
+/// A record whose directory this scan may not open — what `hidepid=1` does to
+/// another user's processes — is skipped as denied, exactly as a refused `stat`
+/// is, whether its directory is pinned or its files are opened by name.
+#[test]
+fn a_record_whose_directory_is_refused_is_skipped_as_denied() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(1, b"systemd", 7)
+        .process(4242, b"hidden", 500);
+    let directory = fixture.0.join("4242");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o000)).unwrap();
+    let snapshot = fixture.source().snapshot();
+    // Restored before any assertion, so the fixture can always be removed.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(snapshot.vanished, 0);
+    assert_eq!(snapshot.completeness.skipped(), 1);
+    assert_eq!(
+        snapshot
+            .completeness
+            .issues()
+            .iter()
+            .find(|issue| issue.scope == IssueScope::Process(4242))
+            .map(|issue| issue.reason),
+        Some(MissingReason::Denied)
     );
 }
 

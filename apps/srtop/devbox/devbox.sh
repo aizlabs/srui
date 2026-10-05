@@ -45,8 +45,12 @@ cmd_build() {
   mkdir -p "$CTX/devbox"
   cp "$DEVBOX_DIR/Dockerfile" "$DEVBOX_DIR/sshd_config" "$DEVBOX_DIR/entrypoint.sh" "$CTX/devbox/"
   cp "$DEVBOX_DIR/Dockerfile" "$CTX/Dockerfile"
-  echo "devbox: building $IMAGE from $(git -C "$REPO_ROOT" rev-parse --short "$REV")"
-  docker build -t "$IMAGE" "$CTX"
+  local revision
+  revision=$(git -C "$REPO_ROOT" rev-parse "$REV^{commit}")
+  echo "devbox: building $IMAGE from $revision"
+  # The label names the exported revision, so evidence taken against the box can say which
+  # srtop it ran: `docker image inspect -f '{{index .Config.Labels "org.srui.revision"}}'`.
+  docker build --label "org.srui.revision=$revision" -t "$IMAGE" "$CTX"
 }
 
 cmd_up() {

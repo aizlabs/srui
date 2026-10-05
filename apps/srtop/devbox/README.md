@@ -6,7 +6,15 @@ client can be pointed at live process data from a Mac. It exists for eyes-on
 checks that no automated test can make — does the table flicker, does scroll
 position survive a refresh, does a row appear when a process really starts.
 
-It is not part of any test suite and nothing in CI runs it.
+It is not part of any test suite and nothing in CI runs it. One script turns it
+into a repeatable check: `apps/srtop/devbox/r0-scenario.sh` (PX-008, the R0 gate)
+starts the box, runs the native `ProcessExplorerDevboxScenarioTests` against it —
+an empty client window, a worker started inside the box, its row appearing,
+warming up and then sampled, the worker ending on its own and its row going —
+and stops the box again (`SRTOP_R0_KEEP_BOX=1` keeps it). With
+`PX008_EVIDENCE_DIR` set it also writes the client window's image and an
+operation/byte trace there. Without the box's coordinates in the environment that
+suite reports itself skipped, never passed.
 
 The box is only useful against a revision whose `srtop` polls its source, so this
 branch is stacked on PX-004 and `SRTOP_DEVBOX_REV` defaults to `HEAD`. Exporting
@@ -68,7 +76,9 @@ rm -rf "${SRTOP_DEVBOX_STATE:-$HOME/.codex/srtop-devbox}"
 ## How it is wired
 
 - The build context is a `git archive` of `SRTOP_DEVBOX_REV`, never the working
-  tree, so no `.git`, no `target/`, and no key material reaches the image.
+  tree, so no `.git`, no `target/`, and no key material reaches the image. The
+  image is labelled `org.srui.revision` with that commit, and `r0-scenario.sh`
+  prints it, so a run's evidence names the srtop it exercised.
 - `srtop` runs as the unprivileged `srui` account on a `0700` directory; it
   refuses a socket directory that is not private to a non-root user.
 - sshd accepts public keys only, for that one account, and exposes exactly one

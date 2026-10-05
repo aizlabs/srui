@@ -7,4 +7,6 @@ scripts/reap-test-servers.sh || echo "note: pre-test sweep failed; continuing" >
 cargo test --locked --manifest-path apps/srtop/Cargo.toml
 cargo build --locked --manifest-path apps/srtop/Cargo.toml
 cargo build --locked --manifest-path server-rust/Cargo.toml -p srui-ssh-bridge
+# PX-008's release gate runs the counter example through the same generic client as the explorer.
+cargo build --locked --manifest-path examples/counter/Cargo.toml
 swift test --package-path client-macos --filter ProcessExplorerShellTests

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -28,9 +29,11 @@ import sys
 import time
 
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-with open(sys.argv[1], "w", encoding="utf-8") as output:
+# Published by rename, so the pid file never exists without its whole content.
+temporary = f"{sys.argv[1]}.{os.getpid()}.tmp"
+with open(temporary, "w", encoding="utf-8") as output:
     output.write(str(os.getpid()))
-    output.flush()
+os.replace(temporary, sys.argv[1])
 time.sleep(60)
 """
 
@@ -39,9 +42,23 @@ import os
 import sys
 import time
 
-with open(sys.argv[1], "w", encoding="utf-8") as output:
+# Published by rename, so the pid file never exists without its whole content.
+temporary = f"{sys.argv[1]}.{os.getpid()}.tmp"
+with open(temporary, "w", encoding="utf-8") as output:
     output.write(str(os.getpid()))
-    output.flush()
+os.replace(temporary, sys.argv[1])
+time.sleep(60)
+"""
+
+# Starts a child that exits at once and never waits for it, so the child stays a
+# zombie whose parent is this process for as long as this process lives.
+ZOMBIE_PARENT = """
+import subprocess
+import sys
+import time
+
+child = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL)
+print(child.pid, flush=True)
 time.sleep(60)
 """
 
@@ -92,65 +109,105 @@ while not descendant_path.exists():
     if time.monotonic() >= deadline:
         raise SystemExit("owner controller descendant did not start")
     time.sleep(0.01)
-state_path.write_text(
+# Published by rename, like the descendant's pid file it carries.
+temporary = state_path.with_name(f"{state_path.name}.tmp")
+temporary.write_text(
     f"{supervisor.pid},{descendant_path.read_text(encoding='utf-8')}",
     encoding="utf-8",
 )
+temporary.replace(state_path)
 time.sleep(60)
 """
 
 
+# Only a whole record counts: a file read before its writer finished is read again.
+PID = re.compile(r"[0-9]+")
+TWO_PIDS = re.compile(r"([0-9]+),([0-9]+)")
+
+
 def wait_for_pid(path: Path) -> int:
     deadline = time.monotonic() + 5
+    text = None
     while time.monotonic() < deadline:
         if path.exists():
-            return int(path.read_text())
+            text = path.read_text(encoding="utf-8")
+            if PID.fullmatch(text):
+                return int(text)
         time.sleep(0.01)
-    raise AssertionError(f"PID file was not written: {path}")
+    raise AssertionError(f"PID file was not written: {path} (last read {text!r})")
 
 
-def process_state(pid: int) -> str:
-    """The process's state letter, or "" when it is not in the table at all."""
-    row = subprocess.run(
-        ["ps", "-o", "state=", "-p", str(pid)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-    return row.stdout.strip()
+def state_and_parent(pid: int) -> tuple[str, int] | None:
+    """`pid`'s one-letter state and parent PID, or None if they could not be read.
 
-
-def assert_process_gone(pid: int) -> None:
-    """Assert `pid` is no longer running: absent, or a zombie nobody has reaped.
-
-    Not `os.kill(pid, 0)`, which succeeds for a zombie. Where pid 1 does not reap an
-    orphan promptly -- a container whose pid 1 is a plain shell, which is where CI
-    runs -- a correctly terminated child stays in state `Z` and that call keeps
-    succeeding, so this waited out its deadline and failed against correct code.
-    `process_group_members` draws the same distinction, for the same reason: an
-    uncollected exit status holds no resources.
+    None never means the process is gone: it may have ended since the caller
+    looked, or the reader itself may have failed.
     """
-    deadline = time.monotonic() + 5
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ps", "-o", "state=,ppid=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        fields = result.stdout.split()
+        if result.returncode != 0 or len(fields) != 2 or not fields[1].isdecimal():
+            return None
+        return fields[0][:1], int(fields[1])
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # State and parent follow the parenthesized command name, which may contain ")".
+    state, parent = stat[stat.rindex(")") + 1 :].split()[:2]
+    return state, int(parent)
+
+
+def assert_process_gone(pid: int, timeout: float = 5) -> None:
+    """Assert `pid` is no longer running: absent, or a zombie left to another parent.
+
+    Not `os.kill(pid, 0)` alone, which succeeds for a zombie. Where pid 1 does not
+    reap an orphan promptly -- a container whose pid 1 is a plain shell, which is
+    where CI runs -- a correctly terminated child stays in state `Z` and that call
+    keeps succeeding, so this waited out its deadline and failed against correct
+    code. `process_group_members` draws the same distinction, for the same reason:
+    an uncollected exit status holds no resources.
+
+    A zombie whose parent is this process is different: it is a child the code
+    under test never reaped, so it does not count, and neither does a process
+    whose state cannot be read.
+    """
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        state = process_state(pid)
-        if state == "" or state.startswith("Z"):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        observed = state_and_parent(pid)
+        if observed and observed[0] in ("Z", "X") and observed[1] != os.getpid():
             return
         time.sleep(0.02)
-    pytest.fail(f"process {pid} survived supervised cleanup (state {process_state(pid)!r})")
+    pytest.fail(
+        f"process {pid} survived supervised cleanup "
+        f"(state and parent {state_and_parent(pid)!r})"
+    )
 
 
 def wait_for_two_pids(path: Path) -> tuple[int, int]:
     deadline = time.monotonic() + 5
+    text = None
     while time.monotonic() < deadline:
         if path.exists():
-            parts = path.read_text(encoding="utf-8").split(",")
-            if len(parts) == 2:
-                return int(parts[0]), int(parts[1])
+            text = path.read_text(encoding="utf-8")
+            match = TWO_PIDS.fullmatch(text)
+            if match:
+                return int(match[1]), int(match[2])
         time.sleep(0.01)
-    raise AssertionError(f"two-PID state file was not written: {path}")
+    raise AssertionError(
+        f"two-PID state file was not written: {path} (last read {text!r})"
+    )
 
 
 def test_process_identity_wait_accepts_numeric_pid_reuse() -> None:
@@ -363,30 +420,61 @@ def test_enumeration_failure_still_kills_and_reaps_pinned_group(
     assert_process_gone(child_pid)
 
 
+def wait_for_zombie(pid: int) -> int:
+    """Wait until `pid` is a zombie, and return its parent."""
+    deadline = time.monotonic() + 5
+    while True:
+        observed = state_and_parent(pid)
+        if observed and observed[0] == "Z":
+            return observed[1]
+        assert time.monotonic() < deadline, f"{pid} never became a zombie ({observed!r})"
+        time.sleep(0.02)
+
+
 def test_a_zombie_counts_as_gone_for_the_cleanup_assertion() -> None:
     """`assert_process_gone` must accept a zombie, not wait out its deadline on one.
 
     `os.kill(pid, 0)` succeeds for a zombie, so on a host whose pid 1 does not reap an
     orphan promptly the assertion used to fail against a correctly terminated child.
     Neither macOS (launchd reaps at once) nor a plain container reproduces that
-    timing, so the zombie is staged directly here: this process forks a child, the
-    child exits, and nothing waits for it until the assertion has run.
+    timing, so the zombie is staged directly here: a child of this process starts a
+    process that exits, and never waits for it, like a pid 1 that does not reap.
     """
-    zombie = os.fork()
-    if zombie == 0:  # pragma: no cover - the child never returns
-        os._exit(0)
+    parent = subprocess.Popen(
+        [sys.executable, "-c", ZOMBIE_PARENT],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        close_fds=True,
+    )
     try:
-        deadline = time.monotonic() + 5
-        while not process_state(zombie).startswith("Z"):
-            assert time.monotonic() < deadline, (
-                f"the child never became a zombie (state {process_state(zombie)!r})"
-            )
-            time.sleep(0.02)
+        assert parent.stdout is not None
+        zombie = int(parent.stdout.readline())
+        assert wait_for_zombie(zombie) == parent.pid
         # Still answers `kill -0`, which is exactly why that is not the test.
         os.kill(zombie, 0)
         started = time.monotonic()
         assert_process_gone(zombie)
         assert time.monotonic() - started < 1.0, "the assertion waited on a zombie"
+    finally:
+        parent.kill()
+        parent.communicate(timeout=5)
+
+
+def test_a_zombie_child_of_this_process_is_not_gone() -> None:
+    """A zombie whose parent is this process is one the code under test never reaped.
+
+    Supervisors are this process's own children, and reaping them is part of what
+    the cleanup tests check, so such a zombie must still fail the assertion.
+    """
+    zombie = os.fork()
+    if zombie == 0:  # pragma: no cover - the child never returns
+        os._exit(0)
+    try:
+        assert wait_for_zombie(zombie) == os.getpid()
+        with pytest.raises(pytest.fail.Exception, match="survived supervised cleanup"):
+            assert_process_gone(zombie, timeout=0.2)
     finally:
         os.waitpid(zombie, 0)
 

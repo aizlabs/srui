@@ -1981,44 +1981,124 @@ mod live {
     };
     use srui_sdk::{ItemId, Value};
     use srui_sessiond::Session;
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// A bounded, disposable worker owned by this test.
+    /// Set in a worker's environment to `<pid>:<activity>`: the PID of the test
+    /// process that spawned it, and what it does once ready ([`WORKER_SLEEPS`] or
+    /// [`WORKER_BURNS`]). [`test_owned_worker`] is a no-op unless that process is
+    /// its parent, so an exported value cannot turn the harness into a worker.
+    const WORKER_ENV: &str = "SRTOP_LIVE_WORKER";
+    /// A worker that sleeps once it is ready.
+    const WORKER_SLEEPS: &str = "sleep";
+    /// A worker that keeps one CPU busy once it is ready.
+    const WORKER_BURNS: &str = "burn";
+    /// The libtest name of [`test_owned_worker`], the one test a worker runs.
+    const WORKER_TEST: &str = "live::test_owned_worker";
+    /// The name a worker gives itself, which a scan reads back from
+    /// `/proc/<pid>/stat`; the kernel keeps at most 15 bytes.
+    const WORKER_NAME: &str = "srtop-worker";
+    /// What a worker prints, followed by its PID, once it is ready to be scanned.
+    const WORKER_READY: &str = "srtop live worker ready: pid=";
+    /// The least memory a worker writes and holds; see [`worker_resident_bytes`].
+    const WORKER_RESIDENT_MIN: usize = 8 * 1024 * 1024;
+    /// Page size assumed when this process cannot read its own auxiliary
+    /// vector: the smallest Linux uses. Guessing too small shows up as the zero
+    /// resident size the live test asserts against; guessing 64 KiB on a 4 KiB
+    /// host writes sixteen times what the counter needs, which a memory-limited
+    /// host answers by killing the worker before it reports ready.
+    const FALLBACK_PAGE_SIZE: usize = 4096;
+    /// CPUs assumed online when the kernel's list cannot be read: many, so a
+    /// worker errs toward writing more pages rather than fewer.
+    const FALLBACK_ONLINE_CPUS: usize = 256;
+    /// How long a worker lives if nothing ends it sooner.
+    const WORKER_LIFETIME: Duration = Duration::from_secs(60);
+    /// How long a test waits for its worker to report ready.
+    const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A bounded, disposable worker process owned by this test: this test
+    /// binary, re-executed to run [`test_owned_worker`] alone.
+    ///
+    /// [`Worker::spawn`] returns once the worker says it is ready, because a
+    /// `/proc/<pid>` entry proves nothing: it exists as soon as the child does,
+    /// and `spawn` can return while the child is still inside `execve` with the
+    /// spawning thread's name, or has just begun running with too few pages for
+    /// the kernel's approximate count to show any.
     struct Worker(Child);
 
     impl Worker {
+        /// A worker that sleeps once it is ready.
         fn start() -> Self {
-            Self::spawn(Command::new("/bin/sleep").arg("47"))
+            Self::spawn(WORKER_SLEEPS)
         }
 
-        /// A single-threaded shell loop that is runnable for as long as it
-        /// lives: shell builtins only, so it never forks and every tick it is
-        /// scheduled for is charged to this one process (PX-006). It is bounded
-        /// twice — by its own iteration count, which ends it within about a
-        /// minute even on a fast host if this test process dies, and by `Drop`,
-        /// which kills and reaps it as soon as the test ends.
+        /// A worker that, once ready, keeps one CPU busy until it ends: one
+        /// thread spins while libtest's main thread only waits for it, so every
+        /// tick it is scheduled for is charged to this one process (PX-006). It
+        /// is bounded like any worker, and its setup is done before it reports
+        /// ready, so none of it falls inside a test's sampling interval.
         fn burn() -> Self {
-            Self::spawn(Command::new("/bin/sh").args([
-                "-c",
-                "i=0; while [ \"$i\" -lt 300000000 ]; do i=$((i+1)); done",
-            ]))
+            Self::spawn(WORKER_BURNS)
         }
 
-        fn spawn(command: &mut Command) -> Self {
-            let child = command
+        fn spawn(activity: &str) -> Self {
+            let program = std::env::current_exe().expect("a test binary knows its own path");
+            let mut child = Command::new(program)
+                .args([
+                    "--exact",
+                    WORKER_TEST,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(WORKER_ENV, format!("{}:{activity}", std::process::id()))
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("the test owns this worker");
-            let worker = Self(child);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !PathBuf::from(format!("/proc/{}/stat", worker.pid())).exists() {
-                assert!(Instant::now() < deadline, "worker never appeared in /proc");
-                std::thread::sleep(Duration::from_millis(10));
+            // Both pipes are this test's own, read on other threads so the wait
+            // below has a deadline. stderr carries libtest's own errors and the
+            // worker's panics.
+            let (sender, lines) = mpsc::channel();
+            forward_lines(
+                child.stdout.take().expect("stdout is piped"),
+                "",
+                sender.clone(),
+            );
+            forward_lines(
+                child.stderr.take().expect("stderr is piped"),
+                "stderr: ",
+                sender,
+            );
+            let mut worker = Self(child);
+            // libtest may already have begun the line with the test's name.
+            let ready = format!("{WORKER_READY}{}", worker.pid());
+            let deadline = Instant::now() + WORKER_READY_TIMEOUT;
+            let mut output = Vec::new();
+            let cause = loop {
+                match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(line) if line.ends_with(&ready) => return worker,
+                    Ok(line) => output.push(line),
+                    Err(cause) => break cause,
+                }
+            };
+            let _ = worker.0.kill();
+            let status = worker.0.wait();
+            // Both pipes end once the worker is gone: keep what it printed last.
+            let drained = Instant::now() + Duration::from_secs(5);
+            while let Ok(line) =
+                lines.recv_timeout(drained.saturating_duration_since(Instant::now()))
+            {
+                output.push(line);
             }
-            worker
+            panic!(
+                "worker {} never reported ready ({cause:?}, waited up to \
+                 {WORKER_READY_TIMEOUT:?}); status {status:?}; output {output:?}",
+                worker.pid()
+            );
         }
 
         fn pid(&self) -> u32 {
@@ -2031,6 +2111,115 @@ mod live {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    /// Sends each line `pipe` yields, after `prefix`, until the pipe ends. It
+    /// keeps draining after nobody listens, so a worker never blocks on output.
+    fn forward_lines(
+        pipe: impl Read + Send + 'static,
+        prefix: &'static str,
+        sender: mpsc::Sender<String>,
+    ) {
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = sender.send(format!("{prefix}{line}"));
+            }
+        });
+    }
+
+    /// The body of a [`Worker`]. Ignored, and a no-op unless [`WORKER_ENV`]
+    /// names this process's parent, so `--ignored` and `--include-ignored` runs
+    /// stay harmless even with the variable exported.
+    ///
+    /// A worker names itself and writes the memory it holds, and only then
+    /// reports ready. It sleeps, or spins, until it is killed, and ends by
+    /// itself after [`WORKER_LIFETIME`] or once that parent is gone, so an
+    /// orphan does not outlive a crashed test for long.
+    #[test]
+    #[ignore = "the body of a test-owned worker process, which Worker::spawn runs"]
+    fn test_owned_worker() {
+        let request = std::env::var(WORKER_ENV).unwrap_or_default();
+        let Some((parent, activity)) = request.split_once(':') else {
+            return;
+        };
+        let parent = parent.parse::<u32>().ok();
+        // Checked against the parent as it is now, so a worker whose test died
+        // before this point ends at once instead of adopting its new parent.
+        let spawned_by_test = || parent == Some(std::os::unix::process::parent_id());
+        if !spawned_by_test() {
+            return;
+        }
+        // Settled before the setup, so an unknown request fails before ready.
+        let burns = match activity {
+            WORKER_SLEEPS => false,
+            WORKER_BURNS => true,
+            other => panic!("unknown worker activity {other:?}"),
+        };
+        // Renames the thread-group leader, whichever thread writes it: the name
+        // `/proc/<pid>/stat` reports for the process.
+        std::fs::write("/proc/self/comm", WORKER_NAME).expect("a process may rename itself");
+        // Written, not merely allocated, so every page is resident.
+        let resident = std::hint::black_box(vec![1u8; worker_resident_bytes()]);
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{WORKER_READY}{}", std::process::id()).expect("the test reads this");
+        stdout.flush().expect("the test reads this");
+        drop(stdout);
+        let started = Instant::now();
+        while started.elapsed() < WORKER_LIFETIME && spawned_by_test() {
+            if burns {
+                // Only this thread runs: libtest's main thread is blocked waiting
+                // for it, so the process uses one CPU and no more.
+                let slice = Instant::now();
+                let mut spins = 0_u64;
+                while slice.elapsed() < Duration::from_millis(100) {
+                    spins = std::hint::black_box(spins.wrapping_add(1));
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        drop(resident);
+    }
+
+    /// How much memory a worker writes and holds, so that the `rss` in
+    /// `/proc/<pid>/stat` cannot read as zero. That field leaves out per-CPU
+    /// counter deltas smaller than the kernel's batch, `max(32, 2 * online
+    /// CPUs)` pages, so one thread writing four batches of its own pages has at
+    /// least three counted. Never less than [`WORKER_RESIDENT_MIN`], and not
+    /// capped: fewer than four batches brings back the zero this guards against.
+    fn worker_resident_bytes() -> usize {
+        let pages = 4 * (2 * online_cpus().unwrap_or(FALLBACK_ONLINE_CPUS)).max(32);
+        (pages * own_auxv(AT_PAGESZ).unwrap_or(FALLBACK_PAGE_SIZE)).max(WORKER_RESIDENT_MIN)
+    }
+
+    /// The value of `wanted` in this process's own auxiliary vector: pairs of
+    /// native-endian words ending at `AT_NULL`, the layout `procfs` reads from a
+    /// mount's `self/auxv`.
+    fn own_auxv(wanted: u64) -> Option<usize> {
+        let bytes = std::fs::read("/proc/self/auxv").ok()?;
+        let word = std::mem::size_of::<usize>();
+        let read = |slice: &[u8]| usize::from_ne_bytes(slice.try_into().expect("one word"));
+        bytes
+            .chunks_exact(2 * word)
+            .map(|pair| (read(&pair[..word]) as u64, read(&pair[word..])))
+            .take_while(|&(key, _)| key != AT_NULL)
+            .find(|&(key, _)| key == wanted)
+            .map(|(_, value)| value)
+    }
+
+    /// How many CPUs the kernel has online, the count it sizes that batch by,
+    /// from the ranges in `/sys/devices/system/cpu/online` (`0-3,8-11`). Not
+    /// `available_parallelism`, which a cgroup can hold below that count.
+    fn online_cpus() -> Option<usize> {
+        let list = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+        list.trim()
+            .split(',')
+            .map(|range| {
+                let (first, last) = range.split_once('-').unwrap_or((range, range));
+                let (first, last) = (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?);
+                last.checked_sub(first).map(|span| span + 1)
+            })
+            .sum()
     }
 
     #[test]
@@ -2048,7 +2237,7 @@ mod live {
             .iter()
             .find(|record| record.key.pid == Observed::Known(pid))
             .expect("the owned worker must appear in a live snapshot");
-        assert_eq!(record.display_name.as_str(), "sleep");
+        assert_eq!(record.display_name.as_str(), WORKER_NAME);
         // A sleeping worker holds a real, readable amount of memory: a live
         // record's metric is a value, not an unread field (PX-005).
         let Observed::Known(resident) = record.resident else {
@@ -2153,7 +2342,7 @@ mod live {
             let Value::List(cells) = &worker_row.value else {
                 panic!("expected table cells")
             };
-            assert_eq!(cells[1], Value::String("sleep".into()));
+            assert_eq!(cells[1], Value::String(WORKER_NAME.into()));
             // Item IDs are session-allocated and opaque: the allocator hands out
             // 1..=count in projection order, whatever the PID values are.
             // Asserting that set keeps this meaningful in a PID namespace with
@@ -2212,7 +2401,7 @@ mod live {
             panic!("expected table cells")
         };
         assert_eq!(cells[0], Value::UnsignedInt(u64::from(pid)));
-        assert_eq!(cells[1], Value::String("sleep".into()));
+        assert_eq!(cells[1], Value::String(WORKER_NAME.into()));
         // The shell was built once and is refreshed in place.
         session.with_store(|store| assert_eq!(store.node_count(), 5));
         assert!(session.current_revision() > before);
@@ -2330,78 +2519,140 @@ mod live {
         drop(block);
     }
 
-    /// PX-006 acceptance on a real host: a bounded worker this test owns, which
-    /// is runnable for the whole interval, reads as roughly one logical CPU, and
-    /// a sleeping one as roughly none. Both are first published as warming up.
+    /// PX-006 acceptance on a real host: the CPU share published for a bounded
+    /// worker this test owns, one runnable for the whole interval and one asleep,
+    /// is what the kernel's own counters say. Both are first published as warming
+    /// up.
     ///
-    /// Tolerances rather than exact values, because the scheduler is not a
-    /// contract: a loaded host may give the burner less than a full CPU, and
-    /// tick accounting has a resolution of one tick per `1 / CLK_TCK` seconds.
-    /// The upper bound is the one that cannot pass by accident — a
-    /// single-threaded process cannot use more than one CPU, so a reading well
-    /// above 100% is a measurement defect (a wall-clock divisor, a stale
-    /// baseline, a spike), not load.
+    /// Checked against ground truth this test reads itself, not against a fixed
+    /// band, because the scheduler is not a contract: a loaded host may give the
+    /// burner any share of a CPU. Each worker's `utime + stime` and an `Instant`
+    /// are read just before and just after each scan, so the counter srtop read
+    /// inside a scan, and the moment it read it, lie between them. The share it
+    /// publishes therefore lies between the smallest tick delta over the longest
+    /// interval and the largest delta over the shortest, less the tenth of a
+    /// point it truncates, whatever share the burner was given.
     #[test]
     fn a_test_owned_busy_worker_reads_about_one_cpu_and_a_sleeping_one_about_none() {
-        /// One tick of slack at USER_HZ 100 over the interval, plus the time a
-        /// scan takes, is far below this.
-        const UPPER_TENTHS: u64 = 1_150;
-        /// A single runnable thread on a host this suite runs on gets far more
-        /// than this; less means the interval or the counters are wrong.
-        const LOWER_TENTHS: u64 = 300;
-        /// A sleeping worker is woken by nothing in the interval.
-        const IDLE_TENTHS: u64 = 50;
         const INTERVAL: Duration = Duration::from_secs(2);
+        /// srtop publishes tenths of a point, truncated.
+        const TRUNCATION: f64 = 0.1;
+        /// Room for floating-point rounding in the bounds, far below a tenth.
+        const ROUNDING: f64 = 1e-6;
 
         let burner = Worker::burn();
         let sleeper = Worker::start();
+        let workers = [("burner", burner.pid()), ("sleeper", sleeper.pid())];
+        let pids = workers.map(|(_, pid)| pid);
         let mut source = ProcFsSource::live();
         let session = Session::mint();
+        let a = Counters::before(&pids);
         let (mut view, first) = start_from_source(&session, &mut source).unwrap();
+        let b = Counters::after(&pids);
         assert_eq!(cpu_for(&first, burner.pid()), CpuUsage::WarmingUp);
         assert_eq!(cpu_for(&first, sleeper.pid()), CpuUsage::WarmingUp);
         assert_eq!(published_cpu(&session, burner.pid()), "Warming up");
 
-        let started = Instant::now();
         std::thread::sleep(INTERVAL);
+        let c = Counters::before(&pids);
         let second = source.snapshot();
-        let wall = started.elapsed();
-        let burning = cpu_for(&second, burner.pid());
-        let sleeping = cpu_for(&second, sleeper.pid());
-        let tenths = |usage: CpuUsage| match usage {
-            CpuUsage::Measured(interval) => {
-                srui_process_explorer::metric::cpu_tenths_of_percent(&interval)
-                    .expect("a live interval is publishable")
-            }
-            other => panic!("a second live sample must be measured: {other:?}"),
+        let d = Counters::after(&pids);
+        // The rate srtop reads too: this process's own `AT_CLKTCK`.
+        let ticks_per_second = own_auxv(AT_CLKTCK).expect("a Linux process has AT_CLKTCK");
+        let (shortest, longest) = (c.at - b.at, d.at - a.at);
+        let share = |ticks: u64, over: Duration| {
+            ticks as f64 / ticks_per_second as f64 / over.as_secs_f64() * 100.0
         };
-        let (burning_tenths, sleeping_tenths) = (tenths(burning), tenths(sleeping));
+        let mut evidence = Vec::new();
+        let mut used = Vec::new();
+        for (index, (role, pid)) in workers.into_iter().enumerate() {
+            let CpuUsage::Measured(interval) = cpu_for(&second, pid) else {
+                panic!("a second live sample of the {role} must be measured")
+            };
+            let published = srui_process_explorer::metric::cpu_tenths_of_percent(&interval)
+                .expect("a live interval is publishable") as f64
+                / 10.0;
+            let fewest = c.ticks[index].saturating_sub(b.ticks[index]);
+            let most = d.ticks[index].saturating_sub(a.ticks[index]);
+            let (lower, upper) = (share(fewest, longest), share(most, shortest));
+            assert!(
+                lower - TRUNCATION - ROUNDING <= published && published <= upper + ROUNDING,
+                "the {role} was published at {published:.1}%, outside [{lower:.3}%, \
+                 {upper:.3}%]: {fewest}..{most} ticks at {ticks_per_second}/s over \
+                 {shortest:?}..{longest:?}"
+            );
+            assert_eq!(
+                interval.ticks_per_second, ticks_per_second as u64,
+                "srtop and this test read different clock tick rates"
+            );
+            evidence.push(format!(
+                "{role}_pid={pid} {role}={published:.1}% in [{lower:.3}%, {upper:.3}%] \
+                 {role}_ticks={fewest}..{most}"
+            ));
+            used.push(most);
+        }
+        // The one check that does not depend on the scheduler at all: the burner
+        // used more CPU than the sleeper did.
         assert!(
-            (LOWER_TENTHS..=UPPER_TENTHS).contains(&burning_tenths),
-            "a runnable single-threaded worker read {burning_tenths} tenths of a percent"
-        );
-        assert!(
-            sleeping_tenths <= IDLE_TENTHS,
-            "a sleeping worker read {sleeping_tenths} tenths of a percent"
+            used[0] > used[1],
+            "the burner used {} ticks and the sleeper {}",
+            used[0],
+            used[1]
         );
         let outcome = view.apply(&session, LIVE_STATUS_TEXT, &second).unwrap();
         assert!(outcome.updated >= 2, "{outcome:?}");
         assert_eq!(
             published_cpu(&session, burner.pid()),
-            srui_process_explorer::metric::cpu_cell(&burning)
+            srui_process_explorer::metric::cpu_cell(&cpu_for(&second, burner.pid()))
         );
         session.with_store(|store| assert_eq!(store.node_count(), 5));
         println!(
-            "PX-006 live evidence: burner_pid={} sleeper_pid={} wall={wall:?} \
-             burner={burning:?} burner_cell={:?} sleeper={sleeping:?} sleeper_cell={:?} \
-             records={} updated={}",
-            burner.pid(),
-            sleeper.pid(),
+            "PX-006 live evidence: clk_tck={ticks_per_second} {} interval={shortest:?}..{longest:?} \
+             burner_cell={:?} sleeper_cell={:?} records={} updated={}",
+            evidence.join(" "),
             published_cpu(&session, burner.pid()),
             published_cpu(&session, sleeper.pid()),
             second.records.len(),
             outcome.updated,
         );
+    }
+
+    /// Each worker's CPU counter, with the moment around it: the instant is read
+    /// before the counters in [`Counters::before`] and after them in
+    /// [`Counters::after`], so a pair of them brackets everything in between.
+    struct Counters {
+        at: Instant,
+        ticks: Vec<u64>,
+    }
+
+    impl Counters {
+        fn before(pids: &[u32]) -> Self {
+            let at = Instant::now();
+            Self {
+                at,
+                ticks: pids.iter().map(|&pid| cpu_ticks(pid)).collect(),
+            }
+        }
+
+        fn after(pids: &[u32]) -> Self {
+            let ticks = pids.iter().map(|&pid| cpu_ticks(pid)).collect();
+            Self {
+                at: Instant::now(),
+                ticks,
+            }
+        }
+    }
+
+    /// `utime + stime` of `pid`, fields 14 and 15 of `/proc/<pid>/stat`, read
+    /// here rather than through the collector this checks.
+    fn cpu_ticks(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .expect("a test's own worker has a stat file");
+        let after_name = &stat[stat.rfind(')').expect("a stat line names its command") + 1..];
+        // Field 3 is the first after the name, so 14 and 15 are the 12th and 13th.
+        let fields: Vec<&str> = after_name.split_whitespace().collect();
+        fields[11].parse::<u64>().expect("utime is a count")
+            + fields[12].parse::<u64>().expect("stime is a count")
     }
 
     /// The CPU usage `snapshot` observed for `pid`.

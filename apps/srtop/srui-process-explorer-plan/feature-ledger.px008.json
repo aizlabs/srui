@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-008",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "The R0 release gate of the read-only Process Explorer: a repeatable launch script and README, the gate's own checks (frozen-source traffic, no process-control path, the same generic client for the counter and the explorer, an end-to-end live scenario), visual evidence and the durable release record; no new product behaviour, no process action, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX008-001",
+      "feature": "A repeatable launch script, apps/srtop/run.sh, opens the explorer in the unchanged generic macOS client (RendererDemoApp) in four modes — the fixed fake snapshot and the scripted sequence on a private local socket, the Linux dev box, and a Linux host serving the srui subsystem — and stops the srtop it started when the client quits; the README states the prerequisites, fake mode, a real Linux host, known limitations and how to stop it",
+      "scope": "PX-008/macOS client; fake and sequence modes driven three times end to end, devbox mode through r0-scenario.sh; the ssh mode against a separate physical host was not exercised by this gate",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-008",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/releases/R0.md",
+        "docs/process-explorer/completions/PX-008.md",
+        "docs/process-explorer/evidence/PX-008/r0-launcher-fake.png"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX008-002",
+      "feature": "A frozen fake source sends a synchronized client no app UI mutation: the production refresh loop at its 50 ms minimum samples it for at least three wall-clock seconds after a real client is synchronized, every message the client then receives is classed by the runtime's own logical_class_for_server_envelope (§19.2), no Ui-, resource- or terminal-class message arrives, control traffic is counted rather than assumed away, and a canary transaction proves the client was receiving; the same holds natively for the real binary behind the real bridge and sshd",
+      "scope": "PX-008/--fake-source; Rust (macOS and Linux) and native macOS over real localhost SSH",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-008",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/releases/R0.md",
+        "docs/process-explorer/completions/PX-008.md",
+        "docs/process-explorer/evidence/PX-008/r0-fake-source-trace.txt"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX008-003",
+      "feature": "No code path of the application can signal or reconfigure a process, checked on every cargo test: the production sources contain no process spawn, FFI, raw system call, signal delivery, ptrace, priority, affinity or limit change, file write, PTY use or client-input handler, and receive only SIGINT, SIGTERM and the --smoke-fixture SIGUSR1; the manifest names only the SRUI runtime and tokio; and the built binary imports no process-creation, targeted-signal or reconfiguration function, its kill, waitpid and waitid imports being the runtime PTY manager's teardown of PTY children whose spawn path is absent from the binary",
+      "scope": "PX-008/apps/srtop production sources and the debug srtop binary on macOS and Linux; dependency internals and raw syscall arguments are outside what either check can see",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-008",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/releases/R0.md",
+        "docs/process-explorer/completions/PX-008.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX008-004",
+      "feature": "The same generic client runs the counter example and the explorer: one client construction, the one RendererDemoApp performs for every live session, drives the counter (Count: 0 to Count: 1) and then the explorer's native table over the same real SSH subsystem path, and no production client source names either application",
+      "scope": "PX-008/native macOS over real localhost SSH",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-008",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/releases/R0.md",
+        "docs/process-explorer/completions/PX-008.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX008-005",
+      "feature": "The R0 end-to-end scenario on a live Linux /proc, re-runnable with apps/srtop/devbox/r0-scenario.sh: from an empty client window, a worker created in the dev box appears as a new row that is first warming up with a resident size in bytes, is then sampled, keeps one item identity until it ends on its own and its row is deleted, while every scan is complete, the summary's process count follows the table and its freshness advances, and srtop's own row and every native control keep their identity; a window image and an operation/byte trace are kept as visual evidence only",
+      "scope": "PX-008/devbox container on Docker Desktop's Linux VM (6.10 linuxkit, aarch64), srtop --live-source behind the real srui-ssh-bridge subsystem, native macOS client; not a separate physical Linux host",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-008",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/releases/R0.md",
+        "docs/process-explorer/evidence/PX-008/r0-devbox-live.png",
+        "docs/process-explorer/evidence/PX-008/r0-devbox-live-trace.txt"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX008-006",
+      "feature": "A durable R0 release record lists every gate command, its result and log, re-runs the phase-A tickets' recorded checks, names what R0 does and does not claim, and leaves the read-only milestone tag as a pending step for the maintainer after merge",
+      "scope": "PX-008/release record; the tag itself is not created by this ticket",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-008",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/releases/R0.md"
+      ]
+    }
+  ]
+}

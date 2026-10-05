@@ -84,6 +84,8 @@ fn scan(pids: &[u32]) -> ProcessSnapshot {
         vanished: 0,
         capped: CappedRecords::none(),
         completeness: Completeness::Complete,
+        // Retention is about rows; this fixture states no system figure.
+        system: SystemSample::not_provided(),
     }
 }
 

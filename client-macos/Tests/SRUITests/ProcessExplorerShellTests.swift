@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004/PX-005/PX-006: real non-PTY SSH launch through the unchanged generic client (§§8, 12, 22, 29).
+// PX-001/PX-002/PX-004/PX-005/PX-006/PX-007: real non-PTY SSH launch through the unchanged generic client (§§8, 12, 22, 29).
 import Testing
 import Foundation
 import AppKit
@@ -44,6 +44,11 @@ struct ProcessExplorerShellTests {
         let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
         let scroll = try #require(tableHandle.view as? NSScrollView)
         let table = try #require(scroll.documentView as? NSTableView)
+        // PX-007: the system summary, rendered by the generic client as native labels and
+        // progress bars between the status line and the table.
+        let summaryHandles = try Self.summaryHandles(renderer)
+        let summaryLines = try Self.summaryLines(renderer)
+        let summaryBars = try Self.summaryBars(renderer)
         // The session already ordered the surface in; re-order it under the host's own
         // presentation policy rather than forcing it front over the developer's desktop.
         SurfacePresentation.forHostApplication().present(window)
@@ -75,6 +80,19 @@ struct ProcessExplorerShellTests {
                 }
             }
         }
+        // PX-007: every summary line as the server worded it, and each bar filled to the share
+        // its line prints — or hidden, carrying no value, where there is no share: a host with
+        // no swap, and an empty shell that has sampled nothing.
+        #expect(summaryLines.map(\.stringValue) == (fakeSource ? Self.fakeSummary : Self.unsampledSummary))
+        #expect(summaryBars.map { $0.accessibilityLabel() } == ["Overall CPU", "Memory used", "Swap used"])
+        if fakeSource {
+            #expect(abs(summaryBars[0].doubleValue - 0.312) < 1e-9)
+            #expect(abs(summaryBars[1].doubleValue - 0.25) < 1e-9)
+            #expect(summaryBars.map(\.alphaValue) == [1, 1, 0])
+        } else {
+            #expect(summaryBars.map(\.alphaValue) == [0, 0, 0])
+        }
+        #expect(summaryBars.allSatisfy { !$0.isIndeterminate })
         let windowNumber = window.windowNumber
         try await Self.capture(window: window, name: fakeSource ? "fake-initial" : "initial")
 
@@ -91,8 +109,13 @@ struct ProcessExplorerShellTests {
         #expect(window.windowNumber == windowNumber)
         #expect(window.isVisible)
         #expect(table.numberOfRows == (fakeSource ? 3 : 0))
+        // The summary's native controls are the same objects, showing the same lines.
+        for (handle, id) in zip(summaryHandles, Self.summaryNodeIDs) {
+            #expect(renderer.registry.handle(for: NodeId(id)) === handle, "summary node \(id) was rebuilt")
+        }
+        #expect(summaryLines.map(\.stringValue) == (fakeSource ? Self.fakeSummary : Self.unsampledSummary))
         try await Self.capture(window: window, name: fakeSource ? "fake-updated" : "updated")
-        print("PX-001/PX-002/PX-005/PX-006 native SSH evidence: fakeSource=\(fakeSource); revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading and Table handles retained; PID/Name/Resident/CPU columns; rows=\(table.numberOfRows); cells=\(Self.nativeRows(table)).")
+        print("PX-001/PX-002/PX-005/PX-006/PX-007 native SSH evidence: fakeSource=\(fakeSource); revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading, Table and \(summaryHandles.count) summary handles retained; PID/Name/Resident/CPU columns; rows=\(table.numberOfRows); cells=\(Self.nativeRows(table)); summary=\(summaryLines.map(\.stringValue)); bars=\(summaryBars.map { ($0.doubleValue, $0.alphaValue) }).")
         await controller.stop()
     }
 
@@ -125,6 +148,8 @@ struct ProcessExplorerShellTests {
         let tableHandle = try #require(renderer.registry.handle(for: NodeId(5)))
         let scroll = try #require(tableHandle.view as? NSScrollView)
         let table = try #require(scroll.documentView as? NSTableView)
+        let summaryHandles = try Self.summaryHandles(renderer)
+        let summaryLines = try Self.summaryLines(renderer)
         SurfacePresentation.forHostApplication().present(window)
         window.contentView?.layoutSubtreeIfNeeded()
         let windowNumber = window.windowNumber
@@ -141,7 +166,8 @@ struct ProcessExplorerShellTests {
         let sessionFailure = ManagedAtomic<String?>(nil)
         controller.onFailure = { failure in sessionFailure.store(String(describing: failure)) }
         let recorder = PublishedStateRecorder(applier: applier, window: window,
-                                              statusField: statusField, table: table)
+                                              statusField: statusField, table: table,
+                                              summaryLines: summaryLines)
         controller.rendererDidRenderInterceptorForTesting = { [recorder] in
             await recorder.record()
         }
@@ -191,6 +217,24 @@ struct ProcessExplorerShellTests {
         #expect(trace[recoveredIndex].rows == settledRows)
         #expect(trace[recoveredIndex].itemIDs == failed.itemIDs, "recovery must move no row")
 
+        // PX-007: every published state shows the script's fixed figures, and the freshness
+        // line its sample time. The failed scan keeps those figures under a collector error
+        // that names the last successful sample — the step before it, two seconds before the
+        // step that recovers — and the recovery shows its own time again.
+        for observation in trace {
+            #expect(Array(observation.summary.dropLast()) == Self.scriptedFigures, "rev \(observation.revision)")
+        }
+        let failedFreshness = try #require(failed.summary.last)
+        let collectorError = "Collector error: could not list processes (permission denied) · last successful sample: "
+        #expect(failedFreshness.hasPrefix(collectorError), "\(failedFreshness)")
+        #expect(failedFreshness.hasSuffix(" UTC (server clock) · source: fake-process-sequence-v1"), "\(failedFreshness)")
+        let recoveredFreshness = try #require(trace[recoveredIndex].summary.last)
+        #expect(recoveredFreshness.hasPrefix("Last successful sample: "), "\(recoveredFreshness)")
+        let failedSecond = try #require(Self.sampleSecond(failedFreshness))
+        let recoveredSecond = try #require(Self.sampleSecond(recoveredFreshness))
+        #expect(recoveredSecond - failedSecond == 2, "\(failedFreshness) / \(recoveredFreshness)")
+        #expect(trace[recoveredIndex].revision == failed.revision + 1)
+
         // The process that never changed keeps one row identity throughout, and
         // so does the renamed one.
         let unchanged = try #require(trace.first { $0.rows.first?.first == "4101" }?.itemIDs.first)
@@ -201,12 +245,18 @@ struct ProcessExplorerShellTests {
         let renamedAfter = try #require(trace.first { $0.rows == settledRows }?.itemIDs[1])
         #expect(renamedBefore == renamedAfter, "a rename must keep the row identity")
 
-        // One cycle is five ticks and exactly four transactions: the tick whose
-        // snapshot repeated the previous one published nothing at all.
-        let cycleStarts = trace.indices.filter { trace[$0].rows == Self.initialRows }
+        // One cycle is five ticks and exactly five transactions. PX-004 counted four, because
+        // the tick whose snapshot repeated the previous one published nothing; since PX-007 the
+        // freshness line shows each step's sample time, so that tick publishes exactly that
+        // one line, and no row and no status move for it.
+        let cycleStarts = Self.cycleStarts(trace)
         try #require(cycleStarts.count >= 2)
         let cycle = trace[cycleStarts[1]].revision - trace[cycleStarts[0]].revision
-        #expect(cycle == 4, "a repeated snapshot must cost no transaction")
+        #expect(cycle == 5, "one transaction per tick: the repeated snapshot costs only its sample time")
+        let repeated = cycleStarts[0] + 1
+        try #require(repeated < trace.count)
+        #expect(trace[repeated].rows == Self.initialRows && trace[repeated].status == normalStatus)
+        #expect(trace[repeated].summary.last != trace[cycleStarts[0]].summary.last, "the repeated tick shows its own time")
 
         // Everything above happened inside the native controls built once.
         #expect(renderer.registry.handle(for: NodeId(1)) === surfaceHandle)
@@ -214,6 +264,9 @@ struct ProcessExplorerShellTests {
         #expect(tableHandle.view as? NSScrollView === scroll)
         #expect(scroll.documentView as? NSTableView === table)
         #expect(renderer.registry.handle(for: NodeId(4))?.view as? NSTextField === statusField)
+        for (handle, id) in zip(summaryHandles, Self.summaryNodeIDs) {
+            #expect(renderer.registry.handle(for: NodeId(id)) === handle, "summary node \(id) was rebuilt")
+        }
         #expect(window.windowNumber == windowNumber)
         #expect(window.isVisible)
         #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
@@ -221,9 +274,11 @@ struct ProcessExplorerShellTests {
         try await Self.capture(window: window, name: "sequence-settled")
         let elapsed = stamps.isEmpty ? Duration.zero : stamps[stamps.count - 1]
         print("""
-        PX-004 native SSH evidence: interval=\(intervalMilliseconds)ms window \(windowNumber) retained; \
+        PX-004/PX-007 native SSH evidence: interval=\(intervalMilliseconds)ms window \(windowNumber) retained; \
         observed \(trace.count) published states in \(elapsed); revisions per five-tick cycle=\(cycle); \
-        unchanged row ItemId=\(unchanged); states=\(trace.map { "\($0.revision):\($0.rows.map { $0[0] }.joined(separator: ","))" })
+        unchanged row ItemId=\(unchanged); \(summaryHandles.count) summary handles retained; \
+        failed freshness=\(failedFreshness); recovered freshness=\(recoveredFreshness); \
+        states=\(trace.map { "\($0.revision):\($0.rows.map { $0[0] }.joined(separator: ","))" })
         """)
         await controller.stop()
     }
@@ -234,10 +289,80 @@ struct ProcessExplorerShellTests {
         let status: String
         let rows: [[String]]
         let itemIDs: [UInt64]
+        /// The native summary lines, the freshness line last (PX-007).
+        let summary: [String]
+    }
+
+    // PX-007: the summary's nodes — its column, three rows of a bar and a line, and four more
+    // lines — and the seven lines in the order they appear, the freshness line last.
+    fileprivate static let summaryNodeIDs: [UInt64] = Array(6...19)
+    fileprivate static let summaryLineIDs: [UInt64] = [9, 12, 15, 16, 17, 18, 19]
+    fileprivate static let summaryBarIDs: [UInt64] = [8, 11, 14]
+
+    private static let fakeSummary = [
+        "Overall CPU (100% = all 8 logical CPUs): 31.2%",
+        "Memory: 4.0 GiB used of 16.0 GiB (25.0% of total)",
+        "Swap: none configured",
+        "Load average (1, 5, 15 min): 0.52, 0.58, 0.59",
+        "Uptime: 3 days, 4 h 05 min",
+        "Processes visible to this reader: 3 listed · complete scan · no srtop filter",
+        "Last successful sample: 2027-01-15 08:00:00 UTC (server clock) · source: fake-processes-v1",
+    ]
+    private static let unsampledSummary = [
+        "Overall CPU (100% = all logical CPUs): Not sampled",
+        "Memory: Not sampled",
+        "Swap: Not sampled",
+        "Load average (1, 5, 15 min): Not sampled",
+        "Uptime: Not sampled",
+        "Processes visible to this reader: Not sampled",
+        "No sample: process collection not started",
+    ]
+    /// The script's figures, the same on every step; only its freshness line moves.
+    private static let scriptedFigures = [
+        "Overall CPU (100% = all 4 logical CPUs): 30.0%",
+        "Memory: 2.0 GiB used of 8.0 GiB (25.0% of total)",
+        "Swap: 256.0 MiB used of 2.0 GiB (12.5% of total)",
+        "Load average (1, 5, 15 min): 1.25, 1.00, 0.75",
+        "Uptime: 1 day, 2 h 30 min",
+        "Processes visible to this reader: 3 listed · complete scan · no srtop filter",
+    ]
+
+    @MainActor
+    private static func summaryHandles(_ renderer: AppKitRenderer) throws -> [RenderHandle] {
+        try summaryNodeIDs.map { id in try #require(renderer.registry.handle(for: NodeId(id)), "summary node \(id)") }
+    }
+
+    @MainActor
+    private static func summaryLines(_ renderer: AppKitRenderer) throws -> [NSTextField] {
+        try summaryLineIDs.map { id in
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? NSTextField, "summary line \(id)")
+        }
+    }
+
+    @MainActor
+    private static func summaryBars(_ renderer: AppKitRenderer) throws -> [NSProgressIndicator] {
+        try summaryBarIDs.map { id in
+            try #require(renderer.registry.handle(for: NodeId(id))?.view as? NSProgressIndicator, "summary bar \(id)")
+        }
+    }
+
+    /// The seconds of the scripted sample time a freshness line names (`2027-01-15 08:00:SS`).
+    private static func sampleSecond(_ line: String) -> Int? {
+        guard let date = line.range(of: "2027-01-15 08:") else { return nil }
+        let clock = line[date.upperBound...].prefix(5)
+        let parts = clock.split(separator: ":")
+        guard parts.count == 2, let minutes = Int(parts[0]), let seconds = Int(parts[1]) else { return nil }
+        return minutes * 60 + seconds
+    }
+
+    /// The first state of each run of the script's initial rows that follows another state:
+    /// one per cycle, at its step 0.
+    private static func cycleStarts(_ trace: [Observation]) -> [Int] {
+        trace.indices.filter { $0 > 0 && trace[$0].rows == initialRows && trace[$0 - 1].rows != initialRows }
     }
 
     // PX-005: every scripted row carries its resident cell, fixed per process so
-    // that a repeated snapshot stays byte-identical and still publishes nothing.
+    // that a repeated snapshot's rows stay byte-identical and publish nothing.
     // PX-006: the CPU cell likewise, one per CPU state the script states.
     private static let initialRows = [
         ["4101", "worker", "2.0 MiB", "50.0%"],
@@ -252,9 +377,9 @@ struct ProcessExplorerShellTests {
     private static let normalStatus = "Read-only · Fake process sequence"
     private static let retainedRowsMarker = "retained from an earlier scan"
 
-    /// Whether the recorded states cover every state the PX-004 assertions read.
+    /// Whether the recorded states cover every state the PX-004 and PX-007 assertions read.
     private static func coversTwoScriptedCycles(_ trace: [Observation]) -> Bool {
-        guard trace.filter({ $0.rows == initialRows && $0.status == normalStatus }).count >= 2,
+        guard cycleStarts(trace).count >= 2,
               trace.contains(where: { $0.rows == settledRows && $0.status == normalStatus }),
               let failed = trace.firstIndex(where: { $0.status.contains(retainedRowsMarker) }),
               failed + 1 < trace.count else {
@@ -299,7 +424,18 @@ struct ProcessExplorerShellTests {
     /// The status text the client holds.
     @MainActor
     fileprivate static func modelStatus(_ applier: TransactionApplier) -> String {
-        guard case .string(let text)? = applier.store.getNode(NodeId(4))?.getProperty(.text) else {
+        modelText(applier, NodeId(4))
+    }
+
+    /// The summary lines the client holds, in display order (PX-007).
+    @MainActor
+    fileprivate static func modelSummary(_ applier: TransactionApplier) -> [String] {
+        summaryLineIDs.map { modelText(applier, NodeId($0)) }
+    }
+
+    @MainActor
+    private static func modelText(_ applier: TransactionApplier, _ id: NodeId) -> String {
+        guard case .string(let text)? = applier.store.getNode(id)?.getProperty(.text) else {
             return ""
         }
         return text
@@ -433,14 +569,17 @@ private final class PublishedStateRecorder {
     private let window: NSWindow
     private let statusField: NSTextField
     private let table: NSTableView
+    private let summaryLines: [NSTextField]
     private let clock = ContinuousClock()
     private let start: ContinuousClock.Instant
 
-    init(applier: TransactionApplier, window: NSWindow, statusField: NSTextField, table: NSTableView) {
+    init(applier: TransactionApplier, window: NSWindow, statusField: NSTextField, table: NSTableView,
+         summaryLines: [NSTextField]) {
         self.applier = applier
         self.window = window
         self.statusField = statusField
         self.table = table
+        self.summaryLines = summaryLines
         self.start = clock.now
     }
 
@@ -450,14 +589,17 @@ private final class PublishedStateRecorder {
             revision: applier.lastAppliedRevision.value,
             status: statusField.stringValue,
             rows: ProcessExplorerShellTests.nativeRows(table),
-            itemIDs: ProcessExplorerShellTests.modelItemIDs(applier)
+            itemIDs: ProcessExplorerShellTests.modelItemIDs(applier),
+            summary: summaryLines.map(\.stringValue)
         )
         let modelRows = ProcessExplorerShellTests.modelRows(applier)
         let modelStatus = ProcessExplorerShellTests.modelStatus(applier)
-        if observation.rows != modelRows || observation.status != modelStatus {
+        let modelSummary = ProcessExplorerShellTests.modelSummary(applier)
+        if observation.rows != modelRows || observation.status != modelStatus
+            || observation.summary != modelSummary {
             divergences.append(
-                "rev \(observation.revision): native \(observation.rows)/\(observation.status)"
-                    + " vs model \(modelRows)/\(modelStatus)"
+                "rev \(observation.revision): native \(observation.rows)/\(observation.status)/\(observation.summary)"
+                    + " vs model \(modelRows)/\(modelStatus)/\(modelSummary)"
             )
         }
         guard states.last != observation else { return }

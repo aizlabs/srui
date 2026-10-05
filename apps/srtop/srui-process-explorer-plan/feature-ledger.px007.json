@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-007",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "A first read-only system summary and data-freshness indicator above the process list: overall CPU as a share of all logical CPUs, memory and swap used of total, load averages, uptime and the process count, with the last successful sample's time (UTC, server clock) and source, published as standard Text and Progress nodes; no custom graph, no per-CPU or other meters, no history, no macOS source, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html",
+      "S1": "https://docs.rs/sysinfo/latest/sysinfo/struct.Process.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX007-001",
+      "feature": "A system summary between the status line and the process table, built from standard nodes only: a Column of Text lines and three Rows of a Progress bar and its Text line (overall CPU, memory, swap), rendered by the unchanged generic client as native labels and NSProgressIndicator bars, each bar filled to exactly the truncated share its line prints; no custom graph, image, resource or drawing instruction",
+      "scope": "PX-007/fake, scripted and live procfs sources/read-only; layout is the generic renderer's",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-007",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-007.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX007-002",
+      "feature": "Overall CPU is a share of all logical CPUs, labelled 'Overall CPU (100% = all N logical CPUs)' and never the process column's 'CPU (100% = 1 CPU)': the /proc/stat cpu line, busy = user + nice + system + irq + softirq + steal and idle = idle + iowait (guest and guest_nice already in user and nice), differenced between two consecutive successful reads and truncated to a tenth of a point; the cpuN lines are counted as the logical CPUs and parsing stops at the first other line; a first read, and the first read after one that failed or held no usable cpu line, is warming up, so an outage is never averaged into a current figure; counters that went backwards, did not advance or were read over a different CPU count are unavailable rather than zero or a spike, and a different boot restarts the baseline",
+      "scope": "PX-007/live and fixture procfs roots, read through the scanned root/read-only",
+      "source_refs": [
+        "D1",
+        "K1",
+        "S1"
+      ],
+      "owner": "PX-007",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-007.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX007-003",
+      "feature": "Memory used is MemTotal - MemAvailable and swap used is SwapTotal - SwapFree (meminfo kB of 1024 bytes), each published with its total and its percentage of that total, truncated; a SwapTotal of 0 is published as 'Swap: none configured' with a hidden bar and no value, never 0% of 0; a missing, malformed or impossible field is unavailable, never zero",
+      "scope": "PX-007/live and fixture procfs roots/read-only",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-007",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-007.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX007-004",
+      "feature": "Load averages are the first three loadavg fields exactly as the kernel prints them, not a percentage and not divided by the CPU count, and uptime is the first uptime field truncated to whole minutes; each is read on its own and published as unavailable or denied when its file cannot be used",
+      "scope": "PX-007/live and fixture procfs roots/read-only",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-007",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-007.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX007-005",
+      "feature": "The process count states the only scope srtop knows: 'Processes visible to this reader', the records the last successful scan listed, in the status line's own counts and words (unreadable, beyond the record limit, complete or incomplete scan), processes and never threads, with 'no srtop filter'; the view is bounded, without any error, by the PID namespace the procfs was mounted for (usually, not always, the reader's) and its mount options such as hidepid, which srtop does not detect, so a complete scan is never a claim about the whole host",
+      "scope": "PX-007/all sources/read-only; filters are PX-010",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-007",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-007.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX007-006",
+      "feature": "A data-freshness line shows the last successful sample's time in UTC to the second, stated as the server's clock, and its source; no generic renderer behaviour derives a local age, so none is shown and no client logic was added. A scan whose process list cannot be read or is rejected publishes no figure: every figure stays as it was and the line becomes 'Collector error: ... last successful sample: ...' in the warning role, while a file that fails alone marks only its own line; transport loss stays the generic client's own indicator",
+      "scope": "PX-007/all sources/read-only",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-007",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-007.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX007-007",
+      "feature": "The summary is refreshed inside the existing refresh transactions as scalar SET_PROPERTY operations on the properties a client would see change and no others (and one CLEAR_PROPERTY only on the tick a bar loses its value, never a zero), so a source whose figures and sample time are constant, like the fake source, publishes nothing once synchronized; it is planned after the status and before the row operations of the same refresh, and charged a fixed 8 KiB reserve against the catch-up snapshot, asserted against the widest summary on the protocol's encoder and pinned at the row ceiling, never its current length",
+      "scope": "PX-007/refresh and snapshot bounds; frame budgets of PX-004 and PX-004-G01 unchanged otherwise",
+      "source_refs": [
+        "D1",
+        "D2"
+      ],
+      "owner": "PX-007",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-007.md"
+      ]
+    }
+  ]
+}

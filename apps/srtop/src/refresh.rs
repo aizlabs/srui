@@ -1,14 +1,18 @@
 //! Periodic incremental refresh of the published process collection
-//! (design §§8, 12.1, 13, 23; PX-004). The semantic node tree is built once,
-//! by [`crate::initialize_from_source`]; every later tick emits nothing but
-//! model mutations and — only when it actually changed — the status text.
+//! (design §§8, 12.1, 13, 23; PX-004) and of the system summary beside it
+//! (PX-007). The semantic node tree is built once, by
+//! [`crate::initialize_from_source`]; every later tick emits nothing but model
+//! mutations and — only when they actually changed — the status text and the
+//! summary's scalar properties ([`crate::summary`]).
 //!
 //! Four rules shape this module:
 //!
 //! * A tick that observed no user-visible change opens no transaction at all.
-//!   Nothing that changes on its own — the sample time, an issue count, a
-//!   sequence number — is ever serialized, so an idle host produces an idle
-//!   wire (§12.2).
+//!   Nothing that changes on its own — an issue count, a sequence number, the
+//!   source's internal state — is ever serialized, so an unchanging source
+//!   produces an idle wire (§12.2). The sample time is the one exception, and
+//!   only because a client sees it: the data-freshness line publishes it, to
+//!   the second (PX-007).
 //! * Rows are deleted only on the word of a scan that is entitled to say a
 //!   process is gone. A scan that could not list the process filesystem, or
 //!   whose records this app refuses to identify, is an error published over the
@@ -78,6 +82,7 @@
 
 use crate::projection::{Row, SessionItemIds};
 use crate::source::{ProcessSnapshot, ProcessSource, Retention};
+use crate::summary::{self, CollectorError, Sample};
 use crate::{
     bounded, initialize_rows, published_status_from, ScanReport, MAX_PUBLISHED_LABEL_BYTES, MODEL,
     STATUS,
@@ -159,8 +164,11 @@ const RECORD_PROPERTY_BYTES: usize = 24;
 ///
 /// The shell is five nodes with fixed labels and a two-column header, so the
 /// real cost is a few hundred bytes; 4 KiB is far above every encoding of them
-/// and leaves the ceiling insensitive to a later label. The status text is the
-/// one property a scan can lengthen, so it is charged separately and exactly.
+/// and leaves the ceiling insensitive to a later label. The status text and the
+/// system summary are what a scan can lengthen, so each is charged separately,
+/// at its own fixed reserve ([`STATUS_RESERVE_BYTES`], [`SUMMARY_RESERVE_BYTES`];
+/// `the_shell_status_and_summary_fit_their_snapshot_allowances` measures all
+/// three on the snapshot a client is sent).
 const SNAPSHOT_SHELL_BYTES: usize = 4096;
 
 /// Bytes one `MODEL_RESET_RANGE` operation of a snapshot costs beyond its items.
@@ -184,6 +192,21 @@ const MAX_STATUS_CLAUSE_BYTES: usize = 1024;
 /// whatever this tick's status turns out to say: the widest label a source can
 /// publish plus the widest set of clauses a scan can add to it.
 const STATUS_RESERVE_BYTES: usize = MAX_PUBLISHED_LABEL_BYTES + MAX_STATUS_CLAUSE_BYTES;
+
+/// Bytes the system summary is charged against the catch-up snapshot frame,
+/// whatever it says this tick (PX-007): one `CREATE_NODE` per summary node, each
+/// with its fixed properties and every published one at its widest.
+///
+/// Reserved rather than measured, for the status's reason: the summary travels
+/// in the same snapshot as the rows, and its lines are longest exactly when a
+/// collector error is being reported, so charging this tick's text would let a
+/// failing collector shrink the row budget and delete rows no scan said had
+/// ended. Every line is bounded ([`summary::MAX_SUMMARY_TEXT_BYTES`],
+/// [`summary::MAX_BAR_DESCRIPTION_BYTES`]), so the widest summary is a constant,
+/// and `the_summary_reserve_covers_the_widest_summary_on_the_real_encoder`
+/// asserts this allowance against it, on the planner's own accounting and on
+/// the protocol's encoder.
+const SUMMARY_RESERVE_BYTES: usize = 8 * 1024;
 
 /// The most of a rejection reason the status quotes. The reason is this app's
 /// own error text, not a record's, and it is bounded all the same so that the
@@ -252,6 +275,8 @@ pub struct Refreshed {
     /// model may cache (§18, §26).
     pub truncated: usize,
     pub status_changed: bool,
+    /// Summary properties this refresh set or cleared (PX-007).
+    pub summary: usize,
     /// Transactions this refresh committed. Zero means the snapshot held no
     /// user-visible change and nothing was sent.
     pub transactions: usize,
@@ -263,12 +288,18 @@ impl Refreshed {
     }
 }
 
-/// The rows and status this session has published, and the identity allocator
-/// that owns their item IDs.
+/// The rows, status and summary this session has published, and the identity
+/// allocator that owns the rows' item IDs.
 pub struct ProcessView {
     ids: SessionItemIds,
     rows: Vec<Row>,
     status: String,
+    /// The summary's properties as the client holds them (PX-007).
+    summary: summary::Properties,
+    /// The last successful sample, which the summary shows until another
+    /// replaces it. Server-side memory only: what reaches the wire is
+    /// `summary`.
+    sample: Option<Sample>,
     /// The most rows this view publishes: [`MAX_PUBLISHED_ROWS`], further
     /// lowered to whatever this session's store will cache.
     published_limit: usize,
@@ -305,10 +336,22 @@ impl ProcessView {
             },
         );
         debug_assert!(status.len() <= STATUS_RESERVE_BYTES);
+        // The first sample is shown if it is one; a first scan that could not
+        // list its processes publishes a collector error and no figure.
+        let (sample, error) = match Sample::of(&snapshot) {
+            Ok(sample) => (Some(sample), None),
+            Err(error) => (None, Some(error)),
+        };
+        let summary = summary::properties(&summary::summarize(&summary::State::Collecting {
+            last: sample.as_ref(),
+            error,
+            source: &snapshot.source,
+        }));
         initialize_rows(
             session,
             rows.iter().map(Row::to_model_item).collect(),
             &status,
+            &summary,
         )?;
         ids.retain(&rows);
         Ok((
@@ -316,6 +359,8 @@ impl ProcessView {
                 ids,
                 rows,
                 status,
+                summary,
+                sample,
                 published_limit,
             },
             snapshot,
@@ -375,13 +420,17 @@ impl ProcessView {
         } else {
             snapshot.retention()
         };
+        // The summary shows the last successful sample (PX-007): this scan, if
+        // its process list was read and accepted, and otherwise the one before
+        // it, marked with this scan's collector error.
+        let summary = self.summarize(snapshot, rejected.is_some());
         // A scan that confirmed nothing and is entitled to delete nothing has no
         // row work to do at all: the target *is* the published rows. It plans
-        // only its status, so a failure whose text is the longest this app emits
-        // cannot cost a row — there is no row budget, no diff and no eviction on
-        // this path to cost one.
+        // only its status and summary, so a failure whose text is the longest
+        // this app emits cannot cost a row — there is no row budget, no diff and
+        // no eviction on this path to cost one.
         if confirmed.is_empty() && retention.is_global() {
-            return self.publish_status_only(session, source_status, snapshot, rejected);
+            return self.publish_status_only(session, source_status, snapshot, rejected, summary);
         }
         let confirmed_ids: HashSet<ItemId> = confirmed.iter().map(|row| row.item_id).collect();
         let mut target = retain_unconfirmed(&self.rows, confirmed, &retention);
@@ -429,6 +478,9 @@ impl ProcessView {
             // of the same refresh does not commit.
             plan.push(Planned::new(Effect::Status(status)));
         }
+        // Then the summary, whose lines are scalar properties: only the ones a
+        // client would see change are planned (PX-007).
+        plan.extend(summary_effects(&self.summary, &summary));
         plan.extend(diff(
             &self.rows,
             &target,
@@ -445,6 +497,7 @@ impl ProcessView {
         for planned in &plan {
             match &planned.effect {
                 Effect::Status(_) => result.status_changed = true,
+                Effect::Summary(_) => result.summary += 1,
                 Effect::Delete(ids) => result.deleted += ids.len(),
                 Effect::Insert(_, rows) => result.inserted += rows.len(),
                 Effect::Update(rows) => result.updated += rows.len(),
@@ -463,12 +516,38 @@ impl ProcessView {
             &plan,
             max_ops,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut self.rows,
-            &mut self.status,
+            &mut Published {
+                rows: &mut self.rows,
+                status: &mut self.status,
+                summary: &mut self.summary,
+            },
         );
         result.transactions = transactions;
         self.ids.retain(&self.rows);
         outcome.map(|()| result)
+    }
+
+    /// The summary this refresh publishes (PX-007): this scan's sample if it is
+    /// one, and otherwise the last successful sample marked with this scan's
+    /// collector error. A scan this app rejected is not a sample, whatever it
+    /// read.
+    fn summarize(&mut self, snapshot: &ProcessSnapshot, rejected: bool) -> summary::Properties {
+        let error = if rejected {
+            Some(CollectorError::Rejected)
+        } else {
+            match Sample::of(snapshot) {
+                Ok(sample) => {
+                    self.sample = Some(sample);
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        };
+        summary::properties(&summary::summarize(&summary::State::Collecting {
+            last: self.sample.as_ref(),
+            error,
+            source: &snapshot.source,
+        }))
     }
 
     /// Publishes an error over the last-known rows and mutates no row.
@@ -485,6 +564,7 @@ impl ProcessView {
         source_status: &str,
         snapshot: &ProcessSnapshot,
         rejected: Option<String>,
+        summary: summary::Properties,
     ) -> Result<Refreshed, SessionError> {
         let retained = self.rows.len();
         let status = refresh_status(
@@ -501,20 +581,29 @@ impl ProcessView {
             retained,
             ..Refreshed::default()
         };
-        if status == self.status {
+        let mut plan = Vec::new();
+        if status != self.status {
+            result.status_changed = true;
+            plan.push(Planned::new(Effect::Status(status)));
+        }
+        plan.extend(summary_effects(&self.summary, &summary));
+        result.summary = plan.len() - usize::from(result.status_changed);
+        if plan.is_empty() {
             // An identical failure republishes nothing at all.
             self.ids.retain(&self.rows);
             return Ok(result);
         }
-        result.status_changed = true;
-        let plan = [Planned::new(Effect::Status(status))];
+        let max_ops = session.with_store(|store| store.limits().max_transaction_operations.max(1));
         let (transactions, outcome) = commit(
             session,
             &plan,
-            1,
+            max_ops,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut self.rows,
-            &mut self.status,
+            &mut Published {
+                rows: &mut self.rows,
+                status: &mut self.status,
+                summary: &mut self.summary,
+            },
         );
         result.transactions = transactions;
         self.ids.retain(&self.rows);
@@ -542,7 +631,7 @@ impl ProcessView {
 /// frame bound is the worse failure, because the store commits the transaction
 /// and the codec then refuses to write it, so the client is detached from a
 /// server whose revision already moved on. Each transaction is still atomic, and
-/// each is recorded into `rows` and `status` as it commits, so a plan that stops
+/// each is recorded into `published` as it commits, so a plan that stops
 /// partway leaves this app's idea of what the client holds equal to what the
 /// store holds. Returns how many transactions committed and the first failure.
 fn commit(
@@ -550,8 +639,7 @@ fn commit(
     plan: &[Planned],
     max_ops: usize,
     max_bytes: usize,
-    rows: &mut Vec<Row>,
-    status: &mut String,
+    published: &mut Published<'_>,
 ) -> (usize, Result<(), SessionError>) {
     let mut committed = 0;
     let mut start = 0;
@@ -576,7 +664,7 @@ fn commit(
             Ok(())
         }) {
             Ok(()) => {
-                record_committed(chunk, rows, status);
+                record_committed(chunk, published);
                 committed += 1;
             }
             Err(error) => return (committed, Err(error)),
@@ -698,10 +786,11 @@ fn rows_word(count: usize) -> &'static str {
 /// one frame in numbers a model may not cache. Both are applied here, where the
 /// rows are chosen.
 ///
-/// The status is charged [`STATUS_RESERVE_BYTES`] rather than its own length, so
-/// the rows that fit are a function of the rows alone. A status that grew
-/// because a scan failed therefore cannot shrink the row budget and delete a row
-/// no scan said had ended.
+/// The status is charged [`STATUS_RESERVE_BYTES`] rather than its own length, and
+/// the system summary [`SUMMARY_RESERVE_BYTES`] rather than its own (PX-007), so
+/// the rows that fit are a function of the rows alone. A status or summary that
+/// grew because a scan or a collector failed therefore cannot shrink the row
+/// budget and delete a row no scan said had ended.
 ///
 /// The rows kept are the *leading* ones, in the order the source already
 /// publishes — `ProcFsSource` sorts by ascending PID — so the published window
@@ -709,8 +798,8 @@ fn rows_word(count: usize) -> &'static str {
 /// exactly the rows it kept last tick: no row churns in and out, and an
 /// identical tick still publishes nothing.
 fn bound_to_publishable_collection(rows: &mut Vec<Row>, limit: usize) -> usize {
-    let budget =
-        MAX_TRANSACTION_PAYLOAD_BYTES.saturating_sub(SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES);
+    let budget = MAX_TRANSACTION_PAYLOAD_BYTES
+        .saturating_sub(SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES);
     let mut spent = 0usize;
     let mut kept = 0usize;
     for row in rows.iter() {
@@ -838,9 +927,29 @@ struct Planned {
 
 enum Effect {
     Status(String),
+    /// One summary property set, or cleared (PX-007).
+    Summary(summary::Change),
     Delete(Vec<ItemId>),
     Insert(u64, Vec<Row>),
     Update(Vec<Row>),
+}
+
+/// What this view has published, as one committed transaction updates it.
+struct Published<'a> {
+    rows: &'a mut Vec<Row>,
+    status: &'a mut String,
+    summary: &'a mut summary::Properties,
+}
+
+/// The planned operations that turn the `published` summary into `target`:
+/// one per property a client would see change, and nothing for the rest.
+fn summary_effects(
+    published: &summary::Properties,
+    target: &summary::Properties,
+) -> impl Iterator<Item = Planned> {
+    summary::changes(published, target)
+        .into_iter()
+        .map(|change| Planned::new(Effect::Summary(change)))
 }
 
 impl Planned {
@@ -849,6 +958,10 @@ impl Planned {
             Effect::Status(text) => {
                 Operation::set_property(STATUS, TEXT, Value::String(text.clone()))
             }
+            Effect::Summary(change) => match &change.value {
+                Some(value) => Operation::set_property(change.node, change.property, value.clone()),
+                None => Operation::clear_property(change.node, change.property),
+            },
             Effect::Delete(ids) => Operation::model_delete_items(MODEL, ids.iter().copied()),
             Effect::Insert(index, rows) => {
                 Operation::model_insert(MODEL, *index, rows.iter().map(Row::to_model_item))
@@ -868,6 +981,9 @@ impl Effect {
     fn payload_bytes(&self) -> usize {
         match self {
             Self::Status(text) => VALUE_FRAMING_BYTES + text.len(),
+            // The node and property are in the fixed header; a clear carries no
+            // value at all.
+            Self::Summary(change) => change.value.as_ref().map_or(0, value_wire_bytes),
             Self::Delete(ids) => ids.len() * ITEM_ID_BYTES,
             Self::Insert(_, rows) | Self::Update(rows) => rows.iter().map(row_wire_bytes).sum(),
         }
@@ -875,9 +991,25 @@ impl Effect {
 
     /// Applies this effect to the view's record of what the client holds. Called
     /// only after the transaction carrying the matching operation committed.
-    fn record(&self, rows: &mut Vec<Row>, status: &mut String) {
+    fn record(&self, published: &mut Published<'_>) {
+        let Published {
+            rows,
+            status,
+            summary,
+        } = published;
         match self {
             Self::Status(text) => status.clone_from(text),
+            Self::Summary(change) => {
+                let key = (change.node, change.property);
+                match &change.value {
+                    Some(value) => {
+                        summary.insert(key, value.clone());
+                    }
+                    None => {
+                        summary.remove(&key);
+                    }
+                }
+            }
             Self::Delete(ids) => {
                 let gone: HashSet<ItemId> = ids.iter().copied().collect();
                 rows.retain(|row| !gone.contains(&row.item_id));
@@ -906,7 +1038,7 @@ impl Effect {
 /// Consecutive insertions are merged in a single pass: a refresh of a large
 /// collection can carry thousands of them, and splicing each one separately
 /// would cost a full copy of the row list per insertion.
-fn record_committed(chunk: &[Planned], rows: &mut Vec<Row>, status: &mut String) {
+fn record_committed(chunk: &[Planned], published: &mut Published<'_>) {
     let mut index = 0;
     while index < chunk.len() {
         if matches!(chunk[index].effect, Effect::Insert(..)) {
@@ -917,10 +1049,10 @@ fn record_committed(chunk: &[Planned], rows: &mut Vec<Row>, status: &mut String)
             ) {
                 index += 1;
             }
-            insert_run(rows, &chunk[start..index]);
+            insert_run(published.rows, &chunk[start..index]);
             continue;
         }
-        chunk[index].effect.record(rows, status);
+        chunk[index].effect.record(published);
         index += 1;
     }
 }
@@ -1114,8 +1246,9 @@ mod tests {
     use super::*;
     use crate::source::{
         CappedRecords, Completeness, CreationToken, DisplayName, EnumerationIssue,
-        FakeProcessSource, IssueScope, MissingReason, Observed, ProcessKey, ProcessRecord,
-        ScriptedFakeSource, SkippedRecords, FAKE_STATUS_TEXT, MAX_DISPLAY_NAME_CHARS,
+        FakeProcessSource, IssueScope, LoadAverages, MemoryFigures, MissingReason, Observed,
+        ProcessKey, ProcessRecord, ScriptedFakeSource, SkippedRecords, SwapFigures, SystemCpu,
+        SystemCpuInterval, SystemSample, FAKE_STATUS_TEXT, MAX_DISPLAY_NAME_CHARS,
     };
     use crate::MAX_SOURCE_STATUS_BYTES;
     use std::collections::BTreeSet;
@@ -1246,6 +1379,25 @@ mod tests {
         let rows = widest_rows(64);
         let plan = vec![
             Planned::new(Effect::Status("x".repeat(4096))),
+            // A summary line at its widest, a bar value, and a cleared one
+            // (PX-007).
+            Planned::new(Effect::Summary(summary::Change {
+                node: summary::FRESHNESS_TEXT,
+                property: TEXT,
+                value: Some(Value::String(
+                    "\u{20000}".repeat(summary::MAX_SUMMARY_TEXT_BYTES / 4),
+                )),
+            })),
+            Planned::new(Effect::Summary(summary::Change {
+                node: summary::CPU_BAR,
+                property: srui_sdk::VALUE,
+                value: Some(Value::Float64(0.999)),
+            })),
+            Planned::new(Effect::Summary(summary::Change {
+                node: summary::CPU_BAR,
+                property: srui_sdk::VALUE,
+                value: None,
+            })),
             Planned::new(Effect::Delete(
                 rows.iter().map(|row| row.item_id).collect::<Vec<ItemId>>(),
             )),
@@ -1291,8 +1443,11 @@ mod tests {
             &plan,
             1_000,
             ceiling,
-            &mut view.rows,
-            &mut view.status,
+            &mut Published {
+                rows: &mut view.rows,
+                status: &mut view.status,
+                summary: &mut view.summary,
+            },
         );
         assert!(outcome.is_ok());
         assert_eq!(transactions, 2, "three operations, two frames");
@@ -1582,6 +1737,111 @@ mod tests {
         }
     }
 
+    /// A [`Host`] whose every scan states `.1` as its system-wide figures.
+    struct HostWith(Host, SystemSample);
+
+    impl ProcessSource for HostWith {
+        fn status_text(&self) -> &str {
+            FAKE_STATUS_TEXT
+        }
+
+        fn snapshot(&mut self) -> ProcessSnapshot {
+            let mut snapshot = self.0.scan(0);
+            snapshot.system = self.1;
+            snapshot
+        }
+    }
+
+    /// Review round 1 (F1): the rows that fit at the snapshot ceiling are the
+    /// frame less its fixed allowances — the shell's, the status's and the
+    /// summary's 8 KiB — and so the same number of rows whatever the summary
+    /// says, from a summary with no figure at all to the widest one. Charging
+    /// the summary nothing, or its current length, publishes another number of
+    /// rows here. The snapshot a fresh client is sent still fits one frame.
+    #[test]
+    fn the_rows_at_the_ceiling_are_the_frame_less_the_fixed_allowances_whatever_the_summary() {
+        let widest = SystemSample {
+            cpu: SystemCpu::Measured(SystemCpuInterval {
+                busy: u64::MAX,
+                total: u64::MAX,
+                cpus: Some(u32::MAX),
+            }),
+            memory: Ok(MemoryFigures {
+                total: u64::MAX,
+                available: 1,
+            }),
+            swap: Ok(SwapFigures {
+                total: u64::MAX,
+                free: 1,
+            }),
+            uptime: Ok(u64::MAX),
+            load: Ok(LoadAverages {
+                one: u64::MAX,
+                five: u64::MAX,
+                fifteen: u64::MAX,
+            }),
+        };
+        let budget = MAX_TRANSACTION_PAYLOAD_BYTES
+            - (SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES);
+        let mut published = Vec::new();
+        for system in [
+            SystemSample::not_provided(),
+            FakeProcessSource::system(),
+            widest,
+        ] {
+            let session = srui_sessiond::Session::mint();
+            let mut source = HostWith(Host::new(58_000, 48), system);
+            let (view, snapshot) = ProcessView::start(&session, &mut source).unwrap();
+            // Every row of this host costs the same, so the rows that fit are a
+            // function of the budget alone.
+            let cost = row_wire_bytes(&view.rows[0]);
+            assert!(view.rows.iter().all(|row| row_wire_bytes(row) == cost));
+            let (mut spent, mut fits) = (0usize, 0usize);
+            loop {
+                let opens = if fits.is_multiple_of(DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION) {
+                    SNAPSHOT_RANGE_BYTES
+                } else {
+                    0
+                };
+                if spent + cost + opens > budget {
+                    break;
+                }
+                spent += cost + opens;
+                fits += 1;
+            }
+            assert!(fits < snapshot.records.len(), "the ceiling must bind here");
+            assert_eq!(
+                view.row_count(),
+                fits,
+                "{system:?}: the rows that fit are the frame less the fixed allowances"
+            );
+            published.push(view.row_count());
+            if system == widest {
+                let hello = srui_protocol::ClientHello {
+                    core_version: "0.5.0".to_string(),
+                    profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                    limits: None,
+                    client_instance_id: vec![1, 2, 3],
+                    client_metadata: Default::default(),
+                    known_resource_hashes: vec![],
+                };
+                let snapshot = session
+                    .bootstrap_fresh_client(&hello)
+                    .expect("a fresh client attaches")
+                    .snapshot
+                    .expect("a populated session sends a catch-up snapshot");
+                let frame = srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+                    msg: Some(srui_protocol::srui_message::Msg::Transaction(snapshot)),
+                });
+                assert!(frame <= DEFAULT_MAX_FRAME_SIZE, "{frame}");
+            }
+        }
+        assert!(
+            published.windows(2).all(|pair| pair[0] == pair[1]),
+            "{published:?}: the summary's length moved the row budget"
+        );
+    }
+
     impl ProcessSource for Host {
         fn status_text(&self) -> &str {
             FAKE_STATUS_TEXT
@@ -1639,6 +1899,130 @@ mod tests {
                 .collect::<Vec<ItemId>>(),
             before,
             "every row keeps the identity and the place it already had"
+        );
+    }
+
+    /// An upper bound on the bytes one `CREATE_NODE` occupies, on the same
+    /// accounting the planner uses for every other operation.
+    fn create_node_bytes(operation: &Operation) -> usize {
+        let Operation::CreateNode { properties, .. } = operation else {
+            panic!("not a node creation: {operation:?}")
+        };
+        OPERATION_FRAMING_BYTES
+            + OPERATION_HEADER_BYTES
+            + properties
+                .iter()
+                .map(|(_, value)| RECORD_PROPERTY_BYTES + value_wire_bytes(value))
+                .sum::<usize>()
+    }
+
+    /// The widest summary the publication path can emit: every line at the
+    /// summary's own text bound and every bar shown, with a value and a
+    /// description at its bound. [`summary::properties`] cuts every line and
+    /// description to those bounds, so no summary is wider than this one.
+    fn widest_summary() -> summary::Properties {
+        let mut widest = summary::properties(&summary::summarize(&summary::State::NotStarted));
+        let text = Value::String("\u{20000}".repeat(summary::MAX_SUMMARY_TEXT_BYTES / 4));
+        let description = Value::String("\u{20000}".repeat(summary::MAX_BAR_DESCRIPTION_BYTES / 4));
+        for (&(_, property), value) in widest.iter_mut() {
+            if property == TEXT {
+                *value = text.clone();
+            } else if property == srui_sdk::VALUE_DESCRIPTION {
+                *value = description.clone();
+            }
+        }
+        for bar in [summary::CPU_BAR, summary::MEMORY_BAR, summary::SWAP_BAR] {
+            widest.insert((bar, srui_sdk::VALUE), Value::Float64(1.0));
+            widest.insert(
+                (bar, srui_sdk::VISIBILITY),
+                Value::from(srui_sdk::EnumToken::from(srui_sdk::Visibility::Visible)),
+            );
+        }
+        widest
+    }
+
+    /// PX-007: the summary is charged a fixed reserve against the catch-up
+    /// snapshot, so that reserve must cover the widest summary this app can
+    /// publish — on the planner's own accounting, which must in turn cover what
+    /// the protocol's encoder really emits for those nodes.
+    #[test]
+    fn the_summary_reserve_covers_the_widest_summary_on_the_real_encoder() {
+        let widest = widest_summary();
+        for (node, property) in widest.keys() {
+            if *property == TEXT {
+                let Some(Value::String(text)) = widest.get(&(*node, *property)) else {
+                    unreachable!()
+                };
+                assert_eq!(text.len(), summary::MAX_SUMMARY_TEXT_BYTES);
+            }
+        }
+        let operations = summary::create_operations(&widest);
+        let planned: usize = operations.iter().map(create_node_bytes).sum();
+        assert!(
+            planned <= SUMMARY_RESERVE_BYTES,
+            "the widest summary is planned at {planned} bytes, above the \
+             {SUMMARY_RESERVE_BYTES} reserved for it"
+        );
+        assert!(
+            planned > SUMMARY_RESERVE_BYTES / 2,
+            "the reserve must be measured against a summary that really is wide: {planned}"
+        );
+        let transaction = srui_protocol::Transaction {
+            base_revision: u64::MAX,
+            new_revision: u64::MAX,
+            priority: u32::MAX,
+            operations: operations.iter().map(Operation::to_wire).collect(),
+        };
+        let encoded = srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(transaction)),
+        });
+        assert!(
+            encoded <= planned + TRANSACTION_ENVELOPE_BYTES,
+            "planned {planned} bytes but the encoder emitted {encoded}"
+        );
+        println!(
+            "PX-007 summary reserve: widest summary planned={planned} encoded={encoded} \
+             reserve={SUMMARY_RESERVE_BYTES}"
+        );
+    }
+
+    /// PX-007: everything in a catch-up snapshot that is not a row — the shell,
+    /// the widest status and the widest summary — fits the fixed allowances the
+    /// row budget is charged before any row, measured on the snapshot a fresh
+    /// client is really sent.
+    #[test]
+    fn the_shell_status_and_summary_fit_their_snapshot_allowances() {
+        let session = srui_sessiond::Session::mint();
+        let status = "\u{20000}".repeat(STATUS_RESERVE_BYTES / 4);
+        crate::initialize_rows(&session, Vec::new(), &status, &widest_summary()).unwrap();
+        let hello = srui_protocol::ClientHello {
+            core_version: "0.5.0".to_string(),
+            profiles: vec!["org.srui.standard-widgets/1".to_string()],
+            limits: None,
+            client_instance_id: vec![1, 2, 3],
+            client_metadata: Default::default(),
+            known_resource_hashes: vec![],
+        };
+        let snapshot = session
+            .bootstrap_fresh_client(&hello)
+            .expect("a fresh client attaches")
+            .snapshot
+            .expect("a populated session sends a catch-up snapshot");
+        let frame = srui_protocol::framed_payload_len(&srui_protocol::SruiMessage {
+            msg: Some(srui_protocol::srui_message::Msg::Transaction(snapshot)),
+        });
+        assert!(
+            frame
+                <= SNAPSHOT_SHELL_BYTES
+                    + STATUS_RESERVE_BYTES
+                    + SUMMARY_RESERVE_BYTES
+                    + TRANSACTION_ENVELOPE_BYTES,
+            "a snapshot with no row is {frame} bytes, above the allowances the row budget \
+             leaves for it"
+        );
+        println!(
+            "PX-007 snapshot without rows: frame={frame} allowances={}",
+            SNAPSHOT_SHELL_BYTES + STATUS_RESERVE_BYTES + SUMMARY_RESERVE_BYTES
         );
     }
 
@@ -1749,8 +2133,11 @@ mod tests {
             &plan,
             2,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut view.rows,
-            &mut view.status,
+            &mut Published {
+                rows: &mut view.rows,
+                status: &mut view.status,
+                summary: &mut view.summary,
+            },
         );
         assert!(outcome.is_ok());
         assert_eq!(transactions, 2, "four operations, two per transaction");
@@ -1773,8 +2160,11 @@ mod tests {
             &plan,
             2,
             MAX_TRANSACTION_PAYLOAD_BYTES,
-            &mut view.rows,
-            &mut view.status,
+            &mut Published {
+                rows: &mut view.rows,
+                status: &mut view.status,
+                summary: &mut view.summary,
+            },
         );
         assert!(outcome.is_err(), "a duplicate item ID must be refused");
         assert_eq!(transactions, 1);
@@ -1823,6 +2213,26 @@ mod tests {
                     text
                 })
             );
+            // And its record of the summary is the store's own (PX-007): every
+            // property a refresh may set or clear, present or absent alike.
+            session.with_store(|store| {
+                for (id, _, _) in summary::LAYOUT {
+                    let node = store.get_node(id).unwrap();
+                    for property in [
+                        TEXT,
+                        srui_sdk::ROLE,
+                        srui_sdk::VALUE,
+                        srui_sdk::VALUE_DESCRIPTION,
+                        srui_sdk::VISIBILITY,
+                    ] {
+                        assert_eq!(
+                            node.get_property(property),
+                            view.summary.get(&(id, property)),
+                            "{id:?} {property:?}"
+                        );
+                    }
+                }
+            });
         }
         assert_ne!(rows_of(&view), published, "the script must move the rows");
     }

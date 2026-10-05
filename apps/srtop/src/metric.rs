@@ -1,6 +1,6 @@
 //! Metric definitions: what one published number is, where it was read, and how
 //! it must be read back (design §§6.2, 22, 29; PX-005 resident memory, PX-006
-//! sampled CPU usage).
+//! sampled CPU usage, PX-007 system-wide figures and the sample time).
 //!
 //! Interpretation is server-side. A metric is stored as the exact integer the
 //! kernel reported, in the unit its definition names, and this module is the one
@@ -16,6 +16,7 @@
 //! 1024, so the whole part is a shift, the fraction is an integer remainder, and
 //! no step of the conversion leaves the integers.
 use crate::source::{CpuInterval, CpuUsage, MissingReason, Observed};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What one published metric is: the value's unit, where the number came from,
 /// and how to read it. A definition is documentation that travels with the code
@@ -194,6 +195,179 @@ pub fn bytes_cell(observed: &Observed<u64>) -> String {
         Observed::Known(bytes) => format_iec_bytes(*bytes),
         Observed::Missing(reason) => missing_text(*reason).to_string(),
     }
+}
+
+/// The host's overall CPU usage (PX-007): a share of **all** logical CPUs, so
+/// 100% is every logical CPU busy for the whole interval — never the process
+/// column's convention, where 100% is one CPU ([`CPU_USAGE`]). The label names
+/// that denominator, because the number alone cannot.
+pub const SYSTEM_CPU: MetricDefinition = MetricDefinition {
+    id: "system.cpu_busy",
+    label: "Overall CPU (100% = all logical CPUs)",
+    unit: "tenths of a percent of the time of all logical CPUs",
+    source: "Linux /proc/stat, first line (cpu): fields user, nice, system, idle, iowait, irq, \
+             softirq and steal, in USER_HZ clock ticks summed over every CPU, read through the \
+             scanned root and differenced between two reads of the same boot; the cpuN lines \
+             that follow it are counted as the logical CPUs online (K1)",
+    interpretation: "Busy is user + nice + system + irq + softirq + steal and idle is idle + \
+                     iowait; the share is the busy delta over the busy plus idle delta, so 100% \
+                     means every logical CPU was busy for the whole interval, where the process \
+                     column's 100% is one CPU. guest and guest_nice are already counted in user \
+                     and nice and are not added again, and fields after steal are not read. \
+                     iowait may decrease between two reads (K1), so idle and iowait are \
+                     differenced as one sum. The share is always measured between two \
+                     consecutive successful reads: a first read, and the first read after one \
+                     that failed, is warming up, so an outage is never averaged into a current \
+                     figure; counters that went backwards, did not advance, or were read over a \
+                     different number of cpuN lines leave no interval and are published as \
+                     unavailable, never as zero and never as a spike.",
+};
+
+/// Memory in use on the host (PX-007).
+pub const MEMORY_USED: MetricDefinition = MetricDefinition {
+    id: "system.memory_used",
+    label: "Memory",
+    unit: "bytes",
+    source: "Linux /proc/meminfo MemTotal and MemAvailable, in kB of 1024 bytes, read through \
+             the scanned root (K1)",
+    interpretation: "Used is MemTotal - MemAvailable: the memory the kernel does not estimate \
+                     as available for starting new applications without swapping. The \
+                     percentage is used / MemTotal, truncated. A missing or malformed field, a \
+                     MemTotal of 0, or a MemAvailable above MemTotal is unavailable, never \
+                     zero.",
+};
+
+/// Swap space in use on the host (PX-007).
+pub const SWAP_USED: MetricDefinition = MetricDefinition {
+    id: "system.swap_used",
+    label: "Swap",
+    unit: "bytes",
+    source: "Linux /proc/meminfo SwapTotal and SwapFree, in kB of 1024 bytes, read through the \
+             scanned root (K1)",
+    interpretation: "Used is SwapTotal - SwapFree, and the percentage is used / SwapTotal, \
+                     truncated. A SwapTotal of 0 is a host with no swap space and is published \
+                     as such: never 0% of 0 and never a division. A SwapFree above SwapTotal \
+                     is unavailable.",
+};
+
+/// Time since the host booted (PX-007).
+pub const UPTIME: MetricDefinition = MetricDefinition {
+    id: "system.uptime",
+    label: "Uptime",
+    unit: "seconds",
+    source: "Linux /proc/uptime, first field: seconds since boot on the boot-time clock, so \
+             time spent suspended counts, read through the scanned root (K1)",
+    interpretation: "Published truncated to whole minutes, never rounded up.",
+};
+
+/// The host's load averages (PX-007).
+pub const LOAD_AVERAGE: MetricDefinition = MetricDefinition {
+    id: "system.load_average",
+    label: "Load average (1, 5, 15 min)",
+    unit: "hundredths of a task",
+    source: "Linux /proc/loadavg, first three fields, each printed by the kernel with exactly \
+             two decimals, read through the scanned root (K1)",
+    interpretation: "Exponentially damped averages, over 1, 5 and 15 minutes, of the tasks \
+                     that are runnable or in uninterruptible sleep. Not a percentage and not \
+                     divided by the number of CPUs; published exactly as the kernel printed \
+                     it.",
+};
+
+/// How many processes the last successful scan listed (PX-007), with the only
+/// scope srtop can state for that count: what this reader can see in the
+/// scanned root.
+pub const PROCESS_COUNT: MetricDefinition = MetricDefinition {
+    id: "system.process_count",
+    label: "Processes visible to this reader",
+    unit: "processes",
+    source: "The scan's own record list: the numeric directories of the scanned root that this \
+             reader can see, one per process (thread group), never one per thread",
+    interpretation: "The records the last successful scan listed and read, with the records \
+                     it could not read and the entries beyond its record limit counted \
+                     separately, in the status line's own words; a process that ended during \
+                     the scan is not counted. The count is bounded by what this reader can see, \
+                     not by the host: a procfs lists only the PID namespace it was mounted for \
+                     (by default the mounter's), which is usually the reader's own but is an \
+                     outer one when the reader runs in a nested namespace that inherited that \
+                     /proc; and a procfs mounted with hidepid=invisible (2), as systemd's \
+                     ProtectProc=invisible does, or hidepid=ptraceable (4), hides other \
+                     users' or unptraceable processes without any error, so a complete scan \
+                     is complete over this view only. srtop detects neither, and applies no \
+                     filter of its own.",
+};
+
+/// When the figures on screen were sampled (PX-007).
+pub const SAMPLE_TIME: MetricDefinition = MetricDefinition {
+    id: "system.sample_time",
+    label: "Last successful sample",
+    unit: "seconds since 1970-01-01 00:00:00 UTC",
+    source: "The collecting server's wall clock when the scan began; a fixture states its own",
+    interpretation: "The time of the last scan whose process list was read, in UTC to the \
+                     second. A scan that fails leaves it, and every figure, as they were and \
+                     marks a collector error. The client derives no age from it, so the age is \
+                     this time against the reader's own clock, and transport loss is the \
+                     client's own indicator, never this one.",
+};
+
+/// `part` as tenths of a percent of `whole`, truncated, or `None` where that
+/// share is not defined: an empty whole, or a part larger than its whole.
+///
+/// Integer arithmetic in `u128`, so no product overflows and a share is never
+/// displayed as larger than it was measured (PX-007).
+pub fn share_tenths(part: u64, whole: u64) -> Option<u64> {
+    if whole == 0 || part > whole {
+        return None;
+    }
+    u64::try_from(u128::from(part) * 1_000 / u128::from(whole)).ok()
+}
+
+/// A count in hundredths, as the kernel prints a load average: `0.52`, `12.00`.
+pub fn format_hundredths(hundredths: u64) -> String {
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+/// Seconds since boot, truncated to whole minutes: `4 h 05 min`,
+/// `1 day, 0 h 00 min`, `3 days, 4 h 05 min`.
+pub fn format_uptime(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let (days, hours, minutes) = (minutes / 1_440, minutes / 60 % 24, minutes % 60);
+    let clock = format!("{hours} h {minutes:02} min");
+    match days {
+        0 => clock,
+        1 => format!("1 day, {clock}"),
+        _ => format!("{days} days, {clock}"),
+    }
+}
+
+/// A wall-clock time in UTC, truncated to the second: `2027-01-15 08:00:00
+/// UTC`, or `None` for a time before 1970-01-01 00:00:00 UTC.
+///
+/// Integer arithmetic only, so every representable time is formatted exactly,
+/// and no dependency: the civil date is H. Hinnant's days-to-civil algorithm
+/// (proleptic Gregorian calendar, days since 1970-01-01).
+pub fn format_utc(time: SystemTime) -> Option<String> {
+    let seconds = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let (days, of_day) = (seconds / 86_400, seconds % 86_400);
+    let shifted = days + 719_468;
+    let era = shifted / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    Some(format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        of_day / 3_600,
+        of_day / 60 % 60,
+        of_day % 60
+    ))
 }
 
 /// Cell wording for a value this scan could not read.
@@ -438,6 +612,127 @@ mod tests {
         assert!(metric.source.contains("monotonic"));
         assert!(metric.interpretation.contains("may exceed 100%"));
         assert!(metric.interpretation.contains("never as zero"));
+    }
+
+    #[test]
+    fn shares_are_truncated_tenths_and_an_undefined_share_is_none() {
+        assert_eq!(share_tenths(1, 3), Some(333));
+        assert_eq!(share_tenths(2, 3), Some(666), "66.66…% truncates to 66.6%");
+        assert_eq!(share_tenths(0, 7), Some(0), "a measured zero is a value");
+        assert_eq!(share_tenths(7, 7), Some(1_000));
+        assert_eq!(share_tenths(u64::MAX, u64::MAX), Some(1_000));
+        assert_eq!(share_tenths(u64::MAX - 1, u64::MAX), Some(999));
+        // Nothing to divide by, and a part larger than its whole, are not shares.
+        assert_eq!(share_tenths(0, 0), None);
+        assert_eq!(share_tenths(8, 7), None);
+    }
+
+    #[test]
+    fn utc_times_are_formatted_exactly_and_never_before_the_epoch() {
+        use std::time::Duration;
+        let at = |seconds: u64| UNIX_EPOCH + Duration::from_secs(seconds);
+        for (seconds, expected) in [
+            (0, "1970-01-01 00:00:00 UTC"),
+            (1_800_000_000, "2027-01-15 08:00:00 UTC"),
+            // Leap days, a century leap year and the turn of a year.
+            (951_782_400, "2000-02-29 00:00:00 UTC"),
+            (1_709_210_096, "2024-02-29 12:34:56 UTC"),
+            (1_735_689_599, "2024-12-31 23:59:59 UTC"),
+            (1_735_689_600, "2025-01-01 00:00:00 UTC"),
+            (4_107_542_400, "2100-03-01 00:00:00 UTC"),
+            (253_402_300_799, "9999-12-31 23:59:59 UTC"),
+            (253_402_300_800, "10000-01-01 00:00:00 UTC"),
+        ] {
+            assert_eq!(
+                format_utc(at(seconds)).as_deref(),
+                Some(expected),
+                "{seconds}"
+            );
+        }
+        // Truncated to the second, never rounded up into the next one.
+        assert_eq!(
+            format_utc(at(59) + Duration::from_nanos(999_999_999)).as_deref(),
+            Some("1970-01-01 00:00:59 UTC")
+        );
+        assert_eq!(format_utc(UNIX_EPOCH - Duration::from_secs(1)), None);
+    }
+
+    #[test]
+    fn uptime_is_truncated_to_whole_minutes() {
+        for (seconds, expected) in [
+            (0, "0 h 00 min"),
+            (59, "0 h 00 min"),
+            (60, "0 h 01 min"),
+            (86_399, "23 h 59 min"),
+            (86_400, "1 day, 0 h 00 min"),
+            (2 * 86_400 + 3_599, "2 days, 0 h 59 min"),
+            (273_906, "3 days, 4 h 05 min"),
+        ] {
+            assert_eq!(format_uptime(seconds), expected, "{seconds}");
+        }
+        assert!(format_uptime(u64::MAX).starts_with("213503982334601 days, "));
+    }
+
+    #[test]
+    fn load_averages_keep_the_kernels_two_decimals() {
+        for (hundredths, expected) in [
+            (0, "0.00"),
+            (5, "0.05"),
+            (52, "0.52"),
+            (125, "1.25"),
+            (1_200, "12.00"),
+        ] {
+            assert_eq!(format_hundredths(hundredths), expected);
+        }
+    }
+
+    /// PX-007: each system figure states which file and fields it is read
+    /// from, how it is computed, and — for a percentage — its denominator.
+    #[test]
+    fn the_system_definitions_name_their_files_fields_and_denominators() {
+        assert_eq!(SYSTEM_CPU.label, "Overall CPU (100% = all logical CPUs)");
+        assert_ne!(SYSTEM_CPU.label, CPU_USAGE.label);
+        for field in [
+            "/proc/stat",
+            "user",
+            "nice",
+            "system",
+            "idle",
+            "iowait",
+            "irq",
+            "softirq",
+            "steal",
+            "cpuN",
+        ] {
+            assert!(SYSTEM_CPU.source.contains(field), "{field}");
+        }
+        assert!(SYSTEM_CPU
+            .interpretation
+            .contains("Busy is user + nice + system + irq + softirq + steal"));
+        assert!(SYSTEM_CPU.interpretation.contains("idle is idle + iowait"));
+        assert!(SYSTEM_CPU.interpretation.contains("guest and guest_nice"));
+        assert!(SYSTEM_CPU.interpretation.contains("never as zero"));
+        assert!(MEMORY_USED.source.contains("MemTotal and MemAvailable"));
+        assert!(MEMORY_USED
+            .interpretation
+            .contains("Used is MemTotal - MemAvailable"));
+        assert!(MEMORY_USED.interpretation.contains("used / MemTotal"));
+        assert!(SWAP_USED.source.contains("SwapTotal and SwapFree"));
+        assert!(SWAP_USED.interpretation.contains("never 0% of 0"));
+        assert!(UPTIME.source.contains("/proc/uptime"));
+        assert!(LOAD_AVERAGE.source.contains("/proc/loadavg"));
+        assert!(LOAD_AVERAGE.interpretation.contains("Not a percentage"));
+        assert!(PROCESS_COUNT.label.contains("visible to this reader"));
+        assert!(PROCESS_COUNT.interpretation.contains("PID namespace"));
+        assert!(PROCESS_COUNT.interpretation.contains("hidepid"));
+        assert!(PROCESS_COUNT
+            .interpretation
+            .contains("applies no filter of its own"));
+        assert!(SYSTEM_CPU
+            .interpretation
+            .contains("two consecutive successful reads"));
+        assert!(SAMPLE_TIME.interpretation.contains("UTC"));
+        assert!(SAMPLE_TIME.interpretation.contains("transport loss"));
     }
 
     #[test]

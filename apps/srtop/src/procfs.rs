@@ -35,17 +35,28 @@
 //! fixture, or a FUSE, 9p or sshfs mirror of another host's `/proc` given to
 //! [`ProcFsSource::with_root`] — is read through the same handle with no such
 //! guarantee (see `RecordAccess`).
+//!
+//! The system-wide figures (PX-007) are read beside the records, from the
+//! scanned root's own `stat`, `meminfo`, `uptime` and `loadavg`, so a fixture
+//! tree states its own and is deterministic on any host. Each file is read, and
+//! can fail, on its own. Overall CPU is a difference too, so the collector also
+//! keeps one baseline of the host's CPU counters, discarded when the boot
+//! changes or a read of `stat` fails: the figure is always measured between
+//! two consecutive successful reads. The sample time is taken on an injected
+//! [`WallClock`], so a fixture's sample time, which the freshness line
+//! publishes, is a fact of the test rather than of the moment it ran.
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
-    DisplayName, EnumerationIssue, HostId, IssueScope, MissingReason, Observed, PidNamespaceId,
-    ProcessKey, ProcessRecord, ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime,
-    SourceId,
+    DisplayName, EnumerationIssue, Figure, FigureGap, HostId, IssueScope, LoadAverages,
+    MemoryFigures, MissingReason, Observed, PidNamespaceId, ProcessKey, ProcessRecord,
+    ProcessSnapshot, ProcessSource, SkippedRecords, SnapshotTime, SourceId, SwapFigures, SystemCpu,
+    SystemCpuInterval, SystemSample,
 };
 use srui_semantic_tree::DEFAULT_MAX_CACHED_ITEMS_PER_MODEL;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -123,6 +134,28 @@ const AT_CLKTCK: u64 = 17;
 /// Linux architecture and 1024 on a few; a megahertz is far above both and still
 /// refuses a value that would turn tick counts into nonsense.
 const MAX_CLOCK_TICKS_PER_SECOND: u64 = 1_000_000;
+/// The fields of the `stat` file's `cpu` line this scan reads, in the kernel's
+/// order (`show_stat`, fs/proc/stat.c; K1): user, nice, system, idle, iowait,
+/// irq, softirq, steal. guest and guest_nice follow them and are already
+/// counted in user and nice (`account_guest_time`, kernel/sched/cputime.c), so
+/// they are not read; neither is any field a later kernel appends.
+const STAT_CPU_FIELDS: usize = 8;
+/// The most fields a `cpu` line may carry before it is refused as not the
+/// kernel's: ten today, and room for any a later kernel appends.
+const MAX_STAT_CPU_FIELDS: usize = 64;
+/// The most `cpuN` lines of a `stat` file this scan parses to count them —
+/// more than 8,000 lines of 256 bytes. Parsing stops at the first other line,
+/// after at most [`MAX_STAT_CPU_LINE_BYTES`] of it. The file is read through an
+/// 8 KiB buffer, so less than one buffer past that point is copied out of the
+/// kernel, and the rest of it — an `intr` line that grows with the interrupt
+/// count among it — is neither parsed nor copied out (the kernel still renders
+/// the whole file when it is first read). A file whose `cpu` lines run past
+/// this keeps its share and reports no CPU count.
+const MAX_STAT_CPU_BYTES: u64 = 2 * 1024 * 1024;
+/// The longest `stat` line examined as a candidate `cpu` line. The kernel's
+/// are ten counts of at most twenty digits; a longer line is examined only this
+/// far and found not to be one.
+const MAX_STAT_CPU_LINE_BYTES: u64 = 4 * 1024;
 
 /// A monotonic clock, as elapsed time since an arbitrary fixed origin.
 ///
@@ -153,6 +186,81 @@ impl Default for SystemMonotonicClock {
 impl MonotonicClock for SystemMonotonicClock {
     fn now(&self) -> Duration {
         self.origin.elapsed()
+    }
+}
+
+/// A wall clock: what stamps a sample with its time (PX-007).
+///
+/// It never measures an interval — [`MonotonicClock`] does — but the sample
+/// time it gives is published, to the second, by the data-freshness line. It is
+/// injected so a fixture tree's sample time is a fact of the test rather than
+/// of the second the test happened to run in.
+pub trait WallClock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> SystemTime;
+}
+
+/// [`SystemTime::now`]: the collecting server's own clock.
+#[derive(Debug, Default)]
+pub struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
+
+/// The host's CPU counters at one read of its `stat`, kept until the next scan
+/// (PX-007): busy and idle ticks summed over every CPU, and how many `cpuN`
+/// lines the read counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SystemCpuCounters {
+    /// user + nice + system + irq + softirq + steal.
+    busy: u64,
+    /// idle + iowait, one sum: iowait may decrease between reads (K1) while the
+    /// time it moves goes to idle.
+    idle: u64,
+    /// The `cpuN` lines that followed, when they could all be counted.
+    cpus: Option<u32>,
+}
+
+/// The host's CPU usage between `previous` and `current` reads, and the counters
+/// the next scan should subtract from.
+///
+/// Every case that cannot be a real measurement says so, never zero or a spike:
+///
+/// * no previous read of this boot is [`SystemCpu::WarmingUp`];
+/// * a different number of `cpuN` lines, or a counter that went backwards, is
+///   [`SystemCpu::Interrupted`], and the current read becomes the baseline;
+/// * counters that did not advance at all — the previous read again, to the
+///   tick — are interrupted too: there is no interval to divide by.
+fn system_cpu_since(
+    previous: Option<&SystemCpuCounters>,
+    current: SystemCpuCounters,
+) -> (SystemCpu, SystemCpuCounters) {
+    let Some(previous) = previous else {
+        return (SystemCpu::WarmingUp, current);
+    };
+    if previous.cpus != current.cpus {
+        return (SystemCpu::Interrupted, current);
+    }
+    let (Some(busy), Some(idle)) = (
+        current.busy.checked_sub(previous.busy),
+        current.idle.checked_sub(previous.idle),
+    ) else {
+        return (SystemCpu::Interrupted, current);
+    };
+    match busy.checked_add(idle) {
+        // Equal to the previous read: either one is the same baseline.
+        Some(0) => (SystemCpu::Interrupted, current),
+        Some(total) => (
+            SystemCpu::Measured(SystemCpuInterval {
+                busy,
+                total,
+                cpus: current.cpus,
+            }),
+            current,
+        ),
+        None => (SystemCpu::Interrupted, current),
     }
 }
 
@@ -387,6 +495,11 @@ pub struct ProcFsSource {
     cpu_boot: Option<BootId>,
     /// The PID namespace the baselines were sampled under, as last observed.
     cpu_namespace: Option<PidNamespaceId>,
+    /// The host's CPU counters at the last read of the root's `stat` (PX-007),
+    /// if that read succeeded; discarded when the boot changes or a read fails.
+    system_baseline: Option<SystemCpuCounters>,
+    /// The clock that stamps each sample's time (PX-007).
+    wall_clock: Arc<dyn WallClock>,
 }
 
 impl ProcFsSource {
@@ -436,6 +549,8 @@ impl ProcFsSource {
                 cpu_baselines: HashMap::new(),
                 cpu_boot: None,
                 cpu_namespace: None,
+                system_baseline: None,
+                wall_clock: Arc::new(SystemWallClock),
             };
         };
         let status = format!(
@@ -458,6 +573,8 @@ impl ProcFsSource {
             cpu_baselines: HashMap::new(),
             cpu_boot: None,
             cpu_namespace: None,
+            system_baseline: None,
+            wall_clock: Arc::new(SystemWallClock),
         }
     }
 
@@ -467,6 +584,13 @@ impl ProcFsSource {
     pub fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
         self.clock = clock;
         self.cpu_baselines.clear();
+        self
+    }
+
+    /// Stamps each sample with `clock`'s time instead of the system's wall
+    /// clock (PX-007). Intervals are never measured on it.
+    pub fn with_wall_clock(mut self, clock: Arc<dyn WallClock>) -> Self {
+        self.wall_clock = clock;
         self
     }
 
@@ -679,7 +803,7 @@ impl ProcessSource for ProcFsSource {
     }
 
     fn snapshot(&mut self) -> ProcessSnapshot {
-        let sampled_at = SnapshotTime(SystemTime::now());
+        let sampled_at = SnapshotTime(self.wall_clock.now());
         let mut issues = Vec::new();
         if !self.anchored {
             // No fixed tree to scan: an empty list here is explicitly not an
@@ -701,6 +825,8 @@ impl ProcessSource for ProcFsSource {
                 capped: CappedRecords::none(),
                 // Nothing was enumerated at all: no absence can be attributed.
                 completeness: Completeness::from_scan(SkippedRecords::unenumerable(), issues),
+                // And no system file was read through a root that names no tree.
+                system: SystemSample::missing(FigureGap::Unread(MissingReason::Unavailable)),
             };
         }
         // The unpublished records are named as the scan leaves them out, so the
@@ -767,11 +893,21 @@ impl ProcessSource for ProcFsSource {
         // process instances; none of them may be subtracted from this scan's.
         // Both components are checked, so neither short-circuits the other's
         // remembered value.
-        if identity_changed(&mut self.cpu_boot, &boot)
-            | identity_changed(&mut self.cpu_namespace, &pid_namespace)
-        {
+        let boot_changed = identity_changed(&mut self.cpu_boot, &boot);
+        let namespace_changed = identity_changed(&mut self.cpu_namespace, &pid_namespace);
+        if boot_changed || namespace_changed {
             self.cpu_baselines.clear();
         }
+        // The host's own counters restart with its boot, and a PID namespace
+        // numbers processes, not CPUs (PX-007).
+        if boot_changed {
+            self.system_baseline = None;
+        }
+        // The system-wide figures, each from its own file under the root. Read
+        // before the listing, so a scan whose listing fails still carries them
+        // and keeps the CPU baseline current; only a scan whose list was read
+        // publishes them (`crate::summary`).
+        let system = self.system_sample();
         // The CPU interval is measured per record, not per scan: each record's
         // instant is taken on the monotonic clock the moment its own `stat`
         // read returns (below). A scan reads records one after another, and a
@@ -801,6 +937,7 @@ impl ProcessSource for ProcFsSource {
                     vanished,
                     capped,
                     completeness: Completeness::from_scan(skipped, issues),
+                    system,
                 };
             }
         };
@@ -974,6 +1111,58 @@ impl ProcessSource for ProcFsSource {
             vanished,
             capped,
             completeness: Completeness::from_scan(skipped, issues),
+            system,
+        }
+    }
+}
+
+impl ProcFsSource {
+    /// The system-wide figures under the scanned root (PX-007): overall CPU from
+    /// `stat`, memory and swap from `meminfo`, `uptime` and `loadavg`. Each file
+    /// is read on its own and any of them can be missing while the others are
+    /// published; none of them degrades [`Completeness`], which is about the
+    /// record list.
+    ///
+    /// Overall CPU is always measured between two consecutive successful reads
+    /// of `stat`. A read that fails, or reads no counter, discards the baseline,
+    /// so the next readable read warms up: measuring from a read before the
+    /// failure would publish the average of a whole outage as the current figure.
+    fn system_sample(&mut self) -> SystemSample {
+        let unread = |error: io::Error| FigureGap::Unread(reason_for(&error));
+        let cpu = match read_stat_cpu(&self.root.join("stat")) {
+            Ok(Some(current)) => {
+                let (cpu, keep) = system_cpu_since(self.system_baseline.as_ref(), current);
+                self.system_baseline = Some(keep);
+                cpu
+            }
+            Ok(None) => {
+                self.system_baseline = None;
+                SystemCpu::Missing(FigureGap::Unusable)
+            }
+            Err(error) => {
+                self.system_baseline = None;
+                SystemCpu::Missing(unread(error))
+            }
+        };
+        let (memory, swap) = match read_bounded(&self.root.join("meminfo")) {
+            Ok(meminfo) => (parse_memory(&meminfo), parse_swap(&meminfo)),
+            Err(error) => {
+                let gap = unread(error);
+                (Err(gap), Err(gap))
+            }
+        };
+        let uptime = read_bounded(&self.root.join("uptime"))
+            .map_err(unread)
+            .and_then(|bytes| parse_uptime(&bytes).ok_or(FigureGap::Unusable));
+        let load = read_bounded(&self.root.join("loadavg"))
+            .map_err(unread)
+            .and_then(|bytes| parse_loadavg(&bytes).ok_or(FigureGap::Unusable));
+        SystemSample {
+            cpu,
+            memory,
+            swap,
+            uptime,
+            load,
         }
     }
 }
@@ -1327,6 +1516,184 @@ fn resident_bytes(pages: Observed<u64>, page_size: &Observed<u64>) -> Observed<u
         // reason applies to every record equally.
         (_, Observed::Missing(reason)) => Observed::Missing(*reason),
     }
+}
+
+/// The CPU counters at the head of a `stat` file, or `None` when its first line
+/// is not a `cpu` line the kernel writes (PX-007).
+///
+/// The first line sums every CPU (`for_each_possible_cpu` in `show_stat`,
+/// fs/proc/stat.c); a `cpuN` line follows it for each CPU online
+/// (`for_each_online_cpu`), and those are counted. Parsing stops at the first
+/// line that is neither, after at most [`MAX_STAT_CPU_LINE_BYTES`] of it. The
+/// file is read through an 8 KiB buffer, so less than one buffer past that
+/// point is copied out, and the rest of it — an `intr` line that grows with the
+/// interrupt count among it — is neither parsed nor copied out. At most
+/// [`MAX_STAT_CPU_BYTES`] of `cpuN` lines are parsed: a count that would need
+/// more is reported as unknown, never as the lines that happened to fit.
+fn read_stat_cpu(path: &Path) -> io::Result<Option<SystemCpuCounters>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    // One line at a time, each through its own bound: a line longer than any
+    // `cpu` line is not one, and is examined no further than that bound.
+    let mut next_line = |line: &mut Vec<u8>| {
+        line.clear();
+        (&mut reader)
+            .take(MAX_STAT_CPU_LINE_BYTES)
+            .read_until(b'\n', line)
+    };
+    next_line(&mut line)?;
+    let Some((busy, idle)) = parse_stat_cpu_line(&line) else {
+        return Ok(None);
+    };
+    let (mut cpus, mut read, mut counted) = (0u32, 0usize, true);
+    loop {
+        let length = next_line(&mut line)?;
+        if !(line.starts_with(b"cpu") && line.get(3).is_some_and(u8::is_ascii_digit)) {
+            // The first line that is not a `cpuN` line, or the end of the file.
+            break;
+        }
+        read += length;
+        if !line.ends_with(b"\n") || read as u64 > MAX_STAT_CPU_BYTES {
+            // Cut by a bound: this scan cannot say how many lines there are.
+            counted = false;
+            break;
+        }
+        match cpus.checked_add(1) {
+            Some(more) => cpus = more,
+            None => {
+                counted = false;
+                break;
+            }
+        }
+    }
+    Ok(Some(SystemCpuCounters {
+        busy,
+        idle,
+        cpus: (counted && cpus > 0).then_some(cpus),
+    }))
+}
+
+/// The busy and idle sums of one `stat` `cpu` line: `cpu`, then at least
+/// [`STAT_CPU_FIELDS`] plain unsigned counts separated by spaces, ended by one
+/// newline. A line with a sign, a non-digit, a count past `u64`, too few or too
+/// many fields, or a sum past `u64` is refused whole.
+fn parse_stat_cpu_line(line: &[u8]) -> Option<(u64, u64)> {
+    let line = line.strip_suffix(b"\n")?;
+    let mut fields = line
+        .split(|byte| *byte == b' ')
+        .filter(|field| !field.is_empty());
+    if fields.next()? != b"cpu" {
+        return None;
+    }
+    let mut counts = [0u64; STAT_CPU_FIELDS];
+    let mut seen = 0usize;
+    for field in fields {
+        let count = parse_count(field)?;
+        if let Some(slot) = counts.get_mut(seen) {
+            *slot = count;
+        }
+        seen += 1;
+        if seen > MAX_STAT_CPU_FIELDS {
+            return None;
+        }
+    }
+    if seen < STAT_CPU_FIELDS {
+        return None;
+    }
+    let [user, nice, system, idle, iowait, irq, softirq, steal] = counts;
+    let busy = [nice, system, irq, softirq, steal]
+        .into_iter()
+        .try_fold(user, u64::checked_add)?;
+    Some((busy, idle.checked_add(iowait)?))
+}
+
+/// One `meminfo` field in bytes: the line `<key>:`, one or more spaces, a plain
+/// count and ` kB` — kibibytes, as `show_val_kb` writes them
+/// (fs/proc/meminfo.c) — or `None` if no line for `key` is that.
+fn meminfo_bytes(meminfo: &[u8], key: &str) -> Option<u64> {
+    let line = meminfo.split(|byte| *byte == b'\n').find(|line| {
+        line.strip_prefix(key.as_bytes())
+            .is_some_and(|rest| rest.first() == Some(&b':'))
+    })?;
+    let value = &line[key.len() + 1..];
+    let digits = value.iter().position(|byte| *byte != b' ')?;
+    if digits == 0 {
+        return None;
+    }
+    let count = value[digits..].strip_suffix(b" kB")?;
+    parse_count(count)?.checked_mul(1024)
+}
+
+/// Memory as `meminfo` states it, or why it cannot be published: a missing or
+/// malformed `MemTotal` or `MemAvailable`, a `MemTotal` of 0, or a
+/// `MemAvailable` above `MemTotal` — none of which a kernel writes.
+fn parse_memory(meminfo: &[u8]) -> Figure<MemoryFigures> {
+    let total = meminfo_bytes(meminfo, "MemTotal").ok_or(FigureGap::Unusable)?;
+    let available = meminfo_bytes(meminfo, "MemAvailable").ok_or(FigureGap::Unusable)?;
+    if total == 0 || available > total {
+        return Err(FigureGap::Unusable);
+    }
+    Ok(MemoryFigures { total, available })
+}
+
+/// Swap as `meminfo` states it. A `SwapTotal` of 0 with no free swap is a host
+/// without swap; free swap above its total, or without one, is refused.
+fn parse_swap(meminfo: &[u8]) -> Figure<SwapFigures> {
+    let total = meminfo_bytes(meminfo, "SwapTotal").ok_or(FigureGap::Unusable)?;
+    let free = meminfo_bytes(meminfo, "SwapFree").ok_or(FigureGap::Unusable)?;
+    if free > total {
+        return Err(FigureGap::Unusable);
+    }
+    Ok(SwapFigures { total, free })
+}
+
+/// A fixed-point count with exactly two decimals, as the kernel prints
+/// `%lu.%02lu`, in hundredths.
+fn parse_hundredths(field: &[u8]) -> Option<u64> {
+    let dot = field.iter().position(|byte| *byte == b'.')?;
+    let (whole, fraction) = (&field[..dot], &field[dot + 1..]);
+    if fraction.len() != 2 {
+        return None;
+    }
+    parse_count(whole)?
+        .checked_mul(100)?
+        .checked_add(parse_count(fraction)?)
+}
+
+/// Whole seconds since boot from an `uptime` line: two `%lu.%02lu` fields, the
+/// uptime and the summed idle time, separated by one space and ended by one
+/// newline (`uptime_proc_show`, fs/proc/uptime.c). The fraction is truncated.
+fn parse_uptime(bytes: &[u8]) -> Option<u64> {
+    let line = bytes.strip_suffix(b"\n")?;
+    let mut fields = line.split(|byte| *byte == b' ');
+    let uptime = parse_hundredths(fields.next()?)?;
+    parse_hundredths(fields.next()?)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(uptime / 100)
+}
+
+/// The three load averages of a `loadavg` line: three `%lu.%02lu` fields, then
+/// `runnable/threads` and the last PID, separated by single spaces and ended by
+/// one newline (`loadavg_proc_show`, fs/proc/loadavg.c). Anything else is
+/// refused whole.
+fn parse_loadavg(bytes: &[u8]) -> Option<LoadAverages> {
+    let line = bytes.strip_suffix(b"\n")?;
+    let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+    let [one, five, fifteen, tasks, last_pid] = fields.as_slice() else {
+        return None;
+    };
+    let (running, threads) = tasks.split_at(tasks.iter().position(|byte| *byte == b'/')?);
+    parse_count(running)?;
+    parse_count(&threads[1..])?;
+    // `%d`: a PID namespace that has handed out none yet prints -1.
+    parse_count(last_pid.strip_prefix(b"-").unwrap_or(*last_pid))?;
+    Some(LoadAverages {
+        one: parse_hundredths(one)?,
+        five: parse_hundredths(five)?,
+        fifteen: parse_hundredths(fifteen)?,
+    })
 }
 
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
@@ -2045,5 +2412,291 @@ mod tests {
         // coincide across namespaces, so agreement proves nothing on its own.
         assert!(!readers_namespace_describes(true, false));
         assert!(!readers_namespace_describes(false, false));
+    }
+
+    /// PX-007: busy is user + nice + system + irq + softirq + steal and idle is
+    /// idle + iowait, read from the kernel's own `cpu` line and nothing else.
+    #[test]
+    fn the_cpu_line_sums_busy_and_idle_and_refuses_any_other_line() {
+        // user nice system idle iowait irq softirq steal guest guest_nice
+        let kernel = b"cpu  100 20 30 400 50 6 7 8 9 10\n";
+        assert_eq!(parse_stat_cpu_line(kernel), Some((171, 450)));
+        // Guest time is already in user and nice: changing it changes nothing.
+        assert_eq!(
+            parse_stat_cpu_line(b"cpu  100 20 30 400 50 6 7 8 900 1000\n"),
+            Some((171, 450))
+        );
+        // A kernel old enough to stop at steal, and fields a later one appends.
+        assert_eq!(
+            parse_stat_cpu_line(b"cpu 100 20 30 400 50 6 7 8\n"),
+            Some((171, 450))
+        );
+        assert_eq!(
+            parse_stat_cpu_line(b"cpu 100 20 30 400 50 6 7 8 9 10 11 12\n"),
+            Some((171, 450))
+        );
+        let too_many = format!("cpu{}\n", " 1".repeat(MAX_STAT_CPU_FIELDS + 1));
+        let past_u64 = format!("cpu {} 1 0 0 0 0 0 0\n", u64::MAX);
+        for refused in [
+            &b"cpu 100 20 30 400 50 6 7\n"[..],
+            b"cpu 100 20 30 400 50 6 7 8 9 10",
+            b"cpu0 100 20 30 400 50 6 7 8 9 10\n",
+            b"intr 100 20 30 400 50 6 7 8 9 10\n",
+            b"cpu 100 -20 30 400 50 6 7 8\n",
+            b"cpu 100 +20 30 400 50 6 7 8\n",
+            b"cpu 100 x 30 400 50 6 7 8\n",
+            b"cpu 100 20 30 400 50 6 7 8 nine\n",
+            b"cpu 18446744073709551616 20 30 400 50 6 7 8\n",
+            too_many.as_bytes(),
+            // Each count fits; their busy sum does not.
+            past_u64.as_bytes(),
+            b"",
+        ] {
+            assert_eq!(
+                parse_stat_cpu_line(refused),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(refused)
+            );
+        }
+    }
+
+    /// A scratch file for one test, removed when it is dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str, contents: &[u8]) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "srtop-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::write(&path, contents).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_cpu_count_is_the_cpu_lines_and_the_rest_of_stat_is_not_parsed() {
+        let mut stat = b"cpu  100 20 30 400 50 6 7 8 0 0\n".to_vec();
+        for cpu in 0..4 {
+            stat.extend_from_slice(format!("cpu{cpu} 25 5 7 100 12 1 1 2 0 0\n").as_bytes());
+        }
+        // An interrupt line far longer than any cpu line, as on a large host:
+        // examined only as far as it takes to see it is not a cpu line.
+        stat.extend_from_slice(b"intr 1");
+        stat.extend_from_slice(&b" 0".repeat(512 * 1024));
+        stat.extend_from_slice(b"\nctxt 1\nbtime 2\n");
+        let file = Scratch::new("stat", &stat);
+        assert_eq!(
+            read_stat_cpu(&file.0).unwrap(),
+            Some(SystemCpuCounters {
+                busy: 171,
+                idle: 450,
+                cpus: Some(4),
+            })
+        );
+        // No cpuN line at all: the share stands, the count is unknown.
+        let alone = Scratch::new("stat", b"cpu  100 20 30 400 50 6 7 8 0 0\nintr 1\n");
+        assert_eq!(read_stat_cpu(&alone.0).unwrap().unwrap().cpus, None);
+        // A first line that is not the kernel's `cpu` line is no counter.
+        let foreign = Scratch::new("stat", b"intr 1\ncpu  1 2 3 4 5 6 7 8\n");
+        assert_eq!(read_stat_cpu(&foreign.0).unwrap(), None);
+        // A cpu line cut by the line bound leaves the count unknown, never
+        // the lines before it.
+        let mut cut = b"cpu  1 2 3 4 5 6 7 8\ncpu0 1 2 3 4 5 6 7 8\ncpu1".to_vec();
+        cut.extend_from_slice(&b" 1".repeat(MAX_STAT_CPU_LINE_BYTES as usize));
+        cut.push(b'\n');
+        let cut = Scratch::new("stat", &cut);
+        assert_eq!(read_stat_cpu(&cut.0).unwrap().unwrap().cpus, None);
+        assert!(read_stat_cpu(Path::new("/nonexistent/srtop/stat")).is_err());
+    }
+
+    /// More `cpuN` lines than the read bound covers: the share is still read,
+    /// and the count is reported unknown rather than as the lines that fit.
+    #[test]
+    fn a_cpu_count_past_the_read_bound_is_unknown_and_the_share_stands() {
+        let line = format!(
+            "cpu{{}} {}\n",
+            [u64::MAX / 4; 10].map(|n| n.to_string()).join(" ")
+        );
+        let per_line = line.replace("{}", "9999").len() as u64;
+        let lines = MAX_STAT_CPU_BYTES / per_line + 2;
+        let mut stat = b"cpu  100 20 30 400 50 6 7 8 0 0\n".to_vec();
+        for cpu in 0..lines {
+            stat.extend_from_slice(
+                line.replace("{}", &format!("{:04}", cpu % 10_000))
+                    .as_bytes(),
+            );
+        }
+        let file = Scratch::new("stat", &stat);
+        let counters = read_stat_cpu(&file.0).unwrap().unwrap();
+        assert_eq!(
+            (counters.busy, counters.idle, counters.cpus),
+            (171, 450, None)
+        );
+    }
+
+    #[test]
+    fn memory_and_swap_are_kibibytes_and_impossible_values_are_refused() {
+        let meminfo = b"MemTotal:       16303736 kB\nMemFree:         1000000 kB\n\
+                        MemAvailable:   12000000 kB\nSwapCached:            0 kB\n\
+                        SwapTotal:       2097148 kB\nSwapFree:        2000000 kB\n\
+                        HugePages_Total:       0\n";
+        assert_eq!(
+            parse_memory(meminfo),
+            Ok(MemoryFigures {
+                total: 16_303_736 * 1024,
+                available: 12_000_000 * 1024,
+            })
+        );
+        assert_eq!(
+            parse_swap(meminfo),
+            Ok(SwapFigures {
+                total: 2_097_148 * 1024,
+                free: 2_000_000 * 1024,
+            })
+        );
+        // No swap at all is a host without swap, not a refusal.
+        assert_eq!(
+            parse_swap(b"SwapTotal:             0 kB\nSwapFree:              0 kB\n"),
+            Ok(SwapFigures { total: 0, free: 0 })
+        );
+        let unusable = Err(FigureGap::Unusable);
+        for refused in [
+            &b"MemTotal: 100 kB\n"[..],
+            b"MemTotal: 100 kB\nMemAvailable: 200 kB\n",
+            b"MemTotal: 0 kB\nMemAvailable: 0 kB\n",
+            b"MemTotal: 100 MB\nMemAvailable: 50 kB\n",
+            b"MemTotal: 100\nMemAvailable: 50 kB\n",
+            b"MemTotal:100 kB\nMemAvailable: 50 kB\n",
+            b"MemTotal: -100 kB\nMemAvailable: 50 kB\n",
+            b"MemTotal: 18014398509481984 kB\nMemAvailable: 50 kB\n",
+            b"MemTotalx: 100 kB\nMemAvailable: 50 kB\n",
+            b"",
+        ] {
+            assert_eq!(
+                parse_memory(refused),
+                unusable,
+                "{:?}",
+                String::from_utf8_lossy(refused)
+            );
+        }
+        for refused in [
+            &b"SwapTotal: 100 kB\nSwapFree: 200 kB\n"[..],
+            b"SwapTotal: 0 kB\nSwapFree: 4 kB\n",
+            b"SwapTotal: 100 kB\n",
+            b"SwapCached: 0 kB\nSwapFree: 0 kB\n",
+        ] {
+            assert_eq!(parse_swap(refused), Err(FigureGap::Unusable));
+        }
+    }
+
+    #[test]
+    fn uptime_and_load_averages_are_read_exactly_as_the_kernel_prints_them() {
+        assert_eq!(parse_uptime(b"350735.47 234388.90\n"), Some(350_735));
+        assert_eq!(parse_uptime(b"0.99 0.00\n"), Some(0), "truncated");
+        for refused in [
+            &b"350735.47 234388.90"[..],
+            b"350735.4 234388.90\n",
+            b"350735 234388.90\n",
+            b"350735.47\n",
+            b"350735.47 234388.90 1.00\n",
+            b"-350735.47 234388.90\n",
+            b"350735.47  234388.90\n",
+        ] {
+            assert_eq!(parse_uptime(refused), None);
+        }
+        assert_eq!(
+            parse_loadavg(b"0.52 0.58 0.59 1/467 12345\n"),
+            Some(LoadAverages {
+                one: 52,
+                five: 58,
+                fifteen: 59,
+            })
+        );
+        assert_eq!(
+            parse_loadavg(b"12.00 3.05 0.00 0/1 -1\n").map(|load| load.one),
+            Some(1_200)
+        );
+        for refused in [
+            &b"0.52 0.58 0.59 1/467 12345"[..],
+            b"0.52 0.58 1/467 12345\n",
+            b"0.5 0.58 0.59 1/467 12345\n",
+            b"0.52 0.58 0.590 1/467 12345\n",
+            b"0.52 0.58 0.59 1467 12345\n",
+            b"0.52 0.58 0.59 1/467\n",
+            b"0.52 0.58 0.59 1/467 12345 7\n",
+            b"-0.52 0.58 0.59 1/467 12345\n",
+        ] {
+            assert_eq!(
+                parse_loadavg(refused),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(refused)
+            );
+        }
+    }
+
+    #[test]
+    fn overall_cpu_needs_two_reads_and_is_never_a_zero_or_a_spike() {
+        let read = |busy, idle, cpus| SystemCpuCounters { busy, idle, cpus };
+        let first = read(1_000, 3_000, Some(4));
+        assert_eq!(system_cpu_since(None, first), (SystemCpu::WarmingUp, first));
+        // 100 of 400 ticks across four CPUs: a quarter of all of them.
+        let second = read(1_100, 3_300, Some(4));
+        assert_eq!(
+            system_cpu_since(Some(&first), second),
+            (
+                SystemCpu::Measured(SystemCpuInterval {
+                    busy: 100,
+                    total: 400,
+                    cpus: Some(4),
+                }),
+                second
+            )
+        );
+        // An idle host is a measured zero, not a missing value.
+        let idle = read(1_100, 3_700, Some(4));
+        assert_eq!(
+            system_cpu_since(Some(&second), idle).0,
+            SystemCpu::Measured(SystemCpuInterval {
+                busy: 0,
+                total: 400,
+                cpus: Some(4),
+            })
+        );
+        // Counters that did not advance: no interval to divide by.
+        assert_eq!(
+            system_cpu_since(Some(&second), second),
+            (SystemCpu::Interrupted, second)
+        );
+        // A counter that went backwards: a reset, never a wrapped delta, and
+        // the new read is the baseline.
+        for reset in [read(10, 3_300, Some(4)), read(1_100, 10, Some(4))] {
+            assert_eq!(
+                system_cpu_since(Some(&second), reset),
+                (SystemCpu::Interrupted, reset)
+            );
+        }
+        // A different number of CPUs was summed: a different denominator.
+        let hotplugged = read(1_200, 3_500, Some(8));
+        assert_eq!(
+            system_cpu_since(Some(&second), hotplugged),
+            (SystemCpu::Interrupted, hotplugged)
+        );
+        // A sum past u64 is not an interval either.
+        let huge = read(u64::MAX, u64::MAX, Some(4));
+        assert_eq!(
+            system_cpu_since(Some(&read(0, 0, Some(4))), huge),
+            (SystemCpu::Interrupted, huge)
+        );
     }
 }

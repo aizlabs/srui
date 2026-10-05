@@ -1,5 +1,7 @@
 //! PX-002 acceptance: injected deterministic domain records become collection rows (§§8, 12, 29).
-use srui_process_explorer::{initialize_from_source, source::*, MODEL, STATUS, TABLE};
+use srui_process_explorer::{
+    initialize_from_source, source::*, MODEL, SHELL_NODE_COUNT, STATUS, TABLE,
+};
 use srui_sdk::{Value, ACTIONS, ACTION_KEY, TEXT};
 use srui_sessiond::Session;
 use std::time::{Duration, SystemTime};
@@ -54,7 +56,7 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
     session.with_store(|store| {
         assert_eq!(
             store.node_count(),
-            5,
+            SHELL_NODE_COUNT,
             "records must not create child view nodes"
         );
         assert_eq!(store.children_of(TABLE), Some([].as_slice()));
@@ -95,7 +97,7 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
         assert!(rows
             .iter()
             .all(|row| row.item_id.get() != 4101 && row.item_id.get() != 4102));
-        for id in 1..=5 {
+        for id in 1..=SHELL_NODE_COUNT as u64 {
             let node = store.get_node(srui_sdk::NodeId::new(id)).unwrap();
             assert!(!node.has_property(ACTIONS));
             assert!(!node.has_property(ACTION_KEY));
@@ -173,7 +175,11 @@ fn a_snapshot_larger_than_one_model_batch_is_published_whole() {
         let model = store.get_model(MODEL).unwrap();
         assert_eq!(model.item_count, crowded as u64);
         assert_eq!(model.id_to_index.len(), crowded, "no row is dropped");
-        assert_eq!(store.node_count(), 5, "rows never become view nodes");
+        assert_eq!(
+            store.node_count(),
+            SHELL_NODE_COUNT,
+            "rows never become view nodes"
+        );
     });
 }
 

@@ -434,4 +434,89 @@ fn main() {
         "Wrote malformed_terminal_data_empty.bin ({} bytes)",
         malformed_terminal_data_bytes.len()
     );
+
+    // 17–20. Multi-envelope snapshot delivery (§18, §26): the client's staging bound, the
+    // decisions that announce a split snapshot, and the refusal of an undeliverable one.
+    for (name, message) in snapshot_framing_vectors() {
+        let bytes = encode_framed(&message).expect("encode framed snapshot-framing vector");
+        fs::write(out_dir.join(name), &bytes).expect("write snapshot-framing vector");
+        println!("Wrote {name} ({} bytes)", bytes.len());
+    }
+}
+
+/// Authored messages for the snapshot-framing golden vectors (§18, §26).
+///
+/// `protocol/tests/conformance_test.rs` re-authors the same messages and asserts they encode to
+/// the committed bytes.
+fn snapshot_framing_vectors() -> [(&'static str, SruiMessage); 4] {
+    [
+        (
+            "golden_snapshot_parts_client_hello.bin",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ClientHello(ClientHello {
+                    core_version: "0.5.0".to_string(),
+                    profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                    limits: Some(ClientLimits {
+                        max_frame_size: 16_777_216,
+                        max_snapshot_parts: 16,
+                        ..ClientLimits::default()
+                    }),
+                    client_instance_id: b"c17".to_vec(),
+                    client_metadata: Default::default(),
+                    known_resource_hashes: vec![],
+                })),
+            },
+        ),
+        (
+            "golden_snapshot_parts_welcome.bin",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ServerWelcome(ServerWelcome {
+                    core_version: "0.5.0".to_string(),
+                    required_profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                    optional_profiles: vec![],
+                    session_id: "abc".to_string(),
+                    initial_revision: 17,
+                    extension_namespaces: vec![ExtensionNamespaceMapping {
+                        extension_uri: "org.srui.standard-widgets".to_string(),
+                        namespace_id: 0,
+                    }],
+                    limits: None,
+                    snapshot_parts: 2,
+                })),
+            },
+        ),
+        (
+            "golden_snapshot_parts_resync_required.bin",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ServerResyncRequired(
+                    ServerResyncRequired {
+                        session_id: "abc".to_string(),
+                        snapshot_revision: 2210,
+                        reason: "journal_gap".to_string(),
+                        continuity: SessionContinuity::SameSession as i32,
+                        last_processed_event_seq: 593,
+                        discarded_text_edits: vec![],
+                        required_profiles: vec!["org.srui.standard-widgets/1".to_string()],
+                        optional_profiles: vec![],
+                        extension_namespaces: vec![ExtensionNamespaceMapping {
+                            extension_uri: "org.srui.standard-widgets".to_string(),
+                            namespace_id: 0,
+                        }],
+                        snapshot_parts: 3,
+                    },
+                )),
+            },
+        ),
+        (
+            "golden_handshake_refused.bin",
+            SruiMessage {
+                msg: Some(srui_message::Msg::ServerHandshakeRefused(
+                    ServerHandshakeRefused {
+                        reason: HandshakeRefusalReason::SnapshotUndeliverable as i32,
+                        detail: "snapshot needs 2 envelopes; client stages at most 1".to_string(),
+                    },
+                )),
+            },
+        ),
+    ]
 }

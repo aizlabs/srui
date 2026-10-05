@@ -12,6 +12,13 @@ pub use framing::{
     framed_payload_len, FramingError, DEFAULT_MAX_FRAME_SIZE,
 };
 
+pub mod snapshot_framing;
+pub use snapshot_framing::{
+    effective_max_snapshot_parts, effective_snapshot_parts, plan_snapshot_frames,
+    SnapshotAssembler, SnapshotAssemblyError, SnapshotFramePlan, SnapshotFramingError,
+    DEFAULT_MAX_SNAPSHOT_PARTS,
+};
+
 #[cfg(feature = "async-codec")]
 pub mod codec;
 #[cfg(feature = "async-codec")]

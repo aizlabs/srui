@@ -40,8 +40,8 @@ use crate::session::{
     SessionError,
 };
 use srui_protocol::{
-    srui_message, EventAckStatus, FramingError, ServerEventAck, SruiCodec, SruiMessage,
-    MAX_TERMINAL_INPUT_BYTES,
+    srui_message, EventAckStatus, FramingError, HandshakeRefusalReason, ServerEventAck,
+    ServerHandshakeRefused, SruiCodec, SruiMessage, MAX_TERMINAL_INPUT_BYTES,
 };
 use srui_pty::TerminalSubscription;
 use srui_semantic_tree::NodeId;
@@ -213,6 +213,45 @@ fn clear_stale_if_settled(
     }
 }
 
+/// Bound on `ServerHandshakeRefused.detail`, far below every §26 `max_string_length`.
+const MAX_HANDSHAKE_REFUSAL_DETAIL_BYTES: usize = 1024;
+
+/// Tells the client why its handshake cannot complete before the connection closes (§18, §19.2).
+///
+/// Only a snapshot that cannot be delivered within the client's limits is reported this way: it is
+/// deterministic, so without a diagnosis on the wire a reconnect would reproduce the same silent
+/// close forever. Every other handshake failure keeps its existing close-only behaviour. The write
+/// is best effort and bounded by [`WRITE_TIMEOUT`]; the caller returns the original error either way.
+async fn refuse_undeliverable_snapshot<W>(
+    framed_write: &mut FramedWrite<W, SruiCodec>,
+    error: &SessionError,
+) where
+    W: AsyncWrite + Unpin,
+{
+    if !matches!(
+        error,
+        SessionError::SnapshotUnrepresentable { .. } | SessionError::SnapshotUndeliverable(_)
+    ) {
+        return;
+    }
+    let refusal = SruiMessage {
+        msg: Some(srui_message::Msg::ServerHandshakeRefused(
+            ServerHandshakeRefused {
+                reason: HandshakeRefusalReason::SnapshotUndeliverable as i32,
+                detail: crate::session::bound_diagnostic_string(
+                    error.to_string(),
+                    MAX_HANDSHAKE_REFUSAL_DETAIL_BYTES,
+                ),
+            },
+        )),
+    };
+    match tokio::time::timeout(WRITE_TIMEOUT, framed_write.send(refusal)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(send_error)) => warn!(%send_error, "could not deliver the handshake refusal"),
+        Err(_) => warn!(timeout = ?WRITE_TIMEOUT, "client did not accept the handshake refusal"),
+    }
+}
+
 /// Handles an active client connection stream through handshake and event processing.
 pub async fn handle_connection<S>(
     stream: S,
@@ -255,7 +294,13 @@ where
                 client_instance_id = ?hello.client_instance_id,
                 "Received ClientHello"
             );
-            let bootstrap = session.bootstrap_fresh_client(&hello)?;
+            let bootstrap = match session.bootstrap_fresh_client(&hello) {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    refuse_undeliverable_snapshot(&mut framed_write, &error).await;
+                    return Err(error.into());
+                }
+            };
             let welcome_envelope = SruiMessage {
                 msg: Some(srui_message::Msg::ServerWelcome(bootstrap.welcome)),
             };
@@ -271,19 +316,23 @@ where
                 return Ok(());
             }
             if let Some(snapshot) = bootstrap.snapshot {
-                let snapshot_envelope = SruiMessage {
-                    msg: Some(srui_message::Msg::Transaction(snapshot)),
-                };
-                if !send_message(
-                    &mut framed_write,
-                    snapshot_envelope,
-                    LogicalChannelClass::Ui,
-                    &shutdown,
-                    &bootstrap.transactions,
-                )
-                .await?
-                {
-                    return Ok(());
+                // `welcome.snapshot_parts` announced these envelopes; each was measured under the
+                // frame limit before the welcome was written (§18, §26).
+                for part in bootstrap.snapshot_frames.split(snapshot) {
+                    let snapshot_envelope = SruiMessage {
+                        msg: Some(srui_message::Msg::Transaction(part)),
+                    };
+                    if !send_message(
+                        &mut framed_write,
+                        snapshot_envelope,
+                        LogicalChannelClass::Ui,
+                        &shutdown,
+                        &bootstrap.transactions,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                 }
             }
             clear_stale_if_settled(&session, &hello.client_instance_id, &bootstrap.transactions);
@@ -303,7 +352,13 @@ where
                 last_applied_revision = resume.last_applied_revision,
                 "Received ClientResume"
             );
-            let bootstrap = session.bootstrap_resume(&resume)?;
+            let bootstrap = match session.bootstrap_resume(&resume) {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    refuse_undeliverable_snapshot(&mut framed_write, &error).await;
+                    return Err(error.into());
+                }
+            };
             match bootstrap.outcome {
                 ResumeOutcome::Replay {
                     welcome_msg,
@@ -358,19 +413,22 @@ where
                     {
                         return Ok(());
                     }
-                    let snapshot_env = SruiMessage {
-                        msg: Some(srui_message::Msg::Transaction(snapshot_transaction)),
-                    };
-                    if !send_message(
-                        &mut framed_write,
-                        snapshot_env,
-                        LogicalChannelClass::Ui,
-                        &shutdown,
-                        &bootstrap.transactions,
-                    )
-                    .await?
-                    {
-                        return Ok(());
+                    // `resync_msg.snapshot_parts` announced these envelopes (§18, §26).
+                    for part in bootstrap.snapshot_frames.split(snapshot_transaction) {
+                        let snapshot_env = SruiMessage {
+                            msg: Some(srui_message::Msg::Transaction(part)),
+                        };
+                        if !send_message(
+                            &mut framed_write,
+                            snapshot_env,
+                            LogicalChannelClass::Ui,
+                            &shutdown,
+                            &bootstrap.transactions,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
                     }
                     clear_stale_if_settled(
                         &session,

@@ -24,6 +24,10 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 | `golden_terminal_resync_required.bin` | Length-prefixed framed `SruiMessage` containing a `TerminalResyncRequired` with `RETENTION_LOSS` (§21.2) |
 | `malformed_terminal_input_empty.bin` | Protobuf-valid `TerminalInput` rejected at the wire boundary because it carries no payload (§21, §26) |
 | `malformed_terminal_data_empty.bin` | Protobuf-valid `TerminalData` rejected by the client apply path because it carries no payload (§21, §26) |
+| `golden_snapshot_parts_client_hello.bin` | Length-prefixed framed `SruiMessage` containing a `ClientHello` advertising `ClientLimits.max_snapshot_parts = 16` (§18, §26) |
+| `golden_snapshot_parts_welcome.bin` | Length-prefixed framed `SruiMessage` containing a `ServerWelcome` announcing a catch-up snapshot in `snapshot_parts = 2` envelopes (§18, §26) |
+| `golden_snapshot_parts_resync_required.bin` | Length-prefixed framed `SruiMessage` containing a `ServerResyncRequired` announcing `snapshot_parts = 3` (§18, §26) |
+| `golden_handshake_refused.bin` | Length-prefixed framed `SruiMessage` containing a `ServerHandshakeRefused` with `SNAPSHOT_UNDELIVERABLE` (§18, §19.2) |
 
 See `expected.json` for canonical hex and field declarations.
 
@@ -43,7 +47,7 @@ and which scenarios are open gaps.
 | 5 | [`05-semantic-input/`](suites/05-semantic-input/) | Semantic-input tests | `GAP` | generated from `registry.yaml` | Task 36 (VectorScene profile) |
 | 6 | [`06-local-text-interaction/`](suites/06-local-text-interaction/) | Local text-interaction tests | `PASS` | code-driven | — |
 | 7 | [`07-extension-negotiation/`](suites/07-extension-negotiation/) | Extension-negotiation tests | `GAP` | code-driven | Task 31 merge (branch codex/task-31-coding-agent) |
-| 8 | [`08-reconnect/`](suites/08-reconnect/) | Reconnect tests | `PASS` | code-driven | — |
+| 8 | [`08-reconnect/`](suites/08-reconnect/) | Reconnect tests | `PASS` | 9 JSON vector(s) (multi-envelope snapshot delivery) plus code-driven | — |
 | 9 | [`09-security-limits/`](suites/09-security-limits/) | Security limits | `PASS` | code-driven | — |
 | 10 | [`10-renderer-semantics/`](suites/10-renderer-semantics/) | Renderer semantic tests | `PASS` | code-driven | — |
 | 11 | [`11-semantic-inspection/`](suites/11-semantic-inspection/) | Semantic inspection tests | `PASS` | code-driven | — |

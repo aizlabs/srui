@@ -97,6 +97,30 @@ separate field there would be redundant state a peer could contradict. Both resp
 - `SESSION_CONTINUITY_UNSPECIFIED` (or any unrecognized value) is a required-semantics failure
   (§4 inv. 13): the client fails the session rather than assuming either outcome.
 
+### Snapshots larger than one frame (§12.1, §18, §26)
+
+A snapshot is one `base_revision = 0 → new_revision = snapshot_revision` transaction applied
+wholesale. When its single envelope would exceed the §26 frame limit it travels in several
+consecutive `Transaction` envelopes instead; the frame limit itself is never raised.
+
+- `ClientLimits.max_snapshot_parts` (re-advertised on every HELLO and RESUME) bounds how many
+  envelopes the client stages for one snapshot. Zero/absent means one: a legacy client is never
+  sent a split snapshot.
+- `ServerWelcome.snapshot_parts` (catch-up) and `ServerResyncRequired.snapshot_parts` (resync)
+  announce how many envelopes follow. Zero/absent means one, so a snapshot that fits a frame keeps
+  the legacy bytes exactly. Every envelope carries `base_revision = 0` and
+  `new_revision = snapshot_revision` and at least one operation.
+- The client stages the envelopes and applies their operations, concatenated in arrival order, as
+  one snapshot after the last one: no partially applied snapshot is ever visible, and a lost
+  connection discards the staged envelopes like any incomplete transaction. Any other
+  transaction while envelopes are outstanding, a revision mismatch, or a staged total above
+  `max_transaction_operations` fails the session.
+- The server measures the encoded snapshot before writing anything. If it cannot be delivered —
+  more operations than `max_transaction_operations`, one operation larger than a frame, or more
+  envelopes than the client stages — it sends `ServerHandshakeRefused{reason =
+  SNAPSHOT_UNDELIVERABLE, detail}` instead of WELCOME/RESYNC_REQUIRED and closes. A reconnect with
+  the same limits reproduces the refusal, so the client surfaces it rather than retrying.
+
 ---
 
 ## Native text editing (§18.3, §22.6)

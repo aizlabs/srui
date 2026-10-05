@@ -1,9 +1,51 @@
-//! Catch-up snapshot export for handshake and resync (§13, §18, §26).
+//! Catch-up snapshot export and delivery planning for handshake and resync (§13, §18, §26).
 
-use srui_protocol::Transaction;
+use srui_protocol::{
+    framed_payload_len, plan_snapshot_frames, ClientLimits, SnapshotFramePlan, Transaction,
+    DEFAULT_MAX_FRAME_SIZE,
+};
 use srui_semantic_tree::{SemanticStore, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION};
 
 use super::SessionError;
+
+/// Encoded-byte ceiling of the items in one exported `MODEL_RESET_RANGE` (§18, §26).
+///
+/// The item-count bound alone lets one operation of wide rows outgrow a whole frame, and a
+/// snapshot can be split between operations but never inside one. A 1 MiB ceiling keeps every
+/// range operation far below `DEFAULT_MAX_FRAME_SIZE`, so split envelopes pack within one operation
+/// of the limit.
+pub(crate) const SNAPSHOT_MODEL_RANGE_MAX_BYTES: usize = 1 << 20;
+
+/// Plans how `snapshot` reaches a client within every frame limit in force (§18, §26).
+///
+/// The envelope budget is the smallest of the codec limit this server writes with
+/// ([`DEFAULT_MAX_FRAME_SIZE`]), the limit it advertises (`server_max_frame_size`), and the
+/// client's advertised `max_frame_size`; a zero advertisement means "no preference". The client's
+/// `max_snapshot_parts` (absent/zero = one envelope) bounds the number of envelopes.
+///
+/// # Errors
+///
+/// [`SessionError::SnapshotUndeliverable`] when no plan fits, which the caller reports at handshake
+/// before any subscription or frame write.
+pub(crate) fn plan_snapshot_delivery(
+    snapshot: &Transaction,
+    server_max_frame_size: u32,
+    client_limits: Option<&ClientLimits>,
+) -> Result<SnapshotFramePlan, SessionError> {
+    let nonzero = |value: u32| (value != 0).then_some(value as usize);
+    let max_frame_size = [
+        Some(DEFAULT_MAX_FRAME_SIZE),
+        nonzero(server_max_frame_size),
+        client_limits.and_then(|limits| nonzero(limits.max_frame_size)),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .expect("the codec limit is always present");
+    let max_parts = client_limits.map_or(0, |limits| limits.max_snapshot_parts);
+    plan_snapshot_frames(snapshot, max_frame_size, max_parts)
+        .map_err(SessionError::SnapshotUndeliverable)
+}
 
 /// Appends one `MODEL_RESET_RANGE` operation carrying `items` starting at `start_index` (§13, §26).
 fn push_model_reset_range(
@@ -39,9 +81,10 @@ fn push_model_reset_range(
 ///
 /// The store's own `max_node_count` (§26) is an order of magnitude above
 /// `max_transaction_operations`, so this bound is reachable by an application that is doing
-/// nothing wrong. Restoring service for such a session requires chunked snapshot delivery, which
-/// needs an explicit snapshot-framing signal on the wire; until then the session fails loudly at
-/// handshake instead of silently poisoning every client that attaches to it.
+/// nothing wrong. Splitting the snapshot across envelopes ([`plan_snapshot_delivery`]) lifts only
+/// the *byte* bound: the envelopes still form one transaction the replica applies atomically, so
+/// its operation count stays bounded by `max_transaction_operations`, and the session fails loudly
+/// at handshake instead of silently poisoning every client that attaches to it.
 pub(crate) fn export_snapshot_transaction(
     store: &SemanticStore,
 ) -> Result<Transaction, SessionError> {
@@ -70,14 +113,32 @@ pub(crate) fn export_snapshot_transaction(
             for range in model.cached_ranges() {
                 let mut chunk_start = range.start;
                 let mut chunk: Vec<srui_protocol::ModelItem> = Vec::new();
+                let mut chunk_bytes = 0usize;
 
                 for idx in range.start..range.start + range.length {
                     match model.get_item_by_index(idx) {
                         Some(item) => {
+                            let item = srui_protocol::ModelItem::from(item);
+                            let item_bytes = framed_payload_len(&item);
+                            // §26: a range whose items outgrow the byte ceiling ends here and the
+                            // next operation resumes at this index, so no single operation can
+                            // outgrow a frame merely because its rows are wide.
+                            if !chunk.is_empty()
+                                && chunk_bytes + item_bytes > SNAPSHOT_MODEL_RANGE_MAX_BYTES
+                            {
+                                push_model_reset_range(
+                                    &mut ops,
+                                    model.id.get(),
+                                    chunk_start,
+                                    std::mem::take(&mut chunk),
+                                );
+                                chunk_bytes = 0;
+                            }
                             if chunk.is_empty() {
                                 chunk_start = idx;
                             }
-                            chunk.push(srui_protocol::ModelItem::from(item));
+                            chunk.push(item);
+                            chunk_bytes += item_bytes;
                             if chunk.len() == DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION {
                                 push_model_reset_range(
                                     &mut ops,
@@ -85,6 +146,7 @@ pub(crate) fn export_snapshot_transaction(
                                     chunk_start,
                                     std::mem::take(&mut chunk),
                                 );
+                                chunk_bytes = 0;
                             }
                         }
                         // `items` are positional from `start_index`, so a hole must end the run
@@ -97,6 +159,7 @@ pub(crate) fn export_snapshot_transaction(
                                     chunk_start,
                                     std::mem::take(&mut chunk),
                                 );
+                                chunk_bytes = 0;
                             }
                         }
                     }
@@ -187,6 +250,49 @@ mod tests {
             }
             other => panic!("expected SnapshotUnrepresentable, got {other:?}"),
         }
+    }
+
+    /// §26: a range of wide rows ends each operation at the byte ceiling, not only at the item
+    /// count, so no operation can outgrow a frame merely because its rows are wide.
+    #[test]
+    fn wide_rows_split_range_operations_at_the_byte_ceiling() {
+        use srui_semantic_tree::{ItemId, ModelId, ModelItem, Value};
+
+        let mut store = SemanticStore::new();
+        let model = ModelId::new(4);
+        store
+            .create_model(model, TypeRef::LIST, 3_000)
+            .expect("model");
+        store
+            .model_reset_range(
+                model,
+                0,
+                (0..3_000u64)
+                    .map(|i| {
+                        ModelItem::with_value(ItemId::new(i + 1), Value::String("w".repeat(1_000)))
+                    })
+                    .collect(),
+                None,
+            )
+            .expect("rows");
+
+        let snapshot = export_snapshot_transaction(&store).expect("representable");
+        let mut next_index = 0u64;
+        let mut ranges = 0;
+        for op in &snapshot.operations {
+            if let Some(srui_protocol::operation::Op::ModelResetRange(range)) = &op.op {
+                ranges += 1;
+                assert_eq!(range.start_index, next_index, "ranges stay contiguous");
+                next_index += range.items.len() as u64;
+                let bytes: usize = range.items.iter().map(framed_payload_len).sum();
+                assert!(bytes <= SNAPSHOT_MODEL_RANGE_MAX_BYTES);
+            }
+        }
+        assert_eq!(next_index, 3_000);
+        assert!(
+            ranges >= 3,
+            "3 MB of rows must span several operations, got {ranges}"
+        );
     }
 
     /// A store that fits stays expressible, and the emitted snapshot is within §26 bounds.

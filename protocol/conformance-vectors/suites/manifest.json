@@ -364,13 +364,19 @@
       "slug": "reconnect",
       "name": "Reconnect tests",
       "spec_sections": [
+        "\u00a712.1",
         "\u00a718",
         "\u00a718.2",
         "\u00a718.3",
         "\u00a721",
+        "\u00a726",
         "\u00a732.8"
       ],
       "status": "active",
+      "vectors": {
+        "dir": "suites/08-reconnect/vectors",
+        "count": 9
+      },
       "rust": [
         [
           "cargo",
@@ -421,6 +427,26 @@
           "srui-sessiond",
           "--test",
           "event_delivery_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-semantic-tree",
+          "--test",
+          "conformance_snapshot_framing_test"
+        ],
+        [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "server-rust/Cargo.toml",
+          "-p",
+          "srui-sessiond",
+          "--test",
+          "snapshot_framing_test"
         ]
       ],
       "swift": [
@@ -455,6 +481,14 @@
           "client-macos",
           "--filter",
           "SessionControllerResyncTests"
+        ],
+        [
+          "swift",
+          "test",
+          "--package-path",
+          "client-macos",
+          "--filter",
+          "SnapshotFramingConformanceTests"
         ]
       ]
     },

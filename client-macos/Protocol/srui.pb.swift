@@ -1241,6 +1241,46 @@ public nonisolated enum Srui_Protocol_SessionContinuity: SwiftProtobuf.Enum, Swi
 
 }
 
+/// Why a server refused to complete a handshake (§18, §19.2 control-class errors).
+public nonisolated enum Srui_Protocol_HandshakeRefusalReason: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public typealias RawValue = Int
+  case unspecified // = 0
+
+  /// The catch-up/resync snapshot cannot be delivered within the client's limits: it needs more
+  /// operations than max_transaction_operations, an operation larger than one frame, or more
+  /// envelopes than ClientLimits.max_snapshot_parts (§18, §26). Reconnecting with the same limits
+  /// reproduces the refusal, so a client MUST surface it rather than retry automatically.
+  case snapshotUndeliverable // = 1
+  case UNRECOGNIZED(Int)
+
+  public init() {
+    self = .unspecified
+  }
+
+  public init?(rawValue: Int) {
+    switch rawValue {
+    case 0: self = .unspecified
+    case 1: self = .snapshotUndeliverable
+    default: self = .UNRECOGNIZED(rawValue)
+    }
+  }
+
+  public var rawValue: Int {
+    switch self {
+    case .unspecified: return 0
+    case .snapshotUndeliverable: return 1
+    case .UNRECOGNIZED(let i): return i
+    }
+  }
+
+  // The compiler won't synthesize support with the UNRECOGNIZED case.
+  public static let allCases: [Srui_Protocol_HandshakeRefusalReason] = [
+    .unspecified,
+    .snapshotUndeliverable,
+  ]
+
+}
+
 /// Transfer priority for resource payloads. Resource traffic is always scheduled
 /// below UI/control traffic (§19.2); this field distinguishes resources from each
 /// other when a multi-class scheduler is introduced later.
@@ -2252,6 +2292,11 @@ public nonisolated struct Srui_Protocol_ClientLimits: Sendable {
 
   public var maxResourceSize: UInt32 = 0
 
+  /// Most consecutive Transaction envelopes this client stages for ONE snapshot (§18, §26).
+  /// Zero/absent means 1: a legacy client accepts only a single-envelope snapshot, so a server
+  /// never splits a snapshot for it and refuses one that does not fit a frame instead.
+  public var maxSnapshotParts: UInt32 = 0
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -2350,6 +2395,13 @@ public nonisolated struct Srui_Protocol_ServerWelcome: Sendable {
   public var hasLimits: Bool {self._limits != nil}
   /// Clears the value of `limits`. Subsequent reads from it will return its default value.
   public mutating func clearLimits() {self._limits = nil}
+
+  /// Number of consecutive Transaction envelopes (each base_revision = 0, new_revision =
+  /// initial_revision) that together carry the catch-up snapshot (§18 snapshot delivery form,
+  /// §26). Zero/absent means one envelope. The client concatenates their operations in arrival
+  /// order and applies them as ONE snapshot after the last envelope; nothing is visible before.
+  /// Never exceeds the client's ClientLimits.max_snapshot_parts (absent = 1).
+  public var snapshotParts: UInt32 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2456,6 +2508,27 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
   public var optionalProfiles: [String] = []
 
   public var extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping] = []
+
+  /// Number of consecutive Transaction envelopes carrying the snapshot at snapshot_revision;
+  /// same rules as ServerWelcome.snapshot_parts (§18, §26). Zero/absent means one envelope.
+  public var snapshotParts: UInt32 = 0
+
+  public var unknownFields = SwiftProtobuf.UnknownStorage()
+
+  public init() {}
+}
+
+/// Sent instead of SERVER WELCOME / RESYNC_REQUIRED when the server cannot complete the
+/// handshake for this client; the server closes the connection after writing it (§18, §19.2).
+public nonisolated struct Srui_Protocol_ServerHandshakeRefused: Sendable {
+  // SwiftProtobuf.Message conformance is added in an extension below. See the
+  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
+  // methods supported on all messages.
+
+  public var reason: Srui_Protocol_HandshakeRefusalReason = .unspecified
+
+  /// Diagnostic only, bounded by max_string_length (§26)
+  public var detail: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
@@ -2729,6 +2802,14 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     set {msg = .terminalResyncRequired(newValue)}
   }
 
+  public var serverHandshakeRefused: Srui_Protocol_ServerHandshakeRefused {
+    get {
+      if case .serverHandshakeRefused(let v)? = msg {return v}
+      return Srui_Protocol_ServerHandshakeRefused()
+    }
+    set {msg = .serverHandshakeRefused(newValue)}
+  }
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public nonisolated enum OneOf_Msg: Equatable, Sendable {
@@ -2747,6 +2828,7 @@ public nonisolated struct Srui_Protocol_SruiMessage: Sendable {
     case terminalInput(Srui_Protocol_TerminalInput)
     case terminalResize(Srui_Protocol_TerminalResize)
     case terminalResyncRequired(Srui_Protocol_TerminalResyncRequired)
+    case serverHandshakeRefused(Srui_Protocol_ServerHandshakeRefused)
 
   }
 
@@ -2835,6 +2917,10 @@ nonisolated extension Srui_Protocol_EventAckStatus: SwiftProtobuf._ProtoNameProv
 
 nonisolated extension Srui_Protocol_SessionContinuity: SwiftProtobuf._ProtoNameProviding {
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0SESSION_CONTINUITY_UNSPECIFIED\0\u{1}SESSION_CONTINUITY_SAME_SESSION\0\u{1}SESSION_CONTINUITY_REPLACED\0")
+}
+
+nonisolated extension Srui_Protocol_HandshakeRefusalReason: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0HANDSHAKE_REFUSAL_REASON_UNSPECIFIED\0\u{1}HANDSHAKE_REFUSAL_REASON_SNAPSHOT_UNDELIVERABLE\0")
 }
 
 nonisolated extension Srui_Protocol_ResourcePriority: SwiftProtobuf._ProtoNameProviding {
@@ -4609,7 +4695,7 @@ nonisolated extension Srui_Protocol_ServerEventAck: SwiftProtobuf.Message, Swift
 
 nonisolated extension Srui_Protocol_ClientLimits: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ClientLimits"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}max_frame_size\0\u{3}max_transaction_operations\0\u{3}max_tree_depth\0\u{3}max_node_count\0\u{3}max_string_length\0\u{3}max_resource_size\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}max_frame_size\0\u{3}max_transaction_operations\0\u{3}max_tree_depth\0\u{3}max_node_count\0\u{3}max_string_length\0\u{3}max_resource_size\0\u{3}max_snapshot_parts\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4623,6 +4709,7 @@ nonisolated extension Srui_Protocol_ClientLimits: SwiftProtobuf.Message, SwiftPr
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.maxNodeCount) }()
       case 5: try { try decoder.decodeSingularUInt32Field(value: &self.maxStringLength) }()
       case 6: try { try decoder.decodeSingularUInt32Field(value: &self.maxResourceSize) }()
+      case 7: try { try decoder.decodeSingularUInt32Field(value: &self.maxSnapshotParts) }()
       default: break
       }
     }
@@ -4647,6 +4734,9 @@ nonisolated extension Srui_Protocol_ClientLimits: SwiftProtobuf.Message, SwiftPr
     if self.maxResourceSize != 0 {
       try visitor.visitSingularUInt32Field(value: self.maxResourceSize, fieldNumber: 6)
     }
+    if self.maxSnapshotParts != 0 {
+      try visitor.visitSingularUInt32Field(value: self.maxSnapshotParts, fieldNumber: 7)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4657,6 +4747,7 @@ nonisolated extension Srui_Protocol_ClientLimits: SwiftProtobuf.Message, SwiftPr
     if lhs.maxNodeCount != rhs.maxNodeCount {return false}
     if lhs.maxStringLength != rhs.maxStringLength {return false}
     if lhs.maxResourceSize != rhs.maxResourceSize {return false}
+    if lhs.maxSnapshotParts != rhs.maxSnapshotParts {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -4813,7 +4904,7 @@ nonisolated extension Srui_Protocol_ClientHello: SwiftProtobuf.Message, SwiftPro
 
 nonisolated extension Srui_Protocol_ServerWelcome: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerWelcome"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}core_version\0\u{3}required_profiles\0\u{3}optional_profiles\0\u{3}session_id\0\u{3}initial_revision\0\u{3}extension_namespaces\0\u{1}limits\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}core_version\0\u{3}required_profiles\0\u{3}optional_profiles\0\u{3}session_id\0\u{3}initial_revision\0\u{3}extension_namespaces\0\u{1}limits\0\u{3}snapshot_parts\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4828,6 +4919,7 @@ nonisolated extension Srui_Protocol_ServerWelcome: SwiftProtobuf.Message, SwiftP
       case 5: try { try decoder.decodeSingularUInt64Field(value: &self.initialRevision) }()
       case 6: try { try decoder.decodeRepeatedMessageField(value: &self.extensionNamespaces) }()
       case 7: try { try decoder.decodeSingularMessageField(value: &self._limits) }()
+      case 8: try { try decoder.decodeSingularUInt32Field(value: &self.snapshotParts) }()
       default: break
       }
     }
@@ -4859,6 +4951,9 @@ nonisolated extension Srui_Protocol_ServerWelcome: SwiftProtobuf.Message, SwiftP
     try { if let v = self._limits {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
     } }()
+    if self.snapshotParts != 0 {
+      try visitor.visitSingularUInt32Field(value: self.snapshotParts, fieldNumber: 8)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -4870,6 +4965,7 @@ nonisolated extension Srui_Protocol_ServerWelcome: SwiftProtobuf.Message, SwiftP
     if lhs.initialRevision != rhs.initialRevision {return false}
     if lhs.extensionNamespaces != rhs.extensionNamespaces {return false}
     if lhs._limits != rhs._limits {return false}
+    if lhs.snapshotParts != rhs.snapshotParts {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -5011,7 +5107,7 @@ nonisolated extension Srui_Protocol_ServerResumeOk: SwiftProtobuf.Message, Swift
 
 nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ServerResyncRequired"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0\u{1}continuity\0\u{3}last_processed_event_seq\0\u{3}discarded_text_edits\0\u{3}required_profiles\0\u{3}optional_profiles\0\u{3}extension_namespaces\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}session_id\0\u{3}snapshot_revision\0\u{1}reason\0\u{1}continuity\0\u{3}last_processed_event_seq\0\u{3}discarded_text_edits\0\u{3}required_profiles\0\u{3}optional_profiles\0\u{3}extension_namespaces\0\u{3}snapshot_parts\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5028,6 +5124,7 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
       case 7: try { try decoder.decodeRepeatedStringField(value: &self.requiredProfiles) }()
       case 8: try { try decoder.decodeRepeatedStringField(value: &self.optionalProfiles) }()
       case 9: try { try decoder.decodeRepeatedMessageField(value: &self.extensionNamespaces) }()
+      case 10: try { try decoder.decodeSingularUInt32Field(value: &self.snapshotParts) }()
       default: break
       }
     }
@@ -5061,6 +5158,9 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if !self.extensionNamespaces.isEmpty {
       try visitor.visitRepeatedMessageField(value: self.extensionNamespaces, fieldNumber: 9)
     }
+    if self.snapshotParts != 0 {
+      try visitor.visitSingularUInt32Field(value: self.snapshotParts, fieldNumber: 10)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -5074,6 +5174,42 @@ nonisolated extension Srui_Protocol_ServerResyncRequired: SwiftProtobuf.Message,
     if lhs.requiredProfiles != rhs.requiredProfiles {return false}
     if lhs.optionalProfiles != rhs.optionalProfiles {return false}
     if lhs.extensionNamespaces != rhs.extensionNamespaces {return false}
+    if lhs.snapshotParts != rhs.snapshotParts {return false}
+    if lhs.unknownFields != rhs.unknownFields {return false}
+    return true
+  }
+}
+
+nonisolated extension Srui_Protocol_ServerHandshakeRefused: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+  public static let protoMessageName: String = _protobuf_package + ".ServerHandshakeRefused"
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}reason\0\u{1}detail\0")
+
+  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
+    while let fieldNumber = try decoder.nextFieldNumber() {
+      // The use of inline closures is to circumvent an issue where the compiler
+      // allocates stack space for every case branch when no optimizations are
+      // enabled. https://github.com/apple/swift-protobuf/issues/1034
+      switch fieldNumber {
+      case 1: try { try decoder.decodeSingularEnumField(value: &self.reason) }()
+      case 2: try { try decoder.decodeSingularStringField(value: &self.detail) }()
+      default: break
+      }
+    }
+  }
+
+  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
+    if self.reason != .unspecified {
+      try visitor.visitSingularEnumField(value: self.reason, fieldNumber: 1)
+    }
+    if !self.detail.isEmpty {
+      try visitor.visitSingularStringField(value: self.detail, fieldNumber: 2)
+    }
+    try unknownFields.traverse(visitor: &visitor)
+  }
+
+  public static func ==(lhs: Srui_Protocol_ServerHandshakeRefused, rhs: Srui_Protocol_ServerHandshakeRefused) -> Bool {
+    if lhs.reason != rhs.reason {return false}
+    if lhs.detail != rhs.detail {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -5401,7 +5537,7 @@ nonisolated extension Srui_Protocol_ClientModelRangeRequest: SwiftProtobuf.Messa
 
 nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SruiMessage"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0\u{3}resource_metadata\0\u{3}resource_chunk\0\u{3}client_model_range_request\0\u{3}terminal_data\0\u{3}terminal_input\0\u{3}terminal_resize\0\u{3}terminal_resync_required\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}client_hello\0\u{3}server_welcome\0\u{3}client_resume\0\u{3}server_resume_ok\0\u{3}server_resync_required\0\u{1}transaction\0\u{1}event\0\u{3}server_event_ack\0\u{3}resource_metadata\0\u{3}resource_chunk\0\u{3}client_model_range_request\0\u{3}terminal_data\0\u{3}terminal_input\0\u{3}terminal_resize\0\u{3}terminal_resync_required\0\u{3}server_handshake_refused\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5604,6 +5740,19 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
           self.msg = .terminalResyncRequired(v)
         }
       }()
+      case 16: try {
+        var v: Srui_Protocol_ServerHandshakeRefused?
+        var hadOneofValue = false
+        if let current = self.msg {
+          hadOneofValue = true
+          if case .serverHandshakeRefused(let m) = current {v = m}
+        }
+        try decoder.decodeSingularMessageField(value: &v)
+        if let v = v {
+          if hadOneofValue {try decoder.handleConflictingOneOf()}
+          self.msg = .serverHandshakeRefused(v)
+        }
+      }()
       default: break
       }
     }
@@ -5674,6 +5823,10 @@ nonisolated extension Srui_Protocol_SruiMessage: SwiftProtobuf.Message, SwiftPro
     case .terminalResyncRequired?: try {
       guard case .terminalResyncRequired(let v)? = self.msg else { preconditionFailure() }
       try visitor.visitSingularMessageField(value: v, fieldNumber: 15)
+    }()
+    case .serverHandshakeRefused?: try {
+      guard case .serverHandshakeRefused(let v)? = self.msg else { preconditionFailure() }
+      try visitor.visitSingularMessageField(value: v, fieldNumber: 16)
     }()
     case nil: break
     }

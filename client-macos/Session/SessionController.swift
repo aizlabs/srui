@@ -64,6 +64,10 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
     /// A newer reconnect attempt on the same outbox superseded this controller. Its handshake can
     /// never complete, so the owner discards this controller instead of reconnecting it (§18).
     case superseded(String)
+    /// The server refused the handshake with `SERVER HANDSHAKE_REFUSED` and closed the connection
+    /// (§18, §19.2). The refusal is deterministic for these client limits, so the owner surfaces it
+    /// instead of reconnecting into the same refusal.
+    case handshakeRefused(String)
 
     public var description: String {
         switch self {
@@ -73,6 +77,7 @@ public enum SessionFailure: Error, Sendable, CustomStringConvertible {
         case .rendererFailed(let msg): return "renderer failed: \(msg)"
         case .transportEnded(let msg): return "transport ended: \(msg)"
         case .superseded(let msg): return "superseded by a newer reconnect attempt: \(msg)"
+        case .handshakeRefused(let msg): return "server refused the handshake: \(msg)"
         }
     }
 }
@@ -531,6 +536,9 @@ public final class SessionController: @unchecked Sendable {
     private var isFlushingTextForDisconnect = false
     private var hasMountedInitialTree = false
     private var pendingResync = false
+    /// Stages the envelopes of the snapshot the outstanding continuity decision announced; only a
+    /// split snapshot (`snapshot_parts > 1`) is staged here (§12.1, §18, §26).
+    private var snapshotAssembler: SnapshotAssembler?
     /// Highest revision whose committed value has finished applying to the native renderer.
     private var lastRenderedRevision: UInt64 = 0
     private var currentSessionId: String?
@@ -2267,7 +2275,22 @@ public final class SessionController: @unchecked Sendable {
             clamping: applier.currentSnapshot.store.limits.maxStringLength
         )
         limits.maxResourceSize = UInt32(clamping: resourceCache.limits.maxEncodedBytes)
+        limits.maxSnapshotParts = defaultMaxSnapshotParts
         return limits
+    }
+
+    /// Validates the snapshot a continuity decision announced against this client's advertised
+    /// `max_snapshot_parts` and operation bound, and prepares to stage it (§18, §26).
+    private func makeSnapshotAssembler(
+        snapshotRevision: UInt64,
+        announcedParts: UInt32
+    ) throws -> SnapshotAssembler {
+        try SnapshotAssembler(
+            snapshotRevision: snapshotRevision,
+            announcedParts: announcedParts,
+            maxParts: defaultMaxSnapshotParts,
+            maxOperations: applier.currentSnapshot.store.limits.maxTransactionOperations
+        )
     }
 
     /// Flushes every committed, non-composing native value and waits for the resulting text-edit
@@ -2926,6 +2949,23 @@ public final class SessionController: @unchecked Sendable {
                 ))
             }
 
+        case .serverHandshakeRefused(let refusal):
+            switch phase {
+            case .idle, .awaitingWelcome, .awaitingResume:
+                let reason: String
+                switch refusal.reason {
+                case .snapshotUndeliverable:
+                    reason = "snapshot undeliverable"
+                default:
+                    reason = "reason \(refusal.reason.rawValue)"
+                }
+                await reportFailure(.handshakeRefused("\(reason): \(refusal.detail)"))
+            case .active, .awaitingSnapshot, .failed:
+                await reportFailure(.protocolViolation(
+                    "Received SERVER HANDSHAKE_REFUSED after the handshake was answered"
+                ))
+            }
+
         case .transaction(let transaction):
             if withStateLock({ isRunning }) {
                 guard let completion = await enqueueIncomingTransaction(transaction) else { return }
@@ -3081,6 +3121,31 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
+        // §18/§26: the catch-up snapshot may arrive in several envelopes, never more than this
+        // client advertised, and only when there is a snapshot at all.
+        let announcedSnapshot: SnapshotAssembler?
+        if welcome.initialRevision > 0 {
+            do {
+                announcedSnapshot = try makeSnapshotAssembler(
+                    snapshotRevision: welcome.initialRevision,
+                    announcedParts: welcome.snapshotParts
+                )
+            } catch {
+                await reportFailure(.protocolViolation(
+                    "SERVER WELCOME announced an undeliverable catch-up snapshot: \(error)"
+                ))
+                return
+            }
+        } else {
+            guard welcome.snapshotParts == 0 else {
+                await reportFailure(.protocolViolation(
+                    "SERVER WELCOME announced snapshot_parts \(welcome.snapshotParts) at revision 0"
+                ))
+                return
+            }
+            announcedSnapshot = nil
+        }
+
         let serverRequired: CapabilitySet
         do {
             serverRequired = try CapabilitySet.fromStrings(welcome.requiredProfiles)
@@ -3160,6 +3225,7 @@ public final class SessionController: @unchecked Sendable {
             self.requestedSessionId = nil
             self.resumeGeneration = nil
             self.retainedCapabilities = negotiated
+            self.snapshotAssembler = announcedSnapshot
             if welcome.initialRevision > 0 {
                 self.pendingResync = true
                 self.eventDispatchEnabled = false
@@ -3605,6 +3671,20 @@ public final class SessionController: @unchecked Sendable {
         case .idle, .awaitingWelcome, .failed:
             await reportFailure(.protocolViolation(
                 "Received SERVER RESYNC_REQUIRED before handshake completed"
+            ))
+            return
+        }
+
+        // §18/§26: validate the announced envelope count before any continuity side effect.
+        do {
+            let assembler = try makeSnapshotAssembler(
+                snapshotRevision: resync.snapshotRevision,
+                announcedParts: resync.snapshotParts
+            )
+            withStateLock { self.snapshotAssembler = assembler }
+        } catch {
+            await reportFailure(.protocolViolation(
+                "SERVER RESYNC_REQUIRED announced an undeliverable snapshot: \(error)"
             ))
             return
         }
@@ -4734,9 +4814,41 @@ public final class SessionController: @unchecked Sendable {
         }
     }
 
-    private func handleTransaction(_ wireTx: SRUITransaction) async {
+    private func handleTransaction(_ deliveredTx: SRUITransaction) async {
         // A diverged replica cannot meaningfully apply anything until it resumes (§18).
         guard !isDiverged else { return }
+
+        // §12.1/§18: a split snapshot is staged off to the side and reaches the replica only as
+        // one reassembled transaction after its last envelope; the replica, renderer and outbox
+        // never observe a partial snapshot. A rejected envelope discards the whole staging.
+        var wireTx = deliveredTx
+        let staged: Result<SRUITransaction?, SnapshotAssemblyError>? = withStateLock {
+            guard pendingResync, var assembler = snapshotAssembler, assembler.expectedParts > 1 else {
+                return nil
+            }
+            do {
+                let complete = try assembler.accept(deliveredTx)
+                snapshotAssembler = complete == nil ? assembler : nil
+                return .success(complete)
+            } catch let error as SnapshotAssemblyError {
+                snapshotAssembler = nil
+                return .failure(error)
+            } catch {
+                snapshotAssembler = nil
+                return .failure(.alreadyComplete)
+            }
+        }
+        switch staged {
+        case nil:
+            break
+        case .success(nil)?:
+            return
+        case .success(let snapshot?)?:
+            wireTx = snapshot
+        case .failure(let error)?:
+            await reportFailure(.protocolViolation("split snapshot rejected: \(error)"))
+            return
+        }
 
         guard let ownership = withStateLock({ () -> (
             EventOutboxConnectionBinding,
@@ -5302,7 +5414,12 @@ public final class SessionController: @unchecked Sendable {
             self.interactionDispatchTail = nil
         }
         guard ownsRunningLifecycle(state.lifecycleGeneration) else { return }
-        SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
+        if case .handshakeRefused = failure {
+            // Deterministic for these client limits: a reconnect reproduces the same refusal.
+            SessionDiagnostics.error("Session failed: \(failure). Reconnecting will not recover (§18, §26).")
+        } else {
+            SessionDiagnostics.error("Session failed: \(failure). Reconnect and resume to recover (§18).")
+        }
         state.handler(failure)
         guard ownsRunningLifecycle(state.lifecycleGeneration) else { return }
         await transport.close()
@@ -5645,6 +5762,7 @@ public final class SessionController: @unchecked Sendable {
             // a snapshot (§18, §4 inv. 13).
             _isDiverged = false
             pendingResync = false
+            snapshotAssembler = nil
             requestedSessionId = nil
             resumeGeneration = nil
             activeReplayRetryGeneration = nil

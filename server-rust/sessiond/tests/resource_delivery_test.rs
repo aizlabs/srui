@@ -234,6 +234,7 @@ async fn oversized_for_client_ceiling_is_not_transferred() {
                 max_node_count: 0,
                 max_string_length: 0,
                 max_resource_size: 8,
+                max_snapshot_parts: 0,
             }),
             client_instance_id: vec![9, 9, 9],
             client_metadata: Default::default(),

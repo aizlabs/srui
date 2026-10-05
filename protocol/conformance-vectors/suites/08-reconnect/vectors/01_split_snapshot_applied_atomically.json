@@ -1,0 +1,163 @@
+{
+  "name": "split_snapshot_applied_atomically",
+  "description": "A snapshot announced in two envelopes is staged until the last one and then applied as one 0 -> 7 snapshot that reconstructs the whole store.",
+  "spec_sections": [
+    "§12.1",
+    "§18",
+    "§26",
+    "§32.8"
+  ],
+  "client_limits": {
+    "max_snapshot_parts": 4,
+    "max_transaction_operations": 10000
+  },
+  "decision": {
+    "snapshot_revision": 7,
+    "snapshot_parts": 2
+  },
+  "envelopes": [
+    {
+      "base_revision": 0,
+      "new_revision": 7,
+      "operations": [
+        {
+          "create_model": {
+            "model_id": 10,
+            "model_type": 17,
+            "item_count": 4
+          }
+        },
+        {
+          "model_reset_range": {
+            "model_id": 10,
+            "start_index": 0,
+            "items": [
+              {
+                "item_id": 100,
+                "string": "r0"
+              },
+              {
+                "item_id": 101,
+                "string": "r1"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "base_revision": 0,
+      "new_revision": 7,
+      "operations": [
+        {
+          "model_reset_range": {
+            "model_id": 10,
+            "start_index": 2,
+            "items": [
+              {
+                "item_id": 102,
+                "string": "r2"
+              },
+              {
+                "item_id": 103,
+                "string": "r3"
+              }
+            ]
+          }
+        },
+        {
+          "create_node": {
+            "node_id": 1,
+            "type": 1,
+            "parent_id": 0,
+            "child_index": 0,
+            "properties": [
+              {
+                "property": 1,
+                "string": "Processes"
+              }
+            ]
+          }
+        },
+        {
+          "create_node": {
+            "node_id": 2,
+            "type": 9,
+            "parent_id": 1,
+            "child_index": 0,
+            "properties": [
+              {
+                "property": 12,
+                "string": "34000 rows"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "expected_outcome": {
+    "status": "applied",
+    "revision": 7,
+    "root_ids": [
+      1
+    ],
+    "nodes": [
+      {
+        "node_id": 1,
+        "type": 1,
+        "parent_id": 0,
+        "children": [
+          2
+        ],
+        "properties": [
+          {
+            "property": 1,
+            "string": "Processes"
+          }
+        ]
+      },
+      {
+        "node_id": 2,
+        "type": 9,
+        "parent_id": 1,
+        "children": [],
+        "properties": [
+          {
+            "property": 12,
+            "string": "34000 rows"
+          }
+        ]
+      }
+    ],
+    "models": [
+      {
+        "model_id": 10,
+        "model_type": 17,
+        "item_count": 4,
+        "items": [
+          {
+            "index": 0,
+            "item_id": 100,
+            "string": "r0"
+          },
+          {
+            "index": 1,
+            "item_id": 101,
+            "string": "r1"
+          },
+          {
+            "index": 2,
+            "item_id": 102,
+            "string": "r2"
+          },
+          {
+            "index": 3,
+            "item_id": 103,
+            "string": "r3"
+          }
+        ]
+      }
+    ]
+  }
+}

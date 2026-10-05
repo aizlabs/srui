@@ -511,6 +511,10 @@ message ClientLimits {
   uint32 max_node_count = 4;
   uint32 max_string_length = 5;
   uint32 max_resource_size = 6;
+  // Most consecutive Transaction envelopes this client stages for ONE snapshot (§18, §26).
+  // Zero/absent means 1: a legacy client accepts only a single-envelope snapshot, so a server
+  // never splits a snapshot for it and refuses one that does not fit a frame instead.
+  uint32 max_snapshot_parts = 7;
 }
 
 message ServerLimits {
@@ -545,6 +549,12 @@ message ServerWelcome {
   uint64 initial_revision = 5;
   repeated ExtensionNamespaceMapping extension_namespaces = 6;
   ServerLimits limits = 7;
+  // Number of consecutive Transaction envelopes (each base_revision = 0, new_revision =
+  // initial_revision) that together carry the catch-up snapshot (§18 snapshot delivery form,
+  // §26). Zero/absent means one envelope. The client concatenates their operations in arrival
+  // order and applies them as ONE snapshot after the last envelope; nothing is visible before.
+  // Never exceeds the client's ClientLimits.max_snapshot_parts (absent = 1).
+  uint32 snapshot_parts = 8;
 }
 
 message ClientResume {
@@ -603,6 +613,26 @@ message ServerResyncRequired {
   repeated string required_profiles = 7;
   repeated string optional_profiles = 8;
   repeated ExtensionNamespaceMapping extension_namespaces = 9;
+  // Number of consecutive Transaction envelopes carrying the snapshot at snapshot_revision;
+  // same rules as ServerWelcome.snapshot_parts (§18, §26). Zero/absent means one envelope.
+  uint32 snapshot_parts = 10;
+}
+
+// Why a server refused to complete a handshake (§18, §19.2 control-class errors).
+enum HandshakeRefusalReason {
+  HANDSHAKE_REFUSAL_REASON_UNSPECIFIED = 0;
+  // The catch-up/resync snapshot cannot be delivered within the client's limits: it needs more
+  // operations than max_transaction_operations, an operation larger than one frame, or more
+  // envelopes than ClientLimits.max_snapshot_parts (§18, §26). Reconnecting with the same limits
+  // reproduces the refusal, so a client MUST surface it rather than retry automatically.
+  HANDSHAKE_REFUSAL_REASON_SNAPSHOT_UNDELIVERABLE = 1;
+}
+
+// Sent instead of SERVER WELCOME / RESYNC_REQUIRED when the server cannot complete the
+// handshake for this client; the server closes the connection after writing it (§18, §19.2).
+message ServerHandshakeRefused {
+  HandshakeRefusalReason reason = 1;
+  string detail = 2; // Diagnostic only, bounded by max_string_length (§26)
 }
 
 // -----------------------------------------------------------------------------
@@ -741,5 +771,6 @@ message SruiMessage {
     TerminalInput terminal_input = 13;
     TerminalResize terminal_resize = 14;
     TerminalResyncRequired terminal_resync_required = 15;
+    ServerHandshakeRefused server_handshake_refused = 16;
   }
 }

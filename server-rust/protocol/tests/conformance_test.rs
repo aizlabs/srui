@@ -793,7 +793,7 @@ fn test_terminal_envelope_conformance() {
     }
 }
 
-/// Authored twins of the snapshot-framing vectors written by `generate_fixtures` (§18, §26).
+/// Authored twins of the snapshot-framing vectors written by `generate_fixtures` (PX-004-G01 extension; §26).
 fn create_authored_snapshot_framing_vectors() -> [(&'static str, SruiMessage); 4] {
     let standard = || ExtensionNamespaceMapping {
         extension_uri: "org.srui.standard-widgets".to_string(),
@@ -865,7 +865,7 @@ fn create_authored_snapshot_framing_vectors() -> [(&'static str, SruiMessage); 4
     ]
 }
 
-/// §18/§26 snapshot framing: decode, encode-from-scratch and roundtrip are bit-identical, and the
+/// PX-004-G01 snapshot framing (§26): decode, encode-from-scratch and roundtrip are bit-identical, and the
 /// decoded framing fields match `expected.json`.
 #[test]
 fn test_snapshot_framing_envelope_conformance() {

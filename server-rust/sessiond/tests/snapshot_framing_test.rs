@@ -482,6 +482,88 @@ async fn operation_bound_is_refused_on_the_wire() {
     }
 }
 
+/// Seeds a Surface with `children` Text nodes: a snapshot of `children + 1` operations.
+fn seed_nodes(session: &Session, children: u64) {
+    session
+        .transaction(|ui| {
+            Surface::builder(1).label("root").create(ui)?;
+            for id in 2..=children + 1 {
+                Text::builder(NodeId::new(id))
+                    .parent(NodeId::new(1))
+                    .text("x")
+                    .create(ui)?;
+            }
+            Ok(())
+        })
+        .expect("seed nodes");
+}
+
+fn op_limited(max_transaction_operations: u32) -> ClientLimits {
+    ClientLimits {
+        max_transaction_operations,
+        max_snapshot_parts: DEFAULT_MAX_SNAPSHOT_PARTS,
+        ..ClientLimits::default()
+    }
+}
+
+/// Operation bound, client side: a client that applies fewer operations per transaction than the
+/// snapshot needs is refused at handshake instead of being sent a snapshot it must reject.
+#[tokio::test]
+async fn client_operation_bound_is_refused_on_the_fresh_handshake() {
+    let session = Arc::new(Session::new("client-op-bound-fresh"));
+    seed_nodes(&session, 5);
+
+    let (read, _write, _shutdown, server) = connect(&session, hello(Some(op_limited(3)))).await;
+    match expect_refusal(read, server).await {
+        SessionError::SnapshotUnrepresentable { limit, actual } => {
+            assert_eq!((limit, actual), (3, 6));
+        }
+        other => panic!("expected SnapshotUnrepresentable, got {other:?}"),
+    }
+
+    // The same snapshot within the client's bound is delivered.
+    let (mut read, _write, shutdown, server) = connect(&session, hello(Some(op_limited(6)))).await;
+    let Some(srui_message::Msg::ServerWelcome(welcome)) = next_frame(&mut read).await.msg else {
+        panic!("expected SERVER WELCOME");
+    };
+    let replica = receive_snapshot(&mut read, 1, welcome.snapshot_parts).await;
+    assert_eq!(replica.node_count(), 6);
+    shutdown.cancel();
+    server.await.expect("join").expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn client_operation_bound_is_refused_on_resync() {
+    let session = Arc::new(Session::with_config(
+        "client-op-bound-resync",
+        SessionConfig {
+            journal_capacity: 1,
+            ..SessionConfig::default()
+        },
+    ));
+    seed_nodes(&session, 5);
+    session
+        .commit_transaction(WireTransaction {
+            base_revision: 1,
+            new_revision: 2,
+            priority: 0,
+            operations: vec![],
+        })
+        .expect("evict revision 1 from the journal");
+
+    let (read, _write, _shutdown, server) = connect(
+        &session,
+        resume("client-op-bound-resync", 0, Some(op_limited(3))),
+    )
+    .await;
+    match expect_refusal(read, server).await {
+        SessionError::SnapshotUnrepresentable { limit, actual } => {
+            assert_eq!((limit, actual), (3, 6));
+        }
+        other => panic!("expected SnapshotUnrepresentable, got {other:?}"),
+    }
+}
+
 /// A split never crosses into the live stream: a non-snapshot transaction cannot be staged.
 #[test]
 fn replica_rejects_a_live_transaction_inside_a_split_snapshot() {

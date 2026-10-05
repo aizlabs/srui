@@ -413,7 +413,7 @@ where
                     {
                         return Ok(());
                     }
-                    // `resync_msg.snapshot_parts` announced these envelopes (§18, §26).
+                    // `resync_msg.snapshot_parts` announced these envelopes (PX-004-G01 extension; §26).
                     for part in bootstrap.snapshot_frames.split(snapshot_transaction) {
                         let snapshot_env = SruiMessage {
                             msg: Some(srui_message::Msg::Transaction(part)),

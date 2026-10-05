@@ -2,7 +2,9 @@
 // SnapshotAssembler.swift
 // Protocol
 //
-// Replica-side staging of one §18 snapshot delivered in several envelopes (§12.1, §18, §26).
+// Replica-side staging of one snapshot delivered in several envelopes: the PX-004-G01 protocol
+// extension documented in protocol/README.md (grounded in §12.1 incomplete-transaction discard and
+// §26 limits; the v0.6 design's §18 defines only the single-envelope snapshot form).
 //
 // A snapshot is ONE transaction (`base_revision = 0`, `new_revision = snapshot_revision`) applied
 // wholesale. When its single envelope would exceed the §26 frame limit, the continuity decision
@@ -25,7 +27,7 @@ import Foundation
 /// 256 MiB; the decoded replica stays bounded by its own store limits.
 public let defaultMaxSnapshotParts: UInt32 = 16
 
-/// Why a replica refused a snapshot envelope sequence (§12.1, §18, §26).
+/// Why a replica refused a snapshot envelope sequence (PX-004-G01 extension; §12.1, §26).
 public enum SnapshotAssemblyError: Error, Equatable, Sendable, CustomStringConvertible {
     /// The decision announced more envelopes than this client advertised it would stage.
     case partsExceedLimit(announced: UInt32, maxParts: UInt32)
@@ -68,7 +70,7 @@ public enum SnapshotAssemblyError: Error, Equatable, Sendable, CustomStringConve
     }
 }
 
-/// Stages the envelopes of one announced snapshot (§12.1, §18).
+/// Stages the envelopes of one announced snapshot (PX-004-G01 extension; §12.1).
 ///
 /// After any thrown error the assembler must be discarded.
 public struct SnapshotAssembler: Sendable {

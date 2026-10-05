@@ -1241,14 +1241,15 @@ public nonisolated enum Srui_Protocol_SessionContinuity: SwiftProtobuf.Enum, Swi
 
 }
 
-/// Why a server refused to complete a handshake (§18, §19.2 control-class errors).
+/// Why a server refused to complete a handshake (PX-004-G01 extension, protocol/README.md;
+/// carried as control-class traffic, §19.2).
 public nonisolated enum Srui_Protocol_HandshakeRefusalReason: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case unspecified // = 0
 
   /// The catch-up/resync snapshot cannot be delivered within the client's limits: it needs more
-  /// operations than max_transaction_operations, an operation larger than one frame, or more
-  /// envelopes than ClientLimits.max_snapshot_parts (§18, §26). Reconnecting with the same limits
+  /// operations than the smaller of the server's and the client's max_transaction_operations, an operation larger than one frame, or more
+  /// envelopes than ClientLimits.max_snapshot_parts (§26 limits). Reconnecting with the same limits
   /// reproduces the refusal, so a client MUST surface it rather than retry automatically.
   case snapshotUndeliverable // = 1
   case UNRECOGNIZED(Int)
@@ -2292,7 +2293,9 @@ public nonisolated struct Srui_Protocol_ClientLimits: Sendable {
 
   public var maxResourceSize: UInt32 = 0
 
-  /// Most consecutive Transaction envelopes this client stages for ONE snapshot (§18, §26).
+  /// Most consecutive Transaction envelopes this client stages for ONE snapshot. Multi-envelope
+  /// snapshots are the PX-004-G01 protocol extension (protocol/README.md): an additive handshake
+  /// field (§18) bounding a §26 resource, not text of the v0.6 design.
   /// Zero/absent means 1: a legacy client accepts only a single-envelope snapshot, so a server
   /// never splits a snapshot for it and refuses one that does not fit a frame instead.
   public var maxSnapshotParts: UInt32 = 0
@@ -2397,9 +2400,10 @@ public nonisolated struct Srui_Protocol_ServerWelcome: Sendable {
   public mutating func clearLimits() {self._limits = nil}
 
   /// Number of consecutive Transaction envelopes (each base_revision = 0, new_revision =
-  /// initial_revision) that together carry the catch-up snapshot (§18 snapshot delivery form,
-  /// §26). Zero/absent means one envelope. The client concatenates their operations in arrival
-  /// order and applies them as ONE snapshot after the last envelope; nothing is visible before.
+  /// initial_revision) that together carry the catch-up snapshot (PX-004-G01 extension,
+  /// protocol/README.md; §26 frame limit). Zero/absent means one envelope. The client concatenates their operations in arrival
+  /// order and applies them as ONE snapshot after the last envelope; nothing is visible before, and
+  /// an incomplete sequence is discarded like any incomplete transaction (§12.1).
   /// Never exceeds the client's ClientLimits.max_snapshot_parts (absent = 1).
   public var snapshotParts: UInt32 = 0
 
@@ -2510,7 +2514,7 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
   public var extensionNamespaces: [Srui_Protocol_ExtensionNamespaceMapping] = []
 
   /// Number of consecutive Transaction envelopes carrying the snapshot at snapshot_revision;
-  /// same rules as ServerWelcome.snapshot_parts (§18, §26). Zero/absent means one envelope.
+  /// same rules as ServerWelcome.snapshot_parts (PX-004-G01 extension; §26). Zero/absent means one envelope.
   public var snapshotParts: UInt32 = 0
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
@@ -2519,7 +2523,7 @@ public nonisolated struct Srui_Protocol_ServerResyncRequired: Sendable {
 }
 
 /// Sent instead of SERVER WELCOME / RESYNC_REQUIRED when the server cannot complete the
-/// handshake for this client; the server closes the connection after writing it (§18, §19.2).
+/// handshake for this client; the server closes the connection after writing it (PX-004-G01 extension; §19.2).
 public nonisolated struct Srui_Protocol_ServerHandshakeRefused: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2527,7 +2531,8 @@ public nonisolated struct Srui_Protocol_ServerHandshakeRefused: Sendable {
 
   public var reason: Srui_Protocol_HandshakeRefusalReason = .unspecified
 
-  /// Diagnostic only, bounded by max_string_length (§26)
+  /// Diagnostic only, bounded by max_string_length (§26): a client rejects an oversized detail
+  /// (discards it unread) but still reports the refusal.
   public var detail: String = String()
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()

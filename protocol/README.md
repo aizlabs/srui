@@ -97,7 +97,15 @@ separate field there would be redundant state a peer could contradict. Both resp
 - `SESSION_CONTINUITY_UNSPECIFIED` (or any unrecognized value) is a required-semantics failure
   (§4 inv. 13): the client fails the session rather than assuming either outcome.
 
-### Snapshots larger than one frame (§12.1, §18, §26)
+### Snapshots larger than one frame (protocol extension, PX-004-G01)
+
+This delivery form is a **protocol extension** introduced by PX-004-G01; it is not text of the
+read-only v0.6 design. The design's §18 *Snapshot delivery form* defines a snapshot as one
+`base_revision = 0` transaction in the transaction envelope and does not define splitting it. The
+extension keeps every rule of that form for the reassembled snapshot and is grounded in what the
+design does define: §12.1 (a transaction is applied atomically and an incomplete one is discarded),
+§18 (handshake negotiation evolves through additive protobuf fields) and §26 (finite frame and
+operation limits that are never raised).
 
 A snapshot is one `base_revision = 0 → new_revision = snapshot_revision` transaction applied
 wholesale. When its single envelope would exceed the §26 frame limit it travels in several
@@ -116,9 +124,12 @@ consecutive `Transaction` envelopes instead; the frame limit itself is never rai
   transaction while envelopes are outstanding, a revision mismatch, or a staged total above
   `max_transaction_operations` fails the session.
 - The server measures the encoded snapshot before writing anything. If it cannot be delivered —
-  more operations than `max_transaction_operations`, one operation larger than a frame, or more
+  more operations than the smaller of the server's and the client's advertised
+  `max_transaction_operations`, one operation larger than a frame, or more
   envelopes than the client stages — it sends `ServerHandshakeRefused{reason =
-  SNAPSHOT_UNDELIVERABLE, detail}` instead of WELCOME/RESYNC_REQUIRED and closes. A reconnect with
+  SNAPSHOT_UNDELIVERABLE, detail}` instead of WELCOME/RESYNC_REQUIRED and closes. `detail` is bounded
+  by the client's `max_string_length`; a client discards an oversized detail unread (as its decode
+  paths reject any oversized string) and still reports the refusal. A reconnect with
   the same limits reproduces the refusal, so the client surfaces it rather than retrying.
 
 ---

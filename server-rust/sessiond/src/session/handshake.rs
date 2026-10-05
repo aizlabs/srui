@@ -58,7 +58,7 @@ pub struct FreshClientBootstrap {
     /// Catch-up snapshot transaction for populated sessions, or `None` if revision is 0 (§18).
     pub snapshot: Option<Transaction>,
     /// How [`Self::snapshot`] is split across envelopes; `welcome.snapshot_parts` announces it
-    /// (§18, §26). One envelope when there is no snapshot.
+    /// (PX-004-G01 extension; §26). One envelope when there is no snapshot.
     pub snapshot_frames: SnapshotFramePlan,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
@@ -74,7 +74,7 @@ pub struct ResumeClientBootstrap {
     /// Replay or resync catch-up collected under the same lock as [`Self::transactions`].
     pub outcome: ResumeOutcome,
     /// How a [`ResumeOutcome::Resync`] snapshot is split across envelopes;
-    /// `resync_msg.snapshot_parts` announces it (§18, §26). One envelope for a replay.
+    /// `resync_msg.snapshot_parts` announces it (PX-004-G01 extension; §26). One envelope for a replay.
     pub snapshot_frames: SnapshotFramePlan,
     /// Bounded outbound receiver capturing every subsequent transaction committed to the session (§20.2).
     pub transactions: OutboundReceiver,
@@ -276,7 +276,7 @@ fn negotiate_hello(
         initial_revision,
         extension_namespaces: inner.extension_namespaces.clone(),
         limits: Some(limits),
-        // Set once the catch-up snapshot has been measured (§18, §26).
+        // Set once the catch-up snapshot has been measured (PX-004-G01 extension; §26).
         snapshot_parts: 0,
     };
 

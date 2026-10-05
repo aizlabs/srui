@@ -8,7 +8,9 @@ use srui_semantic_tree::{SemanticStore, DEFAULT_MAX_ITEMS_PER_MODEL_OPERATION};
 
 use super::SessionError;
 
-/// Encoded-byte ceiling of the items in one exported `MODEL_RESET_RANGE` (§18, §26).
+/// Encoded-byte ceiling of the items in one exported `MODEL_RESET_RANGE` (§26).
+///
+/// Supports the PX-004-G01 multi-envelope extension (`protocol/README.md`).
 ///
 /// The item-count bound alone lets one operation of wide rows outgrow a whole frame, and a
 /// snapshot can be split between operations but never inside one. A 1 MiB ceiling keeps every
@@ -16,8 +18,15 @@ use super::SessionError;
 /// of the limit.
 pub(crate) const SNAPSHOT_MODEL_RANGE_MAX_BYTES: usize = 1 << 20;
 
-/// Plans how `snapshot` reaches a client within every frame limit in force (§18, §26).
+/// Plans how `snapshot` reaches a client within every §26 limit both peers enforce.
 ///
+/// Multi-envelope delivery is the PX-004-G01 protocol extension documented in
+/// `protocol/README.md`; the v0.6 design's §18 defines only the single-envelope snapshot form.
+///
+/// The operation bound is the smaller of the server store's `max_transaction_operations` (already
+/// enforced by [`export_snapshot_transaction`]) and the client's advertised
+/// `max_transaction_operations`: the envelopes reassemble into one transaction the client applies
+/// under its own limit, so a snapshot above it must be refused here rather than sent and rejected.
 /// The envelope budget is the smallest of the codec limit this server writes with
 /// ([`DEFAULT_MAX_FRAME_SIZE`]), the limit it advertises (`server_max_frame_size`), and the
 /// client's advertised `max_frame_size`; a zero advertisement means "no preference". The client's
@@ -25,14 +34,24 @@ pub(crate) const SNAPSHOT_MODEL_RANGE_MAX_BYTES: usize = 1 << 20;
 ///
 /// # Errors
 ///
-/// [`SessionError::SnapshotUndeliverable`] when no plan fits, which the caller reports at handshake
-/// before any subscription or frame write.
+/// [`SessionError::SnapshotUnrepresentable`] when the client's operation bound is exceeded and
+/// [`SessionError::SnapshotUndeliverable`] when no envelope plan fits; the caller reports either at
+/// handshake before any subscription or frame write.
 pub(crate) fn plan_snapshot_delivery(
     snapshot: &Transaction,
     server_max_frame_size: u32,
     client_limits: Option<&ClientLimits>,
 ) -> Result<SnapshotFramePlan, SessionError> {
     let nonzero = |value: u32| (value != 0).then_some(value as usize);
+    if let Some(limit) = client_limits.and_then(|limits| nonzero(limits.max_transaction_operations))
+    {
+        if snapshot.operations.len() > limit {
+            return Err(SessionError::SnapshotUnrepresentable {
+                limit,
+                actual: snapshot.operations.len(),
+            });
+        }
+    }
     let max_frame_size = [
         Some(DEFAULT_MAX_FRAME_SIZE),
         nonzero(server_max_frame_size),

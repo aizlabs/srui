@@ -1,7 +1,8 @@
 //! §32 suite 8 (reconnect): multi-envelope snapshot delivery vectors.
 //!
-//! Implements: §12.1 (an incomplete transaction is discarded), §18 (snapshot delivery form), §26
-//! (frame and operation bounds), §32.8.
+//! Covers the PX-004-G01 multi-envelope snapshot extension documented in `protocol/README.md`.
+//! Grounded in: §12.1 (an incomplete transaction is discarded), §18 (the single-envelope snapshot
+//! form the extension splits), §26 (frame and operation bounds), §32.8.
 //!
 //! Each vector in `protocol/conformance-vectors/suites/08-reconnect/vectors` gives the client's
 //! limits, the snapshot a continuity decision announced, and the envelopes that followed. The

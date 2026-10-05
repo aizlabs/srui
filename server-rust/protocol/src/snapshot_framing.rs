@@ -1,7 +1,11 @@
-//! Multi-envelope delivery of one §18 snapshot within the §26 frame limit.
+//! Multi-envelope delivery of one snapshot within the §26 frame limit.
 //!
-//! Implements: §12.1 (atomic transactions; an incomplete transaction is discarded), §18 (snapshot
-//! delivery form), §26 (maximum frame size, maximum transaction operations).
+//! This is the PX-004-G01 protocol extension documented in `protocol/README.md`. The v0.6 design's
+//! §18 defines a snapshot as one `base_revision = 0` transaction in *the* transaction envelope; it
+//! does not define splitting it. The extension is grounded in what the design does define:
+//! §12.1 (atomic transactions; an incomplete transaction is discarded), §18 (the single-envelope
+//! snapshot form it splits, and handshake evolution through additive protobuf fields) and §26
+//! (maximum frame size, maximum transaction operations).
 //!
 //! A snapshot is still ONE transaction: `base_revision = 0`, `new_revision = snapshot_revision`,
 //! applied wholesale and atomically. What changes is only how its operations reach the replica

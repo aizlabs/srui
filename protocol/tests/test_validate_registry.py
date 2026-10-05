@@ -302,7 +302,7 @@ def test_expected_json_matches_fixtures_and_registry() -> None:
         "golden_terminal_input",
         "golden_terminal_resize",
         "golden_terminal_resync_required",
-        # Multi-envelope snapshot delivery (§18, §26).
+        # Multi-envelope snapshot delivery (PX-004-G01 extension; §26).
         "golden_snapshot_parts_client_hello",
         "golden_snapshot_parts_welcome",
         "golden_snapshot_parts_resync_required",

@@ -435,7 +435,7 @@ fn main() {
         malformed_terminal_data_bytes.len()
     );
 
-    // 17–20. Multi-envelope snapshot delivery (§18, §26): the client's staging bound, the
+    // 17–20. Multi-envelope snapshot delivery (PX-004-G01 extension; §26): the client's staging bound, the
     // decisions that announce a split snapshot, and the refusal of an undeliverable one.
     for (name, message) in snapshot_framing_vectors() {
         let bytes = encode_framed(&message).expect("encode framed snapshot-framing vector");
@@ -444,7 +444,7 @@ fn main() {
     }
 }
 
-/// Authored messages for the snapshot-framing golden vectors (§18, §26).
+/// Authored messages for the snapshot-framing golden vectors (PX-004-G01 extension; §26).
 ///
 /// `protocol/tests/conformance_test.rs` re-authors the same messages and asserts they encode to
 /// the committed bytes.

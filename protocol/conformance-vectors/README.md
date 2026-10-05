@@ -24,10 +24,10 @@ Fixed binary wire fixtures for cross-language Protobuf conformance checks (§16,
 | `golden_terminal_resync_required.bin` | Length-prefixed framed `SruiMessage` containing a `TerminalResyncRequired` with `RETENTION_LOSS` (§21.2) |
 | `malformed_terminal_input_empty.bin` | Protobuf-valid `TerminalInput` rejected at the wire boundary because it carries no payload (§21, §26) |
 | `malformed_terminal_data_empty.bin` | Protobuf-valid `TerminalData` rejected by the client apply path because it carries no payload (§21, §26) |
-| `golden_snapshot_parts_client_hello.bin` | Length-prefixed framed `SruiMessage` containing a `ClientHello` advertising `ClientLimits.max_snapshot_parts = 16` (§18, §26) |
-| `golden_snapshot_parts_welcome.bin` | Length-prefixed framed `SruiMessage` containing a `ServerWelcome` announcing a catch-up snapshot in `snapshot_parts = 2` envelopes (§18, §26) |
-| `golden_snapshot_parts_resync_required.bin` | Length-prefixed framed `SruiMessage` containing a `ServerResyncRequired` announcing `snapshot_parts = 3` (§18, §26) |
-| `golden_handshake_refused.bin` | Length-prefixed framed `SruiMessage` containing a `ServerHandshakeRefused` with `SNAPSHOT_UNDELIVERABLE` (§18, §19.2) |
+| `golden_snapshot_parts_client_hello.bin` | Length-prefixed framed `SruiMessage` containing a `ClientHello` advertising `ClientLimits.max_snapshot_parts = 16` (PX-004-G01 extension; §26) |
+| `golden_snapshot_parts_welcome.bin` | Length-prefixed framed `SruiMessage` containing a `ServerWelcome` announcing a catch-up snapshot in `snapshot_parts = 2` envelopes (PX-004-G01 extension; §26) |
+| `golden_snapshot_parts_resync_required.bin` | Length-prefixed framed `SruiMessage` containing a `ServerResyncRequired` announcing `snapshot_parts = 3` (PX-004-G01 extension; §26) |
+| `golden_handshake_refused.bin` | Length-prefixed framed `SruiMessage` containing a `ServerHandshakeRefused` with `SNAPSHOT_UNDELIVERABLE` (PX-004-G01 extension; §19.2) |
 
 See `expected.json` for canonical hex and field declarations.
 

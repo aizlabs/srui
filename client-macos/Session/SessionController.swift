@@ -537,7 +537,7 @@ public final class SessionController: @unchecked Sendable {
     private var hasMountedInitialTree = false
     private var pendingResync = false
     /// Stages the envelopes of the snapshot the outstanding continuity decision announced; only a
-    /// split snapshot (`snapshot_parts > 1`) is staged here (§12.1, §18, §26).
+    /// split snapshot (`snapshot_parts > 1`) is staged here (PX-004-G01 extension; §12.1, §26).
     private var snapshotAssembler: SnapshotAssembler?
     /// Highest revision whose committed value has finished applying to the native renderer.
     private var lastRenderedRevision: UInt64 = 0
@@ -2279,8 +2279,23 @@ public final class SessionController: @unchecked Sendable {
         return limits
     }
 
+    /// Applies the §26 `max_string_length` this client advertised to a refusal's diagnostic text.
+    ///
+    /// Like every other Swift decode path (`ProtocolDecodeError.maxStringLengthExceeded`), an
+    /// oversized string is rejected rather than truncated, so no partial server-chosen text is
+    /// surfaced. Only the diagnostic is rejected: the refusal's reason is still valid, so the session
+    /// still fails as `handshakeRefused` rather than inviting a reconnect into the same refusal.
+    func boundedRefusalDetail(_ detail: String) -> String {
+        let limit = applier.currentSnapshot.store.limits.maxStringLength
+        let length = detail.utf8.count
+        guard length <= limit else {
+            return "<detail of \(length) bytes exceeds max_string_length \(limit); discarded (§26)>"
+        }
+        return detail
+    }
+
     /// Validates the snapshot a continuity decision announced against this client's advertised
-    /// `max_snapshot_parts` and operation bound, and prepares to stage it (§18, §26).
+    /// `max_snapshot_parts` and operation bound, and prepares to stage it (PX-004-G01 extension; §26).
     private func makeSnapshotAssembler(
         snapshotRevision: UInt64,
         announcedParts: UInt32
@@ -2959,7 +2974,7 @@ public final class SessionController: @unchecked Sendable {
                 default:
                     reason = "reason \(refusal.reason.rawValue)"
                 }
-                await reportFailure(.handshakeRefused("\(reason): \(refusal.detail)"))
+                await reportFailure(.handshakeRefused("\(reason): \(boundedRefusalDetail(refusal.detail))"))
             case .active, .awaitingSnapshot, .failed:
                 await reportFailure(.protocolViolation(
                     "Received SERVER HANDSHAKE_REFUSED after the handshake was answered"
@@ -3121,7 +3136,7 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        // §18/§26: the catch-up snapshot may arrive in several envelopes, never more than this
+        // PX-004-G01 extension (protocol/README.md), §26: the catch-up snapshot may arrive in several envelopes, never more than this
         // client advertised, and only when there is a snapshot at all.
         let announcedSnapshot: SnapshotAssembler?
         if welcome.initialRevision > 0 {
@@ -3675,7 +3690,7 @@ public final class SessionController: @unchecked Sendable {
             return
         }
 
-        // §18/§26: validate the announced envelope count before any continuity side effect.
+        // PX-004-G01 extension, §26: validate the announced envelope count before any continuity side effect.
         do {
             let assembler = try makeSnapshotAssembler(
                 snapshotRevision: resync.snapshotRevision,
@@ -4818,7 +4833,7 @@ public final class SessionController: @unchecked Sendable {
         // A diverged replica cannot meaningfully apply anything until it resumes (§18).
         guard !isDiverged else { return }
 
-        // §12.1/§18: a split snapshot is staged off to the side and reaches the replica only as
+        // §12.1 (PX-004-G01 extension): a split snapshot is staged off to the side and reaches the replica only as
         // one reassembled transaction after its last envelope; the replica, renderer and outbox
         // never observe a partial snapshot. A rejected envelope discards the whole staging.
         var wireTx = deliveredTx

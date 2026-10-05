@@ -67,11 +67,13 @@ struct SessionControllerSplitSnapshotTests {
     }
 
     @MainActor
-    private static func makeController() async throws -> (
+    private static func makeController(
+        limits: StoreLimits = StoreLimits()
+    ) async throws -> (
         SessionController, TransactionApplier, PipeTransport, SplitFailureBox
     ) {
         let (clientTransport, serverTransport) = await PipeTransport.createPair()
-        let applier = TransactionApplier()
+        let applier = TransactionApplier(limits: limits)
         let controller = SessionController(transport: clientTransport, applier: applier)
         let failures = SplitFailureBox()
         controller.onFailure = { failure in
@@ -101,6 +103,68 @@ struct SessionControllerSplitSnapshotTests {
         #expect(await failures.count == 0)
         // The snapshot latch reopens event dispatch once the committed snapshot is finalized.
         #expect(await Self.waitUntil { controller.isEventDispatchEnabled })
+
+        await controller.stop()
+        await server.close()
+    }
+
+    @Test("a resync snapshot announced in two envelopes replaces the replica once, after the last")
+    @MainActor
+    func splitResyncAppliesAtomically() async throws {
+        let (controller, applier, server, failures) = try await Self.makeController()
+
+        try await server.send(data: try Self.framed(Self.welcome(initialRevision: 0, snapshotParts: 0)))
+        try await server.send(
+            data: try Self.framed(Self.envelope(revision: 1, [Self.surface, Self.text(2, "before")])))
+        #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(1) })
+
+        var resync = SRUIServerResyncRequired()
+        resync.sessionID = "split-session"
+        resync.snapshotRevision = 2
+        resync.reason = "journal evicted"
+        resync.continuity = .sameSession
+        resync.snapshotParts = 2
+        var resyncMessage = SRUIMessage()
+        resyncMessage.serverResyncRequired = resync
+        try await server.send(data: try Self.framed(resyncMessage))
+        try await server.send(
+            data: try Self.framed(Self.envelope(revision: 2, [Self.surface, Self.text(2, "after")])))
+        try await server.send(data: try Self.framed(Self.envelope(revision: 2, [Self.text(3, "second")])))
+
+        #expect(await Self.waitUntil { applier.lastAppliedRevision == Revision(2) })
+        let store = applier.currentSnapshot.store
+        // Had the first envelope replaced the replica on its own, node 3 would be missing and the
+        // second envelope would have failed the session as an unclassifiable 0 -> 2 delivery.
+        #expect(store.getNode(NodeId(1))?.orderedChildren == [NodeId(2), NodeId(3)])
+        #expect(store.getNode(NodeId(2))?.properties[.text] == .string("after"))
+        #expect(store.getNode(NodeId(3))?.properties[.text] == .string("second"))
+        #expect(await failures.count == 0)
+
+        await controller.stop()
+        await server.close()
+    }
+
+    @Test("a refusal detail above max_string_length is discarded, not surfaced")
+    @MainActor
+    func oversizedRefusalDetailIsDiscarded() async throws {
+        let (controller, _, server, failures) = try await Self.makeController(
+            limits: StoreLimits(maxStringLength: 32))
+
+        var refusal = SRUIServerHandshakeRefused()
+        refusal.reason = .snapshotUndeliverable
+        refusal.detail = String(repeating: "Z", count: 33)
+        var message = SRUIMessage()
+        message.serverHandshakeRefused = refusal
+        try await server.send(data: try Self.framed(message))
+
+        #expect(await Self.waitUntil { await failures.count >= 1 })
+        guard case .handshakeRefused(let description)? = await failures.first else {
+            Issue.record("expected .handshakeRefused, got \(String(describing: await failures.first))")
+            return
+        }
+        #expect(description.contains("snapshot undeliverable"))
+        #expect(description.contains("exceeds max_string_length 32"))
+        #expect(!description.contains("ZZZZ"))
 
         await controller.stop()
         await server.close()

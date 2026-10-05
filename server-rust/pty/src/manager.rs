@@ -615,12 +615,19 @@ mod tests {
     async fn recv_drains_then_reports_end_of_stream_after_natural_eof() {
         let manager = PTYManager::default();
         let id = NodeId::new(24);
+        // The child writes only after a line of input, so its bytes reach the
+        // ring after this subscription's cut and must arrive through `recv`, not
+        // the catch-up snapshot this test does not read.
         manager
-            .spawn(id, echo_spec("printf 'SRUI_EOF_OK'; exit 0", 4_096))
+            .spawn(
+                id,
+                echo_spec("read line; printf 'SRUI_EOF_OK'; exit 0", 4_096),
+            )
             .unwrap();
         let SubscribeOutcome {
             mut subscription, ..
         } = manager.subscribe(id, 0).unwrap();
+        manager.input(id, b"\n".to_vec()).unwrap();
 
         let mut received = Vec::new();
         let ended = tokio::time::timeout(Duration::from_secs(5), async {

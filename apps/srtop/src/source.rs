@@ -1,6 +1,6 @@
 //! Typed, injectable one-shot process snapshots and process-instance identity
 //! (design §§6.3, 8, 12, 22; PX-002 records, PX-003 identity and completeness,
-//! PX-004 retention).
+//! PX-004 retention, PX-007 system-wide figures).
 //! This module reads no process state: adapters live in their own modules and the
 //! fake adapter below uses constants only, with no OS enumeration or clock read.
 //!
@@ -116,6 +116,116 @@ pub enum CpuUsage {
     Missing(MissingReason),
 }
 
+/// Why one system-wide figure is not published (PX-007). It is never a zero:
+/// [`crate::summary`] words each of these, and a figure it cannot state carries
+/// no digit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FigureGap {
+    /// This source does not provide the figure at all: a test source, or a
+    /// platform no collector reads it on.
+    NotProvided,
+    /// The file the figure comes from could not be read, or reading it was
+    /// refused.
+    Unread(MissingReason),
+    /// The file was read and did not hold what the figure needs, or held values
+    /// no kernel writes: a field missing or malformed, or a part larger than its
+    /// own total.
+    Unusable,
+}
+
+/// One system-wide figure, or why it is not published (PX-007).
+pub type Figure<T> = Result<T, FigureGap>;
+
+/// Clock ticks every logical CPU spent busy, and in all, across one interval
+/// between two reads of the source's `stat` (PX-007). Stored exactly;
+/// [`crate::summary`] turns it into text once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SystemCpuInterval {
+    /// Busy ticks summed over every logical CPU: user, nice, system, irq,
+    /// softirq and steal ([`crate::metric::SYSTEM_CPU`]).
+    pub busy: u64,
+    /// Busy plus idle (idle and iowait) ticks summed over every logical CPU:
+    /// the denominator, so a share of it is a share of all of them.
+    pub total: u64,
+    /// The logical CPUs the source listed — its `cpuN` lines — at the second
+    /// read, when it could count them.
+    pub cpus: Option<u32>,
+}
+
+/// The host's overall CPU usage, which, like a process's, exists only between
+/// two samples (PX-007). None of the states but `Measured` is a quantity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SystemCpu {
+    /// Measured across one interval of the same boot.
+    Measured(SystemCpuInterval),
+    /// The first read of this boot's counters: nothing to subtract yet.
+    WarmingUp,
+    /// The counters went backwards, did not advance at all, or were read over a
+    /// different number of logical CPUs than the previous read: there is no
+    /// interval to divide, so no share — never a zero and never a spike.
+    Interrupted,
+    /// The counters could not be read or used.
+    Missing(FigureGap),
+}
+
+/// Memory as the source reports it, in bytes (PX-007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MemoryFigures {
+    /// `MemTotal`: usable RAM.
+    pub total: u64,
+    /// `MemAvailable`: the kernel's estimate of the memory available for
+    /// starting new applications without swapping.
+    pub available: u64,
+}
+
+/// Swap space as the source reports it, in bytes (PX-007). A `total` of zero is
+/// a host with no swap space at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SwapFigures {
+    /// `SwapTotal`.
+    pub total: u64,
+    /// `SwapFree`.
+    pub free: u64,
+}
+
+/// The kernel's 1-, 5- and 15-minute load averages in hundredths, exactly as it
+/// prints them (PX-007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LoadAverages {
+    pub one: u64,
+    pub five: u64,
+    pub fifteen: u64,
+}
+
+/// The system-wide figures one scan read beside its records (PX-007). Each is
+/// read, and can be missing, on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SystemSample {
+    pub cpu: SystemCpu,
+    pub memory: Figure<MemoryFigures>,
+    pub swap: Figure<SwapFigures>,
+    /// Whole seconds since boot.
+    pub uptime: Figure<u64>,
+    pub load: Figure<LoadAverages>,
+}
+
+impl SystemSample {
+    /// A source that provides no system-wide figure at all.
+    pub fn not_provided() -> Self {
+        Self::missing(FigureGap::NotProvided)
+    }
+
+    /// Every figure missing for the same reason.
+    pub fn missing(gap: FigureGap) -> Self {
+        Self {
+            cpu: SystemCpu::Missing(gap),
+            memory: Err(gap),
+            swap: Err(gap),
+            uptime: Err(gap),
+            load: Err(gap),
+        }
+    }
+}
 /// Longest display name published to the UI, in characters.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 128;
 /// Shown when a record's name sanitizes to nothing.
@@ -583,6 +693,10 @@ pub struct ProcessSnapshot {
     /// absent row forever.
     pub capped: CappedRecords,
     pub completeness: Completeness,
+    /// The system-wide figures this scan read beside its records (PX-007), each
+    /// read — and missing — on its own. They are published only from a scan
+    /// whose process list was read; see [`crate::summary`].
+    pub system: SystemSample,
 }
 
 impl ProcessSnapshot {
@@ -667,6 +781,31 @@ impl FakeProcessSource {
             creation: CreationToken::Opaque(token.into()),
         }
     }
+
+    /// The fixture's system-wide figures (PX-007): 250 of 800 ticks busy on
+    /// eight logical CPUs, which truncates to 31.2%; 4 GiB of 16 GiB in use; a
+    /// host with no swap space at all; up 3 days, 4 h 05 min 6 s; and three load
+    /// averages. Constants, like every record here.
+    pub fn system() -> SystemSample {
+        SystemSample {
+            cpu: SystemCpu::Measured(SystemCpuInterval {
+                busy: 250,
+                total: 800,
+                cpus: Some(8),
+            }),
+            memory: Ok(MemoryFigures {
+                total: 16 << 30,
+                available: 12 << 30,
+            }),
+            swap: Ok(SwapFigures { total: 0, free: 0 }),
+            uptime: Ok(3 * 86_400 + 4 * 3_600 + 5 * 60 + 6),
+            load: Ok(LoadAverages {
+                one: 52,
+                five: 58,
+                fifteen: 59,
+            }),
+        }
+    }
 }
 
 impl ProcessSource for FakeProcessSource {
@@ -714,6 +853,7 @@ impl ProcessSource for FakeProcessSource {
             vanished: 0,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
+            system: Self::system(),
         }
     }
 }
@@ -735,9 +875,15 @@ pub const SEQUENCE_STATUS_TEXT: &str = "Read-only · Fake process sequence";
 ///
 /// The script then repeats from step 0, so a client that attaches at any moment
 /// observes every case within one cycle. Step 1 differs from step 0 only in its
-/// sample time, which is exactly the thing that must never reach the wire; step
-/// 3 must retain the step 2 rows rather than empty the table; and step 4 must
-/// converge back onto them without moving a row.
+/// sample time: no row and no status may move for it, and since PX-007 its one
+/// published change is the data-freshness line, which shows that time. Step 3
+/// must retain the step 2 rows rather than empty the table, and keep the step 2
+/// sample time and figures on screen as the last successful sample; and step 4
+/// must converge back onto them without moving a row.
+///
+/// Every step carries the same system-wide figures ([`Self::system`]), fixed
+/// like each process's metrics, so that only the sample time distinguishes the
+/// two identical steps.
 ///
 /// This is a fixture, not an observation: it reads no process, no clock and no
 /// file, and it names itself as synthetic in every published status.
@@ -757,6 +903,35 @@ impl ScriptedFakeSource {
     /// The step this source will publish next.
     pub fn step(&self) -> usize {
         self.step
+    }
+
+    /// The script's system-wide figures (PX-007), the same on every step: 120
+    /// of 400 ticks busy on four logical CPUs (30.0%), 2 GiB of 8 GiB memory in
+    /// use (25.0%), 256 MiB of 2 GiB swap in use (12.5%), up 1 day, 2 h 30 min,
+    /// and three load averages. Swap is configured here, where
+    /// [`FakeProcessSource::system`] has none, so the two fixtures cover both.
+    pub fn system() -> SystemSample {
+        SystemSample {
+            cpu: SystemCpu::Measured(SystemCpuInterval {
+                busy: 120,
+                total: 400,
+                cpus: Some(4),
+            }),
+            memory: Ok(MemoryFigures {
+                total: 8 << 30,
+                available: 6 << 30,
+            }),
+            swap: Ok(SwapFigures {
+                total: 2 << 30,
+                free: 1_792 << 20,
+            }),
+            uptime: Ok(86_400 + 2 * 3_600 + 30 * 60),
+            load: Ok(LoadAverages {
+                one: 125,
+                five: 100,
+                fifteen: 75,
+            }),
+        }
     }
 
     fn key(token: &str, pid: u32) -> ProcessKey {
@@ -878,15 +1053,17 @@ impl ProcessSource for ScriptedFakeSource {
             source: SourceId(Self::SOURCE.into()),
             sampled_at: SnapshotTime(
                 // The sample time advances on every step, including the two
-                // steps whose records are identical. A tick must publish
-                // nothing at all for those, which it cannot do if the sample
-                // time reaches the UI.
+                // steps whose records are identical. No row and no status may
+                // move for it; the freshness line, which shows it, does
+                // (PX-007). It is still a constant of the script, never a
+                // reading of this machine's clock.
                 SystemTime::UNIX_EPOCH + Duration::from_secs(Self::EPOCH_SECONDS + step as u64),
             ),
             records,
             vanished: 0,
             capped: CappedRecords::none(),
             completeness,
+            system: Self::system(),
         }
     }
 }
@@ -909,9 +1086,12 @@ mod tests {
                 "step {step}"
             );
             assert_ne!(cycle[step].sampled_at, repeated.sampled_at);
+            // The system-wide figures are fixed like the records (PX-007).
+            assert_eq!(cycle[step].system, ScriptedFakeSource::system());
         }
         // Steps 0 and 1 are the same observation taken a second apart.
         assert_eq!(cycle[0].records, cycle[1].records);
+        assert_eq!(cycle[0].system, cycle[1].system);
         assert_ne!(cycle[0].sampled_at, cycle[1].sampled_at);
         // One insertion, one deletion and one rename.
         let before: Vec<_> = cycle[1].records.iter().map(|r| r.key.clone()).collect();

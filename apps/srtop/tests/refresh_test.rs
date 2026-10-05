@@ -4,9 +4,12 @@
 use srui_process_explorer::procfs::MAX_RECORDS;
 use srui_process_explorer::refresh::{refresh_status, RefreshCounts};
 use srui_process_explorer::source::*;
-use srui_process_explorer::{start_from_source, COLUMN, HEADING, MODEL, STATUS, SURFACE, TABLE};
+use srui_process_explorer::summary::{FRESHNESS_TEXT, LAYOUT, SUMMARY};
+use srui_process_explorer::{
+    start_from_source, COLUMN, HEADING, MODEL, SHELL_NODE_COUNT, STATUS, SURFACE, TABLE,
+};
 use srui_protocol::DEFAULT_MAX_FRAME_SIZE;
-use srui_sdk::{ItemId, Operation, Value, TEXT};
+use srui_sdk::{EnumToken, ItemId, NodeId, Operation, TextRole, Value, ROLE, TEXT};
 use srui_semantic_tree::Model;
 use srui_sessiond::Session;
 use std::collections::HashMap;
@@ -72,15 +75,40 @@ fn operations_since(session: &Session, revision: u64) -> Vec<Operation> {
         .collect()
 }
 
-/// The shell nodes must survive every refresh: a tick mutates model data and
-/// the status text, and never rebuilds the semantic node tree.
+/// The text the client holds on summary line `node` (PX-007).
+fn summary_text(session: &Session, node: NodeId) -> String {
+    session.with_store(|store| {
+        let Some(Value::String(text)) = store.get_node(node).unwrap().get_property(TEXT).cloned()
+        else {
+            panic!("summary line {node:?} must carry text")
+        };
+        text
+    })
+}
+
+/// Whether `op` sets or clears one scalar property of the status line or of a
+/// summary node, the only properties a refresh may change besides model data.
+fn is_scalar_shell_property(op: &Operation) -> bool {
+    let summary = |id: &NodeId| LAYOUT.iter().any(|(node, _, _)| node == id);
+    match op {
+        Operation::SetProperty { id, property, .. } => {
+            (*id == STATUS && *property == TEXT) || summary(id)
+        }
+        Operation::ClearProperty { id, .. } => summary(id),
+        _ => false,
+    }
+}
+
+/// The shell nodes must survive every refresh: a tick mutates model data, the
+/// status text and the summary's scalar properties, and never rebuilds the
+/// semantic node tree.
 fn assert_shell_intact(session: &Session) {
     session.with_store(|store| {
-        assert_eq!(store.node_count(), 5);
+        assert_eq!(store.node_count(), SHELL_NODE_COUNT);
         assert_eq!(store.root_ids(), &[SURFACE]);
         assert_eq!(
             store.children_of(COLUMN),
-            Some([HEADING, STATUS, TABLE].as_slice())
+            Some([HEADING, STATUS, SUMMARY, TABLE].as_slice())
         );
         assert_eq!(store.children_of(TABLE), Some([].as_slice()));
         assert_eq!(store.get_node(TABLE).unwrap().model_ref(), Some(MODEL));
@@ -103,16 +131,37 @@ fn a_scripted_sequence_inserts_deletes_and_renames_without_rebuilding_the_tree()
     );
     assert_eq!(session.current_revision(), 1);
 
-    // Step 1: the same processes, one second later. Nothing a client can see
-    // changed, so nothing at all is sent.
+    // Step 1: the same processes, one second later. No row and no status moves,
+    // and the one thing a client sees change is the data-freshness line, which
+    // shows the new sample time (PX-007): exactly one scalar property.
     let outcome = view.refresh(&session, &mut source).unwrap();
-    assert!(!outcome.published(), "{outcome:?}");
-    assert_eq!(session.current_revision(), 1);
+    assert_eq!(session.current_revision(), 2);
     assert_eq!(published(&session), first);
+    assert_eq!(
+        (
+            outcome.inserted,
+            outcome.deleted,
+            outcome.updated,
+            outcome.status_changed,
+            outcome.summary,
+            outcome.transactions
+        ),
+        (0, 0, 0, false, 1, 1),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        operations_since(&session, 1),
+        vec![Operation::set_property(
+            FRESHNESS_TEXT,
+            TEXT,
+            "Last successful sample: 2027-01-15 08:00:01 UTC (server clock) · source: \
+             fake-process-sequence-v1"
+        )]
+    );
 
     // Step 2: one insertion, one deletion, one rename.
     let outcome = view.refresh(&session, &mut source).unwrap();
-    assert_eq!(session.current_revision(), 2);
+    assert_eq!(session.current_revision(), 3);
     assert_eq!(
         (outcome.inserted, outcome.deleted, outcome.updated),
         (1, 1, 1)
@@ -132,15 +181,23 @@ fn a_scripted_sequence_inserts_deletes_and_renames_without_rebuilding_the_tree()
     assert_eq!(second[1].0, first[2].0, "a rename keeps the row identity");
     assert!(second.iter().all(|(id, _)| *id != first[1].0));
 
-    // One transaction carrying model data and nothing else: no node was
-    // created, deleted, moved or reordered to show three different rows.
-    let ops = operations_since(&session, 1);
+    // One transaction carrying model data and the new sample time, and nothing
+    // else: no node was created, deleted, moved or reordered to show three
+    // different rows.
+    let ops = operations_since(&session, 2);
     assert!(
         ops.iter().all(|op| matches!(
             op,
             Operation::ModelInsert { .. }
                 | Operation::ModelDelete { .. }
                 | Operation::ModelUpdate { .. }
+        ) || matches!(
+            op,
+            Operation::SetProperty {
+                id: FRESHNESS_TEXT,
+                property: TEXT,
+                ..
+            }
         )),
         "{ops:?}"
     );
@@ -193,29 +250,29 @@ fn a_failed_scan_keeps_every_row_and_says_so_and_recovery_converges() {
             ScriptedFakeSource::STATUS_TEXT
         )
     );
-    // The failure is reported as a property of the existing status node.
+    // The failure is reported as properties of existing nodes: the status, and
+    // the freshness line, which names the collector error over the last
+    // successful sample — step 2's — in the warning role (PX-007).
     let ops = operations_since(&session, revision);
-    assert!(
-        ops.iter().all(|op| matches!(
-            op,
-            Operation::SetProperty {
-                id: STATUS,
-                property: TEXT,
-                ..
-            }
-        )),
-        "a failed scan must publish nothing but its explanation: {ops:?}"
+    let collector_error = "Collector error: could not list processes (permission denied) · \
+                           last successful sample: 2027-01-15 08:00:02 UTC (server clock) · \
+                           source: fake-process-sequence-v1";
+    assert_eq!(
+        ops,
+        vec![
+            Operation::set_property(STATUS, TEXT, status.clone()),
+            Operation::set_property(FRESHNESS_TEXT, ROLE, EnumToken::from(TextRole::Warning)),
+            Operation::set_property(FRESHNESS_TEXT, TEXT, collector_error),
+        ],
+        "a failed scan must publish nothing but its explanation"
     );
-    assert!(
-        !ops.iter()
-            .any(|op| matches!(op, Operation::ModelDelete { .. })),
-        "a failed scan must never delete a row"
-    );
+    assert_eq!(outcome.summary, 2);
+    assert_eq!(summary_text(&session, FRESHNESS_TEXT), collector_error);
     assert_shell_intact(&session);
 
     // Step 4: the scan succeeds again with exactly the retained processes. The
-    // rows are already right, so recovery costs one status property and not a
-    // single row operation.
+    // rows are already right, so recovery costs the status and the freshness
+    // line's text and role, and not a single row operation.
     let revision = session.current_revision();
     let outcome = view.refresh(&session, &mut source).unwrap();
     assert_eq!(
@@ -230,7 +287,19 @@ fn a_failed_scan_keeps_every_row_and_says_so_and_recovery_converges() {
     assert!(outcome.status_changed);
     assert_eq!(published(&session), settled, "recovery moves no row");
     assert_eq!(status_text(&session), ScriptedFakeSource::STATUS_TEXT);
-    assert_eq!(operations_since(&session, revision).len(), 1);
+    assert_eq!(
+        operations_since(&session, revision),
+        vec![
+            Operation::set_property(STATUS, TEXT, ScriptedFakeSource::STATUS_TEXT),
+            Operation::set_property(FRESHNESS_TEXT, ROLE, EnumToken::from(TextRole::Status)),
+            Operation::set_property(
+                FRESHNESS_TEXT,
+                TEXT,
+                "Last successful sample: 2027-01-15 08:00:04 UTC (server clock) · source: \
+                 fake-process-sequence-v1"
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -434,6 +503,7 @@ impl ProcessSource for Widest {
             vanished: 0,
             capped: CappedRecords::none(),
             completeness: Completeness::Complete,
+            system: SystemSample::not_provided(),
         }
     }
 }
@@ -653,15 +723,16 @@ fn a_failed_scan_at_the_snapshot_ceiling_deletes_no_row_however_long_its_status(
         );
         let ops = operations_since(&session, revision);
         assert!(
-            ops.iter().all(|op| matches!(
-                op,
-                Operation::SetProperty {
-                    id: STATUS,
-                    property: TEXT,
-                    ..
-                }
-            )),
+            ops.iter().all(is_scalar_shell_property),
             "{name}: an error-only refresh must plan no row mutation: {ops:?}"
+        );
+        // And the freshness line says the collector failed, over the sample
+        // the rows were chosen under (PX-007).
+        let freshness = summary_text(&session, FRESHNESS_TEXT);
+        assert!(
+            freshness.starts_with("Collector error: ")
+                && freshness.contains("last successful sample: 1970-01-01 00:00:01 UTC"),
+            "{name}: {freshness}"
         );
         // The status really did carry every clause it can, each stating its own
         // count, and none of it is a process's own text.
@@ -684,7 +755,8 @@ fn a_failed_scan_at_the_snapshot_ceiling_deletes_no_row_however_long_its_status(
     }
 
     // Recovery converges: the same host scanned successfully again publishes
-    // nothing but the status it started with.
+    // nothing but the status it started with and the freshness line's text and
+    // role (PX-007): the same sample time, no longer marked as an error.
     let revision = session.current_revision();
     let outcome = view
         .refresh(&session, &mut Widest { rows, first_pid: 1 })
@@ -697,7 +769,19 @@ fn a_failed_scan_at_the_snapshot_ceiling_deletes_no_row_however_long_its_status(
     assert_eq!(outcome.truncated, dropped);
     assert_eq!(published(&session), before);
     assert_eq!(status_text(&session), settled_status);
-    assert_eq!(operations_since(&session, revision).len(), 1);
+    assert_eq!(
+        operations_since(&session, revision),
+        vec![
+            Operation::set_property(STATUS, TEXT, settled_status.clone()),
+            Operation::set_property(FRESHNESS_TEXT, ROLE, EnumToken::from(TextRole::Status)),
+            Operation::set_property(
+                FRESHNESS_TEXT,
+                TEXT,
+                "Last successful sample: 1970-01-01 00:00:01 UTC (server clock) · source: \
+                 fake-processes-v1"
+            ),
+        ]
+    );
     assert_shell_intact(&session);
 }
 
@@ -774,16 +858,32 @@ fn a_refresh_beyond_the_frame_bound_commits_as_frames_a_client_accepts() {
          bound can split it",
         operations.len()
     );
-    // The status changed — this refresh truncates — so it leads the plan, ahead
-    // of the deletions, and every deletion still precedes every insertion.
-    assert!(matches!(operations[0], Operation::SetProperty { .. }));
-    assert!(matches!(operations[1], Operation::ModelDelete { .. }));
+    // The status changed — this refresh truncates — and so did the summary's
+    // process count (PX-007), so those scalar properties lead the plan, the
+    // status first, ahead of the deletions, and every deletion still precedes
+    // every insertion.
+    assert!(matches!(
+        operations[0],
+        Operation::SetProperty {
+            id: STATUS,
+            property: TEXT,
+            ..
+        }
+    ));
+    let first_row_operation = operations
+        .iter()
+        .position(|op| !is_scalar_shell_property(op))
+        .expect("the refresh mutates rows");
+    assert!(matches!(
+        operations[first_row_operation],
+        Operation::ModelDelete { .. }
+    ));
     let first_insert = operations
         .iter()
         .position(|op| matches!(op, Operation::ModelInsert { .. }))
         .expect("the refresh inserts rows");
     assert!(
-        operations[1..first_insert]
+        operations[first_row_operation..first_insert]
             .iter()
             .all(|op| matches!(op, Operation::ModelDelete { .. })),
         "every deletion must precede every insertion, so an insertion index is final"
@@ -913,6 +1013,7 @@ fn a_refresh_beyond_the_transaction_bound_is_published_whole() {
                 vanished: 0,
                 capped: CappedRecords::none(),
                 completeness: Completeness::Complete,
+                system: SystemSample::not_provided(),
             }
         }
     }

@@ -7,13 +7,16 @@
 //! suite must run unprivileged, like the app itself: the denied-record case
 //! relies on mode 0 being unreadable.
 use srui_process_explorer::procfs::{
-    parse_pid, parse_stat, MonotonicClock, ProcFsSource, LIVE_STATUS_TEXT, MAX_FILE_BYTES,
+    parse_pid, parse_stat, MonotonicClock, ProcFsSource, WallClock, LIVE_STATUS_TEXT,
+    MAX_FILE_BYTES,
 };
 use srui_process_explorer::published_status;
 use srui_process_explorer::source::{
-    Completeness, CpuInterval, CpuUsage, CreationToken, DisplayName, IssueScope, MissingReason,
-    Observed, ProcessSource, Retention, SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
+    Completeness, CpuInterval, CpuUsage, CreationToken, DisplayName, FigureGap, IssueScope,
+    LoadAverages, MemoryFigures, MissingReason, Observed, ProcessSource, Retention, SourceId,
+    SwapFigures, SystemCpu, SystemCpuInterval, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
 };
+use srui_process_explorer::summary;
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -185,6 +188,48 @@ impl ProcFixture {
     fn noise(&self, name: &str) -> &Self {
         fs::create_dir_all(self.0.join(name)).unwrap();
         self
+    }
+
+    /// One host-wide file under the root, verbatim (PX-007): `stat`,
+    /// `meminfo`, `uptime` or `loadavg`.
+    fn system_file(&self, name: &str, contents: &[u8]) -> &Self {
+        fs::write(self.0.join(name), contents).unwrap();
+        self
+    }
+
+    /// A `stat` whose `cpu` line counts `busy` user ticks and `idle` idle
+    /// ticks, followed by `cpus` per-CPU lines and the lines a kernel writes
+    /// after them.
+    fn stat_cpu(&self, busy: u64, idle: u64, cpus: usize) -> &Self {
+        let mut stat = format!("cpu  {busy} 0 0 {idle} 0 0 0 0 0 0\n");
+        for cpu in 0..cpus {
+            stat.push_str(&format!("cpu{cpu} 0 0 0 0 0 0 0 0 0 0\n"));
+        }
+        stat.push_str("intr 0 0 0 0\nctxt 0\nbtime 0\n");
+        self.system_file("stat", stat.as_bytes())
+    }
+
+    /// A `meminfo` with the fields the summary reads, in kB, padded as the
+    /// kernel pads them.
+    fn meminfo(&self, total: u64, available: u64, swap_total: u64, swap_free: u64) -> &Self {
+        let meminfo = format!(
+            "MemTotal:       {total:>8} kB\nMemFree:        {:>8} kB\n\
+             MemAvailable:   {available:>8} kB\nBuffers:               0 kB\n\
+             SwapCached:            0 kB\nSwapTotal:      {swap_total:>8} kB\n\
+             SwapFree:       {swap_free:>8} kB\nHugePages_Total:       0\n",
+            available / 2
+        );
+        self.system_file("meminfo", meminfo.as_bytes())
+    }
+
+    /// Every host-wide file a kernel writes, with this suite's figures: 25%
+    /// of memory and of swap in use, up 3 days 4 h 05 min, and three load
+    /// averages, and four logical CPUs.
+    fn host(&self) -> &Self {
+        self.stat_cpu(1_000, 3_000, 4)
+            .meminfo(16_000_000, 12_000_000, 2_000_000, 1_500_000)
+            .system_file("uptime", b"273906.42 1000.00\n")
+            .system_file("loadavg", b"0.52 0.58 0.59 1/120 4242\n")
     }
 
     fn source(&self) -> ProcFsSource {
@@ -1546,6 +1591,22 @@ impl MonotonicClock for ManualClock {
     }
 }
 
+/// A wall clock that always says the same time: a fixture's sample time is a
+/// fact of the test (PX-007).
+#[derive(Debug)]
+struct FixedWallClock(SystemTime);
+
+impl WallClock for FixedWallClock {
+    fn now(&self) -> SystemTime {
+        self.0
+    }
+}
+
+/// The sample time fixture sources state: 2027-01-15 08:00:00 UTC.
+fn fixture_sample_time() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+}
+
 /// A persistent collector over `fixture`, measuring on a clock the test owns.
 fn clocked(fixture: &ProcFixture) -> (ProcFsSource, Arc<ManualClock>) {
     let clock = Arc::new(ManualClock::default());
@@ -1941,6 +2002,10 @@ fn cpu_baselines_are_bounded_by_the_last_published_records() {
 /// PX-006 through the publication path: the first publication is visibly
 /// warming up, the next refresh publishes the measured value in place, and an
 /// idle process that stays idle publishes nothing further.
+///
+/// The sample time is fixed (PX-007): the freshness line publishes it, so on
+/// the system clock two scans that straddled a second would publish a change
+/// that has nothing to do with the CPU column this test watches.
 #[test]
 fn the_first_publication_is_warming_up_and_a_refresh_publishes_the_measured_value() {
     let fixture = ProcFixture::new();
@@ -1948,7 +2013,8 @@ fn the_first_publication_is_warming_up_and_a_refresh_publishes_the_measured_valu
         .identity("fixture-host", "boot-a", "pid:[4026531836]")
         .clock_ticks(100)
         .cpu(10, b"worker", 500, "100", "0");
-    let (mut source, clock) = clocked(&fixture);
+    let (source, clock) = clocked(&fixture);
+    let mut source = source.with_wall_clock(Arc::new(FixedWallClock(fixture_sample_time())));
     clock.set(100);
     let session = srui_sessiond::Session::mint();
     let (mut view, _) = srui_process_explorer::start_from_source(&session, &mut source).unwrap();
@@ -1970,6 +2036,394 @@ fn the_first_publication_is_warming_up_and_a_refresh_publishes_the_measured_valu
     let outcome = view.refresh(&session, &mut source).unwrap();
     assert_eq!(outcome.updated, 0, "{outcome:?}");
     assert_eq!(session.current_revision(), revision, "nothing changed");
+}
+
+/// A wall clock one second later at every reading: each scan stamps its own
+/// sample time, so the freshness line can tell the last successful scan from a
+/// later one that failed (PX-007).
+#[derive(Debug, Default)]
+struct TickingWallClock(Mutex<u64>);
+
+impl WallClock for TickingWallClock {
+    fn now(&self) -> SystemTime {
+        let mut seconds = self.0.lock().unwrap();
+        let now = fixture_sample_time() + Duration::from_secs(*seconds);
+        *seconds += 1;
+        now
+    }
+}
+
+/// One property the client holds on summary node `node` (PX-007).
+fn summary_property(
+    session: &srui_sessiond::Session,
+    node: srui_sdk::NodeId,
+    property: srui_sdk::PropertyRef,
+) -> Option<srui_sdk::Value> {
+    session.with_store(|store| {
+        store
+            .get_node(node)
+            .unwrap()
+            .get_property(property)
+            .cloned()
+    })
+}
+
+/// The text the client holds on summary line `node` (PX-007).
+fn summary_line(session: &srui_sessiond::Session, node: srui_sdk::NodeId) -> String {
+    match summary_property(session, node, srui_sdk::TEXT) {
+        Some(srui_sdk::Value::String(text)) => text,
+        other => panic!("summary line {node:?} carries no text: {other:?}"),
+    }
+}
+
+/// The role the client holds on summary line `node` (PX-007).
+fn summary_role(session: &srui_sessiond::Session, node: srui_sdk::NodeId) -> srui_sdk::TextRole {
+    match summary_property(session, node, srui_sdk::ROLE) {
+        Some(srui_sdk::Value::EnumToken(token)) => {
+            srui_sdk::TextRole::try_from(token).expect("a summary line's role is a text role")
+        }
+        other => panic!("summary line {node:?} carries no role: {other:?}"),
+    }
+}
+
+/// PX-007: the system-wide figures come from the scanned root's own files, so a
+/// fixture tree states its own and every figure is exact on any host.
+#[test]
+fn system_figures_are_read_through_the_scanned_root() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(10, b"worker", 500)
+        .host();
+    let mut source = fixture.source();
+    let first = source.snapshot();
+    assert_eq!(first.completeness, Completeness::Complete);
+    assert_eq!(first.system.cpu, SystemCpu::WarmingUp);
+    assert_eq!(
+        first.system.memory,
+        Ok(MemoryFigures {
+            total: 16_000_000 * 1024,
+            available: 12_000_000 * 1024,
+        })
+    );
+    assert_eq!(
+        first.system.swap,
+        Ok(SwapFigures {
+            total: 2_000_000 * 1024,
+            free: 1_500_000 * 1024,
+        })
+    );
+    assert_eq!(first.system.uptime, Ok(273_906));
+    assert_eq!(
+        first.system.load,
+        Ok(LoadAverages {
+            one: 52,
+            five: 58,
+            fifteen: 59,
+        })
+    );
+    // A quarter of the next interval's ticks were busy, on four CPUs.
+    fixture.stat_cpu(1_100, 3_300, 4);
+    assert_eq!(
+        source.snapshot().system.cpu,
+        SystemCpu::Measured(SystemCpuInterval {
+            busy: 100,
+            total: 400,
+            cpus: Some(4),
+        })
+    );
+}
+
+/// PX-007: each system file fails on its own, as one figure of a scan whose
+/// record list stays complete: a refused file is denied, a missing one
+/// unavailable, an unparsable one unusable, and the rest are still published.
+#[test]
+fn each_system_file_fails_on_its_own_and_never_degrades_the_record_list() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(10, b"worker", 500)
+        .host()
+        .system_file("loadavg", b"0.52 0.58\n");
+    fs::set_permissions(fixture.0.join("meminfo"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::remove_file(fixture.0.join("stat")).unwrap();
+    let mut source = fixture.source();
+    let snapshot = source.snapshot();
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(
+        snapshot.system.cpu,
+        SystemCpu::Missing(FigureGap::Unread(MissingReason::Unavailable))
+    );
+    let denied = FigureGap::Unread(MissingReason::Denied);
+    assert_eq!(snapshot.system.memory, Err(denied));
+    assert_eq!(snapshot.system.swap, Err(denied));
+    assert_eq!(snapshot.system.load, Err(FigureGap::Unusable));
+    assert_eq!(snapshot.system.uptime, Ok(273_906));
+
+    // Published: each missing figure says why in the warning role, the others
+    // are figures, and the sample is still a successful one.
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut fixture.source()).unwrap();
+    assert_eq!(
+        summary_line(&session, summary::MEMORY_TEXT),
+        "Memory: Denied (reading meminfo was refused)"
+    );
+    assert_eq!(
+        summary_line(&session, summary::CPU_TEXT),
+        "Overall CPU (100% = all logical CPUs): Unavailable (stat could not be read)"
+    );
+    assert_eq!(
+        summary_line(&session, summary::LOAD_TEXT),
+        "Load average (1, 5, 15 min): Unavailable (loadavg has no usable load averages)"
+    );
+    for node in [
+        summary::MEMORY_TEXT,
+        summary::SWAP_TEXT,
+        summary::CPU_TEXT,
+        summary::LOAD_TEXT,
+    ] {
+        assert_eq!(
+            summary_role(&session, node),
+            srui_sdk::TextRole::Warning,
+            "{node:?}"
+        );
+    }
+    assert_eq!(
+        summary_line(&session, summary::UPTIME_TEXT),
+        "Uptime: 3 days, 4 h 05 min"
+    );
+    assert_eq!(
+        summary_role(&session, summary::UPTIME_TEXT),
+        srui_sdk::TextRole::Body
+    );
+    assert!(summary_line(&session, summary::FRESHNESS_TEXT).starts_with("Last successful sample: "));
+    for bar in [summary::CPU_BAR, summary::MEMORY_BAR, summary::SWAP_BAR] {
+        assert_eq!(summary_property(&session, bar, srui_sdk::VALUE), None);
+    }
+}
+
+/// PX-007: overall CPU through the collector — warming up first, then measured;
+/// counters that went backwards or did not advance, or a different number of
+/// CPUs, interrupt it rather than publish a zero or a spike; an unreadable
+/// `stat` keeps the baseline, and a different boot discards it.
+#[test]
+fn overall_cpu_is_warming_up_then_measured_and_never_a_spike() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(10, b"worker", 500)
+        .stat_cpu(1_000, 3_000, 4);
+    let mut source = fixture.source();
+    let measured = |busy, total, cpus| {
+        SystemCpu::Measured(SystemCpuInterval {
+            busy,
+            total,
+            cpus: Some(cpus),
+        })
+    };
+    let mut cpu = |busy, idle, cpus| {
+        fixture.stat_cpu(busy, idle, cpus);
+        source.snapshot().system.cpu
+    };
+    assert_eq!(cpu(1_000, 3_000, 4), SystemCpu::WarmingUp, "first read");
+    assert_eq!(cpu(1_100, 3_300, 4), measured(100, 400, 4));
+    // Did not advance: no interval to divide by, and the next read is measured
+    // from the same counters.
+    assert_eq!(cpu(1_100, 3_300, 4), SystemCpu::Interrupted);
+    assert_eq!(cpu(1_300, 3_500, 4), measured(200, 400, 4));
+    // Went backwards: a reset, never a wrapped delta; measured again from it.
+    assert_eq!(cpu(50, 3_600, 4), SystemCpu::Interrupted);
+    assert_eq!(cpu(150, 3_900, 4), measured(100, 400, 4));
+    // Counted over another number of CPUs: another denominator.
+    assert_eq!(cpu(250, 4_200, 8), SystemCpu::Interrupted);
+    assert_eq!(cpu(350, 4_500, 8), measured(100, 400, 8));
+    // An unreadable `stat` keeps the baseline for the next readable one.
+    fs::remove_file(fixture.0.join("stat")).unwrap();
+    assert_eq!(
+        source.snapshot().system.cpu,
+        SystemCpu::Missing(FigureGap::Unread(MissingReason::Unavailable))
+    );
+    let mut cpu = |busy, idle, cpus| {
+        fixture.stat_cpu(busy, idle, cpus);
+        source.snapshot().system.cpu
+    };
+    assert_eq!(cpu(450, 4_800, 8), measured(100, 400, 8));
+    // A different boot restarts the counters: warming up, not a reset.
+    fs::write(fixture.0.join("sys/kernel/random/boot_id"), "boot-b\n").unwrap();
+    assert_eq!(cpu(10, 20, 8), SystemCpu::WarmingUp);
+}
+
+/// PX-007 through the publication path: a procfs sample is published as text
+/// and bars; a scan whose process list cannot be read keeps every figure on
+/// screen under a collector error that names the last successful sample's
+/// time; and the next good scan replaces them, measured from the last read.
+#[test]
+fn a_collector_error_keeps_the_last_procfs_sample_on_screen_until_a_scan_replaces_it() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(10, b"worker", 500)
+        .host();
+    let mut source = fixture
+        .source()
+        .with_wall_clock(Arc::new(TickingWallClock::default()));
+    let session = srui_sessiond::Session::mint();
+    let (mut view, _) = srui_process_explorer::start_from_source(&session, &mut source).unwrap();
+    let named = format!("source: procfs:{}", fixture.0.display());
+    let healthy = [
+        (
+            summary::CPU_TEXT,
+            "Overall CPU (100% = all logical CPUs): Warming up".to_string(),
+        ),
+        (
+            summary::MEMORY_TEXT,
+            "Memory: 3.8 GiB used of 15.2 GiB (25.0% of total)".to_string(),
+        ),
+        (
+            summary::SWAP_TEXT,
+            "Swap: 488.2 MiB used of 1.9 GiB (25.0% of total)".to_string(),
+        ),
+        (
+            summary::LOAD_TEXT,
+            "Load average (1, 5, 15 min): 0.52, 0.58, 0.59".to_string(),
+        ),
+        (
+            summary::UPTIME_TEXT,
+            "Uptime: 3 days, 4 h 05 min".to_string(),
+        ),
+        (
+            summary::PROCESSES_TEXT,
+            "Processes: 1 listed · complete scan · unfiltered".to_string(),
+        ),
+        (
+            summary::FRESHNESS_TEXT,
+            format!("Last successful sample: 2027-01-15 08:00:00 UTC (server clock) · {named}"),
+        ),
+    ];
+    for (node, text) in &healthy {
+        assert_eq!(&summary_line(&session, *node), text);
+    }
+    assert_eq!(
+        summary_property(&session, summary::MEMORY_BAR, srui_sdk::VALUE),
+        Some(srui_sdk::Value::Float64(0.25))
+    );
+    assert_eq!(
+        summary_role(&session, summary::FRESHNESS_TEXT),
+        srui_sdk::TextRole::Status
+    );
+
+    // Searchable but not listable: the process list fails, while the system
+    // files, read by path, still could be. Nothing of this scan is published.
+    fixture.stat_cpu(1_100, 3_300, 4);
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o300)).unwrap();
+    let outcome = view.refresh(&session, &mut source).unwrap();
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!((outcome.deleted, outcome.retained), (0, 1));
+    assert_eq!(
+        summary_line(&session, summary::FRESHNESS_TEXT),
+        format!(
+            "Collector error: could not list processes (permission denied) · last successful \
+             sample: 2027-01-15 08:00:00 UTC (server clock) · {named}"
+        )
+    );
+    assert_eq!(
+        summary_role(&session, summary::FRESHNESS_TEXT),
+        srui_sdk::TextRole::Warning
+    );
+    for (node, text) in &healthy[..6] {
+        assert_eq!(&summary_line(&session, *node), text, "kept, not replaced");
+    }
+    session.with_store(|store| {
+        assert_eq!(store.node_count(), srui_process_explorer::SHELL_NODE_COUNT)
+    });
+
+    // Recovery: this scan's sample, at its own time, its CPU share measured
+    // from the counters the failed scan read.
+    fixture.stat_cpu(1_300, 3_500, 4);
+    view.refresh(&session, &mut source).unwrap();
+    assert_eq!(
+        summary_line(&session, summary::FRESHNESS_TEXT),
+        format!("Last successful sample: 2027-01-15 08:00:02 UTC (server clock) · {named}")
+    );
+    assert_eq!(
+        summary_role(&session, summary::FRESHNESS_TEXT),
+        srui_sdk::TextRole::Status
+    );
+    assert_eq!(
+        summary_line(&session, summary::CPU_TEXT),
+        "Overall CPU (100% = all 4 logical CPUs): 50.0%"
+    );
+    assert_eq!(
+        summary_property(&session, summary::CPU_BAR, srui_sdk::VALUE),
+        Some(srui_sdk::Value::Float64(0.5))
+    );
+}
+
+/// PX-007: a host with no swap space is published as such through the
+/// collector, never as 0% of 0, and its bar is hidden with no value.
+#[test]
+fn a_host_without_swap_is_published_as_having_none() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .process(10, b"worker", 500)
+        .host()
+        .meminfo(8_000_000, 2_000_000, 0, 0);
+    let mut source = fixture.source();
+    assert_eq!(
+        source.snapshot().system.swap,
+        Ok(SwapFigures { total: 0, free: 0 })
+    );
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut source).unwrap();
+    assert_eq!(
+        summary_line(&session, summary::SWAP_TEXT),
+        "Swap: none configured"
+    );
+    assert_eq!(
+        summary_property(&session, summary::SWAP_BAR, srui_sdk::VALUE),
+        None
+    );
+    assert_eq!(
+        summary_property(&session, summary::SWAP_BAR, srui_sdk::VISIBILITY),
+        Some(srui_sdk::Value::from(srui_sdk::EnumToken::from(
+            srui_sdk::Visibility::Hidden
+        )))
+    );
+    assert_eq!(
+        summary_line(&session, summary::MEMORY_TEXT),
+        "Memory: 5.7 GiB used of 7.6 GiB (75.0% of total)"
+    );
+}
+
+/// PX-007: where there is no process filesystem at all — every system but
+/// Linux — the live source publishes a collector error and no figure.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_live_source_without_a_process_filesystem_publishes_no_figure() {
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut ProcFsSource::live()).unwrap();
+    assert_eq!(
+        summary_line(&session, summary::FRESHNESS_TEXT),
+        "Collector error: could not list processes (unavailable) · no successful sample yet · \
+         source: procfs:/proc"
+    );
+    assert_eq!(
+        summary_role(&session, summary::FRESHNESS_TEXT),
+        srui_sdk::TextRole::Warning
+    );
+    for (node, text) in [
+        (
+            summary::CPU_TEXT,
+            "Overall CPU (100% = all logical CPUs): Not sampled",
+        ),
+        (summary::MEMORY_TEXT, "Memory: Not sampled"),
+        (summary::SWAP_TEXT, "Swap: Not sampled"),
+        (summary::PROCESSES_TEXT, "Processes: Not sampled"),
+    ] {
+        assert_eq!(summary_line(&session, node), text);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2325,7 +2779,11 @@ mod live {
         });
         assert_eq!(session.current_revision(), 1);
         session.with_store(|store| {
-            assert_eq!(store.node_count(), 5, "live rows create no view nodes");
+            assert_eq!(
+                store.node_count(),
+                srui_process_explorer::SHELL_NODE_COUNT,
+                "live rows create no view nodes"
+            );
             let model = store.get_model(MODEL).unwrap();
             assert_eq!(
                 model.item_count,
@@ -2403,7 +2861,9 @@ mod live {
         assert_eq!(cells[0], Value::UnsignedInt(u64::from(pid)));
         assert_eq!(cells[1], Value::String(WORKER_NAME.into()));
         // The shell was built once and is refreshed in place.
-        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        session.with_store(|store| {
+            assert_eq!(store.node_count(), srui_process_explorer::SHELL_NODE_COUNT)
+        });
         assert!(session.current_revision() > before);
 
         // A refresh that sees the same worker leaves its row identity alone.
@@ -2428,7 +2888,9 @@ mod live {
         }
         let (gone_tick, gone_after) =
             gone.expect("an ended worker must leave the collection within two intervals");
-        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        session.with_store(|store| {
+            assert_eq!(store.node_count(), srui_process_explorer::SHELL_NODE_COUNT)
+        });
         println!(
             "PX-004 live evidence: interval={interval:?} worker_pid={pid} item_id={} \
              appeared_tick={appeared_tick} appeared_after={appeared_after:?} \
@@ -2507,7 +2969,9 @@ mod live {
             published_resident(&session, own),
             srui_process_explorer::metric::format_iec_bytes(after)
         );
-        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        session.with_store(|store| {
+            assert_eq!(store.node_count(), srui_process_explorer::SHELL_NODE_COUNT)
+        });
         println!(
             "PX-005 live evidence: pid={own} touched={TOUCHED} before={before} after={after} \
              growth={} kernel_vm_rss={kernel} published={:?} records={} updated={}",
@@ -2605,7 +3069,9 @@ mod live {
             published_cpu(&session, burner.pid()),
             srui_process_explorer::metric::cpu_cell(&cpu_for(&second, burner.pid()))
         );
-        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        session.with_store(|store| {
+            assert_eq!(store.node_count(), srui_process_explorer::SHELL_NODE_COUNT)
+        });
         println!(
             "PX-006 live evidence: clk_tck={ticks_per_second} {} interval={shortest:?}..{longest:?} \
              burner_cell={:?} sleeper_cell={:?} records={} updated={}",
@@ -2614,6 +3080,252 @@ mod live {
             published_cpu(&session, sleeper.pid()),
             second.records.len(),
             outcome.updated,
+        );
+    }
+
+    /// What the kernel's own files say about the host, read by this test with
+    /// its own parsing rather than the collector's (PX-007).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct KernelFigures {
+        mem_total: u64,
+        swap_total: u64,
+        /// Whole seconds since boot.
+        uptime: u64,
+        /// The three load averages exactly as printed.
+        load: [String; 3],
+        /// The `cpuN` lines of `/proc/stat`.
+        cpus: u32,
+    }
+
+    impl KernelFigures {
+        fn read() -> Self {
+            let meminfo = std::fs::read_to_string("/proc/meminfo").expect("Linux has meminfo");
+            let kib = |key: &str| {
+                let line = meminfo
+                    .lines()
+                    .find(|line| line.split(':').next() == Some(key))
+                    .unwrap_or_else(|| panic!("meminfo has {key}"));
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                assert_eq!((fields.len(), fields[2]), (3, "kB"), "{line}");
+                fields[1].parse::<u64>().unwrap() * 1024
+            };
+            let uptime = std::fs::read_to_string("/proc/uptime").expect("Linux has uptime");
+            let seconds = uptime.split('.').next().unwrap().parse().unwrap();
+            let loadavg = std::fs::read_to_string("/proc/loadavg").expect("Linux has loadavg");
+            let load: Vec<String> = loadavg.split_whitespace().map(str::to_string).collect();
+            let stat = std::fs::read_to_string("/proc/stat").expect("Linux has stat");
+            let cpus = stat
+                .lines()
+                .filter(|line| {
+                    line.strip_prefix("cpu")
+                        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+                })
+                .count();
+            Self {
+                mem_total: kib("MemTotal"),
+                swap_total: kib("SwapTotal"),
+                uptime: seconds,
+                load: [load[0].clone(), load[1].clone(), load[2].clone()],
+                cpus: u32::try_from(cpus).unwrap(),
+            }
+        }
+    }
+
+    /// PX-007 acceptance on a real host: the system summary agrees with the
+    /// kernel's own files, read by this test around one scan. Uptime is a
+    /// monotonic clock, so the scan's value is bracketed by the two reads. The
+    /// totals and the load averages change rarely, so a scan whose two
+    /// surrounding reads agree must report exactly what both said; when the
+    /// reads around a scan disagree, the bracket is taken again with a new scan.
+    #[test]
+    fn the_live_system_summary_agrees_with_the_kernels_own_files() {
+        let mut source = ProcFsSource::live();
+        let mut attempts = 0;
+        let (snapshot, kernel, window) = loop {
+            attempts += 1;
+            let (wall, before) = (SystemTime::now(), KernelFigures::read());
+            let snapshot = source.snapshot();
+            let (after, wall_after) = (KernelFigures::read(), SystemTime::now());
+            let Ok(uptime) = snapshot.system.uptime else {
+                panic!("a live uptime is readable: {:?}", snapshot.system.uptime)
+            };
+            assert!(
+                before.uptime <= uptime && uptime <= after.uptime,
+                "uptime {uptime} outside {}..={}",
+                before.uptime,
+                after.uptime
+            );
+            let agreed = KernelFigures {
+                uptime: before.uptime,
+                ..after.clone()
+            } == before;
+            if agreed && wall <= wall_after {
+                break (snapshot, before, (wall, wall_after));
+            }
+            assert!(attempts < 10, "ten scans in a row straddled a change");
+        };
+        let Ok(memory) = snapshot.system.memory else {
+            panic!("live memory is readable: {:?}", snapshot.system.memory)
+        };
+        assert_eq!(memory.total, kernel.mem_total);
+        assert!(memory.available <= memory.total);
+        let Ok(swap) = snapshot.system.swap else {
+            panic!("live swap is readable: {:?}", snapshot.system.swap)
+        };
+        assert_eq!(swap.total, kernel.swap_total);
+        assert!(swap.free <= swap.total);
+        let Ok(load) = snapshot.system.load else {
+            panic!(
+                "live load averages are readable: {:?}",
+                snapshot.system.load
+            )
+        };
+        assert_eq!(
+            [load.one, load.five, load.fifteen]
+                .map(srui_process_explorer::metric::format_hundredths),
+            kernel.load
+        );
+        assert!(
+            window.0 <= snapshot.sampled_at.0 && snapshot.sampled_at.0 <= window.1,
+            "the sample time lies between the reads around the scan"
+        );
+        assert_eq!(
+            snapshot.system.cpu,
+            SystemCpu::WarmingUp,
+            "a fresh collector's first read of the host's counters"
+        );
+
+        // Published through the same path the app uses: every line reads as the
+        // kernel's figures, with no collector error.
+        let session = Session::mint();
+        let (_, first) = start_from_source(&session, &mut ProcFsSource::live()).unwrap();
+        let line = |node| summary_line(&session, node);
+        assert_eq!(
+            line(summary::CPU_TEXT),
+            "Overall CPU (100% = all logical CPUs): Warming up"
+        );
+        let memory_line = line(summary::MEMORY_TEXT);
+        let total = srui_process_explorer::metric::format_iec_bytes(kernel.mem_total);
+        assert!(
+            memory_line.starts_with("Memory: ")
+                && memory_line.contains(&format!(" used of {total} ("))
+                && memory_line.ends_with("% of total)"),
+            "{memory_line}"
+        );
+        let swap_line = line(summary::SWAP_TEXT);
+        let swap_total = srui_process_explorer::metric::format_iec_bytes(kernel.swap_total);
+        assert!(
+            (kernel.swap_total == 0 && swap_line == "Swap: none configured")
+                || swap_line.contains(&format!(" used of {swap_total} (")),
+            "{swap_line} against a SwapTotal of {} bytes",
+            kernel.swap_total
+        );
+        assert!(line(summary::UPTIME_TEXT).starts_with("Uptime: "));
+        assert!(line(summary::LOAD_TEXT).starts_with("Load average (1, 5, 15 min): "));
+        let processes = line(summary::PROCESSES_TEXT);
+        assert!(
+            processes.starts_with(&format!("Processes: {} listed · ", first.records.len()))
+                && processes.ends_with(" · unfiltered"),
+            "{processes}"
+        );
+        let freshness = line(summary::FRESHNESS_TEXT);
+        assert!(
+            freshness.starts_with("Last successful sample: ")
+                && freshness.ends_with(" UTC (server clock) · source: procfs:/proc"),
+            "{freshness}"
+        );
+        assert_eq!(
+            summary_role(&session, summary::FRESHNESS_TEXT),
+            srui_sdk::TextRole::Status
+        );
+        session.with_store(|store| {
+            assert_eq!(store.node_count(), srui_process_explorer::SHELL_NODE_COUNT)
+        });
+        println!(
+            "PX-007 live evidence: attempts={attempts} kernel={kernel:?} memory={memory:?} \
+             swap={swap:?} uptime={:?} load={load:?} lines=[{}] [{}] [{}] [{}] [{}] [{}] [{}]",
+            snapshot.system.uptime,
+            line(summary::CPU_TEXT),
+            memory_line,
+            swap_line,
+            line(summary::LOAD_TEXT),
+            line(summary::UPTIME_TEXT),
+            processes,
+            freshness,
+        );
+    }
+
+    /// PX-007 acceptance on a real host: overall CPU is warming up on its first
+    /// read and then measured as a share of all logical CPUs, over the CPUs the
+    /// kernel lists, and the host's busy time across the interval covers the
+    /// CPU time a test-owned busy worker provably used inside it.
+    ///
+    /// Tolerant rather than exact: the worker's own counter is scaled from its
+    /// precise runtime while the host's is sampled per tick, so the bound is
+    /// half the worker's time, which no accounting difference approaches. A
+    /// counter that went backwards is a legitimate `Interrupted` read, which
+    /// the collector publishes as unavailable, so another interval is measured.
+    #[test]
+    fn a_test_owned_busy_worker_shows_in_the_hosts_overall_cpu() {
+        const INTERVAL: Duration = Duration::from_secs(2);
+        let burner = Worker::burn();
+        let mut source = ProcFsSource::live();
+        let session = Session::mint();
+        let (mut view, first) = start_from_source(&session, &mut source).unwrap();
+        assert_eq!(first.system.cpu, SystemCpu::WarmingUp);
+        let mut attempts = 0;
+        let (second, interval, worker) = loop {
+            attempts += 1;
+            let before = cpu_ticks(burner.pid());
+            std::thread::sleep(INTERVAL);
+            let after = cpu_ticks(burner.pid());
+            let second = source.snapshot();
+            match second.system.cpu {
+                SystemCpu::Measured(interval) => break (second, interval, after - before),
+                SystemCpu::Interrupted => {
+                    assert!(attempts < 3, "three intervals in a row were interrupted")
+                }
+                other => panic!("a live interval is measured: {other:?}"),
+            }
+        };
+        assert!(
+            interval.total > 0 && interval.busy <= interval.total,
+            "{interval:?}"
+        );
+        assert_eq!(interval.cpus, Some(KernelFigures::read().cpus));
+        assert!(
+            interval.busy >= worker / 2,
+            "the host was busy for {} ticks across an interval in which one owned worker \
+             alone used {worker}",
+            interval.busy
+        );
+        let share = srui_process_explorer::metric::share_tenths(interval.busy, interval.total)
+            .expect("a measured interval is a share");
+        let outcome = view.apply(&session, LIVE_STATUS_TEXT, &second).unwrap();
+        assert!(outcome.summary >= 3, "{outcome:?}");
+        let cpus = interval.cpus.unwrap();
+        let all = if cpus == 1 {
+            "1 logical CPU".to_string()
+        } else {
+            format!("all {cpus} logical CPUs")
+        };
+        assert_eq!(
+            summary_line(&session, summary::CPU_TEXT),
+            format!(
+                "Overall CPU (100% = {all}): {}",
+                srui_process_explorer::metric::format_cpu_tenths(share)
+            )
+        );
+        assert_eq!(
+            summary_property(&session, summary::CPU_BAR, srui_sdk::VALUE),
+            Some(Value::Float64(share as f64 / 1_000.0))
+        );
+        println!(
+            "PX-007 live CPU evidence: attempts={attempts} busy={} total={} cpus={cpus} \
+             share_tenths={share} worker_ticks={worker} line={:?}",
+            interval.busy,
+            interval.total,
+            summary_line(&session, summary::CPU_TEXT),
         );
     }
 

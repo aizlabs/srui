@@ -1,12 +1,14 @@
 //! Read-only Process Explorer shell using existing SRUI widgets and transactions
-//! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004). No action handlers
-//! are installed and no process is ever opened for control.
+//! (design §§6–8, 12, 22, 29; PX-001/PX-002/PX-003/PX-004, PX-007 system
+//! summary). No action handlers are installed and no process is ever opened for
+//! control.
 
 pub mod metric;
 pub mod procfs;
 mod projection;
 pub mod refresh;
 pub mod source;
+pub mod summary;
 
 use srui_sdk::*;
 use srui_sessiond::{Session, SessionError};
@@ -20,10 +22,15 @@ pub const MODEL: ModelId = ModelId::new(1);
 pub const TITLE: &str = "Process Explorer";
 pub const FIXTURE_TITLE: &str = "Process Explorer — title fixture";
 pub const STATUS_TEXT: &str = "Read-only · Process collection not started";
+/// Every node of the shell: the five above and the system summary between the
+/// status line and the table (PX-007). Rows are model items, never nodes.
+pub const SHELL_NODE_COUNT: usize = 5 + summary::NODE_COUNT;
 
-/// Creates the complete empty shell in one authoritative commit.
+/// Creates the complete empty shell in one authoritative commit. It has no
+/// source, so its summary says that nothing was sampled.
 pub fn initialize(session: &Session) -> Result<(), SessionError> {
-    initialize_rows(session, vec![], STATUS_TEXT)
+    let summary = summary::properties(&summary::summarize(&summary::State::NotStarted));
+    initialize_rows(session, vec![], STATUS_TEXT, &summary)
 }
 
 /// Samples the injected source once and publishes its model rows atomically with the shell,
@@ -191,7 +198,7 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
-/// Publishes the shell and `items` in one transaction.
+/// Publishes the shell, its system summary and `items` in one transaction.
 ///
 /// `items` must already be bounded to what one catch-up snapshot of the
 /// resulting model can carry: this is the start path, and a client that
@@ -203,6 +210,7 @@ pub(crate) fn initialize_rows(
     session: &Session,
     items: Vec<srui_semantic_tree::ModelItem>,
     status: &str,
+    summary: &summary::Properties,
 ) -> Result<(), SessionError> {
     // §26 bounds the items in a single model mutation batch, and a live host can
     // hold more processes than that bound. The rows are therefore published as
@@ -245,6 +253,11 @@ pub(crate) fn initialize_rows(
             .role(TextRole::Status)
             .create(ui)?;
         ui.set(STATUS, READ_ONLY, true)?;
+        // The system summary, between the status line and the table: standard
+        // Text and Progress nodes only (PX-007).
+        for operation in summary::create_operations(summary) {
+            ui.apply_op(&operation)?;
+        }
         Table::builder(TABLE)
             .parent(COLUMN)
             .model_ref(MODEL)
@@ -401,24 +414,81 @@ mod tests {
         initialize(&session).unwrap();
         assert_eq!(session.current_revision(), 1);
         session.with_store(|store| {
-            assert_eq!(store.node_count(), 5);
+            // The five shell nodes and the fourteen of the system summary
+            // (PX-007), which sits between the status line and the table.
+            assert_eq!(store.node_count(), 19);
+            assert_eq!(SHELL_NODE_COUNT, 19);
             assert_eq!(store.root_ids(), &[SURFACE]);
             assert_eq!(store.children_of(SURFACE), Some([COLUMN].as_slice()));
             assert_eq!(
                 store.children_of(COLUMN),
-                Some([HEADING, STATUS, TABLE].as_slice())
+                Some([HEADING, STATUS, summary::SUMMARY, TABLE].as_slice())
             );
-            for (id, expected_type) in [
+            assert_eq!(
+                store.children_of(summary::SUMMARY),
+                Some(
+                    [
+                        summary::CPU_ROW,
+                        summary::MEMORY_ROW,
+                        summary::SWAP_ROW,
+                        summary::LOAD_TEXT,
+                        summary::UPTIME_TEXT,
+                        summary::PROCESSES_TEXT,
+                        summary::FRESHNESS_TEXT,
+                    ]
+                    .as_slice()
+                )
+            );
+            // Each bar precedes its line in its row.
+            for (row, bar, line) in [
+                (summary::CPU_ROW, summary::CPU_BAR, summary::CPU_TEXT),
+                (
+                    summary::MEMORY_ROW,
+                    summary::MEMORY_BAR,
+                    summary::MEMORY_TEXT,
+                ),
+                (summary::SWAP_ROW, summary::SWAP_BAR, summary::SWAP_TEXT),
+            ] {
+                assert_eq!(store.children_of(row), Some([bar, line].as_slice()));
+            }
+            let shell = [
                 (SURFACE, TypeRef::SURFACE),
                 (COLUMN, TypeRef::COLUMN),
                 (HEADING, TypeRef::TEXT),
                 (STATUS, TypeRef::TEXT),
                 (TABLE, TypeRef::TABLE),
-            ] {
+            ];
+            let summary_nodes = summary::LAYOUT.map(|(id, node_type, _)| (id, node_type));
+            for (id, expected_type) in shell.into_iter().chain(summary_nodes) {
                 let node = store.get_node(id).unwrap();
                 assert_eq!(node.node_type, expected_type);
                 assert!(!node.has_property(ACTIONS));
                 assert!(!node.has_property(ACTION_KEY));
+            }
+            // An empty shell has sampled nothing and says so in every line.
+            assert_eq!(
+                store
+                    .get_node(summary::FRESHNESS_TEXT)
+                    .unwrap()
+                    .get_property(TEXT),
+                Some(&Value::String(
+                    "No sample: process collection not started".into()
+                ))
+            );
+            assert_eq!(
+                store
+                    .get_node(summary::MEMORY_TEXT)
+                    .unwrap()
+                    .get_property(TEXT),
+                Some(&Value::String("Memory: Not sampled".into()))
+            );
+            for bar in [summary::CPU_BAR, summary::MEMORY_BAR, summary::SWAP_BAR] {
+                let node = store.get_node(bar).unwrap();
+                assert_eq!(
+                    node.get_property(VISIBILITY),
+                    Some(&Value::from(EnumToken::from(Visibility::Hidden)))
+                );
+                assert!(!node.has_property(VALUE), "no sample, so no bar value");
             }
             assert_eq!(
                 store.get_node(STATUS).unwrap().get_property(READ_ONLY),
@@ -449,7 +519,7 @@ mod tests {
         update_title(&session, FIXTURE_TITLE).unwrap();
         assert_eq!(session.current_revision(), 2);
         session.with_store(|store| {
-            assert_eq!(store.node_count(), 5);
+            assert_eq!(store.node_count(), SHELL_NODE_COUNT);
             assert_eq!(
                 store.get_node(SURFACE).unwrap().get_property(LABEL),
                 Some(&Value::String(FIXTURE_TITLE.into()))
@@ -460,7 +530,7 @@ mod tests {
             );
             assert_eq!(
                 store.children_of(COLUMN),
-                Some([HEADING, STATUS, TABLE].as_slice())
+                Some([HEADING, STATUS, summary::SUMMARY, TABLE].as_slice())
             );
             assert_eq!(store.get_model(MODEL).unwrap().item_count, 0);
         });
@@ -486,7 +556,7 @@ mod tests {
                 store.get_node(SURFACE).unwrap().get_property(LABEL),
                 Some(&Value::String(FIXTURE_TITLE.into()))
             );
-            assert_eq!(store.node_count(), 5);
+            assert_eq!(store.node_count(), SHELL_NODE_COUNT);
         });
     }
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -28,9 +29,11 @@ import sys
 import time
 
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-with open(sys.argv[1], "w", encoding="utf-8") as output:
+# Published by rename, so the pid file never exists without its whole content.
+temporary = f"{sys.argv[1]}.{os.getpid()}.tmp"
+with open(temporary, "w", encoding="utf-8") as output:
     output.write(str(os.getpid()))
-    output.flush()
+os.replace(temporary, sys.argv[1])
 time.sleep(60)
 """
 
@@ -81,21 +84,32 @@ while not descendant_path.exists():
     if time.monotonic() >= deadline:
         raise SystemExit("owner controller descendant did not start")
     time.sleep(0.01)
-state_path.write_text(
+# Published by rename, like the descendant's pid file it carries.
+temporary = state_path.with_name(f"{state_path.name}.tmp")
+temporary.write_text(
     f"{supervisor.pid},{descendant_path.read_text(encoding='utf-8')}",
     encoding="utf-8",
 )
+temporary.replace(state_path)
 time.sleep(60)
 """
 
 
+# Only a whole record counts: a file read before its writer finished is read again.
+PID = re.compile(r"[0-9]+")
+TWO_PIDS = re.compile(r"([0-9]+),([0-9]+)")
+
+
 def wait_for_pid(path: Path) -> int:
     deadline = time.monotonic() + 5
+    text = None
     while time.monotonic() < deadline:
         if path.exists():
-            return int(path.read_text())
+            text = path.read_text(encoding="utf-8")
+            if PID.fullmatch(text):
+                return int(text)
         time.sleep(0.01)
-    raise AssertionError(f"PID file was not written: {path}")
+    raise AssertionError(f"PID file was not written: {path} (last read {text!r})")
 
 
 def assert_process_gone(pid: int) -> None:
@@ -111,13 +125,17 @@ def assert_process_gone(pid: int) -> None:
 
 def wait_for_two_pids(path: Path) -> tuple[int, int]:
     deadline = time.monotonic() + 5
+    text = None
     while time.monotonic() < deadline:
         if path.exists():
-            parts = path.read_text(encoding="utf-8").split(",")
-            if len(parts) == 2:
-                return int(parts[0]), int(parts[1])
+            text = path.read_text(encoding="utf-8")
+            match = TWO_PIDS.fullmatch(text)
+            if match:
+                return int(match[1]), int(match[2])
         time.sleep(0.01)
-    raise AssertionError(f"two-PID state file was not written: {path}")
+    raise AssertionError(
+        f"two-PID state file was not written: {path} (last read {text!r})"
+    )
 
 
 def test_process_identity_wait_accepts_numeric_pid_reuse() -> None:

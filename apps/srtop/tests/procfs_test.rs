@@ -1046,13 +1046,14 @@ mod live {
     };
     use srui_sdk::{ItemId, Value};
     use srui_sessiond::Session;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// Set in a worker's environment, where it turns [`test_owned_worker`] from
-    /// a no-op into the worker's body.
+    /// Set in a worker's environment to the PID of the test process that
+    /// spawned it. [`test_owned_worker`] is a no-op unless that process is its
+    /// parent, so an exported value cannot turn the harness into a worker.
     const WORKER_ENV: &str = "SRTOP_LIVE_WORKER";
     /// The libtest name of [`test_owned_worker`], the one test a worker runs.
     const WORKER_TEST: &str = "live::test_owned_worker";
@@ -1061,11 +1062,13 @@ mod live {
     const WORKER_NAME: &str = "srtop-worker";
     /// What a worker prints, followed by its PID, once it is ready to be scanned.
     const WORKER_READY: &str = "srtop live worker ready: pid=";
-    /// Memory a worker writes and holds. The `rss` that `/proc/<pid>/stat`
-    /// reports leaves out per-CPU counter deltas of up to `max(32, 2 * CPUs)`
-    /// pages each, so a process that has touched little can read as holding
-    /// none; 8 MiB written by one thread is well past that slack.
-    const WORKER_RESIDENT_BYTES: usize = 8 * 1024 * 1024;
+    /// The least memory a worker writes and holds; see [`worker_resident_bytes`].
+    const WORKER_RESIDENT_MIN: usize = 8 * 1024 * 1024;
+    /// The largest base page size Linux uses (64 KiB, on arm64).
+    const LARGEST_PAGE: usize = 64 * 1024;
+    /// CPUs assumed online when the kernel's list cannot be read: many, so a
+    /// worker errs toward writing too much memory rather than too little.
+    const FALLBACK_ONLINE_CPUS: usize = 256;
     /// How long a worker lives if nothing ends it sooner.
     const WORKER_LIFETIME: Duration = Duration::from_secs(60);
     /// How long a test waits for its worker to report ready.
@@ -1092,42 +1095,52 @@ mod live {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env(WORKER_ENV, "1")
+                .env(WORKER_ENV, std::process::id().to_string())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("the test owns this worker");
-            let stdout = child.stdout.take().expect("the worker's stdout is piped");
-            let mut worker = Self(child);
-            // Read on another thread so the wait below has a deadline. The thread
-            // drains the pipe until the worker ends, so the worker never blocks
-            // on output nobody reads.
+            // Both pipes are this test's own, read on other threads so the wait
+            // below has a deadline. stderr carries libtest's own errors and the
+            // worker's panics.
             let (sender, lines) = mpsc::channel();
-            std::thread::spawn(move || {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    let _ = sender.send(line);
-                }
-            });
+            forward_lines(
+                child.stdout.take().expect("stdout is piped"),
+                "",
+                sender.clone(),
+            );
+            forward_lines(
+                child.stderr.take().expect("stderr is piped"),
+                "stderr: ",
+                sender,
+            );
+            let mut worker = Self(child);
             // libtest may already have begun the line with the test's name.
             let ready = format!("{WORKER_READY}{}", worker.pid());
             let deadline = Instant::now() + WORKER_READY_TIMEOUT;
             let mut output = Vec::new();
-            loop {
+            let cause = loop {
                 match lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(line) if line.ends_with(&ready) => return worker,
                     Ok(line) => output.push(line),
-                    Err(cause) => {
-                        let _ = worker.0.kill();
-                        let status = worker.0.wait();
-                        panic!(
-                            "worker {} never reported ready ({cause:?}, waited up to \
-                             {WORKER_READY_TIMEOUT:?}); status {status:?}; output {output:?}",
-                            worker.pid()
-                        );
-                    }
+                    Err(cause) => break cause,
                 }
+            };
+            let _ = worker.0.kill();
+            let status = worker.0.wait();
+            // Both pipes end once the worker is gone: keep what it printed last.
+            let drained = Instant::now() + Duration::from_secs(5);
+            while let Ok(line) =
+                lines.recv_timeout(drained.saturating_duration_since(Instant::now()))
+            {
+                output.push(line);
             }
+            panic!(
+                "worker {} never reported ready ({cause:?}, waited up to \
+                 {WORKER_READY_TIMEOUT:?}); status {status:?}; output {output:?}",
+                worker.pid()
+            );
         }
 
         fn pid(&self) -> u32 {
@@ -1142,38 +1155,79 @@ mod live {
         }
     }
 
-    /// The body of a [`Worker`]. Ignored, and a no-op unless [`WORKER_ENV`] is
-    /// set, so `--ignored` and `--include-ignored` runs stay harmless.
+    /// Sends each line `pipe` yields, after `prefix`, until the pipe ends. It
+    /// keeps draining after nobody listens, so a worker never blocks on output.
+    fn forward_lines(
+        pipe: impl Read + Send + 'static,
+        prefix: &'static str,
+        sender: mpsc::Sender<String>,
+    ) {
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let _ = sender.send(format!("{prefix}{line}"));
+            }
+        });
+    }
+
+    /// The body of a [`Worker`]. Ignored, and a no-op unless [`WORKER_ENV`]
+    /// names this process's parent, so `--ignored` and `--include-ignored` runs
+    /// stay harmless even with the variable exported.
     ///
     /// A worker names itself and writes the memory it holds, and only then
     /// reports ready. It sleeps until it is killed, and ends by itself after
-    /// [`WORKER_LIFETIME`] or once its parent is gone, so an orphan does not
+    /// [`WORKER_LIFETIME`] or once that parent is gone, so an orphan does not
     /// outlive a crashed test for long.
     #[test]
     #[ignore = "the body of a test-owned worker process, which Worker::start runs"]
     fn test_owned_worker() {
-        if std::env::var_os(WORKER_ENV).is_none() {
+        let parent = std::env::var(WORKER_ENV)
+            .ok()
+            .and_then(|pid| pid.parse::<u32>().ok());
+        // Checked against the parent as it is now, so a worker whose test died
+        // before this point ends at once instead of adopting its new parent.
+        let spawned_by_test = || parent == Some(std::os::unix::process::parent_id());
+        if !spawned_by_test() {
             return;
         }
-        // The parent does not read stderr; a failure reaches it on stdout.
-        std::panic::set_hook(Box::new(|panic| {
-            let _ = writeln!(std::io::stdout(), "srtop live worker failed: {panic}");
-        }));
-        let parent = std::os::unix::process::parent_id();
         // Renames the thread-group leader, whichever thread writes it: the name
         // `/proc/<pid>/stat` reports for the process.
         std::fs::write("/proc/self/comm", WORKER_NAME).expect("a process may rename itself");
         // Written, not merely allocated, so every page is resident.
-        let resident = std::hint::black_box(vec![1u8; WORKER_RESIDENT_BYTES]);
+        let resident = std::hint::black_box(vec![1u8; worker_resident_bytes()]);
         let mut stdout = std::io::stdout().lock();
         writeln!(stdout, "{WORKER_READY}{}", std::process::id()).expect("the test reads this");
         stdout.flush().expect("the test reads this");
         drop(stdout);
         let started = Instant::now();
-        while started.elapsed() < WORKER_LIFETIME && std::os::unix::process::parent_id() == parent {
+        while started.elapsed() < WORKER_LIFETIME && spawned_by_test() {
             std::thread::sleep(Duration::from_millis(100));
         }
         drop(resident);
+    }
+
+    /// How much memory a worker writes and holds, so that the `rss` in
+    /// `/proc/<pid>/stat` cannot read as zero. That field leaves out per-CPU
+    /// counter deltas smaller than the kernel's batch, `max(32, 2 * online
+    /// CPUs)` pages, so one thread writing four batches of the largest page
+    /// size has at least three counted. Never less than [`WORKER_RESIDENT_MIN`].
+    fn worker_resident_bytes() -> usize {
+        let cpus = online_cpus().unwrap_or(FALLBACK_ONLINE_CPUS);
+        (4 * (2 * cpus).max(32) * LARGEST_PAGE).max(WORKER_RESIDENT_MIN)
+    }
+
+    /// How many CPUs the kernel has online, the count it sizes that batch by,
+    /// from the ranges in `/sys/devices/system/cpu/online` (`0-3,8-11`). Not
+    /// `available_parallelism`, which a cgroup can hold below that count.
+    fn online_cpus() -> Option<usize> {
+        let list = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+        list.trim()
+            .split(',')
+            .map(|range| {
+                let (first, last) = range.split_once('-').unwrap_or((range, range));
+                let (first, last) = (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?);
+                last.checked_sub(first).map(|span| span + 1)
+            })
+            .sum()
     }
 
     #[test]

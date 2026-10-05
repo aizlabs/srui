@@ -7,19 +7,20 @@
 //! suite must run unprivileged, like the app itself: the denied-record case
 //! relies on mode 0 being unreadable.
 use srui_process_explorer::procfs::{
-    parse_pid, parse_stat, ProcFsSource, LIVE_STATUS_TEXT, MAX_FILE_BYTES,
+    parse_pid, parse_stat, MonotonicClock, ProcFsSource, LIVE_STATUS_TEXT, MAX_FILE_BYTES,
 };
 use srui_process_explorer::published_status;
 use srui_process_explorer::source::{
-    Completeness, CreationToken, DisplayName, IssueScope, MissingReason, Observed, ProcessSource,
-    Retention, SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
+    Completeness, CpuInterval, CpuUsage, CreationToken, DisplayName, IssueScope, MissingReason,
+    Observed, ProcessSource, Retention, SourceId, FAKE_STATUS_TEXT, MAX_RECORDED_ISSUES,
 };
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct ProcFixture(PathBuf);
 
@@ -88,6 +89,22 @@ impl ProcFixture {
     /// belongs — a count no scan can read as a number of pages.
     fn unreadable_resident(&self, pid: u32, comm: &[u8], ticks: u64, field: &str) -> &Self {
         self.raw(pid, &stat_line_with_resident(pid, comm, ticks, field))
+    }
+
+    /// A record whose `stat` reports `utime` and `stime` verbatim as fields 14
+    /// and 15 (PX-006).
+    fn cpu(&self, pid: u32, comm: &[u8], ticks: u64, utime: &str, stime: &str) -> &Self {
+        self.raw(pid, &stat_line_with_cpu(pid, comm, ticks, utime, stime))
+    }
+
+    /// The page size and the clock-tick rate this tree reports, through
+    /// `AT_PAGESZ` and `AT_CLKTCK` in its own `self/auxv`.
+    fn clock_ticks(&self, hz: u64) -> &Self {
+        self.auxv(&auxv(&[
+            (AT_PAGESZ, FIXTURE_PAGE_SIZE),
+            (AT_CLKTCK, hz),
+            (AT_NULL, 0),
+        ]))
     }
 
     fn raw(&self, pid: u32, stat: &[u8]) -> &Self {
@@ -162,6 +179,8 @@ const FIXTURE_PAGE_SIZE: u64 = 8192;
 /// and this suite cannot drift onto the same wrong constant.
 const AT_PAGESZ: u64 = 6;
 const AT_NULL: u64 = 0;
+/// `AT_CLKTCK`, likewise transcribed from `getauxval(3)` (PX-006).
+const AT_CLKTCK: u64 = 17;
 
 /// `entries` as an auxiliary vector: pairs of native-endian pointer-width words,
 /// exactly the layout `/proc/<pid>/auxv` carries.
@@ -192,6 +211,25 @@ fn stat_line_with_resident(pid: u32, comm: &[u8], ticks: u64, resident: &str) ->
     }
     // Field 22 is the start time, 23 the virtual size, 24 the resident pages.
     line.extend_from_slice(format!(" {ticks} 4096 {resident} 18446744073709551615\n").as_bytes());
+    line
+}
+
+/// The same line with `utime` and `stime` written verbatim as fields 14 and 15
+/// (K1, `proc_pid_stat(5)`), and a resident count of zero.
+fn stat_line_with_cpu(pid: u32, comm: &[u8], ticks: u64, utime: &str, stime: &str) -> Vec<u8> {
+    let mut line = format!("{pid} (").into_bytes();
+    line.extend_from_slice(comm);
+    line.extend_from_slice(b") S");
+    // Fields 4 through 21; field 14 is the 11th of them and field 15 the 12th.
+    for (field, filler) in (4..=21).zip(1..=18) {
+        let value = match field {
+            14 => utime.to_string(),
+            15 => stime.to_string(),
+            _ => filler.to_string(),
+        };
+        line.extend_from_slice(format!(" {value}").as_bytes());
+    }
+    line.extend_from_slice(format!(" {ticks} 4096 0 18446744073709551615\n").as_bytes());
     line
 }
 
@@ -1037,6 +1075,371 @@ fn a_page_count_too_large_to_convert_is_unavailable_rather_than_wrapped() {
     assert_eq!(snapshot.completeness, Completeness::Complete);
 }
 
+/// A monotonic clock this suite sets by hand (PX-006).
+///
+/// The collector measures every CPU interval on its injected clock and nothing
+/// else, so each interval below is exactly the one a test states — including
+/// the zero and backwards intervals a real monotonic clock never produces —
+/// however long the scan really took on the wall clock.
+#[derive(Debug, Default)]
+struct ManualClock(Mutex<Duration>);
+
+impl ManualClock {
+    fn set(&self, seconds: u64) {
+        *self.0.lock().unwrap() = Duration::from_secs(seconds);
+    }
+}
+
+impl MonotonicClock for ManualClock {
+    fn now(&self) -> Duration {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// A persistent collector over `fixture`, measuring on a clock the test owns.
+fn clocked(fixture: &ProcFixture) -> (ProcFsSource, Arc<ManualClock>) {
+    let clock = Arc::new(ManualClock::default());
+    let source = fixture.source().with_clock(clock.clone());
+    (source, clock)
+}
+
+/// The CPU usage of every record a scan published, in scan order.
+fn cpu_of(snapshot: &srui_process_explorer::source::ProcessSnapshot) -> Vec<CpuUsage> {
+    snapshot.records.iter().map(|record| record.cpu).collect()
+}
+
+/// The CPU cell of every published row, in model order.
+fn cpu_cells(session: &srui_sessiond::Session) -> Vec<String> {
+    session.with_store(|store| {
+        store
+            .get_model(srui_process_explorer::MODEL)
+            .expect("the shell publishes one collection")
+            .items
+            .values()
+            .map(|item| {
+                let srui_sdk::Value::List(cells) = &item.value else {
+                    panic!("expected table cells, got {:?}", item.value)
+                };
+                let srui_sdk::Value::String(text) = &cells[3] else {
+                    panic!("a metric cell is published as text, got {:?}", cells[3])
+                };
+                text.clone()
+            })
+            .collect()
+    })
+}
+
+fn measured(ticks: u64, seconds: u64) -> CpuUsage {
+    CpuUsage::Measured(CpuInterval {
+        ticks,
+        ticks_per_second: 100,
+        elapsed: Duration::from_secs(seconds),
+    })
+}
+
+/// PX-006: deterministic counters give the expected single-CPU and multicore
+/// percentages, over the injected monotonic interval and never the wall clock.
+#[test]
+fn cpu_usage_is_counter_ticks_over_the_injected_monotonic_interval() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"single", 500, "100", "50")
+        .cpu(20, b"threads", 600, "1000", "0")
+        .cpu(30, b"idle", 700, "5", "5");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(1_000);
+    let first = source.snapshot();
+    // Nothing to subtract yet: every first sample is visibly warming up, and
+    // none of them is a zero.
+    assert_eq!(cpu_of(&first), vec![CpuUsage::WarmingUp; 3]);
+    assert_eq!(first.completeness, Completeness::Complete);
+
+    // One CPU half used (user and system time both count), four and a half
+    // CPUs fully used by one multithreaded process, and a process that ran not
+    // at all — across two seconds of the injected monotonic clock.
+    fixture
+        .cpu(10, b"single", 500, "170", "80")
+        .cpu(20, b"threads", 600, "1900", "0");
+    clock.set(1_002);
+    let second = source.snapshot();
+    assert_eq!(
+        cpu_of(&second),
+        vec![measured(100, 2), measured(900, 2), measured(0, 2)]
+    );
+    let cells: Vec<String> = second
+        .records
+        .iter()
+        .map(|record| srui_process_explorer::metric::cpu_cell(&record.cpu))
+        .collect();
+    assert_eq!(cells, vec!["50.0%", "450.0%", "0.0%"]);
+    // The wall clock moved by far less than the two seconds divided by: the
+    // sample time is a wall-clock stamp and never reaches the divisor, so a
+    // wall-clock jump of any size cannot stretch or shrink an interval.
+    let wall = second
+        .sampled_at
+        .0
+        .duration_since(first.sampled_at.0)
+        .unwrap_or_default();
+    assert!(wall < Duration::from_secs(1), "{wall:?}");
+}
+
+/// PX-006: a reused PID with a new creation token is another process instance.
+/// It warms up rather than inheriting — and subtracting — the counters of the
+/// process it replaced, which would be a reset or a spike.
+#[test]
+fn a_replacement_under_a_reused_pid_warms_up_instead_of_inheriting_counters() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"worker", 500, "5000", "0");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(10);
+    source.snapshot();
+    // Same PID, same name, a later start time, and far fewer ticks.
+    fixture.cpu(10, b"worker", 900, "7", "0");
+    clock.set(11);
+    let replaced = source.snapshot();
+    assert_eq!(cpu_of(&replaced), vec![CpuUsage::WarmingUp]);
+    assert_eq!(
+        replaced.records[0].key.creation,
+        CreationToken::LinuxBootTicks(900)
+    );
+    // And the new instance is then measured against its own first sample.
+    fixture.cpu(10, b"worker", 900, "57", "0");
+    clock.set(13);
+    assert_eq!(cpu_of(&source.snapshot()), vec![measured(50, 2)]);
+}
+
+/// PX-006: a counter that went backwards for the same instance is a reset, not
+/// a measurement — never a wrapped unsigned delta — and the next interval is
+/// measured from the reset value.
+#[test]
+fn a_counter_that_goes_backwards_is_unavailable_and_then_measured_again() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"worker", 500, "300", "0");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(10);
+    source.snapshot();
+    fixture.cpu(10, b"worker", 500, "20", "0");
+    clock.set(11);
+    assert_eq!(
+        cpu_of(&source.snapshot()),
+        vec![CpuUsage::Missing(MissingReason::Unavailable)]
+    );
+    fixture.cpu(10, b"worker", 500, "120", "0");
+    clock.set(12);
+    assert_eq!(cpu_of(&source.snapshot()), vec![measured(100, 1)]);
+}
+
+/// PX-006: an interval that did not advance has no divisor, and one that ran
+/// backwards has no meaning. Neither is published as a value or a spike.
+#[test]
+fn an_interval_that_does_not_advance_is_unavailable_and_never_a_spike() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"worker", 500, "0", "0");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(5);
+    source.snapshot();
+    // A hundred ticks in zero time would be an infinite percentage.
+    fixture.cpu(10, b"worker", 500, "100", "0");
+    let unavailable = vec![CpuUsage::Missing(MissingReason::Unavailable)];
+    assert_eq!(cpu_of(&source.snapshot()), unavailable);
+    // The older baseline was kept, so the next interval spans both scans.
+    fixture.cpu(10, b"worker", 500, "200", "0");
+    clock.set(6);
+    assert_eq!(cpu_of(&source.snapshot()), vec![measured(200, 1)]);
+    // A clock reading earlier than the baseline: unavailable, then rebased.
+    fixture.cpu(10, b"worker", 500, "300", "0");
+    clock.set(4);
+    assert_eq!(cpu_of(&source.snapshot()), unavailable);
+    fixture.cpu(10, b"worker", 500, "350", "0");
+    clock.set(5);
+    assert_eq!(cpu_of(&source.snapshot()), vec![measured(50, 1)]);
+}
+
+/// PX-006: a mount that cannot state its tick rate publishes no CPU value on any
+/// scan — not a warm-up that never ends, and never a zero — and the reason the
+/// rate is missing is the one published.
+#[test]
+fn a_mount_that_cannot_state_its_tick_rate_publishes_no_cpu_value() {
+    let fixture = ProcFixture::new();
+    // `identity` states a page size and no tick rate.
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .cpu(10, b"worker", 500, "0", "0");
+    let (mut source, clock) = clocked(&fixture);
+    for (second, ticks) in [(1, "0"), (2, "100")] {
+        fixture.cpu(10, b"worker", 500, ticks, "0");
+        clock.set(second);
+        let snapshot = source.snapshot();
+        assert_eq!(
+            cpu_of(&snapshot),
+            vec![CpuUsage::Missing(MissingReason::Unavailable)]
+        );
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+    }
+    for (second, implausible) in [(3, 0), (4, 1_000_001)] {
+        fixture.clock_ticks(implausible);
+        clock.set(second);
+        assert_eq!(
+            cpu_of(&source.snapshot()),
+            vec![CpuUsage::Missing(MissingReason::Unavailable)],
+            "{implausible} ticks per second"
+        );
+    }
+    // Present but unreadable: the reason is reported, not flattened.
+    fixture.clock_ticks(100);
+    fs::set_permissions(
+        fixture.0.join("self/auxv"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    clock.set(5);
+    assert_eq!(
+        cpu_of(&source.snapshot()),
+        vec![CpuUsage::Missing(MissingReason::Denied)]
+    );
+    let session = srui_sessiond::Session::mint();
+    srui_process_explorer::initialize_from_source(&session, &mut source).unwrap();
+    assert_eq!(cpu_cells(&session), vec!["Denied"]);
+}
+
+/// PX-006: an unparsable counter is an unread metric of a published record; the
+/// record list stays authoritative and the next readable sample warms up.
+#[test]
+fn an_unreadable_cpu_counter_is_unavailable_and_the_record_is_still_published() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"worker", 500, "100", "0");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(1);
+    source.snapshot();
+    for (second, utime, stime) in [(2, "-4", "0"), (3, "100", "x")] {
+        fixture.cpu(10, b"worker", 500, utime, stime);
+        clock.set(second);
+        let snapshot = source.snapshot();
+        assert_eq!(
+            cpu_of(&snapshot),
+            vec![CpuUsage::Missing(MissingReason::Unavailable)]
+        );
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+        assert_eq!(snapshot.records[0].display_name.as_str(), "worker");
+    }
+    fixture.cpu(10, b"worker", 500, "150", "0");
+    clock.set(4);
+    assert_eq!(cpu_of(&source.snapshot()), vec![CpuUsage::WarmingUp]);
+}
+
+/// PX-006: start ticks are only comparable within one boot. A boot ID that
+/// comes back different discards every baseline; one the scan merely could not
+/// read is not a reboot and discards nothing.
+#[test]
+fn a_different_boot_discards_every_baseline_and_an_unreadable_one_does_not() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"worker", 500, "100", "0");
+    let boot = fixture.0.join("sys/kernel/random/boot_id");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(1);
+    source.snapshot();
+    fs::remove_file(&boot).unwrap();
+    fixture.cpu(10, b"worker", 500, "150", "0");
+    clock.set(2);
+    assert_eq!(cpu_of(&source.snapshot()), vec![measured(50, 1)]);
+    fs::write(&boot, "boot-b\n").unwrap();
+    fixture.cpu(10, b"worker", 500, "200", "0");
+    clock.set(3);
+    assert_eq!(cpu_of(&source.snapshot()), vec![CpuUsage::WarmingUp]);
+}
+
+/// PX-006: the collector keeps one baseline per record it last published, so a
+/// process that ended is forgotten; a scan that could not list the root read no
+/// counter and keeps every baseline for the next good scan.
+#[test]
+fn cpu_baselines_are_bounded_by_the_last_published_records() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"a", 500, "0", "0")
+        .cpu(20, b"b", 600, "0", "0")
+        .cpu(30, b"c", 700, "0", "0");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(1);
+    source.snapshot();
+    assert_eq!(source.cpu_baselines(), 3);
+    fs::remove_dir_all(fixture.0.join("20")).unwrap();
+    fs::remove_dir_all(fixture.0.join("30")).unwrap();
+    clock.set(2);
+    source.snapshot();
+    assert_eq!(source.cpu_baselines(), 1);
+
+    // Searchable but not listable: identity files still open by path, the
+    // listing itself fails.
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o300)).unwrap();
+    clock.set(3);
+    let failed = source.snapshot();
+    fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(failed.records.is_empty());
+    assert!(!failed.completeness.is_complete());
+    assert_eq!(
+        source.cpu_baselines(),
+        1,
+        "a failed listing read no counter"
+    );
+    fixture.cpu(10, b"a", 500, "300", "0");
+    clock.set(5);
+    // Measured from the last scan that read the counter, across the failed one.
+    assert_eq!(cpu_of(&source.snapshot()), vec![measured(300, 3)]);
+}
+
+/// PX-006 through the publication path: the first publication is visibly
+/// warming up, the next refresh publishes the measured value in place, and an
+/// idle process that stays idle publishes nothing further.
+#[test]
+fn the_first_publication_is_warming_up_and_a_refresh_publishes_the_measured_value() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .clock_ticks(100)
+        .cpu(10, b"worker", 500, "100", "0");
+    let (mut source, clock) = clocked(&fixture);
+    clock.set(100);
+    let session = srui_sessiond::Session::mint();
+    let (mut view, _) = srui_process_explorer::start_from_source(&session, &mut source).unwrap();
+    assert_eq!(cpu_cells(&session), vec!["Warming up"]);
+
+    fixture.cpu(10, b"worker", 500, "125", "25");
+    clock.set(101);
+    let outcome = view.refresh(&session, &mut source).unwrap();
+    assert_eq!((outcome.inserted, outcome.deleted), (0, 0));
+    assert_eq!(outcome.updated, 1, "{outcome:?}");
+    assert_eq!(cpu_cells(&session), vec!["50.0%"]);
+
+    clock.set(102);
+    let outcome = view.refresh(&session, &mut source).unwrap();
+    assert_eq!(outcome.updated, 1, "{outcome:?}");
+    assert_eq!(cpu_cells(&session), vec!["0.0%"]);
+    let revision = session.current_revision();
+    clock.set(103);
+    let outcome = view.refresh(&session, &mut source).unwrap();
+    assert_eq!(outcome.updated, 0, "{outcome:?}");
+    assert_eq!(session.current_revision(), revision, "nothing changed");
+}
+
 #[cfg(target_os = "linux")]
 mod live {
     use super::*;
@@ -1054,8 +1457,24 @@ mod live {
 
     impl Worker {
         fn start() -> Self {
-            let child = Command::new("/bin/sleep")
-                .arg("47")
+            Self::spawn(Command::new("/bin/sleep").arg("47"))
+        }
+
+        /// A single-threaded shell loop that is runnable for as long as it
+        /// lives: shell builtins only, so it never forks and every tick it is
+        /// scheduled for is charged to this one process (PX-006). It is bounded
+        /// twice — by its own iteration count, which ends it within about a
+        /// minute even on a fast host if this test process dies, and by `Drop`,
+        /// which kills and reaps it as soon as the test ends.
+        fn burn() -> Self {
+            Self::spawn(Command::new("/bin/sh").args([
+                "-c",
+                "i=0; while [ \"$i\" -lt 300000000 ]; do i=$((i+1)); done",
+            ]))
+        }
+
+        fn spawn(command: &mut Command) -> Self {
+            let child = command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1377,6 +1796,102 @@ mod live {
             outcome.updated,
         );
         drop(block);
+    }
+
+    /// PX-006 acceptance on a real host: a bounded worker this test owns, which
+    /// is runnable for the whole interval, reads as roughly one logical CPU, and
+    /// a sleeping one as roughly none. Both are first published as warming up.
+    ///
+    /// Tolerances rather than exact values, because the scheduler is not a
+    /// contract: a loaded host may give the burner less than a full CPU, and
+    /// tick accounting has a resolution of one tick per `1 / CLK_TCK` seconds.
+    /// The upper bound is the one that cannot pass by accident — a
+    /// single-threaded process cannot use more than one CPU, so a reading well
+    /// above 100% is a measurement defect (a wall-clock divisor, a stale
+    /// baseline, a spike), not load.
+    #[test]
+    fn a_test_owned_busy_worker_reads_about_one_cpu_and_a_sleeping_one_about_none() {
+        /// One tick of slack at USER_HZ 100 over the interval, plus the time a
+        /// scan takes, is far below this.
+        const UPPER_TENTHS: u64 = 1_150;
+        /// A single runnable thread on a host this suite runs on gets far more
+        /// than this; less means the interval or the counters are wrong.
+        const LOWER_TENTHS: u64 = 300;
+        /// A sleeping worker is woken by nothing in the interval.
+        const IDLE_TENTHS: u64 = 50;
+        const INTERVAL: Duration = Duration::from_secs(2);
+
+        let burner = Worker::burn();
+        let sleeper = Worker::start();
+        let mut source = ProcFsSource::live();
+        let session = Session::mint();
+        let (mut view, first) = start_from_source(&session, &mut source).unwrap();
+        assert_eq!(cpu_for(&first, burner.pid()), CpuUsage::WarmingUp);
+        assert_eq!(cpu_for(&first, sleeper.pid()), CpuUsage::WarmingUp);
+        assert_eq!(published_cpu(&session, burner.pid()), "Warming up");
+
+        let started = Instant::now();
+        std::thread::sleep(INTERVAL);
+        let second = source.snapshot();
+        let wall = started.elapsed();
+        let burning = cpu_for(&second, burner.pid());
+        let sleeping = cpu_for(&second, sleeper.pid());
+        let tenths = |usage: CpuUsage| match usage {
+            CpuUsage::Measured(interval) => {
+                srui_process_explorer::metric::cpu_tenths_of_percent(&interval)
+                    .expect("a live interval is publishable")
+            }
+            other => panic!("a second live sample must be measured: {other:?}"),
+        };
+        let (burning_tenths, sleeping_tenths) = (tenths(burning), tenths(sleeping));
+        assert!(
+            (LOWER_TENTHS..=UPPER_TENTHS).contains(&burning_tenths),
+            "a runnable single-threaded worker read {burning_tenths} tenths of a percent"
+        );
+        assert!(
+            sleeping_tenths <= IDLE_TENTHS,
+            "a sleeping worker read {sleeping_tenths} tenths of a percent"
+        );
+        let outcome = view.apply(&session, LIVE_STATUS_TEXT, &second).unwrap();
+        assert!(outcome.updated >= 2, "{outcome:?}");
+        assert_eq!(
+            published_cpu(&session, burner.pid()),
+            srui_process_explorer::metric::cpu_cell(&burning)
+        );
+        session.with_store(|store| assert_eq!(store.node_count(), 5));
+        println!(
+            "PX-006 live evidence: burner_pid={} sleeper_pid={} wall={wall:?} \
+             burner={burning:?} burner_cell={:?} sleeper={sleeping:?} sleeper_cell={:?} \
+             records={} updated={}",
+            burner.pid(),
+            sleeper.pid(),
+            published_cpu(&session, burner.pid()),
+            published_cpu(&session, sleeper.pid()),
+            second.records.len(),
+            outcome.updated,
+        );
+    }
+
+    /// The CPU usage `snapshot` observed for `pid`.
+    fn cpu_for(snapshot: &srui_process_explorer::source::ProcessSnapshot, pid: u32) -> CpuUsage {
+        snapshot
+            .records
+            .iter()
+            .find(|record| record.key.pid == Observed::Known(pid))
+            .expect("a live scan lists the test's own worker")
+            .cpu
+    }
+
+    /// The CPU cell a client would show for `pid`.
+    fn published_cpu(session: &Session, pid: u32) -> String {
+        let (_, value) = row_for(session, pid).expect("the row of this process is published");
+        let Value::List(cells) = value else {
+            panic!("expected table cells")
+        };
+        let Value::String(text) = &cells[3] else {
+            panic!("a metric cell is published as text, got {:?}", cells[3])
+        };
+        text.clone()
     }
 
     /// The resident bytes `snapshot` observed for `pid`, which a live scan of

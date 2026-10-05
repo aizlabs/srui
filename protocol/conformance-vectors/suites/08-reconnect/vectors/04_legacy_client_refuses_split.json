@@ -1,0 +1,25 @@
+{
+  "name": "legacy_client_refuses_split",
+  "description": "A client that did not advertise max_snapshot_parts stages exactly one envelope, so a split announcement is refused (size bound).",
+  "spec_sections": [
+    "§12.1",
+    "§18",
+    "§26",
+    "§32.8"
+  ],
+  "client_limits": {
+    "max_snapshot_parts": 0,
+    "max_transaction_operations": 10000
+  },
+  "decision": {
+    "snapshot_revision": 7,
+    "snapshot_parts": 2
+  },
+  "envelopes": [],
+  "expected_outcome": {
+    "status": "rejected",
+    "error": "parts_exceed_limit",
+    "at_envelope": null,
+    "replica_unchanged": true
+  }
+}

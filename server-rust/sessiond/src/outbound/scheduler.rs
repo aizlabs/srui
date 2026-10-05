@@ -51,6 +51,7 @@ pub fn logical_class_for_server_envelope(message: &SruiMessage) -> Option<Logica
         Some(srui_message::Msg::ServerWelcome(_))
         | Some(srui_message::Msg::ServerResumeOk(_))
         | Some(srui_message::Msg::ServerResyncRequired(_))
+        | Some(srui_message::Msg::ServerHandshakeRefused(_))
         | Some(srui_message::Msg::ServerEventAck(_)) => Some(LogicalChannelClass::Control),
         Some(srui_message::Msg::Transaction(_)) => Some(LogicalChannelClass::Ui),
         Some(srui_message::Msg::ResourceMetadata(_))

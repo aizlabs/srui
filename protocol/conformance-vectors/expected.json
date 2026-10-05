@@ -261,6 +261,83 @@
         "reason": 1,
         "reason_name": "RETENTION_LOSS"
       }
+    },
+    "golden_snapshot_parts_client_hello": {
+      "file": "golden_snapshot_parts_client_hello.bin",
+      "sha256": "2f3c99c7ec4fbe93ea77ad5cfe8a78777d6eb082a3079f2c7954ea6554485cef",
+      "hex": "340a320a05302e352e30121b6f72672e737275692e7374616e646172642d776964676574732f311a07088080800838102203633137",
+      "byte_length": 53,
+      "expected": {
+        "msg_type": "client_hello",
+        "core_version": "0.5.0",
+        "profiles": [
+          "org.srui.standard-widgets/1"
+        ],
+        "client_instance_id": "c17",
+        "limits": {
+          "max_frame_size": 16777216,
+          "max_snapshot_parts": 16
+        }
+      }
+    },
+    "golden_snapshot_parts_welcome": {
+      "file": "golden_snapshot_parts_welcome.bin",
+      "sha256": "2958187832810023d88bd29f65a7f312d3076ff5fa2e686be695eb838d2fcd8c",
+      "hex": "4c124a0a05302e352e30121b6f72672e737275692e7374616e646172642d776964676574732f3122036162632811321b0a196f72672e737275692e7374616e646172642d776964676574734002",
+      "byte_length": 77,
+      "expected": {
+        "msg_type": "server_welcome",
+        "core_version": "0.5.0",
+        "required_profiles": [
+          "org.srui.standard-widgets/1"
+        ],
+        "session_id": "abc",
+        "initial_revision": 17,
+        "extension_namespaces": [
+          {
+            "extension_uri": "org.srui.standard-widgets",
+            "namespace_id": 0
+          }
+        ],
+        "snapshot_parts": 2
+      }
+    },
+    "golden_snapshot_parts_resync_required": {
+      "file": "golden_snapshot_parts_resync_required.bin",
+      "sha256": "2f611c4c26d111dc390d124030dff63c3eaa6bc0d9c21a20c0753d3617327fce",
+      "hex": "582a560a0361626310a2111a0b6a6f75726e616c5f676170200128d1043a1b6f72672e737275692e7374616e646172642d776964676574732f314a1b0a196f72672e737275692e7374616e646172642d776964676574735003",
+      "byte_length": 89,
+      "expected": {
+        "msg_type": "server_resync_required",
+        "session_id": "abc",
+        "snapshot_revision": 2210,
+        "reason": "journal_gap",
+        "continuity": 1,
+        "continuity_name": "SAME_SESSION",
+        "last_processed_event_seq": 593,
+        "required_profiles": [
+          "org.srui.standard-widgets/1"
+        ],
+        "extension_namespaces": [
+          {
+            "extension_uri": "org.srui.standard-widgets",
+            "namespace_id": 0
+          }
+        ],
+        "snapshot_parts": 3
+      }
+    },
+    "golden_handshake_refused": {
+      "file": "golden_handshake_refused.bin",
+      "sha256": "ab5a3807d7d6e8961be10fd5edb207121c414ba978314db9a70fac4e3b1e9817",
+      "hex": "3a82013708011233736e617073686f74206e65656473203220656e76656c6f7065733b20636c69656e7420737461676573206174206d6f73742031",
+      "byte_length": 59,
+      "expected": {
+        "msg_type": "server_handshake_refused",
+        "reason": 1,
+        "reason_name": "SNAPSHOT_UNDELIVERABLE",
+        "detail": "snapshot needs 2 envelopes; client stages at most 1"
+      }
     }
   },
   "malformed_vectors": {

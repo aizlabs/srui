@@ -330,6 +330,7 @@ fn test_protocol_envelope_carries_no_frame_or_cadence_concept() {
         | Msg::ClientResume(_)
         | Msg::ServerResumeOk(_)
         | Msg::ServerResyncRequired(_)
+        | Msg::ServerHandshakeRefused(_)
         | Msg::Transaction(_) => {}
         // Interaction and its acknowledgement.
         Msg::Event(_) | Msg::ServerEventAck(_) => {}

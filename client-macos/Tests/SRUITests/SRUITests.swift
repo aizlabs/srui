@@ -849,6 +849,94 @@ final class SRUITests: XCTestCase {
         )
     }
 
+    // MARK: - Snapshot framing vectors (§18, §26)
+
+    private func standardWidgetsMapping() -> Srui_Protocol_ExtensionNamespaceMapping {
+        var mapping = Srui_Protocol_ExtensionNamespaceMapping()
+        mapping.extensionUri = "org.srui.standard-widgets"
+        mapping.namespaceID = 0
+        return mapping
+    }
+
+    /// Authored twins of the snapshot-framing vectors `generate_fixtures` writes.
+    private func createAuthoredSnapshotFramingVectors() -> [(String, Srui_Protocol_SruiMessage)] {
+        var hello = Srui_Protocol_ClientHello()
+        hello.coreVersion = "0.5.0"
+        hello.profiles = ["org.srui.standard-widgets/1"]
+        hello.limits.maxFrameSize = 16_777_216
+        hello.limits.maxSnapshotParts = 16
+        hello.clientInstanceID = Data("c17".utf8)
+        var helloMessage = Srui_Protocol_SruiMessage()
+        helloMessage.clientHello = hello
+
+        var welcome = Srui_Protocol_ServerWelcome()
+        welcome.coreVersion = "0.5.0"
+        welcome.requiredProfiles = ["org.srui.standard-widgets/1"]
+        welcome.sessionID = "abc"
+        welcome.initialRevision = 17
+        welcome.extensionNamespaces = [standardWidgetsMapping()]
+        welcome.snapshotParts = 2
+        var welcomeMessage = Srui_Protocol_SruiMessage()
+        welcomeMessage.serverWelcome = welcome
+
+        var resync = Srui_Protocol_ServerResyncRequired()
+        resync.sessionID = "abc"
+        resync.snapshotRevision = 2210
+        resync.reason = "journal_gap"
+        resync.continuity = .sameSession
+        resync.lastProcessedEventSeq = 593
+        resync.requiredProfiles = ["org.srui.standard-widgets/1"]
+        resync.extensionNamespaces = [standardWidgetsMapping()]
+        resync.snapshotParts = 3
+        var resyncMessage = Srui_Protocol_SruiMessage()
+        resyncMessage.serverResyncRequired = resync
+
+        var refusal = Srui_Protocol_ServerHandshakeRefused()
+        refusal.reason = .snapshotUndeliverable
+        refusal.detail = "snapshot needs 2 envelopes; client stages at most 1"
+        var refusalMessage = Srui_Protocol_SruiMessage()
+        refusalMessage.serverHandshakeRefused = refusal
+
+        return [
+            ("golden_snapshot_parts_client_hello", helloMessage),
+            ("golden_snapshot_parts_welcome", welcomeMessage),
+            ("golden_snapshot_parts_resync_required", resyncMessage),
+            ("golden_handshake_refused", refusalMessage),
+        ]
+    }
+
+    /// Swift decode, encode-from-scratch and roundtrip are bit-identical to the Rust-written bytes.
+    func testSnapshotFramingVectorsMatchExpectedJSON() throws {
+        let spec = try loadExpectedSpec()
+        let vectors = try XCTUnwrap(spec["vectors"] as? [String: Any])
+        for (key, authored) in createAuthoredSnapshotFramingVectors() {
+            try assertAuthoredTerminalMatchesFixture(key, authored)
+            let expected = try XCTUnwrap(
+                (vectors[key] as? [String: Any])?["expected"] as? [String: Any])
+            try assertFramedTerminalVector(key: key, authored: authored) { decoded in
+                switch decoded.msg {
+                case .clientHello(let hello)?:
+                    let limits = expected["limits"] as? [String: Any]
+                    XCTAssertEqual(
+                        Int(hello.limits.maxSnapshotParts), limits?["max_snapshot_parts"] as? Int)
+                    XCTAssertEqual(Int(hello.limits.maxFrameSize), limits?["max_frame_size"] as? Int)
+                case .serverWelcome(let welcome)?:
+                    XCTAssertEqual(Int(welcome.snapshotParts), expected["snapshot_parts"] as? Int)
+                    XCTAssertEqual(Int(welcome.initialRevision), expected["initial_revision"] as? Int)
+                case .serverResyncRequired(let resync)?:
+                    XCTAssertEqual(Int(resync.snapshotParts), expected["snapshot_parts"] as? Int)
+                    XCTAssertEqual(
+                        Int(resync.snapshotRevision), expected["snapshot_revision"] as? Int)
+                case .serverHandshakeRefused(let refusal)?:
+                    XCTAssertEqual(refusal.reason.rawValue, expected["reason"] as? Int)
+                    XCTAssertEqual(refusal.detail, expected["detail"] as? String)
+                default:
+                    XCTFail("\(key): unexpected payload \(String(describing: decoded.msg))")
+                }
+            }
+        }
+    }
+
     /// Negative decode vectors for the terminal envelopes (§21, §26; CLAUDE.md decode-path rule).
     func testMalformedTerminalVectorsRejectedBySwiftDecodePath() async throws {
         let spec = try loadExpectedSpec()

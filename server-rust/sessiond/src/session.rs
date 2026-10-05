@@ -204,6 +204,9 @@ pub enum SessionError {
     #[error("catch-up snapshot needs {actual} operations but a transaction may carry at most {limit} (§26)")]
     SnapshotUnrepresentable { limit: usize, actual: usize },
 
+    #[error("catch-up snapshot cannot be delivered within the client's limits: {0}")]
+    SnapshotUndeliverable(srui_protocol::SnapshotFramingError),
+
     #[error("unsupported core protocol version {requested:?}; this server speaks {supported:?}")]
     UnsupportedCoreVersion {
         requested: String,

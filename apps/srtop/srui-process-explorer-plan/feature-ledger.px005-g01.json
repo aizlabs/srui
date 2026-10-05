@@ -17,7 +17,7 @@
   "entries": [
     {
       "feature_id": "SRUI-PX005G01-001",
-      "feature": "Resident memory is /proc/<pid>/statm field 2 (resident) in pages times the scanned mount's own page size, never /proc/<pid>/stat field 24, with no kernel-version branch: exact from Linux 6.16 and the stable kernels carrying the same fix (6.15.7, 6.12.39, 6.6.99), and on earlier kernels since 6.2 the same approximate counter field 24 reports, so never worse; the metric definition and README state both regimes, the bound of max(32, 2 x online CPUs) pages per online CPU per counter, a possible 0 B for a fresh process, and the cost of the extra read",
+      "feature": "Resident memory is /proc/<pid>/statm field 2 (resident) in pages times the scanned mount's own page size, never /proc/<pid>/stat field 24, with no kernel-version branch: exact from Linux 6.16 and the stable kernels carrying the same fix (6.15.7, 6.12.39, 6.6.99), and on every earlier kernel the same approximate counter field 24 reports (percpu_counters read without their per-CPU deltas from 6.2, per-thread caches added in after more than 64 page-fault events before it), so never worse; the metric definition and README state each regime, the bound of max(32, 2 x online CPUs) pages per online CPU per counter, a possible 0 B for a fresh process, and the cost of the extra read and of the pin",
       "scope": "PX-005-G01/live and fixture procfs roots/read-only",
       "source_refs": [
         "K1",
@@ -47,7 +47,7 @@
     },
     {
       "feature_id": "SRUI-PX005G01-003",
-      "feature": "Both files of a record are read through one handle on its /proc/<pid> directory, reached through the reader's own /proc/self/fd/<n> with std alone, so a PID reused between the two reads fails with ESRCH instead of lending another process's memory to the instance stat identified; a reader that cannot name an open directory reads by name",
+      "feature": "Both files of a record are read through one handle on its /proc/<pid> directory, reached through the reader's own /proc/self/fd/<n> with std alone, so a PID reused between the two reads fails with ESRCH instead of lending another process's memory to the instance stat identified; a reader whose own /proc cannot name an open directory (every system but Linux, or a Linux reader without a usable /proc) reads by name without reporting it, and a record directory that may be searched but not read is skipped as Denied",
       "scope": "PX-005-G01/Linux procfs roots and fixture trees/read-only; by name on other systems",
       "source_refs": [
         "KS2"

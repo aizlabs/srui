@@ -45,8 +45,9 @@ pub const RESIDENT_MEMORY: MetricDefinition = MetricDefinition {
     unit: "bytes",
     source: "Linux /proc/<pid>/statm field 2 (resident), in pages, multiplied by the page size \
             the kernel reports through AT_PAGESZ in /proc/self/auxv of the scanned mount, and read \
-            after, and through the same /proc/<pid> directory handle as, the stat line that \
-            identifies the process (K1)",
+            after the stat line that identifies the process: through the same /proc/<pid> \
+            directory handle where the reader's own /proc can pin one, and by name where it \
+            cannot (K1)",
     interpretation: "Pages this process has in real memory at sample time. Shared pages are \
                      counted in full for every process that maps them, so these values do not sum \
                      to the memory a host has in use; pages that are swapped out or were never \
@@ -57,8 +58,10 @@ pub const RESIDENT_MEMORY: MetricDefinition = MetricDefinition {
                      and shared-memory counters it adds up may be off, in either direction, by \
                      less than max(32, 2 x online CPUs) pages per online CPU, so a just-started \
                      or very small process can read 0 B. Field 24 stays approximate on every \
-                     kernel since 6.2 and is not used. Proportional and shared-page accounting \
-                     is PX-046, not this metric.",
+                     kernel since 6.2 and is not used. Before 6.2 statm and stat read one counter \
+                     that is approximate too: each thread adds its cached changes in only after \
+                     more than 64 page-fault events (SPLIT_RSS_COUNTING). Proportional and \
+                     shared-page accounting is PX-046, not this metric.",
 };
 
 /// CPU time a process used over one sampling interval, as a share of **one**
@@ -452,5 +455,8 @@ mod tests {
         assert!(metric.interpretation.contains("max(32, 2 x online CPUs)"));
         assert!(metric.interpretation.contains("can read 0 B"));
         assert!(metric.interpretation.contains("field 24"));
+        assert!(metric.interpretation.contains("Before 6.2"));
+        // And that the same-directory read depends on the reader's own /proc.
+        assert!(metric.source.contains("by name where it"));
     }
 }

@@ -28,21 +28,42 @@ build_client() {
   swift build --package-path "$ROOT/client-macos" --product RendererDemoApp
 }
 
+# What `fake` and `sequence` started, for `cleanup`.
+server=""
+dir=""
+
+# Stops the srtop this script started and removes its private directory, whatever ended the
+# script: the client quitting, Ctrl-C, srtop refusing its arguments or dying first. No step may
+# abort the others, and the script still exits with the status that ended it.
+cleanup() {
+  local status=$?
+  set +e
+  if [ -n "$server" ]; then
+    kill -TERM "$server" 2>/dev/null
+    wait "$server" 2>/dev/null
+  fi
+  if [ -n "$dir" ]; then
+    # A clean stop removes the socket itself; one that died abnormally leaves it behind.
+    [ -S "$dir/srtop.sock" ] && rm -f "$dir/srtop.sock"
+    rmdir "$dir" 2>/dev/null
+  fi
+  exit "$status"
+}
+
 # srtop and the client on this Mac, joined by a private Unix socket: no SSH is involved.
 local_source() {
   need cargo "the Rust toolchain, for srtop"
   cargo build --locked --manifest-path "$ROOT/apps/srtop/Cargo.toml"
   build_client
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   # srtop refuses a socket directory other users can enter; mktemp -d makes it 0700. /tmp keeps
   # the socket path short of the 104-byte AF_UNIX limit wherever TMPDIR points.
-  local dir
   dir=$(mktemp -d /tmp/srtop-run.XXXXXX)
   local socket="$dir/srtop.sock"
   "$SRTOP" --socket "$socket" "$@" &
-  local server=$!
-  # shellcheck disable=SC2064
-  trap "kill -TERM $server 2>/dev/null; wait $server 2>/dev/null; rmdir '$dir' 2>/dev/null" EXIT
-  trap 'exit 130' INT TERM
+  server=$!
   for _ in $(seq 1 100); do
     [ -S "$socket" ] && break
     kill -0 "$server" 2>/dev/null || die "srtop exited before publishing its socket"

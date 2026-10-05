@@ -13,6 +13,11 @@ srui-semantic-tree = { path = "../../server-rust/semantic-tree" }
 srui-sessiond = { path = "../../server-rust/sessiond" }
 srui-unix-security = { path = "../../server-rust/unix-security" }
 
+# PX-008's process-control audit reads the sources as Rust tokens, with the proc-macro2
+# version the runtime's macros already lock: no new package, and nothing in the binary.
+[dev-dependencies]
+proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
+
 [[bin]]
 name = "srtop"
 path = "src/main.rs"

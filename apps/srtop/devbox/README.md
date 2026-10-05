@@ -11,10 +11,12 @@ into a repeatable check: `apps/srtop/devbox/r0-scenario.sh` (PX-008, the R0 gate
 starts the box, runs the native `ProcessExplorerDevboxScenarioTests` against it —
 an empty client window, a worker started inside the box, its row appearing,
 warming up and then sampled, the worker ending on its own and its row going —
-and stops the box again (`SRTOP_R0_KEEP_BOX=1` keeps it). With
-`PX008_EVIDENCE_DIR` set it also writes the client window's image and an
-operation/byte trace there. Without the box's coordinates in the environment that
-suite reports itself skipped, never passed.
+and stops the box again (`SRTOP_R0_KEEP_BOX=1` keeps it), also when `up` or the
+scenario fails or is interrupted. It refuses an image built from a revision that
+differs from the one under test in anything the image contains, and names the
+`devbox.sh build` to run. With `PX008_EVIDENCE_DIR` set it also writes the client
+window's image and an operation/byte trace there. Without the box's coordinates in
+the environment that suite reports itself skipped, never passed.
 
 The box is only useful against a revision whose `srtop` polls its source, so this
 branch is stacked on PX-004 and `SRTOP_DEVBOX_REV` defaults to `HEAD`. Exporting
@@ -77,8 +79,9 @@ rm -rf "${SRTOP_DEVBOX_STATE:-$HOME/.codex/srtop-devbox}"
 
 - The build context is a `git archive` of `SRTOP_DEVBOX_REV`, never the working
   tree, so no `.git`, no `target/`, and no key material reaches the image. The
-  image is labelled `org.srui.revision` with that commit, and `r0-scenario.sh`
-  prints it, so a run's evidence names the srtop it exercised.
+  image is labelled `org.srui.revision` with that commit; `r0-scenario.sh`
+  compares it with the revision under test and prints it, so a run's evidence
+  names the srtop it exercised.
 - `srtop` runs as the unprivileged `srui` account on a `0700` directory; it
   refuses a socket directory that is not private to a non-root user.
 - sshd accepts public keys only, for that one account, and exposes exactly one

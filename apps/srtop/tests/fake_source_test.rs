@@ -68,20 +68,25 @@ fn injected_source_is_called_once_and_three_rows_are_model_data() {
                 // A resident value whose fraction is truncated, a known zero,
                 // and a metric this fixture's scan was denied: three distinct
                 // availability states, none of them published as the others.
+                // The CPU column likewise: a multithreaded process past 100% of
+                // one CPU, a measured zero, and a first sample warming up.
                 Value::List(vec![
                     Value::UnsignedInt(4101),
                     Value::String("worker".into()),
-                    Value::String("1.1 MiB".into())
+                    Value::String("1.1 MiB".into()),
+                    Value::String("250.0%".into())
                 ]),
                 Value::List(vec![
                     Value::UnsignedInt(4102),
                     Value::String("worker".into()),
-                    Value::String("0 B".into())
+                    Value::String("0 B".into()),
+                    Value::String("0.0%".into())
                 ]),
                 Value::List(vec![
                     Value::String("Unavailable".into()),
                     Value::String("helper".into()),
-                    Value::String("Denied".into())
+                    Value::String("Denied".into()),
+                    Value::String("Warming up".into())
                 ]),
             ]
         );
@@ -147,6 +152,7 @@ fn a_snapshot_larger_than_one_model_batch_is_published_whole() {
                     },
                     display_name: DisplayName::sanitize(b"worker"),
                     resident: Observed::Known(4096),
+                    cpu: CpuUsage::WarmingUp,
                 })
                 .collect();
             snapshot

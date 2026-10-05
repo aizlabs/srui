@@ -1,5 +1,6 @@
 //! Metric definitions: what one published number is, where it was read, and how
-//! it must be read back (design §§6.2, 22, 29; PX-005 resident memory).
+//! it must be read back (design §§6.2, 22, 29; PX-005 resident memory, PX-006
+//! sampled CPU usage).
 //!
 //! Interpretation is server-side. A metric is stored as the exact integer the
 //! kernel reported, in the unit its definition names, and this module is the one
@@ -14,7 +15,7 @@
 //! larger than the one that was measured. Every multiple below is a power of
 //! 1024, so the whole part is a shift, the fraction is an integer remainder, and
 //! no step of the conversion leaves the integers.
-use crate::source::{MissingReason, Observed};
+use crate::source::{CpuInterval, CpuUsage, MissingReason, Observed};
 
 /// What one published metric is: the value's unit, where the number came from,
 /// and how to read it. A definition is documentation that travels with the code
@@ -53,16 +54,94 @@ pub const RESIDENT_MEMORY: MetricDefinition = MetricDefinition {
                      is PX-046, not this metric.",
 };
 
+/// CPU time a process used over one sampling interval, as a share of **one**
+/// logical CPU (S1's convention: one fully busy logical CPU is 100%, so a
+/// multithreaded process may exceed 100%). The heading states the convention,
+/// because the number alone cannot: 150% is one and a half CPUs here, never
+/// "one and a half times the host". A share normalized to the whole host is a
+/// later display option, not this metric.
+pub const CPU_USAGE: MetricDefinition = MetricDefinition {
+    id: "process.cpu_usage",
+    label: "CPU (100% = 1 CPU)",
+    unit: "tenths of a percent of one logical CPU",
+    source: "Linux /proc/<pid>/stat fields 14 (utime) and 15 (stime), in clock ticks, divided by \
+            the tick rate the kernel reports through AT_CLKTCK in /proc/self/auxv of the scanned \
+            mount, over the interval between two scans of the same process instance measured on \
+            a monotonic clock (K1)",
+    interpretation: "The user plus system CPU time this process instance was scheduled for \
+                     between two scans, divided by the time that passed between them. 100% is \
+                     one fully used logical CPU, so a multithreaded process may exceed 100%. \
+                     Waited-for children's time (cutime, cstime) is not included. A value needs \
+                     two samples of the same instance: the first sample of a process, of a \
+                     replacement under a reused PID, after a counter went backwards, or across \
+                     an interval that did not advance is published as warming up or unavailable, \
+                     never as zero and never as a spike. The interval is measured on a monotonic \
+                     clock, so a wall-clock change cannot stretch or shrink it.",
+};
+
+/// Published while a process instance has only one sample: there is no interval
+/// yet to divide by. It is a state, not a quantity, so it carries no digit.
+pub const CPU_WARMING_UP: &str = "Warming up";
+
+/// The most logical CPUs a measured value may imply before it is refused as a
+/// counter discontinuity rather than published. Far above any real host
+/// (Linux's own `NR_CPUS` ceiling is 8192), and it is what bounds the widest
+/// CPU cell at `6553600.0%`, inside [`MAX_CELL_BYTES`].
+pub const MAX_PLAUSIBLE_LOGICAL_CPUS: u64 = 65_536;
+
+/// A measured interval as tenths of a percent of one logical CPU, truncated, or
+/// `None` when the interval cannot be divided by or implies more CPUs than
+/// [`MAX_PLAUSIBLE_LOGICAL_CPUS`].
+///
+/// `ticks / ticks_per_second` is CPU seconds; dividing by the elapsed seconds and
+/// scaling by 1000 gives tenths of a percent. Every step is integer arithmetic in
+/// `u128`, checked, and truncating — like [`format_iec_bytes`], a value is never
+/// displayed as larger than it was measured.
+pub fn cpu_tenths_of_percent(interval: &CpuInterval) -> Option<u64> {
+    let elapsed = interval.elapsed.as_nanos();
+    if elapsed == 0 || interval.ticks_per_second == 0 {
+        return None;
+    }
+    let numerator = u128::from(interval.ticks).checked_mul(1_000 * 1_000_000_000)?;
+    let denominator = u128::from(interval.ticks_per_second).checked_mul(elapsed)?;
+    let tenths = numerator / denominator;
+    if tenths > u128::from(MAX_PLAUSIBLE_LOGICAL_CPUS) * 1_000 {
+        return None;
+    }
+    u64::try_from(tenths).ok()
+}
+
+/// Tenths of a percent as published text: `12.3%`, `0.0%`, `250.0%`.
+pub fn format_cpu_tenths(tenths: u64) -> String {
+    format!("{}.{}%", tenths / 10, tenths % 10)
+}
+
+/// The published text of a CPU usage sample: a measured share, the warming-up
+/// state, or why it could not be measured. Neither of the last two is ever
+/// published as `0.0%`, and a *measured* zero is never published as either.
+pub fn cpu_cell(usage: &CpuUsage) -> String {
+    match usage {
+        CpuUsage::Measured(interval) => match cpu_tenths_of_percent(interval) {
+            Some(tenths) => format_cpu_tenths(tenths),
+            None => missing_text(MissingReason::Unavailable).to_string(),
+        },
+        CpuUsage::WarmingUp => CPU_WARMING_UP.to_string(),
+        CpuUsage::Missing(reason) => missing_text(*reason).to_string(),
+    }
+}
+
 /// IEC binary multiples, in ascending order. Each is 1024 times the one before,
 /// so converting between them is a shift (§22: a published unit is never
 /// ambiguous — `MiB` is 1024², never 10⁶).
 const IEC_UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
 
-/// The longest text [`bytes_cell`] can publish, in encoded bytes.
+/// The longest text [`bytes_cell`] or [`cpu_cell`] can publish, in encoded bytes.
 ///
-/// It is [`missing_text`]'s longest wording, not a number: the widest value this
-/// formatter can emit is `"1023.9 PiB"` at ten bytes. The bound is asserted
-/// against both by `no_published_cell_is_wider_than_the_reserved_bound`, and
+/// It is [`missing_text`]'s longest wording, not a number: the widest value the
+/// byte formatter can emit is `"1023.9 PiB"` at ten bytes, the widest CPU value
+/// `"6553600.0%"` at ten, and [`CPU_WARMING_UP`] is ten. The bound is asserted
+/// against all of them by `no_published_cell_is_wider_than_the_reserved_bound`
+/// and `no_cpu_cell_is_wider_than_the_reserved_bound`, and
 /// `crate::refresh` charges a row's cells by their real encoded length, so this
 /// is what the widest row in its frame-ceiling proof carries.
 pub const MAX_CELL_BYTES: usize = 11;
@@ -219,6 +298,136 @@ mod tests {
             10,
             "the widest number this formatter emits is `1023.9 PiB`"
         );
+    }
+
+    fn interval(ticks: u64, ticks_per_second: u64, elapsed: std::time::Duration) -> CpuUsage {
+        CpuUsage::Measured(CpuInterval {
+            ticks,
+            ticks_per_second,
+            elapsed,
+        })
+    }
+
+    #[test]
+    fn one_fully_used_logical_cpu_is_one_hundred_percent_and_more_cpus_exceed_it() {
+        use std::time::Duration;
+        for (ticks, hz, elapsed, expected) in [
+            // Half of one CPU at USER_HZ 100 over one second.
+            (50, 100, Duration::from_secs(1), "50.0%"),
+            // One CPU, fully used, over two seconds.
+            (200, 100, Duration::from_secs(2), "100.0%"),
+            // Four CPUs fully used by one multithreaded process.
+            (400, 100, Duration::from_secs(1), "400.0%"),
+            // A different tick rate is a different divisor, not a different scale.
+            (1024, 1024, Duration::from_secs(1), "100.0%"),
+            // A known zero is a measured zero.
+            (0, 100, Duration::from_secs(1), "0.0%"),
+            // Truncated, never rounded up: 1/3 of a CPU is 33.3%, and one tick
+            // short of a full CPU is not displayed as one.
+            (1, 100, Duration::from_millis(30), "33.3%"),
+            (1999, 100, Duration::from_secs(20), "99.9%"),
+            (999, 100, Duration::from_secs(10), "99.9%"),
+        ] {
+            assert_eq!(
+                cpu_cell(&interval(ticks, hz, elapsed)),
+                expected,
+                "{ticks} ticks at {hz} Hz over {elapsed:?}"
+            );
+        }
+    }
+
+    /// PX-006 review round 1 (W3): at the shortest refresh interval one clock
+    /// tick is a large share of the interval. At 100 Hz over 50 ms a tick is 20
+    /// percentage points, so a fully busy thread honestly reads 80%, 100% or
+    /// 120% depending on where tick boundaries fell. This pins the arithmetic;
+    /// the quantization is documented, not smoothed.
+    #[test]
+    fn a_short_interval_is_quantized_by_the_tick_rate() {
+        use std::time::Duration;
+        let fifty = Duration::from_millis(50);
+        for (ticks, expected) in [(0, "0.0%"), (4, "80.0%"), (5, "100.0%"), (6, "120.0%")] {
+            assert_eq!(cpu_cell(&interval(ticks, 100, fifty)), expected);
+        }
+    }
+
+    #[test]
+    fn an_interval_that_cannot_be_divided_by_is_unavailable_rather_than_a_spike() {
+        use std::time::Duration;
+        // Zero elapsed time would divide by zero; a zero tick rate likewise.
+        assert_eq!(cpu_cell(&interval(10, 100, Duration::ZERO)), "Unavailable");
+        assert_eq!(
+            cpu_cell(&interval(10, 0, Duration::from_secs(1))),
+            "Unavailable"
+        );
+        // A delta implying more logical CPUs than any host has is a counter
+        // discontinuity, not usage: refused rather than published as a spike.
+        let ceiling = MAX_PLAUSIBLE_LOGICAL_CPUS * 100;
+        assert_eq!(
+            cpu_cell(&interval(ceiling, 100, Duration::from_secs(1))),
+            "6553600.0%"
+        );
+        assert_eq!(
+            cpu_cell(&interval(ceiling + 1, 100, Duration::from_secs(1))),
+            "Unavailable"
+        );
+        assert_eq!(
+            cpu_cell(&interval(u64::MAX, u64::MAX, Duration::MAX)),
+            "Unavailable",
+            "an overflowing divisor is refused, never wrapped"
+        );
+        assert_eq!(
+            cpu_cell(&interval(u64::MAX, 1, Duration::from_nanos(1))),
+            "Unavailable"
+        );
+    }
+
+    #[test]
+    fn warming_up_and_unread_cpu_are_never_published_as_zero() {
+        assert_eq!(cpu_cell(&CpuUsage::WarmingUp), "Warming up");
+        assert_eq!(
+            cpu_cell(&CpuUsage::Missing(MissingReason::Denied)),
+            "Denied"
+        );
+        assert_eq!(
+            cpu_cell(&CpuUsage::Missing(MissingReason::Unavailable)),
+            "Unavailable"
+        );
+        for state in [
+            CpuUsage::WarmingUp,
+            CpuUsage::Missing(MissingReason::Denied),
+            CpuUsage::Missing(MissingReason::Unavailable),
+        ] {
+            let text = cpu_cell(&state);
+            assert!(!text.chars().any(|character| character.is_ascii_digit()));
+            assert!(!text.ends_with('%'), "{text}");
+        }
+    }
+
+    #[test]
+    fn no_cpu_cell_is_wider_than_the_reserved_bound() {
+        use std::time::Duration;
+        assert!(CPU_WARMING_UP.len() <= MAX_CELL_BYTES);
+        let widest = cpu_cell(&interval(
+            MAX_PLAUSIBLE_LOGICAL_CPUS * 100,
+            100,
+            Duration::from_secs(1),
+        ));
+        assert_eq!(widest.len(), 10);
+        assert!(widest.len() <= MAX_CELL_BYTES);
+        for tenths in [0, 9, 10, 999, 1_000, 65_535_999, 65_536_000] {
+            assert!(format_cpu_tenths(tenths).len() <= MAX_CELL_BYTES);
+        }
+    }
+
+    #[test]
+    fn the_cpu_definition_names_its_convention_and_its_interfaces() {
+        let metric = CPU_USAGE;
+        assert!(metric.label.contains("100% = 1 CPU"), "{}", metric.label);
+        assert!(metric.source.contains("fields 14 (utime) and 15 (stime)"));
+        assert!(metric.source.contains("AT_CLKTCK"));
+        assert!(metric.source.contains("monotonic"));
+        assert!(metric.interpretation.contains("may exceed 100%"));
+        assert!(metric.interpretation.contains("never as zero"));
     }
 
     #[test]

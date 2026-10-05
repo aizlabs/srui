@@ -255,6 +255,7 @@ pub(crate) fn initialize_rows(
                 Value::String("PID".into()),
                 Value::String("Name".into()),
                 Value::String(metric::RESIDENT_MEMORY.label.into()),
+                Value::String(metric::CPU_USAGE.label.into()),
             ])
             .label("Processes")
             .grow(1.0)
@@ -434,7 +435,8 @@ mod tests {
                 Some(&Value::List(vec![
                     Value::String("PID".into()),
                     Value::String("Name".into()),
-                    Value::String("Resident".into())
+                    Value::String("Resident".into()),
+                    Value::String("CPU (100% = 1 CPU)".into())
                 ]))
             );
         });

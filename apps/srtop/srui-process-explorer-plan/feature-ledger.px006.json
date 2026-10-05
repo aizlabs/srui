@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-006",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Sampled per-process CPU usage as one defined read-only metric beside PID, name and resident memory, with one logical CPU as 100% and explicit warming-up and unavailable states; no host-normalized display, no sorting, no graphs, no process controls, no macOS source, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "D2": "../../../SRUI_Implementation_Plan.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html",
+      "S1": "https://docs.rs/sysinfo/latest/sysinfo/struct.Process.html"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX006-001",
+      "feature": "CPU usage is published as a fourth table column headed 'CPU (100% = 1 CPU)': one fully used logical CPU is 100%, so a multithreaded process may exceed it; the value is stored as an exact tick delta, tick rate and monotonic interval and turned into text once on the server in integer arithmetic with the tenths digit truncated",
+      "scope": "PX-006/fake, scripted and live procfs sources/read-only; a host-normalized percentage is a later display option",
+      "source_refs": [
+        "D1",
+        "K1",
+        "S1"
+      ],
+      "owner": "PX-006",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-006.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX006-002",
+      "feature": "A metric definition states the interface the number is read from (/proc/<pid>/stat fields 14 utime and 15 stime in clock ticks, divided by the tick rate the scanned mount reports through AT_CLKTCK and by a monotonic interval) and what it omits (waited-for children's cutime and cstime)",
+      "scope": "PX-006/metric definition only; the metric registry, scheduling and availability model are PX-042",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-006",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-006.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX006-003",
+      "feature": "One persistent collector keeps one counter baseline per published process instance, keyed by PID and creation token: a first sample and a replacement under a reused PID publish 'Warming up'; a counter reset, a zero or backwards monotonic interval, an implausible delta and an unknown tick rate publish 'Unavailable' (or 'Denied'); none of them is ever published as 0.0% or as a spike, a measured zero stays 0.0%, and a different boot or PID namespace discards every baseline",
+      "scope": "PX-006/live and fixture procfs roots/read-only; baselines bounded by the record bound and forgotten when a process ends",
+      "source_refs": [
+        "D1",
+        "K1"
+      ],
+      "owner": "PX-006",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-006.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX006-004",
+      "feature": "The CPU interval is measured only on an injected monotonic clock, never on the wall clock that stamps the sample, so deterministic counters yield exact single-CPU and multicore percentages independent of wall-clock time",
+      "scope": "PX-006/collector clock injection; the live clock is Instant (CLOCK_MONOTONIC on Linux)",
+      "source_refs": [
+        "D1"
+      ],
+      "owner": "PX-006",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-006.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX006-005",
+      "feature": "On a real Linux kernel a bounded, test-owned, single-threaded busy worker is first published as warming up and then reads within a documented tolerance of one logical CPU, while a test-owned sleeping worker reads near zero, and the measured value reaches the published row through an in-place refresh",
+      "scope": "PX-006/live procfs source/read-only; tolerances rather than exact scheduler numbers",
+      "source_refs": [
+        "K1"
+      ],
+      "owner": "PX-006",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-006.md"
+      ]
+    }
+  ]
+}

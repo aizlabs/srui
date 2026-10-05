@@ -1,4 +1,4 @@
-// PX-001/PX-002/PX-004: real non-PTY SSH launch through the unchanged generic client (§§8, 12, 22, 29).
+// PX-001/PX-002/PX-004/PX-005/PX-006: real non-PTY SSH launch through the unchanged generic client (§§8, 12, 22, 29).
 import Testing
 import Foundation
 import AppKit
@@ -55,19 +55,21 @@ struct ProcessExplorerShellTests {
         #expect(status.stringValue == (fakeSource ? "Read-only · Fake process snapshot" : "Read-only · Process collection not started"))
         #expect(status.isEditable == false)
         #expect(table.numberOfRows == (fakeSource ? 3 : 0))
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
         #expect(tableHandle.actionTrampoline == nil)
         if fakeSource {
             // PX-005: the server published the unit, so the generic client shows
             // it verbatim — a truncated value, a known zero, and a metric this
             // fixture's scan was denied, each distinct in the native cell.
+            // PX-006: likewise for CPU — past 100% of one CPU, a measured zero,
+            // and a first sample that is visibly warming up.
             let expected = [
-                ["4101", "worker", "1.1 MiB"],
-                ["4102", "worker", "0 B"],
-                ["Unavailable", "helper", "Denied"],
+                ["4101", "worker", "1.1 MiB", "250.0%"],
+                ["4102", "worker", "0 B", "0.0%"],
+                ["Unavailable", "helper", "Denied", "Warming up"],
             ]
             for row in 0..<3 {
-                for column in 0..<3 {
+                for column in 0..<4 {
                     let cell = try #require(table.view(atColumn: column, row: row, makeIfNecessary: true) as? NSTextField)
                     #expect(cell.stringValue == expected[row][column])
                 }
@@ -90,7 +92,7 @@ struct ProcessExplorerShellTests {
         #expect(window.isVisible)
         #expect(table.numberOfRows == (fakeSource ? 3 : 0))
         try await Self.capture(window: window, name: fakeSource ? "fake-updated" : "updated")
-        print("PX-001/PX-002/PX-005 native SSH evidence: fakeSource=\(fakeSource); revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading and Table handles retained; PID/Name/Resident columns; rows=\(table.numberOfRows); cells=\(Self.nativeRows(table)).")
+        print("PX-001/PX-002/PX-005/PX-006 native SSH evidence: fakeSource=\(fakeSource); revisions 1 -> 2; visible NSWindow \(windowNumber) retained; Surface, heading and Table handles retained; PID/Name/Resident/CPU columns; rows=\(table.numberOfRows); cells=\(Self.nativeRows(table)).")
         await controller.stop()
     }
 
@@ -214,7 +216,7 @@ struct ProcessExplorerShellTests {
         #expect(renderer.registry.handle(for: NodeId(4))?.view as? NSTextField === statusField)
         #expect(window.windowNumber == windowNumber)
         #expect(window.isVisible)
-        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident"])
+        #expect(table.tableColumns.map(\.title) == ["PID", "Name", "Resident", "CPU (100% = 1 CPU)"])
         #expect(tableHandle.actionTrampoline == nil)
         try await Self.capture(window: window, name: "sequence-settled")
         let elapsed = stamps.isEmpty ? Duration.zero : stamps[stamps.count - 1]
@@ -236,15 +238,16 @@ struct ProcessExplorerShellTests {
 
     // PX-005: every scripted row carries its resident cell, fixed per process so
     // that a repeated snapshot stays byte-identical and still publishes nothing.
+    // PX-006: the CPU cell likewise, one per CPU state the script states.
     private static let initialRows = [
-        ["4101", "worker", "2.0 MiB"],
-        ["4102", "worker", "1023 B"],
-        ["4103", "helper", "Unavailable"],
+        ["4101", "worker", "2.0 MiB", "50.0%"],
+        ["4102", "worker", "1023 B", "0.0%"],
+        ["4103", "helper", "Unavailable", "Unavailable"],
     ]
     private static let settledRows = [
-        ["4101", "worker", "2.0 MiB"],
-        ["4103", "helper-tool", "Unavailable"],
-        ["4104", "builder", "5.0 GiB"],
+        ["4101", "worker", "2.0 MiB", "50.0%"],
+        ["4103", "helper-tool", "Unavailable", "Unavailable"],
+        ["4104", "builder", "5.0 GiB", "Warming up"],
     ]
     private static let normalStatus = "Read-only · Fake process sequence"
     private static let retainedRowsMarker = "retained from an earlier scan"

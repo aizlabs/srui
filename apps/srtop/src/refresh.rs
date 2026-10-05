@@ -1214,7 +1214,8 @@ mod tests {
                     Value::String(name.as_str().to_string()),
                     // The widest metric cell this app can publish, so the
                     // ceiling this fixture proves covers every real row
-                    // (PX-005).
+                    // (PX-005), in both metric columns (PX-006).
+                    Value::String(widest_metric_cell()),
                     Value::String(widest_metric_cell()),
                 ]),
             })
@@ -1544,6 +1545,7 @@ mod tests {
                     // Unread, which is the widest cell a metric publishes: this
                     // host exists to measure the largest collection that fits.
                     resident: Observed::Missing(MissingReason::Unavailable),
+                    cpu: crate::source::CpuUsage::Missing(MissingReason::Unavailable),
                 })
                 .collect();
             snapshot

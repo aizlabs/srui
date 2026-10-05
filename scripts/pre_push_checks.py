@@ -9,6 +9,7 @@ second push wait with a bounded, reported wait instead.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import contextlib
 from dataclasses import asdict, dataclass
 import errno
@@ -497,18 +498,24 @@ def check_process_tree(root: int) -> tuple[set[int], set[int]] | None:
     return (tree | members) - mine, groups
 
 
-def live_groups(groups: set[int], session: int | None = None) -> dict[int, set[int]] | None:
+def live_groups(groups: set[int], session: int | Mapping[int, int] | None = None
+                ) -> dict[int, set[int]] | None:
     """The members of each of `groups` that are still live, keyed by group.
 
-    `session` is the check's own, and a member outside it does not count. A pgid in
-    `groups` was true when it was discovered; by the time the escalation pass runs,
-    that group can have drained and the kernel can have reissued the number while
-    another of this check's groups was still consuming the grace window. The pgid
-    then has live members again - someone else's - and one snapshot cannot tell the
-    difference, because pgid and state are exactly what matched before. The session
-    can: `run_check` makes the check a session leader and nothing it starts leaves
-    that session, so a group with no in-session member is not this check's group,
-    whatever number it wears.
+    `session` is the session each group was *observed in when it was discovered* -
+    one sid for every group, or a pgid -> sid mapping - and a member outside it does
+    not count. A pgid in `groups` was true when it was discovered; by the time the
+    escalation pass runs, that group can have drained and the kernel can have
+    reissued the number while another of this check's groups was still consuming the
+    grace window. The pgid then has live members again - someone else's - and one
+    snapshot cannot tell the difference, because pgid and state are exactly what
+    matched before. The session can, as long as it is the one *that group* had:
+    a descendant that calls `setsid()` (`start_new_session=True` in
+    `benchmarks/process_control.py`, every portable-pty child) leads a session of its
+    own and is still this check's, so comparing every group against the check's own
+    session would drop exactly those groups - never signalled, never awaited, and the
+    stop reported verified over them. With a mapping, a group it does not name has no
+    observed session to compare against and is not reported.
 
     Per group, not in aggregate: when a check owns several groups and one drains
     while another is still running, signalling *every* accumulated group again
@@ -538,8 +545,11 @@ def live_groups(groups: set[int], session: int | None = None) -> dict[int, set[i
         if state.startswith("Z") or pid in mine or pgid not in groups:
             continue
         if session is not None:
+            expected = session.get(pgid) if isinstance(session, Mapping) else session
+            if expected is None:
+                continue  # Never observed as this check's; nothing to compare against.
             try:
-                if os.getsid(pid) != session:
+                if os.getsid(pid) != expected:
                     continue  # This number is someone else's group now.
             except ProcessLookupError:
                 continue  # Exited between the snapshot and the question.
@@ -549,7 +559,8 @@ def live_groups(groups: set[int], session: int | None = None) -> dict[int, set[i
     return by_group
 
 
-def live_group_members(groups: set[int], session: int | None = None) -> set[int] | None:
+def live_group_members(groups: set[int], session: int | Mapping[int, int] | None = None
+                       ) -> set[int] | None:
     """Which processes still belong to `groups`, excluding this push's own.
 
     Membership, not parentage: a process keeps its group when its parent dies, so
@@ -613,11 +624,32 @@ def live_session_members(session: int) -> set[int] | None:
             live.add(pid)
     return live
 
-def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
+def observe_group_sessions(tree: tuple[set[int], set[int]], sessions: dict[int, int]) -> None:
+    """Record, for each newly discovered group, the session one of its members is in now.
+
+    Asked of a pid the discovery snapshot placed in that group, and only kept when the
+    kernel still agrees on the group - otherwise the pid has been reissued since the
+    snapshot and its session says nothing about the check. A group already observed
+    keeps its first answer: that is the one taken closest to discovery.
+    """
+    pids, groups = tree
+    for pid in sorted(pids):
+        try:
+            pgid = os.getpgid(pid)
+            if pgid not in groups or pgid in sessions:
+                continue
+            sid = os.getsid(pid)
+            if os.getpgid(pid) == pgid:
+                sessions[pgid] = sid
+        except OSError:
+            continue  # Gone, or not ours to ask: no evidence either way.
+
+
+def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> dict[int, int]:
     """Stop everything the running check started, and wait for all of it to go.
 
-    Returns the process groups it could **not** prove are gone - empty when the
-    drain was verified. The caller records a non-empty answer, because mutual
+    Returns the process groups it could **not** prove are gone, each with the session
+    it was observed in - empty when the drain was verified. The caller records a non-empty answer, because mutual
     exclusion has to survive this process's death: see [`record_unverified_stop`].
 
     Waiting is the point: the lock must outlive the build it was taken for, so
@@ -633,24 +665,26 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
     """
     process = _active_check
     if process is None or process.poll() is not None:
-        return
+        return {}
     # The group the check leads is known without any snapshot: `start_new_session`
-    # made it the leader of its own group, so its pid *is* that group. Everything
-    # else is discovered, and discovery can fail.
+    # made it the leader of its own group and session, so its pid *is* both. Every
+    # other group is discovered, and so is the session it was in at the time: a
+    # descendant may have left the check's session with `setsid()` and is still the
+    # check's to stop. Whether a group is *still this check's* is answered against the
+    # session it was observed in, never against one assumed for it.
     groups = {process.pid}
-    # The check's session, for the same reason: `start_new_session` made it the leader
-    # of its own session too, so nothing it started can be outside it. Every question
-    # about whether a discovered group is *still this check's* is answered against it.
-    session = process.pid
+    sessions = {process.pid: process.pid}
     tree = check_process_tree(process.pid)
     if tree is not None:
         groups |= tree[1]
+        observe_group_sessions(tree, sessions)
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if process.poll() is None:
             tree = check_process_tree(process.pid)
             if tree is not None:
                 groups |= tree[1]
-        alive = live_groups(groups, session)
+                observe_group_sessions(tree, sessions)
+        alive = live_groups(groups, sessions)
         if alive == {}:
             break
         # Only groups with a live member right now.
@@ -678,7 +712,7 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
             # Only an *answered* enumeration can end the wait. `None` is "cannot
             # tell", and treating it as drained is precisely how the lock would be
             # released over a build still running.
-            if live_groups(groups, session) == {}:
+            if live_groups(groups, sessions) == {}:
                 drained = True
                 break
             time.sleep(0.05)
@@ -686,13 +720,16 @@ def stop_active_check(grace: float = CHECK_STOP_GRACE_SECONDS) -> set[int]:
             break
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=grace)
-    remaining = live_groups(groups, session)
+    remaining = live_groups(groups, sessions)
     if remaining == {}:
-        return set()
+        return {}
     # Either a group is still alive, or the table could not be read at all. Both mean
     # the same thing to the caller: this push cannot promise the build directory is
-    # quiet, and the next one must not start a build into it on trust.
-    return groups if remaining is None else set(remaining)
+    # quiet, and the next one must not start a build into it on trust. A group whose
+    # session was never observed is recorded under the check's own, the only session
+    # anything it started is known to have been in.
+    unaccounted = groups if remaining is None else set(remaining)
+    return {pgid: sessions.get(pgid, process.pid) for pgid in unaccounted}
 
 
 def unverified_path(repo: Path) -> Path:
@@ -700,7 +737,8 @@ def unverified_path(repo: Path) -> Path:
     return lock_path(repo).with_name(UNVERIFIED_FILE)
 
 
-def write_unverified(repo: Path, groups: set[int], session: int | None) -> bool:
+def write_unverified(repo: Path, groups: set[int] | Mapping[int, int],
+                     session: int | None) -> bool:
     """Persist the record, or say loudly that it could not be persisted.
 
     Returns whether it is on disk. The failure must not be swallowed: a full or
@@ -710,6 +748,10 @@ def write_unverified(repo: Path, groups: set[int], session: int | None) -> bool:
     """
     path = unverified_path(repo)
     payload = {"pid": os.getpid(), "groups": sorted(groups), "session": session}
+    if isinstance(groups, Mapping):
+        # The session each group was observed in, so the next push asks the same
+        # question of it that this one did; see [`live_groups`].
+        payload["group_sessions"] = {str(pgid): sid for pgid, sid in sorted(groups.items())}
     try:
         path.write_text(json.dumps(payload) + "\n")
         return True
@@ -743,7 +785,8 @@ def arm_unverified_stop(repo: Path) -> tuple[int | None, bool]:
     return session, write_unverified(repo, {session}, session)
 
 
-def record_unverified_stop(repo: Path, groups: set[int], session: int | None = None) -> None:
+def record_unverified_stop(repo: Path, groups: set[int] | Mapping[int, int],
+                           session: int | None = None) -> None:
     """Record that a stopped run could not prove its build had finished.
 
     A lock cannot outlive the process holding it - flock is released when the fd
@@ -831,10 +874,17 @@ def unverified_reason(repo: Path) -> str | None:
                 "then delete that file.")
     groups = {int(group) for group in recorded.get("groups", [])}
     session = int(recorded.get("session") or 0)
-    # Session-scoped here too, and not only for safety: a recorded pgid the kernel has
-    # since reissued would otherwise keep having live members forever, and the record
-    # would never clear - every later push refused with status 76 by a stranger's group.
-    members = live_group_members(groups, session or None)
+    observed = recorded.get("group_sessions")
+    # Session-scoped here too, against the session each group was observed in: a
+    # recorded pgid the kernel has since handed to a process in another session would
+    # otherwise keep having live members, and the record would never clear. This does
+    # not cover a reissued *session* id - the check's sid is its reaped root's pid, and
+    # a new session leader given that number matches both - which is why the refusal
+    # names the pids, so a stranger can be told apart by hand.
+    scope: int | Mapping[int, int] | None = session or None
+    if isinstance(observed, dict):
+        scope = {int(pgid): int(sid) for pgid, sid in observed.items()}
+    members = live_group_members(groups, scope)
     in_session = live_session_members(session)
     if members is None or in_session is None:
         return (f"a previous push could not confirm its checks had stopped ({path}), and "

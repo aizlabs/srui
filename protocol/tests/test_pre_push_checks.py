@@ -3,6 +3,7 @@
 Uses temporary Git repositories and stub toolchains; no product builds or network.
 The existing protocol pytest CI job also discovers this unittest suite.
 """
+import contextlib
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
@@ -1072,6 +1073,73 @@ class SingleFlightTests(unittest.TestCase):
                          "a group outside the check's session was signalled")
         self.assertIsNone(victim.poll(), "an unrelated process group was killed")
         self.assertNotRunning(root, "the check survived the stop")
+
+    def test_a_descendant_in_a_session_of_its_own_is_still_stopped(self):
+        """A group is judged by the session it was discovered in, not the check's.
+
+        `benchmarks/process_control.py` starts its workers with `start_new_session`,
+        and every portable-pty child calls `setsid()`: real descendants of a check that
+        lead a session of their own. Comparing them against the check's session dropped
+        them - never signalled, never awaited - while the stop still reported itself
+        verified and the lock was released over a running process.
+        """
+        marker = self.root / "setsid.pid"
+        script = self.root / "wrapper_with_setsid_child.py"
+        script.write_text(
+            "import subprocess\n"
+            "child = subprocess.Popen(['sleep', '60'], stdin=subprocess.DEVNULL,\n"
+            "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+            "    start_new_session=True)\n"
+            f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+            "child.wait()\n"
+        )
+        thread = threading.Thread(target=checks.run_check,
+                                  args=([sys.executable, str(script)], self.repo))
+        thread.start()
+        deadline = time.monotonic() + 30
+        while (checks._active_check is None or not marker.exists()
+               or not marker.read_text().strip()):
+            self.assertLess(time.monotonic(), deadline, "the setsid child never started")
+            time.sleep(0.02)
+        root = checks._active_check.pid
+        child = int(marker.read_text())
+        self.assertNotEqual(os.getsid(child), root,
+                            "the fixture must put the child in a session of its own")
+        child_session = os.getsid(child)
+
+        def kill_child():
+            # Only while it still leads that session: the pid is free once it has gone.
+            with contextlib.suppress(OSError):
+                if os.getsid(child) == child_session:
+                    os.kill(child, signal.SIGKILL)
+
+        self.addCleanup(kill_child)
+
+        unaccounted = checks.stop_active_check(grace=1.0)
+        thread.join(timeout=30)
+
+        self.assertNotRunning(root, "the check survived the stop")
+        self.assertNotRunning(child, "a descendant in its own session outlived the stop")
+        self.assertEqual(unaccounted, {}, "a verified stop must report nothing unaccounted")
+
+    def test_a_recorded_group_is_judged_by_the_session_it_was_observed_in(self):
+        """The record carries each group's observed session to the next push.
+
+        Judging a recorded group against the check's session instead would clear the
+        record over a live descendant that had left that session.
+        """
+        live = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+        self.addCleanup(self.reap, live)
+        # A session nothing is in, so only the observed session can make the group count.
+        check_session = 999_999
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            checks.record_unverified_stop(self.repo, {live.pid: live.pid}, check_session)
+        reason = checks.unverified_reason(self.repo)
+        self.assertIsNotNone(reason, "a live group in its observed session must refuse")
+        self.assertIn(str(live.pid), reason)
 
     def test_a_stop_whose_groups_are_empty_keeps_the_record_while_its_session_runs(self):
         """Accounted-for groups are not an empty session.

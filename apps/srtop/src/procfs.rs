@@ -23,6 +23,18 @@
 //! instance and never inherits another process's counters. The interval is
 //! measured on an injected [`MonotonicClock`], never on the wall clock that
 //! stamps [`SnapshotTime`], so a wall-clock jump cannot stretch or shrink it.
+//!
+//! Resident memory (PX-005, PX-005-G01) is read from a second file of the same
+//! record, `statm`, after the `stat` that identifies it: `stat`'s own `rss` is
+//! approximate on every kernel since Linux 6.2, while `statm`'s is exact from
+//! 6.16. Where the reader's own procfs can name an open directory
+//! (`/proc/self/fd/<n>`, on Linux), both files are read through one handle on
+//! the record's directory. A kernel procfs binds that handle to one process
+//! instance, so a PID reused between the two reads cannot lend its memory to the
+//! instance `stat` identified. A scanned tree that is not a kernel procfs — a
+//! fixture, or a FUSE, 9p or sshfs mirror of another host's `/proc` given to
+//! [`ProcFsSource::with_root`] — is read through the same handle with no such
+//! guarantee (see `RecordAccess`).
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
     DisplayName, EnumerationIssue, HostId, IssueScope, MissingReason, Observed, PidNamespaceId,
@@ -35,6 +47,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -70,9 +83,17 @@ const _: () = assert!(MAX_RECORDS + 2 * MAX_UNCERTAIN_PIDS <= DEFAULT_MAX_CACHED
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 /// `/proc/<pid>/stat` field 22 (start time) is the 20th field after `comm`.
 const STARTTIME_FIELD_AFTER_COMM: usize = 19;
-/// `/proc/<pid>/stat` field 24 (`rss`, resident pages) is the 22nd field after
-/// `comm` — two past the start time (K1).
-const RSS_FIELD_AFTER_COMM: usize = 21;
+/// `/proc/<pid>/statm` is seven unsigned page counts — `size resident shared
+/// text lib data dt` — separated by single spaces and ended by a newline, and
+/// `0 0 0 0 0 0 0` for a task with no address space (`proc_pid_statm` in
+/// fs/proc/array.c; K1).
+const STATM_FIELDS: usize = 7;
+/// `resident`, the second of them: the pages of the three resident counters
+/// (file, anonymous, shared memory) `task_statm` sums (fs/proc/task_mmu.c).
+const STATM_RESIDENT: usize = 1;
+/// `ESRCH`, matched by number because `io::ErrorKind` has no stable variant for
+/// it. It is 3 on every Linux architecture (`errno-base.h`).
+const ESRCH: i32 = 3;
 /// `AT_PAGESZ`: the auxiliary-vector entry through which the kernel tells a
 /// process its page size (K1, `getauxval(3)`). It is read from the scanned
 /// mount's own `self/auxv`, the same interface `sysconf(_SC_PAGESIZE)` answers
@@ -231,6 +252,117 @@ enum MountKind {
     /// even classify. Identity read through it belongs to the reader, not to the
     /// records, and is reported unavailable rather than guessed.
     Unproven,
+}
+
+/// How one scan reaches the files of each record it reads (PX-005-G01).
+///
+/// A record is read twice — `stat` for its identity, name and CPU counters,
+/// then `statm` for its resident memory — and a PID is only a number: by path,
+/// the second read reaches whichever process holds that number *now*. Linux
+/// hands a number out again only once the process that held it has been reaped.
+/// An ordinary fork then gets it only when the cyclic PID allocator comes back
+/// round to it, but a process with `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`
+/// over the PID namespace can claim it at once (`clone3()` with `set_tid`, Linux
+/// 5.5+, or `/proc/sys/kernel/ns_last_pid`), so by path the window between two
+/// back-to-back reads is a narrow but real race. A kernel procfs binds an open
+/// `/proc/<pid>` directory to the process instance it was opened on (its
+/// `struct pid`), so once that instance is reaped every lookup through the
+/// handle fails — with `ESRCH` from `proc_pid_permission`, or `ENOENT` from
+/// `proc_pident_lookup` when the task is found gone at the lookup itself (both
+/// fs/proc/base.c) — and never reaches a later process under the same number.
+/// The binding is the kernel procfs's own: [`record_access`] proves only that
+/// the reader can name an open directory, so a tree that is not a kernel procfs
+/// is read through the handle without that guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordAccess {
+    /// Each record's directory is opened once, and its files are read through
+    /// the reader's own `/proc/self/fd/<n>` link to that handle: `std` alone,
+    /// with no `openat`.
+    Pinned,
+    /// Each file is opened by its path under the scanned root. Used where the
+    /// reader has no procfs that names an open directory: every system but
+    /// Linux, and a Linux reader without its own `/proc`.
+    ByName,
+}
+
+/// One record's directory, as one scan reaches it.
+struct RecordDir {
+    /// Where this record's files are read from: the pinned handle's link, or the
+    /// record's own path under the root.
+    base: PathBuf,
+    /// The handle `base` names, held until the record has been read; dropping it
+    /// closes the directory. `None` when the record is read by name.
+    pin: Option<File>,
+    /// The record's path under the root, which test fault injection is keyed by.
+    #[cfg(test)]
+    record: PathBuf,
+}
+
+impl RecordDir {
+    fn open(path: PathBuf, access: RecordAccess) -> io::Result<Self> {
+        #[cfg(test)]
+        fault::check(&path, "open")?;
+        #[cfg(test)]
+        let record = path.clone();
+        let (base, pin) = match access {
+            RecordAccess::ByName => (path, None),
+            RecordAccess::Pinned => {
+                let pin = open_directory(&path)?;
+                (fd_link(&pin), Some(pin))
+            }
+        };
+        Ok(Self {
+            base,
+            pin,
+            #[cfg(test)]
+            record,
+        })
+    }
+
+    fn read(&self, file: &str) -> io::Result<Vec<u8>> {
+        #[cfg(test)]
+        fault::check(&self.record, file)?;
+        read_bounded(&self.base.join(file))
+    }
+
+    /// Whether the process instance `pid` started at `start_ticks` is really
+    /// gone, after its `statm` read failed as if it were. A pinned directory must
+    /// still be reachable, and the record's `stat`, read again through the same
+    /// directory, decides:
+    ///
+    /// * gone too: the instance ended;
+    /// * a parsable line naming another start time: the instance ended and a
+    ///   newcomer already holds its PID — which a read by name, or a tree that is
+    ///   not a kernel procfs, can reach (review round 2);
+    /// * the same start time: the instance is alive, and only its `statm` is
+    ///   missing — a tree no kernel produces;
+    /// * a line that does not parse, or any other failure: nothing is proved
+    ///   either way, so the record stays published with the field unread. That
+    ///   is the conservative answer: it never turns a process that may be alive
+    ///   into an exit, and never claims a value for one that may not be.
+    ///
+    /// So a reader whose own `/proc` stopped resolving mid-scan, or a missing
+    /// `statm` beside a `stat` that still reads, is never taken for an exit, and
+    /// a newcomer under a reused PID never keeps an ended instance published.
+    fn confirms_exit(&self, pid: u32, start_ticks: u64) -> bool {
+        if !self.reachable() {
+            return false;
+        }
+        match self.read("stat") {
+            Err(error) => ended(&error),
+            Ok(bytes) => {
+                parse_stat(pid, &bytes).is_some_and(|again| again.start_ticks != start_ticks)
+            }
+        }
+    }
+
+    /// Whether the pinned directory can still be reached through the reader's
+    /// own `/proc`. A kernel procfs answers that for a reaped process too: the
+    /// link resolves and only lookups beneath it fail. By name there is no link
+    /// to lose.
+    fn reachable(&self) -> bool {
+        self.pin.is_none() || std::fs::metadata(&self.base).is_ok()
+    }
 }
 
 /// One-shot reader over a `/proc`-shaped directory tree.
@@ -628,6 +760,9 @@ impl ProcessSource for ProcFsSource {
         let page_size = self.page_size();
         // Likewise the tick rate the CPU counters are in.
         let ticks_per_second = self.clock_ticks();
+        // Whether each record's two reads go through one pinned directory is a
+        // property of this reader, decided once per scan (see [`RecordAccess`]).
+        let access = record_access(&self.root);
         // Baselines taken under another boot or PID namespace count other
         // process instances; none of them may be subtracted from this scan's.
         // Both components are checked, so neither short-circuits the other's
@@ -711,12 +846,32 @@ impl ProcessSource for ProcFsSource {
                 }
                 continue;
             }
-            match read_bounded(&self.root.join(&name).join("stat")) {
+            // Both of this record's reads go through one directory, pinned where
+            // this reader can pin it (see [`RecordAccess`]).
+            let directory = match RecordDir::open(self.root.join(&name), access) {
+                Ok(directory) => directory,
+                // Gone before its directory could be pinned: the same churn as a
+                // `stat` that is already gone, below.
+                Err(error) if ended(&error) => {
+                    vanished += 1;
+                    continue;
+                }
+                Err(error) => {
+                    skipped.record(pid);
+                    record_issue(&mut issues, || EnumerationIssue {
+                        scope: IssueScope::Process(pid),
+                        reason: reason_for(&error),
+                        detail: format!("{pid}: {error}"),
+                    });
+                    continue;
+                }
+            };
+            match directory.read("stat") {
                 // The process exited between listing the root and reading it.
                 // Nothing was inaccessible: the record no longer exists at sample
                 // time, which is ordinary churn on any busy host, so it is
                 // counted apart and does not degrade the scan.
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(error) if ended(&error) => {
                     vanished += 1;
                 }
                 // One unreadable record is skipped with a reason; it never fails
@@ -741,6 +896,34 @@ impl ProcessSource for ProcFsSource {
                         });
                     }
                     (read_at, Some(stat)) => {
+                        // Resident memory is read second, from the same
+                        // directory: `statm`'s `resident`, which the kernel sums
+                        // exactly from Linux 6.16, where `stat` field 24 stays
+                        // approximate on every kernel since 6.2 (PX-005-G01).
+                        let resident_pages = match directory.read("statm") {
+                            // The process ended between its own two reads, so it
+                            // no longer exists at sample time — exactly like one
+                            // whose `stat` was already gone. It is counted as
+                            // vanished, never published with half a sample, and
+                            // no counter baseline is kept for it. The exit is
+                            // confirmed first: a `statm` that is gone while the
+                            // record's `stat` still reads is an unread field.
+                            Err(error)
+                                if ended(&error)
+                                    && directory.confirms_exit(pid, stat.start_ticks) =>
+                            {
+                                vanished += 1;
+                                continue;
+                            }
+                            // Refused, gone without the process, or failed for
+                            // another reason: this one field is unread, with that
+                            // reason, and the record is still published (PX-005).
+                            Err(error) => Observed::Missing(reason_for(&error)),
+                            Ok(bytes) => match parse_statm_resident(&bytes) {
+                                Some(pages) => Observed::Known(pages),
+                                None => Observed::Missing(MissingReason::Unavailable),
+                            },
+                        };
                         // The instance is the PID *and* its creation token: a
                         // reused PID is a different key, so it warms up instead
                         // of inheriting the counters of the process it replaced.
@@ -769,7 +952,7 @@ impl ProcessSource for ProcFsSource {
                                 creation: CreationToken::LinuxBootTicks(stat.start_ticks),
                             },
                             display_name: stat.display_name,
-                            resident: resident_bytes(stat.resident_pages, &page_size),
+                            resident: resident_bytes(resident_pages, &page_size),
                             cpu,
                         });
                     }
@@ -924,6 +1107,51 @@ fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Whether a read failed because the process it was reading no longer exists:
+/// by path its PID's directory is gone (`ENOENT`), and through a pinned
+/// directory the directory is still held but the instance it was opened on has
+/// been reaped (`ESRCH`, or `ENOENT` when the lookup itself finds the task gone;
+/// see [`RecordAccess`]). Either access can meet either error, and both are an
+/// exit during the scan, never an unreadable record — for a record's `statm`,
+/// once [`RecordDir::confirms_exit`] agrees.
+fn ended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
+}
+
+/// Whether this reader can pin record directories under `root`: it opens the
+/// root itself and checks that its own `/proc/self/fd/<n>` link reaches the very
+/// directory it opened. Decided per scan, so a reader without that link reads by
+/// name instead of taking every record's missing link for a process that ended.
+fn record_access(root: &Path) -> RecordAccess {
+    let Ok(directory) = open_directory(root) else {
+        return RecordAccess::ByName;
+    };
+    match (std::fs::metadata(fd_link(&directory)), directory.metadata()) {
+        (Ok(linked), Ok(opened))
+            if linked.dev() == opened.dev() && linked.ino() == opened.ino() =>
+        {
+            RecordAccess::Pinned
+        }
+        _ => RecordAccess::ByName,
+    }
+}
+
+/// Opens `path` only if it is a directory, without blocking on anything else.
+///
+/// The path is opened as `<path>/.`: resolving `.` beneath it requires `path`
+/// to be a directory, so a FIFO, a socket or a regular file fails with
+/// `ENOTDIR` before anything is opened — in one race-free call, with `std`
+/// alone and no per-architecture `O_DIRECTORY` value. A plain `open(2)` of a
+/// FIFO would instead wait for a writer, and stall the scan with it.
+fn open_directory(path: &Path) -> io::Result<File> {
+    File::open(path.join("."))
+}
+
+/// The reader's own name for an open handle, through its own procfs.
+fn fd_link(handle: &File) -> PathBuf {
+    Path::new(DEFAULT_PROC_ROOT).join(format!("self/fd/{}", handle.as_raw_fd()))
+}
+
 /// Accepts only a plain positive decimal PID directory name.
 pub fn parse_pid(name: &[u8]) -> Option<u32> {
     if name.is_empty() || name.len() > 10 || !name.iter().all(u8::is_ascii_digit) {
@@ -954,28 +1182,26 @@ pub struct StatFields {
     /// Field 22: start time in kernel clock ticks since boot. Mandatory — it is
     /// this record's creation token, and a record without one is not identified.
     pub start_ticks: u64,
-    /// Field 24: resident pages, when the line carries a parsable one.
-    ///
-    /// Optional where the creation token is not, because a metric is not an
-    /// identity: a line that stops before field 24, or whose field 24 is not a
-    /// plain count, still names an identified process whose resident memory this
-    /// scan could not read. It is reported unread rather than published as zero.
-    pub resident_pages: Option<u64>,
     /// Fields 14 and 15 summed: user plus kernel CPU time in clock ticks, when
-    /// both are plain counts and their sum fits. Optional for the same reason as
-    /// `resident_pages`: an unreadable counter is an unread metric, not a missing
-    /// process, and it is reported unread rather than as zero.
+    /// both are plain counts and their sum fits. Optional where the creation
+    /// token is not, because a metric is not an identity: an unreadable counter
+    /// is an unread metric of an identified process, not a missing process, and
+    /// it is reported unread rather than as zero.
     pub cpu_ticks: Option<u64>,
 }
 
-/// Parses `comm`, the creation token, the resident page count and the CPU
-/// counters out of one `/proc/<pid>/stat` line.
+/// Parses `comm`, the creation token and the CPU counters out of one
+/// `/proc/<pid>/stat` line.
 ///
 /// `comm` is raw bytes wrapped in parentheses and may itself contain spaces,
 /// parentheses, control characters and invalid UTF-8 (K1). Fields are therefore
 /// located from the first `(` and the **last** `)`, never by splitting on
 /// whitespace, so a hostile name cannot shift the field indices. The leading PID
 /// field must also match the directory this line came from.
+///
+/// Field 24 (`rss`) is not read: the kernel fills it from `get_mm_rss`, an
+/// approximate count on every kernel since 6.2, and resident memory comes from
+/// `statm` instead (PX-005-G01).
 pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
     let open = bytes.iter().position(|byte| *byte == b'(')?;
     let close = bytes.iter().rposition(|byte| *byte == b')')?;
@@ -988,11 +1214,10 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
     let fields: Vec<&[u8]> = bytes[close + 1..]
         .split(u8::is_ascii_whitespace)
         .filter(|field| !field.is_empty())
-        .take(RSS_FIELD_AFTER_COMM + 1)
+        .take(STARTTIME_FIELD_AFTER_COMM + 1)
         .collect();
-    // Every field read here is an unsigned count. `rss` is printed as a signed
-    // long (K1): a negative count is not a number of pages, so it is unread
-    // rather than reinterpreted, and the same holds for any non-numeric field.
+    // Every field read here is an unsigned count: a negative or non-numeric
+    // field is unread rather than reinterpreted.
     let count = |index: usize| {
         fields
             .get(index)
@@ -1000,16 +1225,44 @@ pub fn parse_stat(pid: u32, bytes: &[u8]) -> Option<StatFields> {
             .and_then(|field| field.parse::<u64>().ok())
     };
     let start_ticks = count(STARTTIME_FIELD_AFTER_COMM)?;
-    let resident_pages = count(RSS_FIELD_AFTER_COMM);
     let cpu_ticks = count(UTIME_FIELD_AFTER_COMM)
         .zip(count(STIME_FIELD_AFTER_COMM))
         .and_then(|(user, system)| user.checked_add(system));
     Some(StatFields {
         display_name: DisplayName::sanitize(&bytes[open + 1..close]),
         start_ticks,
-        resident_pages,
         cpu_ticks,
     })
+}
+
+/// The `resident` page count of one `/proc/<pid>/statm` line, if the line is
+/// exactly what the kernel writes: [`STATM_FIELDS`] plain decimal counts, each
+/// fitting a `u64`, separated by single spaces and ended by one newline.
+///
+/// Anything else is refused as a whole rather than read in part — a field too
+/// many or too few, a sign, a non-digit, a count past `u64`, a doubled or
+/// leading space, a missing newline — because a count taken from a line that is
+/// not the kernel's is not a count of anything. A refused line is an unread
+/// metric, never a zero.
+fn parse_statm_resident(bytes: &[u8]) -> Option<u64> {
+    let line = bytes.strip_suffix(b"\n")?;
+    let mut fields = line.split(|byte| *byte == b' ');
+    let mut counts = [0u64; STATM_FIELDS];
+    for count in &mut counts {
+        *count = parse_count(fields.next()?)?;
+    }
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(counts[STATM_RESIDENT])
+}
+
+/// A plain unsigned decimal: digits only, at least one, fitting a `u64`.
+fn parse_count(field: &[u8]) -> Option<u64> {
+    if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(field).ok()?.parse().ok()
 }
 
 /// The value of `wanted` in an auxiliary vector, if the vector carries one.
@@ -1060,15 +1313,16 @@ fn parse_clock_ticks(bytes: &[u8]) -> Option<u64> {
 ///
 /// Both inputs are needed and neither is guessed: a page count with no page size
 /// is not a byte count, and a page size with no count describes nothing. The
-/// multiplication is checked, so a kernel reporting an absurd count reports the
-/// metric unread rather than a wrapped one.
-fn resident_bytes(pages: Option<u64>, page_size: &Observed<u64>) -> Observed<u64> {
+/// record's own reason is published before the mount's. The multiplication is
+/// checked, so a kernel reporting an absurd count reports the metric unread
+/// rather than a wrapped one.
+fn resident_bytes(pages: Observed<u64>, page_size: &Observed<u64>) -> Observed<u64> {
     match (pages, page_size) {
-        (Some(pages), Observed::Known(size)) => match pages.checked_mul(*size) {
+        (Observed::Known(pages), Observed::Known(size)) => match pages.checked_mul(*size) {
             Some(bytes) => Observed::Known(bytes),
             None => Observed::Missing(MissingReason::Unavailable),
         },
-        (None, _) => Observed::Missing(MissingReason::Unavailable),
+        (Observed::Missing(reason), _) => Observed::Missing(reason),
         // The page size is a property of the scanned mount's kernel, so its
         // reason applies to every record equally.
         (_, Observed::Missing(reason)) => Observed::Missing(*reason),
@@ -1085,6 +1339,56 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
         .rposition(|byte| !byte.is_ascii_whitespace())
         .map_or(start, |index| index + 1);
     &bytes[start..end]
+}
+
+/// Test-only fault injection into one record's reads (PX-005-G01 review round
+/// 1). A hook may answer, in place of the operation, before a record's directory
+/// is opened (`"open"`) and before each of its files is read (the file's name).
+/// A scan runs on its caller's thread, so a thread-local hook reaches exactly
+/// the scan one test runs.
+#[cfg(test)]
+mod fault {
+    use std::cell::RefCell;
+    use std::io;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&Path, &str) -> Option<io::Error>>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Removes the hook when dropped, even when the test panics.
+    #[must_use = "the hook is removed as soon as this guard is dropped"]
+    pub(super) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Installs `hook` on this thread until the returned guard is dropped.
+    pub(super) fn install(
+        hook: impl FnMut(&Path, &str) -> Option<io::Error> + 'static,
+    ) -> Installed {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Installed
+    }
+
+    /// The error the hook injects for `operation` on `record`, if any.
+    pub(super) fn check(record: &Path, operation: &str) -> io::Result<()> {
+        HOOK.with(|slot| {
+            match slot
+                .borrow_mut()
+                .as_mut()
+                .and_then(|hook| hook(record, operation))
+            {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1235,18 +1539,357 @@ mod tests {
         let parsed = parse_stat(7, line("30", "12").as_bytes()).unwrap();
         assert_eq!(parsed.cpu_ticks, Some(42));
         assert_eq!(parsed.start_ticks, 900);
-        assert_eq!(parsed.resident_pages, Some(3));
         for (utime, stime) in [("-1", "2"), ("x", "2"), ("2", "-5")] {
             let parsed = parse_stat(7, line(utime, stime).as_bytes()).unwrap();
             assert_eq!(parsed.cpu_ticks, None, "{utime} {stime}");
-            // The identity and the other metric are untouched by it.
+            // The identity is untouched by it.
             assert_eq!(parsed.start_ticks, 900);
-            assert_eq!(parsed.resident_pages, Some(3));
         }
         let overflowing = format!("{}", u64::MAX);
         let parsed = parse_stat(7, line(&overflowing, "1").as_bytes()).unwrap();
         assert_eq!(parsed.cpu_ticks, None, "an overflowing sum is not wrapped");
     }
+
+    #[test]
+    fn statm_resident_is_the_second_of_exactly_seven_plain_counts() {
+        assert_eq!(parse_statm_resident(b"557 256 252 8 0 88 0\n"), Some(256));
+        // What the kernel writes for a task with no address space: a kernel
+        // thread, a zombie. A known zero, as `stat` field 24 reported it.
+        assert_eq!(parse_statm_resident(b"0 0 0 0 0 0 0\n"), Some(0));
+        let widest = format!("1 {} 0 0 0 0 0\n", u64::MAX);
+        assert_eq!(parse_statm_resident(widest.as_bytes()), Some(u64::MAX));
+        let refused: [&[u8]; 17] = [
+            b"",
+            b"\n",
+            b"557 256 252 8 0 88\n",
+            b"557 256 252 8 0 88 0 0\n",
+            b"557 256 252 8 0 88 0",
+            b"557 -256 252 8 0 88 0\n",
+            b"557 +256 252 8 0 88 0\n",
+            b"557 many 252 8 0 88 0\n",
+            b"557 18446744073709551616 252 8 0 88 0\n",
+            b"557  256 252 8 0 88 0\n",
+            b" 557 256 252 8 0 88 0\n",
+            b"557 256 252 8 0 88 0 \n",
+            b"557\t256 252 8 0 88 0\n",
+            b"557 256 252 8 0 88 0\r\n",
+            b"557 256 252 8 0 88 0\n\n",
+            // Strict about every field, not only the one it publishes: a line
+            // with any field that is not a count is not the kernel's line.
+            b"557 256 252 8 x 88 0\n",
+            b"557 256 252 8 0 88 -0\n",
+        ];
+        for line in refused {
+            assert_eq!(
+                parse_statm_resident(line),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_process_that_is_gone_counts_as_ended() {
+        assert!(ended(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(ended(&io::Error::from_raw_os_error(ESRCH)));
+        // Refused, failed or oversized reads are not exits: the record exists.
+        assert!(!ended(&io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(!ended(&io::Error::from_raw_os_error(5)));
+        assert!(!ended(&io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exceeds the read bound"
+        )));
+    }
+
+    #[test]
+    fn this_reader_pins_record_directories_wherever_its_procfs_can_name_them() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "srtop-record-access-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let access = record_access(&root);
+        std::fs::remove_dir(&root).unwrap();
+        // Linux names an open directory through `/proc/self/fd/<n>`; no other
+        // system this builds on does, and there every record is read by name.
+        let expected = if cfg!(target_os = "linux") {
+            RecordAccess::Pinned
+        } else {
+            RecordAccess::ByName
+        };
+        assert_eq!(access, expected);
+        // A root that cannot be opened is read by name, and its scan reports the
+        // root unreadable as it always has, rather than every record vanished.
+        assert_eq!(record_access(&root), RecordAccess::ByName);
+    }
+
+    /// On a real kernel, a pinned directory is what makes a record's two reads
+    /// one instance's: once the process it was opened on has been reaped, a read
+    /// through it fails with `ESRCH` — it never reaches a newcomer under the same
+    /// PID — and that failure is an exit, not an unreadable record. The worker is
+    /// bounded and owned by this test, killed and reaped before the second read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pinned_directory_of_a_reaped_process_reads_as_ended() {
+        use std::process::{Command, Stdio};
+        let mut worker = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the test owns this worker");
+        let root = Path::new(DEFAULT_PROC_ROOT);
+        let access = record_access(root);
+        let pid = worker.id();
+        let opened = RecordDir::open(root.join(pid.to_string()), access);
+        // The live worker's creation token, read the way a scan reads it.
+        let alive = match &opened {
+            Ok(directory) => directory.read("stat").and_then(|bytes| {
+                directory.read("statm")?;
+                parse_stat(pid, &bytes)
+                    .map(|stat| stat.start_ticks)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no stat line"))
+            }),
+            Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+        };
+        let _ = worker.kill();
+        let _ = worker.wait();
+        let directory = opened.expect("the worker existed when its directory was opened");
+        let start_ticks = alive.expect("a live worker's stat and statm are readable");
+        let error = directory
+            .read("statm")
+            .expect_err("a reaped process has no statm");
+        assert!(ended(&error), "{error:?}");
+        if access == RecordAccess::Pinned {
+            assert_eq!(error.raw_os_error(), Some(ESRCH), "{error:?}");
+        }
+        // And a scan confirms that exit (review round 1, W1): a reaped process's
+        // pinned directory still resolves through the reader's own `/proc`, while
+        // its `stat`, read again, is gone too.
+        assert!(directory.reachable());
+        assert!(directory.confirms_exit(pid, start_ticks));
+    }
+
+    /// A minimal `/proc`-shaped tree for the fault-injection tests: identity
+    /// files, a 4 KiB page size, and one readable `stat` and `statm` per record
+    /// (`statm` reports 3 resident pages).
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(records: &[u32]) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "srtop-faults-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("sys/kernel/random")).unwrap();
+            std::fs::write(root.join("sys/kernel/hostname"), "fault-host\n").unwrap();
+            std::fs::write(root.join("sys/kernel/random/boot_id"), "boot-a\n").unwrap();
+            std::fs::create_dir_all(root.join("self/ns")).unwrap();
+            std::os::unix::fs::symlink("pid:[4026531836]", root.join("self/ns/pid")).unwrap();
+            let auxv: Vec<u8> = [AT_PAGESZ, 4096, AT_NULL, 0]
+                .iter()
+                .flat_map(|word| (*word as usize).to_ne_bytes())
+                .collect();
+            std::fs::write(root.join("self/auxv"), auxv).unwrap();
+            for pid in records {
+                let directory = root.join(pid.to_string());
+                std::fs::create_dir(&directory).unwrap();
+                let fillers: Vec<String> = (4..=21).map(|field| field.to_string()).collect();
+                let stat = format!(
+                    "{pid} (worker) S {} {} 4096 0 0\n",
+                    fillers.join(" "),
+                    100 + pid
+                );
+                std::fs::write(directory.join("stat"), stat).unwrap();
+                std::fs::write(directory.join("statm"), "10 3 1 1 0 1 0\n").unwrap();
+            }
+            Self(root)
+        }
+
+        /// One scan of this tree, with `hook` injecting faults into its records.
+        fn scan(
+            &self,
+            hook: impl FnMut(&Path, &str) -> Option<io::Error> + 'static,
+        ) -> ProcessSnapshot {
+            let _faults = fault::install(hook);
+            ProcFsSource::with_root(&self.0).snapshot()
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record_pid(record: &Path) -> Option<u32> {
+        record.file_name()?.to_str()?.parse().ok()
+    }
+
+    fn published(snapshot: &ProcessSnapshot) -> Vec<u32> {
+        snapshot
+            .records
+            .iter()
+            .filter_map(|record| match record.key.pid {
+                Observed::Known(pid) => Some(pid),
+                Observed::Missing(_) => None,
+            })
+            .collect()
+    }
+
+    /// What a path answers once its process is gone.
+    fn gone() -> io::Error {
+        io::Error::from(io::ErrorKind::NotFound)
+    }
+
+    /// What a pinned directory answers once its process has been reaped.
+    fn reaped() -> io::Error {
+        io::Error::from_raw_os_error(ESRCH)
+    }
+
+    /// Review round 1, W3: a record whose directory is gone before it could be
+    /// opened — by path (`ENOENT`), or reaped in that instant (`ESRCH`) — is
+    /// ordinary churn. It is counted as vanished, never as an unreadable record,
+    /// and the scan stays complete.
+    #[test]
+    fn a_record_gone_before_its_directory_opens_is_churn_and_the_scan_stays_complete() {
+        let tree = Tree::new(&[10, 20, 30]);
+        let snapshot = tree.scan(|record, operation| match (record_pid(record), operation) {
+            (Some(20), "open") => Some(gone()),
+            (Some(30), "open") => Some(reaped()),
+            _ => None,
+        });
+        assert_eq!(published(&snapshot), vec![10]);
+        assert_eq!(snapshot.vanished, 2);
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+        assert!(snapshot.completeness.issues().is_empty());
+    }
+
+    /// Review round 1, W3: the same for a process reaped between its directory's
+    /// open and its `stat` read — `ESRCH` through a pinned directory, `ENOENT` by
+    /// path. Ordinary churn keeps the scan complete.
+    #[test]
+    fn a_process_reaped_between_its_open_and_its_stat_is_churn_and_the_scan_stays_complete() {
+        let tree = Tree::new(&[10, 20, 30]);
+        let snapshot = tree.scan(|record, operation| match (record_pid(record), operation) {
+            (Some(20), "stat") => Some(gone()),
+            (Some(30), "stat") => Some(reaped()),
+            _ => None,
+        });
+        assert_eq!(published(&snapshot), vec![10]);
+        assert_eq!(snapshot.vanished, 2);
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+        assert!(snapshot.completeness.issues().is_empty());
+    }
+
+    /// Review round 1, W1: a `statm` that answers as if its process were gone is
+    /// an exit only when the process is gone too. Record 20's `stat` still reads,
+    /// so its resident memory is an unread field of a published record; record
+    /// 30's `stat`, read again, is gone as well, so 30 vanished.
+    #[test]
+    fn a_missing_statm_is_an_exit_only_when_the_records_stat_is_gone_too() {
+        let tree = Tree::new(&[10, 20, 30]);
+        let mut stat_reads_of_30 = 0;
+        let snapshot = tree.scan(
+            move |record, operation| match (record_pid(record), operation) {
+                (Some(20), "statm") => Some(reaped()),
+                (Some(30), "statm") => Some(gone()),
+                (Some(30), "stat") => {
+                    stat_reads_of_30 += 1;
+                    (stat_reads_of_30 > 1).then(reaped)
+                }
+                _ => None,
+            },
+        );
+        assert_eq!(published(&snapshot), vec![10, 20]);
+        assert_eq!(snapshot.records[0].resident, Observed::Known(3 * 4096));
+        assert_eq!(
+            snapshot.records[1].resident,
+            Observed::Missing(MissingReason::Unavailable)
+        );
+        assert_eq!(snapshot.vanished, 1);
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+    }
+
+    /// Review round 1, W1: through a pinned directory an exit is confirmed only
+    /// while the directory is still reachable. A pin whose link no longer
+    /// resolves — the reader's own `/proc` gone mid-scan — confirms nothing,
+    /// whatever its files answer, because that failure is the reader's and not
+    /// the record's. By name there is no link to lose, and a `stat` that still
+    /// reads confirms no exit either.
+    #[test]
+    fn an_exit_is_not_confirmed_through_a_pin_the_reader_can_no_longer_reach() {
+        let tree = Tree::new(&[10]);
+        let unreachable = RecordDir {
+            // A descriptor number no process can hold, so its link resolves
+            // nowhere, here or on a system with no `/proc` at all.
+            base: Path::new(DEFAULT_PROC_ROOT).join(format!("self/fd/{}", i32::MAX)),
+            pin: Some(File::open(&tree.0).unwrap()),
+            record: tree.0.join("10"),
+        };
+        // The tree's record 10 started at tick 110.
+        assert!(!unreachable.reachable());
+        assert!(!unreachable.confirms_exit(10, 110));
+        let by_name = RecordDir {
+            base: tree.0.join("10"),
+            pin: None,
+            record: tree.0.join("10"),
+        };
+        assert!(by_name.reachable());
+        assert!(!by_name.confirms_exit(10, 110), "its stat still reads");
+    }
+
+    /// Review round 2, R2-W1: a `stat` read again decides an exit by process
+    /// instance, never by PID. Gone, or naming another start time under the same
+    /// PID, the instance ended; the same start time is the same, live instance;
+    /// a line that names no instance proves nothing, so the record stays
+    /// published with its field unread.
+    #[test]
+    fn a_re_read_stat_confirms_an_exit_by_instance_not_by_pid() {
+        let tree = Tree::new(&[10]);
+        let record = tree.0.join("10");
+        let by_name = RecordDir {
+            base: record.clone(),
+            pin: None,
+            record: record.clone(),
+        };
+        // The tree's record 10 started at tick 110.
+        assert!(
+            !by_name.confirms_exit(10, 110),
+            "the same instance still reads"
+        );
+        assert!(by_name.confirms_exit(10, 109), "a newcomer holds the PID");
+        std::fs::write(record.join("stat"), "10 (worker) S\n").unwrap();
+        assert!(
+            !by_name.confirms_exit(10, 110),
+            "a line naming no instance proves nothing"
+        );
+        std::fs::remove_file(record.join("stat")).unwrap();
+        assert!(by_name.confirms_exit(10, 110), "gone too");
+    }
+
+    /// Review round 1, W2: a record directory is opened only if it is one. A
+    /// regular file fails at once with `ENOTDIR`, an unreadable record rather
+    /// than an exit; a FIFO, which a plain open would wait on, is covered by
+    /// `procfs_test`.
+    #[test]
+    fn only_a_directory_is_opened_as_a_record_directory() {
+        let tree = Tree::new(&[10]);
+        let error =
+            open_directory(&tree.0.join("10/stat")).expect_err("a regular file is not a directory");
+        assert!(!ended(&error), "{error:?}");
+        assert!(open_directory(&tree.0.join("10")).is_ok());
+    }
+
     #[test]
     fn an_unnameable_namespace_withholds_the_hostname_rather_than_labelling_it_unknown() {
         let tag = "uts:[4026531838]".to_string();

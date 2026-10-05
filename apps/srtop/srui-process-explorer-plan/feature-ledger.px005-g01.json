@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "ticket": "PX-005-G01",
+  "upstream": {
+    "project": "SRUI",
+    "version": "0.6",
+    "scope": "Resident memory read from /proc/<pid>/statm instead of /proc/<pid>/stat field 24, exact from Linux 6.16, with PX-005's units and availability states unchanged; no kernel-version branch, no further memory field, no CPU, protocol, runtime or client change, no htop parity claim",
+    "references": {
+      "D1": "../../../SRUI_Semantic_Remote_UI_Design_v0.6.md",
+      "K1": "https://docs.kernel.org/filesystems/proc.html",
+      "KC1": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=82241a83cd15aaaf28200a40ad1a8b480012edaf",
+      "KC2": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=f1a7941243c102a44e8847e3b94ff4ff3ec56f25",
+      "KS1": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/proc/array.c?h=v7.2",
+      "KS2": "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/fs/proc/base.c?h=v7.2"
+    }
+  },
+  "entries": [
+    {
+      "feature_id": "SRUI-PX005G01-001",
+      "feature": "Resident memory is /proc/<pid>/statm field 2 (resident) in pages times the scanned mount's own page size, never /proc/<pid>/stat field 24, with no kernel-version branch: exact from Linux 6.16 and the stable kernels carrying the same fix (6.15.7, 6.12.39, 6.6.99), and on every earlier kernel the same approximate counter field 24 reports (percpu_counters read without their per-CPU deltas from 6.2, per-thread caches added in after more than 64 page-fault events before it), so never worse; the metric definition and README state each regime, the bound of max(32, 2 x online CPUs) pages per online CPU per counter, a possible 0 B for a fresh process, and the cost of the extra read and of the pin",
+      "scope": "PX-005-G01/live and fixture procfs roots/read-only",
+      "source_refs": [
+        "K1",
+        "KC1",
+        "KC2",
+        "KS1"
+      ],
+      "owner": "PX-005-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005G01-002",
+      "feature": "A statm that cannot be read after the record's stat was is handled with the existing states and never by falling back to stat field 24: refused is Denied and unreadable, oversized or anything but the kernel's line of seven plain counts is Unavailable, both on a record that is still published without degrading Completeness, while a process that ended between the two reads, confirmed by its stat, read again through the same directory, being gone too or naming another instance under the same PID, is counted as vanished and publishes nothing; a statm missing beside a stat that still reads as the same instance, or beside a line that names none, is Unavailable, never an exit",
+      "scope": "PX-005-G01/all procfs roots/read-only",
+      "source_refs": [
+        "D1",
+        "KS1"
+      ],
+      "owner": "PX-005-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005G01-003",
+      "feature": "Both files of a record are read through one handle on its /proc/<pid> directory, reached through the reader's own /proc/self/fd/<n> with std alone and opened only if it is a directory, so on a kernel procfs a PID reused between the two reads fails with ESRCH or ENOENT instead of lending another process's memory to the instance stat identified (a with_root tree that is not a kernel procfs gets the handle without that guarantee); a reader whose own /proc cannot name an open directory (every system but Linux, or a Linux reader without a usable /proc) reads by name without reporting it, and a record directory that may be searched but not read is skipped as Denied",
+      "scope": "PX-005-G01/Linux procfs roots and fixture trees/read-only; by name on other systems",
+      "source_refs": [
+        "KS2"
+      ],
+      "owner": "PX-005-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005G01-004",
+      "feature": "A task with no address space, a kernel thread or a zombie, reads the kernel's statm of seven zeros and keeps the known 0 B PX-005 published for it from stat field 24",
+      "scope": "PX-005-G01/all procfs roots/read-only",
+      "source_refs": [
+        "KS1"
+      ],
+      "owner": "PX-005-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005-G01.md"
+      ]
+    },
+    {
+      "feature_id": "SRUI-PX005G01-005",
+      "feature": "Correction to PX-005's record, which is not rewritten: its 'exact bytes' and SRUI-PX005-001's 'exact u64 byte count' describe integer storage and conversion, while the count converted, stat field 24, was the kernel's approximate get_mm_rss on every kernel since 6.2; stat, statm and status are 'the same inaccurate number' only before 6.16 and its stable backports; and SRUI-PX005-002's interface is superseded by statm field 2",
+      "scope": "PX-005-G01/documentation of PX-005's resident-memory claims",
+      "source_refs": [
+        "KC1",
+        "KC2",
+        "KS1"
+      ],
+      "owner": "PX-005-G01",
+      "status": "in_progress",
+      "evidence": [
+        "docs/process-explorer/completions/PX-005-G01.md"
+      ]
+    }
+  ]
+}

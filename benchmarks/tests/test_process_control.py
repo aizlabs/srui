@@ -112,6 +112,26 @@ def wait_for_pid(path: Path) -> int:
     raise AssertionError(f"PID file was not written: {path} (last read {text!r})")
 
 
+def process_state(pid: int) -> str | None:
+    """The kernel's one-letter state for `pid`, or None once no process has it."""
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        return result.stdout.strip()[:1] or None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    # The state follows the parenthesized command name, which may contain ")".
+    return stat[stat.rindex(")") + 2]
+
+
 def assert_process_gone(pid: int) -> None:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -119,8 +139,15 @@ def assert_process_gone(pid: int) -> None:
             os.kill(pid, 0)
         except ProcessLookupError:
             return
+        # A zombie has exited and runs nothing; it waits only for its parent to
+        # reap it, which never happens under a PID 1 that does not reap (a
+        # container started without an init). Anything still running fails.
+        if process_state(pid) in (None, "Z", "X"):
+            return
         time.sleep(0.02)
-    pytest.fail(f"process {pid} survived supervised cleanup")
+    pytest.fail(
+        f"process {pid} survived supervised cleanup (state {process_state(pid)!r})"
+    )
 
 
 def wait_for_two_pids(path: Path) -> tuple[int, int]:

@@ -478,8 +478,8 @@ fn uptime(uptime: &Result<u64, FigureGap>) -> Line {
 
 /// The process count, in the status line's own counts and words, and scoped to
 /// what srtop can state: the processes this reader can see in the scanned root,
-/// which its PID namespace and the mount's visibility options (`hidepid`)
-/// bound without telling it, and no filter of srtop's own. A complete scan is
+/// which the PID namespace the mount was made for and the mount's visibility
+/// options (`hidepid`) bound without telling it, and no filter of srtop's own. A complete scan is
 /// complete over that view, never a claim about the whole host.
 fn processes(count: &ProcessCount) -> Line {
     let mut text = format!("{}: {} listed", metric::PROCESS_COUNT.label, count.listed);

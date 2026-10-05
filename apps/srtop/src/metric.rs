@@ -286,8 +286,10 @@ pub const PROCESS_COUNT: MetricDefinition = MetricDefinition {
                      it could not read and the entries beyond its record limit counted \
                      separately, in the status line's own words; a process that ended during \
                      the scan is not counted. The count is bounded by what this reader can see, \
-                     not by the host: its PID namespace hides every process outside it, and a \
-                     procfs mounted with hidepid=invisible (2), as systemd's \
+                     not by the host: a procfs lists only the PID namespace it was mounted for \
+                     (by default the mounter's), which is usually the reader's own but is an \
+                     outer one when the reader runs in a nested namespace that inherited that \
+                     /proc; and a procfs mounted with hidepid=invisible (2), as systemd's \
                      ProtectProc=invisible does, or hidepid=ptraceable (4), hides other \
                      users' or unptraceable processes without any error, so a complete scan \
                      is complete over this view only. srtop detects neither, and applies no \

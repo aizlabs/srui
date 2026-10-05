@@ -71,7 +71,7 @@
     },
     {
       "feature_id": "SRUI-PX007-005",
-      "feature": "The process count states the only scope srtop knows: 'Processes visible to this reader', the records the last successful scan listed, in the status line's own counts and words (unreadable, beyond the record limit, complete or incomplete scan), processes and never threads, with 'no srtop filter'; the view is bounded, without any error, by the reader's PID namespace and procfs mount options such as hidepid, which srtop does not detect, so a complete scan is never a claim about the whole host",
+      "feature": "The process count states the only scope srtop knows: 'Processes visible to this reader', the records the last successful scan listed, in the status line's own counts and words (unreadable, beyond the record limit, complete or incomplete scan), processes and never threads, with 'no srtop filter'; the view is bounded, without any error, by the PID namespace the procfs was mounted for (usually, not always, the reader's) and its mount options such as hidepid, which srtop does not detect, so a complete scan is never a claim about the whole host",
       "scope": "PX-007/all sources/read-only; filters are PX-010",
       "source_refs": [
         "D1",

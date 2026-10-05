@@ -104,6 +104,10 @@ int main(int argc, char **argv) {
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_path = argv[++i];
+        } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+            /* An sshd stand-in carries `-f <config>`: rule 7's whole evidence. Consumed and
+               ignored, so the argument cannot be read as the sleep duration. */
+            i++;
         } else {
             seconds = (unsigned)strtoul(argv[i], NULL, 10);
         }
@@ -181,6 +185,39 @@ marker_pattern() {
     printf '%s$' "$(printf '%s' "$1" | sed -e 's/\./[.]/g' -e 's/[[\*^$+?(){}|]/\\&/g')"
 }
 
+# A marker inside a checkout's SwiftPM build directory, which is where a killed `swift test` leaves
+# its helper and test bundle. The triple directory is spelled out because the real one is, and the
+# shipped pattern has to match it without knowing which triple this machine builds for.
+make_build_marker() {
+    local name=$1 dir="$sandbox/repo/client-macos/.build/arm64-apple-macosx/debug"
+    mkdir -p "$dir"
+    cp "$marker_binary" "$dir/$name"
+    printf '%s' "$dir/$name"
+}
+
+# The same, inside a test *bundle* in that build directory: the other process a killed run leaves.
+make_bundle_marker() {
+    # Two statements, not one `local`: bash creates every name in a `local` unset before assigning
+    # any of them, so `dir="...$name..."` in the same statement reads an unbound variable (and dies
+    # under `set -u`), never the argument just assigned beside it.
+    local name=$1
+    local dir="$sandbox/repo/client-macos/.build/arm64-apple-macosx/debug/$name.xctest/Contents/MacOS"
+    mkdir -p "$dir"
+    cp "$marker_binary" "$dir/$name"
+    printf '%s' "$dir/$name"
+}
+
+# A marker whose `.build` is a symlink into a shared cache: the path `ps` reports is inside the
+# checkout, the file is not. The cargo equivalent is `make_cached_marker`; this is the SwiftPM one,
+# and it is only reapable if the root set follows a `.build` symlink as well as a `target` one.
+make_cached_build_marker() {
+    local name=$1 cache="$sandbox/buildcache-swift/arm64-apple-macosx/debug"
+    mkdir -p "$cache"
+    ln -sfn "$sandbox/buildcache-swift" "$sandbox/wt-cache/.build"
+    cp "$marker_binary" "$cache/$name"
+    printf '%s' "$sandbox/wt-cache/.build/arm64-apple-macosx/debug/$name"
+}
+
 # The spawn helpers publish `spawned_pid` rather than echoing it: a `$(...)` substitution would
 # both reparent the marker to init (defeating case 1) and hang forever, because the background
 # process inherits the substitution's stdout pipe and the shell waits for EOF. Marker stdio goes
@@ -200,6 +237,43 @@ spawn_orphan() {
     spawned_pid=""
     while [ "$waited" -lt 50 ]; do
         spawned_pid=$(pgrep -f "^$1 600$" 2>/dev/null | head -1)
+        [ -n "$spawned_pid" ] && break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [ -n "$spawned_pid" ] && spawned_pids+=("$spawned_pid")
+}
+
+# An orphan started with arguments of its own, matched by the exact command line it will show.
+# `spawn_orphan` can only stage `<path> 600`, and rule 7's candidates are recognized by an argument.
+spawn_orphan_with_args() {
+    local exe=$1
+    shift
+    ("$exe" "$@" 600 >/dev/null 2>&1 &) 2>/dev/null
+    local waited=0 want
+    want="$exe $* 600"
+    spawned_pid=""
+    while [ "$waited" -lt 50 ]; do
+        spawned_pid=$(pgrep -f "^$(printf '%s' "$want" | sed -e 's/[][\\.*^$+?(){}|]/\\&/g')\$" 2>/dev/null | head -1)
+        [ -n "$spawned_pid" ] && break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [ -n "$spawned_pid" ] && spawned_pids+=("$spawned_pid")
+}
+
+# An orphan that rewrote its own process title, the way a real `sshd -D` listener does: argv[0] is
+# `sshd:` and the executable path, if any, follows it. `exec -a` is how a shell can set argv[0] to
+# something other than the file it runs.
+spawn_orphan_with_title() {
+    local title=$1 exe=$2
+    shift 2
+    ((exec -a "$title" "$exe" "$@" 600 >/dev/null 2>&1) &) 2>/dev/null
+    local waited=0 want
+    want="$title $* 600"
+    spawned_pid=""
+    while [ "$waited" -lt 50 ]; do
+        spawned_pid=$(pgrep -f "^$(printf '%s' "$want" | sed -e 's/[][\\.*^$+?(){}|]/\\&/g')\$" 2>/dev/null | head -1)
         [ -n "$spawned_pid" ] && break
         sleep 0.1
         waited=$((waited + 1))
@@ -714,13 +788,34 @@ kill_marker "${holder20:-}"
 
 echo "case 21: the default glob no longer matches an unrelated px0 directory"
 # `/tmp/px0*` also matched `/tmp/px0-cache`; the fixtures use `px0NN-`.
+#
+# The pattern list is iterated with pathname expansion *off*. Unquoted, `$default_globs` is expanded
+# against the real /tmp before the loop sees it, so on any machine with leftover `/tmp/srui-*` litter
+# this compared the fixture path against stale file names instead of against the patterns: the second
+# assertion failed, and the first one passed vacuously, because a litter name matches neither path.
+# (Measured on a developer machine with 76 `/tmp/srui-coding-agent-*.sock.lock` files; CI's /tmp is
+# clean, which is why it only ever failed locally.) The bait file makes the mistake fail here too.
+glob_bait="/tmp/srui-reap-selftest-glob-bait.$$"
+: >"$glob_bait"
 default_globs=$(awk -F"'" '/^tmp_globs=/ { print $2 }' "$reaper")
 matched_cache=no
 matched_fixture=no
-for pattern in $default_globs; do
+set -f
+# shellcheck disable=SC2206 # deliberate word splitting, with globbing off: a list of patterns
+default_glob_list=($default_globs)
+set +f
+for pattern in "${default_glob_list[@]+"${default_glob_list[@]}"}"; do
+    # shellcheck disable=SC2254 # $pattern is a pattern here, by design
     case /tmp/px0-cache in $pattern) matched_cache=yes ;; esac
+    # shellcheck disable=SC2254
     case /tmp/px001-shell in $pattern) matched_fixture=yes ;; esac
 done
+rm -f "$glob_bait"
+if [ "${#default_glob_list[@]}" -eq 3 ]; then
+    pass "the pattern list was read as three patterns, not as whatever /tmp holds"
+else
+    fail "the pattern list expanded to ${#default_glob_list[@]} entries; globbing leaked in"
+fi
 [ "$matched_cache" = no ] && pass "the default glob does not match /tmp/px0-cache" ||
     fail "the default glob still matches /tmp/px0-cache"
 [ "$matched_fixture" = yes ] && pass "the default glob still matches /tmp/px001-shell" ||
@@ -1412,6 +1507,365 @@ else
     printf '%s\n' "    reaper said: $output" >&2
 fi
 assert_contains "$output" "not a regular expression awk accepts" "the reaper said what was wrong"
+
+echo "case 32: the shipped pattern selects the processes a killed swift test leaves behind"
+# The point of this case is the *default* pattern, so no `SRUI_REAP_PATTERN` is set anywhere in it:
+# a pattern supplied here would prove only that the machinery works, not that a real leaked helper is
+# covered. Running with the default is safe in the sandbox because rule 6's roots are derived from
+# where the reaper copy lives, so nothing in the real repository is in scope.
+shipped_pattern=$(awk -F"'" '/^pattern=\$\{SRUI_REAP_PATTERN/ { print $2 }' "$reaper")
+if [ -z "$shipped_pattern" ]; then
+    fail "could not read the shipped pattern out of the reaper"
+else
+    for covered in \
+        "/x/client-macos/.build/arm64-apple-macosx/debug/swiftpm-testing-helper" \
+        "/x/client-macos/.build/x86_64-unknown-linux-gnu/debug/swiftpm-testing-helper" \
+        "/x/client-macos/.build/arm64-apple-macosx/debug/sruiPackageTests.xctest/Contents/MacOS/sruiPackageTests" \
+        "/x/repo/target/debug/counter"; do
+        if awk -v pattern="$shipped_pattern" -v path="$covered" 'BEGIN { exit !(path ~ pattern) }'; then
+            pass "the shipped pattern covers $(basename "$covered")"
+        else
+            fail "the shipped pattern does not cover $covered"
+        fi
+    done
+    # The literal dots really are literal. Written as `\.`, the pattern reaches gawk through `-v`
+    # with its escape sequences processed - `\.build` arrives as plain `.build`, warning on stderr -
+    # and then matches any character before `build`, so an orphan under `xbuild/` is selected as
+    # SwiftPM output and `Fooxctest` as a test bundle. Both are checked here because both dots were
+    # written that way, and both were wrong.
+    for spared in \
+        "/x/client-macos/xbuild/arm64-apple-macosx/debug/swiftpm-testing-helper" \
+        "/x/client-macos/.build/arm64-apple-macosx/debug/Fooxctest/Contents/MacOS/Foo" \
+        "/x/client-macos/.build/arm64-apple-macosx/debug/srui-cli" \
+        "/usr/bin/swift-test" \
+        "/Applications/Xcode.app/Contents/Developer/usr/bin/swift-test"; do
+        if awk -v pattern="$shipped_pattern" -v path="$spared" 'BEGIN { exit !(path ~ pattern) }'; then
+            fail "the shipped pattern matches $spared, which it must not"
+        else
+            pass "the shipped pattern spares $(basename "$spared")"
+        fi
+    done
+fi
+
+echo "case 38: the shipped pattern draws no awk warning, so its dots stay literal"
+# The warning is the symptom; the wildcard match above is the defect. Checked separately because a
+# pattern can be correct today and regress the moment someone writes `\.` into it: awk's stderr is
+# the earliest signal, and a destructive script's stderr is where its notes about what it declined to
+# kill appear, so it has to stay clean.
+awk_warning=$(awk -v pattern="$shipped_pattern" 'BEGIN { if ("" ~ pattern) exit 0 }' 2>&1)
+if [ -z "$awk_warning" ]; then
+    pass "the shipped pattern compiles with no warning on this awk"
+else
+    fail "the shipped pattern warns: $awk_warning"
+fi
+
+echo "case 33: an orphaned swiftpm test process inside a checkout is reaped, outside one is not"
+helper=$(make_build_marker swiftpm-testing-helper)
+spawn_orphan "$helper"
+helper_pid=$spawned_pid
+bundle=$(make_bundle_marker sruiPackageTests)
+spawn_orphan "$bundle"
+bundle_pid=$spawned_pid
+foreign_helper=$(make_foreign_marker "$sandbox/elsewhere/target/debug" swiftpm-testing-helper)
+spawn_orphan "$foreign_helper"
+foreign_pid=$spawned_pid
+if [ -z "$helper_pid" ] || [ -z "$bundle_pid" ] || [ -z "$foreign_pid" ]; then
+    fail "could not stage the swiftpm test-process markers"
+else
+    # One sweep, the shipped pattern, no overrides but the sandbox's socket table and globs.
+    PATH="$sandbox/lsofbin:$PATH" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        TMPDIR="$sandbox_runtime/tmp" \
+        SRUI_TEST_LSOF_TABLE="$lsof_table" \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$sandbox/tmp/srui-*" \
+        bash "$reaper" >/dev/null 2>&1
+    assert_terminated "$helper_pid" "the leaked swiftpm-testing-helper was killed"
+    assert_terminated "$bundle_pid" "the leaked test bundle executable was killed"
+    # Rule 6 still gates the new names: the same binary outside every checkout is somebody else's.
+    assert_alive "$foreign_pid" "a swiftpm-testing-helper outside the checkout survived"
+fi
+kill_marker "${helper_pid:-}"
+kill_marker "${bundle_pid:-}"
+kill_marker "${foreign_pid:-}"
+
+echo "case 34: a swiftpm helper in a checkout whose .build is a symlinked cache is still reaped"
+cached_helper=$(make_cached_build_marker swiftpm-testing-helper)
+spawn_orphan "$cached_helper"
+cached_pid=$spawned_pid
+if [ -z "$cached_pid" ]; then
+    fail "could not stage a marker behind a .build symlink"
+else
+    run_reaper "$(marker_pattern "$cached_helper")" 0 >/dev/null
+    assert_terminated "$cached_pid" "the orphan behind a .build symlink was killed"
+fi
+kill_marker "${cached_pid:-}"
+
+echo "case 35: a fixture sshd is reaped by the config it was started from, not by where it lives"
+# Deliberately outside every checkout, like the real one: /usr/sbin/sshd is what the SSH tests spawn,
+# so rule 6 can never admit it and rule 7 has to carry the whole decision.
+sshd_dir="$sandbox/tmp/srui-sshfix-$$"
+mkdir -p "$sshd_dir"
+# A fixture config, written as the SSH suites write theirs: the subsystem declaration is rule 7's
+# ownership evidence, and without it the pathname alone admits nothing.
+printf 'Port 2222\nSubsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sshd_dir/sshd_config"
+fixture_sshd=$(make_foreign_marker "$sandbox/usr-local-bin" sshd)
+spawn_orphan_with_args "$fixture_sshd" -f "$sshd_dir/sshd_config"
+sshd_pid=$spawned_pid
+if [ -z "$sshd_pid" ]; then
+    fail "could not stage an orphaned fixture sshd"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    output=$(run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+    reap_globs=""
+    assert_terminated "$sshd_pid" "the orphaned fixture sshd was killed"
+    # Selected by rule 7 alone: the pattern given above matches no executable at all.
+    assert_contains "$output" "killing orphaned fixture server pid $sshd_pid" \
+        "the sweep named the sshd it killed"
+fi
+kill_marker "${sshd_pid:-}"
+
+echo "case 36: an sshd configured from anywhere else is never signalled"
+spared_config="$sandbox/etc"
+mkdir -p "$spared_config"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$spared_config/sshd_config"
+survivors=""
+# A service's own config; a relative path, which no snapshot can resolve; and no -f at all.
+spawn_orphan_with_args "$fixture_sshd" -f "$spared_config/sshd_config"
+survivors="$survivors $spawned_pid"
+service_pid=$spawned_pid
+spawn_orphan_with_args "$fixture_sshd" -f "relative/sshd_config"
+survivors="$survivors $spawned_pid"
+relative_pid=$spawned_pid
+spawn_orphan "$fixture_sshd"
+survivors="$survivors $spawned_pid"
+bare_pid=$spawned_pid
+if [ -z "${service_pid:-}" ] || [ -z "${relative_pid:-}" ] || [ -z "${bare_pid:-}" ]; then
+    fail "could not stage the sshd processes rule 7 must spare"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$service_pid" "an sshd configured from outside the fixture globs survived"
+    assert_alive "$relative_pid" "an sshd whose -f path is relative survived"
+    assert_alive "$bare_pid" "an sshd with no -f survived"
+fi
+for pid in $survivors; do kill_marker "$pid"; done
+
+echo "case 40: a matching pathname is not ownership; the config must be a fixture's"
+# `/tmp/srui-production/sshd_config` satisfies the name match while belonging to a daemon nobody
+# here owns, and a path need not even exist to match a glob. So the file is read and must declare
+# SRUI's own subsystem, which every fixture config writes and no system sshd serves.
+foreign_dir="$sandbox/tmp/srui-production"
+mkdir -p "$foreign_dir"
+printf 'Port 22\nSubsystem sftp /usr/lib/openssh/sftp-server\n' >"$foreign_dir/sshd_config"
+absent_dir="$sandbox/tmp/srui-absent"
+mkdir -p "$absent_dir"
+spawn_orphan_with_args "$fixture_sshd" -f "$foreign_dir/sshd_config"
+foreign_sshd_pid=$spawned_pid
+spawn_orphan_with_args "$fixture_sshd" -f "$absent_dir/sshd_config"
+absent_sshd_pid=$spawned_pid
+if [ -z "${foreign_sshd_pid:-}" ] || [ -z "${absent_sshd_pid:-}" ]; then
+    fail "could not stage the sshd processes rule 7's ownership evidence must spare"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$foreign_sshd_pid" "an sshd whose config declares no srui subsystem survived"
+    assert_alive "$absent_sshd_pid" "an sshd whose config file does not exist survived"
+fi
+kill_marker "${foreign_sshd_pid:-}"
+kill_marker "${absent_sshd_pid:-}"
+
+echo "case 39: a blind sweep still reaps a fixture sshd, while sparing what could be a daemon"
+# The no-evidence gate exists to protect a detached `srui-sessiond` that cannot be told from debris
+# without the socket table. An `sshd` binds no unix socket, so it can never be that daemon - but it
+# was being cleared by the same gate, which left leaked fixture sshd processes alive on every host
+# without usable `lsof`: minimal Linux images, and any machine with a detached session daemon.
+blind2_root="$sandbox/tmp39"
+blind2_default="$blind2_root/srui-$(id -u)"
+mkdir -p "$blind2_default"
+python3 -c "import socket; socket.socket(socket.AF_UNIX).bind('$blind2_default/s')" 2>/dev/null
+sshd39_dir="$blind2_root/srui-sshfix39"
+mkdir -p "$sshd39_dir"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sshd39_dir/sshd_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$sshd39_dir/sshd_config"
+sshd39_pid=$spawned_pid
+cargo39=$(make_marker fixture-blind39)
+spawn_orphan "$cargo39"
+cargo39_pid=$spawned_pid
+if [ -z "${sshd39_pid:-}" ] || [ -z "${cargo39_pid:-}" ] || [ ! -S "$blind2_default/s" ]; then
+    fail "could not stage a blind sweep with both families present"
+else
+    output=$(PATH="$sandbox/nolsof:$PATH" \
+        SRUI_REAP_PATTERN="$(marker_pattern "$cargo39")" \
+        SRUI_REAP_AGE_MINUTES=0 \
+        SRUI_REAP_TMP_GLOBS="$blind2_root/srui-*" \
+        TMPDIR="$blind2_root" \
+        XDG_RUNTIME_DIR="$sandbox_runtime/xdg" \
+        bash "$reaper" 2>&1)
+    assert_terminated "$sshd39_pid" "the fixture sshd was reaped despite no socket inventory"
+    # The family the gate is for is still spared, on the same sweep: the exemption is scoped to
+    # rule 7, not a hole in the gate.
+    assert_alive "$cargo39_pid" "a fixture server that could be a detached daemon was spared"
+    assert_contains "$output" "killing nothing a daemon could be" \
+        "the sweep said what the gate did and did not cover"
+fi
+kill_marker "${sshd39_pid:-}"
+kill_marker "${cargo39_pid:-}"
+
+echo "case 42: a config path that only looks like a fixture's is not ownership"
+# `/tmp/srui-bait/../production-sshd_config` carries the fixture prefix letter for letter while
+# naming a file outside every fixture directory, and a symlink inside one does the same. Rule 6 was
+# fixed for exactly this; rule 7 compared spellings until now. Both escapes are staged, and both
+# configs declare the subsystem, so the *only* thing that can spare them is resolving the path.
+escape_root="$sandbox/tmp/srui-bait"
+mkdir -p "$escape_root"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sandbox/tmp/production-sshd_config"
+mkdir -p "$sandbox/outside"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$sandbox/outside/sshd_config"
+ln -sfn "$sandbox/outside/sshd_config" "$escape_root/linked_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$escape_root/../production-sshd_config"
+dotdot_pid=$spawned_pid
+spawn_orphan_with_args "$fixture_sshd" -f "$escape_root/linked_config"
+linked_pid=$spawned_pid
+if [ -z "${dotdot_pid:-}" ] || [ -z "${linked_pid:-}" ]; then
+    fail "could not stage the sshd processes whose config escapes the fixture directory"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$dotdot_pid" "an sshd whose -f escapes the fixture directory through .. survived"
+    assert_alive "$linked_pid" "an sshd whose -f is a symlink out of the fixture directory survived"
+fi
+kill_marker "${dotdot_pid:-}"
+kill_marker "${linked_pid:-}"
+
+echo "case 41: a listener that rewrote its process title is still a rule-7 candidate"
+# A real `sshd -D` rewrites argv to `sshd: /usr/sbin/sshd -f … [listener]`. No prefix of that names
+# an existing file, so argv[0] falls back to the first token, `sshd:` - and a guard that accepted
+# only `sshd` rejected every orphan the SSH suites actually leave on Linux. Case 35 cannot catch
+# this: its stand-in keeps a literal executable path as argv[0].
+titled_dir="$sandbox/tmp/srui-titled-$$"
+mkdir -p "$titled_dir"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$titled_dir/sshd_config"
+spawn_orphan_with_title "sshd: /usr/sbin/sshd" "$fixture_sshd" -f "$titled_dir/sshd_config"
+titled_pid=$spawned_pid
+if [ -z "${titled_pid:-}" ]; then
+    fail "could not stage an orphan with a rewritten process title"
+else
+    # The title really is the shape under test: argv[0] names no file on disk.
+    if [ -e "sshd:" ]; then
+        fail "the sandbox has a file named 'sshd:', so this case proves nothing"
+    else
+        pass "argv[0] of the staged orphan names no existing file"
+    fi
+    reap_globs="$sandbox/tmp/srui-*"
+    output=$(run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+    reap_globs=""
+    assert_terminated "$titled_pid" "the retitled listener was reaped"
+    assert_contains "$output" "killing orphaned fixture server pid $titled_pid" \
+        "the sweep named the retitled listener it killed"
+fi
+kill_marker "${titled_pid:-}"
+
+echo "case 37: rules 1 and 2 apply to a fixture sshd exactly as they do to a fixture server"
+spawn_orphan_with_args "$fixture_sshd" -f "$sshd_dir/sshd_config"
+young_pid=$spawned_pid
+"$fixture_sshd" -f "$sshd_dir/sshd_config" 600 >/dev/null 2>&1 &
+parented_pid=$!
+spawned_pids+=("$parented_pid")
+disown "$parented_pid" 2>/dev/null
+if [ -z "${young_pid:-}" ]; then
+    fail "could not stage a young fixture sshd"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    # An age floor above the marker's age: debris has to be old, whichever rule admitted it.
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 30 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$young_pid" "a fixture sshd younger than the age floor survived"
+    assert_alive "$parented_pid" "a fixture sshd with a live parent survived"
+fi
+kill_marker "${young_pid:-}"
+kill_marker "${parented_pid:-}"
+
+echo "case 43: the effective -f is the last one, because that is the one sshd itself uses"
+# sshd assigns its configuration file on every -f occurrence, so an earlier one names a file the
+# daemon never read. Judging by the first let a service that overrides a fixture config on its own
+# command line be killed by the path it had already discarded - rule 7's one way to kill something
+# real. Both orderings are staged, so neither direction can pass by accident.
+lastf_fixture="$sandbox/tmp/srui-lastf-$$"
+mkdir -p "$lastf_fixture" "$sandbox/etc"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$lastf_fixture/sshd_config"
+printf 'Port 22\nSubsystem sftp /usr/lib/openssh/sftp-server\n' >"$sandbox/etc/sshd_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$lastf_fixture/sshd_config" -f "$sandbox/etc/sshd_config"
+overridden_pid=$spawned_pid
+spawn_orphan_with_args "$fixture_sshd" -f "$sandbox/etc/sshd_config" -f "$lastf_fixture/sshd_config"
+effective_pid=$spawned_pid
+if [ -z "${overridden_pid:-}" ] || [ -z "${effective_pid:-}" ]; then
+    fail "could not stage both -f orderings"
+else
+    reap_globs="$sandbox/tmp/srui-*"
+    run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 >/dev/null 2>&1
+    reap_globs=""
+    assert_alive "$overridden_pid" \
+        "an sshd whose fixture -f was overridden by a later one survived"
+    assert_terminated "$effective_pid" "the sshd whose last -f names the fixture was reaped"
+fi
+kill_marker "${overridden_pid:-}"
+kill_marker "${effective_pid:-}"
+
+echo "case 44: an sshd observed on a different fixture config than it was selected from is spared"
+# The pre-signal check re-derives rule 7 from a fresh `ps` row instead of trusting the snapshot, so
+# a pid selected from one fixture configuration and observed on another - the shape of a restart
+# onto a reused pid - must be refused. A process cannot rewrite its own -f, so the only way to stage
+# this is a `ps` stand-in that answers the single-pid query with the other config. Both configs are
+# inside the globs and declare the subsystem, so the row still selects as a fixture: what is under
+# test is the *identity* comparison, not whether the second path would be admitted.
+recheck_a="$sandbox/tmp/srui-recheck-a-$$"
+recheck_b="$sandbox/tmp/srui-recheck-b-$$"
+mkdir -p "$recheck_a" "$recheck_b"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$recheck_a/sshd_config"
+printf 'Subsystem srui /path/to/srui-ssh-bridge /tmp/s.sock\n' >"$recheck_b/sshd_config"
+spawn_orphan_with_args "$fixture_sshd" -f "$recheck_a/sshd_config"
+recheck_pid=$spawned_pid
+if [ -z "${recheck_pid:-}" ]; then
+    fail "could not stage an sshd for the reconfiguration case"
+else
+    restating_bin="$sandbox/restating-ps"
+    mkdir -p "$restating_bin"
+    cat >"$restating_bin/ps" <<'SH'
+#!/bin/sh
+# The `-eo` snapshot reports what the candidate was selected from; the single-pid row the reaper
+# re-reads immediately before signalling reports the other configuration.
+case $1 in
+    -o)
+        case $2 in
+            *ppid*)
+                /bin/ps "$@" | sed -e "s|$SRUI_FAKE_CONFIG_FROM|$SRUI_FAKE_CONFIG_TO|g"
+                exit $?
+                ;;
+        esac
+        ;;
+esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$restating_bin/ps"
+    reap_globs="$sandbox/tmp/srui-*"
+    output=$(PATH="$restating_bin:$PATH" \
+        SRUI_FAKE_CONFIG_FROM="$recheck_a/sshd_config" \
+        SRUI_FAKE_CONFIG_TO="$recheck_b/sshd_config" \
+        run_reaper 'NEVER_MATCHES_ANY_EXECUTABLE' 0 2>&1)
+    reap_globs=""
+    assert_alive "$recheck_pid" \
+        "an sshd observed on a config other than the one it was selected from survived"
+    if printf '%s' "$output" | grep -qF "killing orphaned fixture server pid $recheck_pid"; then
+        fail "the sweep signalled a pid whose configuration had changed under it"
+    else
+        pass "the sweep refused a candidate whose fresh evidence disagreed"
+    fi
+fi
+kill_marker "${recheck_pid:-}"
 
 echo
 if [ "$failures" -eq 0 ]; then

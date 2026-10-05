@@ -679,7 +679,7 @@ struct TextEditingIntegrationTests {
             ]
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(actionMount))
-        try await AsyncTestSupport.eventually(description: "action button mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "action button mounted") {
             applier.lastAppliedRevision == Revision(2)
                 && renderer.registry.handle(for: actionID) != nil
         }
@@ -1507,7 +1507,7 @@ struct TextEditingIntegrationTests {
             ]
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(correction))
-        try await AsyncTestSupport.eventually(description: "correction applied") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "correction applied") {
             field.stringValue == "corrected"
         }
         #expect(adapter.validationState == .error)
@@ -1585,7 +1585,7 @@ struct TextEditingIntegrationTests {
         ackMessage.serverEventAck = ack
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(ackMessage))
 
-        try await AsyncTestSupport.eventually(description: "native reverts without a transaction") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "native reverts without a transaction") {
             field.stringValue == ""
         }
         #expect(await collector.events().filter { $0.eventType == .EVENT_TEXT_EDIT }.count == 1)
@@ -2030,7 +2030,7 @@ struct TextEditingIntegrationTests {
             ]
         ).toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(intervening))
-        try await AsyncTestSupport.eventually(description: "intervening structural revision remounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "intervening structural revision remounted") {
             applier.lastAppliedRevision == Revision(2)
                 && renderer.registry.handle(for: NodeId(101)) != nil
         }
@@ -2404,7 +2404,7 @@ struct TextEditingIntegrationTests {
         mountMsg.transaction = mountTx.toWire()
         try await server.send(data: try SRUIFraming.encodeFramed(mountMsg))
 
-        try await AsyncTestSupport.eventually(description: "text input mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "text input mounted") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.handle(for: editorID) != nil
         }

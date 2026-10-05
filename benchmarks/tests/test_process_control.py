@@ -34,6 +34,17 @@ with open(sys.argv[1], "w", encoding="utf-8") as output:
 time.sleep(60)
 """
 
+TERMINABLE_SLEEPER = """
+import os
+import sys
+import time
+
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(str(os.getpid()))
+    output.flush()
+time.sleep(60)
+"""
+
 SPAWNER = """
 import subprocess
 import sys
@@ -98,15 +109,37 @@ def wait_for_pid(path: Path) -> int:
     raise AssertionError(f"PID file was not written: {path}")
 
 
+def process_state(pid: int) -> str:
+    """The process's state letter, or "" when it is not in the table at all."""
+    row = subprocess.run(
+        ["ps", "-o", "state=", "-p", str(pid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+        timeout=5,
+    )
+    return row.stdout.strip()
+
+
 def assert_process_gone(pid: int) -> None:
+    """Assert `pid` is no longer running: absent, or a zombie nobody has reaped.
+
+    Not `os.kill(pid, 0)`, which succeeds for a zombie. Where pid 1 does not reap an
+    orphan promptly -- a container whose pid 1 is a plain shell, which is where CI
+    runs -- a correctly terminated child stays in state `Z` and that call keeps
+    succeeding, so this waited out its deadline and failed against correct code.
+    `process_group_members` draws the same distinction, for the same reason: an
+    uncollected exit status holds no resources.
+    """
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        state = process_state(pid)
+        if state == "" or state.startswith("Z"):
             return
         time.sleep(0.02)
-    pytest.fail(f"process {pid} survived supervised cleanup")
+    pytest.fail(f"process {pid} survived supervised cleanup (state {process_state(pid)!r})")
 
 
 def wait_for_two_pids(path: Path) -> tuple[int, int]:
@@ -328,6 +361,92 @@ def test_enumeration_failure_still_kills_and_reaps_pinned_group(
 
     assert managed.closed
     assert_process_gone(child_pid)
+
+
+def test_a_zombie_counts_as_gone_for_the_cleanup_assertion() -> None:
+    """`assert_process_gone` must accept a zombie, not wait out its deadline on one.
+
+    `os.kill(pid, 0)` succeeds for a zombie, so on a host whose pid 1 does not reap an
+    orphan promptly the assertion used to fail against a correctly terminated child.
+    Neither macOS (launchd reaps at once) nor a plain container reproduces that
+    timing, so the zombie is staged directly here: this process forks a child, the
+    child exits, and nothing waits for it until the assertion has run.
+    """
+    zombie = os.fork()
+    if zombie == 0:  # pragma: no cover - the child never returns
+        os._exit(0)
+    try:
+        deadline = time.monotonic() + 5
+        while not process_state(zombie).startswith("Z"):
+            assert time.monotonic() < deadline, (
+                f"the child never became a zombie (state {process_state(zombie)!r})"
+            )
+            time.sleep(0.02)
+        # Still answers `kill -0`, which is exactly why that is not the test.
+        os.kill(zombie, 0)
+        started = time.monotonic()
+        assert_process_gone(zombie)
+        assert time.monotonic() - started < 1.0, "the assertion waited on a zombie"
+    finally:
+        os.waitpid(zombie, 0)
+
+
+def test_group_enumeration_lists_live_members_and_skips_exited_zombies() -> None:
+    own_group = os.getpgid(0)
+    exited = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    try:
+        # WNOWAIT observes the exit without reaping, so the PID is still carried in
+        # the process group while the enumeration below runs.
+        os.waitid(os.P_PID, exited.pid, os.WEXITED | os.WNOWAIT)
+        members = process_control.process_group_members(own_group)
+    finally:
+        exited.wait(timeout=5)
+
+    assert os.getpid() in members, "a live group member must be enumerated"
+    assert exited.pid not in members, "an exited zombie must not count as a member"
+
+
+def test_pinned_group_drains_within_the_cleanup_grace_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "drain-child.pid"
+    managed = ManagedProcess.start(
+        [sys.executable, "-c", TERMINABLE_SLEEPER, str(pid_file)],
+        cwd=tmp_path,
+        label="graceful drain",
+        cleanup_grace_seconds=5.0,
+    )
+    child_pid = wait_for_pid(pid_file)
+    assert managed.supervisor is not None
+    supervisor_pid = managed.supervisor.pid
+
+    original_members = process_control.process_group_members
+    observations: list[set[int]] = []
+
+    def record(process_group: int) -> set[int]:
+        members = original_members(process_group)
+        observations.append(members)
+        return members
+
+    monkeypatch.setattr(process_control, "process_group_members", record)
+    managed.terminate()
+
+    assert managed.closed
+    assert_process_gone(child_pid)
+    assert observations, "the cleanup grace window must enumerate the group"
+    # The stopped sentinel cannot reap its exec child, so a zombie-counting
+    # enumeration leaves this loop to expire on its deadline every single time.
+    assert observations[-1] <= {supervisor_pid}, (
+        "the SIGTERM'd group never drained inside the grace window; last "
+        f"enumeration was {sorted(observations[-1])}"
+    )
 
 
 def test_failed_reap_keeps_control_files_until_retry(

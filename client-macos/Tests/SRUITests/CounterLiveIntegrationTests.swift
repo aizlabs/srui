@@ -74,7 +74,7 @@ struct CounterLiveIntegrationTests {
         initialMsg.transaction = initialTx.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(initialMsg))
 
-        try await AsyncTestSupport.eventually(description: "initial transaction and renderer mount") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "initial transaction and renderer mount") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.registry.handle(for: textID) != nil
                 && renderer.registry.handle(for: progressID) != nil
@@ -126,7 +126,7 @@ struct CounterLiveIntegrationTests {
         for cycle in 1...3 {
             buttonTrampoline.performAction(buttonHandle.view)
 
-            try await AsyncTestSupport.eventually(description: "counter cycle \(cycle)") {
+            try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "counter cycle \(cycle)") {
                 applier.lastAppliedRevision == Revision(UInt64(cycle + 1))
                     && textField.stringValue == "Count: \(cycle)"
                     && abs(progressIndicator.doubleValue - (Double(cycle) / 100.0)) < 0.0001

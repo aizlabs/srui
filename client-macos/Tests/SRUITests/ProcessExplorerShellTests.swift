@@ -322,9 +322,7 @@ struct ProcessExplorerShellTests {
                      "Run bash apps/srtop/test.sh to build the required server")
         try #require(FileManager.default.isExecutableFile(atPath: bridgeBinary.path),
                      "The real SSH bridge is required; this test must not soft-skip")
-        let temp = URL(fileURLWithPath: "/tmp/px001-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
+        let temp = try TestFixtureDirectory.make(prefix: "px001")
         let socket = temp.appendingPathComponent("s.sock").path
         let hostKey = temp.appendingPathComponent("host_key").path
         let userKey = temp.appendingPathComponent("user_key").path
@@ -375,7 +373,7 @@ struct ProcessExplorerShellTests {
                 kill(server.processIdentifier, SIGINT)
                 server.waitUntilExit()
             }
-            try? FileManager.default.removeItem(at: temp)
+            TestFixtureDirectory.release(temp)
             throw error
         }
     }
@@ -384,7 +382,9 @@ struct ProcessExplorerShellTests {
         if harness.server.isRunning { kill(harness.server.processIdentifier, SIGINT) }
         harness.server.waitUntilExit()
         SSHTestSupport.terminate(harness.sshd)
-        try? FileManager.default.removeItem(at: harness.temp)
+        // Last, so the sshd and the app server that hold this directory's socket and host key are
+        // already gone (see `TestFixtureDirectory`).
+        TestFixtureDirectory.release(harness.temp)
     }
 
     @MainActor

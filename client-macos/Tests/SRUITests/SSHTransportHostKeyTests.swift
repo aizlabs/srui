@@ -14,11 +14,8 @@ struct SSHTransportHostKeyTests {
 
     @Test("SSHTransport fails closed on host key verification mismatch")
     func badHostKeyFailsClosed() async throws {
-        let tempDir = URL(fileURLWithPath: "/tmp/srui-hk-\(UUID().uuidString.prefix(8))")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer {
-            try? FileManager.default.removeItem(at: tempDir)
-        }
+        let tempDir = try TestFixtureDirectory.make(prefix: "srui-hk")
+        defer { TestFixtureDirectory.release(tempDir) }
 
         let realHostKeyPath = tempDir.appendingPathComponent("real_host_key").path
         let spoofedHostKeyPath = tempDir.appendingPathComponent("spoofed_host_key").path

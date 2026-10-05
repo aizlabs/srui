@@ -22,18 +22,8 @@ struct CollectionRangeSocketIntegrationTests {
     @Test("Large collection fixture hydrates the first page and fills a delayed cache miss")
     @MainActor
     func largeCollectionFixtureHydratesAndFillsCacheMiss() async throws {
-        let runtimeDirectory = URL(
-            fileURLWithPath: "/tmp/srui-collection-range-\(UUID().uuidString)"
-        )
-        try FileManager.default.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: false
-        )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: runtimeDirectory.path
-        )
-        defer { try? FileManager.default.removeItem(at: runtimeDirectory) }
+        let runtimeDirectory = try TestFixtureDirectory.make(prefix: "srui-collection-range")
+        defer { TestFixtureDirectory.release(runtimeDirectory) }
         let socketPath = runtimeDirectory.appendingPathComponent("counter.sock").path
         let repoRoot = Self.repositoryRoot()
         let counterBinary = repoRoot.appendingPathComponent("examples/counter/target/debug/counter")
@@ -62,7 +52,6 @@ struct CollectionRangeSocketIntegrationTests {
                 server.terminate()
             }
             server.waitUntilExit()
-            try? FileManager.default.removeItem(atPath: socketPath)
         }
 
         try await Self.waitForSocket(at: socketPath, timeoutSeconds: 10)
@@ -132,7 +121,7 @@ struct CollectionRangeSocketIntegrationTests {
             atLeast: Revision(revisionBeforeRequest.value + 1),
             timeoutSeconds: 8
         )
-        try await AsyncTestSupport.eventually(description: "delayed range painted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "delayed range painted") {
             adapter.rowContent(at: 10_000)?.cells.last == "Row 10000"
         }
         #expect(adapter.rowContent(at: 10_000)?.itemID == ItemId(10_001))

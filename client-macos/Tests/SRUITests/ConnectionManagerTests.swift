@@ -215,7 +215,7 @@ struct ConnectionManagerTests {
             sessionID: originalSessionID,
             revision: appliedRevision.value
         ))
-        try await AsyncTestSupport.eventually(description: "original session ready") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "original session ready") {
             manager.status(for: saved.id) == .connected
                 && manager.entries.first?.lastKnownRevision == appliedRevision.value
         }
@@ -224,7 +224,7 @@ struct ConnectionManagerTests {
             previousSessionID: originalSessionID,
             newSessionID: replacementSessionID
         ))
-        try await AsyncTestSupport.eventually(description: "replacement catch-up") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement catch-up") {
             manager.status(for: saved.id) == .resynchronizing
                 && manager.entries.first?.sessionID == replacementSessionID
                 && manager.entries.first?.lastKnownRevision == 0
@@ -265,7 +265,7 @@ struct ConnectionManagerTests {
         manager.connect(id: saved.id)
         let attempt = try #require(harness.attempts.first)
         await attempt.emit(.ready(sessionID: "open-session", revision: 1))
-        try await AsyncTestSupport.eventually(description: "connection ready for open") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "connection ready for open") {
             manager.status(for: saved.id) == .connected
         }
 
@@ -375,7 +375,7 @@ struct ConnectionManagerTests {
         message.serverWelcome = welcome
         try await transport.receive(message)
         try await transport.receive(textSnapshot(value: "original value"))
-        try await AsyncTestSupport.eventually(description: "original session mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "original session mounted") {
             manager.status(for: connectionID) == .connected
                 && harness.requests.last?.context.renderer.textEditingSession
                     .lastKnownAuthoritative(for: NodeId(2)) == "original value"
@@ -404,7 +404,7 @@ struct ConnectionManagerTests {
         _ index: Int,
         from transport: ConnectionManagerCaptureTransport
     ) async throws -> SRUIMessage {
-        try await AsyncTestSupport.eventuallyAsync(description: "outbound frame \(index)") {
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "outbound frame \(index)") {
             await transport.frame(at: index) != nil
         }
         return try decodeFramedMessage(from: #require(await transport.frame(at: index)))
@@ -430,7 +430,7 @@ struct ConnectionManagerTests {
 
         if duringResume {
             await harness.transports.last?.close()
-            try await AsyncTestSupport.eventually(description: "original attempt released") {
+            try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "original attempt released") {
                 !manager.hasActiveAttemptForTesting(saved.id)
             }
             manager.connect(id: saved.id)
@@ -446,7 +446,7 @@ struct ConnectionManagerTests {
         var message = SRUIMessage()
         message.serverResyncRequired = replacement
         try await replacedTransport.receive(message)
-        try await AsyncTestSupport.eventually(description: "replacement accepted before snapshot") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement accepted before snapshot") {
             manager.entries.first?.sessionID == "replacement-session"
                 && manager.status(for: saved.id) == .resynchronizing
         }
@@ -456,7 +456,7 @@ struct ConnectionManagerTests {
 
         // Lose the transport after REPLACED, before the replacement snapshot can arrive.
         await replacedTransport.close()
-        try await AsyncTestSupport.eventually(description: "replacement attempt released") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement attempt released") {
             !manager.hasActiveAttemptForTesting(saved.id)
         }
         manager.connect(id: saved.id)
@@ -481,7 +481,7 @@ struct ConnectionManagerTests {
         message.serverResumeOk = resumed
         try await resumedTransport.receive(message)
         try await resumedTransport.receive(textSnapshot(value: "replacement value"))
-        try await AsyncTestSupport.eventually(description: "replacement replay mounted") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement replay mounted") {
             manager.status(for: saved.id) == .connected
                 && context.renderer.textEditingSession.lastKnownAuthoritative(for: NodeId(2))
                     == "replacement value"
@@ -505,7 +505,7 @@ struct ConnectionManagerTests {
         try await mountOriginalSession(manager: manager, harness: harness, connectionID: saved.id)
         let context = try #require(harness.requests.first?.context)
         await harness.transports.last?.close()
-        try await AsyncTestSupport.eventually(description: "stopped attempt released") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "stopped attempt released") {
             !manager.hasActiveAttemptForTesting(saved.id)
         }
 
@@ -565,7 +565,7 @@ struct ConnectionManagerTests {
         let attempt = try #require(harness.attempts.first)
 
         await attempt.emit(.failed("cold resume failed"))
-        try await AsyncTestSupport.eventually(description: "cold failure recorded") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "cold failure recorded") {
             manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
                 && manager.entries.first?.lastKnownRevision == 900
                 && manager.alert?.kind == .connectionFailed
@@ -595,10 +595,11 @@ struct ConnectionManagerTests {
         let attempt = try #require(harness.attempts.first)
         await attempt.emit(.ready(sessionID: "session-one", revision: 12))
 
-        try await AsyncTestSupport.eventually(description: "connection ready state") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "connection ready state") {
             manager.status(for: connectionID) == .connected
         }
         try await AsyncTestSupport.eventuallyAsync(
+            timeout: .roundTrip,
             description: "successful connection persistence"
         ) {
             let stored = try? await temporary.store.load()
@@ -640,7 +641,7 @@ struct ConnectionManagerTests {
             previousSessionID: "old-session",
             newSessionID: "new-session"
         ))
-        try await AsyncTestSupport.eventually(description: "replacement notification") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement notification") {
             manager.status(for: saved.id) == .resynchronizing
                 && manager.alert?.kind == .sessionReplaced
         }
@@ -649,7 +650,7 @@ struct ConnectionManagerTests {
         #expect(try await temporary.store.load().first?.sessionID == "new-session")
 
         await attempt.emit(.ready(sessionID: "new-session", revision: 5))
-        try await AsyncTestSupport.eventually(description: "replacement snapshot ready") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement snapshot ready") {
             manager.status(for: saved.id) == .connected
         }
         #expect(manager.entries.first?.lastKnownRevision == 5)
@@ -684,6 +685,7 @@ struct ConnectionManagerTests {
 
         await attempt.emit(.stopped)
         try await AsyncTestSupport.eventuallyAsync(
+            timeout: .roundTrip,
             description: "replacement attempt stopped"
         ) {
             await attempt.stopCount() > 0
@@ -758,6 +760,7 @@ struct ConnectionManagerTests {
         let secondAttempt = try #require(harness.attempts.last)
 
         try await AsyncTestSupport.eventuallyAsync(
+            timeout: .roundTrip,
             description: "superseded attempt stopped without starting"
         ) {
             let firstStops = await firstAttempt.stopCount()
@@ -797,14 +800,14 @@ struct ConnectionManagerTests {
         manager.connect(id: saved.id)
         let secondAttempt = try #require(harness.attempts.last)
         await secondAttempt.emit(.ready(sessionID: "new-session", revision: 4))
-        try await AsyncTestSupport.eventually(description: "newer attempt ready") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "newer attempt ready") {
             manager.status(for: saved.id) == .connected
                 && manager.entries.first?.sessionID == "new-session"
         }
 
         await firstStartGate.release()
         let firstAttempt = try #require(harness.attempts.first)
-        try await AsyncTestSupport.eventuallyAsync(description: "stale attempt teardown") {
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "stale attempt teardown") {
             await firstAttempt.stopCount() > 0
         }
         #expect(manager.status(for: saved.id) == .connected)
@@ -833,7 +836,7 @@ struct ConnectionManagerTests {
         let firstAttempt = try #require(harness.attempts.first)
         await firstAttempt.emit(.failed("initial failure"))
 
-        try await AsyncTestSupport.eventually(description: "failed draft removed") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "failed draft removed") {
             manager.entries.isEmpty && manager.alert?.kind == .connectionFailed
         }
 
@@ -910,7 +913,7 @@ struct ConnectionManagerTests {
         let attempt = try #require(harness.attempts.first)
         await attempt.emit(.failed("Host key verification failed."))
 
-        try await AsyncTestSupport.eventually(description: "blocking SSH failure alert") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "blocking SSH failure alert") {
             manager.alert?.kind == .connectionFailed
         }
         #expect(manager.alert?.title == "Connection Failed")
@@ -977,7 +980,7 @@ struct ConnectionManagerTests {
         )
         harness.discardRequests()
         await attempt.emit(.stopped)
-        try await AsyncTestSupport.eventually(description: "attempt ownership released") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "attempt ownership released") {
             manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
                 && manager.hasActiveAttemptForTesting(saved.id) == false
         }
@@ -1031,7 +1034,7 @@ struct ConnectionManagerTests {
         let shutdownTask = Task { @MainActor in
             await manager.shutdown()
         }
-        try await AsyncTestSupport.eventually(description: "shutdown entered") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "shutdown entered") {
             manager.isShuttingDownForTesting
         }
 
@@ -1070,7 +1073,7 @@ struct ConnectionManagerTests {
             newSessionID: "new-session"
         ))
         await attempt.emit(.failed("catch-up failed"))
-        try await AsyncTestSupport.eventually(description: "replacement failure disclosed") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "replacement failure disclosed") {
             manager.status(for: saved.id) == .disconnected(resumeAvailable: true)
                 && manager.alert?.kind == .sessionReplaced
                 && manager.alert?.message.contains("new-session") == true
@@ -1133,7 +1136,7 @@ struct ConnectionManagerTests {
             try #require(harness.requests.first).context
         )
         harness.discardRequests()
-        try await AsyncTestSupport.eventuallyAsync(description: "attempt start") {
+        try await AsyncTestSupport.eventuallyAsync(timeout: .roundTrip, description: "attempt start") {
             await attempt.startCount() == 1
         }
 
@@ -1145,7 +1148,7 @@ struct ConnectionManagerTests {
         #expect(context.value != nil)
 
         await attempt.emit(.stopped)
-        try await AsyncTestSupport.eventually(description: "removed connection context release") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "removed connection context release") {
             context.value == nil
         }
 

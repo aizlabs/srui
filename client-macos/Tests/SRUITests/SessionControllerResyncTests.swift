@@ -1492,7 +1492,7 @@ struct SessionControllerResyncTests {
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         try await oldServer.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
-        try await AsyncTestSupport.eventually(description: "old connection active") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "old connection active") {
             old.isEventDispatchEnabled
         }
 
@@ -1504,7 +1504,7 @@ struct SessionControllerResyncTests {
         var resyncMessage = SRUIMessage()
         resyncMessage.serverResyncRequired = resync
         try await oldServer.send(data: try SRUIFraming.encodeFramed(resyncMessage))
-        try await AsyncTestSupport.eventually(description: "old connection awaiting snapshot") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "old connection awaiting snapshot") {
             !old.isEventDispatchEnabled
         }
 
@@ -1574,7 +1574,7 @@ struct SessionControllerResyncTests {
         var welcomeMessage = SRUIMessage()
         welcomeMessage.serverWelcome = welcome
         try await oldServer.send(data: try SRUIFraming.encodeFramed(welcomeMessage))
-        try await AsyncTestSupport.eventually(description: "old live connection active") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "old live connection active") {
             old.isEventDispatchEnabled
         }
 
@@ -2002,7 +2002,7 @@ struct SessionControllerResyncTests {
         snapshotMessage.transaction = snapshot.toWire()
         try await serverTransport.send(data: try SRUIFraming.encodeFramed(snapshotMessage))
 
-        try await AsyncTestSupport.eventually(description: "cached image hydration") {
+        try await AsyncTestSupport.eventually(timeout: .roundTrip, description: "cached image hydration") {
             applier.lastAppliedRevision == Revision(1)
                 && renderer.resolveResourceImage(hash) != nil
                 && renderer.registry.handle(for: imageID)?.view is NSImageView

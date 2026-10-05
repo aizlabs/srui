@@ -29,8 +29,12 @@
 //! approximate on every kernel since Linux 6.2, while `statm`'s is exact from
 //! 6.16. Where the reader's own procfs can name an open directory
 //! (`/proc/self/fd/<n>`, on Linux), both files are read through one handle on
-//! the record's directory, so a PID reused between the two reads cannot lend its
-//! memory to the instance `stat` identified (see `RecordAccess`).
+//! the record's directory. A kernel procfs binds that handle to one process
+//! instance, so a PID reused between the two reads cannot lend its memory to the
+//! instance `stat` identified. A scanned tree that is not a kernel procfs — a
+//! fixture, or a FUSE, 9p or sshfs mirror of another host's `/proc` given to
+//! [`ProcFsSource::with_root`] — is read through the same handle with no such
+//! guarantee (see `RecordAccess`).
 use crate::source::{
     record_issue, BootId, CappedRecords, Completeness, CpuInterval, CpuUsage, CreationToken,
     DisplayName, EnumerationIssue, HostId, IssueScope, MissingReason, Observed, PidNamespaceId,
@@ -255,14 +259,19 @@ enum MountKind {
 /// A record is read twice — `stat` for its identity, name and CPU counters,
 /// then `statm` for its resident memory — and a PID is only a number: by path,
 /// the second read reaches whichever process holds that number *now*. Linux
-/// hands a number out again only once the process that held it has been reaped
-/// and its cyclic PID allocator has come back round to that number, so by path a
-/// misattribution needs both to happen between two back-to-back reads; a pinned
-/// directory rules it out instead of relying on that. procfs binds
-/// an open `/proc/<pid>` directory to the process instance it was opened on (its
+/// hands a number out again only once the process that held it has been reaped.
+/// An ordinary fork then gets it only when the cyclic PID allocator comes back
+/// round to it, but a process with `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`
+/// over the PID namespace can claim it at once (`clone3()` with `set_tid`, Linux
+/// 5.5+, or `/proc/sys/kernel/ns_last_pid`), so by path the window between two
+/// back-to-back reads is a narrow but real race. A kernel procfs binds an open
+/// `/proc/<pid>` directory to the process instance it was opened on (its
 /// `struct pid`), so once that instance is reaped every lookup through the
 /// handle fails with `ESRCH` (`proc_pid_permission`, fs/proc/base.c) and never
-/// reaches a later process under the same number.
+/// reaches a later process under the same number. The binding is the kernel
+/// procfs's own: [`record_access`] proves only that the reader can name an open
+/// directory, so a tree that is not a kernel procfs is read through the handle
+/// without that guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordAccess {
     /// Each record's directory is opened once, and its files are read through
@@ -280,30 +289,57 @@ struct RecordDir {
     /// Where this record's files are read from: the pinned handle's link, or the
     /// record's own path under the root.
     base: PathBuf,
-    /// The handle `base` names, held until the record has been read and never
-    /// read itself. Dropping it closes the directory.
-    _pin: Option<File>,
+    /// The handle `base` names, held until the record has been read; dropping it
+    /// closes the directory. `None` when the record is read by name.
+    pin: Option<File>,
+    /// The record's path under the root, which test fault injection is keyed by.
+    #[cfg(test)]
+    record: PathBuf,
 }
 
 impl RecordDir {
     fn open(path: PathBuf, access: RecordAccess) -> io::Result<Self> {
-        match access {
-            RecordAccess::ByName => Ok(Self {
-                base: path,
-                _pin: None,
-            }),
+        #[cfg(test)]
+        fault::check(&path, "open")?;
+        #[cfg(test)]
+        let record = path.clone();
+        let (base, pin) = match access {
+            RecordAccess::ByName => (path, None),
             RecordAccess::Pinned => {
-                let pin = File::open(&path)?;
-                Ok(Self {
-                    base: fd_link(&pin),
-                    _pin: Some(pin),
-                })
+                let pin = open_directory(&path)?;
+                (fd_link(&pin), Some(pin))
             }
-        }
+        };
+        Ok(Self {
+            base,
+            pin,
+            #[cfg(test)]
+            record,
+        })
     }
 
     fn read(&self, file: &str) -> io::Result<Vec<u8>> {
+        #[cfg(test)]
+        fault::check(&self.record, file)?;
         read_bounded(&self.base.join(file))
+    }
+
+    /// Whether this record's process is really gone, after its `statm` read
+    /// failed as if it were: its `stat`, read again through the same directory,
+    /// must be gone too, and a pinned directory must still be reachable — so a
+    /// tree that has a `stat` but no `statm`, which no kernel produces, or a
+    /// reader whose own `/proc` stopped resolving mid-scan, is never taken for
+    /// processes that ended.
+    fn confirms_exit(&self) -> bool {
+        self.reachable() && matches!(self.read("stat"), Err(error) if ended(&error))
+    }
+
+    /// Whether the pinned directory can still be reached through the reader's
+    /// own `/proc`. A kernel procfs answers that for a reaped process too: the
+    /// link resolves and only lookups beneath it fail. By name there is no link
+    /// to lose.
+    fn reachable(&self) -> bool {
+        self.pin.is_none() || std::fs::metadata(&self.base).is_ok()
     }
 }
 
@@ -847,14 +883,16 @@ impl ProcessSource for ProcFsSource {
                             // no longer exists at sample time — exactly like one
                             // whose `stat` was already gone. It is counted as
                             // vanished, never published with half a sample, and
-                            // no counter baseline is kept for it.
-                            Err(error) if ended(&error) => {
+                            // no counter baseline is kept for it. The exit is
+                            // confirmed first: a `statm` that is gone while the
+                            // record's `stat` still reads is an unread field.
+                            Err(error) if ended(&error) && directory.confirms_exit() => {
                                 vanished += 1;
                                 continue;
                             }
-                            // Refused, or failed for another reason: this one
-                            // field is unread, with that reason, and the record
-                            // is still published (PX-005).
+                            // Refused, gone without the process, or failed for
+                            // another reason: this one field is unread, with that
+                            // reason, and the record is still published (PX-005).
                             Err(error) => Observed::Missing(reason_for(&error)),
                             Ok(bytes) => match parse_statm_resident(&bytes) {
                                 Some(pages) => Observed::Known(pages),
@@ -1048,7 +1086,8 @@ fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
 /// by path its PID's directory is gone (`ENOENT`), and through a pinned
 /// directory the directory is still held but the instance it was opened on has
 /// been reaped (`ESRCH`, see [`RecordAccess`]). Either access can meet either
-/// error, and both are an exit during the scan, never an unreadable record.
+/// error, and both are an exit during the scan, never an unreadable record —
+/// for a record's `statm`, once [`RecordDir::confirms_exit`] agrees.
 fn ended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
 }
@@ -1058,7 +1097,7 @@ fn ended(error: &io::Error) -> bool {
 /// directory it opened. Decided per scan, so a reader without that link reads by
 /// name instead of taking every record's missing link for a process that ended.
 fn record_access(root: &Path) -> RecordAccess {
-    let Ok(directory) = File::open(root) else {
+    let Ok(directory) = open_directory(root) else {
         return RecordAccess::ByName;
     };
     match (std::fs::metadata(fd_link(&directory)), directory.metadata()) {
@@ -1069,6 +1108,17 @@ fn record_access(root: &Path) -> RecordAccess {
         }
         _ => RecordAccess::ByName,
     }
+}
+
+/// Opens `path` only if it is a directory, without blocking on anything else.
+///
+/// The path is opened as `<path>/.`: resolving `.` beneath it requires `path`
+/// to be a directory, so a FIFO, a socket or a regular file fails with
+/// `ENOTDIR` before anything is opened — in one race-free call, with `std`
+/// alone and no per-architecture `O_DIRECTORY` value. A plain `open(2)` of a
+/// FIFO would instead wait for a writer, and stall the scan with it.
+fn open_directory(path: &Path) -> io::Result<File> {
+    File::open(path.join("."))
 }
 
 /// The reader's own name for an open handle, through its own procfs.
@@ -1263,6 +1313,56 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
         .rposition(|byte| !byte.is_ascii_whitespace())
         .map_or(start, |index| index + 1);
     &bytes[start..end]
+}
+
+/// Test-only fault injection into one record's reads (PX-005-G01 review round
+/// 1). A hook may answer, in place of the operation, before a record's directory
+/// is opened (`"open"`) and before each of its files is read (the file's name).
+/// A scan runs on its caller's thread, so a thread-local hook reaches exactly
+/// the scan one test runs.
+#[cfg(test)]
+mod fault {
+    use std::cell::RefCell;
+    use std::io;
+    use std::path::Path;
+
+    type Hook = Box<dyn FnMut(&Path, &str) -> Option<io::Error>>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Removes the hook when dropped, even when the test panics.
+    #[must_use = "the hook is removed as soon as this guard is dropped"]
+    pub(super) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Installs `hook` on this thread until the returned guard is dropped.
+    pub(super) fn install(
+        hook: impl FnMut(&Path, &str) -> Option<io::Error> + 'static,
+    ) -> Installed {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Installed
+    }
+
+    /// The error the hook injects for `operation` on `record`, if any.
+    pub(super) fn check(record: &Path, operation: &str) -> io::Result<()> {
+        HOOK.with(|slot| {
+            match slot
+                .borrow_mut()
+                .as_mut()
+                .and_then(|hook| hook(record, operation))
+            {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1539,6 +1639,195 @@ mod tests {
         if access == RecordAccess::Pinned {
             assert_eq!(error.raw_os_error(), Some(ESRCH), "{error:?}");
         }
+        // And a scan confirms that exit (review round 1, W1): a reaped process's
+        // pinned directory still resolves through the reader's own `/proc`, while
+        // its `stat`, read again, is gone too.
+        assert!(directory.reachable());
+        assert!(directory.confirms_exit());
+    }
+
+    /// A minimal `/proc`-shaped tree for the fault-injection tests: identity
+    /// files, a 4 KiB page size, and one readable `stat` and `statm` per record
+    /// (`statm` reports 3 resident pages).
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(records: &[u32]) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "srtop-faults-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("sys/kernel/random")).unwrap();
+            std::fs::write(root.join("sys/kernel/hostname"), "fault-host\n").unwrap();
+            std::fs::write(root.join("sys/kernel/random/boot_id"), "boot-a\n").unwrap();
+            std::fs::create_dir_all(root.join("self/ns")).unwrap();
+            std::os::unix::fs::symlink("pid:[4026531836]", root.join("self/ns/pid")).unwrap();
+            let auxv: Vec<u8> = [AT_PAGESZ, 4096, AT_NULL, 0]
+                .iter()
+                .flat_map(|word| (*word as usize).to_ne_bytes())
+                .collect();
+            std::fs::write(root.join("self/auxv"), auxv).unwrap();
+            for pid in records {
+                let directory = root.join(pid.to_string());
+                std::fs::create_dir(&directory).unwrap();
+                let fillers: Vec<String> = (4..=21).map(|field| field.to_string()).collect();
+                let stat = format!(
+                    "{pid} (worker) S {} {} 4096 0 0\n",
+                    fillers.join(" "),
+                    100 + pid
+                );
+                std::fs::write(directory.join("stat"), stat).unwrap();
+                std::fs::write(directory.join("statm"), "10 3 1 1 0 1 0\n").unwrap();
+            }
+            Self(root)
+        }
+
+        /// One scan of this tree, with `hook` injecting faults into its records.
+        fn scan(
+            &self,
+            hook: impl FnMut(&Path, &str) -> Option<io::Error> + 'static,
+        ) -> ProcessSnapshot {
+            let _faults = fault::install(hook);
+            ProcFsSource::with_root(&self.0).snapshot()
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record_pid(record: &Path) -> Option<u32> {
+        record.file_name()?.to_str()?.parse().ok()
+    }
+
+    fn published(snapshot: &ProcessSnapshot) -> Vec<u32> {
+        snapshot
+            .records
+            .iter()
+            .filter_map(|record| match record.key.pid {
+                Observed::Known(pid) => Some(pid),
+                Observed::Missing(_) => None,
+            })
+            .collect()
+    }
+
+    /// What a path answers once its process is gone.
+    fn gone() -> io::Error {
+        io::Error::from(io::ErrorKind::NotFound)
+    }
+
+    /// What a pinned directory answers once its process has been reaped.
+    fn reaped() -> io::Error {
+        io::Error::from_raw_os_error(ESRCH)
+    }
+
+    /// Review round 1, W3: a record whose directory is gone before it could be
+    /// opened — by path (`ENOENT`), or reaped in that instant (`ESRCH`) — is
+    /// ordinary churn. It is counted as vanished, never as an unreadable record,
+    /// and the scan stays complete.
+    #[test]
+    fn a_record_gone_before_its_directory_opens_is_churn_and_the_scan_stays_complete() {
+        let tree = Tree::new(&[10, 20, 30]);
+        let snapshot = tree.scan(|record, operation| match (record_pid(record), operation) {
+            (Some(20), "open") => Some(gone()),
+            (Some(30), "open") => Some(reaped()),
+            _ => None,
+        });
+        assert_eq!(published(&snapshot), vec![10]);
+        assert_eq!(snapshot.vanished, 2);
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+        assert!(snapshot.completeness.issues().is_empty());
+    }
+
+    /// Review round 1, W3: the same for a process reaped between its directory's
+    /// open and its `stat` read — `ESRCH` through a pinned directory, `ENOENT` by
+    /// path. Ordinary churn keeps the scan complete.
+    #[test]
+    fn a_process_reaped_between_its_open_and_its_stat_is_churn_and_the_scan_stays_complete() {
+        let tree = Tree::new(&[10, 20, 30]);
+        let snapshot = tree.scan(|record, operation| match (record_pid(record), operation) {
+            (Some(20), "stat") => Some(gone()),
+            (Some(30), "stat") => Some(reaped()),
+            _ => None,
+        });
+        assert_eq!(published(&snapshot), vec![10]);
+        assert_eq!(snapshot.vanished, 2);
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+        assert!(snapshot.completeness.issues().is_empty());
+    }
+
+    /// Review round 1, W1: a `statm` that answers as if its process were gone is
+    /// an exit only when the process is gone too. Record 20's `stat` still reads,
+    /// so its resident memory is an unread field of a published record; record
+    /// 30's `stat`, read again, is gone as well, so 30 vanished.
+    #[test]
+    fn a_missing_statm_is_an_exit_only_when_the_records_stat_is_gone_too() {
+        let tree = Tree::new(&[10, 20, 30]);
+        let mut stat_reads_of_30 = 0;
+        let snapshot = tree.scan(
+            move |record, operation| match (record_pid(record), operation) {
+                (Some(20), "statm") => Some(reaped()),
+                (Some(30), "statm") => Some(gone()),
+                (Some(30), "stat") => {
+                    stat_reads_of_30 += 1;
+                    (stat_reads_of_30 > 1).then(reaped)
+                }
+                _ => None,
+            },
+        );
+        assert_eq!(published(&snapshot), vec![10, 20]);
+        assert_eq!(snapshot.records[0].resident, Observed::Known(3 * 4096));
+        assert_eq!(
+            snapshot.records[1].resident,
+            Observed::Missing(MissingReason::Unavailable)
+        );
+        assert_eq!(snapshot.vanished, 1);
+        assert_eq!(snapshot.completeness, Completeness::Complete);
+    }
+
+    /// Review round 1, W1: through a pinned directory an exit is confirmed only
+    /// while the directory is still reachable. A pin whose link no longer
+    /// resolves — the reader's own `/proc` gone mid-scan — confirms nothing,
+    /// whatever its files answer, because that failure is the reader's and not
+    /// the record's. By name there is no link to lose, and a `stat` that still
+    /// reads confirms no exit either.
+    #[test]
+    fn an_exit_is_not_confirmed_through_a_pin_the_reader_can_no_longer_reach() {
+        let tree = Tree::new(&[10]);
+        let unreachable = RecordDir {
+            // A descriptor number no process can hold, so its link resolves
+            // nowhere, here or on a system with no `/proc` at all.
+            base: Path::new(DEFAULT_PROC_ROOT).join(format!("self/fd/{}", i32::MAX)),
+            pin: Some(File::open(&tree.0).unwrap()),
+            record: tree.0.join("10"),
+        };
+        assert!(!unreachable.reachable());
+        assert!(!unreachable.confirms_exit());
+        let by_name = RecordDir {
+            base: tree.0.join("10"),
+            pin: None,
+            record: tree.0.join("10"),
+        };
+        assert!(by_name.reachable());
+        assert!(!by_name.confirms_exit(), "its stat still reads");
+    }
+
+    /// Review round 1, W2: a record directory is opened only if it is one. A
+    /// regular file fails at once with `ENOTDIR`, an unreadable record rather
+    /// than an exit; a FIFO, which a plain open would wait on, is covered by
+    /// `procfs_test`.
+    #[test]
+    fn only_a_directory_is_opened_as_a_record_directory() {
+        let tree = Tree::new(&[10]);
+        let error =
+            open_directory(&tree.0.join("10/stat")).expect_err("a regular file is not a directory");
+        assert!(!ended(&error), "{error:?}");
+        assert!(open_directory(&tree.0.join("10")).is_ok());
     }
 
     #[test]

@@ -133,11 +133,13 @@ impl ProcFixture {
         self
     }
 
-    /// A record whose `statm` is gone while its `stat` is still there: the
-    /// process ended between the two reads.
-    fn without_statm(&self, pid: u32) -> &Self {
-        fs::remove_file(self.0.join(pid.to_string()).join("statm")).unwrap();
-        self
+    /// A clock that ends record `pid` the way a kernel does between a record's
+    /// two reads: its whole directory disappears after its `stat` was read and
+    /// before its `statm` is. The clock fires on its first reading, so the
+    /// record must be the only one in the tree (PX-005-G01 review round 1).
+    fn ended_between_reads(&self, pid: u32) -> Arc<BetweenReads> {
+        let directory = self.0.join(pid.to_string());
+        BetweenReads::new(move || fs::remove_dir_all(&directory).unwrap())
     }
 
     /// A record that exists but cannot be read by this unprivileged scan.
@@ -1105,22 +1107,19 @@ impl MonotonicClock for BetweenReads {
 /// PX-005-G01: a process that ends between its `stat` and its `statm` read no
 /// longer exists at sample time. It is counted as vanished exactly like one whose
 /// `stat` was already gone: not published with half a sample, not an unreadable
-/// record, and no counter baseline is kept for it.
+/// record, and no counter baseline is kept for it. Here it ends as a kernel ends
+/// it, with its whole directory gone between the two reads.
 #[test]
 fn a_process_that_ends_between_its_stat_and_statm_reads_has_vanished() {
     let fixture = ProcFixture::new();
     fixture
         .identity("fixture-host", "boot-a", "pid:[4026531836]")
-        .resident(1, b"systemd", 7, 2)
-        .resident(4343, b"exiting", 500, 9)
-        .without_statm(4343);
-    let mut source = fixture.source();
+        .resident(4343, b"exiting", 500, 9);
+    let clock = fixture.ended_between_reads(4343);
+    let mut source = fixture.source().with_clock(clock.clone());
     let snapshot = source.snapshot();
-    assert_eq!(
-        resident_of(&snapshot),
-        vec![Observed::Known(2 * FIXTURE_PAGE_SIZE)]
-    );
-    assert_eq!(snapshot.records[0].key.pid, Observed::Known(1));
+    assert!(clock.fired(), "the record's stat was read");
+    assert!(snapshot.records.is_empty());
     assert_eq!(snapshot.vanished, 1);
     assert_eq!(snapshot.completeness, Completeness::Complete);
     assert!(snapshot.completeness.issues().is_empty());
@@ -1130,23 +1129,112 @@ fn a_process_that_ends_between_its_stat_and_statm_reads_has_vanished() {
     );
     assert_eq!(
         source.cpu_baselines(),
-        1,
+        0,
         "no counter baseline is kept for a process that ended"
     );
+}
 
-    // Ending exactly between the two reads: the record's directory is removed
-    // after its `stat` was read and before its `statm` is.
-    let between = ProcFixture::new();
-    between
-        .identity("fixture-host", "boot-a", "pid:[4026531836]")
-        .resident(4343, b"exiting", 500, 9);
-    let directory = between.0.join("4343");
-    let clock = BetweenReads::new(move || fs::remove_dir_all(&directory).unwrap());
-    let snapshot = between.source().with_clock(clock.clone()).snapshot();
-    assert!(clock.fired(), "the record's stat was read");
-    assert!(snapshot.records.is_empty());
-    assert_eq!(snapshot.vanished, 1);
+/// PX-005-G01 review round 1 (W1): a record whose `stat` reads but whose `statm`
+/// does not exist — which no kernel produces, but a tree given to `with_root`
+/// can — has not ended. It is published with its resident memory unread and the
+/// list stays authoritative, instead of three readable processes vanishing into
+/// an empty, complete result.
+#[test]
+fn a_record_whose_stat_reads_but_whose_statm_is_missing_is_published_unread() {
+    let fixture = ProcFixture::new();
+    fixture.identity("fixture-host", "boot-a", "pid:[4026531836]");
+    for pid in [1u32, 2, 3] {
+        fixture.process(pid, b"p", 10);
+        fs::remove_file(fixture.0.join(pid.to_string()).join("statm")).unwrap();
+    }
+    let snapshot = fixture.source().snapshot();
+    assert_eq!(snapshot.records.len(), 3);
+    assert_eq!(snapshot.vanished, 0);
     assert_eq!(snapshot.completeness, Completeness::Complete);
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![Observed::Missing(MissingReason::Unavailable); 3]
+    );
+}
+
+/// Makes a FIFO at `path` with the system's `mkfifo`, which `std` lacks.
+fn mkfifo(path: &std::path::Path) {
+    let output = std::process::Command::new("mkfifo")
+        .arg(path)
+        .output()
+        .expect("mkfifo runs");
+    assert!(
+        output.status.success(),
+        "mkfifo {}: {output:?}",
+        path.display()
+    );
+}
+
+/// One scan of `root` on another thread, waited for a bounded time. A scan that
+/// blocks — in `open(2)` on `fifo`, waiting for a writer — fails the test rather
+/// than hanging the suite: the FIFO is opened for writing to release the scan,
+/// and the test panics (PX-005-G01 review round 1, W2).
+fn scan_within(root: PathBuf, fifo: PathBuf) -> srui_process_explorer::source::ProcessSnapshot {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let scan = std::thread::spawn(move || {
+        let _ = sender.send(ProcFsSource::with_root(&root).snapshot());
+    });
+    match receiver.recv_timeout(Duration::from_secs(10)) {
+        Ok(snapshot) => {
+            scan.join().unwrap();
+            snapshot
+        }
+        Err(_) => {
+            drop(fs::OpenOptions::new().write(true).open(&fifo));
+            let _ = scan.join();
+            panic!("the scan blocked in open(2) on the FIFO {}", fifo.display());
+        }
+    }
+}
+
+/// PX-005-G01 review round 1 (W2): a scanned root that is a FIFO is refused at
+/// once — an unreadable root and an incomplete scan, as before this ticket —
+/// never a scan waiting in `open(2)` for a writer that does not come.
+#[test]
+fn a_root_that_is_a_fifo_is_refused_without_blocking_the_scan() {
+    let fixture = ProcFixture::new();
+    let fifo = fixture.0.join("root");
+    mkfifo(&fifo);
+    let snapshot = scan_within(fifo.clone(), fifo);
+    assert!(snapshot.records.is_empty());
+    assert!(!snapshot.completeness.is_complete());
+    assert!(snapshot
+        .completeness
+        .issues()
+        .iter()
+        .any(|issue| issue.scope == IssueScope::Root));
+}
+
+/// PX-005-G01 review round 1 (W2): a record entry that is a FIFO is one
+/// unreadable record, as before this ticket, and never a scan stalled opening it.
+#[test]
+fn a_record_entry_that_is_a_fifo_is_skipped_without_blocking_the_scan() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(1, b"init", 10, 7);
+    let fifo = fixture.0.join("2");
+    mkfifo(&fifo);
+    let snapshot = scan_within(fixture.0.clone(), fifo);
+    assert_eq!(
+        resident_of(&snapshot),
+        vec![Observed::Known(7 * FIXTURE_PAGE_SIZE)]
+    );
+    assert_eq!(snapshot.completeness.skipped(), 1);
+    assert_eq!(
+        snapshot
+            .completeness
+            .issues()
+            .iter()
+            .find(|issue| issue.scope == IssueScope::Process(2))
+            .map(|issue| issue.reason),
+        Some(MissingReason::Unavailable)
+    );
 }
 
 /// PX-005-G01: a `statm` this scan may not read is that one field refused —

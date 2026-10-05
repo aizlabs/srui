@@ -1356,6 +1356,44 @@ fn statm_is_read_from_the_directory_its_stat_was_read_from() {
     );
 }
 
+/// PX-005-G01 review round 2 (R2-W1, the reviewer's P4): an instance that ends
+/// between its `stat` and `statm` reads has ended, even when a newcomer already
+/// holds its PID by the time the exit is confirmed. Read by name, the record's
+/// path then holds the newcomer's `stat`, with another start time: that confirms
+/// the exit instead of keeping the ended instance published with an unread field.
+///
+/// Not on Linux, where a fixture's directory is pinned and every later read goes
+/// to the directory that was opened, as
+/// `statm_is_read_from_the_directory_its_stat_was_read_from` shows; there the
+/// decision itself is covered by
+/// `procfs::tests::a_re_read_stat_confirms_an_exit_by_instance_not_by_pid`.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn an_exit_confirmed_by_name_is_not_undone_by_a_newcomer_under_the_same_pid() {
+    let fixture = ProcFixture::new();
+    fixture
+        .identity("fixture-host", "boot-a", "pid:[4026531836]")
+        .resident(700, b"first", 10_000, 3);
+    let root = fixture.0.clone();
+    let clock = BetweenReads::new(move || {
+        fs::rename(root.join("700"), root.join("reaped-700")).unwrap();
+        fs::create_dir(root.join("700")).unwrap();
+        fs::write(root.join("700/stat"), stat_line(700, b"newcomer", 10_500)).unwrap();
+    });
+    let snapshot = fixture.source().with_clock(clock.clone()).snapshot();
+    assert!(clock.fired(), "the first instance's stat was read");
+    assert!(
+        snapshot
+            .records
+            .iter()
+            .all(|record| record.key.creation != CreationToken::LinuxBootTicks(10_000)),
+        "the ended first instance was published as alive: {:?}",
+        snapshot.records
+    );
+    assert_eq!(snapshot.vanished, 1);
+    assert_eq!(snapshot.completeness, Completeness::Complete);
+}
+
 /// A record whose directory this scan may not open — what `hidepid=1` does to
 /// another user's processes — is skipped as denied, exactly as a refused `stat`
 /// is, whether its directory is pinned or its files are opened by name.

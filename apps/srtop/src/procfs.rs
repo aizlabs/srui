@@ -267,11 +267,12 @@ enum MountKind {
 /// back-to-back reads is a narrow but real race. A kernel procfs binds an open
 /// `/proc/<pid>` directory to the process instance it was opened on (its
 /// `struct pid`), so once that instance is reaped every lookup through the
-/// handle fails with `ESRCH` (`proc_pid_permission`, fs/proc/base.c) and never
-/// reaches a later process under the same number. The binding is the kernel
-/// procfs's own: [`record_access`] proves only that the reader can name an open
-/// directory, so a tree that is not a kernel procfs is read through the handle
-/// without that guarantee.
+/// handle fails — with `ESRCH` from `proc_pid_permission`, or `ENOENT` from
+/// `proc_pident_lookup` when the task is found gone at the lookup itself (both
+/// fs/proc/base.c) — and never reaches a later process under the same number.
+/// The binding is the kernel procfs's own: [`record_access`] proves only that
+/// the reader can name an open directory, so a tree that is not a kernel procfs
+/// is read through the handle without that guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordAccess {
     /// Each record's directory is opened once, and its files are read through
@@ -324,14 +325,35 @@ impl RecordDir {
         read_bounded(&self.base.join(file))
     }
 
-    /// Whether this record's process is really gone, after its `statm` read
-    /// failed as if it were: its `stat`, read again through the same directory,
-    /// must be gone too, and a pinned directory must still be reachable — so a
-    /// tree that has a `stat` but no `statm`, which no kernel produces, or a
-    /// reader whose own `/proc` stopped resolving mid-scan, is never taken for
-    /// processes that ended.
-    fn confirms_exit(&self) -> bool {
-        self.reachable() && matches!(self.read("stat"), Err(error) if ended(&error))
+    /// Whether the process instance `pid` started at `start_ticks` is really
+    /// gone, after its `statm` read failed as if it were. A pinned directory must
+    /// still be reachable, and the record's `stat`, read again through the same
+    /// directory, decides:
+    ///
+    /// * gone too: the instance ended;
+    /// * a parsable line naming another start time: the instance ended and a
+    ///   newcomer already holds its PID — which a read by name, or a tree that is
+    ///   not a kernel procfs, can reach (review round 2);
+    /// * the same start time: the instance is alive, and only its `statm` is
+    ///   missing — a tree no kernel produces;
+    /// * a line that does not parse, or any other failure: nothing is proved
+    ///   either way, so the record stays published with the field unread. That
+    ///   is the conservative answer: it never turns a process that may be alive
+    ///   into an exit, and never claims a value for one that may not be.
+    ///
+    /// So a reader whose own `/proc` stopped resolving mid-scan, or a missing
+    /// `statm` beside a `stat` that still reads, is never taken for an exit, and
+    /// a newcomer under a reused PID never keeps an ended instance published.
+    fn confirms_exit(&self, pid: u32, start_ticks: u64) -> bool {
+        if !self.reachable() {
+            return false;
+        }
+        match self.read("stat") {
+            Err(error) => ended(&error),
+            Ok(bytes) => {
+                parse_stat(pid, &bytes).is_some_and(|again| again.start_ticks != start_ticks)
+            }
+        }
     }
 
     /// Whether the pinned directory can still be reached through the reader's
@@ -886,7 +908,10 @@ impl ProcessSource for ProcFsSource {
                             // no counter baseline is kept for it. The exit is
                             // confirmed first: a `statm` that is gone while the
                             // record's `stat` still reads is an unread field.
-                            Err(error) if ended(&error) && directory.confirms_exit() => {
+                            Err(error)
+                                if ended(&error)
+                                    && directory.confirms_exit(pid, stat.start_ticks) =>
+                            {
                                 vanished += 1;
                                 continue;
                             }
@@ -1085,9 +1110,10 @@ fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
 /// Whether a read failed because the process it was reading no longer exists:
 /// by path its PID's directory is gone (`ENOENT`), and through a pinned
 /// directory the directory is still held but the instance it was opened on has
-/// been reaped (`ESRCH`, see [`RecordAccess`]). Either access can meet either
-/// error, and both are an exit during the scan, never an unreadable record —
-/// for a record's `statm`, once [`RecordDir::confirms_exit`] agrees.
+/// been reaped (`ESRCH`, or `ENOENT` when the lookup itself finds the task gone;
+/// see [`RecordAccess`]). Either access can meet either error, and both are an
+/// exit during the scan, never an unreadable record — for a record's `statm`,
+/// once [`RecordDir::confirms_exit`] agrees.
 fn ended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(ESRCH)
 }
@@ -1620,18 +1646,22 @@ mod tests {
             .expect("the test owns this worker");
         let root = Path::new(DEFAULT_PROC_ROOT);
         let access = record_access(root);
-        let opened = RecordDir::open(root.join(worker.id().to_string()), access);
+        let pid = worker.id();
+        let opened = RecordDir::open(root.join(pid.to_string()), access);
+        // The live worker's creation token, read the way a scan reads it.
         let alive = match &opened {
-            Ok(directory) => directory.read("statm").map(|_| ()),
+            Ok(directory) => directory.read("stat").and_then(|bytes| {
+                directory.read("statm")?;
+                parse_stat(pid, &bytes)
+                    .map(|stat| stat.start_ticks)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no stat line"))
+            }),
             Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
         };
         let _ = worker.kill();
         let _ = worker.wait();
         let directory = opened.expect("the worker existed when its directory was opened");
-        assert!(
-            alive.is_ok(),
-            "a live worker's statm is readable: {alive:?}"
-        );
+        let start_ticks = alive.expect("a live worker's stat and statm are readable");
         let error = directory
             .read("statm")
             .expect_err("a reaped process has no statm");
@@ -1643,7 +1673,7 @@ mod tests {
         // pinned directory still resolves through the reader's own `/proc`, while
         // its `stat`, read again, is gone too.
         assert!(directory.reachable());
-        assert!(directory.confirms_exit());
+        assert!(directory.confirms_exit(pid, start_ticks));
     }
 
     /// A minimal `/proc`-shaped tree for the fault-injection tests: identity
@@ -1806,15 +1836,45 @@ mod tests {
             pin: Some(File::open(&tree.0).unwrap()),
             record: tree.0.join("10"),
         };
+        // The tree's record 10 started at tick 110.
         assert!(!unreachable.reachable());
-        assert!(!unreachable.confirms_exit());
+        assert!(!unreachable.confirms_exit(10, 110));
         let by_name = RecordDir {
             base: tree.0.join("10"),
             pin: None,
             record: tree.0.join("10"),
         };
         assert!(by_name.reachable());
-        assert!(!by_name.confirms_exit(), "its stat still reads");
+        assert!(!by_name.confirms_exit(10, 110), "its stat still reads");
+    }
+
+    /// Review round 2, R2-W1: a `stat` read again decides an exit by process
+    /// instance, never by PID. Gone, or naming another start time under the same
+    /// PID, the instance ended; the same start time is the same, live instance;
+    /// a line that names no instance proves nothing, so the record stays
+    /// published with its field unread.
+    #[test]
+    fn a_re_read_stat_confirms_an_exit_by_instance_not_by_pid() {
+        let tree = Tree::new(&[10]);
+        let record = tree.0.join("10");
+        let by_name = RecordDir {
+            base: record.clone(),
+            pin: None,
+            record: record.clone(),
+        };
+        // The tree's record 10 started at tick 110.
+        assert!(
+            !by_name.confirms_exit(10, 110),
+            "the same instance still reads"
+        );
+        assert!(by_name.confirms_exit(10, 109), "a newcomer holds the PID");
+        std::fs::write(record.join("stat"), "10 (worker) S\n").unwrap();
+        assert!(
+            !by_name.confirms_exit(10, 110),
+            "a line naming no instance proves nothing"
+        );
+        std::fs::remove_file(record.join("stat")).unwrap();
+        assert!(by_name.confirms_exit(10, 110), "gone too");
     }
 
     /// Review round 1, W2: a record directory is opened only if it is one. A

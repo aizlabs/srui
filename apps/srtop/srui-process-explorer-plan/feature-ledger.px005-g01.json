@@ -33,7 +33,7 @@
     },
     {
       "feature_id": "SRUI-PX005G01-002",
-      "feature": "A statm that cannot be read after the record's stat was is handled with the existing states and never by falling back to stat field 24: refused is Denied and unreadable, oversized or anything but the kernel's line of seven plain counts is Unavailable, both on a record that is still published without degrading Completeness, while a process that ended between the two reads, confirmed by its stat being gone too when read again through the same directory, is counted as vanished and publishes nothing; a statm missing beside a stat that still reads is Unavailable, never an exit",
+      "feature": "A statm that cannot be read after the record's stat was is handled with the existing states and never by falling back to stat field 24: refused is Denied and unreadable, oversized or anything but the kernel's line of seven plain counts is Unavailable, both on a record that is still published without degrading Completeness, while a process that ended between the two reads, confirmed by its stat, read again through the same directory, being gone too or naming another instance under the same PID, is counted as vanished and publishes nothing; a statm missing beside a stat that still reads as the same instance, or beside a line that names none, is Unavailable, never an exit",
       "scope": "PX-005-G01/all procfs roots/read-only",
       "source_refs": [
         "D1",
@@ -47,7 +47,7 @@
     },
     {
       "feature_id": "SRUI-PX005G01-003",
-      "feature": "Both files of a record are read through one handle on its /proc/<pid> directory, reached through the reader's own /proc/self/fd/<n> with std alone and opened only if it is a directory, so on a kernel procfs a PID reused between the two reads fails with ESRCH instead of lending another process's memory to the instance stat identified (a with_root tree that is not a kernel procfs gets the handle without that guarantee); a reader whose own /proc cannot name an open directory (every system but Linux, or a Linux reader without a usable /proc) reads by name without reporting it, and a record directory that may be searched but not read is skipped as Denied",
+      "feature": "Both files of a record are read through one handle on its /proc/<pid> directory, reached through the reader's own /proc/self/fd/<n> with std alone and opened only if it is a directory, so on a kernel procfs a PID reused between the two reads fails with ESRCH or ENOENT instead of lending another process's memory to the instance stat identified (a with_root tree that is not a kernel procfs gets the handle without that guarantee); a reader whose own /proc cannot name an open directory (every system but Linux, or a Linux reader without a usable /proc) reads by name without reporting it, and a record directory that may be searched but not read is skipped as Denied",
       "scope": "PX-005-G01/Linux procfs roots and fixture trees/read-only; by name on other systems",
       "source_refs": [
         "KS2"
